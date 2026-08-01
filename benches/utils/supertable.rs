@@ -54,6 +54,7 @@ use infino::{
     supertable::{
         Supertable,
         manifest::{ClusterCentroids, SuperfileEntry},
+        writer::maintenance_pool_width,
     },
 };
 use tempfile::TempDir;
@@ -80,7 +81,7 @@ const RESULT_PREFIX: &str = "__SUPERTABLE_SHAPE_RESULT__ ";
 /// can't carry `Option<f64>`, so a negative sentinel encodes `None`.
 const INGEST_CPU_NOT_MEASURED_NS: i128 = -1;
 
-/// The three measured shapes: (display label, child-env key, modality).
+/// The measured ingest shapes: (display label, child-env key, modality).
 const SHAPES: [(&str, &str, Modality); 4] = [
     ("FTS-only", "fts", Modality::Fts),
     ("vector-only", "vector", Modality::Vector),
@@ -1110,6 +1111,7 @@ fn measure_routing_state_with(
             supertable::n_docs(),
             gate.ceilings_first,
             gate.ceilings_second,
+            gate.steady_law_width,
         );
     }
     eprintln!(
@@ -1378,6 +1380,14 @@ struct ColdReadAssert<'a> {
     expected: ExpectedTiers,
     ceilings_first: &'a [(&'a str, u64, u64)],
     ceilings_second: &'a [(&'a str, u64, u64)],
+    /// The stamped width law at the battery's `k` (1 when absent). The
+    /// ceiling tables encode a width-1 probe; a wider law legitimately
+    /// reads one more coalesced cell-GET per extra probed cell, so both
+    /// cold windows scale by `width - 1`. The gate then measures
+    /// per-cell fetch efficiency, not the law's width choice (the
+    /// accepted trade: 0.994 recall at width 2 vs 0.957 at width 1 on
+    /// the 10M gate).
+    steady_law_width: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1488,7 +1498,12 @@ fn assert_expected_cold_reads(
     // the caller supplies its own tables (empty = tier check only).
     ceilings_first: &[(&str, u64, u64)],
     ceilings_second: &[(&str, u64, u64)],
+    steady_law_width: u64,
 ) {
+    // The ceiling tables assume a width-1 probe (one coalesced cell-GET);
+    // a stamped law width w reads w cells by design, adding w-1 GETs to
+    // both cold windows.
+    let law_extra = steady_law_width.saturating_sub(1);
     let user_data = split
         .first_query
         .class_io(storage_meter::UriClass::UserData)
@@ -1510,12 +1525,14 @@ fn assert_expected_cold_reads(
     // one-time warmup fan and the second query's steady per-query fetch
     // each stay within their per-scale ceilings.
     if let Some(ceiling) = cold_data_get_ceiling(ceilings_first, label, n_docs) {
+        let ceiling = ceiling.saturating_add(law_extra);
         let total = user_data + hidden_data;
         assert!(
             total <= ceiling,
             "{label}: first cold query (metadata warmup) regressed — {total} data GETs \
-             ({user_data} user + {hidden_data} hidden), ceiling {ceiling} at {n_docs} docs \
-             (per-modality ceilings; provisional post-v1-open values)"
+             ({user_data} user + {hidden_data} hidden), ceiling {ceiling} at {n_docs} docs, \
+             law width {steady_law_width} (per-modality ceilings; provisional \
+             post-v1-open values)"
         );
     }
     if let Some(ceiling) = cold_data_get_ceiling(ceilings_second, label, n_docs) {
@@ -1527,12 +1544,14 @@ fn assert_expected_cold_reads(
             .second_query
             .class_io(storage_meter::UriClass::HiddenData)
             .get_count;
+        let ceiling = ceiling.saturating_add(law_extra);
         let total = second_user + second_hidden;
         assert!(
             total <= ceiling,
             "{label}: second (steady) cold query regressed — {total} data GETs \
              ({second_user} user + {second_hidden} hidden), ceiling {ceiling} at {n_docs} \
-             docs (per-modality ceilings; provisional post-v1-open values)"
+             docs, law width {steady_law_width} (per-modality ceilings; provisional \
+             post-v1-open values)"
         );
     }
 }
@@ -2288,7 +2307,7 @@ pub mod vector {
     use crate::{
         corpus,
         executors::{
-            fts as exec_fts, vector as exec_vec,
+            vector as exec_vec,
             vector::{SupertableVectorRead, VectorRead},
         },
     };
@@ -2367,6 +2386,10 @@ pub mod vector {
     /// jitter. A width-blind selection regression falls far beyond it
     /// (0.994 -> 0.388 measured at 10M pre-floor).
     const WIDTH_SWEEP_MONOTONICITY_SLACK: f32 = 0.01;
+    /// Doc id whose bucket term the predicate battery filters on —
+    /// arbitrary, stable across runs; taken modulo the corpus size so
+    /// the bucket exists even on tiny debug corpora.
+    const FILTER_BUCKET_PICK: usize = 42;
     /// Explicitly discard only the derived hidden vector-index sibling before
     /// a retained-prefix lifecycle run; the durable user table is untouched.
     const RESET_HIDDEN_INDEX_ENV: &str = "INFINO_BENCH_RESET_HIDDEN_VECTOR_INDEX";
@@ -3039,6 +3062,26 @@ pub mod vector {
         );
     }
 
+    /// Index of the `k = TOP_K = 10` knot in the stamped width law
+    /// (`WIDTH_LAW_KS = [1, 10, 100, 1000]`) — the k every battery
+    /// query runs at.
+    const WIDTH_LAW_K10_IDX: usize = 1;
+
+    /// The stamped width law at the battery's `TOP_K`, read from the
+    /// hidden manifest exactly as the default query path resolves it
+    /// (1 when the table has no hidden index or no calibrated law).
+    fn stamped_width_law_at_top_k(consumer: &Supertable) -> u64 {
+        let Some(hidden) = consumer.vector_index_table() else {
+            return 1;
+        };
+        match hidden.pinned_reader().manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { routing, .. } => {
+                u64::from(routing.width_for_k[WIDTH_LAW_K10_IDX].max(1))
+            }
+            _ => 1,
+        }
+    }
+
     fn log_hidden_stats(consumer: &Supertable, label: &str) {
         let Some(hidden) = consumer.vector_index_table() else {
             return;
@@ -3080,8 +3123,18 @@ pub mod vector {
             Some((fine_min, fine_p50, fine_p90, fine_max)),
         ) = (cell_dist, fine_dist)
         {
+            // The stamped probe laws travel with every hidden-stats line so
+            // a post-compact battery can be read against the RECALIBRATED
+            // laws, not the drain-time stamp the post-drain label showed.
+            let laws = match hidden_reader.manifest().get_partition_strategy() {
+                PartitionStrategy::VectorCell { routing, .. } => format!(
+                    "law={:?} finelaw={:?} reranklaw={:?}",
+                    routing.width_for_k, routing.fine_for_k, routing.rerank_for_k
+                ),
+                _ => "law=n/a".to_string(),
+            };
             eprintln!(
-                "[supertable_vector] hidden {label}: {} files, {} cells, {} fine clusters, {}; cell rows min/p50/p90/max={cell_min}/{cell_p50}/{cell_p90}/{cell_max}; fine rows={fine_min}/{fine_p50}/{fine_p90}/{fine_max}",
+                "[supertable_vector] hidden {label}: {} files, {} cells, {} fine clusters, {}; cell rows min/p50/p90/max={cell_min}/{cell_p50}/{cell_p90}/{cell_max}; fine rows={fine_min}/{fine_p50}/{fine_p90}/{fine_max}; {laws}",
                 entries.len(),
                 cell_rows.len(),
                 rows_by_fine_cluster.len(),
@@ -3476,6 +3529,7 @@ pub mod vector {
                 expected,
                 ceilings_first: super::VECTOR_COLD_GET_CEILINGS_FIRST,
                 ceilings_second: super::VECTOR_COLD_GET_CEILINGS_SECOND,
+                steady_law_width: stamped_width_law_at_top_k(consumer),
             }),
         )
     }
@@ -4093,6 +4147,15 @@ pub mod vector {
                         rss::fmt_bytes(filtered_io.get_bytes),
                         q_correct.len(),
                     );
+                    // This window has no per-query predicate resolution (the
+                    // allow-set is prepared once, above), so warm means warm:
+                    // any GET here is a cache-coverage regression.
+                    assert_eq!(
+                        filtered_io.get_count, 0,
+                        "filtered warm battery issued object-store GETs — an \
+                         undersized or unwarmed cache turned the warm window \
+                         into silent round-trips"
+                    );
                 }
                 // Probe-width discriminator for filtered recall loss: if
                 // recall climbs with an explicit wider cell probe, the gap
@@ -4196,58 +4259,68 @@ pub mod vector {
             // per surviving superfile) on EVERY call. The prepared-allow-set
             // table above hoists exactly that step out of its timed window, so
             // its p50 omits it; this measures the end-to-end cost a caller
-            // actually pays. Needs a table with both an FTS column and a
-            // vector column — `Modality::Combined` already is one (the
-            // vector-only table the rest of this file measures has no text
-            // column to filter on), so no new corpus or schema shape is
-            // introduced here.
+            // actually pays. The primary table's `filter_bucket` column
+            // (one FTS-indexed token per row) exists for exactly this
+            // measurement, so it runs on the SAME table as every other
+            // vector number — no second build.
             if phases.warm {
-                let rep = exec_fts::FTS_BATTERY
-                    .iter()
-                    .find(|q| q.name == "single_rare")
-                    .expect("battery keeps its rare-term representative");
-                let filter_query = rep.terms.join(" ");
-                let filter_mode = exec_fts::to_infino_mode(rep.mode);
-
-                let combined_corpus = supertable::prepare_corpus(Modality::Combined);
-                let combined_built =
-                    supertable::build_on_storage(Modality::Combined, &combined_corpus);
-                let (_combined_cache_dir, combined_consumer) =
-                    open_consumer(Modality::Combined, &combined_built);
-                // Post-drain, matching every other search number in this file.
-                drain_hidden_incoming(&combined_consumer);
-                let combined_ids = corpus::engine_id_to_dense(&combined_consumer, n_docs);
-                let combined_reader = combined_consumer.reader().expect("reader");
+                // One representative bucket term — every bucket matches
+                // exactly 1/VECTOR_FILTER_BUCKET_TERMS of the corpus, the
+                // 0.2% `single_rare` selectivity class this battery has
+                // always measured. Runs against the PRIMARY table (its
+                // `filter_bucket` column exists for exactly this), post-drain
+                // like every other search number in this file — a second
+                // full table just to host a text predicate doubled ingest
+                // and was untenable at 100M/1B.
+                // Pick a bucket that exists at ANY corpus size: bucket
+                // ids are `doc_id % VECTOR_FILTER_BUCKET_TERMS`, so passing
+                // a live doc id guarantees at least that doc matches (a
+                // fixed id larger than a tiny debug corpus would resolve
+                // to an empty allow-set and grade recall against nothing).
+                let filter_query =
+                    supertable::vector_filter_bucket_term(FILTER_BUCKET_PICK % n_docs.max(1));
+                let filter_mode = infino::BoolMode::And;
+                let primary_reader = consumer.reader().expect("reader");
 
                 // Allow-set = the ENGINE's own `token_match` over the same
                 // column/term/mode the filter carries — the identical
                 // resolution the filtered kNN runs internally, so the graded
                 // ground truth and the measured path agree by construction.
-                let matched_hits = combined_reader
-                    .token_match(supertable::TEXT_COLUMN, &filter_query, filter_mode)
+                // Timed once here purely as a decomposition aid: the same
+                // resolution runs INSIDE every timed `VectorFilter` query
+                // below, so `p50 - this` bounds the constrained-kNN share.
+                let t_resolve = Instant::now();
+                let matched_hits = primary_reader
+                    .token_match(supertable::VECTOR_FILTER_COLUMN, &filter_query, filter_mode)
                     .expect("filter predicate token_match");
+                let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1e3;
                 let mut allow = RoaringBitmap::new();
-                for (dense, _) in
-                    hits_to_dense_u32(&combined_consumer, &combined_ids, &matched_hits)
-                {
+                for (dense, _) in hits_to_dense_u32(&consumer, &id_to_dense, &matched_hits) {
                     allow.insert(dense);
                 }
                 let matched = allow.len();
+                assert!(
+                    matched > 0,
+                    "predicate-filtered battery resolved an empty allow-set — \
+                     the graded numbers would be meaningless"
+                );
                 let selectivity = matched as f64 / n_docs.max(1) as f64;
 
-                let combined_vectors = combined_corpus
+                let primary_vectors = corpus
+                    .as_ref()
+                    .expect("vector benches always prepare a corpus")
                     .vectors()
-                    .expect("combined corpus carries vectors");
-                let vslice = &combined_vectors.as_slice()[..n_docs * DIM];
+                    .expect("vector corpus carries vectors");
+                let vslice = &primary_vectors.as_slice()[..n_docs * DIM];
                 let gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
 
                 let filter = || VectorFilter {
-                    column: supertable::TEXT_COLUMN,
+                    column: supertable::VECTOR_FILTER_COLUMN,
                     query: filter_query.as_str(),
                     mode: filter_mode,
                 };
                 let run_query = |q: &Vec<f32>| {
-                    combined_reader
+                    primary_reader
                         .vector_search(
                             supertable::VEC_COLUMN,
                             q,
@@ -4264,6 +4337,17 @@ pub mod vector {
                 }
                 let mut recalls = Vec::with_capacity(q_correct.len());
                 let mut latencies = Vec::with_capacity(q_correct.len());
+                // Metered: the kNN side of a warm battery must be 0 GET —
+                // an undersized or unwarmed cache turns "warm p50" into
+                // silent object-store round-trips (measured: 196-330
+                // ms/query on the old second-table shape, whose cache was
+                // auto-sized before the drain added the hidden index it
+                // then queried). This window cannot promise 0 in total:
+                // it deliberately includes the per-query predicate
+                // resolution a caller pays, and the engine serves that
+                // with per-query posting reads today (the measured
+                // request-count cost this battery exposes).
+                let meter_before = consumer_meter.snapshot();
                 for (q, truth) in q_correct.iter().zip(&gt) {
                     let t0 = Instant::now();
                     let batches = run_query(q);
@@ -4273,7 +4357,7 @@ pub mod vector {
                     let hits: Vec<(u32, f32)> = corpus::id_scores_from_vector_search(&batches)
                         .into_iter()
                         .filter_map(|(id, score)| {
-                            combined_ids.get(&id).copied().map(|dense| (dense, score))
+                            id_to_dense.get(&id).copied().map(|dense| (dense, score))
                         })
                         .collect();
                     recalls.push(corpus::recall_at_k(&hits, truth));
@@ -4282,14 +4366,28 @@ pub mod vector {
                     let mean_recall: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
                     latencies.sort_unstable();
                     let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
+                    let io = consumer_meter.snapshot().since(&meter_before);
                     eprintln!(
-                        "[supertable_vector] predicate-filtered ({}, {matched} of {} rows = \
-                         {:.2}% selectivity): recall@{TOP_K}={mean_recall:.3} p50={:.2}ms",
-                        rep.name,
+                        "[supertable_vector] predicate-filtered ({filter_query}, {matched} of {} \
+                         rows = {:.2}% selectivity): recall@{TOP_K}={mean_recall:.3} p50={:.2}ms \
+                         (predicate resolution alone: {resolve_ms:.2}ms; timed window: {} GET / \
+                         {} down over {} queries)",
                         fmt_count(n_docs),
                         selectivity * 100.0,
                         p50_ns / 1e6,
+                        io.get_count,
+                        rss::fmt_bytes(io.get_bytes),
+                        q_correct.len(),
                     );
+                    // NO 0-GET assert here, deliberately: this timed window
+                    // includes the per-query predicate resolution, and the
+                    // engine currently serves that with ~112 tiny GETs per
+                    // query (~240 B each, measured on CI at 1M) even with the
+                    // kNN side fully cached. Surfacing that request-count
+                    // profile is this battery's job — the count is reported
+                    // above and in the section note; the cache-coverage
+                    // guarantee is asserted on the resolution-free allow-set
+                    // window instead.
                     report.emit(&Section {
                         anchor: "bench/vector/supertable/filtered-predicate".into(),
                         title: format!(
@@ -4299,16 +4397,16 @@ pub mod vector {
                         ),
                         note: format!(
                             "The PUBLIC filtered path: `vector_search` with a real \
-                             `VectorFilter{{column,query,mode}}` over a `Modality::Combined` \
-                             table, resolved fresh on every call — so unlike the \
-                             prepared-allow-set table above, the timed window INCLUDES the \
-                             predicate resolution (`token_match` per surviving superfile) a \
-                             caller pays. Predicate is the `{}` battery term over `{}`, \
-                             matching {matched} of {} rows as measured (no target selectivity \
-                             is engineered). Δ is vs the previous run.",
-                            rep.name,
-                            supertable::TEXT_COLUMN,
+                             `VectorFilter{{column,query,mode}}` over the PRIMARY vector \
+                             table's `{}` column, resolved fresh on every call — so unlike \
+                             the prepared-allow-set table above, the timed window INCLUDES \
+                             the predicate resolution (`token_match` per surviving \
+                             superfile) a caller pays. Predicate is the uniform bucket term \
+                             `{filter_query}`, matching {matched} of {} rows (engineered \
+                             1/{} selectivity). Δ is vs the previous run.",
+                            supertable::VECTOR_FILTER_COLUMN,
                             fmt_count(n_docs),
+                            supertable::VECTOR_FILTER_BUCKET_TERMS,
                         ),
                         blocks: vec![Block {
                             subtitle: String::new(),
@@ -4331,10 +4429,6 @@ pub mod vector {
                             ]],
                         }],
                     });
-                }
-                drop(combined_consumer);
-                if let Some(cleanup) = &combined_built.cleanup {
-                    tiers::cleanup_prefix(cleanup);
                 }
             }
 
@@ -4469,7 +4563,11 @@ pub mod vector {
                 // delta phase ran it first drains that tail. The following
                 // state must therefore be hidden-only in either mode.
                 let compaction_stats = run_compact.then(|| {
-                    eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
+                    eprintln!(
+                        "[supertable_vector] compacting (optimize: user + hidden, maintenance \
+                         threads {})...",
+                        maintenance_pool_width()
+                    );
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
                     let (result, wall, cpu_s) =

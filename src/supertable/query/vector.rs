@@ -1407,6 +1407,38 @@ impl SupertableReader {
             // must be per-table and per-k, never a constant. A law width
             // of 1 resolves to `None` and keeps the fine-first p=1 path
             // byte-for-byte.
+            // Fine-depth law: a measured floor on runs-per-probed-cell for
+            // the unfiltered hidden path. Applied to the BASE routing before
+            // any pin — pin arms then lift depth to MAX on top, so the law
+            // only matters where no pin engages (the width<=1 default path,
+            // exactly where a flat config floor was measured scale-fragile:
+            // 10M post-drain 0.982 at floor 4 vs 0.996 at 8, identical
+            // latency).
+            if hidden_vector_index
+                && !filtered
+                && let Some(fine) = hidden_routing.and_then(|r| r.fine_for_k_at(k))
+            {
+                cell_routing.fine_nprobe = cell_routing.fine_nprobe.max(fine);
+            }
+            // Rerank law: the measured global survivor budget replaces the
+            // `k x rerank_mult` DEFAULT on the unfiltered hidden path —
+            // expressed as the equivalent multiplier so the divided cold
+            // budget and the global shortlist cap below both inherit it
+            // through `resolve`. Adaptive both ways: a table whose top-k
+            // hides deeper in the 1-bit estimate order gets MORE survivors
+            // than the constant, an easy table gets fewer. A caller-set
+            // `rerank_mult` wins over the law, exactly as a caller-set
+            // `nprobe` wins over the width law.
+            let options = match rerank_mult_from_law(
+                hidden_vector_index,
+                filtered,
+                options.rerank_mult(),
+                hidden_routing.as_ref(),
+                k,
+            ) {
+                Some(mult) => options.with_rerank_mult(mult),
+                None => options,
+            };
             let law_width: Option<usize> =
                 if hidden_vector_index && !filtered && options.nprobe.is_none() {
                     hidden_routing
@@ -2925,6 +2957,30 @@ fn subtract_tombstones(
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
+/// The rerank-law multiplier for this query, or `None` to keep the
+/// caller's options untouched. `Some` only when ALL of: the query runs
+/// on the hidden vector-index table, it is unfiltered (filtered queries
+/// keep their own budget model), the caller set no `rerank_mult` (caller
+/// intent always wins, exactly as a caller `nprobe` wins over the width
+/// law), and the manifest carries a calibrated rerank point at this `k`.
+/// The measured global survivor budget is expressed as the equivalent
+/// multiplier so the divided cold budget and the global shortlist cap
+/// both inherit it through `resolve`.
+fn rerank_mult_from_law(
+    hidden_vector_index: bool,
+    filtered: bool,
+    caller_rerank_mult: Option<usize>,
+    hidden_routing: Option<&CellRoutingParams>,
+    k: usize,
+) -> Option<usize> {
+    if !hidden_vector_index || filtered || caller_rerank_mult.is_some() {
+        return None;
+    }
+    hidden_routing
+        .and_then(|r| r.rerank_for_k_at(k))
+        .map(|n| n.div_ceil(k.max(1)).max(1))
+}
+
 /// One shared width override on top of the per-branch base routing:
 /// explicit caller `nprobe` pins the cell sweep width on every branch —
 /// an override is honored, never discarded — and with no override a
@@ -3215,15 +3271,17 @@ mod tests {
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
         VectorSearchOptions, admit_shortlist_window, apply_width_pin, cells_ranked_by_fine_score,
         gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
-        postings_by_cell_from_summaries, projection_is_id_score_only, score_fine_candidates,
-        select_global_shortlist, union_cell_selection, vector_read_query_error,
+        postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        vector_read_query_error,
     };
     use crate::{
-        InfinoError,
+        BoolMode, InfinoError,
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             error::{ReadError, VectorError},
+            fts::reader::Bm25Stats,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -3233,6 +3291,7 @@ mod tests {
                 ClusterCentroids,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            writer::{recalibrate_probe_laws, split_overflow_cell},
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -4712,6 +4771,39 @@ mod tests {
         assert_eq!(from_a, vec![(0, 0, 1, 1), (1, 0, 1, 1), (1, 0, 3, 3)]);
     }
 
+    /// The rerank-law application gates: the measured budget converts to a
+    /// multiplier ONLY on the unfiltered hidden path with no caller
+    /// override — a caller `rerank_mult` always wins, filtered queries
+    /// keep their own budget model, non-hidden tables never consult the
+    /// law, and an uncalibrated `k` (cleared high-k point, or `k` past the
+    /// knot table) falls back to the configured default rather than a
+    /// clamped-down budget. Guards the silent failure modes: dropping the
+    /// caller-override gate would override caller intent, dropping the
+    /// `!filtered` gate would mis-budget filtered queries — both with zero
+    /// other test failures.
+    #[test]
+    fn rerank_law_yields_to_caller_filter_and_uncalibrated_k() {
+        let routing = CellRoutingParams {
+            rerank_for_k: [40, 320, 2400, 0],
+            ..CellRoutingParams::default()
+        };
+        let r = Some(&routing);
+        // Engages: unfiltered hidden path, no caller override, calibrated k.
+        // k=10 budget 320 -> equivalent multiplier ceil(320/10) = 32.
+        assert_eq!(rerank_mult_from_law(true, false, None, r, 10), Some(32));
+        // Caller override wins.
+        assert_eq!(rerank_mult_from_law(true, false, Some(8), r, 10), None);
+        // Filtered queries keep their own budget model.
+        assert_eq!(rerank_mult_from_law(true, true, None, r, 10), None);
+        // Non-hidden tables never consult the law.
+        assert_eq!(rerank_mult_from_law(false, false, None, r, 10), None);
+        // Uncalibrated k (the k=1000 point cleared): default fallback, not
+        // a clamp down to the k=100 budget.
+        assert_eq!(rerank_mult_from_law(true, false, None, r, 1000), None);
+        // No routing at all (user table, undrained): default fallback.
+        assert_eq!(rerank_mult_from_law(true, false, None, None, 10), None);
+    }
+
     /// The per-cell floor rescues each scanned cell's best candidates from
     /// global eviction: a cell whose candidates all rank below the global
     /// cut still lands its `cell_floor` best in the kept set, counting any
@@ -4824,6 +4916,168 @@ mod tests {
             near, k,
             "drain-calibrated width law must widen the default sweep to all \
              {k} exact neighbors across three cells, got {near}"
+        );
+    }
+
+    /// The public unranked `count` surface over a multi-superfile table —
+    /// the count fan sums per-superfile match counts without scoring or
+    /// row materialization. Fixture titles repeat "doc {0..31}" per
+    /// commit, so token "5" counts one row per superfile and "doc"
+    /// counts every row.
+    #[test]
+    fn count_sums_matches_across_superfiles() {
+        let (_dir, st, _q, _k) = drained_three_direction_fixture();
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            reader
+                .count("title", "5", BoolMode::And)
+                .expect("sparse count"),
+            FIXTURE_COMMITS,
+            "one match per superfile"
+        );
+        assert_eq!(
+            reader
+                .count("title", "doc", BoolMode::And)
+                .expect("dense count"),
+            (FIXTURE_COMMITS as usize * FIXTURE_ROWS_PER_COMMIT) as u64,
+            "every row matches"
+        );
+    }
+
+    /// BM25 with GLOBAL statistics over a fragmented table: the
+    /// corpus-wide document count and per-term document frequencies are
+    /// gathered across every superfile before scoring, so a term's idf —
+    /// and a doc's score — does not depend on which superfile the doc
+    /// landed in. The default per-superfile mode never runs that gather;
+    /// this is the global mode's only end-to-end exercise.
+    #[test]
+    fn bm25_global_stats_scores_across_superfiles() {
+        let (_dir, st, _q, _k) = drained_three_direction_fixture();
+        let reader = st.reader().expect("reader");
+        let batches = reader
+            .bm25_search("title", "5", 8, BoolMode::And, Bm25Stats::Global, None)
+            .expect("global-stats bm25");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, FIXTURE_COMMITS as usize,
+            "token \"5\" lives in one row per superfile; global-idf \
+             scoring must find all of them"
+        );
+    }
+
+    /// The PUBLIC predicate-filtered path end-to-end: a `VectorFilter`
+    /// resolves its allow-set through the engine's own per-superfile
+    /// `token_match` fan and the filtered kNN returns ONLY matching rows.
+    /// First unit coverage of the public filter entry — the bench battery
+    /// exercises it, but benches don't gate. Fixture titles repeat "doc
+    /// {0..31}" per commit, so the token "5" matches exactly one row in
+    /// each of the four commits (stable ids 5 + 32k), and a matching-all
+    /// token ("doc") must reproduce a full top-k.
+    #[test]
+    fn vector_filter_restricts_hits_to_predicate_matches() {
+        let (_dir, st, q, _k) = drained_three_direction_fixture();
+        let reader = st.reader().expect("reader");
+        let matched = reader
+            .vector_hits(
+                "emb",
+                &q,
+                10,
+                VectorSearchOptions::new(),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "5",
+                    mode: BoolMode::And,
+                }),
+            )
+            .expect("sparse filtered search");
+        assert_eq!(
+            matched.len(),
+            FIXTURE_COMMITS as usize,
+            "the predicate matches one row per commit — nothing more"
+        );
+        assert!(
+            matched
+                .iter()
+                .all(|h| h.stable_id.is_some_and(|id| id % 32 == 5)),
+            "every hit is a predicate row, not a nearest neighbor: {matched:?}"
+        );
+
+        let all = reader
+            .vector_hits(
+                "emb",
+                &q,
+                10,
+                VectorSearchOptions::new(),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "doc",
+                    mode: BoolMode::And,
+                }),
+            )
+            .expect("match-all filtered search");
+        assert_eq!(
+            all.len(),
+            10,
+            "a predicate matching every row fills the full top-k"
+        );
+    }
+
+    /// The recall target guarded end-to-end THROUGH the stamped laws:
+    /// after a compaction-style reshape (splitting the cell holding the
+    /// query's strongest direction) and `recalibrate_probe_laws`, a
+    /// DEFAULT search — no caller knobs, every probe decision resolved
+    /// from the restamped width/fine/rerank laws — must still recover
+    /// the full planted top-k against the exact oracle. This is the
+    /// assertion the law-shape checks cannot provide: a recalibration
+    /// that under-stamps any law (a shallowing merge rule, a biased
+    /// query sample, a clamped-down rerank budget) passes every
+    /// nonzero/monotone check and fails only here, as lost recall.
+    #[test]
+    fn recalibrated_laws_serve_full_recall_at_default_search() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Split the cell carrying the query's strongest direction: its
+        // planted neighbors now span TWO cells, so a stale pre-split law
+        // (or an under-restamped one) leaves part of the top-k unprobed.
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell { clusters, .. } = strategy else {
+            panic!("hidden index must be VectorCell");
+        };
+        let mut direction = vec![0.0f32; FIXTURE_DIM];
+        direction[0] = 1.0;
+        let target_cell = clusters.nearest_cell(Metric::Cosine, &direction);
+        hidden
+            .block_on_query(split_overflow_cell(
+                hidden.inner().clone(),
+                target_cell,
+                0.0,
+            ))
+            .expect("split")
+            .expect("populated cell must split");
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate");
+        assert!(stamped, "the reshaped grid must restamp the laws");
+
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("default search after recalibration");
+        let near = near_count(&hits);
+        assert_eq!(
+            near, k,
+            "recalibrated laws must serve the full {k} planted neighbors \
+             at default settings, got {near}"
         );
     }
 

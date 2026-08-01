@@ -205,7 +205,7 @@ Rule of thumb for landing a change in the right place:
 
 ### 🚫 Never propose (measured and rejected; don't bring back without genuinely new evidence)
 
-- **Non-Parquet file format** (e.g. a proprietary columnar layout like Lance). Search-on-Parquet is the thesis; ecosystem reuse outweighs a 30-50% storage win.
+- **Non-Parquet file format** (a proprietary columnar layout). Search-on-Parquet is the thesis; ecosystem reuse outweighs a 30-50% storage win.
 - **WAL-based ingest** (per-row durability before commit). Rejected as a different architectural model; commit-as-durability-boundary is deliberate. Note: a WAL *does* exist in `src/supertable/wal/` for the **updates/deletes** pipeline — that's orchestration state, not ingest durability. Don't conflate.
 - **HNSW graph inside each IVF partition.** Memory cost is 80 MB / 1M docs for an 18% warm-search win; not worth it given our high-`n_cent` + 1-bit-code shape.
 - **OPANN-style in-place IVF rebalance.** Superfiles are immutable by design. Updates = delete + insert via tombstones.

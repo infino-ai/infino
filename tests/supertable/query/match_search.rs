@@ -26,10 +26,16 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    superfile::{
+        builder::FtsConfig,
+        fts::reader::{Bm25Stats, BoolMode},
+    },
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
-        query::{SuperfileHit, vector::VectorSearchOptions},
+        query::{
+            SuperfileHit,
+            vector::{VectorFilter, VectorSearchOptions},
+        },
     },
     test_helpers::{default_tokenizer, default_vector_config},
 };
@@ -166,6 +172,97 @@ fn stable_ids(hits: &[SuperfileHit]) -> HashSet<i128> {
     hits.iter()
         .map(|h| h.stable_id.expect("search hits carry stable _id"))
         .collect()
+}
+
+/// The unranked `count` surface agrees with `token_match`'s cardinality
+/// over the multi-superfile corpus — the count fan sums per-superfile
+/// match counts without materializing hits, and the two surfaces must
+/// never drift.
+#[test]
+fn count_agrees_with_token_match_cardinality() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+    for mode in [BoolMode::Or, BoolMode::And] {
+        let hits = reader
+            .token_match("title", "rust", mode)
+            .expect("token_match");
+        let n = reader.count("title", "rust", mode).expect("count");
+        assert_eq!(
+            n,
+            hits.len() as u64,
+            "count must equal the match set's cardinality"
+        );
+    }
+}
+
+/// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
+/// across every superfile before scoring. Statistics change SCORES,
+/// never MEMBERSHIP: with `k` covering every match, the global-stats
+/// result holds the same number of rows as the default per-superfile
+/// mode's hit set.
+#[test]
+fn bm25_global_stats_keeps_the_default_modes_membership() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+    let default_hits = reader
+        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+        .expect("per-superfile bm25");
+    let global = reader
+        .bm25_search(
+            "title",
+            "rust",
+            TOP_K,
+            BoolMode::Or,
+            Bm25Stats::Global,
+            None,
+        )
+        .expect("global-stats bm25");
+    let global_rows: usize = global.iter().map(|b| b.num_rows()).sum();
+    assert!(!default_hits.is_empty(), "the corpus has rust docs");
+    assert_eq!(
+        global_rows,
+        default_hits.len(),
+        "global statistics rescore the same match set"
+    );
+}
+
+/// The public predicate-filtered vector path: a `VectorFilter` resolves
+/// its allow-set through the engine's own per-superfile `token_match`
+/// fan, and the filtered kNN returns ONLY predicate rows — here with
+/// `k` covering the whole match set, exactly the predicate rows.
+#[test]
+fn vector_filter_restricts_hits_to_the_predicate_match_set() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+    let allowed = stable_ids(
+        &reader
+            .token_match("title", "rust", BoolMode::Or)
+            .expect("token_match"),
+    );
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "rust",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    let got = stable_ids(&hits);
+    assert!(!got.is_empty(), "the predicate matches rows");
+    assert!(
+        got.is_subset(&allowed),
+        "every filtered hit is a predicate row: {got:?} vs {allowed:?}"
+    );
+    assert_eq!(
+        got.len(),
+        allowed.len(),
+        "k covers the whole match set — every predicate row returns"
+    );
 }
 
 #[test]

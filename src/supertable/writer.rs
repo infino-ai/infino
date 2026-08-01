@@ -111,8 +111,6 @@ use super::{
         },
     },
 };
-#[cfg(test)]
-use crate::superfile::ReadError;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
@@ -120,7 +118,7 @@ use crate::{
     runtime_bridge::{bridge_on_runtime, run_on_pool},
     storage::{StorageError, StorageProvider},
     superfile::{
-        BuildError as SuperfileBuildError, SuperfileReader,
+        BuildError as SuperfileBuildError, ReadError, SuperfileReader,
         builder::{SuperfileBuilder, VectorConfig},
         format::{
             CRC_BYTES,
@@ -168,7 +166,10 @@ use crate::{
             options_hash,
             part::{self as part_mod, PartId},
         },
-        query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
+        query::{
+            dispatch::{open_compaction_input, open_reader},
+            vector::stable_ids_by_local_for_routing,
+        },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state,
         slow_vector_state::{CentroidSection, fetch_centroid_section},
@@ -2288,7 +2289,6 @@ impl PreparedSuperfile {
     /// Open a `SuperfileReader` directly on this superfile's bytes.
     /// Returns `None` if no bytes are held (cache-attached path with
     /// no prepopulation — bytes went to storage only).
-    #[cfg(test)]
     pub(crate) fn open_reader(&self) -> Option<Result<SuperfileReader, ReadError>> {
         let bytes = self
             .bytes_for_store
@@ -2654,13 +2654,15 @@ async fn persist_superfile_publish_batch_async(
     Ok(())
 }
 
-/// Rayon pool for hidden-maintenance CPU work (cell-split planning + child
-/// builds on the `optimize()` path). Installing the work under this pool pins
-/// all its nested `par_iter`/`join` here instead of fanning out across the
-/// global pool, so maintenance can't starve foreground ingest CPU (and vice
-/// versa the pool can be capped when optimize runs beside latency-critical
+/// Rayon pool for hidden-maintenance CPU work (cell-split planning, child
+/// builds, and the probe-law recalibration scan — all on the `optimize()` /
+/// hidden-compaction path; nothing on the ingest commit path rides this
+/// pool). Installing the work under this pool pins all its nested
+/// `par_iter`/`join` here instead of fanning out across the global pool,
+/// so maintenance can't starve foreground ingest CPU (and vice versa the
+/// pool can be capped when optimize runs beside latency-critical
 /// work). Width from `vector.maintenance_threads`; `auto` (default) =
-/// all hardware threads.
+/// all hardware threads. Sized once, at first use.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
 fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
@@ -2680,6 +2682,15 @@ fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
         .build()
         .map_err(|e| BuildError::Store(format!("hidden maintenance rayon pool: {e}")))?;
     Ok(MAINT_POOL.get_or_init(|| pool))
+}
+
+test_visible! {
+    /// Effective maintenance-pool width — bench/test introspection so a
+    /// run's log can record the compute width its optimize measurements
+    /// were taken at.
+    fn maintenance_pool_width() -> usize {
+        maint_pool().map(ThreadPool::current_num_threads).unwrap_or(1)
+    }
 }
 
 /// No-staging drain: read committed user superfiles, assign their encoded rows
@@ -3819,9 +3830,29 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .cloned()
             .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
         // All batches spilled: freeze the calibration sample so the pack
-        // fan-out below can score cells against a stable query set.
-        if let Some(cal) = width_law.as_mut() {
-            cal.freeze();
+        // fan-out below can score cells against a stable query set. The
+        // grid is final here — every spill is already assigned to its
+        // cells — so the rerank-law pools rank against what queries will
+        // actually sweep. Freezing rotates every sampled query and ranks
+        // it against the full grid — CPU work, so it rides a rayon pool
+        // behind `run_on_pool` instead of pinning this tokio worker. The
+        // GLOBAL pool, deliberately: the writer pool is busy with the
+        // overlapping user-table build (the two publishes run under a
+        // `join!`), so queueing there stalls the drain behind build
+        // shards, and the maintenance pool is contractually
+        // optimize-only. The grid MOVES into the task and comes back
+        // with the frozen state — no clone of the centroid bytes.
+        if let Some(mut cal) = width_law.take() {
+            let rot_seed = vector_config.rot_seed;
+            let clusters_for_freeze = running_clusters;
+            let (frozen, clusters_back) = run_on_pool(None, "width-law freeze", move || {
+                cal.freeze(&clusters_for_freeze, rot_seed);
+                (cal, clusters_for_freeze)
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("width-law freeze: {e}")))?;
+            width_law = Some(frozen);
+            running_clusters = clusters_back;
         }
         let width_law_ref = width_law.as_ref();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
@@ -3865,7 +3896,39 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     };
                     packed.push((*cell_id, cell));
                 }
-                build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)
+                let prepared: PreparedSuperfile =
+                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?;
+                // Depth-law observation: fine clusters exist only now that
+                // the shard is packed; record each surviving candidate's
+                // fine-centroid rank from the shard's own bytes.
+                if let Some(cal) = width_law_ref {
+                    match prepared.open_reader() {
+                        Some(reader) => {
+                            let reader = reader.map_err(|e| {
+                                BuildError::Store(format!("depth-law shard reopen: {e}"))
+                            })?;
+                            if let Some(views) = reader
+                                .vec()
+                                .and_then(|v| v.cell_fine_calibration_views(&vector_config.column))
+                            {
+                                cal.observe_shard_views(&views);
+                            }
+                        }
+                        // Cache-attached path without prepopulation: the
+                        // shard's bytes went to storage only, so this pack
+                        // carries no depth observation. Loud, not silent -
+                        // the fine law keeps its previous value (max-merge)
+                        // and the first optimize recalibration re-measures
+                        // from committed bytes through the resident opener,
+                        // but a fresh table serves the config fine floor
+                        // until then.
+                        None => warn!(
+                            "drain depth-law observation skipped for shard {shard_id}: \
+                             bytes not retained (cache-attached, no prepopulation)"
+                        ),
+                    }
+                }
+                Ok::<_, BuildError>(prepared)
             },
         )?;
         local_checkpoint = checkpoint
@@ -4012,14 +4075,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // The alternative (rescoring every packed cell per incremental
         // drain) would make drain cost track table size, not delta size.
         if let Some(cal) = width_law.take()
-            && let Some(law) = cal.finish(&running_clusters)
+            && let Some(laws) = cal.finish(&running_clusters)
         {
-            for (slot, measured) in routing.width_for_k.iter_mut().zip(law) {
+            for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
                 *slot = (*slot).max(measured);
             }
+            for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+                *slot = (*slot).max(measured);
+            }
+            for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
+                *slot = (*slot).max(measured);
+            }
+            opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
             info!(
-                "supertable drain: probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): measured {law:?}, stamped {:?}",
-                routing.width_for_k
+                "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
+                laws.width_for_k,
+                routing.width_for_k,
+                laws.fine_for_k,
+                routing.fine_for_k,
+                laws.rerank_for_k,
+                routing.rerank_for_k
             );
         }
         let list_metadata = CommitListMetadata {
@@ -6830,6 +6905,400 @@ pub(in crate::supertable) async fn split_overflow_cells(
     Ok(())
 }
 
+/// Re-measure both probe laws (width + fine depth) over the CURRENT cell
+/// geometry, from stored bytes, and stamp them into the manifest routing.
+///
+/// Compaction reshapes exactly what the drain-time law was measured
+/// against: splits spread the true top-k over more, smaller cells
+/// (widening the width a query needs), and merges rebuild each merged
+/// cell's fine IVF (reshuffling the fine ranks the depth law counts).
+/// A law stamped pre-split therefore goes stale precisely when the
+/// hidden index is optimized — measured at 10M as post-optimize recall
+/// 0.982 against 0.993 under a fresh law. This pass reruns the drain's
+/// calibration machinery over live stored rows: a deterministic stride
+/// sample over the cell-ordered live-row enumeration picks the query
+/// rows (proportional-to-size per cell, reads only the sampled cells —
+/// the drain's reservoir needs a stream that is already flowing; here a
+/// full pre-read just to sample would double the pass), then ONE full
+/// sweep scores every live cell and observes fine ranks per superfile.
+/// The measured width REPLACES the stamped point (the fresh full-table
+/// measurement is authoritative, and width — the dominant cost term,
+/// every probed cell is a fetch — must be able to narrow after a merge
+/// pass); fine depth and rerank MAX-MERGE against the prior stamp
+/// (their shrink buys only intra-fetch compute, so keeping the deeper
+/// stamp is recall-safe insurance against a sample that under-measures
+/// a per-stage walk). Points the fresh sample could not support
+/// (measured `0`) keep their previous value under both rules. Skipped
+/// for never-calibrated tables (all-zero width law): the drain gate is
+/// the calibration entry point; this pass only refreshes.
+///
+/// Returns whether a new law was stamped.
+pub(in crate::supertable) async fn recalibrate_probe_laws(
+    inner: &Arc<SupertableInner>,
+) -> Result<bool, BuildError> {
+    let manifest = inner.manifest.load_full();
+    let (clusters, column, routing, metric, rot_seed) = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing,
+        } => {
+            // Resolve the config by the strategy's OWN column name — a
+            // positional `first()` would silently calibrate with the wrong
+            // metric/rotation if a table ever carries several vector columns.
+            // A VectorCell manifest whose column is missing from the options
+            // is an invariant violation, not a nothing-to-do: silently
+            // skipping would leave stale routing in place, so fail the
+            // optimize loudly instead.
+            let Some(vec_col) = inner
+                .options
+                .vector_columns
+                .iter()
+                .find(|cfg| cfg.column == column)
+            else {
+                return Err(BuildError::Store(format!(
+                    "vector routing column {column:?} missing from table options"
+                )));
+            };
+            (clusters, column, routing, vec_col.metric, vec_col.rot_seed)
+        }
+        _ => return Ok(false),
+    };
+    if clusters.n_cent == 0 || clusters.dim == 0 {
+        return Ok(false);
+    }
+    if routing.width_for_k.iter().all(|&w| w == 0) {
+        return Ok(false);
+    }
+    // A VectorCell table without storage cannot re-read committed bytes —
+    // like a missing column config, that is an invariant violation, not a
+    // nothing-to-do: silently skipping would leave stale routing while
+    // optimize() reports success.
+    let Some(storage) = inner.options.storage.clone() else {
+        return Err(BuildError::Store(
+            "probe-law recalibration requires configured storage".into(),
+        ));
+    };
+
+    let now = time::Instant::now();
+    let superseded_map = manifest.get_superseded_cells();
+    // Live (entry, (cell, docs)) work list — superseded and empty cells
+    // excluded, exactly as split selection excludes them.
+    let mut work: Vec<(Arc<SuperfileEntry>, Vec<(u32, u32)>)> = Vec::new();
+    let mut total_docs = 0u64;
+    for entry in manifest.superfiles.iter() {
+        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
+        let cells: Vec<(u32, u32)> = cell_doc_counts_for_entry(inner, entry, superseded)
+            .await?
+            .into_iter()
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        if !cells.is_empty() {
+            total_docs += cells.iter().map(|&(_, n)| u64::from(n)).sum::<u64>();
+            work.push((Arc::clone(entry), cells));
+        }
+    }
+    if work.is_empty() || total_docs == 0 {
+        return Ok(false);
+    }
+
+    // Evidence basis for the width stamp below: the exact superfile set
+    // this scan measures. A drain that commits between the scan and the
+    // stamp adds rows this evidence never saw.
+    let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
+    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
+    // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
+    // evenly spaced ordinals over the cell-ordered live-row enumeration —
+    // the law's noise floor is set by evidence size, and any fixed stride
+    // drifts off it near the boundaries (floor overshoots: 511 docs ->
+    // 511 picks; ceil undershoots: 257 docs -> 129 picks). Counts are
+    // physical (tombstones included); each picked ordinal is mapped
+    // proportionally onto the cell's live rows below.
+    let sample_count = total_docs.min(opann::WIDTH_LAW_QUERY_SAMPLE as u64);
+    // u128 intermediates: the products are provably in-range today only
+    // because doc counts are u32-bounded — widening makes the sampler
+    // correct unconditionally, at zero cost on this once-per-pass path.
+    let sample_ordinals: Vec<u64> = (0..sample_count)
+        .map(|i| ((u128::from(i) * u128::from(total_docs)) / u128::from(sample_count)) as u64)
+        .collect();
+    let mut picks: BTreeMap<(usize, u32), Vec<u32>> = BTreeMap::new();
+    let mut base = 0u64;
+    let mut next_pick = 0usize;
+    'outer: for (ei, (_, cells)) in work.iter().enumerate() {
+        for &(cell, n) in cells {
+            let end = base + u64::from(n);
+            while next_pick < sample_ordinals.len() && sample_ordinals[next_pick] < end {
+                picks
+                    .entry((ei, cell))
+                    .or_default()
+                    .push((sample_ordinals[next_pick] - base) as u32);
+                next_pick += 1;
+            }
+            if next_pick == sample_ordinals.len() {
+                break 'outer;
+            }
+            base = end;
+        }
+    }
+    for (&(ei, cell), ordinals) in &picks {
+        let (entry, cells) = &work[ei];
+        let rows =
+            load_materialized_rows_from_ivf_superfile(inner, entry, &column, now, Some(&[cell]))
+                .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        // Physical-to-live remap: the strides above were laid out over
+        // physical (tombstone-inclusive) counts, but `rows` is live-only.
+        // Scale each ordinal proportionally instead of clamping — in a
+        // heavily tombstoned cell a clamp collapses every tail pick onto
+        // the last live row, filling the reservoir with duplicates of one
+        // neighborhood and biasing the REPLACE stamp — and drop picks that
+        // land on an already-offered row (ordinals are increasing, so the
+        // proportional map is monotone and duplicates are adjacent).
+        let phys = cells
+            .iter()
+            .find(|&&(c, _)| c == cell)
+            .map(|&(_, n)| u64::from(n))
+            .unwrap_or(0)
+            .max(1);
+        let mut last_idx = usize::MAX;
+        for &ordinal in ordinals {
+            let idx = ((u128::from(ordinal) * rows.len() as u128) / u128::from(phys)) as usize;
+            let idx = idx.min(rows.len() - 1);
+            if idx == last_idx {
+                continue;
+            }
+            last_idx = idx;
+            cal.offer(&rows[idx]);
+        }
+    }
+    // Freeze rotates every sampled query and ranks it against the full
+    // grid — CPU work, bridged onto the maintenance pool via
+    // `run_on_pool` like every other compute wave in this pass (this IS
+    // the optimize path, so the maintenance pool is the right pool —
+    // unlike the drain's freeze, which rides the global pool). The grid
+    // moves into the task and comes back with the frozen state: no
+    // centroid clone.
+    let pool = maint_pool()?;
+    let clusters_for_freeze = clusters;
+    let (cal, clusters) = run_on_pool(Some(pool), "recalibration freeze", move || {
+        cal.freeze(&clusters_for_freeze, rot_seed);
+        (cal, clusters_for_freeze)
+    })
+    .await
+    .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
+    // Shared handle for the scoring sweep: chunks are MOVED onto the
+    // maintenance pool and awaited over a oneshot, so the tokio worker
+    // keeps driving the next chunk's loads instead of blocking under the
+    // compute (the standing rayon/tokio bridge contract).
+    let cal = Arc::new(cal);
+
+    // Single full sweep: score every live cell against the frozen queries,
+    // then observe fine ranks from each superfile's own bytes (mirrors the
+    // drain's per-shard observe: a superfile's candidates are always merged
+    // before its views are read). Cells are scored in pool-width chunks —
+    // loads stay sequential (async), the CPU fans out across the chunk on
+    // the maintenance pool (`vector.maintenance_threads`), and transient
+    // memory stays bounded at one chunk of materialized cells.
+    let chunk_cells = pool.current_num_threads().max(1);
+    for (entry, cells) in &work {
+        for chunk in cells.chunks(chunk_cells) {
+            let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
+            for &(cell, _) in chunk {
+                let rows = load_materialized_rows_from_ivf_superfile(
+                    inner,
+                    entry,
+                    &column,
+                    now,
+                    Some(&[cell]),
+                )
+                .await?;
+                loaded.push((cell, rows));
+            }
+            let chunk_cal = Arc::clone(&cal);
+            run_on_pool(Some(pool), "recalibration score", move || {
+                let result = loaded
+                    .par_iter()
+                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows));
+                // Release the shared handle BEFORE returning — the oneshot
+                // send follows the return, and the awaiting side unwraps
+                // the Arc after the final recv (a send-then-drop order
+                // raced it: the \"state still shared\" failure under test
+                // parallelism).
+                drop(chunk_cal);
+                result
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("recalibration score: {e}")))??;
+        }
+        // The fine observation reads subsection/stable-id bytes
+        // SYNCHRONOUSLY (`cell_fine_calibration_views` resolves through
+        // `try_get_range_sync`), and the lazy query opener only exposes
+        // sync bytes after a BACKGROUND mmap promotion — a fresh
+        // post-compaction output racing that promotion would silently
+        // skip its depth observation and keep the previous law, the
+        // staleness this pass exists to fix. Open the way compaction
+        // opens its own inputs: resident bytes guaranteed.
+        let reader = open_compaction_input(
+            &inner.options.store,
+            inner.options.disk_cache.as_ref(),
+            inner.options.storage.as_ref(),
+            entry,
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        // `None` here is a legacy single-cell layout — skip its depth
+        // observation; the finish fallback keeps the previous depth law
+        // rather than shallowing it on partial evidence.
+        if let Some(views) = reader
+            .vec()
+            .and_then(|v| v.cell_fine_calibration_views(&column))
+        {
+            // Depth ranking is CPU work — same bridge as the scoring
+            // chunks. The shared handle is released BEFORE the closure
+            // returns (the oneshot send follows the return; the awaiting
+            // side unwraps the Arc after the final recv).
+            let observe_cal = Arc::clone(&cal);
+            run_on_pool(Some(pool), "recalibration depth observation", move || {
+                observe_cal.observe_shard_views(&views);
+                drop(observe_cal);
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("recalibration depth observation: {e}")))?;
+        }
+    }
+    // Every chunk's oneshot was awaited, so this is the last reference.
+    let cal = Arc::into_inner(cal)
+        .ok_or_else(|| BuildError::Store("recalibration state still shared".into()))?;
+    // The final reduction (rank sorts, coverage crossings) is CPU work
+    // too — same bridge. The entry-snapshot grid is consumed here; the
+    // stamp loop below reloads the FRESH grid from the manifest.
+    let Some(laws) = run_on_pool(Some(pool), "recalibration finish", move || {
+        cal.finish(&clusters)
+    })
+    .await
+    .map_err(|e| BuildError::Store(format!("recalibration finish: {e}")))?
+    else {
+        return Ok(false);
+    };
+
+    // Stamp commit: one CAS attempt per FRESH strategy snapshot. The shared
+    // `persist_commit_async` re-applies its captured metadata verbatim on
+    // OCC retries — safe for the drain (user commits are serialized behind
+    // the writer slot) but not here: the compaction slot serializes hidden
+    // reorgs against each other, NOT against live drains (a writer commits
+    // mid-compaction by design), so a retry carrying this function's
+    // snapshot would revert a concurrent drain's newer grid counts and
+    // max-merged law. Re-derive the whole stamp — fresh clusters, fresh
+    // routing, measured deltas re-applied — from the freshly loaded
+    // manifest on every attempt instead. The measured laws themselves stay
+    // valid across attempts: cell geometry only changes under the
+    // compaction slot this pass already holds; concurrent drains bump
+    // counts, never the grid.
+    let max_retries = inner.options.max_commit_retries.max(1);
+    for attempt in 0..max_retries {
+        let manifest = inner.manifest.load_full();
+        let (clusters, fresh_routing) = match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell {
+                clusters, routing, ..
+            } => (clusters, routing),
+            _ => return Ok(false),
+        };
+        let mut routing = fresh_routing;
+        // Width REPLACEs — the fresh full-table measurement is authoritative,
+        // and narrowing after a merge pass is the cost half (every probed
+        // cell is a fetch) — but only while the scan's evidence is still
+        // current. A concurrent drain appends superfiles and max-merges a
+        // law measured on rows this scan never saw; REPLACING that with our
+        // older-evidence narrower width would under-probe the fresh rows.
+        // When the superfile set moved after the scan, fall back to the
+        // recall-safe max-merge; the next reshape's recalibration re-earns
+        // the narrow from current evidence.
+        let evidence_current = manifest
+            .superfiles
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect::<HashSet<Uuid>>()
+            == scan_ids;
+        for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
+            if evidence_current {
+                if measured > 0 {
+                    *slot = measured;
+                }
+            } else {
+                *slot = (*slot).max(measured);
+            }
+        }
+        // Fine depth and rerank MAX-MERGE against the live stamp, exactly as
+        // the drain does: a sample that under-measures a per-stage walk must
+        // never shallow a stamp the previous full measurement certified —
+        // that is the query-time under-probe this PR exists to fix. Their
+        // shrink direction buys only intra-fetch compute, so keeping the
+        // deeper value is recall-safe at bounded cost. A measured `0`
+        // (unsupported point) keeps the previous value under both rules.
+        for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+            *slot = (*slot).max(measured);
+        }
+        for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
+            *slot = (*slot).max(measured);
+        }
+        opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
+        if routing == fresh_routing {
+            // The live stamp already carries everything this pass measured
+            // (e.g. a concurrent drain max-merged past us) — nothing to
+            // commit.
+            return Ok(false);
+        }
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column: column.clone(),
+                clusters: clusters.clone(),
+                routing,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let base = Arc::new(list_metadata.apply(&manifest));
+        let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        match try_commit_attempt(
+            Arc::clone(&storage),
+            Arc::clone(&inner.options),
+            base,
+            &[],
+            &no_removals,
+            NewEntryBirthVersions::StampCommit,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+        {
+            Ok(new_manifest) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                info!(
+                    "supertable optimize: probe laws recalibrated over {} cells at k={WIDTH_LAW_KS:?}: width {:?}, fine depth {:?}, rerank {:?}",
+                    clusters.n_cent, routing.width_for_k, routing.fine_for_k, routing.rerank_for_k
+                );
+                return Ok(true);
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage)
+                    .await
+                    .map_err(BuildError::from)?;
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(BuildError::from(e));
+            }
+        }
+    }
+    Err(BuildError::from(
+        SupertableCommitError::WriteContentionExhausted,
+    ))
+}
+
 // OCC retry budget — read from
 // `SupertableOptions::max_commit_retries` (default 10) so
 // callers with high contention can raise it. The
@@ -8654,6 +9123,25 @@ mod tests {
         assert!(
             budget.peak() > 0,
             "the vector build must reserve against the budget"
+        );
+    }
+
+    /// Recalibration is a no-op on tables it does not own: a user table
+    /// (no `VectorCell` strategy) returns `false` without touching the
+    /// manifest or requiring storage — the drain gate is the calibration
+    /// entry point, and user tables never pass it.
+    #[test]
+    fn recalibration_skips_non_vector_cell_tables() {
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let before = st.inner().manifest.load_full().get_manifest_id();
+        let stamped = st
+            .block_on_query(recalibrate_probe_laws(st.inner()))
+            .expect("recalibrate on a user table is a clean no-op");
+        assert!(!stamped, "no VectorCell strategy, nothing to restamp");
+        assert_eq!(
+            st.inner().manifest.load_full().get_manifest_id(),
+            before,
+            "the no-op must not commit"
         );
     }
 

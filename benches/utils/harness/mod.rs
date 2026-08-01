@@ -7,7 +7,7 @@
 //! measure infino and other retrieval engines through identical code.
 //! infino ships the reference implementation ([`InfinoFtsEngine`]); the
 //! external comparison crate implements the trait for
-//! other engines (Tantivy, DuckDB, LanceDB, CoreDB) and drives them all
+//! other engines and drives them all
 //! the same way, against a byte-identical [`crate::corpus::MmapTextCorpus`].
 //!
 //! The three verbs the driver measures are:

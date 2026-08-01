@@ -5575,6 +5575,475 @@ mod tests {
         }
     }
 
+    /// Regression for the stale-probe-law path: (1) a clean drain stamps
+    /// BOTH laws — probe width and fine depth — into the manifest routing
+    /// (fine depth is what a flat `fine_nprobe_floor` regressed at 10M:
+    /// post-drain 0.982 at floor 4 vs 0.996 at 8); (2) after a geometry
+    /// change (cell split), `recalibrate_probe_laws` re-measures from
+    /// stored bytes and restamps: width REPLACEs (fresh full-table
+    /// measurement is authoritative, must be able to narrow), fine depth
+    /// and rerank MAX-MERGE (never shallowed below a certified stamp),
+    /// and a point the fresh sample cannot support keeps its previous
+    /// value under both rules.
+    #[test]
+    fn drain_stamps_both_laws_and_recalibration_restamps_after_split() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                writer::{
+                    CommitListMetadata, persist_commit_async, recalibrate_probe_laws,
+                    split_overflow_cell,
+                },
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Identical embeddings route every doc into one global cell, so the
+        // drain calibrates over one populated cell and the later split has a
+        // cell to cut.
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // (1) The clean drain stamped both laws. Six identical rows support
+        // the k=1 and k=10 points (5 non-self candidates each), so both laws
+        // must be nonzero there; the fine depth comes from the post-pack
+        // shard observation.
+        let read_strategy = |hidden: &Supertable| match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell {
+                clusters,
+                column,
+                routing,
+            } => (clusters, column, routing),
+            other => panic!("hidden index must be VectorCell, got {other:?}"),
+        };
+        let (_, _, routing) = read_strategy(&hidden);
+        assert!(
+            routing.width_for_k[0] > 0,
+            "drain must stamp the width law, got {:?}",
+            routing.width_for_k
+        );
+        assert!(
+            routing.fine_for_k[0] > 0,
+            "drain must stamp the fine-depth law, got {:?}",
+            routing.fine_for_k
+        );
+        assert!(
+            routing.rerank_for_k[0] > 0,
+            "drain must stamp the rerank law, got {:?}",
+            routing.rerank_for_k
+        );
+
+        // Split the populated cell: the stamped law now describes a grid
+        // that no longer exists (the split swap ports routing verbatim).
+        let (clusters, _, _) = read_strategy(&hidden);
+        let split_cell = (0..clusters.n_cent)
+            .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+            .expect("at least one cell");
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
+            .expect("split")
+            .expect("live rows present, split must commit");
+
+        // Plant a stale law as an old-geometry stamp would carry: an
+        // over-wide width, a deeper-than-measurable fine point at k=1, and
+        // no rerank. Six rows cannot support k=100/1000, so the fresh
+        // measurement is 0 there and those planted points must survive the
+        // restamp; the deep fine point must survive too (fine max-merges —
+        // a fresh sample must never shallow a certified depth), while the
+        // over-wide width must be REPLACED by the fresh measurement.
+        const STALE_WIDTH: u32 = 33;
+        const STALE_FINE: u32 = 9;
+        let (clusters, column, mut planted) = read_strategy(&hidden);
+        planted.width_for_k = [STALE_WIDTH; 4];
+        planted.fine_for_k = [STALE_FINE, 0, 0, 0];
+        planted.rerank_for_k = [0; 4];
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: planted,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let no_removals = Vec::new();
+        // The hidden table's own scoped provider — its pointer file, not the
+        // user table's, is the CAS target.
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let planted_manifest = hidden
+            .block_on_query(persist_commit_async(
+                hidden.inner(),
+                hidden_storage,
+                Vec::new(),
+                &no_removals,
+                Vec::new(),
+                Vec::new(),
+                list_metadata,
+            ))
+            .expect("plant stale law");
+        hidden.inner().manifest.store(Arc::new(planted_manifest));
+
+        // (2) Recalibration re-measures both laws over the post-split grid
+        // from stored bytes and stamps the difference.
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate");
+        assert!(stamped, "a stale law over a changed grid must restamp");
+        let (clusters, _, routing) = read_strategy(&hidden);
+        assert!(
+            routing.width_for_k[0] >= 1 && routing.width_for_k[0] <= clusters.n_cent,
+            "k=1 width re-measured within the live grid, got {:?}",
+            routing.width_for_k
+        );
+        assert!(
+            routing.width_for_k[0] < STALE_WIDTH,
+            "measured points replace the stale value, got {:?}",
+            routing.width_for_k
+        );
+        // The distinguishing max-merge check: the fresh sample DOES measure
+        // fine depth at k=1 (a 1-2 on this tiny grid), so a REPLACE rule
+        // would stamp that shallow value — only max-merge keeps the deeper
+        // certified 9. (Fresh stamping from zero is evidenced by the rerank
+        // law below; end-to-end fine restamping by the recall-guard test in
+        // `query::vector::tests`.)
+        assert_eq!(
+            routing.fine_for_k[0], STALE_FINE,
+            "fine depth max-merges: recalibration must never shallow a \
+             stamp a previous measurement certified, got {:?}",
+            routing.fine_for_k
+        );
+        assert!(
+            routing.rerank_for_k[0] > 0,
+            "recalibration must stamp the rerank law, got {:?}",
+            routing.rerank_for_k
+        );
+        assert_eq!(
+            routing.width_for_k[3], STALE_WIDTH,
+            "a point the sample cannot support keeps its previous value"
+        );
+    }
+
+    /// Recalibration over a heavily tombstoned table, twice. (1) The query
+    /// sampler lays its strides over PHYSICAL (tombstone-inclusive) counts
+    /// but loads live-only rows — regression for the biased-sample review
+    /// finding: the old clamp collapsed every tail pick onto the last live
+    /// row, so a 10-live-of-50 cell filled the sample with one
+    /// neighborhood. With most rows deleted the pass must still measure
+    /// and stamp usable laws from the spread live sample. (2) Immediately
+    /// recalibrating again re-measures identical laws against an unchanged
+    /// grid and must return `false` — no empty stamp commit.
+    #[test]
+    fn recalibration_samples_live_rows_and_is_idempotent() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                writer::{CommitListMetadata, persist_commit_async, recalibrate_probe_laws},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // 48 identical embeddings (one populated cell); most rows carry the
+        // doomed title so the delete leaves the cell heavily tombstoned:
+        // 8 live of 48 physical.
+        const N: usize = 48;
+        const N_LIVE: usize = 8;
+        let titles = LargeStringArray::from(
+            (0..N)
+                .map(|i| {
+                    if i < N_LIVE {
+                        format!("keep-{i}")
+                    } else {
+                        "dropme".to_string()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let stats = st.delete(col("title").eq(lit("dropme"))).expect("delete");
+        assert_eq!(
+            stats.n_tombstoned() as usize,
+            N - N_LIVE,
+            "delete must tombstone the doomed rows"
+        );
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Plant an over-wide stale width so the first pass has a measurable
+        // change to stamp regardless of what the drain calibrated.
+        const STALE_WIDTH: u32 = 33;
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing: mut planted,
+        } = strategy
+        else {
+            panic!("hidden index must be VectorCell");
+        };
+        planted.width_for_k = [STALE_WIDTH; 4];
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: planted,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let no_removals = Vec::new();
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let planted_manifest = hidden
+            .block_on_query(persist_commit_async(
+                hidden.inner(),
+                hidden_storage,
+                Vec::new(),
+                &no_removals,
+                Vec::new(),
+                Vec::new(),
+                list_metadata,
+            ))
+            .expect("plant stale law");
+        hidden.inner().manifest.store(Arc::new(planted_manifest));
+
+        // (1) Heavily tombstoned recalibration measures from the live rows.
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate over tombstones");
+        assert!(stamped, "the planted stale width must restamp");
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell { routing, .. } = strategy else {
+            panic!("hidden index must stay VectorCell");
+        };
+        assert!(
+            routing.width_for_k[0] >= 1 && routing.width_for_k[0] < STALE_WIDTH,
+            "live-sample measurement replaces the stale width, got {:?}",
+            routing.width_for_k
+        );
+
+        // (2) Nothing changed since — the repeat pass must decline to stamp.
+        let restamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("repeat recalibrate");
+        assert!(
+            !restamped,
+            "an unchanged grid re-measures identical laws — no empty stamp commit"
+        );
+
+        // (3) A never-calibrated grid is left alone: zero the width law and
+        // recalibration must decline — the drain gate is the calibration
+        // entry point; this pass only refreshes an existing law.
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing: mut zeroed,
+        } = strategy
+        else {
+            panic!("hidden index must stay VectorCell");
+        };
+        zeroed.width_for_k = [0; 4];
+        let zero_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: zeroed,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let zero_manifest = hidden
+            .block_on_query(persist_commit_async(
+                hidden.inner(),
+                hidden
+                    .inner()
+                    .options
+                    .storage
+                    .clone()
+                    .expect("hidden table has storage"),
+                Vec::new(),
+                &no_removals,
+                Vec::new(),
+                Vec::new(),
+                zero_metadata,
+            ))
+            .expect("plant zero law");
+        hidden.inner().manifest.store(Arc::new(zero_manifest));
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate on an uncalibrated grid is a clean no-op");
+        assert!(
+            !stamped,
+            "an all-zero width law must not trigger calibration"
+        );
+    }
+
     /// End-to-end reclaim loop: a cell split appends its children and marks the
     /// parent cell superseded (no removal); a later merge drops those superseded
     /// blocks and reclaims the parent. Every doc must resolve exactly once at

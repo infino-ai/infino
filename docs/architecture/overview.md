@@ -195,7 +195,7 @@ vectors in RAM/SSD can get expensive as the corpus grows.
 where it sits relative to your other systems, and breadth beyond
 vectors.
 
-### Object-storage-native search (Infino, TurboPuffer, LanceDB)
+### Object-storage-native search (Infino, TurboPuffer)
 
 This camp's distinction isn't "the only ones who *can*" do these things
 — it's that the architecture is **built around object storage and

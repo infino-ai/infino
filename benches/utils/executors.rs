@@ -1532,8 +1532,31 @@ pub mod vector {
                     && let PartitionStrategy::VectorCell { routing, .. } =
                         manifest.get_partition_strategy()
                 {
+                    // `nprobe_min..max` is the manifest's BASE routing; the
+                    // probe-width law (`width_for_k`, stamped by the drain and
+                    // applied per query, overriding those fields) is what
+                    // actually decides the sweep. Print it too — otherwise a
+                    // run cannot be read to tell whether the law is active.
+                    let law = if routing.width_for_k.iter().all(|&w| w == 0) {
+                        "law=none".to_string()
+                    } else {
+                        format!("law={:?}", routing.width_for_k)
+                    };
+                    // Same for the fine-depth law: a floor over the config's
+                    // `fine` value on the default path, so a run must show it
+                    // to be read correctly.
+                    let fine_law = if routing.fine_for_k.iter().all(|&f| f == 0) {
+                        "finelaw=none".to_string()
+                    } else {
+                        format!("finelaw={:?}", routing.fine_for_k)
+                    };
+                    let rerank_law = if routing.rerank_for_k.iter().all(|&r| r == 0) {
+                        "reranklaw=none".to_string()
+                    } else {
+                        format!("reranklaw={:?}", routing.rerank_for_k)
+                    };
                     return format!(
-                        "hidden: cells {}..{}, fine {}, {}, {rerank_label}",
+                        "hidden: cells {}..{}, {law}, fine {}, {fine_law}, {rerank_law}, {}, {rerank_label}",
                         routing.nprobe_min,
                         routing.nprobe_max,
                         routing.fine_nprobe,

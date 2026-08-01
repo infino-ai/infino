@@ -109,3 +109,37 @@ pub enum ReaderCacheError {
         source: ReadError,
     },
 }
+
+#[cfg(test)]
+mod trait_default_tests {
+    use super::*;
+
+    /// The trait's default `remove` is a documented safe no-op: a cache
+    /// with its own eviction may ignore removal hints entirely, and the
+    /// reader contract (miss -> NotFound) is untouched by the call.
+    struct IgnoresRemoval;
+
+    impl SuperfileReaderCache for IgnoresRemoval {
+        fn reader(&self, uri: &SuperfileUri) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+            Err(ReaderCacheError::NotFound { uri: *uri })
+        }
+        fn insert(&self, _uri: SuperfileUri, _bytes: Bytes) -> Result<(), ReaderCacheError> {
+            Ok(())
+        }
+        fn resident_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn default_remove_is_a_safe_no_op() {
+        let cache = IgnoresRemoval;
+        let uri = SuperfileUri::new_v4();
+        cache.remove(&uri);
+        assert!(
+            matches!(cache.reader(&uri), Err(ReaderCacheError::NotFound { .. })),
+            "remove neither panics nor changes the miss contract"
+        );
+        assert_eq!(cache.resident_bytes(), 0);
+    }
+}

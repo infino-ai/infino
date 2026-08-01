@@ -107,7 +107,7 @@ pub fn fts_ingest_recorded() -> bool {
     FTS_INGEST.get().is_some()
 }
 
-/// Vector-only supertable ingest (apples-to-apples vs Lance vector-only).
+/// Vector-only supertable ingest (apples-to-apples vs external vector-only baselines).
 pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
     if VEC_INGEST.get().is_none() {
         eprintln!(
