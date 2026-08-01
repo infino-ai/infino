@@ -4111,6 +4111,15 @@ pub mod vector {
                         rss::fmt_bytes(filtered_io.get_bytes),
                         q_correct.len(),
                     );
+                    // This window has no per-query predicate resolution (the
+                    // allow-set is prepared once, above), so warm means warm:
+                    // any GET here is a cache-coverage regression.
+                    assert_eq!(
+                        filtered_io.get_count, 0,
+                        "filtered warm battery issued object-store GETs — an \
+                         undersized or unwarmed cache turned the warm window \
+                         into silent round-trips"
+                    );
                 }
                 // Probe-width discriminator for filtered recall loss: if
                 // recall climbs with an explicit wider cell probe, the gap
@@ -4292,11 +4301,16 @@ pub mod vector {
                 }
                 let mut recalls = Vec::with_capacity(q_correct.len());
                 let mut latencies = Vec::with_capacity(q_correct.len());
-                // Metered: a warm battery must PROVE 0 GET — an undersized
-                // or unwarmed cache turns "warm p50" into silent object-store
-                // round-trips (measured: 196-330 ms/query on the old
-                // second-table shape, whose cache was auto-sized before the
-                // drain added the hidden index it then queried).
+                // Metered: the kNN side of a warm battery must be 0 GET —
+                // an undersized or unwarmed cache turns "warm p50" into
+                // silent object-store round-trips (measured: 196-330
+                // ms/query on the old second-table shape, whose cache was
+                // auto-sized before the drain added the hidden index it
+                // then queried). This window cannot promise 0 in total:
+                // it deliberately includes the per-query predicate
+                // resolution a caller pays, and the engine serves that
+                // with per-query posting reads today (the measured
+                // request-count cost this battery exposes).
                 let meter_before = consumer_meter.snapshot();
                 for (q, truth) in q_correct.iter().zip(&gt) {
                     let t0 = Instant::now();
@@ -4329,12 +4343,15 @@ pub mod vector {
                         rss::fmt_bytes(io.get_bytes),
                         q_correct.len(),
                     );
-                    assert_eq!(
-                        io.get_count, 0,
-                        "predicate-filtered warm battery issued object-store GETs — \
-                         an undersized or unwarmed cache turned the warm window into \
-                         silent round-trips (see the PROVE-0-GET note above)"
-                    );
+                    // NO 0-GET assert here, deliberately: this timed window
+                    // includes the per-query predicate resolution, and the
+                    // engine currently serves that with ~112 tiny GETs per
+                    // query (~240 B each, measured on CI at 1M) even with the
+                    // kNN side fully cached. Surfacing that request-count
+                    // profile is this battery's job — the count is reported
+                    // above and in the section note; the cache-coverage
+                    // guarantee is asserted on the resolution-free allow-set
+                    // window instead.
                     report.emit(&Section {
                         anchor: "bench/vector/supertable/filtered-predicate".into(),
                         title: format!(
