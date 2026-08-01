@@ -9117,6 +9117,25 @@ mod tests {
         );
     }
 
+    /// Recalibration is a no-op on tables it does not own: a user table
+    /// (no `VectorCell` strategy) returns `false` without touching the
+    /// manifest or requiring storage — the drain gate is the calibration
+    /// entry point, and user tables never pass it.
+    #[test]
+    fn recalibration_skips_non_vector_cell_tables() {
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let before = st.inner().manifest.load_full().get_manifest_id();
+        let stamped = st
+            .block_on_query(recalibrate_probe_laws(st.inner()))
+            .expect("recalibrate on a user table is a clean no-op");
+        assert!(!stamped, "no VectorCell strategy, nothing to restamp");
+        assert_eq!(
+            st.inner().manifest.load_full().get_manifest_id(),
+            before,
+            "the no-op must not commit"
+        );
+    }
+
     // ---- writer slot exclusion ---------------------------------------
 
     #[test]
