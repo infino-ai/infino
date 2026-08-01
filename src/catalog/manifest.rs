@@ -37,7 +37,6 @@ const MAX_CATALOG_RETRIES: u32 = 16;
 pub(crate) struct VectorEntry {
     pub(crate) column: String,
     pub(crate) dim: usize,
-    pub(crate) n_cent: usize,
     /// `"cosine"` / `"l2sq"` / `"negdot"` — the metric's lowercased name,
     /// matching the manifest's encoding so `open`'s options-hash check
     /// stays in lockstep.
@@ -177,7 +176,6 @@ mod tests {
             vectors: vec![VectorEntry {
                 column: "emb".into(),
                 dim: 8,
-                n_cent: 4,
                 metric: "cosine".into(),
             }],
             created_at_unix: 0,

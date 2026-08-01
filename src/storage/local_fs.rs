@@ -88,6 +88,46 @@ impl LocalFsStorageProvider {
             source: Box::new(e),
         })
     }
+
+    /// The etag this provider reports for an object at `path` whose size is
+    /// `size` and whose metadata etag is `meta_etag`: a content hash (one extra
+    /// body read) for small objects, else the metadata etag. Used by `head` and
+    /// the conditional-PUT compare, so both agree with what `get` reports.
+    async fn reported_etag(
+        &self,
+        path: &ObjPath,
+        size: u64,
+        meta_etag: Option<String>,
+    ) -> Result<Option<String>, ObjError> {
+        if size <= CONTENT_ETAG_MAX_BYTES {
+            let bytes = self.store.get(path).await?.bytes().await?;
+            Ok(Some(content_etag(&bytes)))
+        } else {
+            Ok(meta_etag)
+        }
+    }
+}
+
+/// Objects at or below this size get a **content-derived** etag (a blake3 hash
+/// of the body) instead of object_store's `inode-mtime-size` metadata etag.
+///
+/// The metadata etag can collide across a rewrite: a staged-file rename can
+/// reuse the freed inode, the size is unchanged when the body is fixed-width,
+/// and the `as_micros()` mtime can land in the same microsecond — so two
+/// *different* bodies share an etag and a conditional read
+/// (`get_if_none_match`) misses a real change. That bites the tiny,
+/// frequently-rewritten manifest pointer: a reader that probed it before a
+/// commit would keep being told "not modified" and serve the pre-commit
+/// (empty) manifest. A content hash cannot collide. Larger objects are
+/// immutable and content-addressed (their URIs already are hashes) and are
+/// never conditionally probed, so they keep the cheap metadata etag and are
+/// never hashed on the read path.
+const CONTENT_ETAG_MAX_BYTES: u64 = 4096;
+
+/// Content-derived etag for a small object body. The `c:` prefix keeps it
+/// distinct from object_store's `inode-mtime-size` metadata form.
+fn content_etag(bytes: &[u8]) -> String {
+    format!("c:{}", blake3::hash(bytes).to_hex())
 }
 
 /// Translate an `object_store::Error` to our `StorageError`.
@@ -126,9 +166,14 @@ impl StorageProvider for LocalFsStorageProvider {
             .await
             .map_err(|e| translate(uri, e))?;
         self.meter.record_head();
+        let size = meta.size as u64;
+        let etag = self
+            .reported_etag(&path, size, meta.e_tag)
+            .await
+            .map_err(|e| translate(uri, e))?;
         Ok(ObjectMeta {
-            size: meta.size as u64,
-            etag: meta.e_tag,
+            size,
+            etag,
             last_modified: meta.last_modified.into(),
         })
     }
@@ -138,13 +183,24 @@ impl StorageProvider for LocalFsStorageProvider {
         let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
         // `GetResult.meta` matches the version we're about to
         // read — no separate HEAD needed to capture the etag.
-        let meta = ObjectMeta {
-            size: result.meta.size as u64,
-            etag: result.meta.e_tag.clone(),
-            last_modified: result.meta.last_modified.into(),
-        };
+        let size = result.meta.size as u64;
+        let meta_etag = result.meta.e_tag.clone();
+        let last_modified = result.meta.last_modified.into();
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
         self.meter.record_get(uri, None, bytes.len() as u64);
+        // Small objects report a content-derived etag (the body is already in
+        // hand, so this is just a hash) so conditional reads can't be fooled by
+        // a colliding metadata etag; see `CONTENT_ETAG_MAX_BYTES`.
+        let etag = if size <= CONTENT_ETAG_MAX_BYTES {
+            Some(content_etag(&bytes))
+        } else {
+            meta_etag
+        };
+        let meta = ObjectMeta {
+            size,
+            etag,
+            last_modified,
+        };
         Ok((bytes, meta))
     }
 
@@ -169,6 +225,9 @@ impl StorageProvider for LocalFsStorageProvider {
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
         let n = bytes.len() as u64;
+        // Report the same content etag `get`/`head` would for a small object,
+        // so a caller carrying this value into a later conditional read matches.
+        let content = (n <= CONTENT_ETAG_MAX_BYTES).then(|| content_etag(&bytes));
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
@@ -177,7 +236,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
-            .map(|r| r.e_tag)
+            .map(|r| content.or(r.e_tag))
             .map_err(|e| translate(uri, e));
         if out.is_ok() {
             self.meter.record_put(n);
@@ -196,6 +255,7 @@ impl StorageProvider for LocalFsStorageProvider {
             // None == create-only-if-absent. Same as put_atomic.
             None => {
                 let n = bytes.len() as u64;
+                let content = (n <= CONTENT_ETAG_MAX_BYTES).then(|| content_etag(&bytes));
                 let opts = PutOptions {
                     mode: PutMode::Create,
                     ..Default::default()
@@ -204,7 +264,7 @@ impl StorageProvider for LocalFsStorageProvider {
                     .store
                     .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                     .await
-                    .map(|r| r.e_tag)
+                    .map(|r| content.or(r.e_tag))
                     .map_err(|e| translate(uri, e));
                 if out.is_ok() {
                     self.meter.record_put(n);
@@ -290,11 +350,20 @@ impl StorageProvider for LocalFsStorageProvider {
                         .head(&path)
                         .await
                         .map_err(|e| translate(uri, e))?;
-                    let current_etag = current.e_tag.as_deref().unwrap_or("");
-                    if current_etag != expected {
+                    // Compare the etag this provider *reports* (a content hash
+                    // for the small pointer), so the CAS agrees with the value a
+                    // caller captured via `get`/`head` — not object_store's
+                    // collision-prone metadata etag.
+                    let current_etag = self
+                        .reported_etag(&path, current.size as u64, current.e_tag)
+                        .await
+                        .map_err(|e| translate(uri, e))?;
+                    if current_etag.as_deref().unwrap_or("") != expected {
                         return Err(StorageError::PreconditionFailed { uri: uri.into() });
                     }
                     let put_bytes = bytes.len() as u64;
+                    let content =
+                        (put_bytes <= CONTENT_ETAG_MAX_BYTES).then(|| content_etag(&bytes));
                     let opts = PutOptions {
                         mode: PutMode::Overwrite,
                         ..Default::default()
@@ -303,7 +372,7 @@ impl StorageProvider for LocalFsStorageProvider {
                         .store
                         .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                         .await
-                        .map(|r| r.e_tag)
+                        .map(|r| content.or(r.e_tag))
                         .map_err(|e| translate(uri, e));
                     if out.is_ok() {
                         self.meter.record_put(put_bytes);
@@ -461,6 +530,49 @@ mod tests {
             .expect("changed object returns the body");
         assert_eq!(changed.0, Bytes::from_static(b"v2-longer"));
         assert_ne!(changed.1.etag.expect("etag"), etag_v1);
+    }
+
+    #[tokio::test]
+    async fn small_object_etag_is_content_derived_so_same_length_rewrites_are_detected() {
+        // Regression for a manifest-pointer stale read: object_store's
+        // `inode-mtime-size` etag can repeat across a rewrite — a staged-file
+        // rename reuses the freed inode, the body length is unchanged, and the
+        // `as_micros()` mtime lands in the same microsecond — so a conditional
+        // read of the tiny pointer misses a real commit and serves the stale
+        // (empty) manifest. Small objects now carry a content-derived etag,
+        // which changes iff the bytes change, even at identical length.
+        let (_dir, p) = provider();
+        let uri = "cond/pointer";
+
+        p.put_atomic(uri, Bytes::from_static(b"aaaa"))
+            .await
+            .expect("put v1");
+        let (_, meta1) = p.get(uri).await.expect("get v1");
+        let etag1 = meta1.etag.expect("etag v1");
+        assert!(
+            etag1.starts_with("c:"),
+            "small object reports a content etag, got {etag1}"
+        );
+
+        // Overwrite with a DIFFERENT body of the SAME length.
+        p.put_if_match(uri, Bytes::from_static(b"bbbb"), Some(&etag1))
+            .await
+            .expect("cas overwrite");
+        let (_, meta2) = p.get(uri).await.expect("get v2");
+        assert_ne!(
+            meta2.etag.expect("etag v2"),
+            etag1,
+            "a same-length content change must change the etag"
+        );
+
+        // The conditional probe with the stale etag must return the new body,
+        // never a false not-modified.
+        let changed = p
+            .get_if_none_match(uri, &etag1)
+            .await
+            .expect("probe")
+            .expect("same-length change must not read as not-modified");
+        assert_eq!(changed.0, Bytes::from_static(b"bbbb"));
     }
 
     #[tokio::test]

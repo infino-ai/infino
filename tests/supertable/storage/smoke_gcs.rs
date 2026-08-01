@@ -44,7 +44,6 @@ use tempfile::TempDir;
 
 /// Vector-index shape for the unified fixture.
 const EMB_DIM: usize = 16;
-const VECTOR_N_CENT: usize = 4;
 const VECTOR_ROT_SEED: u64 = 17;
 /// Docs in the fixture (one-hot embeddings, distinct titles).
 const EXPECTED_N_DOCS: u64 = 8;
@@ -83,7 +82,6 @@ fn gcs_options(dim: usize) -> SupertableOptions {
         vec![VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::{VectorEngine, VectorHit};
 use crate::{
-    corpus, cpu,
+    cpu,
     markdown::fmt_count,
     rss::{PeakSampler, RssStats},
 };
@@ -94,7 +94,6 @@ pub fn run_vector_with_index<E: VectorEngine>(
     queries: &[VectorQuery<'_>],
 ) -> (EngineVectorResult, E::Index) {
     let n_docs = vectors.len() / cfg.dim;
-    let n_cent = corpus::n_cent(n_docs);
 
     eprintln!(
         "[harness/vector] {}: building 1-writer index over {} docs × dim={}...",
@@ -102,7 +101,7 @@ pub fn run_vector_with_index<E: VectorEngine>(
         fmt_count(n_docs),
         cfg.dim,
     );
-    let mut index = E::open(cfg.column, cfg.dim, cfg.metric, n_cent);
+    let mut index = E::open(cfg.column, cfg.dim, cfg.metric);
     let sampler = PeakSampler::start_default();
     let ((), wall, cpu_s) = cpu::timed(|| E::write(&mut index, vectors));
     let rss = sampler.stop_stats();

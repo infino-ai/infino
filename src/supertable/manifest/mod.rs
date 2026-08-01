@@ -419,7 +419,6 @@ impl ManifestSnapshot {
                 .map(|v| list::VectorColumnInfo {
                     column: v.column.clone(),
                     dim: v.dim,
-                    n_cent: v.n_cent,
                     rot_seed: v.rot_seed,
                     metric: format!("{:?}", v.metric).to_lowercase(),
                 })
@@ -461,6 +460,19 @@ impl ManifestSnapshot {
     /// Prefer this on the query path over [`Self::get_partition_strategy`]: a
     /// `VectorCell` strategy owns [`ClusterCentroids`], and cloning it drops
     /// (or re-copies) the transposed SIMD cache used by cell ranking.
+    ///
+    /// This is also the ONLY correct signal for "does hidden VectorCell
+    /// semantics apply here" (membership in the slow-CAS blob, no manifest
+    /// parts, split/merge maintenance). Never key such gates on
+    /// `SupertableOptions::partition_strategy`: options are a
+    /// construction-time snapshot, and a hidden handle built at table
+    /// `create` carries `None` there for its whole process lifetime — no
+    /// user manifest existed to bootstrap a grid from, and nothing updates
+    /// the options after the first drain locks VectorCell into the
+    /// manifest. Options-keyed gates therefore behave differently in
+    /// create-era and reopened processes; one such gate let a membership
+    /// commit clear the slow-state ref without restamping it, publishing a
+    /// hidden manifest whose membership was durably empty.
     pub(crate) fn partition_strategy(&self) -> Option<&list::PartitionStrategy> {
         self.stamped_partition_strategy
             .as_ref()
@@ -1795,7 +1807,6 @@ impl ManifestSnapshot {
             .map(|v| list::VectorColumnInfo {
                 column: v.column.clone(),
                 dim: v.dim,
-                n_cent: v.n_cent,
                 rot_seed: v.rot_seed,
                 metric: format!("{:?}", v.metric).to_lowercase(),
             })
@@ -1825,7 +1836,6 @@ impl ManifestSnapshot {
                 .map(|v| list::VectorColumnInfo {
                     column: v.column.clone(),
                     dim: v.dim,
-                    n_cent: v.n_cent,
                     rot_seed: v.rot_seed,
                     metric: format!("{:?}", v.metric).to_lowercase(),
                 })

@@ -870,13 +870,12 @@ mod tests {
         let cfg = VectorConfig {
             column: "emb".into(),
             dim: DIM,
-            n_cent: N_CENT,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: Some(Arc::from(centroids)),
         };
-        build_merged_subsection_from_fp32(cfg, Arc::new(vectors), &ids).expect("cell build")
+        build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids).expect("cell build")
     }
 
     /// `merge_fragment_subsections` concatenates two fragment cells verbatim:

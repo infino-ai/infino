@@ -235,9 +235,13 @@ python-examples-test:
 	# Warm the shared embedding model so parallel workers don't race the download.
 	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
 		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
-	# Run every example notebook, including the langchain/ suite. Notebooks that
-	# need an LLM degrade to a printed note when no key is set (e.g. fork PRs).
-	@ls infino-python/examples/*/[0-9]*.ipynb | \
+	# Run the example notebooks. The langchain/ and crewai/ suites go through the
+	# published integration packages; a breaking infino API change can land before
+	# those packages ship a compatible release, so each is gated on a compat probe
+	# and skipped (with a note) rather than hard-failing when it isn't ready yet.
+	# Direct-infino examples always run; LLM notebooks degrade to a note w/o a key.
+	@PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
+		infino-python/examples/_shared/select_example_notebooks.py | \
 	PY=infino-python/.venv/bin/python xargs -P $(CONCURRENT_EXAMPLE_TESTS) -I {} \
 		sh -c 'echo "executing {}"; "$$PY" -m nbconvert --to notebook --execute \
 			--stdout --ExecutePreprocessor.timeout=900 "{}" >/dev/null'; \

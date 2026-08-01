@@ -35,8 +35,6 @@ use infino::{
 use infino_bench_utils::rustfs_server;
 use tempfile::TempDir;
 
-/// Vector index shape for the RustFS TVF smoke fixture.
-const VECTOR_N_CENT: usize = 4;
 const VECTOR_ROT_SEED: u64 = 17;
 const EMB_DIM: usize = 16;
 const EXPECTED_N_DOCS: u64 = 8;
@@ -299,7 +297,6 @@ fn rustfs_vector_options(dim: usize) -> infino::supertable::SupertableOptions {
         vec![VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
