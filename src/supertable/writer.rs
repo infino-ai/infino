@@ -6946,13 +6946,19 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             // Resolve the config by the strategy's OWN column name — a
             // positional `first()` would silently calibrate with the wrong
             // metric/rotation if a table ever carries several vector columns.
+            // A VectorCell manifest whose column is missing from the options
+            // is an invariant violation, not a nothing-to-do: silently
+            // skipping would leave stale routing in place, so fail the
+            // optimize loudly instead.
             let Some(vec_col) = inner
                 .options
                 .vector_columns
                 .iter()
                 .find(|cfg| cfg.column == column)
             else {
-                return Ok(false);
+                return Err(BuildError::Store(format!(
+                    "vector routing column {column:?} missing from table options"
+                )));
             };
             (clusters, column, routing, vec_col.metric, vec_col.rot_seed)
         }

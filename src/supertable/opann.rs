@@ -1409,14 +1409,22 @@ impl WidthLawCalibration {
 /// one neighbor), then keep the ascending-best `cap`. The dedup must
 /// precede the truncate — replicated copies of near rows filling raw slots
 /// would evict distinct farther neighbors and stamp a narrower law than a
-/// real query experiences.
+/// real query experiences. Equal-distance copies (the NORMAL case for a
+/// boundary replica — same vector, same exact distance) tie-break toward
+/// a rankable candidate: a copy scored outside the rerank pool carries
+/// `NEG_INFINITY` est, and keeping that one starves the rerank histogram
+/// of the row's rank, under-measuring the budget.
 fn merge_candidates(
     acc: &mut Vec<(f32, u32, i128, f32)>,
     mut cand: Vec<(f32, u32, i128, f32)>,
     cap: usize,
 ) {
     acc.append(&mut cand);
-    acc.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.total_cmp(&b.0)));
+    acc.sort_unstable_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then_with(|| a.0.total_cmp(&b.0))
+            .then_with(|| b.3.is_finite().cmp(&a.3.is_finite()))
+    });
     acc.dedup_by_key(|c| c.2);
     truncate_ascending(acc, cap);
 }
