@@ -548,23 +548,12 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
     // between-batches kill point.
     let report = hidden.gc(Duration::ZERO).expect("hidden gc");
 
-    if expect_split_generation {
-        // The crash interrupted maintenance BETWEEN the split commit and the
-        // pass-final in-process refresh. The durable state must be coherent
-        // AND immediately queryable (the split commit's own slow-state
-        // restamp — keyed on the manifest strategy since #498 — publishes
-        // complete hidden membership), and the next maintenance cycle must
-        // complete without error. Before #498 this state under-served
-        // queries unrecoverably; the retrieval assertion below is the
-        // regression tripwire for that window.
-        recovered
-            .optimize(&OptimizeOptions::default())
-            .expect("post-crash optimize completes the interrupted maintenance");
-    }
-
-    // Doc conservation: one exhaustive-width query per planted direction
+    // Doc conservation FIRST — before any optimize that could repair the
+    // state under test: one exhaustive-width query per planted direction
     // must retrieve its full half, whichever side of the crash the hidden
-    // generation landed on.
+    // generation landed on. For the durable-split generations this is the
+    // regression tripwire for the pre-#498 window (a split commit whose
+    // slow-state restamp is dropped under-serves exactly here).
     let reader = recovered.reader().expect("reader");
     let mut seen_ids: Vec<i128> = Vec::new();
     for direction in 0..2usize {
@@ -598,6 +587,14 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
         CRASH_ROWS_PER_DIRECTION * 2,
         "every planted doc is retrievable after the crash"
     );
+
+    if expect_split_generation {
+        // The crash interrupted maintenance mid-pass; the next cycle must
+        // complete it without error.
+        recovered
+            .optimize(&OptimizeOptions::default())
+            .expect("post-crash optimize completes the interrupted maintenance");
+    }
 
     report.objects_deleted
 }
