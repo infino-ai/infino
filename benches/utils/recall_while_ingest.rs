@@ -619,15 +619,14 @@ pub fn run() {
         n += checkpoint_len;
         idx += 1;
 
-        // Re-open once the first batch is committed. The create-time handle
-        // built its hidden vector index from an EMPTY user manifest, so the
-        // hidden options carry no `VectorCell` partition strategy — and
-        // `optimize()` therefore never enters the over-cap cell-split path
-        // (`is_hidden_vector_index_table` checks the options). Re-opening from
-        // storage, with the first batch committed, trains the hidden cell grid
-        // and stamps `VectorCell` into the hidden options, so subsequent
-        // `optimize()`s split over-cap cells. The reopened handle serves the
-        // rest of the run (append + optimize + query on one handle).
+        // Re-open once the first batch is committed. Historically required:
+        // a create-era handle's hidden options carried no `VectorCell`
+        // strategy and `optimize()` gated the cell-split phase on those
+        // options, so only a reopened handle ever split cells. The split
+        // gate now keys on the hidden manifest's locked strategy, but the
+        // reopen is kept: it pins the measured shape to the steady-state
+        // handle (append + optimize + query on one reopened handle), which
+        // is what the recorded baselines were taken against.
         if !reopened {
             st = Supertable::open(build_opts()).expect("reopen supertable");
             reopened = true;
