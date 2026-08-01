@@ -5713,7 +5713,15 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             column,
             routing,
         } => {
-            let Some(vec_col) = inner.options.vector_columns.first() else {
+            // Resolve the config by the strategy's OWN column name — a
+            // positional `first()` would silently calibrate with the wrong
+            // metric/rotation if a table ever carries several vector columns.
+            let Some(vec_col) = inner
+                .options
+                .vector_columns
+                .iter()
+                .find(|cfg| cfg.column == column)
+            else {
                 return Ok(false);
             };
             (clusters, column, routing, vec_col.metric, vec_col.rot_seed)
@@ -5757,7 +5765,12 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // enumeration, WIDTH_LAW_QUERY_SAMPLE picks total. Counts are physical
     // (tombstones included), the loaded rows are live — each picked ordinal
     // is mapped proportionally onto the cell's live rows below.
-    let step = (total_docs / opann::WIDTH_LAW_QUERY_SAMPLE as u64).max(1);
+    // Ceiling division: a floor stride overshoots the sample whenever
+    // total_docs is not an exact multiple (511 docs -> step 1 -> 511
+    // picks); ceil keeps the pick count at or under the requested size.
+    let step = total_docs
+        .div_ceil(opann::WIDTH_LAW_QUERY_SAMPLE as u64)
+        .max(1);
     let mut picks: BTreeMap<(usize, u32), Vec<u32>> = BTreeMap::new();
     let mut base = 0u64;
     let mut next_pick = 0u64;
