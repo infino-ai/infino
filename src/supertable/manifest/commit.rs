@@ -338,6 +338,15 @@ pub(crate) async fn write_part_bytes(
 /// a given `manifest_id`'s manifest; concurrent attempts surface
 /// `PreconditionFailed` and the caller's commit fails (the
 /// writer's OCC retry loop catches this).
+///
+/// A list object can outlive its writer without ever being
+/// published: a crash between this PUT and the pointer CAS
+/// leaves the id occupied but unreferenced. Retrying the same
+/// id would fail here forever, so the OCC retry loop detects
+/// the case (contention while the list object exists at an id
+/// the pointer never reached) and derives its next successor
+/// past the orphan — see `refresh_and_orphaned_id_floor` in
+/// the writer. The orphan itself ages into the GC sweep.
 pub async fn write_manifest(
     storage: &dyn StorageProvider,
     list: &PersistedManifest,

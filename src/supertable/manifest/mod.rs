@@ -133,9 +133,12 @@ pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 pub struct SuperfileList {
     /// Monotonic point-in-time identifier. Starts at 0 (empty
     /// initial manifest from `Supertable::create`); each commit
-    /// derives `manifest_id = old.manifest_id + 1`. With a single
-    /// writer at a time, no separate counter or atomic is needed —
-    /// the read-then-store sequence is exclusive by construction.
+    /// derives `manifest_id = old.next_manifest_id()` — normally
+    /// `old.manifest_id + 1`, past that when a crash-orphaned list
+    /// occupies an id (ids may gap; readers follow the pointer, never
+    /// id arithmetic). With a single writer at a time, no separate
+    /// counter or atomic is needed — the read-then-store sequence is
+    /// exclusive by construction.
     pub manifest_id: u64,
     /// Pointer back to the immutable per-supertable configuration.
     /// Same Arc across all manifests of one supertable.
@@ -147,6 +150,13 @@ pub struct SuperfileList {
     /// Hidden vector-index sibling prefix. Set at create before the
     /// first manifest list is persisted; cleared once loaded from list.
     pub(crate) vector_index_storage_prefix: Option<String>,
+    /// In-memory only — never persisted. Minimum id the next successor
+    /// manifest may take. The OCC retry loop raises it past a manifest list
+    /// left orphaned by a writer that crashed between its list PUT and its
+    /// pointer CAS: the orphaned object occupies its id (lists are
+    /// conditional-create and never overwritten), so re-deriving the same
+    /// id can never publish. 0 means unconstrained.
+    pub(crate) next_manifest_id_floor: u64,
 }
 
 impl SuperfileList {
@@ -157,6 +167,7 @@ impl SuperfileList {
             options,
             superfiles: Vec::new(),
             vector_index_storage_prefix: None,
+            next_manifest_id_floor: 0,
         }
     }
 
@@ -169,20 +180,29 @@ impl SuperfileList {
             options,
             superfiles: Vec::new(),
             vector_index_storage_prefix,
+            next_manifest_id_floor: 0,
         }
+    }
+
+    /// The id the next successor manifest takes: one past this manifest,
+    /// unless `next_manifest_id_floor` was raised past a crash-orphaned
+    /// manifest list occupying that id.
+    pub(crate) fn next_manifest_id(&self) -> u64 {
+        (self.manifest_id + 1).max(self.next_manifest_id_floor)
     }
 
     /// Build a successor SuperfileList with `new_entries` appended to
     /// the end of `superfiles`. Original is unchanged. `manifest_id`
-    /// of the result is `self.manifest_id + 1`.
+    /// of the result is `self.next_manifest_id()`.
     pub fn with_appended(&self, new_entries: Vec<Arc<SuperfileEntry>>) -> Self {
         let mut superfiles = self.superfiles.clone();
         superfiles.extend(new_entries);
         Self {
-            manifest_id: self.manifest_id + 1,
+            manifest_id: self.next_manifest_id(),
             options: self.options.clone(),
             superfiles,
             vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
+            next_manifest_id_floor: self.next_manifest_id_floor,
         }
     }
 
@@ -269,6 +289,7 @@ impl ManifestSnapshot {
             options,
             superfiles: superfile_list,
             vector_index_storage_prefix: None,
+            next_manifest_id_floor: 0,
         };
         if let Some(storage) = storage
             && let Some(list) = list
@@ -442,7 +463,7 @@ impl ManifestSnapshot {
     }
 
     pub fn get_next_manifest_id(&self) -> u64 {
-        self.get_manifest_id() + 1
+        self.superfile_list.next_manifest_id()
     }
 
     pub fn get_opts(&self) -> Arc<SupertableOptions> {
@@ -1188,16 +1209,10 @@ impl ManifestSnapshot {
             list.deleted_user_ids_inline = Some(encoded.clone());
             list
         });
+        let mut superfile_list = self.superfile_list.clone();
+        superfile_list.manifest_id = next_id;
         Self {
-            superfile_list: SuperfileList {
-                manifest_id: next_id,
-                options: Arc::clone(&self.superfile_list.options),
-                superfiles: self.superfile_list.superfiles.clone(),
-                vector_index_storage_prefix: self
-                    .superfile_list
-                    .vector_index_storage_prefix
-                    .clone(),
-            },
+            superfile_list,
             list: new_list,
             parts: self.parts.clone(),
             loader: self.loader.clone(),
@@ -1229,16 +1244,10 @@ impl ManifestSnapshot {
             list.slow_vector_state_centroids = Some(centroids);
             list
         });
+        let mut superfile_list = self.superfile_list.clone();
+        superfile_list.manifest_id = next_id;
         Self {
-            superfile_list: SuperfileList {
-                manifest_id: next_id,
-                options: Arc::clone(&self.superfile_list.options),
-                superfiles: self.superfile_list.superfiles.clone(),
-                vector_index_storage_prefix: self
-                    .superfile_list
-                    .vector_index_storage_prefix
-                    .clone(),
-            },
+            superfile_list,
             list: new_list,
             parts: self.parts.clone(),
             loader: self.loader.clone(),
@@ -1267,15 +1276,7 @@ impl ManifestSnapshot {
             list
         });
         Self {
-            superfile_list: SuperfileList {
-                manifest_id: self.superfile_list.manifest_id,
-                options: Arc::clone(&self.superfile_list.options),
-                superfiles: self.superfile_list.superfiles.clone(),
-                vector_index_storage_prefix: self
-                    .superfile_list
-                    .vector_index_storage_prefix
-                    .clone(),
-            },
+            superfile_list: self.superfile_list.clone(),
             list: new_list,
             parts: self.parts.clone(),
             loader: self.loader.clone(),
@@ -1298,12 +1299,7 @@ impl ManifestSnapshot {
             None => None,
         };
         Self {
-            superfile_list: SuperfileList {
-                manifest_id: self.manifest_id,
-                options: Arc::clone(&self.options),
-                superfiles: self.superfiles.clone(),
-                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
-            },
+            superfile_list: self.superfile_list.clone(),
             list: new_list.or_else(|| self.list.clone()),
             parts: self.parts.clone(),
             loader: self.loader.clone(),
@@ -1324,12 +1320,7 @@ impl ManifestSnapshot {
             list
         });
         Self {
-            superfile_list: SuperfileList {
-                manifest_id: self.manifest_id,
-                options: Arc::clone(&self.options),
-                superfiles: self.superfiles.clone(),
-                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
-            },
+            superfile_list: self.superfile_list.clone(),
             list: new_list.or_else(|| self.list.clone()),
             parts: self.parts.clone(),
             loader: self.loader.clone(),
@@ -1351,18 +1342,35 @@ impl ManifestSnapshot {
             list
         });
         Self {
-            superfile_list: SuperfileList {
-                manifest_id: self.manifest_id,
-                options: Arc::clone(&self.options),
-                superfiles: self.superfiles.clone(),
-                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
-            },
+            superfile_list: self.superfile_list.clone(),
             list: new_list.or_else(|| self.list.clone()),
             parts: self.parts.clone(),
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: Some(ranges),
+        }
+    }
+
+    /// Identity successor whose next derived manifest id is at least
+    /// `floor` (see [`SuperfileList::next_manifest_id`]). The OCC retry
+    /// loop stamps this onto its reloaded base after a commit attempt
+    /// collided with a manifest list no pointer references — a writer
+    /// crashed between its list PUT and its pointer CAS, so the orphaned
+    /// object occupies the id and re-deriving it can never publish.
+    /// `manifest_id` and the persisted list are unchanged; only successor
+    /// derivation is affected.
+    pub(crate) fn with_next_manifest_id_floor(&self, floor: u64) -> Self {
+        let mut superfile_list = self.superfile_list.clone();
+        superfile_list.next_manifest_id_floor = superfile_list.next_manifest_id_floor.max(floor);
+        Self {
+            superfile_list,
+            list: self.list.clone(),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
         }
     }
 
@@ -1383,12 +1391,7 @@ impl ManifestSnapshot {
             list
         });
         Self {
-            superfile_list: SuperfileList {
-                manifest_id: self.manifest_id,
-                options: Arc::clone(&self.options),
-                superfiles: self.superfiles.clone(),
-                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
-            },
+            superfile_list: self.superfile_list.clone(),
             list: new_list.or_else(|| self.list.clone()),
             parts: self.parts.clone(),
             loader: self.loader.clone(),
@@ -1883,6 +1886,7 @@ impl ManifestSnapshot {
             options: self.get_opts(),
             superfiles: new_superfile_list,
             vector_index_storage_prefix: None,
+            next_manifest_id_floor: self.superfile_list.next_manifest_id_floor,
         };
         let loader = opts.storage.as_ref().map(|storage| {
             Arc::new(ManifestPartLoader::new_with_cache(
@@ -4180,6 +4184,44 @@ mod tests {
     }
 
     #[test]
+    fn with_next_manifest_id_floor_skips_orphaned_ids() {
+        // The floor stamp is the OCC retry loop's escape from a
+        // crash-orphaned manifest list: the base's own id is unchanged
+        // (the pointer-etag fence still validates), but every successor
+        // derives past the occupied id.
+        let m1 = ManifestSnapshot::empty(opts()).with_appended(vec![seg_entry(Uuid::new_v4(), 1)]);
+        assert_eq!(m1.get_next_manifest_id(), 2);
+
+        let floored = m1.with_next_manifest_id_floor(3);
+        assert_eq!(floored.get_manifest_id(), 1, "base id unchanged");
+        assert_eq!(floored.get_next_manifest_id(), 3, "successor skips id 2");
+
+        let m3 = floored.with_appended(vec![seg_entry(Uuid::new_v4(), 1)]);
+        assert_eq!(m3.get_manifest_id(), 3);
+        assert_eq!(
+            m3.get_next_manifest_id(),
+            4,
+            "an inert floor never skips again once passed"
+        );
+    }
+
+    #[test]
+    fn with_next_manifest_id_floor_is_monotonic_and_inert_below_next() {
+        // Stamping a lower floor never lowers an existing one, and a
+        // floor at or below the natural successor id changes nothing.
+        let m1 = ManifestSnapshot::empty(opts()).with_appended(vec![seg_entry(Uuid::new_v4(), 1)]);
+        let floored = m1
+            .with_next_manifest_id_floor(5)
+            .with_next_manifest_id_floor(3);
+        assert_eq!(floored.get_next_manifest_id(), 5, "floor is monotonic");
+        assert_eq!(
+            m1.with_next_manifest_id_floor(2).get_next_manifest_id(),
+            2,
+            "floor at the natural successor is inert"
+        );
+    }
+
+    #[test]
     fn superfile_uri_is_distinct_per_call() {
         let a = SuperfileUri::new_v4();
         let b = SuperfileUri::new_v4();
@@ -5584,6 +5626,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![old_superfile],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts,
@@ -5735,6 +5778,7 @@ mod tests {
                     .cloned()
                     .collect(),
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -5944,6 +5988,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf1, sf2],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts,
@@ -6045,6 +6090,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf1, sf2],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts,
@@ -6175,6 +6221,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf1, sf2],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts,
@@ -6305,6 +6352,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf_old, sf_latest],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts,
@@ -6442,6 +6490,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf_a, sf_b],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -6586,6 +6635,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf_a, sf_b],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -6768,6 +6818,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf_a_old, sf_a_latest, sf_b_old, sf_b_latest],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -6946,6 +6997,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf_keep.clone(), sf_remove.clone()],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -7044,6 +7096,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf_keep.clone(), sf_remove.clone()],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -7176,6 +7229,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf_a_keep.clone(), sf_a_remove.clone(), sf_b.clone()],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -7317,6 +7371,7 @@ mod tests {
                     sf_a_latest_remove.clone(),
                 ],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -7427,6 +7482,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf1.clone(), sf2.clone()],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -7516,6 +7572,7 @@ mod tests {
                 options: opts.clone(),
                 superfiles: vec![sf1.clone(), sf2.clone()],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,
@@ -7645,6 +7702,7 @@ mod tests {
                     sf_a_latest.clone(),
                 ],
                 vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
             },
             list: Some(list),
             parts: parts_map,

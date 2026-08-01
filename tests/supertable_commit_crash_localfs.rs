@@ -48,6 +48,7 @@
 //! | `crash_post_list_no_prior_commit_yields_pointer_unreadable`    | After create's list PUT, before its pointer | `OpenError::PointerUnreadable`                     |
 //! | `crash_post_superfile_on_second_commit_yields_v1`                | First commit succeeds; 2nd commit's superfile PUT triggers | `manifest_id == 1` (v_prev), orphan v2 superfile    |
 //! | `crash_post_list_on_second_commit_yields_v1`                   | First commit succeeds; 2nd commit's list PUT triggers   | `manifest_id == 1`, orphan v2 list + part         |
+//! | `crash_post_list_on_second_commit_recovers_next_commit`        | Same crash point as above                    | v1 recovered; the FIRST post-crash commit publishes at id 3, skipping the orphaned id 2 |
 //! | `crash_post_pointer_on_second_commit_yields_v2`                | First commit succeeds; 2nd commit's pointer PUT triggers AFTER it lands | `manifest_id == 2` (commit was durable)           |
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
@@ -404,6 +405,47 @@ fn crash_post_list_on_second_commit_yields_v1() {
     assert!(
         n_lists >= 2,
         "v1 list + orphan v2 list both on disk; found {n_lists}"
+    );
+}
+
+#[test]
+fn crash_post_list_on_second_commit_recovers_next_commit() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_post_list_on_second_commit_recovers_next_commit",
+        KP_LIST_SECOND,
+    );
+
+    // Recovery opens at v1: the crashed second commit never published, but
+    // its manifest list survives on disk, occupying id 2 (lists are
+    // conditional-create and never overwritten).
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
+    let recovered =
+        Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v1");
+    assert_eq!(recovered.manifest_id(), 1);
+
+    // The FIRST post-crash commit must publish. Regression: the OCC retry
+    // loop used to refresh from the (unmoved) pointer, re-derive the same
+    // occupied id 2, and exhaust as WriteContentionExhausted until a GC
+    // sweep past the safety gap reclaimed the orphan. It now skips to id 3
+    // and leaves the orphan for GC.
+    let mut w = recovered.writer().expect("writer");
+    w.append(&build_title_batch(&["post crash gamma"]))
+        .expect("append");
+    w.commit()
+        .expect("first post-crash commit must publish past the orphaned list");
+    assert_eq!(
+        recovered.manifest_id(),
+        3,
+        "commit skips the orphaned id 2 and publishes at id 3"
+    );
+    assert_eq!(
+        recovered.reader().expect("reader").n_superfiles(),
+        2,
+        "first commit's superfile + the post-crash commit's superfile"
     );
 }
 

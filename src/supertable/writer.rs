@@ -158,7 +158,7 @@ use crate::{
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
             ClusterCentroids, RabitqAdmitContext,
-            commit::get_current_manifest_etag,
+            commit::{get_current_manifest_etag, manifest_uri},
             list::{
                 CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy,
                 WIDTH_LAW_KS,
@@ -5758,8 +5758,16 @@ async fn stamp_slow_vector_state(
         return Ok(());
     };
     let max_retries = inner.options.max_commit_retries.max(1);
+    let mut next_id_floor: u64 = 0;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
+        // A prior attempt found its id occupied by a crash-orphaned
+        // manifest list — derive this attempt's successor past it.
+        let old = if next_id_floor > 0 {
+            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+        } else {
+            old
+        };
         let entries = old.get_all_superfiles();
         if entries.is_empty() && pending_drain.is_none() {
             // Nothing to describe (pre-drain / empty table); the ref is
@@ -5800,6 +5808,7 @@ async fn stamp_slow_vector_state(
         }
         let new_manifest =
             old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
+        let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .inspect_err(|e| inner.note_commit_error(e))
@@ -5813,9 +5822,11 @@ async fn stamp_slow_vector_state(
                 return Ok(());
             }
             Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                refresh_inner_state_async(inner, &storage)
-                    .await
-                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                next_id_floor = next_id_floor.max(
+                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
                 sleep(backoff_delay(attempt)).await;
             }
             Err(e) => return Err(BuildError::Store(e.to_string())),
@@ -5837,8 +5848,16 @@ async fn record_hidden_deleted_ids(
         return Ok(());
     };
     let max_retries = inner.options.max_commit_retries.max(1);
+    let mut next_id_floor: u64 = 0;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
+        // A prior attempt found its id occupied by a crash-orphaned
+        // manifest list — derive this attempt's successor past it.
+        let old = if next_id_floor > 0 {
+            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+        } else {
+            old
+        };
         let mut ids = hidden_deleted::deleted_user_ids(&old)
             .map_err(|e| BuildError::Store(e.to_string()))?
             .as_ref()
@@ -5852,6 +5871,7 @@ async fn record_hidden_deleted_ids(
         }
         let bytes = encode_deleted_ids(&ids);
         let new_manifest = old.with_deleted_user_ids(bytes);
+        let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .inspect_err(|e| inner.note_commit_error(e))
@@ -5865,9 +5885,11 @@ async fn record_hidden_deleted_ids(
                 return Ok(());
             }
             Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                refresh_inner_state_async(inner, &storage)
-                    .await
-                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                next_id_floor = next_id_floor.max(
+                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
                 sleep(backoff_delay(attempt)).await;
             }
             Err(e) => return Err(BuildError::Store(e.to_string())),
@@ -5940,8 +5962,16 @@ pub(in crate::supertable) async fn persist_commit_async(
     let max_retries = opts.max_commit_retries.max(1);
     let drive = async move {
         let mut last_err: Option<SupertableCommitError> = None;
+        let mut next_id_floor: u64 = 0;
         for attempt in 0..max_retries {
             let old = inner.manifest.load_full();
+            // A prior attempt found its id occupied by a crash-orphaned
+            // manifest list — derive this attempt's successor past it.
+            let old = if next_id_floor > 0 {
+                Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+            } else {
+                old
+            };
             // Re-apply call-site stamps on every attempt. A pre-store of these
             // fields is not OCC-safe: contention refresh reloads from storage
             // and would drop them before a successful CAS.
@@ -5950,6 +5980,7 @@ pub(in crate::supertable) async fn persist_commit_async(
             } else {
                 Arc::new(list_metadata.apply(&old))
             };
+            let attempted_id = base.get_next_manifest_id();
             let pending_writes = &mut pending_storage_writes;
             let pending_replaces = &mut pending_storage_replaces;
             match try_commit_attempt(
@@ -5968,7 +5999,9 @@ pub(in crate::supertable) async fn persist_commit_async(
                 Err(SupertableCommitError::WriteContentionExhausted)
                     if attempt + 1 < max_retries =>
                 {
-                    refresh_inner_state_async(inner, &storage_async).await?;
+                    next_id_floor = next_id_floor.max(
+                        refresh_and_orphaned_id_floor(inner, &storage_async, attempted_id).await?,
+                    );
                     last_err = Some(SupertableCommitError::WriteContentionExhausted);
                     sleep(backoff_delay(attempt)).await;
                 }
@@ -6387,6 +6420,47 @@ pub(in crate::supertable) async fn refresh_inner_state_async(
     Ok(())
 }
 
+/// Refresh after a contention-failed publish attempt at `attempted_id` and
+/// compute the manifest-id floor for the next attempt.
+///
+/// `WriteContentionExhausted` from one attempt covers two situations:
+///
+/// - **Real race** — another writer published and moved the pointer. The
+///   refresh advances the in-memory base, the next attempt derives a fresh
+///   id, and no floor is needed (returns 0).
+/// - **Unpublished occupant** — the list object at `attempted_id` exists
+///   while the pointer sits short of it: no pointer references that list.
+///   Its writer either died between its list PUT and its pointer CAS (a
+///   crash orphan), or is mid-commit. Lists are conditional-create and
+///   never overwritten, so re-deriving the same id can never publish;
+///   return `attempted_id + 1` so the retry skips past it. The object is
+///   left untouched — an orphan stays unreferenced and ages into the GC
+///   sweep, while a live mid-commit writer keeps its candidate: its pointer
+///   CAS and ours are fenced on the same prior etag, so exactly one wins
+///   and the loser retries as usual.
+///
+/// Both conditions are required. The pointer sitting short of
+/// `attempted_id` alone is not proof of an occupant: a loser's refresh can
+/// run before the winner's pointer CAS lands, and a floored attempt can
+/// lose its etag pre-check with nothing at its id — hence the existence
+/// probe before skipping.
+pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
+    inner: &SupertableInner,
+    storage: &Arc<dyn StorageProvider>,
+    attempted_id: u64,
+) -> Result<u64, SupertableCommitError> {
+    refresh_inner_state_async(inner, storage).await?;
+    let refreshed_id = inner.manifest.load_full().get_manifest_id();
+    if refreshed_id >= attempted_id {
+        return Ok(0);
+    }
+    match storage.head(&manifest_uri(attempted_id)).await {
+        Ok(_) => Ok(attempted_id + 1),
+        Err(StorageError::NotFound { .. }) => Ok(0),
+        Err(e) => Err(SupertableCommitError::Storage(e)),
+    }
+}
+
 /// CAS-publish a successor manifest whose tombstone seq for every
 /// superfile in `touched` is bumped to the successor's `manifest_id`.
 ///
@@ -6410,12 +6484,21 @@ pub(in crate::supertable) async fn stamp_tombstone_seqs(
         return Ok(());
     };
     let max_retries = inner.options.max_commit_retries.max(1);
+    let mut next_id_floor: u64 = 0;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
+        // A prior attempt found its id occupied by a crash-orphaned
+        // manifest list — derive this attempt's successor past it.
+        let old = if next_id_floor > 0 {
+            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+        } else {
+            old
+        };
         let Some(new_manifest) = old.with_tombstone_seqs_bumped(touched) else {
             // No persisted list ⇒ in-process-only ⇒ nothing to stamp.
             return Ok(());
         };
+        let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = match get_current_manifest_etag(&storage, Arc::clone(&old)).await {
             Ok(etag) => etag,
             // Pointer moved past our snapshot — reload and retry.
@@ -6439,7 +6522,8 @@ pub(in crate::supertable) async fn stamp_tombstone_seqs(
                 return Ok(());
             }
             Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                refresh_inner_state_async(inner, &storage).await?;
+                next_id_floor = next_id_floor
+                    .max(refresh_and_orphaned_id_floor(inner, &storage, attempted_id).await?);
                 sleep(backoff_delay(attempt)).await;
             }
             Err(e) => return Err(e),
