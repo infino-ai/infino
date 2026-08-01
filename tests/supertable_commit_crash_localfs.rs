@@ -49,6 +49,9 @@
 //! | `crash_post_superfile_on_second_commit_yields_v1`                | First commit succeeds; 2nd commit's superfile PUT triggers | `manifest_id == 1` (v_prev), orphan v2 superfile    |
 //! | `crash_post_list_on_second_commit_yields_v1`                   | First commit succeeds; 2nd commit's list PUT triggers   | `manifest_id == 1`, orphan v2 list + part         |
 //! | `crash_post_pointer_on_second_commit_yields_v2`                | First commit succeeds; 2nd commit's pointer PUT triggers AFTER it lands | `manifest_id == 2` (commit was durable)           |
+//! | `crash_post_hidden_child_superfile_yields_pre_split_index`     | Batched cell split: first child superfile PUT (pre-commit) | Hidden index at drained state; orphan children GC'd |
+//! | `crash_post_hidden_list_yields_pre_split_index`                | Batched cell split: hidden list PUT, before its pointer | Hidden index at drained state; orphans GC'd |
+//! | `crash_post_hidden_pointer_yields_split_index`                 | Batched cell split: hidden pointer CAS AFTER it lands | Split durable; post-crash `optimize` + `gc` run clean (see the KNOWN GAP note in `verify_hidden_split_crash`) |
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
 //! filesystem behavior; RustFS's crash story is its own
@@ -63,18 +66,27 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
+use arrow_array::{Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
+    VectorSearchOptions,
+    config::OptimizeOptions,
+    superfile::{
+        builder::{FtsConfig, VectorConfig},
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    },
     supertable::{
-        OpenError, Supertable,
+        OpenError, Supertable, SupertableOptions,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{build_title_batch, default_supertable_options, default_tokenizer},
 };
 
 const ENV_DIR: &str = "INFINO_M12_CRASH_DIR";
@@ -88,20 +100,40 @@ const KP_SEG_SECOND: &str = "seg-2";
 const KP_LIST_SECOND: &str = "list-2";
 const KP_POINTER_SECOND: &str = "pointer-2";
 
+/// Hidden vector-index kill points: crash inside the batched cell-split's
+/// window (child superfile upload → hidden list PUT → hidden pointer CAS).
+/// The hidden table's storage prefix is `_infino_<uuid>_vector_index/` with
+/// a per-table random uuid, so these match by CONTAINED token (the same
+/// `_vector_index` token `runtime_metrics::io` classifies hidden URIs by)
+/// rather than a static prefix, and the child ARMS the counter only once
+/// the split starts — create/commit/drain traffic through the same wrapper
+/// is not counted, keeping the nth-match config independent of how many
+/// PUTs the drain issues.
+const KP_HIDDEN_SPLIT_SEG: &str = "hidden-split-seg";
+const KP_HIDDEN_SPLIT_LIST: &str = "hidden-split-list";
+const KP_HIDDEN_SPLIT_POINTER: &str = "hidden-split-pointer";
+
 /// Exit code used when the crash child finishes WITHOUT aborting —
 /// signals a misconfigured kill point (distinct from a clean exit).
 const MISCONFIGURED_KILL_POINT_EXIT_CODE: i32 = 2;
 
 /// Storage wrapper that aborts the process after the N-th
-/// PUT whose URI starts with `trigger_path_prefix` returns
-/// success. Everything else is forwarded verbatim to the
-/// inner `LocalFsStorageProvider`.
+/// PUT whose URI matches the trigger returns success (prefix
+/// match for the user-table kill points; contained-token match
+/// for the hidden-index ones, whose per-table uuid prefix cannot
+/// be known statically). Everything else is forwarded verbatim
+/// to the inner `LocalFsStorageProvider`. Matches count only
+/// while `armed` — the hidden kill points arm right before the
+/// split so earlier create/commit/drain PUTs don't shift the
+/// nth-match configuration.
 #[derive(Debug)]
 struct CrashStorage {
     inner: LocalFsStorageProvider,
     trigger_path_prefix: String,
+    trigger_is_contains: bool,
     trigger_after_nth_match: usize,
     matches_seen: AtomicUsize,
+    armed: AtomicBool,
     abort_label: String,
 }
 
@@ -115,17 +147,46 @@ impl CrashStorage {
         Self {
             inner,
             trigger_path_prefix: trigger_path_prefix.into(),
+            trigger_is_contains: false,
             trigger_after_nth_match,
             matches_seen: AtomicUsize::new(0),
+            armed: AtomicBool::new(true),
             abort_label: abort_label.into(),
         }
     }
 
+    /// Contained-token matcher, starting DISARMED; the child arms it at the
+    /// step it wants counted (`arm`).
+    fn new_contains_disarmed(
+        inner: LocalFsStorageProvider,
+        trigger_token: impl Into<String>,
+        trigger_after_nth_match: usize,
+        abort_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            trigger_is_contains: true,
+            armed: AtomicBool::new(false),
+            ..Self::new(inner, trigger_token, trigger_after_nth_match, abort_label)
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn uri_matches(&self, uri: &str) -> bool {
+        if self.trigger_is_contains {
+            uri.contains(&self.trigger_path_prefix)
+        } else {
+            uri.starts_with(&self.trigger_path_prefix)
+        }
+    }
+
     /// Called from put_atomic / put_if_match after the
-    /// inner provider returns. Aborts the process iff
-    /// `is_match` AND `ok` AND this is the Nth such match.
+    /// inner provider returns. Aborts the process iff armed
+    /// AND `is_match` AND `ok` AND this is the Nth such match.
     fn maybe_abort(&self, uri: &str, is_match: bool, ok: bool) {
-        if !(is_match && ok) {
+        if !(self.armed.load(Ordering::SeqCst) && is_match && ok) {
             return;
         }
         let n = self.matches_seen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -151,7 +212,7 @@ impl StorageProvider for CrashStorage {
         self.inner.get_range(uri, range).await
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
-        let is_match = uri.starts_with(&self.trigger_path_prefix);
+        let is_match = self.uri_matches(uri);
         let result = self.inner.put_atomic(uri, bytes).await;
         self.maybe_abort(uri, is_match, result.is_ok());
         result
@@ -162,7 +223,7 @@ impl StorageProvider for CrashStorage {
         bytes: Bytes,
         expected_etag: Option<&str>,
     ) -> Result<Option<String>, StorageError> {
-        let is_match = uri.starts_with(&self.trigger_path_prefix);
+        let is_match = self.uri_matches(uri);
         let result = self.inner.put_if_match(uri, bytes, expected_etag).await;
         self.maybe_abort(uri, is_match, result.is_ok());
         result
@@ -201,6 +262,141 @@ fn kill_point_config(kp: &str) -> (&'static str, usize, usize) {
         KP_POINTER_SECOND => ("_supertable/current", 3, 2),
         other => panic!("unknown kill point {other}"),
     }
+}
+
+/// Vector dimension for the hidden-split crash fixture.
+const CRASH_EMB_DIM: usize = 16;
+/// Rows per planted direction; two directions → two populated hidden cells,
+/// and the busiest cell has enough rows to split k-ways.
+const CRASH_ROWS_PER_DIRECTION: usize = 8;
+/// Hidden grid size for the crash fixture (parity with the in-crate split
+/// unit tests).
+const CRASH_N_CENT: usize = 4;
+/// Rotation seed for the crash fixture's vector column.
+const CRASH_ROT_SEED: u64 = 7;
+/// Probe width covering every cell of the tiny fixture grid, pre- and
+/// post-split.
+const CRASH_NPROBE: usize = 64;
+/// Marker file (in the crash dir, outside every swept prefix) through which
+/// the child reports the drained hidden manifest id to the parent.
+const DRAINED_HIDDEN_ID_MARKER: &str = "drained-hidden-manifest-id";
+
+/// Options + one committed batch for the hidden-split crash tests: `title`
+/// FTS plus a 16-dim `emb` vector column with the Sq8Residual rerank codec
+/// the split path requires (`test_helpers::default_vector_config` is Fp32 —
+/// unusable here). The 1-thread writer pool keeps the drain to one packed
+/// shard so the hidden PUT sequence is deterministic. Rows: 8 at `e_0` and
+/// 8 at `e_1` → two populated hidden cells after the drain.
+fn vector_crash_fixture() -> (SupertableOptions, arrow_array::RecordBatch) {
+    let dim = CRASH_EMB_DIM;
+    let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(item_field.clone(), dim as i32),
+            false,
+        ),
+    ]));
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool"),
+    );
+    let options = SupertableOptions::new(
+        schema.clone(),
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        vec![VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent: CRASH_N_CENT,
+            rot_seed: CRASH_ROT_SEED,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        }],
+        Some(default_tokenizer()),
+    )
+    .expect("valid options")
+    .with_writer_pool(pool);
+
+    let n = CRASH_ROWS_PER_DIRECTION * 2;
+    let titles = LargeStringArray::from((0..n).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+    let mut flat = vec![0.0f32; n * dim];
+    for r in 0..n {
+        flat[r * dim + usize::from(r >= n / 2)] = 1.0;
+    }
+    let fsl = FixedSizeListArray::new(
+        item_field,
+        dim as i32,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    );
+    let batch = arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(titles) as Arc<dyn Array>,
+            Arc::new(fsl) as Arc<dyn Array>,
+        ],
+    )
+    .expect("batch");
+    (options, batch)
+}
+
+/// Translate a hidden kill point into (contained URI token, nth armed
+/// match). All fire on the FIRST armed match of their step — the child arms
+/// the counter right before the split, so create/commit/drain PUTs through
+/// the same wrapper don't shift the count.
+fn hidden_kill_point_config(kp: &str) -> (&'static str, usize) {
+    match kp {
+        KP_HIDDEN_SPLIT_SEG => ("_vector_index/data/", 1),
+        KP_HIDDEN_SPLIT_LIST => ("_vector_index/manifest/", 1),
+        KP_HIDDEN_SPLIT_POINTER => ("_vector_index/_supertable/current", 1),
+        other => panic!("unknown hidden kill point {other}"),
+    }
+}
+
+/// Child path for the hidden-split kill points: create a vector table,
+/// commit one batch, drain it into the hidden per-cell index, ARM the crash
+/// storage, then split the busiest hidden cell. The batched split's PUT
+/// sequence (child superfiles → hidden list → hidden pointer CAS) crosses
+/// the armed kill point and aborts; reaching the end means the kill point
+/// never fired.
+fn run_vector_crash_child(dir: PathBuf, kill_point: &str) -> ! {
+    let (token, nth) = hidden_kill_point_config(kill_point);
+
+    let local = LocalFsStorageProvider::new(&dir).expect("local fs provider");
+    let wrapped = Arc::new(CrashStorage::new_contains_disarmed(
+        local, token, nth, kill_point,
+    ));
+    let storage: Arc<dyn StorageProvider> = Arc::clone(&wrapped) as Arc<dyn StorageProvider>;
+
+    let (options, batch) = vector_crash_fixture();
+    let st = Supertable::create(options.with_storage(storage)).expect("create");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+    // Record the drained hidden generation for the parent's assertions —
+    // stamp/checkpoint publishes don't bump ids deterministically enough to
+    // hardcode, but "pre-split vs pre-split + 1" is exact.
+    let drained_id = st.vector_index_table().expect("hidden index").manifest_id();
+    std::fs::write(dir.join(DRAINED_HIDDEN_ID_MARKER), drained_id.to_string())
+        .expect("write drained-id marker");
+
+    wrapped.arm();
+    let split = st.split_busiest_hidden_cell_sync().expect("split");
+
+    eprintln!(
+        "CRASH-CHILD: completed split (committed={split}) without aborting \
+         (kill_point={kill_point}) — test configuration is wrong"
+    );
+    std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
 }
 
 /// Child path: build a Supertable on `CrashStorage` and run
@@ -281,9 +477,108 @@ fn spawn_crash_child(test_name: &str, kill_point: &str) -> PathBuf {
 fn dispatch_child_if_set() -> Option<()> {
     if let Ok(dir) = env::var(ENV_DIR) {
         let kp = env::var(ENV_KILL_POINT).expect("ENV_KILL_POINT must be set with ENV_DIR");
+        if kp.starts_with("hidden-") {
+            run_vector_crash_child(PathBuf::from(dir), &kp);
+        }
         run_crash_child(PathBuf::from(dir), &kp);
     }
     None
+}
+
+/// Parent-side verification shared by the hidden-split kill points: reopen
+/// the user table with a plain provider (the hidden table reopens
+/// automatically off the manifest's `vector_index_storage_prefix`), assert
+/// the hidden manifest generation, assert no docs were lost through the
+/// crash (both planted directions fully retrievable), then run an explicit
+/// hidden-table `gc` (the background sweep never fires inside a test's
+/// lifetime) and return its deleted-object count.
+fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u64 {
+    let drained_id: u64 = std::fs::read_to_string(dir.join(DRAINED_HIDDEN_ID_MARKER))
+        .expect("child wrote the drained-id marker before arming")
+        .trim()
+        .parse()
+        .expect("marker holds a manifest id");
+    let expect_hidden_manifest_id = if expect_split_generation {
+        drained_id + 1
+    } else {
+        drained_id
+    };
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir).expect("provider"));
+    let (options, _) = vector_crash_fixture();
+    let recovered =
+        Supertable::open(options.with_storage(storage)).expect("open recovers the user table");
+    let hidden = recovered
+        .vector_index_table()
+        .expect("vector table reopens its hidden index")
+        .clone();
+    assert_eq!(
+        hidden.manifest_id(),
+        expect_hidden_manifest_id,
+        "hidden index generation after the crash (drained at {drained_id})"
+    );
+
+    if expect_split_generation {
+        // The crash interrupted maintenance BETWEEN the split commit and the
+        // pass-final in-process `refresh_slow_vector_state`. The durable
+        // state is coherent (generation advanced atomically, nothing
+        // dangling — gc below must run clean) and the next maintenance
+        // cycle must complete without error.
+        //
+        // KNOWN GAP (pre-existing, reproduced on unmodified main with the
+        // singleton split, two populated cells): vector queries against
+        // this state under-serve — post-split 0/16 hits in-process, after
+        // reopen, and even after a full post-reopen `optimize()`; only the
+        // in-process refresh immediately after the split restores 16/16.
+        // Completed optimizes are unaffected (the pass always ends with
+        // that refresh in the same process); the crash window is what
+        // exposes it. Retrieval is asserted below only for the pre-split
+        // generations until that visibility bug is fixed — its fix should
+        // flip this branch to fall through to the retrieval check.
+        recovered
+            .optimize(&OptimizeOptions::default())
+            .expect("post-crash optimize completes the interrupted maintenance");
+    } else {
+        // Doc conservation: one exhaustive-width query per planted
+        // direction must retrieve its full half from the intact pre-split
+        // generation.
+        let reader = recovered.reader().expect("reader");
+        let mut seen_ids: Vec<i128> = Vec::new();
+        for direction in 0..2usize {
+            let mut query = vec![0.0f32; CRASH_EMB_DIM];
+            query[direction] = 1.0;
+            let batches = reader
+                .vector_search(
+                    "emb",
+                    &query,
+                    CRASH_ROWS_PER_DIRECTION,
+                    VectorSearchOptions::new().with_nprobe(CRASH_NPROBE),
+                    None,
+                    None,
+                )
+                .expect("vector search");
+            for batch in &batches {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("_id column");
+                for i in 0..ids.len() {
+                    seen_ids.push(ids.value(i));
+                }
+            }
+        }
+        seen_ids.sort_unstable();
+        seen_ids.dedup();
+        assert_eq!(
+            seen_ids.len(),
+            CRASH_ROWS_PER_DIRECTION * 2,
+            "every planted doc is retrievable after the crash"
+        );
+    }
+
+    let report = hidden.gc(Duration::ZERO).expect("hidden gc");
+    report.objects_deleted
 }
 
 #[test]
@@ -405,6 +700,65 @@ fn crash_post_list_on_second_commit_yields_v1() {
         n_lists >= 2,
         "v1 list + orphan v2 list both on disk; found {n_lists}"
     );
+}
+
+/// Crash after the FIRST split-child superfile PUT, before the batch's
+/// hidden list/pointer: the previous (drained) hidden generation stays
+/// intact and fully queryable, and an explicit `gc` reclaims the orphaned
+/// child bytes (they are younger than any real reclaim grace, but a
+/// zero-gap sweep proves they are unreferenced).
+#[test]
+fn crash_post_hidden_child_superfile_yields_pre_split_index() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_post_hidden_child_superfile_yields_pre_split_index",
+        KP_HIDDEN_SPLIT_SEG,
+    );
+    let deleted = verify_hidden_split_crash(&dir, false);
+    assert!(
+        deleted >= 1,
+        "the uploaded-but-uncommitted split child is an orphan gc reclaims; deleted {deleted}"
+    );
+}
+
+/// Crash after the batch's hidden manifest LIST PUT, before its pointer
+/// CAS: still the drained generation (the pointer is the visibility
+/// barrier), with the children + orphan list reclaimable.
+#[test]
+fn crash_post_hidden_list_yields_pre_split_index() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_post_hidden_list_yields_pre_split_index",
+        KP_HIDDEN_SPLIT_LIST,
+    );
+    let deleted = verify_hidden_split_crash(&dir, false);
+    assert!(
+        deleted >= 1,
+        "uploaded children + the orphan hidden list are gc-reclaimable; deleted {deleted}"
+    );
+}
+
+/// Crash immediately AFTER the batch's hidden pointer CAS lands: the split
+/// is durable (the reopened hidden index is the post-split generation), and
+/// the next `optimize` + `gc` complete cleanly. Retrieval against this
+/// generation is blocked on a pre-existing visibility bug — see the KNOWN
+/// GAP note in `verify_hidden_split_crash`.
+#[test]
+fn crash_post_hidden_pointer_yields_split_index() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_post_hidden_pointer_yields_split_index",
+        KP_HIDDEN_SPLIT_POINTER,
+    );
+    // Split durable; gc must simply succeed (superseded parents remain
+    // referenced — reclaiming their dead blocks is the merge phase's job).
+    verify_hidden_split_crash(&dir, true);
 }
 
 #[test]

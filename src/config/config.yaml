@@ -228,6 +228,14 @@ vector:
   # integer.
   drain_read_concurrency: auto
 
+  # CPU threads for maintenance-compaction compute (cell splits'
+  # k-means and child builds) — the `optimize()` path; the
+  # ingest commit path does not ride this pool. `auto` = all hardware
+  # threads (an explicit optimize owns its machine). Set an integer to
+  # cap it when optimize runs concurrently with latency-critical
+  # foreground work.
+  maintenance_threads: auto
+
   # Cell count for the USER table's grid, trained at the first commit —
   # controls user-superfile cell packing and pre-drain query routing. Finer
   # than the hidden grid on purpose: smaller cells make the single pre-drain

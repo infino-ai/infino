@@ -32,7 +32,10 @@ use tracing::{debug, warn};
 use super::{
     error::{BuildError, CommitError, OpenError},
     hidden_deleted::{self, HiddenDeletedError},
-    manifest::{ManifestSnapshot, list::CellRoutingParams},
+    manifest::{
+        ManifestSnapshot,
+        list::{CellRoutingParams, PartitionStrategy},
+    },
     options::SupertableOptions,
 };
 use crate::{
@@ -828,6 +831,36 @@ impl Supertable {
     /// pre-drain and post-drain search phases.
     fn drain_vectors_to_cells_sync(&self) -> Result<(), BuildError> {
         self.drain_hidden_vector_cells_sync()
+    }
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// Split the busiest populated hidden cell (modality trigger off, so any
+    /// cell with ≥ 2 live rows splits). Crash-test entry: the split fns are
+    /// `pub(in crate::supertable)` and the production trigger needs a cell
+    /// past the 500k `cell_split_doc_cap` — this reaches the batched split
+    /// commit from an integration test without that volume. Returns whether
+    /// a split committed.
+    fn split_busiest_hidden_cell_sync(&self) -> Result<bool, BuildError> {
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return Ok(false);
+        };
+        let manifest = hidden.inner.manifest.load_full();
+        let busiest = match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .filter(|&c| clusters.counts[c as usize] > 0)
+                .max_by_key(|&c| clusters.counts[c as usize]),
+            _ => None,
+        };
+        let Some(cell) = busiest else {
+            return Ok(false);
+        };
+        let outcome = bridge_on_runtime(
+            super::writer::split_overflow_cell(Arc::clone(&hidden.inner), cell, 0.0),
+            &self.query_runtime(),
+        )?;
+        Ok(outcome.is_some())
     }
     }
 
@@ -4287,6 +4320,204 @@ mod tests {
             parent_superseded,
             "the parent superfile survives with the split cell marked superseded"
         );
+        assert!(
+            manifest.superfiles.len() > superfiles_before,
+            "child superfiles are appended, none removed"
+        );
+    }
+
+    /// One BATCHED commit splits BOTH populated cells
+    /// (`split_overflow_cell_batch`): the hidden manifest advances exactly
+    /// one id (one OCC publish for the whole batch), the grid grows by every
+    /// split's appended children, each parent's split cell is superseded,
+    /// and per-cell doc counts are conserved into that split's children.
+    #[test]
+    fn split_overflow_cell_batch_commits_once_and_conserves_docs() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                writer::{scan_cell_parents, split_overflow_cell_batch},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // 8 rows at e_0 and 8 at e_1 → two distinct populated cells.
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let manifest_before = Arc::clone(hidden.reader().expect("reader").manifest());
+        let n_cent_before = match manifest_before.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent,
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+        let manifest_id_before = manifest_before.manifest_id;
+        let superfiles_before = manifest_before.superfiles.len();
+
+        let inner = hidden.inner().clone();
+        // Physical per-cell postings — the baseline the split pass selects
+        // and extracts from (the GRID's stamped counts also fold in the
+        // bootstrap commit's routing, so they can exceed the postings).
+        let (scan_counts, parents_by_cell) = hidden
+            .block_on_query(scan_cell_parents(&inner, &manifest_before, None))
+            .expect("cell index scan");
+        let mut populated: Vec<u32> = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&cell, _)| cell)
+            .collect();
+        populated.sort_unstable();
+        assert!(
+            populated.len() >= 2,
+            "two directions must drain into two cells, got {scan_counts:?}"
+        );
+        let outcome = hidden
+            .block_on_query(split_overflow_cell_batch(
+                &inner,
+                &populated,
+                0.0,
+                &parents_by_cell,
+            ))
+            .expect("batched split");
+
+        // Every batch cell split (no defensive no-ops on planted data), and
+        // each split's children conserve the parent's indexed doc count.
+        assert_eq!(outcome.per_cell.len(), populated.len());
+        let mut appended_total = 0u32;
+        for (cell, result) in &outcome.per_cell {
+            let children = result
+                .as_ref()
+                .unwrap_or_else(|| panic!("cell {cell} must split, not no-op"));
+            assert!(children.len() >= 2, "a split has at least two children");
+            assert_eq!(children[0].0, *cell, "child 0 reuses the parent id");
+            appended_total += children.len() as u32 - 1;
+            let child_sum: u64 = children.iter().map(|(_, n)| *n).sum();
+            assert_eq!(
+                child_sum,
+                scan_counts.get(cell).copied().unwrap_or(0),
+                "children of cell {cell} conserve its physical postings"
+            );
+        }
+
+        let reader = hidden.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(
+            manifest.manifest_id,
+            manifest_id_before + 1,
+            "the whole batch publishes in ONE manifest commit"
+        );
+        match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(
+                    clusters.n_cent,
+                    n_cent_before + appended_total,
+                    "grid grows by every split's appended children"
+                );
+                // The batch's count stamp landed AFTER the grid fold: every
+                // child id is in range and carries its routed count.
+                for (cell, result) in &outcome.per_cell {
+                    for (child, docs) in result.as_ref().expect("split") {
+                        assert!(*child < clusters.n_cent, "child id in folded grid");
+                        assert_eq!(
+                            u64::from(clusters.counts[*child as usize]),
+                            *docs,
+                            "cell {cell} child {child} count stamped"
+                        );
+                    }
+                }
+            }
+            other => panic!("still VectorCell, got {other:?}"),
+        }
+        let superseded = manifest
+            .get_superseded_cells()
+            .expect("persisted list carries a superseded map");
+        for cell in &populated {
+            let parent_superseded = manifest.superfiles.iter().any(|e| {
+                superseded
+                    .get(&e.superfile_id)
+                    .is_some_and(|cells| cells.contains(cell))
+            });
+            assert!(
+                parent_superseded,
+                "cell {cell}'s parent survives with the cell marked superseded"
+            );
+        }
         assert!(
             manifest.superfiles.len() > superfiles_before,
             "child superfiles are appended, none removed"

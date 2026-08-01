@@ -985,6 +985,11 @@ pub(crate) fn plan_sq8_split(
 /// `1..k` as fresh cells at the end of the grid. Returns the grown grid and the
 /// `k` sub-cell ids (index 0 == the reused `cell_id`; the rest are the new
 /// ids), aligned to `sub_centroids` (`k * dim` fp32).
+///
+/// Test-only since the batched split landed: production folds every split
+/// through [`insert_split_centroids_batch`], and this singleton remains as
+/// the reference implementation its equivalence test folds against.
+#[cfg(test)]
 pub(crate) fn insert_split_centroids(
     base: &ClusterCentroids,
     cell_id: u32,
@@ -1018,6 +1023,70 @@ pub(crate) fn insert_split_centroids(
     counts.resize(new_n, 0);
     let updated = ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts);
     (updated, ids)
+}
+
+/// Fold every split of `splits` (`(parent_cell, sub_centroids, k)`, parent
+/// cells distinct) into ONE grown grid, in the given order. Equivalent to
+/// folding the singleton `insert_split_centroids` (now the test-only
+/// reference implementation) sequentially over `splits`, but with a single
+/// centroid-buffer allocation and one wire-invariant rebuild instead of one
+/// per split.
+///
+/// Child ids are positional ordinals minted off the end of the grid (the id
+/// IS the array index IS the reader routing key), so each split's appended
+/// ids start at `base.n_cent + Σ (k_j − 1)` over the splits before it —
+/// callers must fix the order BEFORE calling (the split pass uses ascending
+/// parent id) and must not compute ids per-split off the shared base.
+/// Returns the grown grid and, per split, its `k` child ids (index 0 == the
+/// reused parent id), aligned to that split's `sub_centroids` (`k * dim`
+/// fp32). New children carry count 0; the caller sets real counts on the
+/// GROWN grid via [`apply_cell_count_updates`] (out-of-range ids there are
+/// silently dropped, so count application must never precede this fold).
+pub(crate) fn insert_split_centroids_batch(
+    base: &ClusterCentroids,
+    splits: &[(u32, &[f32], usize)],
+) -> (ClusterCentroids, Vec<Vec<u32>>) {
+    debug_assert!(
+        {
+            let mut parents: Vec<u32> = splits.iter().map(|(p, _, _)| *p).collect();
+            parents.sort_unstable();
+            parents.windows(2).all(|w| w[0] != w[1])
+        },
+        "batch splits must target distinct parent cells"
+    );
+    let dim = base.dim as usize;
+    let old_n = base.n_cent as usize;
+    let appended: usize = splits.iter().map(|(_, _, k)| k - 1).sum();
+    let new_n = old_n + appended;
+
+    let mut fp32 = vec![0f32; new_n * dim];
+    for c in 0..old_n {
+        fp32[c * dim..(c + 1) * dim].copy_from_slice(base.centroid(c));
+    }
+    let mut ids_per_split = Vec::with_capacity(splits.len());
+    let mut next_id = old_n;
+    for &(cell_id, sub_centroids, k) in splits {
+        debug_assert_eq!(sub_centroids.len(), k * dim);
+        // Sub-cell 0 reuses the split cell's slot; 1..k append.
+        let p = cell_id as usize;
+        fp32[p * dim..(p + 1) * dim].copy_from_slice(&sub_centroids[..dim]);
+        let mut ids = vec![cell_id];
+        for j in 1..k {
+            fp32[next_id * dim..(next_id + 1) * dim]
+                .copy_from_slice(&sub_centroids[j * dim..(j + 1) * dim]);
+            ids.push(next_id as u32);
+            next_id += 1;
+        }
+        ids_per_split.push(ids);
+    }
+
+    // Counts must have one entry per cell (see the sibling comment in
+    // [`insert_split_centroids`]): a short counts vec silently passes
+    // in-memory but truncates the wire encoding.
+    let mut counts = base.counts.clone();
+    counts.resize(new_n, 0);
+    let updated = ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts);
+    (updated, ids_per_split)
 }
 
 /// Binary variant (`k = 2`): replace `cell_id`'s centroid and append one new
@@ -1415,6 +1484,57 @@ mod tests {
             .expect("split grid must reopen from wire bytes");
         assert_eq!(decoded.n_cent, 5);
         assert_eq!(decoded.centroids.len(), 5 * base.dim as usize);
+    }
+
+    /// The batch fold must be indistinguishable from folding
+    /// [`insert_split_centroids`] sequentially in the same order — same
+    /// grown grid, same minted child ids. The batched split pass relies on
+    /// this equivalence: ids are positional ordinals, so any drift here
+    /// silently re-routes readers.
+    #[test]
+    fn insert_split_centroids_batch_matches_sequential_fold() {
+        let dim = 8usize;
+        let base = synth_centroids(6, dim as u32);
+        // Three splits with distinct k's; parents in ascending order (the
+        // executor's fixed fold order). Distinct value patterns per split so
+        // a misplaced copy shows up as a centroid mismatch, not a no-op.
+        let sub = |tag: f32, k: usize| -> Vec<f32> {
+            (0..k * dim).map(|i| tag + i as f32 * 0.01).collect()
+        };
+        let (s0, s2, s5) = (sub(1.0, 2), sub(2.0, 4), sub(3.0, 3));
+        let splits: Vec<(u32, &[f32], usize)> = vec![(0, &s0, 2), (2, &s2, 4), (5, &s5, 3)];
+
+        let (batched, batched_ids) = insert_split_centroids_batch(&base, &splits);
+
+        let mut folded = base.clone();
+        let mut folded_ids = Vec::new();
+        for &(cell, sub_centroids, k) in &splits {
+            let (next, ids) = insert_split_centroids(&folded, cell, sub_centroids, k);
+            folded = next;
+            folded_ids.push(ids);
+        }
+
+        assert_eq!(batched.n_cent, folded.n_cent);
+        assert_eq!(batched.dim, folded.dim);
+        assert_eq!(batched.centroids, folded.centroids);
+        assert_eq!(batched.counts, folded.counts);
+        assert_eq!(batched_ids, folded_ids);
+        // Prefix-sum id minting: appended ids are contiguous off the base
+        // grid's end, in fold order.
+        assert_eq!(batched_ids[0], vec![0, 6]);
+        assert_eq!(batched_ids[1], vec![2, 7, 8, 9]);
+        assert_eq!(batched_ids[2], vec![5, 10, 11]);
+        // Counts cover every cell (wire-encoding invariant) with new
+        // children zeroed until the caller applies real counts.
+        assert_eq!(batched.counts.len(), 12);
+        assert!(batched.counts[6..].iter().all(|&c| c == 0));
+
+        // Round-trips through the manifest wire format cleanly.
+        let bytes = crate::supertable::manifest::encoding::encode_cluster_centroids(&batched);
+        let decoded = crate::supertable::manifest::encoding::decode_cluster_centroids(&bytes)
+            .expect("batch-split grid must reopen from wire bytes");
+        assert_eq!(decoded.n_cent, 12);
+        assert_eq!(decoded.centroids.len(), 12 * dim);
     }
 
     #[test]
