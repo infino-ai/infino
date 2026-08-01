@@ -798,12 +798,16 @@ pub(crate) struct WidthLawCalibration {
     /// propagated: each merge is an atomic append+truncate, so a panicked
     /// pack worker leaves the held data usable.
     tops: Mutex<Vec<Vec<(f32, u32, i128, f32)>>>,
-    /// `(query index, stable id) -> fine-centroid rank` of that candidate's
-    /// fine cluster within its cell, recorded by [`Self::observe_shard_views`]
-    /// after each shard is packed (fine clusters exist only post-pack).
-    /// Entries for candidates later evicted from `tops` are harmless — the
-    /// law walk only looks up ids that survived.
-    fine_ranks: Mutex<HashMap<(u32, i128), u32>>,
+    /// `(query index, stable id, cell) -> fine-centroid rank` of that
+    /// candidate's fine cluster within THAT cell, recorded by
+    /// [`Self::observe_shard_views`] after each shard is packed (fine
+    /// clusters exist only post-pack). The cell is part of the key:
+    /// boundary replicas of one row live in several cells, and a rank
+    /// observed in one cell's fine geometry says nothing about another's —
+    /// the law walk looks up the SURVIVING copy's cell. Entries for
+    /// candidates later evicted from `tops` are harmless — the walk only
+    /// looks up ids that survived.
+    fine_ranks: Mutex<HashMap<(u32, i128, u32), u32>>,
     /// Largest fine-cluster count observed across packed cells: the depth
     /// law's search domain.
     max_fine: AtomicU32,
@@ -1113,12 +1117,20 @@ impl WidthLawCalibration {
                         &row.rabitq_code,
                         rl.q_total[qi],
                     );
-                    est_of[qi] = est;
-                    let bins = hist_local
-                        .entry(qi)
-                        .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
-                    let bin = rl.bin(qi, est);
-                    bins[bin] = bins[bin].saturating_add(1);
+                    // A non-finite estimate (corrupt code, degenerate
+                    // quantizer) is not rank evidence: NaN casts to bin 0 —
+                    // the BEST bin — and would count as a top distractor in
+                    // every pooled query's histogram. Leave the candidate
+                    // unrankable (NEG_INFINITY), which the exact walk and
+                    // the dedup tie-break already treat conservatively.
+                    if est.is_finite() {
+                        est_of[qi] = est;
+                        let bins = hist_local
+                            .entry(qi)
+                            .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                        let bin = rl.bin(qi, est);
+                        bins[bin] = bins[bin].saturating_add(1);
+                    }
                 }
             }
             dequantize_row_into(&row.encoded, scratch);
@@ -1222,7 +1234,7 @@ impl WidthLawCalibration {
                     rank_of
                 });
                 if let Some(&r) = rank_of.get(cluster as usize) {
-                    ranks.insert((qi, id), r);
+                    ranks.insert((qi, id, cell_id), r);
                 }
             }
         }
@@ -1328,8 +1340,12 @@ impl WidthLawCalibration {
                     coverage_sums[ki][rank] += f64::from(covered) / k as f64;
                 }
                 let mut per_fine_rank = vec![0u32; max_fine];
-                for (_, _, id, _) in &sorted[..k] {
-                    if let Some(&r) = fine_ranks.get(&(qi as u32, *id)) {
+                for (_, cell, id, _) in &sorted[..k] {
+                    // Look up the rank observed for the SURVIVING copy's
+                    // cell — a boundary replica's rank in another cell's
+                    // fine geometry would mis-measure the depth this
+                    // candidate actually needs at query time.
+                    if let Some(&r) = fine_ranks.get(&(qi as u32, *id, *cell)) {
                         per_fine_rank[(r as usize).min(max_fine - 1)] += 1;
                     }
                 }

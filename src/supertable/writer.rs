@@ -6970,8 +6970,14 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     if routing.width_for_k.iter().all(|&w| w == 0) {
         return Ok(false);
     }
+    // A VectorCell table without storage cannot re-read committed bytes —
+    // like a missing column config, that is an invariant violation, not a
+    // nothing-to-do: silently skipping would leave stale routing while
+    // optimize() reports success.
     let Some(storage) = inner.options.storage.clone() else {
-        return Ok(false);
+        return Err(BuildError::Store(
+            "probe-law recalibration requires configured storage".into(),
+        ));
     };
 
     let now = time::Instant::now();
