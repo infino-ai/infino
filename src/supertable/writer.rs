@@ -5608,7 +5608,31 @@ fn plan_split_wave(
             let (sub_centroids, assign) =
                 opann::plan_sq8_split_kway(&split_refs, clusters, cell, metric, k, self_tune);
             drop(split_refs);
-            let k = (sub_centroids.len() / (clusters.dim as usize)).max(1);
+            // Shape-check the planner output at this boundary — everything
+            // downstream (the id fold, routing, count stamps) trusts it. A
+            // malformed buffer degrades to a per-cell defensive no-op
+            // rather than failing the whole pass; the debug_assert makes it
+            // loud in CI.
+            let dim = clusters.dim as usize;
+            let well_formed = !sub_centroids.is_empty()
+                && sub_centroids.len() % dim == 0
+                && assign.len() == rows.len();
+            debug_assert!(
+                well_formed,
+                "planner shape for cell {cell}: {} centroid floats (dim {dim}), \
+                 {} assignments for {} rows",
+                sub_centroids.len(),
+                assign.len(),
+                rows.len()
+            );
+            if !well_formed {
+                warn!(
+                    cell,
+                    "cell split: malformed planner output; skipping the cell"
+                );
+                return Err(cell);
+            }
+            let k = sub_centroids.len() / dim;
             Ok(PlannedCellSplit {
                 cell,
                 parent_ids,
