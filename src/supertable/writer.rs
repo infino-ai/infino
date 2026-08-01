@@ -5727,20 +5727,20 @@ fn build_split_subcell(
 ///   GC-reclaimable orphans: the singleton crash contract at coarser
 ///   granularity.
 ///
-/// `parents_by_cell` must come from the same manifest lineage as
-/// `inner.manifest` (the pass driver maintains it incrementally from one
-/// initial scan); entries whose cell an earlier batch superseded are
-/// excluded here against the CURRENT superseded map. Batch cells must be
+/// `parents_by_cell` must share `manifest`'s lineage (the pass driver
+/// maintains it incrementally from one initial scan and passes the freshest
+/// snapshot per batch); entries whose cell an earlier batch superseded are
+/// excluded here against that snapshot's superseded map. Batch cells must be
 /// distinct. In-process the pass is serialized by `compaction_outstanding`;
 /// cross-process writers are the hidden table's existing single-writer
 /// assumption (the grid stamp is a whole-grid last-writer-wins replace).
 pub(in crate::supertable) async fn split_overflow_cell_batch(
     inner: &Arc<SupertableInner>,
+    manifest: &ManifestSnapshot,
     batch_cells: &[u32],
     modality_d: f64,
     parents_by_cell: &HashMap<u32, Vec<Arc<SuperfileEntry>>>,
 ) -> Result<SplitBatchOutcome, BuildError> {
-    let manifest = inner.manifest.load_full();
     let (clusters, column, routing, metric) = match manifest.get_partition_strategy() {
         PartitionStrategy::VectorCell {
             clusters,
@@ -6090,6 +6090,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
 /// below.
 pub(in crate::supertable) async fn split_repack_bulk(
     inner: &Arc<SupertableInner>,
+    manifest: &ManifestSnapshot,
     candidates: Vec<(u32, u64)>,
     modality_d: f64,
     parents_by_cell: &HashMap<u32, Vec<Arc<SuperfileEntry>>>,
@@ -6100,7 +6101,6 @@ pub(in crate::supertable) async fn split_repack_bulk(
             .map(|&(cell, _)| cell)
             .collect::<Vec<u32>>()
     };
-    let manifest = inner.manifest.load_full();
     let (clusters, column, routing, metric) = match manifest.get_partition_strategy() {
         PartitionStrategy::VectorCell {
             clusters,
@@ -6382,27 +6382,33 @@ pub(in crate::supertable) async fn split_repack_bulk(
     let buckets = group_cells_by_packed_shard(packed_children, shard_count);
     let build_inner = Arc::clone(inner);
     let build_scratch = scratch.clone();
-    let bucket_cells: Vec<(u32, Vec<u32>)> = buckets
+    let bucket_cells: HashMap<u32, Vec<u32>> = buckets
         .iter()
         .map(|(shard, cells)| (*shard, cells.iter().map(|(cell, _)| *cell).collect()))
         .collect();
-    let prepared: Vec<PreparedSuperfile> =
+    // Join by shard id, not position: the cell → entry pairing must not
+    // depend on the parallel collect preserving bucket order.
+    let prepared: Vec<(u32, PreparedSuperfile)> =
         run_on_pool(Some(maint_pool()?), "repack shard assembly", move || {
             buckets
                 .par_iter()
                 .map(|(shard, cells)| {
                     build_prepared_from_spilled_cells(&build_inner, &build_scratch, *shard, cells)
+                        .map(|prepared| (*shard, prepared))
                 })
-                .collect::<Result<Vec<PreparedSuperfile>, BuildError>>()
+                .collect::<Result<Vec<(u32, PreparedSuperfile)>, BuildError>>()
         })
         .await
         .map_err(|e| BuildError::Store(format!("repack shard assembly: {e}")))??;
     let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
-    for ((_, cells), prepared_shard) in bucket_cells.iter().zip(prepared.iter()) {
-        for &cell in cells {
-            new_entries_by_cell.push((cell, Arc::clone(&prepared_shard.entry)));
+    for (shard, prepared_shard) in &prepared {
+        if let Some(cells) = bucket_cells.get(shard) {
+            for &cell in cells {
+                new_entries_by_cell.push((cell, Arc::clone(&prepared_shard.entry)));
+            }
         }
     }
+    let prepared: Vec<PreparedSuperfile> = prepared.into_iter().map(|(_, p)| p).collect();
     let SuperfilePublishBatch {
         new_entries,
         to_remove: _,
@@ -6521,7 +6527,8 @@ pub(in crate::supertable) async fn split_overflow_cell(
     let (_cell_counts, parents_by_cell) =
         scan_cell_parents(&inner, &manifest, Some(&only_cell)).await?;
     let outcome =
-        split_overflow_cell_batch(&inner, &only_cell, modality_d, &parents_by_cell).await?;
+        split_overflow_cell_batch(&inner, &manifest, &only_cell, modality_d, &parents_by_cell)
+            .await?;
     Ok(outcome
         .per_cell
         .into_iter()
@@ -6628,6 +6635,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
     {
         let outcome = split_repack_bulk(
             &inner,
+            &manifest,
             eligible,
             opann::cell_split_modality_d(),
             &parents_by_cell,
@@ -6696,8 +6704,13 @@ pub(in crate::supertable) async fn split_overflow_cells(
                 "cell split: budget denied; single split proceeds unreserved"
             );
         }
+        // Freshest snapshot per batch — batch N+1 must see batch N's
+        // commit; the incrementally-maintained parents index shares this
+        // lineage.
+        let batch_manifest = inner.manifest.load_full();
         let outcome = split_overflow_cell_batch(
             &inner,
+            &batch_manifest,
             &batch,
             opann::cell_split_modality_d(),
             &parents_by_cell,

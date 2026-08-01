@@ -847,12 +847,24 @@ impl Supertable {
             return Ok(false);
         };
         let manifest = hidden.inner.manifest.load_full();
-        let busiest = match manifest.get_partition_strategy() {
-            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
-                .filter(|&c| clusters.counts[c as usize] > 0)
-                .max_by_key(|&c| clusters.counts[c as usize]),
-            _ => None,
-        };
+        if !matches!(
+            manifest.get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        ) {
+            return Ok(false);
+        }
+        // Physical postings, not grid counts: stamped counts can lag or
+        // fold in bootstrap-era routing, and a splittable cell needs real
+        // rows behind it.
+        let (scan_counts, _parents) = bridge_on_runtime(
+            super::writer::scan_cell_parents(&hidden.inner, &manifest, None),
+            &self.query_runtime(),
+        )?;
+        let busiest = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .max_by_key(|&(_, &n)| n)
+            .map(|(&cell, _)| cell);
         let Some(cell) = busiest else {
             return Ok(false);
         };
@@ -876,22 +888,35 @@ impl Supertable {
             return Ok(0);
         };
         let manifest = hidden.inner.manifest.load_full();
-        let candidates: Vec<(u32, u64)> = match manifest.get_partition_strategy() {
-            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
-                .filter(|&c| clusters.counts[c as usize] > 0)
-                .map(|c| (c, u64::from(clusters.counts[c as usize])))
-                .collect(),
-            _ => return Ok(0),
-        };
-        if candidates.is_empty() {
+        if !matches!(
+            manifest.get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        ) {
             return Ok(0);
         }
-        let (_counts, parents_by_cell) = bridge_on_runtime(
+        // Candidates from the same physical scan that builds the parent
+        // index — grid counts can name cells with no live postings.
+        let (scan_counts, parents_by_cell) = bridge_on_runtime(
             super::writer::scan_cell_parents(&hidden.inner, &manifest, None),
             &self.query_runtime(),
         )?;
+        let mut candidates: Vec<(u32, u64)> = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&cell, &n)| (cell, n))
+            .collect();
+        candidates.sort_unstable_by_key(|&(cell, _)| cell);
+        if candidates.is_empty() {
+            return Ok(0);
+        }
         let outcome = bridge_on_runtime(
-            super::writer::split_repack_bulk(&hidden.inner, candidates, 0.0, &parents_by_cell),
+            super::writer::split_repack_bulk(
+                &hidden.inner,
+                &manifest,
+                candidates,
+                0.0,
+                &parents_by_cell,
+            ),
             &self.query_runtime(),
         )?;
         Ok(outcome
@@ -4463,6 +4488,7 @@ mod tests {
         let outcome = hidden
             .block_on_query(split_overflow_cell_batch(
                 &inner,
+                &manifest_before,
                 &populated,
                 0.0,
                 &parents_by_cell,
@@ -4660,6 +4686,7 @@ mod tests {
         let outcome = hidden
             .block_on_query(split_repack_bulk(
                 &inner,
+                &manifest_before,
                 candidates.clone(),
                 0.0,
                 &parents_by_cell,
