@@ -3274,11 +3274,12 @@ mod tests {
         vector_read_query_error,
     };
     use crate::{
-        InfinoError,
+        BoolMode, InfinoError,
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             error::{ReadError, VectorError},
+            fts::reader::Bm25Stats,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -4913,6 +4914,109 @@ mod tests {
             near, k,
             "drain-calibrated width law must widen the default sweep to all \
              {k} exact neighbors across three cells, got {near}"
+        );
+    }
+
+    /// The public unranked `count` surface over a multi-superfile table —
+    /// the count fan sums per-superfile match counts without scoring or
+    /// row materialization. Fixture titles repeat "doc {0..31}" per
+    /// commit, so token "5" counts one row per superfile and "doc"
+    /// counts every row.
+    #[test]
+    fn count_sums_matches_across_superfiles() {
+        let (_dir, st, _q, _k) = drained_three_direction_fixture();
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            reader
+                .count("title", "5", BoolMode::And)
+                .expect("sparse count"),
+            FIXTURE_COMMITS,
+            "one match per superfile"
+        );
+        assert_eq!(
+            reader
+                .count("title", "doc", BoolMode::And)
+                .expect("dense count"),
+            (FIXTURE_COMMITS as usize * FIXTURE_ROWS_PER_COMMIT) as u64,
+            "every row matches"
+        );
+    }
+
+    /// BM25 with GLOBAL statistics over a fragmented table: the
+    /// corpus-wide document count and per-term document frequencies are
+    /// gathered across every superfile before scoring, so a term's idf —
+    /// and a doc's score — does not depend on which superfile the doc
+    /// landed in. The default per-superfile mode never runs that gather;
+    /// this is the global mode's only end-to-end exercise.
+    #[test]
+    fn bm25_global_stats_scores_across_superfiles() {
+        let (_dir, st, _q, _k) = drained_three_direction_fixture();
+        let reader = st.reader().expect("reader");
+        let batches = reader
+            .bm25_search("title", "5", 8, BoolMode::And, Bm25Stats::Global, None)
+            .expect("global-stats bm25");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, FIXTURE_COMMITS as usize,
+            "token \"5\" lives in one row per superfile; global-idf \
+             scoring must find all of them"
+        );
+    }
+
+    /// The PUBLIC predicate-filtered path end-to-end: a `VectorFilter`
+    /// resolves its allow-set through the engine's own per-superfile
+    /// `token_match` fan and the filtered kNN returns ONLY matching rows.
+    /// First unit coverage of the public filter entry — the bench battery
+    /// exercises it, but benches don't gate. Fixture titles repeat "doc
+    /// {0..31}" per commit, so the token "5" matches exactly one row in
+    /// each of the four commits (stable ids 5 + 32k), and a matching-all
+    /// token ("doc") must reproduce a full top-k.
+    #[test]
+    fn vector_filter_restricts_hits_to_predicate_matches() {
+        let (_dir, st, q, _k) = drained_three_direction_fixture();
+        let reader = st.reader().expect("reader");
+        let matched = reader
+            .vector_hits(
+                "emb",
+                &q,
+                10,
+                VectorSearchOptions::new(),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "5",
+                    mode: BoolMode::And,
+                }),
+            )
+            .expect("sparse filtered search");
+        assert_eq!(
+            matched.len(),
+            FIXTURE_COMMITS as usize,
+            "the predicate matches one row per commit — nothing more"
+        );
+        assert!(
+            matched
+                .iter()
+                .all(|h| h.stable_id.is_some_and(|id| id % 32 == 5)),
+            "every hit is a predicate row, not a nearest neighbor: {matched:?}"
+        );
+
+        let all = reader
+            .vector_hits(
+                "emb",
+                &q,
+                10,
+                VectorSearchOptions::new(),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "doc",
+                    mode: BoolMode::And,
+                }),
+            )
+            .expect("match-all filtered search");
+        assert_eq!(
+            all.len(),
+            10,
+            "a predicate matching every row fills the full top-k"
         );
     }
 
