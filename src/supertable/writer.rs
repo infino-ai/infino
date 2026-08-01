@@ -1668,6 +1668,32 @@ impl SupertableWriter {
         let owned = buffer.to_vec();
         // VectorCell strategy: pre-shard by nearest centroid instead of
         // round-robin. Each shard becomes one superfile in its cell-partition.
+        //
+        // This read of the OPTIONS strategy is a contained instance of the
+        // create-era staleness the manifest-keyed hidden gates exist to
+        // avoid (see `ManifestSnapshot::partition_strategy`): only an
+        // open-era hidden handle carries a (bootstrap) VectorCell grid in
+        // its options, so a create-era hidden handle taking this path would
+        // shard round-robin with no partition hints. That cannot corrupt
+        // the table — `assign_partition` rejects un-hinted superfiles on a
+        // VectorCell-locked manifest, failing the commit loudly — and no
+        // production path appends to the hidden table through the buffered
+        // writer anyway (hidden membership is written by drain / split /
+        // merge as prepared superfiles). The assert pins both facts; if a
+        // buffered hidden append path is ever added, shard from the
+        // manifest's locked grid instead of the options snapshot.
+        debug_assert!(
+            matches!(
+                self.inner.options.partition_strategy,
+                Some(PartitionStrategy::VectorCell { .. })
+            ) || !matches!(
+                self.inner.manifest.load().partition_strategy(),
+                Some(PartitionStrategy::VectorCell { .. })
+            ),
+            "buffered append onto a VectorCell-locked manifest from a handle whose options \
+             carry no grid: create-era hidden handles must not append through the buffered \
+             writer"
+        );
         let (shards, cell_hints): (Vec<Vec<BufferedBatch>>, Vec<Option<u32>>) =
             if let Some(PartitionStrategy::VectorCell { ref clusters, .. }) =
                 self.inner.options.partition_strategy
