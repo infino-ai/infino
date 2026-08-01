@@ -26,6 +26,7 @@
 
 pub mod brute_force_bm25;
 pub mod cas_conformance;
+pub mod fault_storage;
 
 use std::{collections::HashSet, path::Path, sync::Arc};
 
