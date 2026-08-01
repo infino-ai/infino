@@ -1618,6 +1618,12 @@ pub mod vector {
     /// [`mean_recall`] plus the p50 query latency of the same pass, so a
     /// probe sweep can price a setting on the same line that reports its
     /// recall.
+    ///
+    /// Panics on a query/truth length mismatch or an empty battery: both
+    /// are harness bugs, and a measurement helper must fail loudly rather
+    /// than report a number computed from silently truncated pairs (or a
+    /// 0/0 = NaN recall, which the width-sweep tripwire would compare
+    /// unpredictably).
     pub fn mean_recall_timed<R: VectorRead>(
         reader: &R,
         column: &str,
@@ -1627,6 +1633,12 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> (f32, Duration) {
+        assert_eq!(
+            queries.len(),
+            truths.len(),
+            "each query needs exactly one ground-truth row"
+        );
+        assert!(!queries.is_empty(), "recall over zero queries is undefined");
         let mut sum = 0f32;
         let mut lat: Vec<Duration> = Vec::with_capacity(queries.len());
         for (q, t) in queries.iter().zip(truths) {
@@ -1636,7 +1648,7 @@ pub mod vector {
             sum += corpus::recall_at_k(&hits, t);
         }
         lat.sort_unstable();
-        let p50 = lat.get(lat.len() / 2).copied().unwrap_or_default();
+        let p50 = lat[lat.len() / 2];
         (sum / queries.len() as f32, p50)
     }
 
