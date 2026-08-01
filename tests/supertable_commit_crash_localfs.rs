@@ -52,6 +52,7 @@
 //! | `crash_post_hidden_child_superfile_yields_pre_split_index`     | Batched cell split: first child superfile PUT (pre-commit) | Hidden index at drained state; orphan children GC'd |
 //! | `crash_post_hidden_list_yields_pre_split_index`                | Batched cell split: hidden list PUT, before its pointer | Hidden index at drained state; orphans GC'd |
 //! | `crash_post_hidden_pointer_yields_split_index`                 | Batched cell split: hidden pointer CAS AFTER it lands | Split durable; post-crash `optimize` + `gc` run clean (see the KNOWN GAP note in `verify_hidden_split_crash`) |
+//! | `crash_post_hidden_repack_shard_yields_pre_split_index`        | Bulk repack: first packed-shard PUT (pre-pin, pre-commit) | Hidden index at drained state; orphan shard GC'd |
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
 //! filesystem behavior; RustFS's crash story is its own
@@ -112,6 +113,9 @@ const KP_POINTER_SECOND: &str = "pointer-2";
 const KP_HIDDEN_SPLIT_SEG: &str = "hidden-split-seg";
 const KP_HIDDEN_SPLIT_LIST: &str = "hidden-split-list";
 const KP_HIDDEN_SPLIT_POINTER: &str = "hidden-split-pointer";
+/// Bulk-repack variant: crash on the repack's first packed-shard PUT,
+/// before its slow-CAS pin and commit.
+const KP_HIDDEN_REPACK_SEG: &str = "hidden-repack-seg";
 
 /// Exit code used when the crash child finishes WITHOUT aborting —
 /// signals a misconfigured kill point (distinct from a clean exit).
@@ -353,7 +357,7 @@ fn vector_crash_fixture() -> (SupertableOptions, arrow_array::RecordBatch) {
 /// the same wrapper don't shift the count.
 fn hidden_kill_point_config(kp: &str) -> (&'static str, usize) {
     match kp {
-        KP_HIDDEN_SPLIT_SEG => ("_vector_index/data/", 1),
+        KP_HIDDEN_SPLIT_SEG | KP_HIDDEN_REPACK_SEG => ("_vector_index/data/", 1),
         KP_HIDDEN_SPLIT_LIST => ("_vector_index/manifest/", 1),
         KP_HIDDEN_SPLIT_POINTER => ("_vector_index/_supertable/current", 1),
         other => panic!("unknown hidden kill point {other}"),
@@ -390,7 +394,11 @@ fn run_vector_crash_child(dir: PathBuf, kill_point: &str) -> ! {
         .expect("write drained-id marker");
 
     wrapped.arm();
-    let split = st.split_busiest_hidden_cell_sync().expect("split");
+    let split = if kill_point == KP_HIDDEN_REPACK_SEG {
+        st.repack_all_hidden_cells_sync().expect("repack") > 0
+    } else {
+        st.split_busiest_hidden_cell_sync().expect("split")
+    };
 
     eprintln!(
         "CRASH-CHILD: completed split (committed={split}) without aborting \
@@ -739,6 +747,26 @@ fn crash_post_hidden_list_yields_pre_split_index() {
     assert!(
         deleted >= 1,
         "uploaded children + the orphan hidden list are gc-reclaimable; deleted {deleted}"
+    );
+}
+
+/// Crash on the bulk repack's FIRST packed-shard PUT, before its slow-CAS
+/// pin and commit: the drained (pre-split) hidden generation stays intact
+/// and fully queryable, and an explicit `gc` reclaims the unpinned orphan
+/// shard.
+#[test]
+fn crash_post_hidden_repack_shard_yields_pre_split_index() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_post_hidden_repack_shard_yields_pre_split_index",
+        KP_HIDDEN_REPACK_SEG,
+    );
+    let deleted = verify_hidden_split_crash(&dir, false);
+    assert!(
+        deleted >= 1,
+        "the uploaded-but-unpinned repack shard is an orphan gc reclaims; deleted {deleted}"
     );
 }
 

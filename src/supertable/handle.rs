@@ -864,6 +864,44 @@ impl Supertable {
     }
     }
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// Bulk-repack every populated hidden cell (modality trigger off, so
+    /// any cell with ≥ 2 live rows splits). Crash-test entry to the
+    /// write-once repack path ([`split_repack_bulk`] is
+    /// `pub(in crate::supertable)` and the production trigger needs most of
+    /// the grid split-eligible). Returns how many cells committed a split.
+    fn repack_all_hidden_cells_sync(&self) -> Result<usize, BuildError> {
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return Ok(0);
+        };
+        let manifest = hidden.inner.manifest.load_full();
+        let candidates: Vec<(u32, u64)> = match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .filter(|&c| clusters.counts[c as usize] > 0)
+                .map(|c| (c, u64::from(clusters.counts[c as usize])))
+                .collect(),
+            _ => return Ok(0),
+        };
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let (_counts, parents_by_cell) = bridge_on_runtime(
+            super::writer::scan_cell_parents(&hidden.inner, &manifest, None),
+            &self.query_runtime(),
+        )?;
+        let outcome = bridge_on_runtime(
+            super::writer::split_repack_bulk(&hidden.inner, candidates, 0.0, &parents_by_cell),
+            &self.query_runtime(),
+        )?;
+        Ok(outcome
+            .per_cell
+            .iter()
+            .filter(|(_, result)| result.is_some())
+            .count())
+    }
+    }
+
     /// Block until the disk cache has settled every background fill the
     /// caller's own queries kicked off, or `timeout` elapses.
     ///
@@ -4522,6 +4560,353 @@ mod tests {
             manifest.superfiles.len() > superfiles_before,
             "child superfiles are appended, none removed"
         );
+    }
+
+    /// The bulk repack (`split_repack_bulk`) splits BOTH populated cells and
+    /// lands every child in ONE packed shard superfile (1-thread writer pool
+    /// ⇒ shard_count 1): one commit, write-once output, docs conserved,
+    /// parents superseded, and the slow-CAS upload pin cleared by the
+    /// publish.
+    #[test]
+    fn split_repack_bulk_lands_children_in_packed_shards() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                slow_vector_state,
+                writer::{scan_cell_parents, split_repack_bulk},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        // Reopen from storage before the repack: a CREATE-ERA hidden handle
+        // carries no partition strategy in its OPTIONS, and the commit's
+        // slow-state restamp (step 2b) is options-gated until the
+        // manifest-gating fix from the split-visibility-bug branch lands —
+        // the slow-ref/pin assertions below need the reopened handle shape,
+        // which is also how production optimize reaches this path.
+        drop(st);
+        let reopened_options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        ));
+        let st = Supertable::open(reopened_options).expect("reopen");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let manifest_before = Arc::clone(hidden.reader().expect("reader").manifest());
+        let n_cent_before = match manifest_before.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent,
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+        let manifest_id_before = manifest_before.manifest_id;
+        let superfiles_before = manifest_before.superfiles.len();
+
+        let inner = hidden.inner().clone();
+        let (scan_counts, parents_by_cell) = hidden
+            .block_on_query(scan_cell_parents(&inner, &manifest_before, None))
+            .expect("cell index scan");
+        let mut candidates: Vec<(u32, u64)> = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&cell, &n)| (cell, n))
+            .collect();
+        candidates.sort_unstable();
+        assert!(
+            candidates.len() >= 2,
+            "two directions must drain into two cells, got {scan_counts:?}"
+        );
+
+        let outcome = hidden
+            .block_on_query(split_repack_bulk(
+                &inner,
+                candidates.clone(),
+                0.0,
+                &parents_by_cell,
+            ))
+            .expect("bulk repack");
+
+        let mut appended_total = 0u32;
+        for (cell, result) in &outcome.per_cell {
+            let children = result
+                .as_ref()
+                .unwrap_or_else(|| panic!("cell {cell} must split, not no-op"));
+            assert!(children.len() >= 2, "a split has at least two children");
+            assert_eq!(children[0].0, *cell, "child 0 reuses the parent id");
+            appended_total += children.len() as u32 - 1;
+            let child_sum: u64 = children.iter().map(|(_, n)| *n).sum();
+            let expected = candidates
+                .iter()
+                .find(|(c, _)| c == cell)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            assert_eq!(
+                child_sum, expected,
+                "children of cell {cell} conserve its physical postings"
+            );
+        }
+
+        let reader = hidden.reader().expect("reader");
+        let manifest = reader.manifest();
+        // Membership publishes ONCE; the single shard's slow-CAS upload pin
+        // is its own etag-CAS list+pointer stamp (the drain's per-shard
+        // checkpoint behavior), so the id advances by shards + 1.
+        assert_eq!(
+            manifest.manifest_id,
+            manifest_id_before + 2,
+            "one pin stamp (single shard) + ONE membership commit"
+        );
+        assert_eq!(
+            manifest.superfiles.len(),
+            superfiles_before + 1,
+            "every child lands in ONE packed shard superfile (shard_count 1) — write-once output"
+        );
+        match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(
+                    clusters.n_cent,
+                    n_cent_before + appended_total,
+                    "grid grows by every split's appended children"
+                );
+            }
+            other => panic!("still VectorCell, got {other:?}"),
+        }
+        let superseded = manifest
+            .get_superseded_cells()
+            .expect("persisted list carries a superseded map");
+        for (cell, _) in &candidates {
+            let parent_superseded = manifest.superfiles.iter().any(|e| {
+                superseded
+                    .get(&e.superfile_id)
+                    .is_some_and(|cells| cells.contains(cell))
+            });
+            assert!(
+                parent_superseded,
+                "cell {cell}'s parent survives with the cell marked superseded"
+            );
+        }
+        // The publish's own slow-state restamp carries no pending state:
+        // the upload pin is cleared atomically with the commit. The blob
+        // URI is relative to the HIDDEN table's prefixed provider, so load
+        // through it — not the user-root provider.
+        let (uri, hash) = manifest
+            .slow_vector_state_blob()
+            .expect("hidden manifest carries a slow-state ref");
+        let hidden_storage = inner
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let state = hidden
+            .block_on_query(slow_vector_state::load_full_state(
+                hidden_storage.as_ref(),
+                uri,
+                &hash,
+            ))
+            .expect("slow state loads");
+        assert!(
+            state.pending_drain.is_none(),
+            "the repack's upload pin is cleared by the publish"
+        );
+    }
+
+    /// A stale repack upload pin in the slow-CAS pending state must not
+    /// brick the drain: the checkpoint loader recognizes the foreign schema
+    /// and ignores it (pre-fix this failed with a checkpoint decode error).
+    #[test]
+    fn drain_tolerates_foreign_repack_pin() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                slow_vector_state::PendingDrainState,
+                writer::{REPACK_CHECKPOINT_SCHEMA, stamp_slow_vector_state},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 4;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        // Plant a foreign (repack-schema) pin, as an aborted repack would
+        // leave behind.
+        let hidden = st.vector_index_table().expect("hidden index").clone();
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "schema": REPACK_CHECKPOINT_SCHEMA
+        }))
+        .expect("pin metadata");
+        hidden
+            .block_on_query(stamp_slow_vector_state(
+                hidden.inner(),
+                Some(PendingDrainState {
+                    metadata,
+                    entries: Vec::new(),
+                }),
+            ))
+            .expect("plant foreign pin");
+
+        // The drain must ignore the pin and proceed (its own checkpoint
+        // stamp then supersedes it, releasing any pinned orphans).
+        st.drain_vectors_to_cells_sync()
+            .expect("drain proceeds past a foreign repack pin");
     }
 
     /// Directly exercises the over-cap cell split (`split_overflow_cell`). The
