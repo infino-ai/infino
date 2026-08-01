@@ -82,7 +82,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -6433,39 +6433,72 @@ pub(in crate::supertable) async fn refresh_inner_state_async(
 ///   Its writer either died between its list PUT and its pointer CAS (a
 ///   crash orphan), or is mid-commit. Lists are conditional-create and
 ///   never overwritten, so re-deriving the same id can never publish;
-///   walk the contiguous occupied run and return the first free id, so a
-///   single retry escapes the whole run (skipping one id per retry would
-///   still exhaust `max_commit_retries` on a run longer than the budget).
-///   The occupants are left untouched — an orphan stays unreferenced and
-///   ages into the GC sweep, while a live mid-commit writer keeps its
-///   candidate: its pointer CAS and ours are fenced on the same prior
-///   etag, so exactly one wins and the loser retries as usual.
+///   walk the occupied run (bounded per retry) and return the first free
+///   id, so a retry escapes a whole run in chunks instead of one id per
+///   retry, which would exhaust `max_commit_retries` on a run longer than
+///   the budget. The occupants are left untouched — an orphan stays
+///   unreferenced and ages into the GC sweep, while a live mid-commit
+///   writer keeps its candidate: its pointer CAS and ours are fenced on
+///   the same prior etag, so exactly one wins and the loser retries as
+///   usual.
 ///
 /// Both conditions are required. The pointer sitting short of
 /// `attempted_id` alone is not proof of an occupant: a loser's refresh can
 /// run before the winner's pointer CAS lands, and a floored attempt can
 /// lose its etag pre-check with nothing at its id — hence the existence
 /// probe before skipping.
+///
+/// The two conditions still cannot tell a crash orphan from a live winner
+/// that has PUT its list but not yet CAS'd its pointer. Skipping past a
+/// live winner is safe (the etag fence elects exactly one CAS) but leaves
+/// the loser's own earlier list as an orphan, so a hot-contention table
+/// trades some steady-state orphan production — reclaimed by the GC sweep
+/// like any other orphan — for the guarantee that the first commit after a
+/// crash publishes. The `refreshed_id >= attempted_id` pre-check keeps the
+/// common lost-race shape (winner already published) on the dense-id path
+/// with no probe at all.
+///
+/// The floor is advisory: failing to compute it must never fail the
+/// caller's commit. A transient probe error ends the walk at what it has
+/// established so far — a real orphan re-detects on the next contention,
+/// and a persistent storage fault still surfaces through the retry's own
+/// I/O.
 pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     inner: &SupertableInner,
     storage: &Arc<dyn StorageProvider>,
     attempted_id: u64,
 ) -> Result<u64, SupertableCommitError> {
+    /// Cap on sequential HEAD probes per retry. A contiguous orphan run
+    /// longer than this escapes in chunks — each retry's floor lands on
+    /// the first unprobed id and the next collision resumes the walk from
+    /// there — instead of one unbounded serial probe-per-orphan walk
+    /// delaying the commit (on LocalFS a `head` of a small object reads
+    /// its body, so probes are not free).
+    const MAX_ORPHAN_RUN_PROBES: u64 = 32;
+
     refresh_inner_state_async(inner, storage).await?;
     let refreshed_id = inner.manifest.load_full().get_manifest_id();
     if refreshed_id >= attempted_id {
         return Ok(0);
     }
-    // Ids above the pointer are only ever held by unpublished lists, and
-    // every write below the pointer has already happened, so the run of
-    // occupied ids starting at `attempted_id` is finite and the walk
-    // terminates at the first free id.
+    // Ids above the pointer are only ever held by unpublished lists, so
+    // the occupied run starting at `attempted_id` is finite; the floor
+    // contract is only that every id below it is occupied, which holds at
+    // whatever point the walk stops (first free id, probe cap, or a
+    // failed probe).
     let mut next_free_id = attempted_id;
-    loop {
+    while next_free_id < attempted_id + MAX_ORPHAN_RUN_PROBES {
         match storage.head(&manifest_uri(next_free_id)).await {
             Ok(_) => next_free_id += 1,
             Err(StorageError::NotFound { .. }) => break,
-            Err(e) => return Err(SupertableCommitError::Storage(e)),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    manifest_id = next_free_id,
+                    "orphaned-list probe failed; retrying at the last established id"
+                );
+                break;
+            }
         }
     }
     Ok(if next_free_id > attempted_id {
