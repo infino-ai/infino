@@ -57,7 +57,8 @@ use crate::{
         error::BuildError,
         manifest::{
             ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
-            RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitContext, list::WIDTH_LAW_KS,
+            RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitContext,
+            list::{WIDTH_LAW_KS, WIDTH_LAW_MAX_K},
         },
     },
 };
@@ -733,7 +734,7 @@ const LAW_STAGE_TARGET_COVERAGE: f64 = 0.997;
 /// the pool a width-law sweep would actually scan. A `k` point whose
 /// measured width exceeds this stays uncalibrated (the pool under-counts
 /// its distractors), falling back to the configured `rerank_mult`.
-const RERANK_LAW_POOL_CELLS: usize = 64;
+pub(crate) const RERANK_LAW_POOL_CELLS: usize = 64;
 
 /// Rerank-law estimate histogram resolution: per-query counts of pool-row
 /// 1-bit estimates, binned linearly over `[-Σ|q_rot|, +Σ|q_rot|]` (the
@@ -855,6 +856,25 @@ pub(crate) struct CalibratedLaws {
     /// Global 1-bit-estimate survivor budget (rows) for 0.99 containment
     /// of the exact top-k — the measured replacement for `k x rerank_mult`.
     pub(crate) rerank_for_k: [u32; WIDTH_LAW_KS.len()],
+}
+
+/// Post-stamp guard shared by both stamp sites (drain max-merge and
+/// recalibration replace): a rerank point whose STAMPED width exceeds
+/// the calibration's distractor pool is cleared. The previous value was
+/// certified against a narrower geometry — its distractor counts stop
+/// at [`RERANK_LAW_POOL_CELLS`] cells — so carrying it into a wider law
+/// silently under-provisions the survivor budget; `0` falls back to the
+/// configured `rerank_mult`, which is the safe default for the width
+/// the pool never measured.
+pub(crate) fn clear_rerank_beyond_pool(
+    width_for_k: &[u32; WIDTH_LAW_KS.len()],
+    rerank_for_k: &mut [u32; WIDTH_LAW_KS.len()],
+) {
+    for (w, r) in width_for_k.iter().zip(rerank_for_k.iter_mut()) {
+        if *w as usize > RERANK_LAW_POOL_CELLS {
+            *r = 0;
+        }
+    }
 }
 
 /// Floor measured law points to be monotone in `k`, skipping unmeasured
@@ -1019,7 +1039,7 @@ impl WidthLawCalibration {
         partial: Vec<Vec<(f32, u32, i128, f32)>>,
         hist_local: HashMap<usize, Vec<u32>>,
     ) {
-        let k_max = *WIDTH_LAW_KS.last().expect("law has k points");
+        let k_max = WIDTH_LAW_MAX_K;
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
         for (qi, cand) in partial.into_iter().enumerate() {
             merge_candidates(&mut tops[qi], cand, k_max);
@@ -1070,7 +1090,7 @@ impl WidthLawCalibration {
         partial: &mut [Vec<(f32, u32, i128, f32)>],
         hist_local: &mut HashMap<usize, Vec<u32>>,
     ) {
-        let k_max = *WIDTH_LAW_KS.last().expect("law has k points");
+        let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
         let mut est_of = vec![f32::NEG_INFINITY; frozen.ids.len()];
         for row in rows {
@@ -1251,8 +1271,13 @@ impl WidthLawCalibration {
                 .collect()
         });
         let mut rerank_law = [0u32; WIDTH_LAW_KS.len()];
-        let mut rerank_sums = [0f64; WIDTH_LAW_KS.len()];
-        let mut rerank_support = [0usize; WIDTH_LAW_KS.len()];
+        // Pooled candidate ranks per k point: mean coverage at budget N is
+        // #(query, candidate) pairs with rank <= N over (support x k), so
+        // the coverage crossing is EXACTLY the ceil(target x len)-th
+        // smallest pooled rank — the same mean-coverage semantic as the
+        // width and fine walks (a mean of per-query quantile budgets is
+        // NOT: easy queries would subsidize hard ones below target).
+        let mut rerank_ranks: [Vec<u64>; WIDTH_LAW_KS.len()] = Default::default();
         let mut rank_of_cell = vec![0u32; n_cells];
         for (qi, cand) in tops.iter().enumerate() {
             let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
@@ -1298,28 +1323,18 @@ impl WidthLawCalibration {
                     }
                 }
                 if let (Some(rl), Some(prefix)) = (self.rerank.as_ref(), rerank_prefix.as_ref()) {
-                    // Survivor budget for this query at this k: the
-                    // ceil(0.99·k)-th smallest candidate distractor count —
-                    // the global-shortlist size that keeps 0.99 of the
-                    // exact top-k. An unrankable candidate (outside the
-                    // pool, or an empty histogram) makes the query sit the
-                    // point out rather than stamp on partial evidence.
-                    let needed = (LAW_STAGE_TARGET_COVERAGE * k as f64).ceil() as usize;
-                    let mut ranks: Vec<u64> = Vec::with_capacity(k);
+                    // Pool every candidate's distractor count (rows with a
+                    // better-or-equal 1-bit estimate in the query's pool).
+                    // Unrankable candidates (outside the pool, or an empty
+                    // histogram) pool as MAX: they push the coverage
+                    // crossing up or leave the point unsupported —
+                    // conservative both ways.
                     for (_, _, _, est) in &sorted[..k] {
                         if est.is_finite() && !prefix[qi].is_empty() {
-                            ranks.push(prefix[qi][rl.bin(qi, *est)]);
+                            rerank_ranks[ki].push(prefix[qi][rl.bin(qi, *est)]);
                         } else {
-                            ranks.push(u64::MAX);
+                            rerank_ranks[ki].push(u64::MAX);
                         }
-                    }
-                    ranks.sort_unstable();
-                    if needed >= 1
-                        && let Some(&n_q) = ranks.get(needed - 1)
-                        && n_q != u64::MAX
-                    {
-                        rerank_sums[ki] += n_q as f64;
-                        rerank_support[ki] += 1;
                     }
                 }
                 let mut fine_covered = 0u32;
@@ -1346,10 +1361,21 @@ impl WidthLawCalibration {
             // A k point is rerank-measurable only where the pool covered
             // the measured width — beyond it the distractor counts are
             // partial and the point stays uncalibrated.
-            if w == 0 || w as usize > RERANK_LAW_POOL_CELLS || rerank_support[ki] == 0 {
+            let ranks = &mut rerank_ranks[ki];
+            if w == 0 || w as usize > RERANK_LAW_POOL_CELLS || ranks.is_empty() {
                 continue;
             }
-            rerank_law[ki] = (rerank_sums[ki] / rerank_support[ki] as f64).ceil() as u32;
+            // Mean-coverage crossing at the stage target: the
+            // ceil(target x pooled)-th smallest pooled rank. MAX at the
+            // crossing means the evidence cannot certify the target —
+            // the point stays uncalibrated (constant fallback).
+            ranks.sort_unstable();
+            let needed = (LAW_STAGE_TARGET_COVERAGE * ranks.len() as f64).ceil() as usize;
+            if let Some(&crossing) = ranks.get(needed.saturating_sub(1).min(ranks.len() - 1))
+                && crossing != u64::MAX
+            {
+                rerank_law[ki] = crossing.min(u64::from(u32::MAX)) as u32;
+            }
         }
         // Coverage need only grows with k, so each measured point is floored
         // by the measured points below it — sampling noise near the target
@@ -1520,7 +1546,7 @@ mod tests {
         // Plant through the same merge the scorer uses — dedup happens
         // there, BEFORE the truncate, so replicas can never occupy slots.
         let mut acc = Vec::new();
-        merge_candidates(&mut acc, cands, *WIDTH_LAW_KS.last().expect("knots"));
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
         let law = cal
@@ -1563,7 +1589,7 @@ mod tests {
             .map(|id| (id as f32 * 0.01, 0u32, id as i128, f32::NEG_INFINITY))
             .collect();
         let mut acc = Vec::new();
-        merge_candidates(&mut acc, cands, *WIDTH_LAW_KS.last().expect("knots"));
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
         // Unit fine centroids ranked 0, 1, 2 against the e0 query.
@@ -1597,6 +1623,26 @@ mod tests {
             "top-10 coverage needs the rank-2 cluster"
         );
         assert_eq!(&laws.fine_for_k[2..], &[0, 0], "unsupported points stay 0");
+    }
+
+    /// A stamped width beyond the calibration pool clears the rerank
+    /// point (previous values were certified for narrower geometry and
+    /// under-provision the wider one); widths within the pool keep it.
+    #[test]
+    fn rerank_points_clear_when_stamped_width_outgrows_pool() {
+        let width = [
+            1,
+            RERANK_LAW_POOL_CELLS as u32,
+            (RERANK_LAW_POOL_CELLS + 1) as u32,
+            500,
+        ];
+        let mut rerank = [10, 20, 30, 40];
+        clear_rerank_beyond_pool(&width, &mut rerank);
+        assert_eq!(
+            rerank,
+            [10, 20, 0, 0],
+            "points at widths beyond the pool must fall back to the constant"
+        );
     }
 
     /// The rerank law reads each exact-top-k candidate's survivor budget
@@ -1636,7 +1682,7 @@ mod tests {
             })
             .collect();
         let mut acc = Vec::new();
-        merge_candidates(&mut acc, cands, *WIDTH_LAW_KS.last().expect("knots"));
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
         let laws = cal.finish(&grid).expect("laws from planted candidates");
@@ -1674,7 +1720,7 @@ mod tests {
             .map(|id| (id as f32 * 0.01, 0u32, id as i128, f32::NEG_INFINITY))
             .collect();
         let mut acc = Vec::new();
-        merge_candidates(&mut acc, cands, *WIDTH_LAW_KS.last().expect("knots"));
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
         // id 10 is missing from the view: its rank is unobservable.
@@ -1731,7 +1777,7 @@ mod tests {
             queries,
             ids: vec![998, 999],
         });
-        let k_max = *WIDTH_LAW_KS.last().expect("knots");
+        let k_max = WIDTH_LAW_MAX_K;
         // A: distinct ids 1..=10 spread 2/2/3/3 over cells 0..=3, so its
         // 0.99 top-10 coverage needs the 4th-ranked cell.
         let a: Vec<(f32, u32, i128, f32)> = (1..=10)
@@ -1798,7 +1844,7 @@ mod tests {
         merge_candidates(
             &mut acc,
             vec![(0.01, 7, 1, f32::NEG_INFINITY)],
-            *WIDTH_LAW_KS.last().expect("knots"),
+            WIDTH_LAW_MAX_K,
         );
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
         assert!(

@@ -345,6 +345,11 @@ pub struct VectorColumnInfo {
 /// stays within one decade of a measured point.
 pub(crate) const WIDTH_LAW_KS: [usize; 4] = [1, 10, 100, 1000];
 
+/// The largest calibrated `k` knot — the accumulator cap every law walk
+/// shares. A const, not `.last().expect(..)`: the knot table is never
+/// empty by construction, and src/ stays panic-free.
+pub(crate) const WIDTH_LAW_MAX_K: usize = WIDTH_LAW_KS[WIDTH_LAW_KS.len() - 1];
+
 /// Adaptive cell-probe tuning for the hidden VectorCell index.
 /// Calibrated per table; persisted in the manifest list.
 #[derive(Debug, Clone, Copy, PartialEq)]

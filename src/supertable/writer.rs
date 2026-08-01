@@ -4022,6 +4022,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
                 *slot = (*slot).max(measured);
             }
+            opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
             info!(
                 "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
                 laws.width_for_k,
@@ -5890,6 +5891,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             *slot = measured;
         }
     }
+    opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
     let list_metadata = CommitListMetadata {
         partition_strategy: Some(PartitionStrategy::VectorCell {
             column: column.clone(),
