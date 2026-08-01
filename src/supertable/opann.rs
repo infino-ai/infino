@@ -830,8 +830,10 @@ struct RerankLawObservation {
     /// grid-nearest cells.
     pools: Vec<Vec<u32>>,
     /// Per query estimate histogram (`RERANK_LAW_EST_BINS` bins,
-    /// bin 0 = best estimate).
-    hist: Mutex<Vec<Vec<u32>>>,
+    /// bin 0 = best estimate). `u64` + saturating merges: a dense pool
+    /// on a large table must never wrap a bin and silently NARROW the
+    /// measured survivor budget.
+    hist: Mutex<Vec<Vec<u64>>>,
 }
 
 impl RerankLawObservation {
@@ -973,7 +975,7 @@ impl WidthLawCalibration {
         }
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
-        let mut hist_local: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
         let mut reader = spill.reader()?;
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
@@ -1013,7 +1015,7 @@ impl WidthLawCalibration {
         }
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
-        let mut hist_local: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
         let mut scratch = vec![0f32; self.dim];
         for chunk in rows.chunks(WIDTH_LAW_SCORE_CHUNK) {
             self.score_slice(
@@ -1037,7 +1039,7 @@ impl WidthLawCalibration {
     fn merge_partial(
         &self,
         partial: Vec<Vec<(f32, u32, i128, f32)>>,
-        hist_local: HashMap<usize, Vec<u32>>,
+        hist_local: HashMap<usize, Vec<u64>>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1055,7 +1057,7 @@ impl WidthLawCalibration {
                     *slot = delta;
                 } else {
                     for (a, b) in slot.iter_mut().zip(delta) {
-                        *a += b;
+                        *a = a.saturating_add(b);
                     }
                 }
             }
@@ -1088,7 +1090,7 @@ impl WidthLawCalibration {
         members: &[usize],
         scratch: &mut [f32],
         partial: &mut [Vec<(f32, u32, i128, f32)>],
-        hist_local: &mut HashMap<usize, Vec<u32>>,
+        hist_local: &mut HashMap<usize, Vec<u64>>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
@@ -1112,9 +1114,11 @@ impl WidthLawCalibration {
                         rl.q_total[qi],
                     );
                     est_of[qi] = est;
-                    hist_local
+                    let bins = hist_local
                         .entry(qi)
-                        .or_insert_with(|| vec![0u32; RERANK_LAW_EST_BINS])[rl.bin(qi, est)] += 1;
+                        .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                    let bin = rl.bin(qi, est);
+                    bins[bin] = bins[bin].saturating_add(1);
                 }
             }
             dequantize_row_into(&row.encoded, scratch);
@@ -1270,7 +1274,7 @@ impl WidthLawCalibration {
                     let mut run = 0u64;
                     h.iter()
                         .map(|&c| {
-                            run += u64::from(c);
+                            run = run.saturating_add(c);
                             run
                         })
                         .collect()
@@ -1677,7 +1681,7 @@ mod tests {
             pools: vec![vec![0]],
             hist: Mutex::new(vec![Vec::new()]),
         };
-        let mut hist = vec![0u32; RERANK_LAW_EST_BINS];
+        let mut hist = vec![0u64; RERANK_LAW_EST_BINS];
         hist[rl.bin(0, 0.9)] = 3;
         hist[rl.bin(0, 0.5)] = 50;
         *rl.hist.lock().unwrap_or_else(PoisonError::into_inner) = vec![hist];

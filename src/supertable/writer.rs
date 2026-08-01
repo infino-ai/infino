@@ -166,7 +166,10 @@ use crate::{
             options_hash,
             part::{self as part_mod, PartId},
         },
-        query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
+        query::{
+            dispatch::{open_compaction_input, open_reader},
+            vector::stable_ids_by_local_for_routing,
+        },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state,
         slow_vector_state::{CentroidSection, fetch_centroid_section},
@@ -5761,31 +5764,32 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     }
 
     let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
-    // Query-sample pass: every `step`-th row of the cell-ordered live-row
-    // enumeration, WIDTH_LAW_QUERY_SAMPLE picks total. Counts are physical
-    // (tombstones included), the loaded rows are live — each picked ordinal
-    // is mapped proportionally onto the cell's live rows below.
-    // Ceiling division: a floor stride overshoots the sample whenever
-    // total_docs is not an exact multiple (511 docs -> step 1 -> 511
-    // picks); ceil keeps the pick count at or under the requested size.
-    let step = total_docs
-        .div_ceil(opann::WIDTH_LAW_QUERY_SAMPLE as u64)
-        .max(1);
+    // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
+    // evenly spaced ordinals over the cell-ordered live-row enumeration —
+    // the law's noise floor is set by evidence size, and any fixed stride
+    // drifts off it near the boundaries (floor overshoots: 511 docs ->
+    // 511 picks; ceil undershoots: 257 docs -> 129 picks). Counts are
+    // physical (tombstones included); each picked ordinal is mapped
+    // proportionally onto the cell's live rows below.
+    let sample_count = total_docs.min(opann::WIDTH_LAW_QUERY_SAMPLE as u64);
+    let sample_ordinals: Vec<u64> = (0..sample_count)
+        .map(|i| i * total_docs / sample_count)
+        .collect();
     let mut picks: BTreeMap<(usize, u32), Vec<u32>> = BTreeMap::new();
     let mut base = 0u64;
-    let mut next_pick = 0u64;
+    let mut next_pick = 0usize;
     'outer: for (ei, (_, cells)) in work.iter().enumerate() {
         for &(cell, n) in cells {
             let end = base + u64::from(n);
-            while next_pick < end {
+            while next_pick < sample_ordinals.len() && sample_ordinals[next_pick] < end {
                 picks
                     .entry((ei, cell))
                     .or_default()
-                    .push((next_pick - base) as u32);
-                next_pick += step;
-                if next_pick >= total_docs {
-                    break 'outer;
-                }
+                    .push((sample_ordinals[next_pick] - base) as u32);
+                next_pick += 1;
+            }
+            if next_pick == sample_ordinals.len() {
+                break 'outer;
             }
             base = end;
         }
@@ -5870,11 +5874,25 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 .await
                 .map_err(|_| BuildError::Store("recalibration score task dropped".into()))??;
         }
-        let (reader, _bitmap) = open_ivf_reader_with_tombstones(inner, entry, now).await?;
-        // Resident-only read: `None` (cold bytes, or a legacy single-cell
-        // layout) skips this superfile's depth observation — the finish
-        // fallback below keeps the previous depth law rather than
-        // shallowing it on partial evidence.
+        // The fine observation reads subsection/stable-id bytes
+        // SYNCHRONOUSLY (`cell_fine_calibration_views` resolves through
+        // `try_get_range_sync`), and the lazy query opener only exposes
+        // sync bytes after a BACKGROUND mmap promotion — a fresh
+        // post-compaction output racing that promotion would silently
+        // skip its depth observation and keep the previous law, the
+        // staleness this pass exists to fix. Open the way compaction
+        // opens its own inputs: resident bytes guaranteed.
+        let reader = open_compaction_input(
+            &inner.options.store,
+            inner.options.disk_cache.as_ref(),
+            inner.options.storage.as_ref(),
+            entry,
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        // `None` here is a legacy single-cell layout — skip its depth
+        // observation; the finish fallback keeps the previous depth law
+        // rather than shallowing it on partial evidence.
         if let Some(views) = reader
             .vec()
             .and_then(|v| v.cell_fine_calibration_views(&column))
