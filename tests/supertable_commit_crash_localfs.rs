@@ -53,6 +53,7 @@
 //! | `crash_post_hidden_list_yields_pre_split_index`                | Batched cell split: hidden list PUT, before its pointer | Hidden index at drained state; orphans GC'd |
 //! | `crash_post_hidden_pointer_yields_split_index`                 | Batched cell split: hidden pointer CAS AFTER it lands | Split durable + immediately queryable (regression tripwire for the pre-#498 window); post-crash `optimize` + `gc` run clean |
 //! | `crash_post_hidden_repack_shard_yields_pre_split_index`        | Bulk repack: first packed-shard PUT (pre-pin, pre-commit) | Hidden index at drained state; orphan shard GC'd |
+//! | `crash_between_split_batches_yields_first_batch`               | Two batches: crash in batch 2's pin stamp, after batch 1's commit | Batch 1 durable + queryable; batch 2 orphans GC'd |
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
 //! filesystem behavior; RustFS's crash story is its own
@@ -116,6 +117,9 @@ const KP_HIDDEN_SPLIT_POINTER: &str = "hidden-split-pointer";
 /// Bulk-repack variant: crash on the repack's first packed-shard PUT,
 /// before its slow-CAS pin and commit.
 const KP_HIDDEN_REPACK_SEG: &str = "hidden-repack-seg";
+/// Multi-batch variant: two sequential single-cell batches; crash inside
+/// batch 2's window, after batch 1's commit is durable.
+const KP_HIDDEN_SPLIT_SECOND_LIST: &str = "hidden-split-second-list";
 
 /// Exit code used when the crash child finishes WITHOUT aborting —
 /// signals a misconfigured kill point (distinct from a clean exit).
@@ -354,8 +358,14 @@ fn vector_crash_fixture() -> (SupertableOptions, arrow_array::RecordBatch) {
 fn hidden_kill_point_config(kp: &str) -> (&'static str, usize) {
     match kp {
         KP_HIDDEN_SPLIT_SEG | KP_HIDDEN_REPACK_SEG => ("_vector_index/data/", 1),
+        // nth 1 on list/pointer is the batch's upload-PIN stamp; the
+        // membership commit's list/pointer are nth 2.
         KP_HIDDEN_SPLIT_LIST => ("_vector_index/manifest/", 1),
-        KP_HIDDEN_SPLIT_POINTER => ("_vector_index/_supertable/current", 1),
+        KP_HIDDEN_SPLIT_POINTER => ("_vector_index/_supertable/current", 2),
+        // Second batch's pin-list PUT: batch 1 pin list (1) + batch 1
+        // commit list (2) + batch 2 pin list (3) — a crash BETWEEN batch
+        // commits, after batch 1 is durable.
+        KP_HIDDEN_SPLIT_SECOND_LIST => ("_vector_index/manifest/", 3),
         other => panic!("unknown hidden kill point {other}"),
     }
 }
@@ -392,6 +402,12 @@ fn run_vector_crash_child(dir: PathBuf, kill_point: &str) -> ! {
     wrapped.arm();
     let split = if kill_point == KP_HIDDEN_REPACK_SEG {
         st.repack_all_hidden_cells_sync().expect("repack") > 0
+    } else if kill_point == KP_HIDDEN_SPLIT_SECOND_LIST {
+        // Two sequential single-cell batches: the kill point sits inside
+        // batch 2's window, so batch 1 must land durably first.
+        let first = st.split_busiest_hidden_cell_sync().expect("first split");
+        let second = st.split_busiest_hidden_cell_sync().expect("second split");
+        first && second
     } else {
         st.split_busiest_hidden_cell_sync().expect("split")
     };
@@ -502,8 +518,10 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
         .trim()
         .parse()
         .expect("marker holds a manifest id");
+    // A durable batch advances the id twice: its upload-pin stamp and its
+    // membership commit.
     let expect_hidden_manifest_id = if expect_split_generation {
-        drained_id + 1
+        drained_id + 2
     } else {
         drained_id
     };
@@ -521,6 +539,14 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
         expect_hidden_manifest_id,
         "hidden index generation after the crash (drained at {drained_id})"
     );
+
+    // Sweep FIRST — production's recovery order. A crash between a list
+    // PUT and its pointer CAS (e.g. inside a pin stamp) leaves an orphaned
+    // next-id manifest list, and the NEXT commit at that id fails with
+    // write contention until the orphan is reclaimed — a pre-existing
+    // property of the one-writer-per-manifest-id list PUT, surfaced by the
+    // between-batches kill point.
+    let report = hidden.gc(Duration::ZERO).expect("hidden gc");
 
     if expect_split_generation {
         // The crash interrupted maintenance BETWEEN the split commit and the
@@ -573,7 +599,6 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
         "every planted doc is retrievable after the crash"
     );
 
-    let report = hidden.gc(Duration::ZERO).expect("hidden gc");
     report.objects_deleted
 }
 
@@ -755,6 +780,28 @@ fn crash_post_hidden_repack_shard_yields_pre_split_index() {
     assert!(
         deleted >= 1,
         "the uploaded-but-unpinned repack shard is an orphan gc reclaims; deleted {deleted}"
+    );
+}
+
+/// Crash BETWEEN two batch commits (inside batch 2's upload-pin stamp,
+/// after batch 1's pointer CAS): the pass's mid-loop contract — each batch
+/// is all-or-nothing and a partial pass leaves a valid, partially-split
+/// grid the next optimize finishes. Batch 1's split is durable and
+/// queryable; batch 2's uploads are reclaimable orphans; `optimize`
+/// completes the pass.
+#[test]
+fn crash_between_split_batches_yields_first_batch() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_between_split_batches_yields_first_batch",
+        KP_HIDDEN_SPLIT_SECOND_LIST,
+    );
+    let deleted = verify_hidden_split_crash(&dir, true);
+    assert!(
+        deleted >= 1,
+        "batch 2's uploaded-but-unpinned children are orphans gc reclaims; deleted {deleted}"
     );
 }
 

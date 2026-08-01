@@ -5278,10 +5278,19 @@ const SPLIT_RESIDENT_BYTES_PER_ROW_DIM: u64 = 7;
 /// operator-facing story. `0` degenerates to one split per batch.
 fn split_batch_memory_budget_bytes() -> u64 {
     const MIB: u64 = 1024 * 1024;
-    config::global()
-        .vector
-        .compaction_max_memory_mb
-        .saturating_mul(MIB)
+    /// Window used when `vector.compaction_max_memory_mb` is 0: the merge
+    /// phase reads 0 as "no byte ceiling", but a zero SPLIT window would
+    /// silently collapse batching to one split per commit — reintroducing
+    /// the per-commit fixed costs batching exists to amortize. Same value
+    /// as that knob's shipped default.
+    const SPLIT_BATCH_FALLBACK_BUDGET_MIB: u64 = 4096;
+    let configured = config::global().vector.compaction_max_memory_mb;
+    let budget_mib = if configured == 0 {
+        SPLIT_BATCH_FALLBACK_BUDGET_MIB
+    } else {
+        configured
+    };
+    budget_mib.saturating_mul(MIB)
 }
 
 /// Estimated peak resident bytes for splitting one cell of `physical_rows`
@@ -5595,6 +5604,45 @@ fn plan_split_wave(
         .collect()
 }
 
+/// Pin uploaded-but-uncommitted split output in the slow-CAS pending slot
+/// so gc's live set covers it until the membership commit publishes (and,
+/// via its own restamp, clears the pin). `probe_existing` warns if the
+/// stamp replaces a DRAIN-schema checkpoint: inside optimize the drain
+/// phase precedes the split pass, so a drain pin surviving to this point
+/// was already unconsumable (a stale crash leftover) — replacing it
+/// releases its orphans to age out, but it should never happen silently.
+async fn pin_uploaded_superfiles(
+    inner: &SupertableInner,
+    entries: Vec<Arc<SuperfileEntry>>,
+    probe_existing: bool,
+) -> Result<(), BuildError> {
+    if probe_existing {
+        let manifest = inner.manifest.load_full();
+        if let (Some((uri, hash)), Some(storage)) = (
+            manifest.slow_vector_state_blob(),
+            inner.options.storage.as_ref(),
+        ) && let Ok(state) =
+            slow_vector_state::load_full_state(storage.as_ref(), uri, &hash).await
+            && let Some(pending) = state.pending_drain
+            && pending_metadata_schema(&pending.metadata) == Some(DRAIN_CHECKPOINT_SCHEMA)
+        {
+            warn!(
+                "split upload pin replacing a stale drain checkpoint (the drain phase \
+                 precedes the split pass, so a surviving drain pin is unconsumable)"
+            );
+        }
+    }
+    let metadata = serde_json::to_vec(&RepackCheckpoint {
+        schema: REPACK_CHECKPOINT_SCHEMA,
+    })
+    .map_err(|error| BuildError::Store(format!("split upload pin encode: {error}")))?;
+    stamp_slow_vector_state(
+        inner,
+        Some(slow_vector_state::PendingDrainState { metadata, entries }),
+    )
+    .await
+}
+
 /// One repacked split: its children already packed as spilled cell
 /// subsections on scratch disk, awaiting shard assembly.
 struct RepackedSplit {
@@ -5799,6 +5847,11 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
                     let mut groups: Vec<Vec<MaterializedIvfRow>> =
                         (0..child_ids.len()).map(|_| Vec::new()).collect();
                     for (row, &side) in rows.into_iter().zip(assign.iter()) {
+                        debug_assert!(
+                            (side as usize) < child_ids.len(),
+                            "planner assignment {side} outside {} children",
+                            child_ids.len()
+                        );
                         groups[(side as usize).min(child_ids.len() - 1)].push(row);
                     }
                     let child_counts: Vec<u32> = groups.iter().map(|g| g.len() as u32).collect();
@@ -5912,6 +5965,14 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         upload?;
     }
     drop(in_flight);
+
+    // Pin the uploaded children until the commit publishes them (the same
+    // protection as the repack's per-shard pin): the upload window is
+    // byte-bounded, not time-bounded, and a degraded store plus a
+    // concurrent commit's deferred reclaim could otherwise sweep an
+    // uploaded-but-uncommitted child past the grace. One stamp per batch;
+    // the commit's own restamp clears it.
+    pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
 
     // Publish the child superfiles, the supersede markers, and the grown
     // grid in one OCC attempt for the WHOLE batch. The parents are NOT
@@ -6084,6 +6145,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
     // Wave loop: largest candidates first, smaller ones packing whatever
     // byte budget remains (the first is always admitted so the pass can't
     // stall on one oversized cell).
+    let cell_bytes: HashMap<u32, u64> = candidates.iter().copied().collect();
     let mut queue: Vec<(u32, u64)> = candidates;
     while !queue.is_empty() {
         let mut wave_cells: Vec<u32> = Vec::new();
@@ -6105,6 +6167,43 @@ pub(in crate::supertable) async fn split_repack_bulk(
         queue = deferred;
         if wave_cells.is_empty() {
             continue;
+        }
+        // Same refuse-and-shrink gate as the batched loop: reserve the wave
+        // against the connection budget; on denial shrink to the largest
+        // cell alone (which proceeds unreserved — parity with the batched
+        // path's single-split fallback), re-queueing the rest.
+        let wave_reservation: Option<Reservation> = match inner
+            .options
+            .connection_memory_budget
+            .try_reserve(usize::try_from(wave_bytes).unwrap_or(usize::MAX))
+        {
+            Ok(reservation) => Some(reservation),
+            Err(_) if wave_cells.len() > 1 => {
+                let requeue: Vec<(u32, u64)> = wave_cells
+                    .split_off(1)
+                    .into_iter()
+                    .map(|cell| (cell, cell_bytes.get(&cell).copied().unwrap_or(0)))
+                    .collect();
+                let mut restored = requeue;
+                restored.append(&mut queue);
+                queue = restored;
+                let single = estimate_split_resident_bytes(
+                    cell_bytes.get(&wave_cells[0]).copied().unwrap_or(0),
+                    dim,
+                );
+                inner
+                    .options
+                    .connection_memory_budget
+                    .try_reserve(usize::try_from(single).unwrap_or(usize::MAX))
+                    .ok()
+            }
+            Err(_) => None,
+        };
+        if wave_reservation.is_none() {
+            debug!(
+                cell = wave_cells[0],
+                "repack: budget denied; single-cell wave proceeds unreserved"
+            );
         }
 
         let jobs = live_split_extraction_jobs(&wave_cells, parents_by_cell, superseded_map);
@@ -6175,6 +6274,11 @@ pub(in crate::supertable) async fn split_repack_bulk(
                         let mut groups: Vec<Vec<MaterializedIvfRow>> =
                             (0..child_ids.len()).map(|_| Vec::new()).collect();
                         for (row, &side) in rows.into_iter().zip(assign.iter()) {
+                            debug_assert!(
+                                (side as usize) < child_ids.len(),
+                                "planner assignment {side} outside {} children",
+                                child_ids.len()
+                            );
                             groups[(side as usize).min(child_ids.len() - 1)].push(row);
                         }
                         let child_counts: Vec<u32> =
@@ -6315,10 +6419,6 @@ pub(in crate::supertable) async fn split_repack_bulk(
         .iter()
         .map(|entry| (entry.uri, Arc::clone(entry)))
         .collect();
-    let pin_metadata = serde_json::to_vec(&RepackCheckpoint {
-        schema: REPACK_CHECKPOINT_SCHEMA,
-    })
-    .map_err(|error| BuildError::Store(format!("repack pin encode: {error}")))?;
     let multipart_threshold = inner.options.put_multipart_threshold_bytes;
     let uploads = pending_storage_writes.into_iter().map(|(uri, bytes)| {
         let storage = Arc::clone(&storage);
@@ -6335,14 +6435,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         let uri = landed?;
         if let Some(entry) = entry_by_uri.get(&uri) {
             pinned.push(Arc::clone(entry));
-            stamp_slow_vector_state(
-                inner,
-                Some(slow_vector_state::PendingDrainState {
-                    metadata: pin_metadata.clone(),
-                    entries: pinned.clone(),
-                }),
-            )
-            .await?;
+            pin_uploaded_superfiles(inner, pinned.clone(), pinned.len() == 1).await?;
         }
     }
     drop(in_flight);
@@ -6572,17 +6665,21 @@ pub(in crate::supertable) async fn split_overflow_cells(
         // refuse-only gate compaction's merge uses. On denial, shrink to a
         // single cell; a single split proceeds unreserved (the pre-batch
         // path never reserved, and failing the pass here would regress it).
+        // Fail closed on narrow targets: an estimate that doesn't fit usize
+        // reserves usize::MAX, which is always denied and takes the shrink
+        // path below instead of silently under-reserving.
         let reservation: Option<Reservation> = match inner
             .options
             .connection_memory_budget
-            .try_reserve(estimated_bytes as usize)
+            .try_reserve(usize::try_from(estimated_bytes).unwrap_or(usize::MAX))
         {
             Ok(reservation) => Some(reservation),
             Err(_) => {
                 if batch.len() > 1 {
                     batch.truncate(1);
                     let n = cell_counts.get(&batch[0]).copied().unwrap_or(0);
-                    let single_bytes = estimate_split_resident_bytes(n, dim) as usize;
+                    let single_bytes = usize::try_from(estimate_split_resident_bytes(n, dim))
+                        .unwrap_or(usize::MAX);
                     inner
                         .options
                         .connection_memory_budget

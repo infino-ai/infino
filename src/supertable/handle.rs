@@ -4490,10 +4490,12 @@ mod tests {
 
         let reader = hidden.reader().expect("reader");
         let manifest = reader.manifest();
+        // Membership publishes ONCE; the batch's upload pin is its own
+        // etag-CAS stamp, so the id advances by two.
         assert_eq!(
             manifest.manifest_id,
-            manifest_id_before + 1,
-            "the whole batch publishes in ONE manifest commit"
+            manifest_id_before + 2,
+            "one upload-pin stamp + ONE membership commit"
         );
         match manifest.get_partition_strategy() {
             PartitionStrategy::VectorCell { clusters, .. } => {
@@ -4625,39 +4627,6 @@ mod tests {
         w.append(&batch).expect("append");
         w.commit().expect("commit");
         st.drain_vectors_to_cells_sync().expect("drain to cells");
-
-        // Reopen from storage before the repack: a CREATE-ERA hidden handle
-        // carries no partition strategy in its OPTIONS, and the commit's
-        // slow-state restamp (step 2b) is options-gated until the
-        // manifest-gating fix from the split-visibility-bug branch lands —
-        // the slow-ref/pin assertions below need the reopened handle shape,
-        // which is also how production optimize reaches this path.
-        drop(st);
-        let reopened_options = SupertableOptions::new(
-            schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![VectorConfig {
-                column: "emb".into(),
-                dim,
-                rot_seed: 7,
-                metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8Residual,
-                provided_centroids: None,
-            }],
-            Some(crate::test_helpers::default_tokenizer()),
-        )
-        .expect("valid options")
-        .with_storage(Arc::clone(&storage))
-        .with_writer_pool(Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .expect("pool"),
-        ));
-        let st = Supertable::open(reopened_options).expect("reopen");
 
         let hidden = st
             .reader()
