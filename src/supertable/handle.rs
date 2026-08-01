@@ -504,12 +504,14 @@ impl Supertable {
             PointerProbe::NotModified => return Ok(false),
             PointerProbe::Read(pointer, meta) => (pointer, meta),
         };
-        *self
-            .inner
-            .last_pointer_etag
-            .lock()
-            .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
 
+        // Record the new pointer etag only once we've actually accounted for
+        // this pointer version — after a successful load, or when our in-memory
+        // state already covers it. Recording it *before* the load would, on a
+        // load failure (e.g. a manifest not yet visible to this process),
+        // advance the etag while the snapshot stays behind: the next conditional
+        // probe would then see `NotModified` and never retry the load, pinning
+        // the handle to the pre-commit manifest and serving its rows as empty.
         let current = self.inner.manifest.load_full();
         let manifest = match ManifestSnapshot::load_with_pointer(
             Some(current),
@@ -520,15 +522,28 @@ impl Supertable {
         .await
         {
             Ok(manifest) => manifest,
-            // Pointer changed but our in-memory state already
-            // covers it (e.g. this process's own commit rewrote
-            // the pointer) — nothing newer to load, and the etag
-            // captured above makes the next probe a 304.
-            Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
+            // Pointer changed but our in-memory state already covers it (e.g.
+            // this process's own commit rewrote the pointer) — nothing newer to
+            // load. Record the etag so the next probe is a cheap 304.
+            Err(ManifestLoadError::AlreadyLoaded) => {
+                *self
+                    .inner
+                    .last_pointer_etag
+                    .lock()
+                    .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
+                return Ok(false);
+            }
+            // Load failed. Leave the etag unchanged so the next probe reads the
+            // pointer again and retries rather than short-circuiting to 304.
             Err(err) => return Err(err),
         };
         self.inner.manifest.store(manifest);
         self.inner.reconcile_tombstone_seqs();
+        *self
+            .inner
+            .last_pointer_etag
+            .lock()
+            .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
         debug!(
             manifest_id = self.inner.manifest.load().manifest_id,
             "refreshed manifest"
@@ -4509,7 +4524,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -4854,7 +4868,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim: DIM,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -6383,6 +6396,149 @@ mod tests {
             bm25_title_hits(&consumer, "added"),
             1,
             "recovers to v2 after the probe heals"
+        );
+    }
+
+    /// A [`StorageProvider`] that fails to read the manifest *list* on demand
+    /// while letting the pointer probe through — models the pointer advancing
+    /// before its manifest is readable by this process, so the failure lands
+    /// inside `load_with_pointer`, after the pointer re-check succeeded.
+    #[derive(Debug)]
+    struct FailManifestGet {
+        inner: Arc<dyn StorageProvider>,
+        fail: AtomicBool,
+    }
+
+    impl FailManifestGet {
+        fn new(inner: Arc<dyn StorageProvider>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                fail: AtomicBool::new(false),
+            })
+        }
+        fn set_failing(&self, failing: bool) {
+            self.fail.store(failing, Ordering::SeqCst);
+        }
+        // The manifest list is `manifest/manifest-NNNNNN.json`; the pointer
+        // (`_supertable/current`) and parts (`manifest_parts/part-…`) don't
+        // contain `manifest-`, so only the list read is faulted.
+        fn should_fail(&self, uri: &str) -> bool {
+            self.fail.load(Ordering::SeqCst) && uri.contains("manifest-")
+        }
+        fn injected(uri: &str) -> StorageError {
+            StorageError::TransientExhausted {
+                uri: uri.to_string(),
+                source: "injected manifest-list fault".into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for FailManifestGet {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            if self.should_fail(uri) {
+                return Err(Self::injected(uri));
+            }
+            self.inner.get(uri).await
+        }
+        async fn get_if_none_match(
+            &self,
+            uri: &str,
+            etag: &str,
+        ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
+            self.inner.get_if_none_match(uri, etag).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+            self.inner.tail(uri, len).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+        async fn list_with_prefix_metadata(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+            self.inner.list_with_prefix_metadata(prefix).await
+        }
+    }
+
+    /// Regression: a refresh whose pointer probe *succeeds* but whose manifest
+    /// load *fails* must not advance the last-seen pointer etag. If it did, the
+    /// next conditional probe would answer `NotModified` and never retry the
+    /// load — pinning the handle to the pre-commit manifest and serving its rows
+    /// as empty even after the load could succeed.
+    #[test]
+    fn strong_read_recovers_after_a_manifest_load_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // A writer commits v1.
+        let producer = Supertable::create(opts().with_storage(Arc::clone(&inner))).expect("create");
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["initial"])).expect("append v1");
+        w.commit().expect("commit v1");
+        drop(w);
+
+        // The consumer reads through the manifest-fault wrapper, Strong.
+        let fault = FailManifestGet::new(Arc::clone(&inner));
+        let consumer = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&fault) as Arc<dyn StorageProvider>)
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("open");
+        // First read pins v1 and captures its pointer etag.
+        assert_eq!(bm25_title_hits(&consumer, "initial"), 1, "sees v1");
+
+        // The producer commits v2.
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["added"])).expect("append v2");
+        w.commit().expect("commit v2");
+        drop(w);
+
+        // The consumer's next Strong read reaches the new pointer but its
+        // manifest load fails — it must surface the error, not silently pin.
+        fault.set_failing(true);
+        let err = consumer
+            .reader()
+            .expect_err("a Strong read must fail closed when the manifest load fails");
+        assert!(
+            matches!(err, ManifestLoadError::Storage(_)),
+            "expected a storage error from the failed load, got {err:?}"
+        );
+
+        // Once the load heals, the same read must refresh to v2 — i.e. the failed
+        // load did NOT poison the pointer etag into a permanent `NotModified`.
+        fault.set_failing(false);
+        assert_eq!(
+            bm25_title_hits(&consumer, "added"),
+            1,
+            "recovers to v2 after a transient manifest-load failure"
         );
     }
 
