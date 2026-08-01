@@ -453,16 +453,22 @@ fn read_u8(cursor: &mut &[u8]) -> Result<u8> {
     Ok(bytes[0])
 }
 
-fn read_u32(cursor: &mut &[u8]) -> Result<u32> {
+pub(crate) fn read_u32(cursor: &mut &[u8]) -> Result<u32> {
     let mut bytes = [0u8; 4];
     read_exact(cursor, &mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_u64(cursor: &mut &[u8]) -> Result<u64> {
+pub(crate) fn read_u64(cursor: &mut &[u8]) -> Result<u64> {
     let mut bytes = [0u8; 8];
     read_exact(cursor, &mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+pub(crate) fn read_f32(cursor: &mut &[u8]) -> Result<f32> {
+    let mut bytes = [0u8; 4];
+    read_exact(cursor, &mut bytes)?;
+    Ok(f32::from_le_bytes(bytes))
 }
 
 fn invalid_data<T>(message: &str) -> Result<T> {

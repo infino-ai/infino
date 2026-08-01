@@ -186,30 +186,6 @@ struct GtBin {
     heaps: Vec<HeldTopK>,
 }
 
-fn gt_rd_u32(b: &[u8], p: &mut usize) -> std::io::Result<u32> {
-    let s = b.get(*p..*p + 4).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "GT bin truncated")
-    })?;
-    *p += 4;
-    Ok(u32::from_le_bytes(s.try_into().unwrap()))
-}
-
-fn gt_rd_u64(b: &[u8], p: &mut usize) -> std::io::Result<u64> {
-    let s = b.get(*p..*p + 8).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "GT bin truncated")
-    })?;
-    *p += 8;
-    Ok(u64::from_le_bytes(s.try_into().unwrap()))
-}
-
-fn gt_rd_f32(b: &[u8], p: &mut usize) -> std::io::Result<f32> {
-    let s = b.get(*p..*p + 4).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "GT bin truncated")
-    })?;
-    *p += 4;
-    Ok(f32::from_le_bytes(s.try_into().unwrap()))
-}
-
 /// Serialize the running GT heaps to `path` atomically (temp + rename) so a
 /// crash never leaves a half-written bin. The header carries the provenance a
 /// reload needs to reject an incompatible bin.
@@ -249,20 +225,22 @@ fn gt_bin_write(
 /// bin *contents* vs the indexed vectors can't be verified here; the caller
 /// warns and reconciles the covered `m` against the index's committed count.
 fn gt_bin_read(path: &str, n_queries: usize, n_cent: usize) -> std::io::Result<GtBin> {
+    use crate::corpus::grading::{read_f32, read_u32, read_u64};
     let mkerr = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
     let b = std::fs::read(path)?;
     if b.get(0..4) != Some(b"GTB1".as_slice()) {
         return Err(mkerr("GT bin: bad magic".into()));
     }
-    let mut p = 4usize;
-    let _version = gt_rd_u32(&b, &mut p)?;
-    let m = gt_rd_u64(&b, &mut p)? as usize;
-    let f_nq = gt_rd_u64(&b, &mut p)? as usize;
-    let f_nc = gt_rd_u64(&b, &mut p)? as usize;
-    let f_dim = gt_rd_u32(&b, &mut p)? as usize;
-    let f_k = gt_rd_u32(&b, &mut p)? as usize;
-    let f_vseed = gt_rd_u64(&b, &mut p)?;
-    let f_qseed = gt_rd_u64(&b, &mut p)?;
+    // Cursor past the 4-byte magic; the shared `grading` readers advance it.
+    let mut cur: &[u8] = &b[4..];
+    let _version = read_u32(&mut cur)?;
+    let m = read_u64(&mut cur)? as usize;
+    let f_nq = read_u64(&mut cur)? as usize;
+    let f_nc = read_u64(&mut cur)? as usize;
+    let f_dim = read_u32(&mut cur)? as usize;
+    let f_k = read_u32(&mut cur)? as usize;
+    let f_vseed = read_u64(&mut cur)?;
+    let f_qseed = read_u64(&mut cur)?;
     if f_nq != n_queries
         || f_nc != n_cent
         || f_dim != DIM
@@ -277,11 +255,11 @@ fn gt_bin_read(path: &str, n_queries: usize, n_cent: usize) -> std::io::Result<G
     }
     let mut heaps = Vec::with_capacity(f_nq);
     for _ in 0..f_nq {
-        let len = gt_rd_u32(&b, &mut p)? as usize;
+        let len = read_u32(&mut cur)? as usize;
         let mut h = HeldTopK::new();
         for _ in 0..len {
-            let id = gt_rd_u32(&b, &mut p)?;
-            let score = gt_rd_f32(&b, &mut p)?;
+            let id = read_u32(&mut cur)?;
+            let score = read_f32(&mut cur)?;
             h.offer(score, id);
         }
         heaps.push(h);
