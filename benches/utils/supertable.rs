@@ -81,7 +81,7 @@ const RESULT_PREFIX: &str = "__SUPERTABLE_SHAPE_RESULT__ ";
 /// can't carry `Option<f64>`, so a negative sentinel encodes `None`.
 const INGEST_CPU_NOT_MEASURED_NS: i128 = -1;
 
-/// The three measured shapes: (display label, child-env key, modality).
+/// The measured ingest shapes: (display label, child-env key, modality).
 const SHAPES: [(&str, &str, Modality); 4] = [
     ("FTS-only", "fts", Modality::Fts),
     ("vector-only", "vector", Modality::Vector),

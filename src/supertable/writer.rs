@@ -3884,16 +3884,31 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 // Depth-law observation: fine clusters exist only now that
                 // the shard is packed; record each surviving candidate's
                 // fine-centroid rank from the shard's own bytes.
-                if let Some(cal) = width_law_ref
-                    && let Some(reader) = prepared.open_reader()
-                {
-                    let reader = reader
-                        .map_err(|e| BuildError::Store(format!("depth-law shard reopen: {e}")))?;
-                    if let Some(views) = reader
-                        .vec()
-                        .and_then(|v| v.cell_fine_calibration_views(&vector_config.column))
-                    {
-                        cal.observe_shard_views(&views);
+                if let Some(cal) = width_law_ref {
+                    match prepared.open_reader() {
+                        Some(reader) => {
+                            let reader = reader.map_err(|e| {
+                                BuildError::Store(format!("depth-law shard reopen: {e}"))
+                            })?;
+                            if let Some(views) = reader
+                                .vec()
+                                .and_then(|v| v.cell_fine_calibration_views(&vector_config.column))
+                            {
+                                cal.observe_shard_views(&views);
+                            }
+                        }
+                        // Cache-attached path without prepopulation: the
+                        // shard's bytes went to storage only, so this pack
+                        // carries no depth observation. Loud, not silent -
+                        // the fine law keeps its previous value (max-merge)
+                        // and the first optimize recalibration re-measures
+                        // from committed bytes through the resident opener,
+                        // but a fresh table serves the config fine floor
+                        // until then.
+                        None => warn!(
+                            "drain depth-law observation skipped for shard {shard_id}: \
+                             bytes not retained (cache-attached, no prepopulation)"
+                        ),
                     }
                 }
                 Ok::<_, BuildError>(prepared)
@@ -6958,6 +6973,10 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         return Ok(false);
     }
 
+    // Evidence basis for the width stamp below: the exact superfile set
+    // this scan measures. A drain that commits between the scan and the
+    // stamp adds rows this evidence never saw.
+    let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
     let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
     // evenly spaced ordinals over the cell-ordered live-row enumeration —
@@ -7125,12 +7144,28 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             _ => return Ok(false),
         };
         let mut routing = fresh_routing;
-        // Width REPLACEs: the fresh full-table measurement is authoritative,
-        // and width must be able to narrow after a merge pass — every probed
-        // cell is a fetch, so a stale-wide width is the dominant cost leak.
+        // Width REPLACEs — the fresh full-table measurement is authoritative,
+        // and narrowing after a merge pass is the cost half (every probed
+        // cell is a fetch) — but only while the scan's evidence is still
+        // current. A concurrent drain appends superfiles and max-merges a
+        // law measured on rows this scan never saw; REPLACING that with our
+        // older-evidence narrower width would under-probe the fresh rows.
+        // When the superfile set moved after the scan, fall back to the
+        // recall-safe max-merge; the next reshape's recalibration re-earns
+        // the narrow from current evidence.
+        let evidence_current = manifest
+            .superfiles
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect::<HashSet<Uuid>>()
+            == scan_ids;
         for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
-            if measured > 0 {
-                *slot = measured;
+            if evidence_current {
+                if measured > 0 {
+                    *slot = measured;
+                }
+            } else {
+                *slot = (*slot).max(measured);
             }
         }
         // Fine depth and rerank MAX-MERGE against the live stamp, exactly as

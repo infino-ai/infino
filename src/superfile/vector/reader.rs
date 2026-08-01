@@ -2023,6 +2023,14 @@ impl VectorReader {
         &self,
         column: &str,
     ) -> Option<Vec<CellFineCalibrationView>> {
+        // In the packed multi-cell layout each subsection entry IS one grid
+        // cell of the SINGLE indexed vector column (`cell_ids` is parallel
+        // to `columns` — see the round-trip in the drain's cell build), so
+        // walking every entry is walking that column's cells, not mixing
+        // columns. The name gate rejects readers that don't carry the
+        // requested column; a second vector column cannot reach this path
+        // (the hidden index is single-column by construction, resolved by
+        // name at the calibration entry).
         if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
             return None;
         }
