@@ -6485,9 +6485,12 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     // the occupied run starting at `attempted_id` is finite; the floor
     // contract is only that every id below it is occupied, which holds at
     // whatever point the walk stops (first free id, probe cap, or a
-    // failed probe).
+    // failed probe). The saturating bound keeps the arithmetic total even
+    // for ids no real table reaches; below it, the plain increment cannot
+    // wrap.
+    let probe_limit = attempted_id.saturating_add(MAX_ORPHAN_RUN_PROBES);
     let mut next_free_id = attempted_id;
-    while next_free_id < attempted_id + MAX_ORPHAN_RUN_PROBES {
+    while next_free_id < probe_limit {
         match storage.head(&manifest_uri(next_free_id)).await {
             Ok(_) => next_free_id += 1,
             Err(StorageError::NotFound { .. }) => break,
