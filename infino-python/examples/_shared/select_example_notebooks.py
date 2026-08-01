@@ -31,7 +31,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _EXAMPLES = os.path.dirname(_HERE)
 
 # A tiny vector width — the probe only needs to reach the index-spec build.
-_DIM = 8
+_DIM = 16
 
 
 def _probe_langchain() -> None:
@@ -51,7 +51,7 @@ def _probe_langchain() -> None:
         ["compat probe"],
         _FixedEmbeddings(),
         connection=conn,
-        table_name="_compat_probe",
+        table_name="compat_probe",
         dim=_DIM,
     )
 
@@ -63,7 +63,7 @@ def _probe_crewai() -> None:
     conn = infino.connect("memory://")
     InfinoIndex.create(
         conn,
-        "_compat_probe",
+        "compat_probe",
         embed_documents=lambda texts: [[0.1] * _DIM for _ in texts],
         embed_query=lambda text: [0.1] * _DIM,
         dim=_DIM,
