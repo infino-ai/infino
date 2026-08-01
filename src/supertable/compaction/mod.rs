@@ -276,14 +276,18 @@ impl Supertable {
         // merged just to be re-split (the merge output would be discarded), and
         // the split runs as its own snapshot-consistent phase, so it can't remove
         // a superfile a later merge job in this pass planned to use.
-        // Gate on the MANIFEST's locked strategy, not the handle options:
-        // hidden-index handles built in the creating process carry no
-        // marker in their immutable options (the create-era gap #500 fixes
-        // for the split phase the same way), and `recalibrate_probe_laws`
-        // self-guards on the strategy — trigger and pass on one signal.
+        //
+        // Keyed on the manifest's LOCKED strategy, not the handle options: a
+        // hidden handle built at table create time has no user manifest to
+        // train a grid from, so its options never carry VectorCell — only the
+        // first drain locks the strategy into the manifest. An options-keyed
+        // gate silently skips every split until the table is reopened.
+        // `split_overflow_cells` re-checks the manifest strategy itself, so
+        // user tables (never VectorCell-locked) cannot reach the split. The
+        // recalibration trigger below shares the same signal.
         let hidden_ivf = matches!(
-            inner.manifest.load().get_partition_strategy(),
-            PartitionStrategy::VectorCell { .. }
+            inner.manifest.load().partition_strategy(),
+            Some(PartitionStrategy::VectorCell { .. })
         );
         // Superfile-id snapshot for the recalibration trigger below: splits
         // and merges both change the id set, and both invalidate a stamped

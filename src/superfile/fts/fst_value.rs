@@ -9,7 +9,9 @@
 //! - `value & 1 == 0` → **PFOR form**. The payload stores both
 //!   `metadata_offset` and `postings_length`, so the reader can fetch
 //!   the complete term range in one GET instead of probing the 20 B
-//!   metadata header first.
+//!   metadata header first. `postings_length` is a hint — the header
+//!   carries the same value and is the authority; see
+//!   [`PFOR_LENGTH_UNKNOWN`].
 //! - `value & 1 == 1` → **inline form**. The payload `(doc_id, tf)`
 //!   lives entirely in bits 1..63; there is no postings-region entry
 //!   for this term (no metadata header, no skip table, no PFOR block).
@@ -36,6 +38,11 @@ const PFOR_LENGTH_SHIFT: u32 = PFOR_OFFSET_SHIFT + PFOR_OFFSET_BITS;
 const PFOR_LENGTH_BITS: u32 = 21;
 const PFOR_OFFSET_MAX: u64 = (1u64 << PFOR_OFFSET_BITS) - 1;
 pub(crate) const PFOR_LENGTH_MAX: u32 = (1u32 << PFOR_LENGTH_BITS) - 1;
+/// Length-slot sentinel: a term whose postings don't fit the 21-bit
+/// slot stores this instead, and the reader gets the real length from
+/// the term's metadata header. All-ones is safe as a legacy real
+/// length too — the header still resolves it to the same value.
+pub(crate) const PFOR_LENGTH_UNKNOWN: u32 = PFOR_LENGTH_MAX;
 /// Maximum `tf` representable in the inline form's 30-bit slot.
 /// Real-world per-doc tf is bounded by document length (in tokens),
 /// which fits a u16; this limit only exists to guarantee the
@@ -48,7 +55,10 @@ pub(crate) enum FstValue {
     /// and walk the metadata header, skip table, and PFOR blocks.
     Pfor {
         metadata_offset: u64,
-        postings_length: u32,
+        /// `None` when the slot held [`PFOR_LENGTH_UNKNOWN`]: the term
+        /// is too large for the slot and its length must be read from
+        /// the metadata header at `metadata_offset`.
+        postings_length_hint: Option<u32>,
     },
     /// df = 1 — the entire posting is right here. No postings-region
     /// read required.
@@ -59,9 +69,13 @@ impl FstValue {
     #[inline]
     pub(crate) fn unpack(packed: u64) -> Self {
         if packed & 1 == 0 {
+            let slot = ((packed >> PFOR_LENGTH_SHIFT) as u32) & PFOR_LENGTH_MAX;
             Self::Pfor {
                 metadata_offset: (packed >> PFOR_OFFSET_SHIFT) & PFOR_OFFSET_MAX,
-                postings_length: ((packed >> PFOR_LENGTH_SHIFT) as u32) & PFOR_LENGTH_MAX,
+                postings_length_hint: match slot {
+                    PFOR_LENGTH_UNKNOWN => None,
+                    len => Some(len),
+                },
             }
         } else {
             let doc_id = (packed >> DOC_ID_SHIFT) as u32;
@@ -72,17 +86,18 @@ impl FstValue {
 
     /// Pack `(metadata_offset, postings_length)` into the PFOR-form
     /// FST value. The low bit is always 0.
+    ///
+    /// A `postings_length` at or past [`PFOR_LENGTH_UNKNOWN`] is stored
+    /// as that sentinel rather than rejected — the reader recovers the
+    /// true length from the term's metadata header.
     #[inline]
     pub(crate) fn pack_pfor(metadata_offset: u64, postings_length: u32) -> u64 {
         assert!(
             metadata_offset <= PFOR_OFFSET_MAX,
             "metadata_offset {metadata_offset} overflows the {PFOR_OFFSET_BITS}-bit PFOR slot"
         );
-        assert!(
-            postings_length <= PFOR_LENGTH_MAX,
-            "postings_length {postings_length} overflows the {PFOR_LENGTH_BITS}-bit PFOR slot"
-        );
-        (metadata_offset << PFOR_OFFSET_SHIFT) | ((postings_length as u64) << PFOR_LENGTH_SHIFT)
+        let slot = postings_length.min(PFOR_LENGTH_UNKNOWN);
+        (metadata_offset << PFOR_OFFSET_SHIFT) | ((slot as u64) << PFOR_LENGTH_SHIFT)
     }
 
     /// Pack a `(doc_id, tf)` pair into the inline-form FST value. The
@@ -109,7 +124,8 @@ mod tests {
             (20, 4096),
             (1 << 20, 1 << 16),
             ((1u64 << 34) - 1, (1 << 20) - 1),
-            (1u64 << 34, PFOR_LENGTH_MAX),
+            (1u64 << 34, PFOR_LENGTH_UNKNOWN - 1),
+            (PFOR_OFFSET_MAX, 1 << 16),
         ] {
             let packed = FstValue::pack_pfor(offset, len);
             assert_eq!(packed & 1, 0, "PFOR form must have low bit clear");
@@ -117,10 +133,39 @@ mod tests {
                 FstValue::unpack(packed),
                 FstValue::Pfor {
                     metadata_offset: offset,
-                    postings_length: len
+                    postings_length_hint: Some(len)
                 }
             );
         }
+    }
+
+    #[test]
+    fn oversize_length_becomes_unknown() {
+        const SIXTY_FOUR_MIB: u32 = 64 << 20;
+        for &len in &[PFOR_LENGTH_UNKNOWN, PFOR_LENGTH_UNKNOWN + 1, SIXTY_FOUR_MIB] {
+            let packed = FstValue::pack_pfor(4096, len);
+            assert_eq!(packed & 1, 0, "PFOR form must have low bit clear");
+            assert_eq!(
+                FstValue::unpack(packed),
+                FstValue::Pfor {
+                    metadata_offset: 4096,
+                    postings_length_hint: None
+                },
+                "length {len} must degrade to the header-probe sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn largest_expressible_length_is_not_the_sentinel() {
+        let packed = FstValue::pack_pfor(4096, PFOR_LENGTH_UNKNOWN - 1);
+        assert_eq!(
+            FstValue::unpack(packed),
+            FstValue::Pfor {
+                metadata_offset: 4096,
+                postings_length_hint: Some(PFOR_LENGTH_UNKNOWN - 1)
+            }
+        );
     }
 
     #[test]

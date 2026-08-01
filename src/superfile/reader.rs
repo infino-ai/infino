@@ -52,7 +52,9 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
-            reader::{self as fts_reader, BoolMode, ClauseLists, FtsReader, OrCursorSet},
+            reader::{
+                self as fts_reader, BoolMode, ClauseLists, FtsReader, OrCursorSet, PreparedClauses,
+            },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
         vector::{
@@ -1175,6 +1177,30 @@ impl SuperfileReader {
         Ok(fts.search_excluding(column, lists, k, floor).await?)
     }
 
+    /// I/O half of [`Self::bm25_search_clauses`] — resolves the column
+    /// and fetches every cursor [`Self::run_prepared`] needs to score.
+    pub(crate) async fn prepare_clauses(
+        &self,
+        column: &str,
+        lists: ClauseLists<'_>,
+        k: usize,
+        floor: f32,
+    ) -> Result<PreparedClauses, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.prepare_clauses(column, lists, k, floor).await?)
+    }
+
+    /// CPU half paired with [`Self::prepare_clauses`] — scores the
+    /// cursors it fetched.
+    pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.run_prepared(prep)?)
+    }
+
     /// Prefix-expanded BM25 search.
     ///
     /// Expands `prefix` to the lex-ordered list of indexed terms
@@ -1292,6 +1318,29 @@ impl SuperfileReader {
         Ok(fts.build_or_cursor_set(column, terms, global_idf).await?)
     }
 
+    /// Expand `prefix` via the FST and build its OR cursor set, for
+    /// reuse across this superfile's doc-id sub-ranges via
+    /// [`Self::bm25_search_or_range_prebuilt`].
+    pub(crate) async fn bm25_prefix_cursor_set(
+        &self,
+        column: &str,
+        prefix: &str,
+    ) -> Result<OrCursorSet, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let lowered = prefix.to_ascii_lowercase();
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
+        // FST keys are valid UTF-8 by construction (AsciiLower
+        // tokenizer only emits ASCII bytes); the from_utf8 below
+        // is a typed pass-through, not a re-validation cost.
+        let term_strings: Vec<&str> = term_bytes
+            .iter()
+            .filter_map(|b| str::from_utf8(b).ok())
+            .collect();
+        Ok(fts.build_or_cursor_set(column, &term_strings, None).await?)
+    }
+
     /// Ranged multi-term OR against prebuilt cursors — see
     /// [`Self::bm25_search_or_range_pretokenized_with_floor`] for the
     /// range and floor contract.
@@ -1314,11 +1363,9 @@ impl SuperfileReader {
     /// Same expansion logic as [`Self::bm25_search_prefix`] —
     /// AsciiLower the prefix, walk the FST for matching terms, run
     /// BM25 OR over the term set — but only docs in
-    /// `[doc_id_start, doc_id_end)` are eligible. Used by the
-    /// supertable layer's intra-superfile parallel fan-out on prefix
-    /// queries; the per-sub-range expansion is identical (same FST,
-    /// same column) so each sub-range expands locally rather than
-    /// passing pre-expanded terms across the task boundary.
+    /// `[doc_id_start, doc_id_end)` are eligible. A single-call wrapper
+    /// around [`Self::bm25_prefix_cursor_set`] +
+    /// [`Self::bm25_search_or_range_prebuilt`].
     pub async fn bm25_search_prefix_range(
         &self,
         column: &str,
@@ -1327,24 +1374,11 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         if k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
-        let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
-        if term_bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let term_strings: Vec<&str> = term_bytes
-            .iter()
-            .filter_map(|b| str::from_utf8(b).ok())
-            .collect();
-        Ok(fts
-            .search_or_range_pretokenized(column, &term_strings, k, doc_id_start, doc_id_end)
-            .await?)
+        let set = self.bm25_prefix_cursor_set(column, prefix).await?;
+        self.bm25_search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, f32::NEG_INFINITY)
     }
 
     /// Multi-column BM25 search with per-column weights ("most

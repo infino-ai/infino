@@ -49,7 +49,9 @@ const RESERVOIR_RECALL_FLOOR: f32 = 0.85;
 /// Query row indices probed for recall measurement.
 const RESERVOIR_QUERY_INDICES: [usize; 8] = [0, 137, 251, 503, 911, 1234, 1567, 1999];
 // Default-reservoir fixture (reservoir holds the whole corpus).
-const DEFAULT_RESERVOIR_N_CENT: usize = 4;
+// Matches the fine centroid count the 200-doc fixture builds (its IVF is
+// sized from the row count), so probing `n_cent` clusters scans them all.
+const DEFAULT_RESERVOIR_N_CENT: usize = 64;
 const DEFAULT_RESERVOIR_N_DOCS: usize = 200;
 const DEFAULT_RESERVOIR_TOP_K: usize = 5;
 const DEFAULT_RESERVOIR_CORPUS_SEED: u64 = 19;
@@ -123,7 +125,6 @@ fn build_reader_with_sample_size(
         .register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec,
@@ -233,14 +234,13 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         n_cent,
         /*seed=*/ DEFAULT_RESERVOIR_CORPUS_SEED,
     );
-    // Same call site as the test above but without the override,
-    // so the default sample size (100K) is in effect; reservoir
-    // holds the full 200-doc corpus.
+    // Same call site as the test above but without the override, so the
+    // default sample size is in effect; the reservoir holds the full
+    // 200-doc corpus.
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
         column: "v".into(),
         dim,
-        n_cent,
         rot_seed: ROT_SEED,
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,

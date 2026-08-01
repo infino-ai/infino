@@ -24,7 +24,7 @@
 //! "schema"       | n_fields u64 | for each field: name_len u64 | name | dt_str_len u64 | dt_str | nullable u8
 //! "id_column"    | len u64 | bytes
 //! "fts_columns"  | count u64 | for each: name_len u64 | name
-//! "vector_columns" | count u64 | for each: name_len u64 | name | dim u64 | n_cent u64 | rot_seed u64 | metric_len u64 | metric_str | codec
+//! "vector_columns" | count u64 | for each: name_len u64 | name | dim u64 | rot_seed u64 | metric_len u64 | metric_str | codec
 //! "partition_strategy" | variant_tag | per-variant fields
 //! ```
 //!
@@ -125,7 +125,6 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
     for v in &opts.vector_columns {
         push_str(&mut buf, &v.column);
         buf.extend_from_slice(&(v.dim as u64).to_le_bytes());
-        buf.extend_from_slice(&(v.n_cent as u64).to_le_bytes());
         buf.extend_from_slice(&v.rot_seed.to_le_bytes());
         // Match the manifest list's metric encoding
         // (`VectorColumnInfo.metric` writer site) — lowercased
@@ -539,7 +538,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim: 16,
-                n_cent: 4,
                 rot_seed: 0,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::default(),
@@ -566,7 +564,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim: 16,
-                    n_cent: 4,
                     rot_seed: 0,
                     metric,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -590,7 +587,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim: 16,
-                    n_cent: 4,
                     rot_seed: 0,
                     metric: Metric::Cosine,
                     rerank_codec,

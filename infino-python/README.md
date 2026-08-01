@@ -61,7 +61,7 @@ schema = pa.schema([
     pa.field("embedding", pa.list_(pa.float32(), 16), nullable=False),
 ])
 docs = db.create_table(
-    "docs", schema, infino.IndexSpec().fts("body").vector("embedding", 16, 1, "cosine")
+    "docs", schema, infino.IndexSpec().fts("body").vector("embedding", 16, "cosine")
 )
 
 # Append rows. One append is one atomic commit.

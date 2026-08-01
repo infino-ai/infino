@@ -467,17 +467,16 @@ impl Supertable {
     /// via [`Supertable::ensure_fresh`] on the read path, governed by
     /// [`crate::supertable::options::Consistency`]. This is the
     /// mechanism that drives the pointer re-check.
-    pub(crate) async fn refresh(&self) -> Result<bool, OpenError> {
+    pub(crate) async fn refresh(&self) -> Result<bool, ManifestLoadError> {
         let storage = self
             .inner
             .options
             .storage
             .as_ref()
-            .ok_or_else(|| {
-                OpenError::Build(BuildError::Store(
-                    "Supertable::refresh requires options.storage".into(),
-                ))
-            })?
+            // No storage attached ⇒ nothing to refresh against. The read path
+            // never reaches here (`pointer_refresh_due` returns false without
+            // storage); surfaced for direct callers.
+            .ok_or(ManifestLoadError::NoLoaderAttached)?
             .clone();
 
         // Conditional pointer probe: with the last-seen etag in hand,
@@ -490,9 +489,7 @@ impl Supertable {
             .lock()
             .expect("last_pointer_etag mutex poisoned")
             .clone();
-        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref())
-            .await
-            .map_err(OpenError::ManifestLoadError)?;
+        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref()).await?;
         let (pointer, meta) = match probe {
             // Absent means the pointer was deleted — the table was
             // dropped and purged. It is never "not committed yet": this handle
@@ -502,9 +499,7 @@ impl Supertable {
             // no storage never reaches here — `refresh` requires it above.
             PointerProbe::Absent => {
                 let _ = self.inner.pointer_vanished.set(());
-                return Err(OpenError::ManifestLoadError(
-                    ManifestLoadError::PointerVanished,
-                ));
+                return Err(ManifestLoadError::PointerVanished);
             }
             PointerProbe::NotModified => return Ok(false),
             PointerProbe::Read(pointer, meta) => (pointer, meta),
@@ -530,7 +525,7 @@ impl Supertable {
             // the pointer) — nothing newer to load, and the etag
             // captured above makes the next probe a 304.
             Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
-            Err(err) => return Err(OpenError::ManifestLoadError(err)),
+            Err(err) => return Err(err),
         };
         self.inner.manifest.store(manifest);
         self.inner.reconcile_tombstone_seqs();
@@ -569,7 +564,7 @@ impl Supertable {
     /// lookup; one holding this handle has nothing to re-resolve, so refusing
     /// is the only correct answer.
     fn reader(&self) -> Result<SupertableReader, ManifestLoadError> {
-        self.ensure_fresh();
+        self.ensure_fresh()?;
         if self.pointer_vanished() {
             return Err(ManifestLoadError::PointerVanished);
         }
@@ -656,14 +651,28 @@ impl Supertable {
     /// Called at the head of every public query method. No-op for an
     /// in-memory supertable (no storage pointer) and for
     /// [`Consistency::Snapshot`](crate::supertable::options::Consistency::Snapshot).
-    /// Best-effort: a failed pointer read leaves the current snapshot
-    /// in place rather than failing the query.
-    pub(crate) fn ensure_fresh(&self) {
-        if self.pointer_refresh_due()
-            && let Err(e) = bridge_sync_to_async(self.refresh())
-        {
+    ///
+    /// Failure handling is governed by the consistency level. Under
+    /// [`Consistency::Strong`](crate::supertable::options::Consistency::Strong)
+    /// a failed pointer re-check is surfaced as an error: Strong promises a
+    /// fresh manifest on every query, so if that check can't complete the
+    /// caller must be told rather than silently served a pinned older
+    /// snapshot — which, for a handle pinned before a commit it hasn't yet
+    /// observed, would return that commit's rows as an empty result. Under
+    /// [`Consistency::BoundedStaleness`](crate::supertable::options::Consistency::BoundedStaleness)
+    /// and `Snapshot`, staleness is acceptable by contract, so a failed probe
+    /// leaves the current snapshot in place and only logs.
+    pub(crate) fn ensure_fresh(&self) -> Result<(), ManifestLoadError> {
+        if !self.pointer_refresh_due() {
+            return Ok(());
+        }
+        if let Err(e) = bridge_sync_to_async(self.refresh()) {
+            if self.inner.options.read_consistency == Consistency::Strong {
+                return Err(e);
+            }
             debug!(error = %e, "manifest refresh failed; serving current snapshot");
         }
+        Ok(())
     }
 
     /// Whether this handle's table was dropped and purged elsewhere, seen as
@@ -1209,21 +1218,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// footprint / this`). Slack for in-flight cold-fetch reservations while
 /// the full working set stays resident.
 const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
-
-/// Train global VectorCell centroids from the user manifest and queue them
-/// on the hidden index table for its next commit.
-/// Aggressive compaction profile for the hidden vector-index table: keep
-/// ~one compact packed shard object per partition key instead of many
-/// small delta files.
-/// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
-pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
-    !opts.vector_columns.is_empty()
-        && opts.fts_columns.is_empty()
-        && matches!(
-            opts.partition_strategy,
-            Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
-        )
-}
 
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
     let vector = &crate::config::global().vector;
@@ -1841,23 +1835,37 @@ impl fmt::Debug for SupertableReader {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        sync::Arc,
+        ops::Range,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
     };
 
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use object_store::MultipartUpload;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
         config::OptimizeOptions,
-        storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
+        },
         supertable::{
             manifest::{
                 SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
+                list::PartitionStrategy,
             },
+            opann::MODALITY_MIN_CELL_DOCS,
             options::Consistency,
             query::dispatch::open_reader,
         },
@@ -2240,7 +2248,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -2534,7 +2541,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -2750,7 +2756,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -2853,7 +2858,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -2958,7 +2962,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -3060,7 +3063,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -3173,7 +3175,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3297,7 +3298,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3423,7 +3423,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3613,7 +3612,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3812,7 +3810,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim: DIM,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3965,7 +3962,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4060,7 +4056,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4153,7 +4148,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4324,7 +4318,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4427,6 +4420,183 @@ mod tests {
         }
     }
 
+    /// A committed cell split ALONE — without the pass-final in-process
+    /// `refresh_slow_vector_state` that production maintenance tacks onto the
+    /// end of the hidden pass — must leave every doc retrievable, both
+    /// in-process and after a reopen from storage. The split's own commit
+    /// (`try_commit_attempt` step 2b) publishes the slow-state blob + centroid
+    /// section for the post-split membership; if that publication disagrees
+    /// with what the refresh composes, a crash between the split commit and
+    /// the refresh leaves the table durably under-serving (0 hits from every
+    /// cell, including cells the split never touched) with no recovery path —
+    /// reopen re-hydrates the broken state and a post-reopen `optimize`
+    /// republishes it unchanged. Two populated cells are required to expose
+    /// the mismatch.
+    #[test]
+    fn split_commit_without_refresh_keeps_docs_retrievable() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{manifest::list::PartitionStrategy, writer::split_overflow_cell},
+        };
+
+        /// Docs planted per orthogonal direction (two directions → the two
+        /// populated cells the repro needs).
+        const ROWS_PER_DIRECTION: usize = 8;
+        /// Total planted docs.
+        const N_TOTAL: usize = 2 * ROWS_PER_DIRECTION;
+        /// Probe width covering every cell before and after the split.
+        const SPLIT_NPROBE: usize = 64;
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let dir = TempDir::new().expect("tempdir");
+        let make_options = || {
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            );
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(pool)
+        };
+        let st = Supertable::create(make_options()).expect("create");
+
+        // Two orthogonal directions, ROWS_PER_DIRECTION docs each, in ONE
+        // commit so the grid trains on both and the drain populates two cells.
+        let titles =
+            LargeStringArray::from((0..N_TOTAL).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut vectors = vec![0.0f32; N_TOTAL * dim];
+        for i in 0..N_TOTAL {
+            vectors[i * dim + i / ROWS_PER_DIRECTION] = 1.0;
+        }
+        let flat = Float32Array::from(vectors);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // Exhaustive-width retrieval per planted direction: with k = N_TOTAL
+        // and every cell probed, each query must surface every live doc, so
+        // the count reads as true retrievability rather than ranking.
+        let live_hit_count = |table: &Supertable, direction: usize| {
+            let mut q = vec![0.0f32; dim];
+            q[direction] = 1.0;
+            table
+                .reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    N_TOTAL,
+                    VectorSearchOptions::new().with_nprobe(SPLIT_NPROBE),
+                    None,
+                )
+                .expect("vector search")
+                .len()
+        };
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&st, direction),
+                N_TOTAL,
+                "all docs resolve before the split (direction {direction})"
+            );
+        }
+
+        let split_cell = match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                .expect("a populated cell"),
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
+            .expect("split")
+            .expect("live rows present, split commits");
+
+        // Deliberately NO refresh_slow_vector_state here: the split commit's
+        // own slow-state publication is the durable state a crash right after
+        // the commit leaves behind, and it must serve on its own.
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&st, direction),
+                N_TOTAL,
+                "all docs resolve after the split commit alone (direction {direction})"
+            );
+        }
+
+        // The same durable state must serve a fresh process: reopen from
+        // storage and retrieve every doc again.
+        drop(hidden);
+        drop(st);
+        let reopened = Supertable::open(make_options()).expect("reopen");
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&reopened, direction),
+                N_TOTAL,
+                "all docs resolve after reopen from post-split state (direction {direction})"
+            );
+        }
+    }
+
     /// Regression for the stale-probe-law path: (1) a clean drain stamps
     /// BOTH laws — probe width and fine depth — into the manifest routing
     /// (fine depth is what a flat `fine_nprobe_floor` regressed at 10M:
@@ -4483,7 +4653,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4694,7 +4863,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4822,6 +4990,145 @@ mod tests {
         );
     }
 
+    /// Regression: `optimize` must run the hidden cell-split phase on a handle
+    /// built at table CREATE time, in the same process, with no reopen. The
+    /// split gate in `compact_one_table` once keyed on the handle's options —
+    /// but a create-era hidden handle has no user manifest to train a grid
+    /// from, so its options never carry a VectorCell strategy (only the first
+    /// drain locks it into the manifest), and the options-keyed gate silently
+    /// skipped every split until the table was reopened elsewhere. This pins
+    /// the manifest-keyed gate through the public `optimize()` entry.
+    #[test]
+    fn optimize_runs_split_phase_on_create_era_handle() {
+        // The 500k `cell_split_doc_cap` is out of unit-test reach and config is
+        // process-global, so the fixture leans on the default modality trigger
+        // instead: a cell holding >= MODALITY_MIN_CELL_DOCS rows in MORE than
+        // the whole-mode grouping factor (4 modes, `opann::cell_split_plan`)
+        // of well-separated modes splits under `optimize`.
+        const DIM: usize = 16;
+        /// One-hot modes e_0..e_7 — more than the 4-modes-per-cell grouping
+        /// stop, so the modality plan must split the cell.
+        const MODES: usize = 8;
+        const DOCS_PER_MODE: usize = 64;
+        const N: usize = MODES * DOCS_PER_MODE;
+        assert!(
+            N as u64 >= MODALITY_MIN_CELL_DOCS,
+            "fixture must reach the modality trigger's minimum cell size"
+        );
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool)
+        // A single hidden cell: every mode drains into cell 0, making it the
+        // one over-populated multimodal cell the split phase must act on.
+        .with_vector_cell_counts(1, 1);
+        // The handle under test comes from CREATE and is never reopened.
+        let st = Supertable::create(options).expect("create");
+
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * DIM];
+        for r in 0..N {
+            let mode = r / DOCS_PER_MODE;
+            flat[r * DIM + mode] = 1.0;
+            // Tiny deterministic jitter on a component no mode occupies keeps
+            // within-mode variance non-zero (no 0/0 Ashman-D corner) while the
+            // modes stay maximally separated.
+            flat[r * DIM + MODES + mode] = ((r % 5) as f32 - 2.0) * 1e-3;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(clusters.n_cent, 1, "single-cell grid before optimize");
+                // Grid counts are maintenance bookkeeping (they tally the
+                // incoming region as well as the drained cells), so only the
+                // populated/empty distinction is asserted here.
+                assert!(clusters.counts[0] > 0, "the one cell is populated");
+            }
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        }
+
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+
+        // No reopen: the same create-era handles observe the split. The grid
+        // must have grown past one cell (doc preservation across a split is
+        // pinned by the dedicated `split_overflow_cell_*` tests).
+        let reader = hidden.reader().expect("reader");
+        match reader.manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert!(
+                    clusters.n_cent > 1,
+                    "optimize on a create-era handle must run the split phase; \
+                     grid stayed at {} cell(s)",
+                    clusters.n_cent
+                );
+            }
+            other => panic!("hidden stays VectorCell after optimize, got {other:?}"),
+        }
+    }
+
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most
     /// N packed shard objects and stamps partition_hint = shard_id (cell % N).
     #[test]
@@ -4865,7 +5172,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4993,7 +5299,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -5121,7 +5426,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5261,7 +5565,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5394,7 +5697,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5523,7 +5825,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5646,7 +5947,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -5825,7 +6125,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5965,7 +6264,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -6092,6 +6390,226 @@ mod tests {
         assert!(!advanced, "no commit yet ⇒ refresh finds nothing newer");
     }
 
+    /// A [`StorageProvider`] that fails the manifest-pointer probe on demand and
+    /// delegates everything else. Models a transient object-store read error
+    /// landing on exactly the per-query freshness check, so a test can pin down
+    /// how the read path reacts to it.
+    #[derive(Debug)]
+    struct FailPointerProbe {
+        inner: Arc<dyn StorageProvider>,
+        fail: AtomicBool,
+    }
+
+    impl FailPointerProbe {
+        fn new(inner: Arc<dyn StorageProvider>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                fail: AtomicBool::new(false),
+            })
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.fail.store(failing, Ordering::SeqCst);
+        }
+
+        fn should_fail(&self, uri: &str) -> bool {
+            self.fail.load(Ordering::SeqCst) && uri.ends_with(POINTER_PATH)
+        }
+
+        fn injected(uri: &str) -> StorageError {
+            StorageError::TransientExhausted {
+                uri: uri.to_string(),
+                source: "injected pointer-probe fault".into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for FailPointerProbe {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            if self.should_fail(uri) {
+                return Err(Self::injected(uri));
+            }
+            self.inner.get(uri).await
+        }
+
+        async fn get_if_none_match(
+            &self,
+            uri: &str,
+            etag: &str,
+        ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
+            if self.should_fail(uri) {
+                return Err(Self::injected(uri));
+            }
+            self.inner.get_if_none_match(uri, etag).await
+        }
+
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+
+        async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+            self.inner.tail(uri, len).await
+        }
+
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+
+        async fn list_with_prefix_metadata(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+            self.inner.list_with_prefix_metadata(prefix).await
+        }
+    }
+
+    fn title_batch(titles: &[&str]) -> RecordBatch {
+        use arrow_array::LargeStringArray;
+        RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(LargeStringArray::from(titles.to_vec()))],
+        )
+        .expect("title batch")
+    }
+
+    fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
+        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        table
+            .bm25_search(
+                "title",
+                query,
+                10,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("bm25 search")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
+    }
+
+    /// Regression: under `Strong`, a read whose per-query pointer re-check fails
+    /// must error rather than silently serve a snapshot pinned before a commit
+    /// it hasn't observed — which would return that commit's rows as an empty
+    /// result. Mirrors one handle pinned at an older manifest while another
+    /// writer commits, then hitting a transient object-store error on its next
+    /// refresh probe.
+    #[test]
+    fn strong_read_fails_closed_when_the_pointer_probe_fails() {
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // A separate writer commits v1.
+        let producer = Supertable::create(opts().with_storage(Arc::clone(&inner))).expect("create");
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["initial"])).expect("append v1");
+        w.commit().expect("commit v1");
+        drop(w);
+
+        // The consumer reads the same table through the fault wrapper, Strong.
+        let fault = FailPointerProbe::new(Arc::clone(&inner));
+        let consumer = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&fault) as Arc<dyn StorageProvider>)
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("open");
+        // A first read pins v1 and captures its pointer etag.
+        assert_eq!(bm25_title_hits(&consumer, "initial"), 1, "sees v1");
+
+        // The producer commits v2 with a row the consumer hasn't observed.
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["added"])).expect("append v2");
+        w.commit().expect("commit v2");
+        drop(w);
+
+        // The consumer's next Strong read has its pointer probe fail. It must
+        // NOT serve the pinned v1 snapshot (which misses "added"); it must
+        // surface the failure so the caller can retry rather than receive
+        // stale data.
+        fault.set_failing(true);
+        let err = consumer
+            .reader()
+            .expect_err("a Strong read must fail closed when its refresh cannot complete");
+        assert!(
+            matches!(err, ManifestLoadError::Storage(_)),
+            "expected a storage error from the failed probe, got {err:?}"
+        );
+
+        // Once the probe recovers, the same read refreshes to v2 and sees it —
+        // the failure was transient, not a poisoned handle.
+        fault.set_failing(false);
+        assert_eq!(
+            bm25_title_hits(&consumer, "added"),
+            1,
+            "recovers to v2 after the probe heals"
+        );
+    }
+
+    /// The mirror under `BoundedStaleness`: a failed probe is tolerated by
+    /// contract, so the read still succeeds, serving the last good snapshot.
+    /// Confirms the fail-closed change is scoped to `Strong` and did not turn
+    /// best-effort freshness into a hard failure.
+    #[test]
+    fn bounded_staleness_read_tolerates_a_failing_pointer_probe() {
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let producer = Supertable::create(opts().with_storage(Arc::clone(&inner))).expect("create");
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["initial"])).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        // Window 0 ⇒ every query re-checks the pointer, just like Strong — the
+        // only difference under test is how a failed check is handled.
+        let fault = FailPointerProbe::new(Arc::clone(&inner));
+        let consumer = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&fault) as Arc<dyn StorageProvider>)
+                .with_read_consistency(Consistency::BoundedStaleness(Duration::from_secs(0))),
+        )
+        .expect("open");
+        assert_eq!(bm25_title_hits(&consumer, "initial"), 1);
+
+        // With the probe failing, the bounded-staleness read still succeeds:
+        // staleness is acceptable, so it serves the pinned snapshot.
+        fault.set_failing(true);
+        assert_eq!(
+            bm25_title_hits(&consumer, "initial"),
+            1,
+            "bounded staleness serves the last good snapshot when the probe fails"
+        );
+    }
+
     /// The typed shape of a deleted pointer on the read path, pinned at the
     /// layer that produces it. Both the error and the latch matter: callers
     /// above match the variant, and the catalog keys handle eviction on the
@@ -6113,10 +6631,7 @@ mod tests {
 
         let err = bridge_sync_to_async(st.refresh()).expect_err("refresh must refuse");
         assert!(
-            matches!(
-                err,
-                OpenError::ManifestLoadError(ManifestLoadError::PointerVanished)
-            ),
+            matches!(err, ManifestLoadError::PointerVanished),
             "expected PointerVanished, got {err:?}"
         );
         assert!(

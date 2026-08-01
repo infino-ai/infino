@@ -184,7 +184,7 @@ fn main() {
     let t = Instant::now();
     let vectors = corpus::generate_vector_corpus(n_docs, n_cent, SEED, true);
     let docs = corpus::generate_text_corpus(n_docs, SEED);
-    let blob = corpus::build_superfile(&docs, &vectors, n_cent);
+    let blob = corpus::build_superfile(&docs, &vectors);
     let reader = corpus::open_superfile(blob);
     eprintln!(
         "[profile] build+open took {:.1}s  (docs/cluster ≈ {})",

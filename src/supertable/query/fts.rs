@@ -91,7 +91,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
-use tokio::sync::{OnceCell, oneshot};
+use tokio::sync::OnceCell;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -107,9 +107,16 @@ use uuid::Uuid;
 /// cannot drift apart.
 const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 
+/// Fewest summed term document frequencies for which the un-ranged
+/// clause kernel runs on the reader pool instead of inline. Measured
+/// masses split bimodal — cheap matches stay under 4,000, real scans
+/// start past 60,000 — so this sits in the gap.
+const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
+
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::{
     InfinoError,
+    runtime_bridge::run_on_pool,
     superfile::{
         SuperfileReader,
         error::{FtsError, ReadError},
@@ -531,32 +538,24 @@ impl SupertableReader {
                         // run inline where the oneshot round-trip would cost
                         // more than the scan — see the gate's doc comment.
                         if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
-                            let (tx, rx) = oneshot::channel();
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
-                            reader_pool.spawn(move || {
-                                let _ = tx.send(kernel_reader.bm25_search_or_range_prebuilt(
-                                    &kernel_set,
-                                    k,
-                                    start,
-                                    end,
-                                    floor,
-                                ));
-                            });
-                            // A dropped `tx` means the pool task died before
-                            // sending (it can't happen short of a kernel
-                            // panic, which the shared pool's default rayon
-                            // handler turns into an abort first) — but
-                            // surface it as an error rather than a second
-                            // panic, matching the resolve-decode bridge in
-                            // `exec::common`.
-                            rx.await
-                                .map_err(|_| {
-                                    QueryError::Execute(
-                                        "ranged fts kernel: reader pool dropped result".into(),
+                            run_on_pool(
+                                Some(&reader_pool),
+                                "ranged fts kernel: reader pool dropped result",
+                                move || {
+                                    kernel_reader.bm25_search_or_range_prebuilt(
+                                        &kernel_set,
+                                        k,
+                                        start,
+                                        end,
+                                        floor,
                                     )
-                                })?
-                                .map_err(fts_read_error)?
+                                },
+                            )
+                            .await
+                            .map_err(|e| QueryError::Execute(e.to_string()))?
+                            .map_err(fts_read_error)?
                         } else {
                             r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
                                 .map_err(fts_read_error)?
@@ -567,22 +566,39 @@ impl SupertableReader {
                         let should_refs: Vec<&str> =
                             should_arc.iter().map(|s| s.as_str()).collect();
                         let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                        r.bm25_search_clauses(
-                            &column_arc,
-                            ClauseLists {
-                                musts: &must_refs,
-                                shoulds: &should_refs,
-                                negatives: &neg_refs,
-                                must_phrases: &must_ph_arc,
-                                should_phrases: &should_ph_arc,
-                                negative_phrases: &neg_ph_arc,
-                                global_idf: global_idf.as_deref(),
-                            },
-                            k,
-                            floor,
-                        )
-                        .await
-                        .map_err(fts_read_error)?
+                        let prep = r
+                            .prepare_clauses(
+                                &column_arc,
+                                ClauseLists {
+                                    musts: &must_refs,
+                                    shoulds: &should_refs,
+                                    negatives: &neg_refs,
+                                    must_phrases: &must_ph_arc,
+                                    should_phrases: &should_ph_arc,
+                                    negative_phrases: &neg_ph_arc,
+                                    global_idf: global_idf.as_deref(),
+                                },
+                                k,
+                                floor,
+                            )
+                            .await
+                            .map_err(fts_read_error)?;
+                        // Gate on posting mass, not term count: this scan
+                        // isn't sliced, so a rare-term query with many
+                        // terms can be cheaper than a common-term pair.
+                        if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS {
+                            let kernel_reader = Arc::clone(&r);
+                            run_on_pool(
+                                Some(&reader_pool),
+                                "un-ranged fts kernel: reader pool dropped result",
+                                move || kernel_reader.run_prepared(prep),
+                            )
+                            .await
+                            .map_err(|e| QueryError::Execute(e.to_string()))?
+                            .map_err(fts_read_error)?
+                        } else {
+                            r.run_prepared(prep).map_err(fts_read_error)?
+                        }
                     }
                 };
                 // Raise the global floor with this unit's surviving
@@ -723,23 +739,71 @@ impl SupertableReader {
         // Prefix expansion is always multi-term OR with no negation, so
         // it is directly sub-range eligible.
         let work_units = build_work_units(&kept_refs, FanOut::SubRanges, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
-            work_units.into_iter().map(|u| (u.entry, u.range)).collect();
+        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
+            .into_iter()
+            .map(|u| {
+                let suid = u.entry.superfile_id;
+                (u.entry, (u.range, suid))
+            })
+            .collect();
 
         let column_arc = Arc::new(column_owned);
         let prefix_arc = Arc::new(prefix_owned);
+        let reader_pool = Arc::clone(&manifest.options.reader_pool);
+
+        // Share one FST expansion + cursor build per superfile across its
+        // slices, keyed by superfile id.
+        type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
+        let cursor_sets: Arc<Mutex<HashMap<Uuid, SharedCursorCell>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // Shared fan-out — see `bm25_search` for the rationale; the
         // kernel differs only in calling the prefix search variants.
-        let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
+        let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
             let column_arc = Arc::clone(&column_arc);
             let prefix_arc = Arc::clone(&prefix_arc);
+            let cursor_sets = Arc::clone(&cursor_sets);
+            let reader_pool = Arc::clone(&reader_pool);
             async move {
                 match range {
-                    Some((start, end)) => r
-                        .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
-                        .await
-                        .map_err(fts_read_error),
+                    Some((start, end)) => {
+                        let cell = {
+                            let mut sets =
+                                cursor_sets.lock().expect("cursor-set map lock poisoned");
+                            Arc::clone(sets.entry(suid).or_default())
+                        };
+                        let set = cell
+                            .get_or_try_init(|| async {
+                                r.bm25_prefix_cursor_set(&column_arc, &prefix_arc)
+                                    .await
+                                    .map(Arc::new)
+                                    .map_err(fts_read_error)
+                            })
+                            .await?;
+                        if set.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
+                            let kernel_reader = Arc::clone(&r);
+                            let kernel_set = Arc::clone(set);
+                            run_on_pool(
+                                Some(&reader_pool),
+                                "ranged prefix kernel: reader pool dropped result",
+                                move || {
+                                    kernel_reader.bm25_search_or_range_prebuilt(
+                                        &kernel_set,
+                                        k,
+                                        start,
+                                        end,
+                                        f32::NEG_INFINITY,
+                                    )
+                                },
+                            )
+                            .await
+                            .map_err(|e| QueryError::Execute(e.to_string()))?
+                            .map_err(fts_read_error)
+                        } else {
+                            r.bm25_search_or_range_prebuilt(set, k, start, end, f32::NEG_INFINITY)
+                                .map_err(fts_read_error)
+                        }
+                    }
                     None => r
                         .bm25_search_prefix(&column_arc, &prefix_arc, k)
                         .await

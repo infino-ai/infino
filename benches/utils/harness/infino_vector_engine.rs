@@ -41,7 +41,6 @@ fn build_superfile(
     vectors: &[f32],
     dim: usize,
     metric: VectorMetric,
-    n_cent: usize,
     id_base: usize,
 ) -> Vec<u8> {
     let n_docs = vectors.len() / dim;
@@ -59,7 +58,6 @@ fn build_superfile(
             provided_centroids: None,
             column: column.into(),
             dim,
-            n_cent,
             rot_seed: ROT_SEED,
             metric,
             rerank_codec: corpus::bench_rerank_codec(metric),
@@ -90,7 +88,6 @@ pub struct InfinoVectorIndex {
     column: String,
     dim: usize,
     metric: VectorMetric,
-    n_cent: usize,
     bytes: Option<Vec<u8>>,
     reader: Option<SuperfileReader>,
 }
@@ -121,26 +118,18 @@ impl VectorEngine for InfinoVectorEngine {
         }
     }
 
-    fn create(column: &str, dim: usize, metric: VectorMetric, n_cent: usize) -> Self::Index {
+    fn create(column: &str, dim: usize, metric: VectorMetric) -> Self::Index {
         InfinoVectorIndex {
             column: column.to_string(),
             dim,
             metric,
-            n_cent,
             bytes: None,
             reader: None,
         }
     }
 
     fn write(index: &mut Self::Index, vectors: &[f32]) {
-        let bytes = build_superfile(
-            &index.column,
-            vectors,
-            index.dim,
-            index.metric,
-            index.n_cent,
-            0,
-        );
+        let bytes = build_superfile(&index.column, vectors, index.dim, index.metric, 0);
         index.reader =
             Some(SuperfileReader::open(Bytes::from(bytes.clone())).expect("open SuperfileReader"));
         index.bytes = Some(bytes);
@@ -155,15 +144,7 @@ impl VectorEngine for InfinoVectorEngine {
     ) {
         let writers = writers.max(1);
         if writers == 1 {
-            let n_docs = vectors.len() / dim;
-            std::hint::black_box(build_superfile(
-                column,
-                vectors,
-                dim,
-                metric,
-                corpus::n_cent(n_docs),
-                0,
-            ));
+            std::hint::black_box(build_superfile(column, vectors, dim, metric, 0));
             return;
         }
         let n_docs = vectors.len() / dim;
@@ -183,7 +164,6 @@ impl VectorEngine for InfinoVectorEngine {
                     &vectors[start..end],
                     dim,
                     metric,
-                    corpus::n_cent(len_docs),
                     start_doc,
                 ))
             })

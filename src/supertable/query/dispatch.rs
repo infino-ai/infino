@@ -15,18 +15,25 @@
 //! orchestrator instead of each re-implementing the fan-out. The
 //! division of labor is the project-wide model:
 //!
-//!   * **tokio owns the fan-out and I/O.** One `tokio::spawn` task per
-//!     work unit: each opens its superfile reader and runs the kernel,
-//!     so superfile opens and cold object-store range GETs across
-//!     hundreds of superfiles are all in flight at once on the shared
-//!     multi-thread query runtime.
-//!   * **CPU model is per-kernel, not uniform.** The vector kernel
-//!     parallelizes its own scoring + rerank with `par_iter` (see
-//!     `superfile/vector/reader.rs`). The FTS BMW/MaxScore kernel
-//!     scores **serially inside its tokio task** — there is no rayon in
-//!     the FTS scoring path. Intra-superfile FTS parallelism is instead
-//!     expressed as additional tokio work units (doc-id sub-ranges; see
-//!     `query/fts.rs`).
+//!   * **tokio bounds I/O concurrency — stays wide.** One `tokio::spawn`
+//!     task per work unit: each opens its superfile reader and runs the
+//!     kernel, so superfile opens and cold object-store range GETs
+//!     across hundreds of superfiles are all in flight at once on the
+//!     shared multi-thread query runtime. Never cap the fan-out's task
+//!     count at the reader pool's width — `tokio::spawn` dispatches a
+//!     task, not an OS thread, and object-store GETs are latency-bound,
+//!     so narrowing their concurrency only hurts cold latency.
+//!   * **The reader pool bounds CPU concurrency — the configured knob.**
+//!     Both vector and FTS scoring run their scan/scoring kernel on the
+//!     configured reader pool, bridged back to the awaiting tokio task
+//!     via a oneshot (`runtime_bridge::run_on_pool`) so no tokio worker
+//!     blocks under the compute. The vector kernel parallelizes its own
+//!     scoring + rerank with `par_iter` (see `superfile/vector/reader.rs`);
+//!     FTS kernels are scored on one reader-pool thread per work unit,
+//!     with intra-superfile parallelism expressed as additional tokio
+//!     work units (doc-id sub-ranges; see `query/fts.rs`). Cheap
+//!     shapes stay inline where the pool round trip would cost more
+//!     than the scan.
 //!
 //! The per-superfile merge (top-k ascending for vector distance,
 //! descending for BM25 relevance) stays with each caller; this layer

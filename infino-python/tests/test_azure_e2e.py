@@ -124,7 +124,7 @@ def test_update_delete_optimize(db: infino.Connection) -> None:
 
 def test_vector_search(db: infino.Connection) -> None:
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), DIM), nullable=False)])
-    table = db.create_table("vecs", schema, infino.IndexSpec().vector("emb", DIM, 1, "cosine"))
+    table = db.create_table("vecs", schema, infino.IndexSpec().vector("emb", DIM, "cosine"))
     vecs = pa.array([_onehot(0), _onehot(1), _onehot(2)], type=pa.list_(pa.float32(), DIM))
     table.append(pa.record_batch([vecs], schema=schema))
 
@@ -139,7 +139,7 @@ def test_hybrid_search(db: infino.Connection) -> None:
         pa.field("emb", pa.list_(pa.float32(), DIM), nullable=False),
     ])
     table = db.create_table(
-        "docs", schema, infino.IndexSpec().fts("title").vector("emb", DIM, 1, "cosine")
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", DIM, "cosine")
     )
     table.append(
         pa.record_batch(

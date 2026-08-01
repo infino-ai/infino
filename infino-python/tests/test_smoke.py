@@ -444,7 +444,7 @@ def test_vector_search_end_to_end():
         return v
 
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), dim), nullable=False)])
-    t = db.create_table("vecs", schema, infino.IndexSpec().vector("emb", dim, 1, "cosine"))
+    t = db.create_table("vecs", schema, infino.IndexSpec().vector("emb", dim, "cosine"))
     vecs = [onehot(0), onehot(1), onehot(2)]
     t.append(pa.record_batch([pa.array(vecs, type=pa.list_(pa.float32(), dim))], schema=schema))
 
@@ -472,7 +472,7 @@ def test_filtered_vector_search():
         pa.field("emb", pa.list_(pa.float32(), dim), nullable=False),
     ])
     t = db.create_table(
-        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, 1, "cosine")
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, "cosine")
     )
     t.append(
         pa.record_batch(
@@ -534,7 +534,7 @@ def test_hybrid_search_fuses_text_and_vector():
         pa.field("emb", pa.list_(pa.float32(), dim), nullable=False),
     ])
     t = db.create_table(
-        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, 1, "cosine")
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, "cosine")
     )
     t.append(
         pa.record_batch(

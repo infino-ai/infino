@@ -30,8 +30,6 @@ const ID_DECIMAL_PRECISION: u8 = 38;
 const ID_DECIMAL_SCALE: i8 = 0;
 /// Vector-column dimension for the pipeline fixture.
 const EMB_DIM: usize = 16;
-/// IVF centroid count for the pipeline fixture.
-const N_CENT: usize = 4;
 /// Random-rotation seed for the pipeline fixture's vector index.
 const ROT_SEED: u64 = 17;
 /// Planted-corpus document count.
@@ -86,7 +84,6 @@ fn build_pipeline_superfile() -> Bytes {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
-            n_cent: N_CENT,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -394,7 +391,6 @@ fn add_batch_from_reader_mergeability_compatible_superfiles() {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: 16,
-            n_cent: 4,
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -626,7 +622,6 @@ fn add_batch_from_reader_mergeability_vector_column_count_mismatch() {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: 16,
-            n_cent: 4,
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -680,7 +675,6 @@ fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: 16,
-            n_cent: 4,
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -720,7 +714,6 @@ fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
         vec![SfVectorConfig {
             column: "other_vec".into(),
             dim: 16,
-            n_cent: 4,
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -748,7 +741,6 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: 16,
-            n_cent: 4,
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -788,7 +780,6 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: 32, // different dimension
-            n_cent: 4,
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -981,7 +972,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
-            n_cent: N_CENT,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -1031,7 +1021,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
-            n_cent: N_CENT,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -1186,7 +1175,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
-            n_cent: N_CENT,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
@@ -1238,7 +1226,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
-            n_cent: N_CENT,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,

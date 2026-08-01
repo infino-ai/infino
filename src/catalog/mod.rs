@@ -362,7 +362,6 @@ impl Connection {
                     .map(|vc| VectorEntry {
                         column: vc.column.clone(),
                         dim: vc.dim,
-                        n_cent: vc.n_cent,
                         metric: metric_to_str(vc.metric).to_string(),
                     })
                     .collect();
@@ -515,7 +514,6 @@ impl Connection {
                     spec = spec.vector(
                         v.column.clone(),
                         v.dim,
-                        v.n_cent,
                         metric_from_str(&v.metric)
                             .map_err(|e| e.with_context("open_table", Some(name)))?,
                     );
@@ -2245,7 +2243,7 @@ mod tests {
 
         // Zero (below the floor) and an oversized dim both fail at create time.
         for dim in [0_i32, 100_000] {
-            let spec = IndexSpec::new().vector("emb", dim as usize, 1, Metric::Cosine);
+            let spec = IndexSpec::new().vector("emb", dim as usize, Metric::Cosine);
             let err = conn
                 .create_table(&format!("v{dim}"), emb_schema(dim), spec)
                 .expect_err("an out-of-range vector dim is rejected");
@@ -2260,7 +2258,7 @@ mod tests {
         // vector index at either bound is created successfully.
         let conn = connect("memory://").expect("connect");
         for dim in [16_i32, 4096] {
-            let spec = IndexSpec::new().vector("emb", dim as usize, 1, Metric::Cosine);
+            let spec = IndexSpec::new().vector("emb", dim as usize, Metric::Cosine);
             conn.create_table(&format!("v{dim}"), emb_schema(dim), spec)
                 .expect("an in-range vector dim is accepted");
         }
@@ -2823,8 +2821,6 @@ mod tests {
 
         /// Embedding dimension for the fixture's vector column.
         const DIM: usize = 16;
-        /// IVF centroid count; kmeans needs at least this many rows.
-        const N_CENT: usize = 4;
         /// Rows in the fixture (one-hot vectors at dims 0..ROWS).
         const ROWS: usize = 4;
         /// Top-k requested by the vector / hybrid queries.
@@ -2877,7 +2873,7 @@ mod tests {
                 schema,
                 IndexSpec::new()
                     .fts("title")
-                    .vector("emb", DIM, N_CENT, Metric::L2Sq),
+                    .vector("emb", DIM, Metric::L2Sq),
             )
             .expect("create table");
         table.append(&batch).expect("append");
@@ -3063,7 +3059,7 @@ mod tests {
                     schema.clone(),
                     IndexSpec::new()
                         .fts("title")
-                        .vector("embedding", 16, 4, Metric::L2Sq),
+                        .vector("embedding", 16, Metric::L2Sq),
                 )
                 .expect("create vector table");
             table.append(&one_vector()).expect("append vector row");

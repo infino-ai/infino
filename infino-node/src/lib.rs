@@ -326,13 +326,13 @@ pub struct VectorFilter {
 
 /// Declares which columns are full-text (BM25) and which are vector (IVF
 /// kNN) indexed. Built fluently:
-/// `new IndexSpec().fts("body").vector("emb", 384, 256, "cosine")`.
+/// `new IndexSpec().fts("body").vector("emb", 384, "cosine")`.
 #[napi]
 #[derive(Clone, Default)]
 pub struct IndexSpec {
     fts: Vec<String>,
-    /// `(column, dim, n_cent, metric)`.
-    vectors: Vec<(String, u32, u32, String)>,
+    /// `(column, dim, metric)`.
+    vectors: Vec<(String, u32, String)>,
 }
 
 #[napi]
@@ -351,12 +351,12 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a `fixed_size_list<float32, dim>`) as vector
-    /// indexed. `nCent` is the IVF centroid count (size it to the table's
-    /// scale); `metric` is `"cosine"` / `"l2sq"` / `"negdot"`.
+    /// indexed. `metric` is `"cosine"` / `"l2sq"` / `"negdot"`. The IVF
+    /// centroid count is derived from the data at build time.
     #[napi]
-    pub fn vector(&self, column: String, dim: u32, n_cent: u32, metric: String) -> Self {
+    pub fn vector(&self, column: String, dim: u32, metric: String) -> Self {
         let mut next = self.clone();
-        next.vectors.push((column, dim, n_cent, metric));
+        next.vectors.push((column, dim, metric));
         next
     }
 }
@@ -368,13 +368,8 @@ impl IndexSpec {
         for column in &self.fts {
             spec = spec.fts(column.clone());
         }
-        for (column, dim, n_cent, metric) in &self.vectors {
-            spec = spec.vector(
-                column.clone(),
-                *dim as usize,
-                *n_cent as usize,
-                metric_from_str(metric)?,
-            );
+        for (column, dim, metric) in &self.vectors {
+            spec = spec.vector(column.clone(), *dim as usize, metric_from_str(metric)?);
         }
         Ok(spec)
     }

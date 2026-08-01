@@ -401,7 +401,9 @@ impl Supertable {
         ctx: &SessionContext,
         name: &str,
     ) -> Result<Arc<SupertableReader>, QueryError> {
-        self.ensure_fresh();
+        // `reader()` applies the read-consistency freshness check itself (and,
+        // under Strong, fails rather than serving a stale snapshot), so no
+        // separate `ensure_fresh` call is needed here.
         let reader = Arc::new(self.reader().map_err(QueryError::ManifestLoad)?);
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
@@ -1702,7 +1704,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 0,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,

@@ -158,10 +158,10 @@ pub trait VectorEngine {
 
     fn capabilities() -> Capabilities;
 
-    fn create(column: &str, dim: usize, metric: VectorMetric, n_cent: usize) -> Self::Index;
+    fn create(column: &str, dim: usize, metric: VectorMetric) -> Self::Index;
 
-    fn open(column: &str, dim: usize, metric: VectorMetric, n_cent: usize) -> Self::Index {
-        Self::create(column, dim, metric, n_cent)
+    fn open(column: &str, dim: usize, metric: VectorMetric) -> Self::Index {
+        Self::create(column, dim, metric)
     }
 
     fn write(index: &mut Self::Index, vectors: &[f32]);

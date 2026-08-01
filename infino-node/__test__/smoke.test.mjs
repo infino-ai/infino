@@ -100,7 +100,7 @@ test("query_sql with a hybrid_search TVF returns rows from a sync host (#170)", 
     new Field("title", new LargeUtf8(), false),
     new Field("emb", new FixedSizeList(dim, new Field("item", new Float32(), true)), false),
   ]);
-  const docs = db.createTable("docs", schema, new IndexSpec().fts("title").vector("emb", dim, 1, "cosine"));
+  const docs = db.createTable("docs", schema, new IndexSpec().fts("title").vector("emb", dim, "cosine"));
   docs.append([
     { title: "billing and refunds", emb: onehot(0, dim) },
     { title: "dark mode appearance", emb: onehot(1, dim) },
@@ -121,7 +121,7 @@ test("hybridSearch fuses BM25 and vector retrieval", () => {
     new Field("title", new LargeUtf8(), false),
     new Field("emb", new FixedSizeList(dim, new Field("item", new Float32(), true)), false),
   ]);
-  const docs = db.createTable("docs", schema, new IndexSpec().fts("title").vector("emb", dim, 1, "cosine"));
+  const docs = db.createTable("docs", schema, new IndexSpec().fts("title").vector("emb", dim, "cosine"));
   docs.append([
     { title: "rust async", emb: onehot(0, dim) },
     { title: "python data", emb: onehot(1, dim) },
@@ -205,7 +205,7 @@ test("connect does not probe by default", () => {
 test("vector search end-to-end", () => {
   const db = connect("memory://");
   const dim = 16; // infino requires vector dim in [16, 4096]
-  const docs = db.createTable("vecs", embSchema(dim), new IndexSpec().vector("emb", dim, 1, "cosine"));
+  const docs = db.createTable("vecs", embSchema(dim), new IndexSpec().vector("emb", dim, "cosine"));
 
   // append objects with the vector as a plain number[] — the wrapper
   // builds the FixedSizeList<float32> column from the declared schema.
@@ -231,7 +231,7 @@ test("filtered vector search (pushdown text predicate)", () => {
   const docs = db.createTable(
     "docs",
     schema,
-    new IndexSpec().fts("title").vector("emb", dim, 1, "cosine"),
+    new IndexSpec().fts("title").vector("emb", dim, "cosine"),
   );
   docs.append([
     { title: "billing and refunds", emb: onehot(0, dim) },

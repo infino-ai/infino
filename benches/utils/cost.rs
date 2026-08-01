@@ -67,9 +67,13 @@ const PER_MILLION: f64 = 1.0e6;
 /// the cell's own corpus size (`n_docs`/month) so the summary prices writing
 /// THIS table, not a synthetic volume.
 const SUMMARY_QUERIES_PER_MONTH: f64 = 1.0e6;
-/// Warm fraction of the blended monthly read line (the rest pay the cold
-/// per-query cost).
-const SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
+/// Default warm fraction of the blended monthly read line (the rest pay
+/// the cold per-query cost). Env-overridable via
+/// `INFINO_BENCH_COST_WARM_FRACTION` (0 < f ≤ 1) so pricing scenarios can
+/// flex the assumed hit rate without recompiling — the frequency knob;
+/// the warm/cold rate gap the summary prints is the magnitude it
+/// multiplies against.
+const DEFAULT_SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
 /// Padding on the per-query RAM-hold window: a query holds the resident set
 /// a little longer than its own p50 (dispatch, response write, scheduler
 /// slack between overlapped queries), so the hold is billed at fudge × p50.
@@ -606,6 +610,30 @@ fn occupancy_replicas() -> u32 {
     static REPLICAS: OnceLock<u32> = OnceLock::new();
     *REPLICAS
         .get_or_init(|| parse_replicas(std::env::var("INFINO_BENCH_COST_REPLICAS").ok().as_deref()))
+}
+
+/// Parse an `INFINO_BENCH_COST_WARM_FRACTION` override. Accepts only
+/// 0 < f ≤ 1; anything else (unset, garbage, 0, negative, >1, NaN) falls
+/// back to the default — a nonsense hit rate must never silently shape
+/// the blend.
+fn parse_warm_fraction(raw: Option<&str>) -> f64 {
+    raw.and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f > 0.0 && *f <= 1.0)
+        .unwrap_or(DEFAULT_SUMMARY_READ_WARM_FRACTION)
+}
+
+/// Warm fraction for the blended read line, env-overridable like
+/// [`occupancy_replicas`] (a workload assumption, not an instance
+/// attribute).
+fn summary_warm_fraction() -> f64 {
+    static FRACTION: OnceLock<f64> = OnceLock::new();
+    *FRACTION.get_or_init(|| {
+        parse_warm_fraction(
+            std::env::var("INFINO_BENCH_COST_WARM_FRACTION")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 /// The tenant's composed serving cost per month: marginal work (storage +
@@ -2145,7 +2173,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // set.
     let blended_read_q = match (&steady_warm, &steady_cold) {
         (Some((_, warm_q)), Some((_, cold_q))) => {
-            Some(warm_q * SUMMARY_READ_WARM_FRACTION + cold_q * (1.0 - SUMMARY_READ_WARM_FRACTION))
+            Some(warm_q * summary_warm_fraction() + cold_q * (1.0 - summary_warm_fraction()))
         }
         (Some((_, warm_q)), None) => Some(*warm_q),
         (None, Some((_, cold_q))) => Some(*cold_q),
@@ -2213,8 +2241,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             text(format!(
                 "Reads — {} queries/mo, {:.0}% warm / {:.0}% cold blend",
                 fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
-                SUMMARY_READ_WARM_FRACTION * 100.0,
-                (1.0 - SUMMARY_READ_WARM_FRACTION) * 100.0,
+                summary_warm_fraction() * 100.0,
+                (1.0 - summary_warm_fraction()) * 100.0,
             )),
             text(usd_per_million(blended_q)),
             metric(month, usd(month), Better::Lower),
@@ -2513,7 +2541,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // single-sided fallback) as the monthly read line.
     let blended_vcpu_q = match (steady_warm_vcpu_s, steady_cold_vcpu_s) {
         (Some(warm_v), Some(cold_v)) => {
-            Some(warm_v * SUMMARY_READ_WARM_FRACTION + cold_v * (1.0 - SUMMARY_READ_WARM_FRACTION))
+            Some(warm_v * summary_warm_fraction() + cold_v * (1.0 - summary_warm_fraction()))
         }
         (Some(warm_v), None) => Some(warm_v),
         (None, Some(cold_v)) => Some(cold_v),
@@ -2563,9 +2591,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             text(""),
         ]);
     }
-    if let Some((binding, share)) =
-        binding_share(&[("CPU", cpu_sh), ("RAM", ram_sh), ("NVMe", nvme_sh)])
-    {
+    let active_binding = binding_share(&[("CPU", cpu_sh), ("RAM", ram_sh), ("NVMe", nvme_sh)]);
+    if let Some((binding, share)) = active_binding {
         let per_replica = share * node_month;
         let total = per_replica * f64::from(replicas);
         occupancy_rows.push(vec![
@@ -2616,14 +2643,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         rows: occupancy_rows,
     });
 
-    // ---- Block 7: serving COGS (the composed per-tenant number) ----
-    // The one number the two blocks above only imply: what serving this
-    // tenant costs per month. Marginal work (storage + blended reads +
-    // writes + maintenance) PLUS the keep-warm floor that buys the blend's
-    // warm-hit rate (idle-retained NVMe × R). Egress is excluded — it is
-    // passed through to the customer, so it is revenue-neutral, not COGS.
-    // The floor requires a measured NVMe cache size; when unmeasured the
-    // total is withheld, never guessed low.
+    // ---- Block 7: serving COGS per keep-warm policy ----
+    // The number the marginal summary and the occupancy view each show one
+    // half of: what serving this tenant costs per month, one row per
+    // keep-warm policy. Egress is excluded throughout — passed through to
+    // the customer at cost, revenue-neutral, not COGS. These rows are the
+    // COGS basis for pricing; the assumptions are the knobs printed in the
+    // subtitle, all env-overridable, so scenarios re-run without a code
+    // change. Unmeasured components withhold their row, never guess.
+    let warm_frac = summary_warm_fraction();
     let marginal_ex_egress = storage_month
         + blended_read_q
             .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
@@ -2631,46 +2659,80 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         + writes_month
         + maintenance_month.unwrap_or(0.0);
     let idle_floor_total = nvme_sh.map(|s| s * node_month * f64::from(replicas));
+    let active_floor_total = active_binding.map(|(_, s)| s * node_month * f64::from(replicas));
+    let warm_reads_month = steady_warm
+        .as_ref()
+        .map(|(_, q)| q * SUMMARY_QUERIES_PER_MONTH);
     let serving_cogs = {
-        let warm_pct = SUMMARY_READ_WARM_FRACTION * 100.0;
+        let warm_pct = warm_frac * 100.0;
+        let cold_pct = 100.0 - warm_pct;
         let mut rows = vec![vec![
+            text("Policy A — scale-to-zero (nothing retained between queries)"),
             text(format!(
-                "Marginal work — storage + blended reads ({warm_pct:.0}/{:.0}) + writes + maintenance",
-                100.0 - warm_pct,
+                "storage {} + reads {} ({warm_pct:.0}% warm / {cold_pct:.0}% at Azure-cold) \
+                 + writes {} + maintenance {}",
+                usd(storage_month),
+                usd(blended_read_q
+                    .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
+                    .unwrap_or(0.0)),
+                usd(writes_month),
+                usd(maintenance_month.unwrap_or(0.0)),
             )),
-            text("summary lines above, egress excluded (passed through to the customer)"),
-            context(marginal_ex_egress, usd(marginal_ex_egress), Better::Lower),
+            metric(marginal_ex_egress, usd(marginal_ex_egress), Better::Lower),
         ]];
-        match idle_floor_total {
-            Some(floor) => {
+        match serving_cogs_month(marginal_ex_egress, idle_floor_total) {
+            Some(total) => rows.push(vec![
+                text("Policy B — keep-warm NVMe (worker reaped between queries)"),
+                text(format!(
+                    "policy A {} + idle-NVMe floor {} (×R={replicas}). Conservative: the \
+                     {cold_pct:.0}% misses are still priced at Azure-cold, but with NVMe \
+                     retained a miss costs near the warm rate — true B is at most this",
+                    usd(marginal_ex_egress),
+                    usd(idle_floor_total.unwrap_or(0.0)),
+                )),
+                metric(total, usd(total), Better::Lower),
+            ]),
+            None => rows.push(vec![
+                text("Policy B — keep-warm NVMe (worker reaped between queries)"),
+                text("NVMe cache unmeasured this run — row withheld, never guessed"),
+                text("—"),
+            ]),
+        }
+        match (active_floor_total, warm_reads_month) {
+            (Some(active), Some(warm_reads)) => {
+                let total = storage_month
+                    + warm_reads
+                    + writes_month
+                    + maintenance_month.unwrap_or(0.0)
+                    + active;
                 rows.push(vec![
+                    text("Policy C — reserved (worker held live, 100% warm)"),
                     text(format!(
-                        "Keep-warm floor — idle-retained NVMe × R={replicas}"
+                        "storage {} + reads at 100% warm {} + writes {} + maintenance {} + \
+                         active occupancy {} (binding share × node-mo × R={replicas})",
+                        usd(storage_month),
+                        usd(warm_reads),
+                        usd(writes_month),
+                        usd(maintenance_month.unwrap_or(0.0)),
+                        usd(active),
                     )),
-                    text("the occupancy row that buys the blend's warm-hit rate"),
-                    context(floor, usd(floor), Better::Lower),
-                ]);
-                let total = serving_cogs_month(marginal_ex_egress, idle_floor_total)
-                    .expect("floor is Some in this branch");
-                rows.push(vec![
-                    text("Serving COGS (marginal + keep-warm floor, ex-egress)"),
-                    text("—"),
                     metric(total, usd(total), Better::Lower),
                 ]);
             }
-            None => rows.push(vec![
-                text("Serving COGS (marginal + keep-warm floor, ex-egress)"),
-                text("NVMe cache unmeasured this run — total withheld, never guessed"),
+            _ => rows.push(vec![
+                text("Policy C — reserved (worker held live, 100% warm)"),
+                text("needs a measured warm read class and an occupancy share — row withheld"),
                 text("—"),
             ]),
         }
         Block {
             subtitle: format!(
-                "Serving COGS — per tenant-month at {} queries/mo, {:.0}% warm blend, \
-                 keep-warm-NVMe policy. The composed number the marginal summary and the \
-                 occupancy view each show one half of.",
+                "Serving COGS per keep-warm policy — one tenant-month at {} queries/mo, \
+                 egress excluded (passed through at cost). Pick the policy you sell; \
+                 assumptions are knobs: warm-hit rate {warm_pct:.0}% \
+                 (INFINO_BENCH_COST_WARM_FRACTION), R={replicas} \
+                 (INFINO_BENCH_COST_REPLICAS), instance rates (INFINO_BENCH_COST_*).",
                 fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
-                SUMMARY_READ_WARM_FRACTION * 100.0,
             ),
             headers: vec!["Line".into(), "Basis".into(), "$/month".into()],
             rows,
@@ -3002,6 +3064,26 @@ mod tests {
         assert!((inst.usd_per_month() - 0.3629 * HOURS_PER_MONTH).abs() < 1e-9);
         let billed = 0.5 * inst.usd_per_month() * 2.0;
         assert!((billed - inst.usd_per_month()).abs() < 1e-9);
+    }
+
+    /// The warm-fraction knob accepts only a real hit rate: 0 < f ≤ 1.
+    /// Unset, garbage, zero, negative, >1 and NaN all fall back to the
+    /// default rather than silently shaping the blend.
+    #[test]
+    fn warm_fraction_parse_accepts_only_a_real_hit_rate() {
+        assert_eq!(
+            parse_warm_fraction(None),
+            DEFAULT_SUMMARY_READ_WARM_FRACTION
+        );
+        assert_eq!(parse_warm_fraction(Some("0.5")), 0.5);
+        assert_eq!(parse_warm_fraction(Some("1")), 1.0);
+        for bad in ["0", "-0.2", "1.5", "NaN", "warm"] {
+            assert_eq!(
+                parse_warm_fraction(Some(bad)),
+                DEFAULT_SUMMARY_READ_WARM_FRACTION,
+                "{bad} must fall back"
+            );
+        }
     }
 
     /// The composed serving-COGS number: marginal-ex-egress plus the

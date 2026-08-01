@@ -41,7 +41,7 @@ use rand_distr::{Distribution, StandardNormal};
 /// Standard small-corpus oracle shape (brute force stays cheap).
 const ORACLE_DIM: usize = 32;
 const ORACLE_N_DOCS: usize = 200;
-const ORACLE_N_CENT: usize = 4;
+const ORACLE_N_CENT: usize = 64;
 /// Top-k and rerank pool for the full-nprobe oracle comparisons.
 const ORACLE_TOP_K: usize = 5;
 const ORACLE_RERANK_MULT: usize = 40;
@@ -145,7 +145,6 @@ fn build_reader_with_codec(
     b.register_column(VectorConfig {
         column: "v".into(),
         dim,
-        n_cent,
         rot_seed,
         metric,
         rerank_codec,

@@ -3121,7 +3121,7 @@ impl Supertable {
     /// #     DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
     /// #     false,
     /// # )]));
-    /// # let vecs = db.create_table("vecs", schema.clone(), IndexSpec::new().vector("emb", 16, 1, Metric::Cosine))?;
+    /// # let vecs = db.create_table("vecs", schema.clone(), IndexSpec::new().vector("emb", 16, Metric::Cosine))?;
     /// # let mut data = vec![0.0f32; 16]; data[0] = 1.0;
     /// # let col = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(data.iter().copied().map(Some).collect::<Vec<_>>())], 16);
     /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
@@ -3541,7 +3541,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
@@ -3609,7 +3608,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
@@ -5015,7 +5013,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5083,7 +5080,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5191,7 +5187,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5307,7 +5302,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,

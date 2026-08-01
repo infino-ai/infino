@@ -99,7 +99,7 @@ test("update, delete, optimize", { skip }, () => {
 
 test("vector search", { skip }, () => {
   withDb((db) => {
-    const vecs = db.createTable("vecs", { emb: { vector: DIM } }, new IndexSpec().vector("emb", DIM, 1, "cosine"));
+    const vecs = db.createTable("vecs", { emb: { vector: DIM } }, new IndexSpec().vector("emb", DIM, "cosine"));
     vecs.append([{ emb: onehot(0) }, { emb: onehot(1) }, { emb: onehot(2) }]);
 
     const hits = vecs.vectorSearch("emb", onehot(0), 10);
@@ -113,7 +113,7 @@ test("hybridSearch", { skip }, () => {
     const docs = db.createTable(
       "docs",
       { title: "large_utf8", emb: { vector: DIM } },
-      new IndexSpec().fts("title").vector("emb", DIM, 1, "cosine"),
+      new IndexSpec().fts("title").vector("emb", DIM, "cosine"),
     );
     docs.append([
       { title: "rust async", emb: onehot(0) },

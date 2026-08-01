@@ -339,14 +339,8 @@ impl BuilderOptions {
                     .expect("multi-cell reader has at least one cell ColumnReader");
                 (
                     vec![
-                        VectorConfig::new(
-                            v.name.clone(),
-                            v.dim,
-                            v.n_cent as usize,
-                            v.rot_seed,
-                            v.metric,
-                        )
-                        .with_rerank_codec(v.rerank_codec),
+                        VectorConfig::new(v.name.clone(), v.dim, v.rot_seed, v.metric)
+                            .with_rerank_codec(v.rerank_codec),
                     ],
                     VectorLayout::MultiCellIvf,
                 )
@@ -354,14 +348,8 @@ impl BuilderOptions {
                 (
                     vec.vector_columns_config()
                         .map(|v| {
-                            VectorConfig::new(
-                                v.name.clone(),
-                                v.dim,
-                                v.n_cent as usize,
-                                v.rot_seed,
-                                v.metric,
-                            )
-                            .with_rerank_codec(v.rerank_codec)
+                            VectorConfig::new(v.name.clone(), v.dim, v.rot_seed, v.metric)
+                                .with_rerank_codec(v.rerank_codec)
                         })
                         .collect::<Vec<_>>(),
                     VectorLayout::Ivf,
@@ -948,9 +936,11 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-                let mut cfg = vec_cfg.clone();
-                cfg.n_cent = n_cent.max(1);
-                let merged = build_merged_subsection_from_materialized(cfg, rows)?;
+                let merged = build_merged_subsection_from_materialized(
+                    vec_cfg.clone(),
+                    n_cent.max(1),
+                    rows,
+                )?;
                 if stable_ids.len() != merged.n_docs as usize {
                     return Err(BuildError::VectorSchemaMismatch(format!(
                         "cell {cell_id}: stable_ids len {} != merged n_docs {}",
@@ -1030,9 +1020,11 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-                let mut cfg = vec_cfg.clone();
-                cfg.n_cent = n_cent.max(1);
-                let merged = build_merged_subsection_from_materialized(cfg, rows)?;
+                let merged = build_merged_subsection_from_materialized(
+                    vec_cfg.clone(),
+                    n_cent.max(1),
+                    rows,
+                )?;
                 if stable_ids.len() != merged.n_docs as usize {
                     return Err(BuildError::VectorSchemaMismatch(format!(
                         "cell {cell_id}: stable_ids len {} != merged n_docs {}",
@@ -1592,9 +1584,10 @@ fn fts_columns_json(cols: &[FtsConfig], tokenizers: &[Arc<dyn Tokenizer>]) -> St
 /// `Serialize` needed.
 ///
 /// Output shape per column:
-/// `{"column":"<escaped>","dim":<u>,"n_cent":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
-/// The reader at open time parses this back into
-/// `VectorConfig` to drive distance kernels + IVF probing.
+/// `{"column":"<escaped>","dim":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
+/// The reader at open time parses this back for the column name, dim, rot_seed,
+/// and metric; the physical centroid count comes from each subsection's own
+/// on-disk directory, not from this record.
 fn vec_columns_json(cols: &[VectorConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
@@ -1605,8 +1598,6 @@ fn vec_columns_json(cols: &[VectorConfig]) -> String {
         s.push_str(&escape_json(&c.column));
         s.push_str(r#"","dim":"#);
         s.push_str(&c.dim.to_string());
-        s.push_str(r#","n_cent":"#);
-        s.push_str(&c.n_cent.to_string());
         s.push_str(r#","rot_seed":"#);
         s.push_str(&c.rot_seed.to_string());
         s.push_str(r#","metric":""#);
@@ -2082,7 +2073,6 @@ mod tests {
         let cols = vec![VectorConfig {
             column: "emb".into(),
             dim: 384,
-            n_cent: 64,
             rot_seed: 99,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -2091,7 +2081,10 @@ mod tests {
         let s = vec_columns_json(&cols);
         assert!(s.contains(r#""column":"emb""#));
         assert!(s.contains(r#""dim":384"#));
-        assert!(s.contains(r#""n_cent":64"#));
+        assert!(
+            !s.contains("n_cent"),
+            "n_cent is no longer part of the record: {s}"
+        );
         assert!(s.contains(r#""rot_seed":99"#));
         assert!(s.contains(r#""metric":"l2sq""#));
     }
@@ -2542,7 +2535,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim: 16,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -2855,6 +2847,64 @@ mod tests {
             .await
             .expect("search merged");
         assert_eq!(results_merged.len(), 2);
+    }
+
+    /// Merged `df` for a shared term here is well past the point
+    /// where its postings outgrow the FST value's 21-bit length slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_from_readers_merges_common_term_past_pfor_length_slot() {
+        const NUM_FILES: usize = 12;
+        const DOCS_PER_FILE: usize = 450_000;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+
+        let mut readers = Vec::with_capacity(NUM_FILES);
+        for file_idx in 0..NUM_FILES {
+            let base_id = (file_idx * DOCS_PER_FILE) as u64;
+            let ids = decimal128_ids(base_id..base_id + DOCS_PER_FILE as u64);
+            let title = LargeStringArray::from(vec!["common"; DOCS_PER_FILE]);
+            let body = LargeStringArray::from(vec!["x"; DOCS_PER_FILE]);
+            let batch = RecordBatch::try_new(
+                opts.schema.clone(),
+                vec![Arc::new(ids), Arc::new(title), Arc::new(body)],
+            )
+            .expect("build RecordBatch");
+
+            let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+            b.add_batch(&batch, &[]).expect("add_batch");
+            let bytes = b.finish().expect("finish builder");
+            readers.push((
+                Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open reader")),
+                empty_bitmap(),
+            ));
+        }
+
+        let total_docs = (NUM_FILES * DOCS_PER_FILE) as u64;
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_readers(&readers).expect("build_from_readers");
+        assert_eq!(stats.n_docs, total_docs);
+
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        let fts_reader_merged = merged_reader.fts().expect("get fts reader from merged");
+        let hits = fts_reader_merged
+            .token_match("title", &["common"], BoolMode::Or)
+            .await
+            .expect("token_match on merged");
+        assert_eq!(
+            hits.len() as u64,
+            total_docs,
+            "every doc matches \"common\""
+        );
     }
 
     #[test]
@@ -3613,10 +3663,9 @@ mod tests {
                 })
                 .collect()
         };
-        let make_cfg = |n_cent: usize| VectorConfig {
+        let make_cfg = || VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: if rerank_codec == RerankCodec::Sq8FixedResidual {
                 Metric::Cosine
@@ -3631,7 +3680,7 @@ mod tests {
         for &(cell_id, n_rows, n_cent) in cells {
             let rows = make_rows(cell_id, n_rows);
             ids.extend(rows.iter().map(|r| r.stable_id));
-            let sub = build_merged_subsection_from_materialized(make_cfg(n_cent), rows)
+            let sub = build_merged_subsection_from_materialized(make_cfg(), n_cent, rows)
                 .expect("cell subsection");
             packed.push((cell_id, sub));
         }
@@ -3647,10 +3696,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
                 .expect("batch");
-        let first_n_cent = cells.first().map(|&(_, _, n)| n).unwrap_or(1);
-        let opts =
-            BuilderOptions::new(schema, "doc_id", vec![], vec![make_cfg(first_n_cent)], None)
-                .with_vector_layout(VectorLayout::MultiCellIvf);
+        let opts = BuilderOptions::new(schema, "doc_id", vec![], vec![make_cfg()], None)
+            .with_vector_layout(VectorLayout::MultiCellIvf);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         b.add_batch_ids_only(&batch).expect("ids");
         b.set_prebuilt_multi_cell_ivfs(packed).expect("pack");

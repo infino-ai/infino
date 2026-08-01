@@ -32,13 +32,16 @@
 //! actix, etc.).
 
 use std::{
+    fmt,
     future::Future,
     sync::{Arc, OnceLock},
     thread,
 };
 
+use rayon::ThreadPool;
 use tokio::{
     runtime::{self, Handle, Runtime},
+    sync::oneshot,
     task::block_in_place,
 };
 
@@ -114,6 +117,47 @@ where
             .expect("sync→async bridge worker thread panicked"),
         Err(_) => build_current_thread_runtime().block_on(fut),
     }
+}
+
+/// Async→rayon bridge: dispatch CPU work onto the configured reader pool
+pub(crate) fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
+    match pool {
+        Some(pool) => pool.spawn(f),
+        None => rayon::spawn(f),
+    }
+}
+
+/// The pool task's sender was dropped before sending a result surfaced as
+/// an error rather than a second panic.
+#[derive(Debug)]
+pub(crate) struct PoolDropped(pub(crate) &'static str);
+
+impl fmt::Display for PoolDropped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PoolDropped {}
+
+/// Run `f` on `pool` (or the global rayon pool if `None`) and bridge the
+/// result back to the awaiting async task via a oneshot, so no tokio worker
+/// blocks under the compute. `what` becomes the [`PoolDropped`] message if
+/// the pool task dies before sending
+pub(crate) async fn run_on_pool<R, F>(
+    pool: Option<&ThreadPool>,
+    what: &'static str,
+    f: F,
+) -> Result<R, PoolDropped>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    spawn_on(pool, move || {
+        let _ = tx.send(f());
+    });
+    rx.await.map_err(|_| PoolDropped(what))
 }
 
 /// Process-wide query runtime, shared by every `Connection` and
