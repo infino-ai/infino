@@ -5660,6 +5660,18 @@ async fn pin_uploaded_superfiles(
     .await
 }
 
+/// Best-effort release of the split upload pin after a failed publish, so a
+/// stale pin cannot hold the aborted output live on an otherwise idle table
+/// (any later slow-state stamp would also release it, but an idle table may
+/// never write one). The publish error wins; a failed unpin is logged and
+/// swallowed — the orphans then wait for the next stamp as before.
+async fn unpin_after_failed_publish(inner: &SupertableInner, error: BuildError) -> BuildError {
+    if let Err(unpin) = stamp_slow_vector_state(inner, None).await {
+        debug!("split upload unpin after failed publish: {unpin}");
+    }
+    error
+}
+
 /// One repacked split: its children already packed as spilled cell
 /// subsections on scratch disk, awaiting shard assembly.
 struct RepackedSplit {
@@ -5985,7 +5997,10 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
     });
     let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
     while let Some(upload) = in_flight.next().await {
-        upload?;
+        if let Err(error) = upload {
+            drop(in_flight);
+            return Err(unpin_after_failed_publish(inner, error).await);
+        }
     }
     drop(in_flight);
 
@@ -6011,7 +6026,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         superseded_cells_additions: Some(superseded_additions),
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
-    let new_manifest = persist_commit_async(
+    let new_manifest = match persist_commit_async(
         inner,
         Arc::clone(&storage),
         new_entries,
@@ -6021,7 +6036,12 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         list_metadata,
     )
     .await
-    .map_err(BuildError::from)?;
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(unpin_after_failed_publish(inner, BuildError::from(error)).await);
+        }
+    };
     inner.manifest.store(Arc::new(new_manifest));
     apply_pending_store_inserts(inner, pending_store_inserts);
 
@@ -6464,7 +6484,10 @@ pub(in crate::supertable) async fn split_repack_bulk(
     });
     let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
     while let Some(landed) = in_flight.next().await {
-        landed?;
+        if let Err(error) = landed {
+            drop(in_flight);
+            return Err(unpin_after_failed_publish(inner, error).await);
+        }
     }
     drop(in_flight);
 
@@ -6483,7 +6506,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         superseded_cells_additions: Some(superseded_additions),
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
-    let new_manifest = persist_commit_async(
+    let new_manifest = match persist_commit_async(
         inner,
         Arc::clone(&storage),
         new_entries,
@@ -6493,7 +6516,12 @@ pub(in crate::supertable) async fn split_repack_bulk(
         list_metadata,
     )
     .await
-    .map_err(BuildError::from)?;
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(unpin_after_failed_publish(inner, BuildError::from(error)).await);
+        }
+    };
     inner.manifest.store(Arc::new(new_manifest));
     apply_pending_store_inserts(inner, pending_store_inserts);
     schedule_background_storage_reclaim(Arc::clone(inner));

@@ -191,10 +191,13 @@ impl CrashStorage {
     }
 
     /// Called from put_atomic / put_if_match after the
-    /// inner provider returns. Aborts the process iff armed
-    /// AND `is_match` AND `ok` AND this is the Nth such match.
-    fn maybe_abort(&self, uri: &str, is_match: bool, ok: bool) {
-        if !(self.armed.load(Ordering::SeqCst) && is_match && ok) {
+    /// inner provider returns, with the arm state CAPTURED AT REQUEST
+    /// START — a request already in flight when `arm()` fires must not
+    /// count toward the post-arm matches. Aborts the process iff that
+    /// snapshot was armed AND `is_match` AND `ok` AND this is the Nth
+    /// such match.
+    fn maybe_abort(&self, uri: &str, armed_at_start: bool, is_match: bool, ok: bool) {
+        if !(armed_at_start && is_match && ok) {
             return;
         }
         let n = self.matches_seen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -220,9 +223,10 @@ impl StorageProvider for CrashStorage {
         self.inner.get_range(uri, range).await
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+        let armed_at_start = self.armed.load(Ordering::SeqCst);
         let is_match = self.uri_matches(uri);
         let result = self.inner.put_atomic(uri, bytes).await;
-        self.maybe_abort(uri, is_match, result.is_ok());
+        self.maybe_abort(uri, armed_at_start, is_match, result.is_ok());
         result
     }
     async fn put_if_match(
@@ -231,9 +235,10 @@ impl StorageProvider for CrashStorage {
         bytes: Bytes,
         expected_etag: Option<&str>,
     ) -> Result<Option<String>, StorageError> {
+        let armed_at_start = self.armed.load(Ordering::SeqCst);
         let is_match = self.uri_matches(uri);
         let result = self.inner.put_if_match(uri, bytes, expected_etag).await;
-        self.maybe_abort(uri, is_match, result.is_ok());
+        self.maybe_abort(uri, armed_at_start, is_match, result.is_ok());
         result
     }
     async fn put_multipart(
