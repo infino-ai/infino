@@ -5962,12 +5962,18 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         pending_store_inserts,
     } = collect_prepared_superfiles(inner, all_prepared)?;
 
+    // Pin the batch's children BEFORE any byte moves: the pin's entries are
+    // manifest metadata, so one stamp up front covers every child from its
+    // first uploaded byte — no unprotected window at all, and no per-child
+    // stamping. The commit's own restamp clears the pin; after a crash the
+    // stale pin holds the orphans until the next slow-state stamp releases
+    // them to gc (abandon-based recovery, same as the repack).
+    pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
+
     // Upload the child bytes EAGERLY and drop them, so the batch holds no
     // superfile bytes across the commit and OCC retries re-PUT nothing
     // (superfile URIs are UUID v4; a re-PUT's `PreconditionFailed` is
-    // swallowed as our own prior attempt). A crash between here and the
-    // pointer CAS leaves only GC-reclaimable orphans, all younger than the
-    // reclaim grace for the seconds this window stays open.
+    // swallowed as our own prior attempt).
     let multipart_threshold = inner.options.put_multipart_threshold_bytes;
     let uploads = pending_storage_writes.into_iter().map(|(uri, bytes)| {
         let storage = Arc::clone(&storage);
@@ -5982,14 +5988,6 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         upload?;
     }
     drop(in_flight);
-
-    // Pin the uploaded children until the commit publishes them (the same
-    // protection as the repack's per-shard pin): the upload window is
-    // byte-bounded, not time-bounded, and a degraded store plus a
-    // concurrent commit's deferred reclaim could otherwise sweep an
-    // uploaded-but-uncommitted child past the grace. One stamp per batch;
-    // the commit's own restamp clears it.
-    pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
 
     // Publish the child superfiles, the supersede markers, and the grown
     // grid in one OCC attempt for the WHOLE batch. The parents are NOT
@@ -6148,9 +6146,23 @@ pub(in crate::supertable) async fn split_repack_bulk(
     let initial_n_cent = clusters.n_cent;
     let budget_bytes = split_batch_memory_budget_bytes();
 
+    /// Removes the pass's scratch on every return path — a failed repack
+    /// must not leak table-sized spill files under TMPDIR. A hard crash
+    /// (SIGABRT) still leaks, as with the drain's scratch: no Drop runs.
+    struct RepackScratchGuard {
+        path: PathBuf,
+    }
+    impl Drop for RepackScratchGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
     let scratch = repack_scratch_dir();
     fs::create_dir_all(&scratch)
         .map_err(|error| BuildError::Store(format!("repack scratch create: {error}")))?;
+    let _scratch_guard = RepackScratchGuard {
+        path: scratch.clone(),
+    };
 
     let mut running_clusters = clusters;
     let mut noop_cells: Vec<u32> = Vec::new();
@@ -6375,7 +6387,6 @@ pub(in crate::supertable) async fn split_repack_bulk(
         }
     }
     if packed_children.is_empty() {
-        let _ = fs::remove_dir_all(&scratch);
         return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
     }
 
@@ -6435,31 +6446,25 @@ pub(in crate::supertable) async fn split_repack_bulk(
         pending_store_inserts,
     } = collect_prepared_superfiles(inner, prepared)?;
 
-    // Upload each shard and PIN it in slow-CAS pending state as it lands
-    // (the drain's per-shard pattern): the pin extends gc's live set for
-    // the rest of the upload window, which can exceed the reclaim grace.
-    let entry_by_uri: HashMap<SuperfileUri, Arc<SuperfileEntry>> = new_entries
-        .iter()
-        .map(|entry| (entry.uri, Arc::clone(entry)))
-        .collect();
+    // Pin every shard BEFORE any byte moves (entries are metadata): one
+    // stamp covers the whole upload window — which can exceed the reclaim
+    // grace — with zero unprotected bytes, instead of the drain's per-shard
+    // incremental stamps. The commit's restamp clears the pin; a crash
+    // leaves the orphans pinned until the next slow-state stamp releases
+    // them (abandon-based recovery).
+    pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
     let multipart_threshold = inner.options.put_multipart_threshold_bytes;
     let uploads = pending_storage_writes.into_iter().map(|(uri, bytes)| {
         let storage = Arc::clone(&storage);
         async move {
             put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
                 .await
-                .map(|()| uri)
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
     let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
-    let mut pinned: Vec<Arc<SuperfileEntry>> = Vec::new();
     while let Some(landed) = in_flight.next().await {
-        let uri = landed?;
-        if let Some(entry) = entry_by_uri.get(&uri) {
-            pinned.push(Arc::clone(entry));
-            pin_uploaded_superfiles(inner, pinned.clone(), pinned.len() == 1).await?;
-        }
+        landed?;
     }
     drop(in_flight);
 
@@ -6492,7 +6497,6 @@ pub(in crate::supertable) async fn split_repack_bulk(
     inner.manifest.store(Arc::new(new_manifest));
     apply_pending_store_inserts(inner, pending_store_inserts);
     schedule_background_storage_reclaim(Arc::clone(inner));
-    let _ = fs::remove_dir_all(&scratch);
 
     debug!(
         cells = committed_cells.len(),

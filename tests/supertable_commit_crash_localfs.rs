@@ -512,19 +512,17 @@ fn dispatch_child_if_set() -> Option<()> {
 /// crash (both planted directions fully retrievable), then run an explicit
 /// hidden-table `gc` (the background sweep never fires inside a test's
 /// lifetime) and return its deleted-object count.
-fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u64 {
+fn verify_hidden_split_crash(dir: &PathBuf, expected_id_delta: u64) -> u64 {
     let drained_id: u64 = std::fs::read_to_string(dir.join(DRAINED_HIDDEN_ID_MARKER))
         .expect("child wrote the drained-id marker before arming")
         .trim()
         .parse()
         .expect("marker holds a manifest id");
-    // A durable batch advances the id twice: its upload-pin stamp and its
-    // membership commit.
-    let expect_hidden_manifest_id = if expect_split_generation {
-        drained_id + 2
-    } else {
-        drained_id
-    };
+    // Per-kill-point id delta: the pre-upload pin stamp advances the id by
+    // one BEFORE any byte moves, the membership commit by one more. A kill
+    // inside the pin stamp (pre-pointer) recovers at +0; after the pin's
+    // pointer at +1; after the commit's pointer at +2.
+    let expect_hidden_manifest_id = drained_id + expected_id_delta;
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir).expect("provider"));
     let (options, _) = vector_crash_fixture();
@@ -545,8 +543,9 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
     // next-id manifest list, and the NEXT commit at that id fails with
     // write contention until the orphan is reclaimed — a pre-existing
     // property of the one-writer-per-manifest-id list PUT, surfaced by the
-    // between-batches kill point.
-    let report = hidden.gc(Duration::ZERO).expect("hidden gc");
+    // between-batches kill point. Children pinned by a pre-upload pin
+    // survive this sweep by design.
+    let first_sweep = hidden.gc(Duration::ZERO).expect("hidden gc");
 
     // Doc conservation FIRST — before any optimize that could repair the
     // state under test: one exhaustive-width query per planted direction
@@ -569,6 +568,7 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
                 None,
             )
             .expect("vector search");
+        let mut direction_ids: Vec<i128> = Vec::new();
         for batch in &batches {
             let ids = batch
                 .column(0)
@@ -576,9 +576,17 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
                 .downcast_ref::<Decimal128Array>()
                 .expect("_id column");
             for i in 0..ids.len() {
-                seen_ids.push(ids.value(i));
+                direction_ids.push(ids.value(i));
             }
         }
+        direction_ids.sort_unstable();
+        direction_ids.dedup();
+        assert_eq!(
+            direction_ids.len(),
+            CRASH_ROWS_PER_DIRECTION,
+            "direction {direction} must retrieve its full planted half after the crash"
+        );
+        seen_ids.extend(direction_ids);
     }
     seen_ids.sort_unstable();
     seen_ids.dedup();
@@ -588,15 +596,16 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
         "every planted doc is retrievable after the crash"
     );
 
-    if expect_split_generation {
-        // The crash interrupted maintenance mid-pass; the next cycle must
-        // complete it without error.
-        recovered
-            .optimize(&OptimizeOptions::default())
-            .expect("post-crash optimize completes the interrupted maintenance");
-    }
+    // The next maintenance cycle must complete cleanly on EVERY recovered
+    // state. Its pass-final slow-state stamp also releases any stale
+    // upload pin the crash left behind (abandon-based recovery), so the
+    // second sweep below reclaims what the pin was protecting.
+    recovered
+        .optimize(&OptimizeOptions::default())
+        .expect("post-crash optimize completes the interrupted maintenance");
+    let second_sweep = hidden.gc(Duration::ZERO).expect("hidden gc after optimize");
 
-    report.objects_deleted
+    first_sweep.objects_deleted + second_sweep.objects_deleted
 }
 
 #[test]
@@ -734,10 +743,10 @@ fn crash_post_hidden_child_superfile_yields_pre_split_index() {
         "crash_post_hidden_child_superfile_yields_pre_split_index",
         KP_HIDDEN_SPLIT_SEG,
     );
-    let deleted = verify_hidden_split_crash(&dir, false);
+    let deleted = verify_hidden_split_crash(&dir, 1);
     assert!(
         deleted >= 1,
-        "the uploaded-but-uncommitted split child is an orphan gc reclaims; deleted {deleted}"
+        "the pinned child is released by the recovery stamp and reclaimed; deleted {deleted}"
     );
 }
 
@@ -753,10 +762,10 @@ fn crash_post_hidden_list_yields_pre_split_index() {
         "crash_post_hidden_list_yields_pre_split_index",
         KP_HIDDEN_SPLIT_LIST,
     );
-    let deleted = verify_hidden_split_crash(&dir, false);
+    let deleted = verify_hidden_split_crash(&dir, 0);
     assert!(
         deleted >= 1,
-        "uploaded children + the orphan hidden list are gc-reclaimable; deleted {deleted}"
+        "the half-stamped pin list is a gc-reclaimable orphan; deleted {deleted}"
     );
 }
 
@@ -773,19 +782,19 @@ fn crash_post_hidden_repack_shard_yields_pre_split_index() {
         "crash_post_hidden_repack_shard_yields_pre_split_index",
         KP_HIDDEN_REPACK_SEG,
     );
-    let deleted = verify_hidden_split_crash(&dir, false);
+    let deleted = verify_hidden_split_crash(&dir, 1);
     assert!(
         deleted >= 1,
-        "the uploaded-but-unpinned repack shard is an orphan gc reclaims; deleted {deleted}"
+        "the pinned shard is released by the recovery stamp and reclaimed; deleted {deleted}"
     );
 }
 
-/// Crash BETWEEN two batch commits (inside batch 2's upload-pin stamp,
+/// Crash BETWEEN two batch commits (inside batch 2's pre-upload pin stamp,
 /// after batch 1's pointer CAS): the pass's mid-loop contract — each batch
 /// is all-or-nothing and a partial pass leaves a valid, partially-split
 /// grid the next optimize finishes. Batch 1's split is durable and
-/// queryable; batch 2's uploads are reclaimable orphans; `optimize`
-/// completes the pass.
+/// queryable; batch 2's leftovers (at minimum the half-stamped pin list)
+/// are reclaimable; `optimize` completes the pass.
 #[test]
 fn crash_between_split_batches_yields_first_batch() {
     if dispatch_child_if_set().is_some() {
@@ -795,10 +804,10 @@ fn crash_between_split_batches_yields_first_batch() {
         "crash_between_split_batches_yields_first_batch",
         KP_HIDDEN_SPLIT_SECOND_LIST,
     );
-    let deleted = verify_hidden_split_crash(&dir, true);
+    let deleted = verify_hidden_split_crash(&dir, 2);
     assert!(
         deleted >= 1,
-        "batch 2's uploaded-but-unpinned children are orphans gc reclaims; deleted {deleted}"
+        "batch 2's crash leftovers are reclaimed across the recovery sweeps; deleted {deleted}"
     );
 }
 
@@ -818,7 +827,7 @@ fn crash_post_hidden_pointer_yields_split_index() {
     );
     // Split durable; gc must simply succeed (superseded parents remain
     // referenced — reclaiming their dead blocks is the merge phase's job).
-    verify_hidden_split_crash(&dir, true);
+    verify_hidden_split_crash(&dir, 2);
 }
 
 #[test]
