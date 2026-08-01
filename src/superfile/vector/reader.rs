@@ -2078,8 +2078,21 @@ impl VectorReader {
                     let id_bytes = block.get(p..p.checked_add(DOC_ID_BYTES)?)?;
                     let did = u32::from_le_bytes(id_bytes.try_into().ok()?);
                     let stable = Self::stable_id_at(&region, did as usize)?;
-                    cluster_of_stable.insert(stable, cluster as u32);
+                    // One fine cluster per row, by construction — a stable
+                    // id claimed by two cluster blocks is an inconsistent
+                    // index, and calibrating depth from it would silently
+                    // under-stamp the laws. Degrade the whole read.
+                    if cluster_of_stable.insert(stable, cluster as u32).is_some() {
+                        return None;
+                    }
                 }
+            }
+            // Completeness: every row of the cell must be mapped (inserts
+            // are all-unique above, so len == the summed cluster counts).
+            // A partial view is partial depth evidence — degrade instead
+            // of calibrating from it.
+            if cluster_of_stable.len() != col.n_docs as usize {
+                return None;
             }
             // This walk is multi-cell-only (gated above), so every subsection
             // must have a cell-id entry — a missing one is inconsistent
