@@ -2064,16 +2064,21 @@ impl VectorReader {
                 let block = self
                     .source
                     .try_get_range_sync(col.cluster_codes_doc_ids_range(off, cnt))?;
-                let ids_start = (cnt as usize) * col.quant.code_bytes();
+                let ids_start = (cnt as usize).checked_mul(col.quant.code_bytes())?;
                 for i in 0..cnt as usize {
-                    let p = ids_start + i * DOC_ID_BYTES;
-                    let did = u32::from_le_bytes(block[p..p + DOC_ID_BYTES].try_into().ok()?);
+                    let p = ids_start.checked_add(i.checked_mul(DOC_ID_BYTES)?)?;
+                    let id_bytes = block.get(p..p.checked_add(DOC_ID_BYTES)?)?;
+                    let did = u32::from_le_bytes(id_bytes.try_into().ok()?);
                     let stable = Self::stable_id_at(&region, did as usize)?;
                     cluster_of_stable.insert(stable, cluster as u32);
                 }
             }
+            // This walk is multi-cell-only (gated above), so every subsection
+            // must have a cell-id entry — a missing one is inconsistent
+            // metadata, and observations mapped without a cell would be
+            // silently dropped downstream. Degrade the whole read instead.
             out.push(CellFineCalibrationView {
-                cell_id: self.cell_ids.get(index).copied(),
+                cell_id: Some(self.cell_ids.get(index).copied()?),
                 dim: col.dim,
                 n_fine,
                 fine_centroids_bytes,

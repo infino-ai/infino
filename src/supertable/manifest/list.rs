@@ -424,8 +424,26 @@ impl CellRoutingParams {
     }
 
     /// The rerank law at this query's `k` — same log-linear interpolation
-    /// and clamping as [`Self::width_for_k_at`].
+    /// as [`Self::width_for_k_at`] within the calibrated range, but NO
+    /// clamp above it. The rerank law is an absolute survivor budget, not
+    /// a per-`k` multiplier: a high-`k` point is zeroed when the stamped
+    /// width outgrows the calibration pool, and clamping such a `k` down
+    /// to the last calibrated point would serve it with a budget certified
+    /// for a `k` orders of magnitude smaller (k=1000 under a k=100 budget
+    /// is ~85x fewer survivors than the default). Beyond the last
+    /// calibrated knot, `None` falls back to the configured `rerank_mult`,
+    /// which scales with `k`. (Width and fine depth keep the clamp: they
+    /// grow sub-linearly in `k`, so the boundary value is a sane floor.)
     pub(crate) fn rerank_for_k_at(&self, k: usize) -> Option<usize> {
+        let last_calibrated = WIDTH_LAW_KS
+            .iter()
+            .zip(self.rerank_for_k.iter())
+            .filter(|(_, w)| **w > 0)
+            .map(|(k_pt, _)| *k_pt)
+            .next_back()?;
+        if k > last_calibrated {
+            return None;
+        }
         Self::law_at(&self.rerank_for_k, k)
     }
 
@@ -2776,6 +2794,37 @@ mod tests {
         assert_eq!(full.fine_for_k_at(100_000), Some(12), "clamps above range");
         assert_eq!(law([0, 0, 8, 0]).fine_for_k_at(1), Some(8), "zeros skip");
         assert_eq!(law([0; WIDTH_LAW_KS.len()]).fine_for_k_at(10), None);
+    }
+
+    /// `rerank_for_k_at` never clamps ABOVE its calibrated range: the law
+    /// is an absolute survivor budget, so a `k` past the last calibrated
+    /// knot (a zeroed point — the stamped width outgrew the calibration
+    /// pool — or simply `k` beyond the knot table) must fall back to the
+    /// configured `rerank_mult` (`None`), not be served a budget certified
+    /// for a far smaller `k`.
+    #[test]
+    fn rerank_for_k_at_returns_none_beyond_last_calibrated_knot() {
+        let law = |r: [u32; WIDTH_LAW_KS.len()]| CellRoutingParams {
+            rerank_for_k: r,
+            ..CellRoutingParams::default()
+        };
+        // Fully calibrated: resolves inside the knot range, clamps LOW
+        // (over-provision is safe), and refuses to serve k past the last
+        // knot with the k=1000 budget.
+        let full = law([40, 320, 2400, 16000]);
+        assert_eq!(full.rerank_for_k_at(1), Some(40));
+        assert_eq!(full.rerank_for_k_at(0), Some(40), "clamps low end");
+        assert_eq!(full.rerank_for_k_at(1000), Some(16000));
+        assert_eq!(full.rerank_for_k_at(2000), None, "no clamp past range");
+        // High-k point cleared (stamped width outgrew the pool): k at or
+        // below the last calibrated knot resolves, anything above falls
+        // back to the default budget instead of clamping down to n(100).
+        let cleared = law([40, 320, 2400, 0]);
+        assert_eq!(cleared.rerank_for_k_at(100), Some(2400));
+        assert_eq!(cleared.rerank_for_k_at(101), None);
+        assert_eq!(cleared.rerank_for_k_at(1000), None);
+        // All-zero = no law.
+        assert_eq!(law([0; WIDTH_LAW_KS.len()]).rerank_for_k_at(10), None);
     }
 
     #[test]

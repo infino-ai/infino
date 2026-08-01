@@ -4605,8 +4605,11 @@ mod tests {
     /// (fine depth is what a flat `fine_nprobe_floor` regressed at 10M:
     /// post-drain 0.982 at floor 4 vs 0.996 at 8); (2) after a geometry
     /// change (cell split), `recalibrate_probe_laws` re-measures from
-    /// stored bytes and REPLACES measured points while a point the fresh
-    /// sample cannot support keeps its previous value.
+    /// stored bytes and restamps: width REPLACEs (fresh full-table
+    /// measurement is authoritative, must be able to narrow), fine depth
+    /// and rerank MAX-MERGE (never shallowed below a certified stamp),
+    /// and a point the fresh sample cannot support keeps its previous
+    /// value under both rules.
     #[test]
     fn drain_stamps_both_laws_and_recalibration_restamps_after_split() {
         use std::sync::Arc;
@@ -4740,14 +4743,18 @@ mod tests {
             .expect("split")
             .expect("live rows present, split must commit");
 
-        // Plant a stale law, as a pre-depth-law manifest stamped under the
-        // old geometry would carry: an over-wide width and no fine depth.
-        // Six rows cannot support k=100/1000, so the fresh measurement is 0
-        // there and those planted points must survive the restamp.
+        // Plant a stale law as an old-geometry stamp would carry: an
+        // over-wide width, a deeper-than-measurable fine point at k=1, and
+        // no rerank. Six rows cannot support k=100/1000, so the fresh
+        // measurement is 0 there and those planted points must survive the
+        // restamp; the deep fine point must survive too (fine max-merges —
+        // a fresh sample must never shallow a certified depth), while the
+        // over-wide width must be REPLACED by the fresh measurement.
         const STALE_WIDTH: u32 = 33;
+        const STALE_FINE: u32 = 9;
         let (clusters, column, mut planted) = read_strategy(&hidden);
         planted.width_for_k = [STALE_WIDTH; 4];
-        planted.fine_for_k = [0; 4];
+        planted.fine_for_k = [STALE_FINE, 0, 0, 0];
         planted.rerank_for_k = [0; 4];
         let list_metadata = CommitListMetadata {
             partition_strategy: Some(PartitionStrategy::VectorCell {
@@ -4798,9 +4805,16 @@ mod tests {
             "measured points replace the stale value, got {:?}",
             routing.width_for_k
         );
-        assert!(
-            routing.fine_for_k[0] > 0,
-            "recalibration must stamp the fine-depth law, got {:?}",
+        // The distinguishing max-merge check: the fresh sample DOES measure
+        // fine depth at k=1 (a 1-2 on this tiny grid), so a REPLACE rule
+        // would stamp that shallow value — only max-merge keeps the deeper
+        // certified 9. (Fresh stamping from zero is evidenced by the rerank
+        // law below; end-to-end fine restamping by the recall-guard test in
+        // `query::vector::tests`.)
+        assert_eq!(
+            routing.fine_for_k[0], STALE_FINE,
+            "fine depth max-merges: recalibration must never shallow a \
+             stamp a previous measurement certified, got {:?}",
             routing.fine_for_k
         );
         assert!(

@@ -1429,13 +1429,15 @@ impl SupertableReader {
             // than the constant, an easy table gets fewer. A caller-set
             // `rerank_mult` wins over the law, exactly as a caller-set
             // `nprobe` wins over the width law.
-            let options = if hidden_vector_index && !filtered && options.rerank_mult().is_none() {
-                match hidden_routing.and_then(|r| r.rerank_for_k_at(k)) {
-                    Some(n) => options.with_rerank_mult(n.div_ceil(k.max(1)).max(1)),
-                    None => options,
-                }
-            } else {
-                options
+            let options = match rerank_mult_from_law(
+                hidden_vector_index,
+                filtered,
+                options.rerank_mult(),
+                hidden_routing.as_ref(),
+                k,
+            ) {
+                Some(mult) => options.with_rerank_mult(mult),
+                None => options,
             };
             let law_width: Option<usize> =
                 if hidden_vector_index && !filtered && options.nprobe.is_none() {
@@ -2950,6 +2952,30 @@ fn subtract_tombstones(
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
+/// The rerank-law multiplier for this query, or `None` to keep the
+/// caller's options untouched. `Some` only when ALL of: the query runs
+/// on the hidden vector-index table, it is unfiltered (filtered queries
+/// keep their own budget model), the caller set no `rerank_mult` (caller
+/// intent always wins, exactly as a caller `nprobe` wins over the width
+/// law), and the manifest carries a calibrated rerank point at this `k`.
+/// The measured global survivor budget is expressed as the equivalent
+/// multiplier so the divided cold budget and the global shortlist cap
+/// both inherit it through `resolve`.
+fn rerank_mult_from_law(
+    hidden_vector_index: bool,
+    filtered: bool,
+    caller_rerank_mult: Option<usize>,
+    hidden_routing: Option<&CellRoutingParams>,
+    k: usize,
+) -> Option<usize> {
+    if !hidden_vector_index || filtered || caller_rerank_mult.is_some() {
+        return None;
+    }
+    hidden_routing
+        .and_then(|r| r.rerank_for_k_at(k))
+        .map(|n| n.div_ceil(k.max(1)).max(1))
+}
+
 /// One shared width override on top of the per-branch base routing:
 /// explicit caller `nprobe` pins the cell sweep width on every branch —
 /// an override is honored, never discarded — and with no override a
@@ -3177,8 +3203,9 @@ mod tests {
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
         VectorSearchOptions, admit_shortlist_window, apply_width_pin, cells_ranked_by_fine_score,
         gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
-        postings_by_cell_from_summaries, projection_is_id_score_only, score_fine_candidates,
-        select_global_shortlist, union_cell_selection, vector_read_query_error,
+        postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -3195,6 +3222,7 @@ mod tests {
                 ClusterCentroids,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            writer::{recalibrate_probe_laws, split_overflow_cell},
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -4674,6 +4702,39 @@ mod tests {
         assert_eq!(from_a, vec![(0, 0, 1, 1), (1, 0, 1, 1), (1, 0, 3, 3)]);
     }
 
+    /// The rerank-law application gates: the measured budget converts to a
+    /// multiplier ONLY on the unfiltered hidden path with no caller
+    /// override — a caller `rerank_mult` always wins, filtered queries
+    /// keep their own budget model, non-hidden tables never consult the
+    /// law, and an uncalibrated `k` (cleared high-k point, or `k` past the
+    /// knot table) falls back to the configured default rather than a
+    /// clamped-down budget. Guards the silent failure modes: dropping the
+    /// caller-override gate would override caller intent, dropping the
+    /// `!filtered` gate would mis-budget filtered queries — both with zero
+    /// other test failures.
+    #[test]
+    fn rerank_law_yields_to_caller_filter_and_uncalibrated_k() {
+        let routing = CellRoutingParams {
+            rerank_for_k: [40, 320, 2400, 0],
+            ..CellRoutingParams::default()
+        };
+        let r = Some(&routing);
+        // Engages: unfiltered hidden path, no caller override, calibrated k.
+        // k=10 budget 320 -> equivalent multiplier ceil(320/10) = 32.
+        assert_eq!(rerank_mult_from_law(true, false, None, r, 10), Some(32));
+        // Caller override wins.
+        assert_eq!(rerank_mult_from_law(true, false, Some(8), r, 10), None);
+        // Filtered queries keep their own budget model.
+        assert_eq!(rerank_mult_from_law(true, true, None, r, 10), None);
+        // Non-hidden tables never consult the law.
+        assert_eq!(rerank_mult_from_law(false, false, None, r, 10), None);
+        // Uncalibrated k (the k=1000 point cleared): default fallback, not
+        // a clamp down to the k=100 budget.
+        assert_eq!(rerank_mult_from_law(true, false, None, r, 1000), None);
+        // No routing at all (user table, undrained): default fallback.
+        assert_eq!(rerank_mult_from_law(true, false, None, None, 10), None);
+    }
+
     /// A clean drain calibrates the probe-width law from the table's own
     /// rows and stamps it into the manifest routing; a DEFAULT search (no
     /// nprobe, no config) then widens to the calibrated width. On this
@@ -4694,6 +4755,65 @@ mod tests {
             near, k,
             "drain-calibrated width law must widen the default sweep to all \
              {k} exact neighbors across three cells, got {near}"
+        );
+    }
+
+    /// The recall target guarded end-to-end THROUGH the stamped laws:
+    /// after a compaction-style reshape (splitting the cell holding the
+    /// query's strongest direction) and `recalibrate_probe_laws`, a
+    /// DEFAULT search — no caller knobs, every probe decision resolved
+    /// from the restamped width/fine/rerank laws — must still recover
+    /// the full planted top-k against the exact oracle. This is the
+    /// assertion the law-shape checks cannot provide: a recalibration
+    /// that under-stamps any law (a shallowing merge rule, a biased
+    /// query sample, a clamped-down rerank budget) passes every
+    /// nonzero/monotone check and fails only here, as lost recall.
+    #[test]
+    fn recalibrated_laws_serve_full_recall_at_default_search() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Split the cell carrying the query's strongest direction: its
+        // planted neighbors now span TWO cells, so a stale pre-split law
+        // (or an under-restamped one) leaves part of the top-k unprobed.
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell { clusters, .. } = strategy else {
+            panic!("hidden index must be VectorCell");
+        };
+        let mut direction = vec![0.0f32; FIXTURE_DIM];
+        direction[0] = 1.0;
+        let target_cell = clusters.nearest_cell(Metric::Cosine, &direction);
+        hidden
+            .block_on_query(split_overflow_cell(
+                hidden.inner().clone(),
+                target_cell,
+                0.0,
+            ))
+            .expect("split")
+            .expect("populated cell must split");
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate");
+        assert!(stamped, "the reshaped grid must restamp the laws");
+
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("default search after recalibration");
+        let near = near_count(&hits);
+        assert_eq!(
+            near, k,
+            "recalibrated laws must serve the full {k} planted neighbors \
+             at default settings, got {near}"
         );
     }
 

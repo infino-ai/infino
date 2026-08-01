@@ -5691,10 +5691,14 @@ pub(in crate::supertable) async fn split_overflow_cells(
 /// the drain's reservoir needs a stream that is already flowing; here a
 /// full pre-read just to sample would double the pass), then ONE full
 /// sweep scores every live cell and observes fine ranks per superfile.
-/// The result REPLACES the stamped law point-for-point (the fresh
-/// full-table measurement is authoritative; the drain's max-merge stamp
-/// may carry bias from a small residual drain). Points the fresh sample
-/// could not support (measured `0`) keep their previous value. Skipped
+/// The measured width REPLACES the stamped point (the fresh full-table
+/// measurement is authoritative, and width — the dominant cost term,
+/// every probed cell is a fetch — must be able to narrow after a merge
+/// pass); fine depth and rerank MAX-MERGE against the prior stamp
+/// (their shrink buys only intra-fetch compute, so keeping the deeper
+/// stamp is recall-safe insurance against a sample that under-measures
+/// a per-stage walk). Points the fresh sample could not support
+/// (measured `0`) keep their previous value under both rules. Skipped
 /// for never-calibrated tables (all-zero width law): the drain gate is
 /// the calibration entry point; this pass only refreshes.
 ///
@@ -5703,8 +5707,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     inner: &Arc<SupertableInner>,
 ) -> Result<bool, BuildError> {
     let manifest = inner.manifest.load_full();
-    let (clusters, column, mut routing, metric, rot_seed) = match manifest.get_partition_strategy()
-    {
+    let (clusters, column, routing, metric, rot_seed) = match manifest.get_partition_strategy() {
         PartitionStrategy::VectorCell {
             clusters,
             column,
@@ -5752,8 +5755,8 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
     // Query-sample pass: every `step`-th row of the cell-ordered live-row
     // enumeration, WIDTH_LAW_QUERY_SAMPLE picks total. Counts are physical
-    // (tombstones included), the loaded rows are live — clamping a picked
-    // ordinal onto the live rows keeps the pick, on a neighbouring row.
+    // (tombstones included), the loaded rows are live — each picked ordinal
+    // is mapped proportionally onto the cell's live rows below.
     let step = (total_docs / opann::WIDTH_LAW_QUERY_SAMPLE as u64).max(1);
     let mut picks: BTreeMap<(usize, u32), Vec<u32>> = BTreeMap::new();
     let mut base = 0u64;
@@ -5775,16 +5778,36 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         }
     }
     for (&(ei, cell), ordinals) in &picks {
-        let (entry, _) = &work[ei];
+        let (entry, cells) = &work[ei];
         let rows =
             load_materialized_rows_from_ivf_superfile(inner, entry, &column, now, Some(&[cell]))
                 .await?;
         if rows.is_empty() {
             continue;
         }
+        // Physical-to-live remap: the strides above were laid out over
+        // physical (tombstone-inclusive) counts, but `rows` is live-only.
+        // Scale each ordinal proportionally instead of clamping — in a
+        // heavily tombstoned cell a clamp collapses every tail pick onto
+        // the last live row, filling the reservoir with duplicates of one
+        // neighborhood and biasing the REPLACE stamp — and drop picks that
+        // land on an already-offered row (ordinals are increasing, so the
+        // proportional map is monotone and duplicates are adjacent).
+        let phys = cells
+            .iter()
+            .find(|&&(c, _)| c == cell)
+            .map(|&(_, n)| u64::from(n))
+            .unwrap_or(0)
+            .max(1);
+        let mut last_idx = usize::MAX;
         for &ordinal in ordinals {
-            let row = &rows[(ordinal as usize).min(rows.len() - 1)];
-            cal.offer(row);
+            let idx = ((u64::from(ordinal) * rows.len() as u64) / phys) as usize;
+            let idx = idx.min(rows.len() - 1);
+            if idx == last_idx {
+                continue;
+            }
+            last_idx = idx;
+            cal.offer(&rows[idx]);
         }
     }
     cal.freeze(&clusters, rot_seed);
@@ -5853,90 +5876,104 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         return Ok(false);
     };
 
-    let mut changed = false;
-    for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
-        if measured > 0 && *slot != measured {
-            *slot = measured;
-            changed = true;
+    // Stamp commit: one CAS attempt per FRESH strategy snapshot. The shared
+    // `persist_commit_async` re-applies its captured metadata verbatim on
+    // OCC retries — safe for the drain (user commits are serialized behind
+    // the writer slot) but not here: the compaction slot serializes hidden
+    // reorgs against each other, NOT against live drains (a writer commits
+    // mid-compaction by design), so a retry carrying this function's
+    // snapshot would revert a concurrent drain's newer grid counts and
+    // max-merged law. Re-derive the whole stamp — fresh clusters, fresh
+    // routing, measured deltas re-applied — from the freshly loaded
+    // manifest on every attempt instead. The measured laws themselves stay
+    // valid across attempts: cell geometry only changes under the
+    // compaction slot this pass already holds; concurrent drains bump
+    // counts, never the grid.
+    let max_retries = inner.options.max_commit_retries.max(1);
+    for attempt in 0..max_retries {
+        let manifest = inner.manifest.load_full();
+        let (clusters, fresh_routing) = match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell {
+                clusters, routing, ..
+            } => (clusters, routing),
+            _ => return Ok(false),
+        };
+        let mut routing = fresh_routing;
+        // Width REPLACEs: the fresh full-table measurement is authoritative,
+        // and width must be able to narrow after a merge pass — every probed
+        // cell is a fetch, so a stale-wide width is the dominant cost leak.
+        for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
+            if measured > 0 {
+                *slot = measured;
+            }
+        }
+        // Fine depth and rerank MAX-MERGE against the live stamp, exactly as
+        // the drain does: a sample that under-measures a per-stage walk must
+        // never shallow a stamp the previous full measurement certified —
+        // that is the query-time under-probe this PR exists to fix. Their
+        // shrink direction buys only intra-fetch compute, so keeping the
+        // deeper value is recall-safe at bounded cost. A measured `0`
+        // (unsupported point) keeps the previous value under both rules.
+        for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+            *slot = (*slot).max(measured);
+        }
+        for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
+            *slot = (*slot).max(measured);
+        }
+        opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
+        if routing == fresh_routing {
+            // The live stamp already carries everything this pass measured
+            // (e.g. a concurrent drain max-merged past us) — nothing to
+            // commit.
+            return Ok(false);
+        }
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column: column.clone(),
+                clusters: clusters.clone(),
+                routing,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let base = Arc::new(list_metadata.apply(&manifest));
+        let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        match try_commit_attempt(
+            Arc::clone(&storage),
+            Arc::clone(&inner.options),
+            base,
+            &[],
+            &no_removals,
+            NewEntryBirthVersions::StampCommit,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+        {
+            Ok(new_manifest) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                info!(
+                    "supertable optimize: probe laws recalibrated over {} cells at k={WIDTH_LAW_KS:?}: width {:?}, fine depth {:?}, rerank {:?}",
+                    clusters.n_cent, routing.width_for_k, routing.fine_for_k, routing.rerank_for_k
+                );
+                return Ok(true);
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage)
+                    .await
+                    .map_err(BuildError::from)?;
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(BuildError::from(e));
+            }
         }
     }
-    for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
-        if measured > 0 && *slot != measured {
-            *slot = measured;
-            changed = true;
-        }
-    }
-    for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
-        if measured > 0 && *slot != measured {
-            *slot = measured;
-            changed = true;
-        }
-    }
-    if !changed {
-        return Ok(false);
-    }
-
-    // Reload the freshest STRATEGY for the stamp commit — both halves.
-    // Clusters: the split pass this recalibration follows has already
-    // swapped the grid, and OCC re-applies this metadata verbatim on
-    // retries, so the stamp must carry the current grid, not this
-    // function's entry snapshot. Routing: a concurrent commit (another
-    // drain's max-merge stamp, a split porting routing forward) may have
-    // written routing since our snapshot — re-apply the measured deltas
-    // onto the FRESH routing so the stamp cannot clobber a newer law
-    // with our stale snapshot's other fields.
-    let manifest = inner.manifest.load_full();
-    let (clusters, fresh_routing) = match manifest.get_partition_strategy() {
-        PartitionStrategy::VectorCell {
-            clusters, routing, ..
-        } => (clusters, routing),
-        _ => return Ok(false),
-    };
-    let mut routing = fresh_routing;
-    for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
-        if measured > 0 {
-            *slot = measured;
-        }
-    }
-    for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
-        if measured > 0 {
-            *slot = measured;
-        }
-    }
-    for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
-        if measured > 0 {
-            *slot = measured;
-        }
-    }
-    opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
-    let list_metadata = CommitListMetadata {
-        partition_strategy: Some(PartitionStrategy::VectorCell {
-            column: column.clone(),
-            clusters: clusters.clone(),
-            routing,
-        }),
-        drained_ranges: None,
-        global_vector_index: None,
-        superseded_cells_additions: None,
-    };
-    let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
-    let new_manifest = persist_commit_async(
-        inner,
-        storage,
-        Vec::new(),
-        &no_removals,
-        Vec::new(),
-        Vec::new(),
-        list_metadata,
-    )
-    .await
-    .map_err(BuildError::from)?;
-    inner.manifest.store(Arc::new(new_manifest));
-    info!(
-        "supertable optimize: probe laws recalibrated over {} cells at k={WIDTH_LAW_KS:?}: width {:?}, fine depth {:?}, rerank {:?}",
-        clusters.n_cent, routing.width_for_k, routing.fine_for_k, routing.rerank_for_k
-    );
-    Ok(true)
+    Err(BuildError::from(
+        SupertableCommitError::WriteContentionExhausted,
+    ))
 }
 
 // OCC retry budget — read from

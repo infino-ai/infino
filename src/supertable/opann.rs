@@ -1098,6 +1098,13 @@ impl WidthLawCalibration {
                 && row.rabitq_code.len() == rl.quant.code_bytes()
             {
                 for &qi in members {
+                    // Self-hit: the sampled query's own row is not a
+                    // distractor. `finish` already excludes it from the
+                    // exact top-k (below), so counting it here would
+                    // inflate every measured rerank budget.
+                    if row.stable_id == frozen.ids[qi] {
+                        continue;
+                    }
                     let q_rot = &rl.q_rot[qi * self.dim..(qi + 1) * self.dim];
                     let est = rl.quant.estimate_dot_rotated_with_total(
                         q_rot,
