@@ -1111,6 +1111,7 @@ fn measure_routing_state_with(
             supertable::n_docs(),
             gate.ceilings_first,
             gate.ceilings_second,
+            gate.steady_law_width,
         );
     }
     eprintln!(
@@ -1379,6 +1380,14 @@ struct ColdReadAssert<'a> {
     expected: ExpectedTiers,
     ceilings_first: &'a [(&'a str, u64, u64)],
     ceilings_second: &'a [(&'a str, u64, u64)],
+    /// The stamped width law at the battery's `k` (1 when absent). The
+    /// ceiling tables encode a width-1 probe; a wider law legitimately
+    /// reads one more coalesced cell-GET per extra probed cell, so both
+    /// cold windows scale by `width - 1`. The gate then measures
+    /// per-cell fetch efficiency, not the law's width choice (the
+    /// accepted trade: 0.994 recall at width 2 vs 0.957 at width 1 on
+    /// the 10M gate).
+    steady_law_width: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1489,7 +1498,12 @@ fn assert_expected_cold_reads(
     // the caller supplies its own tables (empty = tier check only).
     ceilings_first: &[(&str, u64, u64)],
     ceilings_second: &[(&str, u64, u64)],
+    steady_law_width: u64,
 ) {
+    // The ceiling tables assume a width-1 probe (one coalesced cell-GET);
+    // a stamped law width w reads w cells by design, adding w-1 GETs to
+    // both cold windows.
+    let law_extra = steady_law_width.saturating_sub(1);
     let user_data = split
         .first_query
         .class_io(storage_meter::UriClass::UserData)
@@ -1511,12 +1525,14 @@ fn assert_expected_cold_reads(
     // one-time warmup fan and the second query's steady per-query fetch
     // each stay within their per-scale ceilings.
     if let Some(ceiling) = cold_data_get_ceiling(ceilings_first, label, n_docs) {
+        let ceiling = ceiling.saturating_add(law_extra);
         let total = user_data + hidden_data;
         assert!(
             total <= ceiling,
             "{label}: first cold query (metadata warmup) regressed — {total} data GETs \
-             ({user_data} user + {hidden_data} hidden), ceiling {ceiling} at {n_docs} docs \
-             (per-modality ceilings; provisional post-v1-open values)"
+             ({user_data} user + {hidden_data} hidden), ceiling {ceiling} at {n_docs} docs, \
+             law width {steady_law_width} (per-modality ceilings; provisional \
+             post-v1-open values)"
         );
     }
     if let Some(ceiling) = cold_data_get_ceiling(ceilings_second, label, n_docs) {
@@ -1528,12 +1544,14 @@ fn assert_expected_cold_reads(
             .second_query
             .class_io(storage_meter::UriClass::HiddenData)
             .get_count;
+        let ceiling = ceiling.saturating_add(law_extra);
         let total = second_user + second_hidden;
         assert!(
             total <= ceiling,
             "{label}: second (steady) cold query regressed — {total} data GETs \
              ({second_user} user + {second_hidden} hidden), ceiling {ceiling} at {n_docs} \
-             docs (per-modality ceilings; provisional post-v1-open values)"
+             docs, law width {steady_law_width} (per-modality ceilings; provisional \
+             post-v1-open values)"
         );
     }
 }
@@ -3020,6 +3038,26 @@ pub mod vector {
         );
     }
 
+    /// Index of the `k = TOP_K = 10` knot in the stamped width law
+    /// (`WIDTH_LAW_KS = [1, 10, 100, 1000]`) — the k every battery
+    /// query runs at.
+    const WIDTH_LAW_K10_IDX: usize = 1;
+
+    /// The stamped width law at the battery's `TOP_K`, read from the
+    /// hidden manifest exactly as the default query path resolves it
+    /// (1 when the table has no hidden index or no calibrated law).
+    fn stamped_width_law_at_top_k(consumer: &Supertable) -> u64 {
+        let Some(hidden) = consumer.vector_index_table() else {
+            return 1;
+        };
+        match hidden.pinned_reader().manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { routing, .. } => {
+                u64::from(routing.width_for_k[WIDTH_LAW_K10_IDX].max(1))
+            }
+            _ => 1,
+        }
+    }
+
     fn log_hidden_stats(consumer: &Supertable, label: &str) {
         let Some(hidden) = consumer.vector_index_table() else {
             return;
@@ -3382,6 +3420,7 @@ pub mod vector {
                 expected,
                 ceilings_first: super::VECTOR_COLD_GET_CEILINGS_FIRST,
                 ceilings_second: super::VECTOR_COLD_GET_CEILINGS_SECOND,
+                steady_law_width: stamped_width_law_at_top_k(consumer),
             }),
         )
     }
