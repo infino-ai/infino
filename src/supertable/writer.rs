@@ -1668,9 +1668,26 @@ impl SupertableWriter {
         let owned = buffer.to_vec();
         // VectorCell strategy: pre-shard by nearest centroid instead of
         // round-robin. Each shard becomes one superfile in its cell-partition.
+        //
+        // Keyed on the manifest's LOCKED strategy (see
+        // `ManifestSnapshot::partition_strategy`), never the handle's
+        // options: options are a construction-time snapshot, so keying on
+        // them made a create-era hidden handle round-robin here — no
+        // partition hints, which `assign_partition` then rejects loudly on
+        // a VectorCell-locked manifest — while a reopened handle
+        // cell-sharded, and the reopened handle's options grid is only the
+        // open-time bootstrap, stale against a grid the manifest has since
+        // grown by cell splits. The manifest is the commit-side signal
+        // `assign_partition` validates against, so sharding from it keeps
+        // the two ends of the invariant on one source. (No production path
+        // appends to the hidden table through the buffered writer today —
+        // hidden membership is written by drain / split / merge as
+        // prepared superfiles — this keeps the path correct if one ever
+        // appears.)
+        let shard_manifest = self.inner.manifest.load_full();
         let (shards, cell_hints): (Vec<Vec<BufferedBatch>>, Vec<Option<u32>>) =
-            if let Some(PartitionStrategy::VectorCell { ref clusters, .. }) =
-                self.inner.options.partition_strategy
+            if let Some(PartitionStrategy::VectorCell { clusters, .. }) =
+                shard_manifest.partition_strategy()
             {
                 let metric = self
                     .inner
