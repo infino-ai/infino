@@ -268,3 +268,28 @@ impl CacheEvictionPolicy for LruPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hand-written `Debug` exists because the eviction policy is a
+    /// trait object with no `Debug` of its own: every tuning field must
+    /// print, the policy elides to a placeholder, and CRC verification
+    /// defaults on.
+    #[test]
+    fn disk_cache_config_debug_elides_the_policy() {
+        let cfg = DiskCacheConfig::default();
+        let debug = format!("{cfg:?}");
+        for field in [
+            "cache_root",
+            "disk_budget_bytes",
+            "cold_fetch_mode",
+            "prefetch_concurrency",
+            "<dyn CacheEvictionPolicy>",
+        ] {
+            assert!(debug.contains(field), "Debug must print {field}: {debug}");
+        }
+        assert!(cfg.verify_crc_on_open, "CRC verification defaults on");
+    }
+}
