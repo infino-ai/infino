@@ -32,7 +32,6 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
-    VectorSearchOptions,
     storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions, manifest::commit::POINTER_PATH},
@@ -107,8 +106,6 @@ impl StorageProvider for PointerHiddenOnce {
 const DIM: usize = 16;
 /// Random-rotation seed for the fixture's vector index.
 const VECTOR_ROT_SEED: u64 = 31;
-/// Top-K above corpus size, so ranking decides the assertions.
-const TOP_K: usize = 8;
 /// The winner's committed corpus.
 const TITLES: &[&str] = &["alpha document", "bravo document", "charlie document"];
 
