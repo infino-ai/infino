@@ -3264,7 +3264,9 @@ mod tests {
     };
 
     use arrow::array::Array;
-    use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+    use arrow_array::{
+        Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
@@ -4971,8 +4973,18 @@ mod tests {
     /// First unit coverage of the public filter entry — the bench battery
     /// exercises it, but benches don't gate. Fixture titles repeat "doc
     /// {0..31}" per commit, so the token "5" matches exactly one row in
-    /// each of the four commits (stable ids 5 + 32k), and a matching-all
-    /// token ("doc") must reproduce a full top-k.
+    /// each of the four commits, and a matching-all token ("doc") must
+    /// reproduce a full top-k.
+    ///
+    /// Hit identity is checked against an `exact_match("doc 5")` oracle,
+    /// never via arithmetic on the generated `_id`s: the fixture has no
+    /// explicit id column, and a minted snowflake id's low sequence bits
+    /// track row position only while each 32-row batch mints with the
+    /// generator's per-millisecond sequence on a multiple of 32 and no
+    /// millisecond tick lands mid-batch. The open-time handle-id mint
+    /// sharing a millisecond with the first commit's batch is enough to
+    /// shift every sequence by one, and parallel test load makes exactly
+    /// that timing likely.
     #[test]
     fn vector_filter_restricts_hits_to_predicate_matches() {
         let (_dir, st, q, _k) = drained_three_direction_fixture();
@@ -4995,10 +5007,28 @@ mod tests {
             FIXTURE_COMMITS as usize,
             "the predicate matches one row per commit — nothing more"
         );
+        // Identity oracle: resolve the predicate rows' stable ids through
+        // the stored-text-verified exact-match surface — a different path
+        // from the token_match fan the filter itself resolves through.
+        let predicate_rows: HashSet<i128> = st
+            .exact_match("title", "doc 5", Some(&["_id"]))
+            .expect("exact-match oracle")
+            .iter()
+            .filter_map(|b| {
+                b.column_by_name("_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+            })
+            .flat_map(|c| c.values().iter().copied())
+            .collect();
+        assert_eq!(
+            predicate_rows.len(),
+            FIXTURE_COMMITS as usize,
+            "oracle sanity: exactly one \"doc 5\" row per commit"
+        );
         assert!(
             matched
                 .iter()
-                .all(|h| h.stable_id.is_some_and(|id| id % 32 == 5)),
+                .all(|h| h.stable_id.is_some_and(|id| predicate_rows.contains(&id))),
             "every hit is a predicate row, not a nearest neighbor: {matched:?}"
         );
 
