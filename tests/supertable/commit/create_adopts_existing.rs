@@ -9,9 +9,13 @@
 //! adopt path must also RECONCILE: drop the loser's hidden handle and
 //! reopen the hidden table at the prefix stamped in the adopted manifest.
 //! A regression here silently splits the hidden index across two
-//! prefixes — reads route to an empty index while maintenance writes the
-//! other — so the assertions check the adopted handle actually serves
-//! vector queries over the winner's data.
+//! prefixes — maintenance writes one subtree while every fresh handle
+//! reads the other. The guard therefore routes vectors THROUGH the
+//! adopted handle's hidden machinery (commit + drain) and asserts a
+//! FRESH handle — which resolves its hidden prefix from the stamped
+//! manifest alone — sees them. User-table adoption is asserted
+//! separately; user-side queries cannot stand in for the hidden index,
+//! because undrained searches are served from user superfiles.
 
 #![deny(clippy::unwrap_used)]
 
@@ -192,44 +196,26 @@ async fn losing_creator_adopts_winner_manifest_and_hidden_index() {
         TITLES.len() as u64
     );
 
-    // The adopted handle serves vector search over the winner's data —
-    // proof the hidden index it reconciled to is the winner's, not the
-    // loser's orphaned pre-built one.
-    let mut q = vec![0.0f32; DIM];
-    q[1] = 1.0;
-    let hits = loser
-        .vector_search(
-            "emb",
-            &q,
-            TOP_K,
-            VectorSearchOptions::new(),
-            None,
-            Some(&["_id", "title", "score"]),
-        )
-        .expect("vector search on adopted handle");
-    let first = hits
-        .iter()
-        .find(|b| b.num_rows() > 0)
-        .expect("at least one hit");
-    let title_idx = first.schema().index_of("title").expect("title projected");
-    let titles = first
-        .column(title_idx)
-        .as_any()
-        .downcast_ref::<LargeStringArray>()
-        .expect("title column");
-    assert_eq!(
-        titles.value(0),
-        TITLES[1],
-        "row 1 ranks first for its own embedding"
-    );
-
-    // The adopted handle can also write: a commit through the loser lands
-    // on the shared table and is visible to a fresh open.
+    // The reconciliation guard — the two-prefix-split detector. Route
+    // vectors through the ADOPTED handle's hidden machinery (a commit's
+    // dual-write plus an explicit drain), then read the hidden index
+    // through a FRESH handle, which resolves its hidden prefix from the
+    // stamped manifest alone. Had the loser kept its pre-built hidden
+    // handle (a fresh prefix the manifest never records), this batch's
+    // vectors would land under that orphaned subtree and the fresh
+    // handle's hidden index would come up short. A user-side query can't
+    // stand in here: undrained searches are answered from user
+    // superfiles and pass regardless of which prefix the hidden handle
+    // points at.
     let schema = loser.options().schema.clone();
     let mut w = loser.writer().expect("loser writer");
     w.append(&one_hot_batch(schema))
         .expect("append via adopted");
     w.commit().expect("commit via adopted");
+    drop(w);
+    loser
+        .drain_vectors_to_cells_sync()
+        .expect("drain through the adopted handle");
 
     let fresh =
         Supertable::open(vector_options().with_storage(Arc::clone(&storage))).expect("fresh open");
@@ -237,5 +223,13 @@ async fn losing_creator_adopts_winner_manifest_and_hidden_index() {
         fresh.reader().expect("reader").n_docs_total(),
         2 * TITLES.len() as u64,
         "both writers' commits are visible"
+    );
+    let fresh_hidden = fresh.vector_index_table().expect("hidden handle");
+    assert_eq!(
+        fresh_hidden.reader().expect("hidden reader").n_docs_total(),
+        2 * TITLES.len() as u64,
+        "vectors routed through the adopted handle must land under the \
+         manifest-stamped hidden prefix; a shortfall means the loser \
+         drained into its own orphaned prefix"
     );
 }

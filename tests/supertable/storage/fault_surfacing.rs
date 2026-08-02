@@ -99,11 +99,14 @@ fn commit_surfaces_manifest_list_put_fault_as_storage_error() {
     // A transient list-PUT failure is a storage error. Only
     // PreconditionFailed (a lost race) may be folded into the
     // write-contention retry story; masking real faults as contention
-    // would burn the whole retry budget re-hitting a broken store.
-    let rendered = format!("{err}");
+    // would burn the whole retry budget re-hitting a broken store. Tie
+    // the failure to the injection so a fault that never fired (or a
+    // different storage error) can't false-pass this assert.
+    assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+    let rendered = format!("{err:?}");
     assert!(
-        !rendered.contains("contention"),
-        "a transient fault must not be mislabeled as contention: {rendered}"
+        rendered.contains("injected") && !format!("{err}").contains("contention"),
+        "the injected fault must surface as a storage error, not contention: {rendered}"
     );
     assert_eq!(st.manifest_id(), 1, "nothing published");
 
@@ -124,10 +127,11 @@ fn commit_surfaces_pointer_cas_fault_without_publishing() {
     let err = w
         .commit()
         .expect_err("pointer CAS fault must fail the commit");
-    let rendered = format!("{err}");
+    assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+    let rendered = format!("{err:?}");
     assert!(
-        !rendered.contains("contention"),
-        "a transient CAS fault must not be mislabeled as contention: {rendered}"
+        rendered.contains("injected") && !format!("{err}").contains("contention"),
+        "the injected CAS fault must surface as a storage error, not contention: {rendered}"
     );
 
     // The visibility barrier never moved: the handle still sees only the
