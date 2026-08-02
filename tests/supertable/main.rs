@@ -26,6 +26,7 @@
 mod commit;
 mod compact_gc;
 mod disk_cache;
+mod drain_tombstones;
 mod manifest;
 mod query;
 mod storage;
