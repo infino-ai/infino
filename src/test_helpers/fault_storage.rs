@@ -21,7 +21,7 @@ use std::{
     io::Error as IoError,
     ops::Range,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -73,10 +73,16 @@ impl FaultStorage {
         })
     }
 
-    /// Arm a rule: the next `times` calls of `op` whose URI contains
+    /// Arm a rule: the next `times` calls of `op` whose URI **contains**
     /// `uri_fragment` fail with [`StorageError::TransientExhausted`].
+    ///
+    /// Substring matching is deliberate — it lets a rule arm a whole
+    /// namespace (`"data/"`, a hidden-index prefix) as easily as one
+    /// object. Rules meant for a single object should pass its full path;
+    /// the repo's numbered object names are fixed-width (zero-padded), so
+    /// a full path never substring-matches a sibling.
     pub fn fail(&self, op: FaultOp, uri_fragment: &str, times: usize) {
-        self.rules.lock().expect("fault rules").push(FaultRule {
+        self.rules_guard().push(FaultRule {
             op,
             uri_fragment: uri_fragment.to_string(),
             remaining: times,
@@ -85,7 +91,7 @@ impl FaultStorage {
 
     /// Disarm every remaining rule.
     pub fn clear(&self) {
-        self.rules.lock().expect("fault rules").clear();
+        self.rules_guard().clear();
     }
 
     /// Total faults fired since construction — lets a test assert the
@@ -94,8 +100,19 @@ impl FaultStorage {
         self.fired.load(Ordering::SeqCst)
     }
 
+    /// The rules table, recovering from mutex poisoning: the helper's
+    /// contract is failures-as-clean-errors, so a panic elsewhere must not
+    /// turn every later storage call into a second panic. The state is
+    /// safe to reuse — mutations under the lock are single-field writes.
+    fn rules_guard(&self) -> MutexGuard<'_, Vec<FaultRule>> {
+        match self.rules.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     fn check(&self, op: FaultOp, uri: &str) -> Result<(), StorageError> {
-        let mut rules = self.rules.lock().expect("fault rules");
+        let mut rules = self.rules_guard();
         for rule in rules.iter_mut() {
             if rule.op == op && rule.remaining > 0 && uri.contains(&rule.uri_fragment) {
                 rule.remaining -= 1;

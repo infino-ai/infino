@@ -20,6 +20,7 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
@@ -27,7 +28,6 @@ use infino::{
     supertable::{
         SuperfileUri, Supertable,
         manifest::commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
-        storage::{LocalFsStorageProvider, StorageProvider},
     },
     test_helpers::{
         build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
