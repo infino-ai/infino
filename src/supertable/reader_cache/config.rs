@@ -361,7 +361,7 @@ mod tests {
         assert!(rendered.contains("cold_fetch_mode"));
         assert!(rendered.contains("<dyn CacheEvictionPolicy>"));
     }
-  
+
     /// The hand-written `Debug` exists because the eviction policy is a
     /// trait object with no `Debug` of its own: every tuning field must
     /// print, the policy elides to a placeholder, and CRC verification
