@@ -345,6 +345,11 @@ pub struct VectorColumnInfo {
 /// stays within one decade of a measured point.
 pub(crate) const WIDTH_LAW_KS: [usize; 4] = [1, 10, 100, 1000];
 
+/// The largest calibrated `k` knot — the accumulator cap every law walk
+/// shares. A const, not `.last().expect(..)`: the knot table is never
+/// empty by construction, and src/ stays panic-free.
+pub(crate) const WIDTH_LAW_MAX_K: usize = WIDTH_LAW_KS[WIDTH_LAW_KS.len() - 1];
+
 /// Adaptive cell-probe tuning for the hidden VectorCell index.
 /// Calibrated per table; persisted in the manifest list.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -368,6 +373,20 @@ pub struct CellRoutingParams {
     /// at k=100 under a converged grid, ~1 at k=1) — so the default cannot
     /// be a constant; it has to be measured per table.
     pub width_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Per-table fine-depth law: fine runs (in fine-centroid-rank order)
+    /// needed per probed cell for mean 0.99 coverage of the exact top-k,
+    /// measured by the same drain calibration at the same [`WIDTH_LAW_KS`]
+    /// points. `0` = uncalibrated. Consumed as a FLOOR on the unfiltered
+    /// default path (`max(config floor, this)`); pinned sweeps read every
+    /// run regardless. Absent on older manifests (all-zero).
+    pub fine_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Per-table rerank law: TOTAL 1-bit-estimate survivors (rows) needed
+    /// for 0.99 containment of the exact top-k, measured by the same
+    /// calibration at the same [`WIDTH_LAW_KS`] points. `0` = uncalibrated.
+    /// Consumed on the unfiltered hidden path as a measured replacement
+    /// for the `k x rerank_mult` constant (expressed as the equivalent
+    /// multiplier, `ceil(N / k)`). Absent on older manifests (all-zero).
+    pub rerank_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 impl Default for CellRoutingParams {
@@ -378,6 +397,8 @@ impl Default for CellRoutingParams {
             slack: DEFAULT_CELL_SLACK,
             fine_nprobe: crate::config::global().vector.fine_nprobe_floor,
             width_for_k: [0; WIDTH_LAW_KS.len()],
+            fine_for_k: [0; WIDTH_LAW_KS.len()],
+            rerank_for_k: [0; WIDTH_LAW_KS.len()],
         }
     }
 }
@@ -393,12 +414,46 @@ impl CellRoutingParams {
     /// the calibrated range. Width is rounded up: under-probing costs
     /// recall, over-probing costs one cell's read.
     pub(crate) fn width_for_k_at(&self, k: usize) -> Option<usize> {
+        Self::law_at(&self.width_for_k, k)
+    }
+
+    /// The fine-depth law at this query's `k` — same log-linear
+    /// interpolation and clamping as [`Self::width_for_k_at`].
+    pub(crate) fn fine_for_k_at(&self, k: usize) -> Option<usize> {
+        Self::law_at(&self.fine_for_k, k)
+    }
+
+    /// The rerank law at this query's `k` — same log-linear interpolation
+    /// as [`Self::width_for_k_at`] within the calibrated range, but NO
+    /// clamp above it. The rerank law is an absolute survivor budget, not
+    /// a per-`k` multiplier: a high-`k` point is zeroed when the stamped
+    /// width outgrows the calibration pool, and clamping such a `k` down
+    /// to the last calibrated point would serve it with a budget certified
+    /// for a `k` orders of magnitude smaller (k=1000 under a k=100 budget
+    /// is ~85x fewer survivors than the default). Beyond the last
+    /// calibrated knot, `None` falls back to the configured `rerank_mult`,
+    /// which scales with `k`. (Width and fine depth keep the clamp: they
+    /// grow sub-linearly in `k`, so the boundary value is a sane floor.)
+    pub(crate) fn rerank_for_k_at(&self, k: usize) -> Option<usize> {
+        let last_calibrated = WIDTH_LAW_KS
+            .iter()
+            .zip(self.rerank_for_k.iter())
+            .filter(|(_, w)| **w > 0)
+            .map(|(k_pt, _)| *k_pt)
+            .next_back()?;
+        if k > last_calibrated {
+            return None;
+        }
+        Self::law_at(&self.rerank_for_k, k)
+    }
+
+    fn law_at(law: &[u32; WIDTH_LAW_KS.len()], k: usize) -> Option<usize> {
         // Calibrated (ln k, width) points, gathered on the stack — at most
         // `WIDTH_LAW_KS.len()` of them, resolved once per query, so no
         // per-query heap allocation.
         let mut pts = [(0f64, 0f64); WIDTH_LAW_KS.len()];
         let mut n = 0;
-        for (k_pt, w) in WIDTH_LAW_KS.iter().zip(self.width_for_k.iter()) {
+        for (k_pt, w) in WIDTH_LAW_KS.iter().zip(law.iter()) {
             if *w > 0 {
                 pts[n] = ((*k_pt as f64).ln(), f64::from(*w));
                 n += 1;
@@ -424,6 +479,11 @@ impl CellRoutingParams {
 /// How superfiles are routed into manifest parts. Stamped into
 /// the list on first commit; immutable thereafter (changes
 /// require external compaction).
+// `VectorCell` carries the live cell grid plus the calibrated routing
+// laws — intrinsically bigger than the scalar strategies. Boxing it
+// would put a pointer chase on every routing read to shrink an enum
+// that lives once inside the manifest snapshot, not in per-row state.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartitionStrategy {
     TimeRange {
@@ -1216,6 +1276,12 @@ struct CellRoutingParamsDto {
     /// to all-zero = no law).
     #[serde(default)]
     width_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Fine-depth law; absent on pre-depth-law manifests (all-zero).
+    #[serde(default)]
+    fine_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Rerank law; absent on pre-rerank-law manifests (all-zero).
+    #[serde(default)]
+    rerank_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 impl From<CellRoutingParams> for CellRoutingParamsDto {
@@ -1226,6 +1292,8 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             slack: Some(r.slack),
             fine_nprobe: r.fine_nprobe,
             width_for_k: r.width_for_k,
+            fine_for_k: r.fine_for_k,
+            rerank_for_k: r.rerank_for_k,
         }
     }
 }
@@ -1246,6 +1314,8 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
             r.fine_nprobe = d.fine_nprobe;
         }
         r.width_for_k = d.width_for_k;
+        r.fine_for_k = d.fine_for_k;
+        r.rerank_for_k = d.rerank_for_k;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -2617,6 +2687,8 @@ mod tests {
             clusters: ClusterCentroids::from_fp32(1, 4, &[0.5, 0.5, 0.5, 0.5], vec![1]),
             routing: CellRoutingParams {
                 width_for_k: [1, 2, 30, 48],
+                fine_for_k: [1, 3, 6, 9],
+                rerank_for_k: [2, 20, 200, 2000],
                 ..CellRoutingParams::default()
             },
         };
@@ -2626,19 +2698,20 @@ mod tests {
             panic!("VectorCell strategy must survive the round-trip");
         };
         assert_eq!(routing.width_for_k, [1, 2, 30, 48]);
+        assert_eq!(routing.fine_for_k, [1, 3, 6, 9]);
+        assert_eq!(routing.rerank_for_k, [2, 20, 200, 2000]);
 
         // Strip the whole `"width_for_k": [...]` member (the encoder
         // pretty-prints, so cut structurally: from the comma preceding the
         // key through the closing bracket).
-        let s = from_utf8(&bytes).expect("utf8");
-        let key = s
-            .find("\"width_for_k\"")
-            .expect("field present in encoding");
-        let comma = s[..key].rfind(',').expect("preceding member comma");
-        let close = key + s[key..].find(']').expect("array close") + 1;
-        let stripped = format!("{}{}", &s[..comma], &s[close..]);
-        assert_ne!(stripped, s, "fixture must actually strip the field");
-        let legacy = decode(stripped.as_bytes()).expect("decode without width law");
+        let mut stripped = from_utf8(&bytes).expect("utf8").to_string();
+        for field in ["\"width_for_k\"", "\"fine_for_k\"", "\"rerank_for_k\""] {
+            let key = stripped.find(field).expect("field present in encoding");
+            let comma = stripped[..key].rfind(',').expect("preceding member comma");
+            let close = key + stripped[key..].find(']').expect("array close") + 1;
+            stripped = format!("{}{}", &stripped[..comma], &stripped[close..]);
+        }
+        let legacy = decode(stripped.as_bytes()).expect("decode without either law");
         let PartitionStrategy::VectorCell { routing, .. } = &legacy.partition_strategy else {
             panic!("VectorCell strategy must survive the stripped decode");
         };
@@ -2647,7 +2720,27 @@ mod tests {
             [0; WIDTH_LAW_KS.len()],
             "absent law decodes to all-zero (no law)"
         );
+        assert_eq!(
+            routing.fine_for_k,
+            [0; WIDTH_LAW_KS.len()],
+            "absent fine law decodes to all-zero (no law)"
+        );
+        assert_eq!(
+            routing.rerank_for_k,
+            [0; WIDTH_LAW_KS.len()],
+            "absent rerank law decodes to all-zero (no law)"
+        );
         assert_eq!(routing.width_for_k_at(100), None, "no law resolves None");
+        assert_eq!(
+            routing.fine_for_k_at(100),
+            None,
+            "no fine law resolves None"
+        );
+        assert_eq!(
+            routing.rerank_for_k_at(100),
+            None,
+            "no rerank law resolves None"
+        );
     }
 
     /// Width-law resolution: log-interpolation between calibrated points,
@@ -2683,6 +2776,55 @@ mod tests {
         assert_eq!(single.width_for_k_at(5000), Some(30));
         // All-zero = no law.
         assert_eq!(law([0; WIDTH_LAW_KS.len()]).width_for_k_at(10), None);
+    }
+
+    /// `fine_for_k_at` runs the same shared resolution (`law_at`) over the
+    /// depth points: calibrated points resolve exactly, zeros skip, and an
+    /// absent law resolves `None`.
+    #[test]
+    fn fine_for_k_at_delegates_to_shared_resolution() {
+        let law = |f: [u32; WIDTH_LAW_KS.len()]| CellRoutingParams {
+            fine_for_k: f,
+            ..CellRoutingParams::default()
+        };
+        let full = law([1, 4, 8, 12]);
+        assert_eq!(full.fine_for_k_at(1), Some(1));
+        assert_eq!(full.fine_for_k_at(10), Some(4));
+        assert_eq!(full.fine_for_k_at(1000), Some(12));
+        assert_eq!(full.fine_for_k_at(100_000), Some(12), "clamps above range");
+        assert_eq!(law([0, 0, 8, 0]).fine_for_k_at(1), Some(8), "zeros skip");
+        assert_eq!(law([0; WIDTH_LAW_KS.len()]).fine_for_k_at(10), None);
+    }
+
+    /// `rerank_for_k_at` never clamps ABOVE its calibrated range: the law
+    /// is an absolute survivor budget, so a `k` past the last calibrated
+    /// knot (a zeroed point — the stamped width outgrew the calibration
+    /// pool — or simply `k` beyond the knot table) must fall back to the
+    /// configured `rerank_mult` (`None`), not be served a budget certified
+    /// for a far smaller `k`.
+    #[test]
+    fn rerank_for_k_at_returns_none_beyond_last_calibrated_knot() {
+        let law = |r: [u32; WIDTH_LAW_KS.len()]| CellRoutingParams {
+            rerank_for_k: r,
+            ..CellRoutingParams::default()
+        };
+        // Fully calibrated: resolves inside the knot range, clamps LOW
+        // (over-provision is safe), and refuses to serve k past the last
+        // knot with the k=1000 budget.
+        let full = law([40, 320, 2400, 16000]);
+        assert_eq!(full.rerank_for_k_at(1), Some(40));
+        assert_eq!(full.rerank_for_k_at(0), Some(40), "clamps low end");
+        assert_eq!(full.rerank_for_k_at(1000), Some(16000));
+        assert_eq!(full.rerank_for_k_at(2000), None, "no clamp past range");
+        // High-k point cleared (stamped width outgrew the pool): k at or
+        // below the last calibrated knot resolves, anything above falls
+        // back to the default budget instead of clamping down to n(100).
+        let cleared = law([40, 320, 2400, 0]);
+        assert_eq!(cleared.rerank_for_k_at(100), Some(2400));
+        assert_eq!(cleared.rerank_for_k_at(101), None);
+        assert_eq!(cleared.rerank_for_k_at(1000), None);
+        // All-zero = no law.
+        assert_eq!(law([0; WIDTH_LAW_KS.len()]).rerank_for_k_at(10), None);
     }
 
     #[test]

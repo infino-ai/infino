@@ -68,6 +68,24 @@ pub fn n_writers() -> usize {
     corpus::parallel_writers()
 }
 pub const TEXT_COLUMN: &str = "title";
+
+/// FTS-indexed single-token filter column carried by the VECTOR table, so
+/// the predicate-filtered battery measures the public `VectorFilter` path
+/// on the SAME table every other vector number uses. (The previous shape —
+/// a full second `Modality::Combined` build just to host a text column —
+/// doubled ingest and is untenable at 100M/1B.) One short token per row,
+/// uniform over [`VECTOR_FILTER_BUCKET_TERMS`] values, so every term
+/// matches exactly `1/VECTOR_FILTER_BUCKET_TERMS` of the corpus.
+pub const VECTOR_FILTER_COLUMN: &str = "filter_bucket";
+/// Distinct `filter_bucket` terms: 500 ⇒ every term is a 0.2%-selectivity
+/// predicate — the `single_rare` class the battery has always measured.
+pub const VECTOR_FILTER_BUCKET_TERMS: usize = 500;
+
+/// The bucket token stored for `doc_id` (and, symmetrically, the term a
+/// filter query uses to hit exactly one bucket).
+pub fn vector_filter_bucket_term(doc_id: usize) -> String {
+    format!("bucket{:03}", doc_id % VECTOR_FILTER_BUCKET_TERMS)
+}
 pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
@@ -158,8 +176,8 @@ pub struct IngestResult {
 }
 
 /// Which index shapes a supertable build includes. Drives apples-to-apples
-/// ingest comparisons: `Fts` vs Tantivy (FTS-only), `Vector` vs Lance
-/// (vector-only), `Combined` vs a combined Lance table.
+/// ingest comparisons: `Fts` vs an FTS-only baseline, `Vector` vs a
+/// vector-only baseline, `Combined` vs a combined-table baseline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Modality {
     Fts,
@@ -190,6 +208,12 @@ impl Modality {
     pub fn has_sql(self) -> bool {
         matches!(self, Modality::Sql)
     }
+    /// The vector-only table carries the small `filter_bucket` FTS column
+    /// for the predicate-filtered battery. `Combined` has a real text
+    /// column already; FTS/SQL tables have no vector column to filter.
+    pub fn has_vector_filter_bucket(self) -> bool {
+        matches!(self, Modality::Vector)
+    }
     /// Path token namespacing a prepared dataset by modality.
     pub fn dataset_dir(self) -> &'static str {
         match self {
@@ -209,6 +233,9 @@ pub(crate) fn schema_for(modality: Modality) -> Arc<Schema> {
     if modality.has_sql() {
         fields.push(Field::new(SQL_CATEGORY_COLUMN, DataType::LargeUtf8, false));
         fields.push(Field::new(SQL_RATING_COLUMN, DataType::Int64, false));
+    }
+    if modality.has_vector_filter_bucket() {
+        fields.push(Field::new(VECTOR_FILTER_COLUMN, DataType::LargeUtf8, false));
     }
     if modality.has_vector() {
         fields.push(Field::new(
@@ -262,14 +289,21 @@ pub fn options_for(
             .expect("pool"),
     );
     let tk: Arc<dyn Tokenizer> = default_tokenizer();
-    let fts = if modality.has_fts() {
-        vec![FtsConfig {
+    let mut fts = Vec::new();
+    if modality.has_fts() {
+        fts.push(FtsConfig {
             column: TEXT_COLUMN.into(),
             positions: true,
-        }]
-    } else {
-        vec![]
-    };
+        });
+    }
+    if modality.has_vector_filter_bucket() {
+        // Single token per row, equality-only predicates — positions buy
+        // nothing and would triple the (tiny) index.
+        fts.push(FtsConfig {
+            column: VECTOR_FILTER_COLUMN.into(),
+            positions: false,
+        });
+    }
     let vector = if modality.has_vector() {
         vec![VectorConfig {
             provided_centroids: None,
@@ -800,6 +834,12 @@ fn chunk_batch(
             )
             .expect("sql emb FixedSizeList"),
         ));
+    }
+    if modality.has_vector_filter_bucket() {
+        let buckets: Vec<String> = (start..end).map(vector_filter_bucket_term).collect();
+        columns.push(Arc::new(LargeStringArray::from(
+            buckets.iter().map(String::as_str).collect::<Vec<_>>(),
+        )));
     }
     if modality.has_vector() {
         let all = corpus

@@ -793,6 +793,39 @@ mod tests {
     //! surfaces a typed error.
     use std::{collections::HashMap, sync::Arc};
 
+    /// `from_hex` is the exact inverse of `to_hex` — the recovery path a
+    /// content-addressed cache file name round-trips through — and
+    /// rejects wrong lengths and non-hex input. Debug elides to the
+    /// short prefix for log readability; Display carries the full
+    /// digest; a `PartId` displays as its bare uuid.
+    #[test]
+    fn content_hash_hex_round_trip_and_formats() {
+        let hash = ContentHash::of(b"the quick brown fox");
+        let hex = hash.to_hex();
+        assert_eq!(hex.len(), BLAKE3_HEX_LEN);
+        assert_eq!(ContentHash::from_hex(&hex), Some(hash));
+        assert_eq!(
+            ContentHash::from_hex(&hex.to_uppercase()),
+            Some(hash),
+            "upper-case hex parses too"
+        );
+        assert_eq!(ContentHash::from_hex("abc123"), None, "wrong length");
+        assert_eq!(
+            ContentHash::from_hex(&"zz".repeat(BLAKE3_DIGEST_BYTES)),
+            None,
+            "non-hex bytes"
+        );
+        assert_eq!(format!("{hash}"), format!("blake3:{hex}"));
+        let debug = format!("{hash:?}");
+        assert!(
+            debug.starts_with("blake3:") && debug.ends_with('…'),
+            "Debug is the elided form: {debug}"
+        );
+        assert!(debug.contains(&hex[..CONTENT_HASH_DEBUG_HEX_PREFIX_LEN]));
+        let part_id = PartId::new_v4();
+        assert_eq!(format!("{part_id}"), part_id.0.to_string());
+    }
+
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use bytes::Bytes;
     use uuid::Uuid;

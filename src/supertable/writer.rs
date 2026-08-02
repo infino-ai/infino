@@ -57,8 +57,10 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Write},
     marker::PhantomData,
     mem,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::Ordering},
+    thread::available_parallelism,
     time,
 };
 
@@ -82,7 +84,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -109,16 +111,14 @@ use super::{
         },
     },
 };
-#[cfg(test)]
-use crate::superfile::ReadError;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     memory::{ConnectionMemoryBudget, Reservation},
-    runtime_bridge::bridge_on_runtime,
+    runtime_bridge::{bridge_on_runtime, run_on_pool},
     storage::{StorageError, StorageProvider},
     superfile::{
-        BuildError as SuperfileBuildError, SuperfileReader,
+        BuildError as SuperfileBuildError, ReadError, SuperfileReader,
         builder::{SuperfileBuilder, VectorConfig},
         format::{
             CRC_BYTES,
@@ -166,7 +166,10 @@ use crate::{
             options_hash,
             part::{self as part_mod, PartId},
         },
-        query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
+        query::{
+            dispatch::{open_compaction_input, open_reader},
+            vector::stable_ids_by_local_for_routing,
+        },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state,
         slow_vector_state::{CentroidSection, fetch_centroid_section},
@@ -181,7 +184,7 @@ const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
 /// Stable IDs fed to the streamed shard Parquet builder per Arrow batch.
 const DRAIN_ID_BATCH_ROWS: usize = 64 * 1024;
-const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
+pub(in crate::supertable) const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
 /// Local checkpoint filename inside one epoch scratch directory.
 const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
 
@@ -2286,7 +2289,6 @@ impl PreparedSuperfile {
     /// Open a `SuperfileReader` directly on this superfile's bytes.
     /// Returns `None` if no bytes are held (cache-attached path with
     /// no prepopulation — bytes went to storage only).
-    #[cfg(test)]
     pub(crate) fn open_reader(&self) -> Option<Result<SuperfileReader, ReadError>> {
         let bytes = self
             .bytes_for_store
@@ -2652,25 +2654,43 @@ async fn persist_superfile_publish_batch_async(
     Ok(())
 }
 
-/// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
-/// superfile encode). Installing the build under this pool pins all its nested
-/// `par_iter`/`join` to one thread instead of fanning out across every core, so
-/// routing can't starve foreground ingest CPU.
+/// Rayon pool for hidden-maintenance CPU work (cell-split planning, child
+/// builds, and the probe-law recalibration scan — all on the `optimize()` /
+/// hidden-compaction path; nothing on the ingest commit path rides this
+/// pool). Installing the work under this pool pins all its nested
+/// `par_iter`/`join` here instead of fanning out across the global pool,
+/// so maintenance can't starve foreground ingest CPU (and vice versa the
+/// pool can be capped when optimize runs beside latency-critical
+/// work). Width from `vector.maintenance_threads`; `auto` (default) =
+/// all hardware threads. Sized once, at first use.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
 fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
     if let Some(pool) = MAINT_POOL.get() {
         return Ok(pool);
     }
+    let threads = config::global()
+        .vector
+        .maintenance_threads
+        .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
     // Build outside `get_or_init` so a spawn failure propagates instead of
     // panicking the maintenance path (`OnceLock::get_or_try_init` is not
     // stable). A racing initializer wins harmlessly; ours is dropped.
     let pool = ThreadPoolBuilder::new()
-        .num_threads(1)
+        .num_threads(threads)
         .thread_name(|_| "hidden-maint-cpu".into())
         .build()
         .map_err(|e| BuildError::Store(format!("hidden maintenance rayon pool: {e}")))?;
     Ok(MAINT_POOL.get_or_init(|| pool))
+}
+
+test_visible! {
+    /// Effective maintenance-pool width — bench/test introspection so a
+    /// run's log can record the compute width its optimize measurements
+    /// were taken at.
+    fn maintenance_pool_width() -> usize {
+        maint_pool().map(ThreadPool::current_num_threads).unwrap_or(1)
+    }
 }
 
 /// No-staging drain: read committed user superfiles, assign their encoded rows
@@ -2849,6 +2869,15 @@ async fn load_drain_remote_checkpoint(
     let Some(pending) = state.pending_drain else {
         return Ok(None);
     };
+    // A pin with a recognizable foreign schema (the bulk repack's upload
+    // pin) is not a drain checkpoint: ignore it rather than fail the drain.
+    // The repack never resumes; its stale pin is cleared by the next
+    // slow-state stamp — this drain's own checkpoint included — after which
+    // the pinned orphans age out to gc.
+    if pending_metadata_schema(&pending.metadata) == Some(REPACK_CHECKPOINT_SCHEMA) {
+        debug!("drain: ignoring foreign repack upload pin in slow-CAS pending state");
+        return Ok(None);
+    }
     let checkpoint: DrainRemoteCheckpoint = serde_json::from_slice(&pending.metadata)
         .map_err(|error| BuildError::Store(format!("drain remote checkpoint decode: {error}")))?;
     if checkpoint.schema != DRAIN_CHECKPOINT_SCHEMA {
@@ -3801,9 +3830,29 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .cloned()
             .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
         // All batches spilled: freeze the calibration sample so the pack
-        // fan-out below can score cells against a stable query set.
-        if let Some(cal) = width_law.as_mut() {
-            cal.freeze();
+        // fan-out below can score cells against a stable query set. The
+        // grid is final here — every spill is already assigned to its
+        // cells — so the rerank-law pools rank against what queries will
+        // actually sweep. Freezing rotates every sampled query and ranks
+        // it against the full grid — CPU work, so it rides a rayon pool
+        // behind `run_on_pool` instead of pinning this tokio worker. The
+        // GLOBAL pool, deliberately: the writer pool is busy with the
+        // overlapping user-table build (the two publishes run under a
+        // `join!`), so queueing there stalls the drain behind build
+        // shards, and the maintenance pool is contractually
+        // optimize-only. The grid MOVES into the task and comes back
+        // with the frozen state — no clone of the centroid bytes.
+        if let Some(mut cal) = width_law.take() {
+            let rot_seed = vector_config.rot_seed;
+            let clusters_for_freeze = running_clusters;
+            let (frozen, clusters_back) = run_on_pool(None, "width-law freeze", move || {
+                cal.freeze(&clusters_for_freeze, rot_seed);
+                (cal, clusters_for_freeze)
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("width-law freeze: {e}")))?;
+            width_law = Some(frozen);
+            running_clusters = clusters_back;
         }
         let width_law_ref = width_law.as_ref();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
@@ -3847,7 +3896,39 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     };
                     packed.push((*cell_id, cell));
                 }
-                build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)
+                let prepared: PreparedSuperfile =
+                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?;
+                // Depth-law observation: fine clusters exist only now that
+                // the shard is packed; record each surviving candidate's
+                // fine-centroid rank from the shard's own bytes.
+                if let Some(cal) = width_law_ref {
+                    match prepared.open_reader() {
+                        Some(reader) => {
+                            let reader = reader.map_err(|e| {
+                                BuildError::Store(format!("depth-law shard reopen: {e}"))
+                            })?;
+                            if let Some(views) = reader
+                                .vec()
+                                .and_then(|v| v.cell_fine_calibration_views(&vector_config.column))
+                            {
+                                cal.observe_shard_views(&views);
+                            }
+                        }
+                        // Cache-attached path without prepopulation: the
+                        // shard's bytes went to storage only, so this pack
+                        // carries no depth observation. Loud, not silent -
+                        // the fine law keeps its previous value (max-merge)
+                        // and the first optimize recalibration re-measures
+                        // from committed bytes through the resident opener,
+                        // but a fresh table serves the config fine floor
+                        // until then.
+                        None => warn!(
+                            "drain depth-law observation skipped for shard {shard_id}: \
+                             bytes not retained (cache-attached, no prepopulation)"
+                        ),
+                    }
+                }
+                Ok::<_, BuildError>(prepared)
             },
         )?;
         local_checkpoint = checkpoint
@@ -3994,14 +4075,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // The alternative (rescoring every packed cell per incremental
         // drain) would make drain cost track table size, not delta size.
         if let Some(cal) = width_law.take()
-            && let Some(law) = cal.finish(&running_clusters)
+            && let Some(laws) = cal.finish(&running_clusters)
         {
-            for (slot, measured) in routing.width_for_k.iter_mut().zip(law) {
+            for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
                 *slot = (*slot).max(measured);
             }
+            for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+                *slot = (*slot).max(measured);
+            }
+            for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
+                *slot = (*slot).max(measured);
+            }
+            opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
             info!(
-                "supertable drain: probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): measured {law:?}, stamped {:?}",
-                routing.width_for_k
+                "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
+                laws.width_for_k,
+                routing.width_for_k,
+                laws.fine_for_k,
+                routing.fine_for_k,
+                laws.rerank_for_k,
+                routing.rerank_for_k
             );
         }
         let list_metadata = CommitListMetadata {
@@ -5257,53 +5350,544 @@ fn build_shard_parquet_and_fts(
 /// needs at least one row per side, so fewer than this is a no-op.
 const MIN_ROWS_TO_SPLIT_CELL: usize = 2;
 
-/// Physical count changes from one committed cell split. The split pass keeps
-/// this small delta in memory so it can choose the next overflow without
-/// reopening every superfile to rebuild the complete count table.
-pub(in crate::supertable) struct CellSplitOutcome {
-    /// Post-split `(cell_id, live_docs)` for every sub-cell (index 0 is the
-    /// reused split-cell id; the rest are the appended ids). The caller folds
-    /// these into its in-memory count table to pick the next overflow.
-    child_counts: Vec<(u32, u64)>,
+/// Conservative engineering estimate of one split's peak resident bytes per
+/// (physical row × vector dimension), used to budget a batch window in BYTES
+/// (not cell count — one near-cap cell can cost what dozens of freshly
+/// overflowed ones do). Per-row terms across the pipeline's phase peaks: the
+/// materialized Sq8+ε input (~2.3×dim: codes + residuals + RaBitQ code +
+/// struct overhead), the planner's full-cell fp32 decode for below-cap
+/// modality candidates (4×dim, not concurrent with the build), the k-means
+/// training sample (≤ rows/4 fp32 ≈ 1×dim amortized), and the finished child
+/// superfile bytes held until upload (~2.2×dim, transiently ~2× at splice).
+/// The largest phase peak (input + spliced output) rounds up to 7. Physical
+/// counts are tombstone-inclusive, so the estimate only over-reserves.
+const SPLIT_RESIDENT_BYTES_PER_ROW_DIM: u64 = 7;
+
+/// Byte budget for one split batch's resident window. Reuses the hidden
+/// maintenance memory ceiling (`vector.compaction_max_memory_mb`) — the
+/// merge phase that runs right after the split pass bounds its inputs by the
+/// same knob, so "hidden maintenance may hold this many MiB" stays one
+/// operator-facing story. `0` degenerates to one split per batch.
+fn split_batch_memory_budget_bytes() -> u64 {
+    split_batch_window_bytes(config::global().vector.compaction_max_memory_mb)
 }
 
-/// Split one over-cap **global cell** into `K = ⌈rows/cap⌉` sub-cells. Extracts
-/// the cell's live rows (dropping tombstones) from every superfile that holds it,
-/// k-means-partitions them into `K` sub-centroids — nearest-centroid assignment,
-/// identical to query routing, so a split doc lands in the very cell its query
-/// probes — writes the `K` children as one appended packed superfile, and marks
-/// the parent cell superseded in the manifest. No republish, no removal: the
-/// parent's rows stay live and queryable (readers skip the superseded cell) until
-/// a later merge reclaims them; the grid grows `{..,P,..}` → `{..,child0(=P),new..}`
-/// in one atomic commit. The caller ([`split_overflow_cells`]) picks the cell
-/// from physical file counts.
-///
-/// Returns the committed physical count delta. `None` is a defensive no-op
-/// result; the caller remembers it for this pass so unchanged physical counts
-/// cannot select the same cell repeatedly. User deletes are represented by the
-/// hidden resident deleted-id set rather than hidden tombstones, so a
-/// delete-heavy user table does not normally reach this branch.
-pub(in crate::supertable) async fn split_overflow_cell(
-    inner: Arc<SupertableInner>,
-    split_cell: u32,
+/// Split-window bytes for a configured `vector.compaction_max_memory_mb`.
+/// The merge phase reads 0 as "no byte ceiling", but a zero SPLIT window
+/// would silently collapse batching to one split per commit — reintroducing
+/// the per-commit fixed costs batching exists to amortize — so 0 falls back
+/// to the knob's shipped default.
+fn split_batch_window_bytes(configured_mib: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    /// Same value as the knob's shipped default.
+    const SPLIT_BATCH_FALLBACK_BUDGET_MIB: u64 = 4096;
+    let budget_mib = if configured_mib == 0 {
+        SPLIT_BATCH_FALLBACK_BUDGET_MIB
+    } else {
+        configured_mib
+    };
+    budget_mib.saturating_mul(MIB)
+}
+
+/// Estimated peak resident bytes for splitting one cell of `physical_rows`
+/// rows at dimension `dim` (see [`SPLIT_RESIDENT_BYTES_PER_ROW_DIM`]).
+fn estimate_split_resident_bytes(physical_rows: u64, dim: u32) -> u64 {
+    physical_rows
+        .saturating_mul(u64::from(dim))
+        .saturating_mul(SPLIT_RESIDENT_BYTES_PER_ROW_DIM)
+}
+
+/// Pick the next split batch from the live physical counts: largest
+/// candidates first, packing smaller cells into whatever remains of the byte
+/// budget (an oversized candidate is skipped, not a stopper). The first
+/// candidate is always admitted — one near-cap cell can cost the whole
+/// window and the pass must not stall — and the batch never exceeds
+/// `max_cells` (the pass's remaining split allowance). Ties break by cell id
+/// so a batch is deterministic for given counts.
+fn select_split_batch(
+    cell_counts: &HashMap<u32, u64>,
+    unsplittable: &HashSet<u32>,
+    dim: u32,
+    budget_bytes: u64,
+    max_cells: usize,
+) -> Vec<u32> {
+    let candidates = split_candidates(cell_counts, unsplittable);
+    let mut batch: Vec<u32> = Vec::new();
+    let mut estimated_bytes = 0u64;
+    for (cell, n) in candidates {
+        if batch.len() >= max_cells {
+            break;
+        }
+        let cost = estimate_split_resident_bytes(n, dim);
+        if !batch.is_empty() && estimated_bytes.saturating_add(cost) > budget_bytes {
+            continue;
+        }
+        batch.push(cell);
+        estimated_bytes = estimated_bytes.saturating_add(cost);
+    }
+    batch
+}
+
+/// One pass over `manifest`'s superfiles: per-cell physical doc counts plus
+/// the cell → holding-entries index. The counts drive split selection; the
+/// index replaces the full-manifest rescan the singleton split used to run
+/// PER SPLIT for parent discovery — parents and the superseded exclusions
+/// derive from the SAME snapshot, so a cell superseded by one committed
+/// split can never be re-extracted by a later one. `only_cells` restricts
+/// both outputs (the single-cell wrapper's scan); `None` indexes every live
+/// cell.
+pub(in crate::supertable) async fn scan_cell_parents(
+    inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
+    only_cells: Option<&[u32]>,
+) -> Result<(HashMap<u32, u64>, HashMap<u32, Vec<Arc<SuperfileEntry>>>), BuildError> {
+    let superseded_map = manifest.get_superseded_cells();
+    let mut cell_counts: HashMap<u32, u64> = HashMap::new();
+    let mut parents_by_cell: HashMap<u32, Vec<Arc<SuperfileEntry>>> = HashMap::new();
+    for entry in manifest.superfiles.iter() {
+        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
+        for (cell, n) in cell_doc_counts_for_entry(inner, entry, superseded).await? {
+            if only_cells.is_some_and(|want| !want.contains(&cell)) {
+                continue;
+            }
+            *cell_counts.entry(cell).or_default() += u64::from(n);
+            parents_by_cell
+                .entry(cell)
+                .or_default()
+                .push(Arc::clone(entry));
+        }
+    }
+    Ok((cell_counts, parents_by_cell))
+}
+
+/// One batch cell's extracted live rows plus the parents that held them.
+struct ExtractedCellRows {
+    cell: u32,
+    parent_ids: Vec<Uuid>,
+    rows: Vec<MaterializedIvfRow>,
+}
+
+/// One planned split awaiting the sequential id fold + child builds.
+struct PlannedCellSplit {
+    cell: u32,
+    parent_ids: Vec<Uuid>,
+    rows: Vec<MaterializedIvfRow>,
+    /// `k * dim` fp32 sub-centroids from the k-way planner.
+    sub_centroids: Vec<f32>,
+    /// Actual child count. The planner self-tunes k UPWARD for route
+    /// fidelity (a cell packing many natural groups splits into more,
+    /// smaller children so each holds ~whole groups), so this derives from
+    /// the returned centroid length, not the requested cap-minimum k.
+    k: usize,
+    /// Per-row child ordinal (`0..k`), aligned to `rows`.
+    assign: Vec<u32>,
+}
+
+/// One built split awaiting the batch commit.
+struct BuiltCellSplit {
+    cell: u32,
+    parent_ids: Vec<Uuid>,
+    child_ids: Vec<u32>,
+    child_counts: Vec<u32>,
+    prepared: Vec<(u32, PreparedSuperfile)>,
+}
+
+/// Result of one batched split commit: per input cell either the committed
+/// `(child_id, live_docs)` deltas or `None` for a defensive no-op (the
+/// planner declined, or too few live rows) — the caller marks those cells
+/// unsplittable for the pass so unchanged physical counts cannot re-select
+/// them. `new_entries_by_cell` lets the pass driver extend its
+/// cell → parents index without rescanning the manifest.
+pub(in crate::supertable) struct SplitBatchOutcome {
+    pub(in crate::supertable) per_cell: Vec<(u32, Option<Vec<(u32, u64)>>)>,
+    pub(in crate::supertable) new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)>,
+}
+
+impl SplitBatchOutcome {
+    /// Every cell a defensive no-op — nothing planned, nothing committed.
+    fn no_op_cells(cells: Vec<u32>) -> Self {
+        Self {
+            per_cell: cells.into_iter().map(|cell| (cell, None)).collect(),
+            new_entries_by_cell: Vec::new(),
+        }
+    }
+}
+
+/// Fraction of the live grid's cells that must be split-eligible before the
+/// pass takes the bulk-repack path ([`split_repack_bulk`]: children born
+/// directly in packed shards, the table written once) instead of the
+/// incremental batched path (per-child files the merge phase consolidates —
+/// a second full write when most of the grid is reshaping). A bulk load's
+/// first optimize presents ~100% eligible cells; a steady incremental table
+/// a handful.
+const SPLIT_BULK_REPACK_MIN_CANDIDATE_FRACTION: f64 = 0.25;
+
+/// Slow-CAS pending-metadata schema tag for the bulk repack's upload pin
+/// (ASCII "RPK1"). Distinct from `DRAIN_CHECKPOINT_SCHEMA` so the drain's
+/// checkpoint loader recognizes and IGNORES a foreign pin instead of
+/// failing: the repack never resumes — a stale pin is abandoned and cleared
+/// by the next slow-state stamp, releasing its orphans to gc.
+pub(in crate::supertable) const REPACK_CHECKPOINT_SCHEMA: u32 = 0x5250_4B31;
+
+/// Opaque slow-CAS pending metadata for the repack's upload pin. Only the
+/// schema tag matters (recognition + ignore); the pin's `entries` list is
+/// what extends gc's live set while the repack's upload window is open.
+#[derive(Serialize, Deserialize)]
+struct RepackCheckpoint {
+    schema: u32,
+}
+
+/// Minimal probe for the schema tag of a slow-CAS pending-metadata blob —
+/// both the drain checkpoint and the repack pin serialize a leading
+/// `schema` field.
+#[derive(Deserialize)]
+struct PendingMetadataSchemaProbe {
+    schema: u32,
+}
+
+/// Schema tag of a slow-CAS pending-metadata blob, if one parses at all.
+fn pending_metadata_schema(metadata: &[u8]) -> Option<u32> {
+    serde_json::from_slice::<PendingMetadataSchemaProbe>(metadata)
+        .ok()
+        .map(|probe| probe.schema)
+}
+
+/// Pass-scoped scratch for the bulk repack's row spills and packed cell
+/// subsections (the drain's `env::temp_dir()` convention — `TMPDIR`
+/// controls placement). Removed on success; an aborted pass leaves
+/// local-disk garbage only.
+fn repack_scratch_dir() -> PathBuf {
+    env::temp_dir()
+        .join("infino-repack")
+        .join(Uuid::new_v4().to_string())
+}
+
+/// Split-eligible cells from the live physical counts, largest first (ties
+/// by id, so selection is deterministic). Shared by batch selection and the
+/// pass driver's bulk-repack trigger.
+fn split_candidates(
+    cell_counts: &HashMap<u32, u64>,
+    unsplittable: &HashSet<u32>,
+) -> Vec<(u32, u64)> {
+    let mut candidates: Vec<(u32, u64)> = cell_counts
+        .iter()
+        .filter(|&(cell, &n)| {
+            opann::split_candidate(n)
+                && (n as usize) >= MIN_ROWS_TO_SPLIT_CELL
+                && !unsplittable.contains(cell)
+        })
+        .map(|(&cell, &n)| (cell, n))
+        .collect();
+    candidates.sort_unstable_by_key(|&(cell, n)| (cmp::Reverse(n), cell));
+    candidates
+}
+
+/// Extraction jobs for a set of split cells: each cell paired with the
+/// parents that still hold it live under `superseded_map` (cell directory
+/// for packed entries; partition_hint for legacy). A parent whose cell an
+/// earlier split superseded is skipped — those rows live in the earlier
+/// children, not here.
+fn live_split_extraction_jobs(
+    cells: &[u32],
+    parents_by_cell: &HashMap<u32, Vec<Arc<SuperfileEntry>>>,
+    superseded_map: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
+) -> Vec<(u32, Vec<Arc<SuperfileEntry>>)> {
+    cells
+        .iter()
+        .map(|&cell| {
+            let parents: Vec<Arc<SuperfileEntry>> = parents_by_cell
+                .get(&cell)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            !superseded_map
+                                .and_then(|m| m.get(&entry.superfile_id))
+                                .is_some_and(|s| s.contains(&cell))
+                        })
+                        .map(Arc::clone)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (cell, parents)
+        })
+        .collect()
+}
+
+/// Stage 1 of a split pass — each job's cell rows extracted from its live
+/// parents (tombstone-filtered). Cells overlap on the shared query runtime;
+/// parents within a cell load sequentially (a packed parent holds many
+/// batch cells, and its open is coalesced by the reader cache anyway).
+async fn extract_split_cell_rows(
+    inner: &SupertableInner,
+    column: &str,
+    now: time::Instant,
+    jobs: Vec<(u32, Vec<Arc<SuperfileEntry>>)>,
+) -> Result<Vec<ExtractedCellRows>, BuildError> {
+    let extraction = jobs.into_iter().map(|(cell, parents)| {
+        let column = column.to_owned();
+        async move {
+            let only_cell = [cell];
+            let mut rows: Vec<MaterializedIvfRow> = Vec::new();
+            for entry in &parents {
+                let mut entry_rows = load_materialized_rows_from_ivf_superfile(
+                    inner,
+                    entry,
+                    &column,
+                    now,
+                    Some(&only_cell),
+                )
+                .await?;
+                rows.append(&mut entry_rows);
+            }
+            Ok::<ExtractedCellRows, BuildError>(ExtractedCellRows {
+                cell,
+                parent_ids: parents.iter().map(|entry| entry.superfile_id).collect(),
+                rows,
+            })
+        }
+    });
+    let results: Vec<Result<ExtractedCellRows, BuildError>> = stream::iter(extraction)
+        .buffered(drain_read_concurrency())
+        .collect()
+        .await;
+    results.into_iter().collect()
+}
+
+/// Stage 2 of a split pass — every extracted cell's split decision + k-way
+/// k-means. Plans are pure and seeded per cell, so the wave is
+/// deterministic regardless of scheduling; callers run it inside the
+/// maintenance pool via `run_on_pool`. The planner borrows the encoded rows
+/// instead of cloning the (largest) cell's Sq8+ε payload — a clone here
+/// doubled the biggest cell's resident bytes at split time (a RAM cliff at
+/// 100M/1B). Over the hard cap the plan is a cap-derived `k` backstop the
+/// executor self-tunes up for route fidelity; otherwise the modality
+/// trigger finds the reliable mode count (see `cell_split_plan`). `Err` is
+/// the declined cell — a defensive no-op, not a failure.
+fn plan_split_wave(
+    plan_inputs: Vec<ExtractedCellRows>,
+    clusters: &ClusterCentroids,
+    metric: Metric,
     modality_d: f64,
-) -> Result<Option<CellSplitOutcome>, BuildError> {
-    let manifest = inner.manifest.load_full();
-    let (clusters, column, routing, metric, _vec_dim) = match manifest.get_partition_strategy() {
+) -> Vec<Result<PlannedCellSplit, u32>> {
+    plan_inputs
+        .into_par_iter()
+        .map(|extracted| {
+            let ExtractedCellRows {
+                cell,
+                parent_ids,
+                rows,
+            } = extracted;
+            let split_refs: Vec<&EncodedCellRow> = rows.iter().map(|r| &r.encoded).collect();
+            let Some((k, self_tune)) =
+                opann::cell_split_plan(&split_refs, clusters.dim as usize, cell, modality_d)
+            else {
+                return Err(cell);
+            };
+            let (sub_centroids, assign) =
+                opann::plan_sq8_split_kway(&split_refs, clusters, cell, metric, k, self_tune);
+            drop(split_refs);
+            // Shape-check the planner output at this boundary — everything
+            // downstream (the id fold, routing, count stamps) trusts it. A
+            // malformed buffer degrades to a per-cell defensive no-op
+            // rather than failing the whole pass; the debug_assert makes it
+            // loud in CI.
+            let dim = clusters.dim as usize;
+            let well_formed = !sub_centroids.is_empty()
+                && sub_centroids.len() % dim == 0
+                && assign.len() == rows.len();
+            debug_assert!(
+                well_formed,
+                "planner shape for cell {cell}: {} centroid floats (dim {dim}), \
+                 {} assignments for {} rows",
+                sub_centroids.len(),
+                assign.len(),
+                rows.len()
+            );
+            if !well_formed {
+                warn!(
+                    cell,
+                    "cell split: malformed planner output; skipping the cell"
+                );
+                return Err(cell);
+            }
+            let k = sub_centroids.len() / dim;
+            Ok(PlannedCellSplit {
+                cell,
+                parent_ids,
+                rows,
+                sub_centroids,
+                k,
+                assign,
+            })
+        })
+        .collect()
+}
+
+/// Pin uploaded-but-uncommitted split output in the slow-CAS pending slot
+/// so gc's live set covers it until the membership commit publishes (and,
+/// via its own restamp, clears the pin). `probe_existing` warns if the
+/// stamp replaces a DRAIN-schema checkpoint: inside optimize the drain
+/// phase precedes the split pass, so a drain pin surviving to this point
+/// was already unconsumable (a stale crash leftover) — replacing it
+/// releases its orphans to age out, but it should never happen silently.
+async fn pin_uploaded_superfiles(
+    inner: &SupertableInner,
+    entries: Vec<Arc<SuperfileEntry>>,
+    probe_existing: bool,
+) -> Result<(), BuildError> {
+    if probe_existing {
+        let manifest = inner.manifest.load_full();
+        if let (Some((uri, hash)), Some(storage)) = (
+            manifest.slow_vector_state_blob(),
+            inner.options.storage.as_ref(),
+        ) && let Ok(state) =
+            slow_vector_state::load_full_state(storage.as_ref(), uri, &hash).await
+            && let Some(pending) = state.pending_drain
+            && pending_metadata_schema(&pending.metadata) == Some(DRAIN_CHECKPOINT_SCHEMA)
+        {
+            warn!(
+                "split upload pin replacing a stale drain checkpoint (the drain phase \
+                 precedes the split pass, so a surviving drain pin is unconsumable)"
+            );
+        }
+    }
+    let metadata = serde_json::to_vec(&RepackCheckpoint {
+        schema: REPACK_CHECKPOINT_SCHEMA,
+    })
+    .map_err(|error| BuildError::Store(format!("split upload pin encode: {error}")))?;
+    stamp_slow_vector_state(
+        inner,
+        Some(slow_vector_state::PendingDrainState { metadata, entries }),
+    )
+    .await
+}
+
+/// Best-effort release of the split upload pin after a failed publish, so a
+/// stale pin cannot hold the aborted output live on an otherwise idle table
+/// (any later slow-state stamp would also release it, but an idle table may
+/// never write one). The publish error wins; a failed unpin is logged and
+/// swallowed — the orphans then wait for the next stamp as before.
+async fn unpin_after_failed_publish(inner: &SupertableInner, error: BuildError) -> BuildError {
+    if let Err(unpin) = stamp_slow_vector_state(inner, None).await {
+        debug!("split upload unpin after failed publish: {unpin}");
+    }
+    error
+}
+
+/// One repacked split: its children already packed as spilled cell
+/// subsections on scratch disk, awaiting shard assembly.
+struct RepackedSplit {
+    cell: u32,
+    parent_ids: Vec<Uuid>,
+    child_ids: Vec<u32>,
+    child_counts: Vec<u32>,
+    packed: Vec<(u32, SpilledPackedCell)>,
+}
+
+/// Build one split child as a packed single-cell superfile (extracted from
+/// the singleton path's inline closure so the batch wave can call it on the
+/// maintenance pool). Pure per-child work — no shared mutable state, safe to
+/// run for many children in parallel.
+fn build_split_subcell(
+    inner: &SupertableInner,
+    shard_count: usize,
+    cell_id: u32,
+    mut rows: Vec<MaterializedIvfRow>,
+) -> Result<Option<PreparedSuperfile>, BuildError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    for (i, row) in rows.iter_mut().enumerate() {
+        row.local_doc_id = i as u32;
+    }
+    let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+    let base_cfg = inner
+        .options
+        .vector_columns
+        .first()
+        .cloned()
+        .ok_or_else(|| BuildError::Store("missing vector column".into()))?;
+    // Size the child's fine IVF to ITS OWN row count via the native drain
+    // policy, rather than inheriting the parent's fine-cluster count: a
+    // ~13K-row child carrying a ~126K-row parent's `n_cent` over-fragments
+    // its fine routing.
+    let (cfg, cell_n_cent) = drain_cell_vector_config(&base_cfg, rows.len());
+    let sub = build_merged_subsection_from_materialized(cfg, cell_n_cent, rows)?;
+    let shard_id = packed_cell_shard(cell_id, shard_count) as u32;
+    build_prepared_from_packed_cells(inner, shard_id, vec![(cell_id, sub, stable_ids)]).map(Some)
+}
+
+/// Split a BATCH of over-cap **global cells** in one manifest commit. Per
+/// cell the semantics are the singleton split's: extract the cell's live
+/// rows (dropping tombstones) from every superfile that holds it,
+/// k-means-partition them into `K = ⌈rows/cap⌉` (self-tuned) sub-cells —
+/// nearest-centroid assignment, identical to query routing, so a split doc
+/// lands in the very cell its query probes — write each child as an appended
+/// packed superfile, and mark the parent cell superseded. No republish, no
+/// removal: the parents' rows stay live and queryable (readers skip
+/// superseded cells) until a later merge reclaims them; the grid grows
+/// `{..,P,..}` → `{..,child0(=P),new..}` per split, all in one atomic
+/// commit.
+///
+/// Batching moves the costs, not the semantics:
+///
+/// - **Stages, not per-cell round trips.** Extraction overlaps across cells
+///   on the shared query runtime; planning and the child builds run as two
+///   parallel waves on the maintenance pool, bridged with a oneshot so no
+///   tokio worker blocks under the compute (the singleton path ran the child
+///   builds inline on the calling tokio thread, with their nested
+///   `par_iter`s landing on the GLOBAL rayon pool — the serial hot spot).
+/// - **One sequential id fold.** Child ids are positional ordinals minted
+///   off the end of the grid, so after the parallel planning wave every
+///   split's centroids fold into ONE grown grid in ascending-parent order
+///   ([`opann::insert_split_centroids_batch`]); per-split id computation off
+///   the shared base would collide. Counts apply AFTER the fold —
+///   [`opann::apply_cell_count_updates`] silently drops out-of-range ids, so
+///   the order is a checked invariant here.
+/// - **One OCC commit for the whole batch** publishes every child entry, the
+///   superseded-marker union, and the grown grid atomically, amortizing the
+///   per-commit fixed costs that scale with total membership (slow-state
+///   blob rewrite, list PUT, pointer CAS) across N splits. Child bytes
+///   upload EAGERLY before the commit (the drain's exercised pattern:
+///   `put_new_superfile_bytes` swallows `PreconditionFailed`, so OCC retries
+///   re-PUT nothing) and are dropped as soon as they land; the child entries
+///   keep their fp32 fine centroids resident in `vector_summary`, which the
+///   commit's slow-state compose requires. The upload→commit orphan window
+///   is seconds of tail latency — far inside the GC reclaim grace — and a
+///   crash before the pointer CAS leaves the previous manifest intact plus
+///   GC-reclaimable orphans: the singleton crash contract at coarser
+///   granularity.
+///
+/// `parents_by_cell` must share `manifest`'s lineage (the pass driver
+/// maintains it incrementally from one initial scan and passes the freshest
+/// snapshot per batch); entries whose cell an earlier batch superseded are
+/// excluded here against that snapshot's superseded map. Batch cells must be
+/// distinct. In-process the pass is serialized by `compaction_outstanding`;
+/// cross-process writers are the hidden table's existing single-writer
+/// assumption (the grid stamp is a whole-grid last-writer-wins replace).
+pub(in crate::supertable) async fn split_overflow_cell_batch(
+    inner: &Arc<SupertableInner>,
+    manifest: &ManifestSnapshot,
+    batch_cells: &[u32],
+    modality_d: f64,
+    parents_by_cell: &HashMap<u32, Vec<Arc<SuperfileEntry>>>,
+) -> Result<SplitBatchOutcome, BuildError> {
+    let (clusters, column, routing, metric) = match manifest.get_partition_strategy() {
         PartitionStrategy::VectorCell {
             clusters,
             column,
             routing,
         } => {
             let Some(vec_col) = inner.options.vector_columns.first() else {
-                return Ok(None);
+                return Ok(SplitBatchOutcome::no_op_cells(batch_cells.to_vec()));
             };
-            (clusters, column, routing, vec_col.metric, vec_col.dim)
+            (clusters, column, routing, vec_col.metric)
         }
-        _ => return Ok(None),
+        _ => return Ok(SplitBatchOutcome::no_op_cells(batch_cells.to_vec())),
     };
-    if clusters.n_cent == 0 || clusters.dim == 0 || split_cell >= clusters.n_cent {
-        return Ok(None);
+    if clusters.n_cent == 0 || clusters.dim == 0 {
+        return Ok(SplitBatchOutcome::no_op_cells(batch_cells.to_vec()));
     }
 
     let now = time::Instant::now();
@@ -5312,277 +5896,817 @@ pub(in crate::supertable) async fn split_overflow_cell(
         .storage
         .clone()
         .ok_or_else(|| BuildError::Store("cell split requires storage".into()))?;
-
-    // In-place split scoped to `split_cell`: extract its live rows, route them
-    // into two sub-cells written as freshly appended superfiles, and mark the
-    // cell superseded on every superfile that still holds it. The parent blocks
-    // stay on disk (dead) until merge or dead-fraction compaction reclaims them
-    // — no neighbor rebalance (nprobe >= 2 covers the shifted boundary), no
-    // republish of cells that merely shared a shard. `split_cell` stays live and
-    // queryable until the swap commit.
-    let neighborhood_slice = [split_cell];
     let superseded_map = manifest.get_superseded_cells();
 
-    // Parents = superfiles that still hold `split_cell` as a live cell (cell
-    // directory for packed; partition_hint == cell_id for legacy). One whose
-    // `split_cell` an earlier split already superseded is skipped — those rows
-    // live in the earlier children, not here.
-    let mut parents: Vec<Arc<SuperfileEntry>> = Vec::new();
-    for entry in manifest.superfiles.iter() {
-        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
-        if entry.vector_layout == VectorLayout::MultiCellIvf {
-            let counts = cell_doc_counts_for_entry(&inner, entry, superseded).await?;
-            if counts
-                .iter()
-                .any(|(cell, _)| neighborhood_slice.contains(cell))
-            {
-                parents.push(Arc::clone(entry));
-            }
+    // Invalid ids and thin cells fall out of the pipeline as `None` results
+    // rather than errors: defensive no-ops the pass marks unsplittable.
+    let mut noop_cells: Vec<u32> = Vec::new();
+    let mut eligible_cells: Vec<u32> = Vec::new();
+    for &cell in batch_cells {
+        if cell >= clusters.n_cent {
+            noop_cells.push(cell);
         } else {
-            let Some(hint) = entry.partition_hint else {
-                continue;
-            };
-            if neighborhood_slice.contains(&hint) && !superseded.is_some_and(|s| s.contains(&hint))
-            {
-                parents.push(Arc::clone(entry));
-            }
+            eligible_cells.push(cell);
         }
     }
 
-    let mut all_materialized: Vec<MaterializedIvfRow> = Vec::new();
-    for entry in &parents {
-        let mut rows = load_materialized_rows_from_ivf_superfile(
-            &inner,
-            entry,
-            &column,
-            now,
-            Some(&neighborhood_slice),
-        )
-        .await?;
-        all_materialized.append(&mut rows);
+    // Stage 1 — extraction (I/O), then Stage 2 — planning (CPU) as one
+    // parallel wave on the maintenance pool (see the stage helpers' docs).
+    let jobs = live_split_extraction_jobs(&eligible_cells, parents_by_cell, superseded_map);
+    let extracted = extract_split_cell_rows(inner, &column, now, jobs).await?;
+    let mut plan_inputs: Vec<ExtractedCellRows> = Vec::new();
+    for item in extracted {
+        if item.rows.len() < MIN_ROWS_TO_SPLIT_CELL {
+            noop_cells.push(item.cell);
+        } else {
+            plan_inputs.push(item);
+        }
     }
-    if all_materialized.len() < MIN_ROWS_TO_SPLIT_CELL {
-        return Ok(None);
+    let plan_clusters = clusters.clone();
+    let planned_or_noop: Vec<Result<PlannedCellSplit, u32>> = run_on_pool(
+        Some(maint_pool()?),
+        "cell split batch planning",
+        move || plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d),
+    )
+    .await
+    .map_err(|e| BuildError::Store(format!("cell split batch planning: {e}")))?;
+    let mut planned: Vec<PlannedCellSplit> = Vec::new();
+    for item in planned_or_noop {
+        match item {
+            Ok(split) => planned.push(split),
+            Err(cell) => noop_cells.push(cell),
+        }
+    }
+    if planned.is_empty() {
+        return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
     }
 
-    // Partition the extracted (live) rows k-ways via k-means: `assign[i]`
-    // routes all_materialized[i] to sub-cell `0..k`; sub-cell 0 keeps
-    // `split_cell`'s id, `1..k` are appended. `k = ceil(rows / cap)` is the
-    // starting child count — `k = 2` for a cell just over cap (steady
-    // incremental growth), larger for a bulk overflow — which the planner
-    // self-tunes upward until each child's rows route to it (see
-    // `plan_sq8_split_kway`). Capacitated k-means assigns each row to its
-    // NEAREST sub-centroid, so split membership == query routing; that match is
-    // what keeps split recall at native parity. Borrow the
-    // encoded rows into the planner instead of cloning the whole (largest)
-    // cell's Sq8+ε payload — a clone here doubled the biggest cell's resident
-    // bytes at split time (a RAM cliff at 100M/1B).
-    let split_refs: Vec<&EncodedCellRow> = all_materialized.iter().map(|r| &r.encoded).collect();
-    // Decide whether to split and into how many children (see `cell_split_plan`):
-    // over the hard cap => cap-derived `k` backstop (executor self-tunes k up for
-    // route fidelity); otherwise, with the modality trigger on, an in-memory
-    // recursive binary finds the reliable mode count `k` and the executor splits
-    // into exactly that `k` in one pass (`self_tune = false`) — no cross-pass
-    // cascade. Trigger off (default) => exactly the over-cap check. `None` is a
-    // no-op; the caller marks the cell unsplittable for the pass.
-    let Some((k, self_tune)) = maint_pool()?.install(|| {
-        opann::cell_split_plan(&split_refs, clusters.dim as usize, split_cell, modality_d)
-    }) else {
-        return Ok(None);
-    };
-    let (sub_centroids, assign) = maint_pool()?.install(|| {
-        opann::plan_sq8_split_kway(&split_refs, &clusters, split_cell, metric, k, self_tune)
-    });
-    // The planner self-tunes k UPWARD for route fidelity (a cell packing many
-    // natural groups splits into more, smaller children so each holds ~whole
-    // groups), so the actual child count is the returned centroid count, not the
-    // requested cap-minimum `k`.
-    let actual_k = (sub_centroids.len() / (clusters.dim as usize)).max(1);
-    let (updated_clusters, child_ids) =
-        opann::insert_split_centroids(&clusters, split_cell, &sub_centroids, actual_k);
+    // Stage 3 — the sequential id fold. Fixed ascending-parent order keeps
+    // the minted ids deterministic for a given batch.
+    planned.sort_unstable_by_key(|split| split.cell);
+    let fold_inputs: Vec<(u32, &[f32], usize)> = planned
+        .iter()
+        .map(|split| (split.cell, split.sub_centroids.as_slice(), split.k))
+        .collect();
+    let (updated_clusters, ids_per_split) =
+        opann::insert_split_centroids_batch(&clusters, &fold_inputs);
+    drop(fold_inputs);
 
-    // Route the extracted rows into the k sub-cells and build each as a packed
-    // cell. Sub-cell 0 reuses `split_cell`'s id; the rest are the appended ids.
-    // Each child's fine IVF is rebuilt from its own rows by the packer.
-    let mut groups: Vec<Vec<MaterializedIvfRow>> =
-        (0..child_ids.len()).map(|_| Vec::new()).collect();
-    for (row, &side) in all_materialized.into_iter().zip(assign.iter()) {
-        groups[(side as usize).min(child_ids.len() - 1)].push(row);
-    }
-    let child_counts: Vec<u32> = groups.iter().map(|g| g.len() as u32).collect();
-    tracing::debug!(
-        cell = split_cell,
-        rows = child_counts.iter().sum::<u32>(),
-        k = child_counts.len(),
-        child_min = child_counts.iter().min().copied().unwrap_or(0),
-        child_max = child_counts.iter().max().copied().unwrap_or(0),
-        "cell split committed"
-    );
-    let build_subcell = |cell_id: u32,
-                         mut rows: Vec<MaterializedIvfRow>|
-     -> Result<Option<PreparedSuperfile>, BuildError> {
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        for (i, row) in rows.iter_mut().enumerate() {
-            row.local_doc_id = i as u32;
-        }
-        let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-        let base_cfg = inner
-            .options
-            .vector_columns
-            .first()
-            .cloned()
-            .ok_or_else(|| BuildError::Store("missing vector column".into()))?;
-        // Size the child's fine IVF to ITS OWN row count via the native drain
-        // policy, rather than inheriting the parent's fine-cluster count: a
-        // ~13K-row child carrying a ~126K-row parent's `n_cent` over-fragments
-        // its fine routing.
-        let (cfg, cell_n_cent) = drain_cell_vector_config(&base_cfg, rows.len());
-        let sub = build_merged_subsection_from_materialized(cfg, cell_n_cent, rows)?;
-        let shard_id = packed_cell_shard(cell_id, packed_cell_shard_count(&inner.options)) as u32;
-        build_prepared_from_packed_cells(&inner, shard_id, vec![(cell_id, sub, stable_ids)])
-            .map(Some)
-    };
-    let mut all_prepared = Vec::new();
-    for (group, &cell_id) in groups.into_iter().zip(child_ids.iter()) {
-        all_prepared.extend(build_subcell(cell_id, group)?);
-    }
-    if all_prepared.is_empty() {
-        return Ok(None);
+    // Stage 4 — route each split's rows into its children and build every
+    // child as a packed cell: one parallel wave per batch on the maintenance
+    // pool. Splits fan out; children within one split build sequentially,
+    // which bounds per-split scratch fds and memory. Sub-cell 0 reuses the
+    // split cell's id; the rest are the appended ids. Each child's fine IVF
+    // is rebuilt from its own rows by the packer.
+    let shard_count = packed_cell_shard_count(&inner.options);
+    let build_inner = Arc::clone(inner);
+    let build_jobs: Vec<(PlannedCellSplit, Vec<u32>)> =
+        planned.into_iter().zip(ids_per_split).collect();
+    let built: Vec<BuiltCellSplit> = run_on_pool(
+        Some(maint_pool()?),
+        "cell split batch child builds",
+        move || {
+            build_jobs
+                .into_par_iter()
+                .map(|(split, child_ids)| {
+                    let PlannedCellSplit {
+                        cell,
+                        parent_ids,
+                        rows,
+                        assign,
+                        ..
+                    } = split;
+                    let mut groups: Vec<Vec<MaterializedIvfRow>> =
+                        (0..child_ids.len()).map(|_| Vec::new()).collect();
+                    for (row, &side) in rows.into_iter().zip(assign.iter()) {
+                        debug_assert!(
+                            (side as usize) < child_ids.len(),
+                            "planner assignment {side} outside {} children",
+                            child_ids.len()
+                        );
+                        groups[(side as usize).min(child_ids.len() - 1)].push(row);
+                    }
+                    let child_counts: Vec<u32> = groups.iter().map(|g| g.len() as u32).collect();
+                    let mut prepared: Vec<(u32, PreparedSuperfile)> = Vec::new();
+                    for (group, &child_id) in groups.into_iter().zip(child_ids.iter()) {
+                        if let Some(p) =
+                            build_split_subcell(&build_inner, shard_count, child_id, group)?
+                        {
+                            prepared.push((child_id, p));
+                        }
+                    }
+                    Ok(BuiltCellSplit {
+                        cell,
+                        parent_ids,
+                        child_ids,
+                        child_counts,
+                        prepared,
+                    })
+                })
+                .collect::<Result<Vec<BuiltCellSplit>, BuildError>>()
+        },
+    )
+    .await
+    .map_err(|e| BuildError::Store(format!("cell split batch child builds: {e}")))??;
+    if built.iter().all(|b| b.prepared.is_empty()) {
+        noop_cells.extend(built.iter().map(|b| b.cell));
+        return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
     }
 
     // Set every sub-cell's count from the routing; other cells unchanged.
-    let count_updates: std::collections::HashMap<u32, u32> = child_ids
+    // Applied AFTER the grid fold — `apply_cell_count_updates` silently
+    // drops out-of-range ids, so a pre-fold application would freeze the
+    // appended children at count 0. Checked as an invariant.
+    let count_updates: HashMap<u32, u32> = built
         .iter()
-        .copied()
-        .zip(child_counts.iter().copied())
+        .flat_map(|b| {
+            b.child_ids
+                .iter()
+                .copied()
+                .zip(b.child_counts.iter().copied())
+        })
         .collect();
+    if let Some(&bad) = count_updates
+        .keys()
+        .find(|&&cell| cell >= updated_clusters.n_cent)
+    {
+        return Err(BuildError::Store(format!(
+            "cell split batch: child id {bad} outside the folded grid ({} cells)",
+            updated_clusters.n_cent
+        )));
+    }
     let updated_clusters = opann::apply_cell_count_updates(&updated_clusters, &count_updates);
 
-    let batch = collect_prepared_superfiles(&inner, all_prepared)?;
+    // Mark each split cell superseded on every parent that still held it:
+    // readers, per-cell counts, merges, and split selection all exclude it,
+    // so the parent blocks are logically dead and reclaimed later without a
+    // rewrite here. Additions merge by UNION into the carried-forward map
+    // (idempotent and retry-safe; one packed parent legitimately carries
+    // several batch cells).
+    let mut superseded_additions: BTreeMap<Uuid, BTreeSet<u32>> = BTreeMap::new();
+    let mut committed_cells: Vec<(u32, Vec<(u32, u64)>)> = Vec::with_capacity(built.len());
+    let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
+    let mut all_prepared: Vec<PreparedSuperfile> = Vec::new();
+    for b in built {
+        for parent in &b.parent_ids {
+            superseded_additions
+                .entry(*parent)
+                .or_default()
+                .insert(b.cell);
+        }
+        committed_cells.push((
+            b.cell,
+            b.child_ids
+                .iter()
+                .copied()
+                .zip(b.child_counts.iter().map(|&c| u64::from(c)))
+                .collect(),
+        ));
+        for (cell, p) in b.prepared {
+            new_entries_by_cell.push((cell, Arc::clone(&p.entry)));
+            all_prepared.push(p);
+        }
+    }
+    let SuperfilePublishBatch {
+        new_entries,
+        to_remove: _,
+        pending_storage_writes,
+        // Parity with the singleton split: no disk-cache warm fill for
+        // children (the merge phase rewrites them shortly anyway).
+        pending_cache_inserts: _,
+        pending_store_inserts,
+    } = collect_prepared_superfiles(inner, all_prepared)?;
 
-    // Mark `split_cell` superseded on every parent that still holds it: readers,
-    // per-cell counts, merges, and split selection all exclude it, so the parent
-    // blocks are logically dead and reclaimed later without a rewrite here.
-    let superseded_additions: BTreeMap<Uuid, BTreeSet<u32>> = parents
-        .iter()
-        .map(|e| (e.superfile_id, BTreeSet::from([split_cell])))
-        .collect();
+    // Pin the batch's children BEFORE any byte moves: the pin's entries are
+    // manifest metadata, so one stamp up front covers every child from its
+    // first uploaded byte — no unprotected window at all, and no per-child
+    // stamping. The commit's own restamp clears the pin; after a crash the
+    // stale pin holds the orphans until the next slow-state stamp releases
+    // them to gc (abandon-based recovery, same as the repack).
+    pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
 
-    // Publish the child superfiles, the supersede markers, and the new grid in
-    // one OCC attempt. The parents are NOT removed (they hold other live cells);
-    // only their `split_cell` blocks are marked dead. Re-applied on every retry
-    // so a contention refresh cannot drop the stamp. Every other manifest field
-    // rides through `update` unchanged — a hidden-space reorg consumes no user
-    // commit and must not disturb coverage.
+    // Upload the child bytes EAGERLY and drop them, so the batch holds no
+    // superfile bytes across the commit and OCC retries re-PUT nothing
+    // (superfile URIs are UUID v4; a re-PUT's `PreconditionFailed` is
+    // swallowed as our own prior attempt).
+    let multipart_threshold = inner.options.put_multipart_threshold_bytes;
+    let uploads = pending_storage_writes.into_iter().map(|(uri, bytes)| {
+        let storage = Arc::clone(&storage);
+        async move {
+            put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                .await
+                .map_err(|error| BuildError::Store(error.to_string()))
+        }
+    });
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    while let Some(upload) = in_flight.next().await {
+        if let Err(error) = upload {
+            drop(in_flight);
+            return Err(unpin_after_failed_publish(inner, error).await);
+        }
+    }
+    drop(in_flight);
+
+    // Publish the child superfiles, the supersede markers, and the grown
+    // grid in one OCC attempt for the WHOLE batch. The parents are NOT
+    // removed (they hold other live cells); only their split cells' blocks
+    // are marked dead. Stamps re-apply on every retry so a contention
+    // refresh cannot drop them; the grid stamp is a whole-grid
+    // last-writer-wins replace computed from THIS batch's base snapshot —
+    // concurrent independent full-grid stamps are unsound (the hidden
+    // table's existing single-writer assumption; in-process the pass is
+    // serialized by `compaction_outstanding`). Every other manifest field
+    // rides through `update` unchanged — a hidden-space reorg consumes no
+    // user commit and must not disturb coverage.
     let list_metadata = CommitListMetadata {
         partition_strategy: Some(PartitionStrategy::VectorCell {
             column: column.clone(),
-            clusters: updated_clusters.clone(),
+            clusters: updated_clusters,
             routing,
         }),
         drained_ranges: None,
         global_vector_index: None,
         superseded_cells_additions: Some(superseded_additions),
     };
-
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
-    let new_manifest = persist_commit_async(
-        &inner,
+    let new_manifest = match persist_commit_async(
+        inner,
         Arc::clone(&storage),
-        batch.new_entries,
+        new_entries,
         &no_removals,
-        batch.pending_storage_writes,
+        Vec::new(),
         Vec::new(),
         list_metadata,
     )
     .await
-    .map_err(BuildError::from)?;
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(unpin_after_failed_publish(inner, BuildError::from(error)).await);
+        }
+    };
     inner.manifest.store(Arc::new(new_manifest));
-    apply_pending_store_inserts(&inner, batch.pending_store_inserts);
+    apply_pending_store_inserts(inner, pending_store_inserts);
 
-    schedule_background_storage_reclaim(Arc::clone(&inner));
+    schedule_background_storage_reclaim(Arc::clone(inner));
 
-    Ok(Some(CellSplitOutcome {
-        child_counts: child_ids
-            .iter()
-            .copied()
-            .zip(child_counts.iter().map(|&c| u64::from(c)))
-            .collect(),
-    }))
+    // Convergence logs AFTER the publish (the singleton path logged
+    // "committed" before its commit — premature on a failed publish).
+    for (cell, children) in &committed_cells {
+        debug!(
+            cell = *cell,
+            rows = children.iter().map(|(_, n)| *n).sum::<u64>(),
+            k = children.len(),
+            child_min = children.iter().map(|(_, n)| *n).min().unwrap_or(0),
+            child_max = children.iter().map(|(_, n)| *n).max().unwrap_or(0),
+            "cell split committed"
+        );
+    }
+    debug!(
+        cells = committed_cells.len(),
+        children = new_entries_by_cell.len(),
+        noops = noop_cells.len(),
+        wall_ms = now.elapsed().as_millis() as u64,
+        "cell split batch committed"
+    );
+
+    let mut per_cell: Vec<(u32, Option<Vec<(u32, u64)>>)> = committed_cells
+        .into_iter()
+        .map(|(cell, children)| (cell, Some(children)))
+        .collect();
+    per_cell.extend(noop_cells.into_iter().map(|cell| (cell, None)));
+    Ok(SplitBatchOutcome {
+        per_cell,
+        new_entries_by_cell,
+    })
 }
 
-/// Split-then-merge phase 1: repeatedly split the largest over-cap global cell
-/// until every cell is within `cell_split_doc_cap`. Eligibility is read from the
-/// live grid counts (not a just-merged shard), which keeps the split its own
-/// snapshot-consistent phase — it never removes a superfile a later merge job
-/// planned to use — and lets an over-cap cell converge within one `optimize`
-/// rather than one split per pass. Each split commits atomically, so a mid-loop
-/// failure leaves a valid, partially-split grid that the next `optimize`
-/// finishes. Splitting first also avoids merging a cell that is about to be
-/// re-split (the merge output would be discarded immediately).
-pub(in crate::supertable) async fn split_overflow_cells(
+/// Bulk reshape: split EVERY eligible cell and land the children directly
+/// in their final packed shards — optimize's write-once path for the burst
+/// case, where the incremental path's per-child files would all be
+/// immediately rewritten by the merge phase (the 2× write). Split
+/// DECISIONS are identical to the batched path (same planners, same
+/// modality trigger, same id fold); only the mass split's output format
+/// changes, by reusing the drain's spill/pack plumbing:
+///
+/// 1. **Plan waves, byte-budgeted** — extract a wave of cells, plan in
+///    parallel on the maintenance pool, fold the wave's child ids onto the
+///    RUNNING grid (ids exist BEFORE any row is filed under them — the
+///    final commit stamps a grid whose counts must cover every packed cell
+///    id), then route each row to its child's disk spill and drop the
+///    wave's rows. RAM stays O(wave); each child's rows arrive from
+///    exactly one wave (its parent's extraction), so spill writers open
+///    and close within the wave — never ~2 fds × every child at once.
+/// 2. **Pack per child within the wave** — spill → streamed cell IVF on
+///    scratch ([`build_spilled_packed_cell_from_rows`]; fine IVF sized to
+///    the child's own rows), row spill deleted immediately.
+/// 3. **Assemble shards once** — children grouped `cell_id % shard_count`;
+///    each shard's cells stream into ONE mmap-backed packed superfile
+///    ([`build_prepared_from_spilled_cells`]), in parallel on the
+///    maintenance pool.
+/// 4. **Upload + pin** — each landed shard is appended to a slow-CAS
+///    pending pin (the drain's exercised gc-protection pattern): a bulk
+///    repack's upload window is ~table-size bytes and can exceed the
+///    reclaim grace, and concurrent same-process commits schedule sweeps.
+///    The drain's checkpoint loader recognizes the foreign pin by schema
+///    and ignores it; a stale pin from an aborted pass is cleared by the
+///    next slow-state stamp (abandonment IS the recovery — a repack never
+///    resumes).
+/// 5. **ONE OCC commit** — every shard entry + the grown grid (counts
+///    applied post-fold, checked) + the superseded union. The commit's own
+///    slow-state restamp carries no pending state, so publication clears
+///    the pin atomically. Crash contract unchanged: previous manifest
+///    intact + reclaimable orphans.
+///
+/// The merge phase afterwards finds nothing to consolidate for repack
+/// output; superseded parents in a bulk reshape are ~fully dead and take
+/// merge's existing all-dead pure-reclaim path. Memory is bounded
+/// structurally (waves + disk spill, the drain's model), so no connection-
+/// budget reservation is taken. When 047's probe-law calibration lands,
+/// its hooks ride this pass (offer at wave routing, score at shard pack,
+/// finish + stamp inside the commit; REPLACE semantics) — seams marked
+/// below.
+pub(in crate::supertable) async fn split_repack_bulk(
+    inner: &Arc<SupertableInner>,
+    manifest: &ManifestSnapshot,
+    candidates: Vec<(u32, u64)>,
+    modality_d: f64,
+    parents_by_cell: &HashMap<u32, Vec<Arc<SuperfileEntry>>>,
+) -> Result<SplitBatchOutcome, BuildError> {
+    let all_cells = || {
+        candidates
+            .iter()
+            .map(|&(cell, _)| cell)
+            .collect::<Vec<u32>>()
+    };
+    let (clusters, column, routing, metric) = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing,
+        } => {
+            let Some(vec_col) = inner.options.vector_columns.first() else {
+                return Ok(SplitBatchOutcome::no_op_cells(all_cells()));
+            };
+            (clusters, column, routing, vec_col.metric)
+        }
+        _ => return Ok(SplitBatchOutcome::no_op_cells(all_cells())),
+    };
+    if clusters.n_cent == 0 || clusters.dim == 0 {
+        return Ok(SplitBatchOutcome::no_op_cells(all_cells()));
+    }
+    let Some(base_cfg) = inner.options.vector_columns.first().cloned() else {
+        return Ok(SplitBatchOutcome::no_op_cells(all_cells()));
+    };
+    let now = time::Instant::now();
+    let storage = inner
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| BuildError::Store("cell split requires storage".into()))?;
+    let superseded_map = manifest.get_superseded_cells();
+    let dim = clusters.dim;
+    let initial_n_cent = clusters.n_cent;
+    let budget_bytes = split_batch_memory_budget_bytes();
+
+    /// Removes the pass's scratch on every return path — a failed repack
+    /// must not leak table-sized spill files under TMPDIR. A hard crash
+    /// (SIGABRT) still leaks, as with the drain's scratch: no Drop runs.
+    struct RepackScratchGuard {
+        path: PathBuf,
+    }
+    impl Drop for RepackScratchGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+    let scratch = repack_scratch_dir();
+    fs::create_dir_all(&scratch)
+        .map_err(|error| BuildError::Store(format!("repack scratch create: {error}")))?;
+    let _scratch_guard = RepackScratchGuard {
+        path: scratch.clone(),
+    };
+
+    let mut running_clusters = clusters;
+    let mut noop_cells: Vec<u32> = Vec::new();
+    let mut committed_cells: Vec<(u32, Vec<(u32, u64)>)> = Vec::new();
+    let mut superseded_additions: BTreeMap<Uuid, BTreeSet<u32>> = BTreeMap::new();
+    let mut count_updates: HashMap<u32, u32> = HashMap::new();
+    let mut packed_children: Vec<(u32, SpilledPackedCell)> = Vec::new();
+
+    // Wave loop: largest candidates first, smaller ones packing whatever
+    // byte budget remains (the first is always admitted so the pass can't
+    // stall on one oversized cell).
+    let cell_bytes: HashMap<u32, u64> = candidates.iter().copied().collect();
+    let mut queue: Vec<(u32, u64)> = candidates;
+    while !queue.is_empty() {
+        let mut wave_cells: Vec<u32> = Vec::new();
+        let mut wave_bytes = 0u64;
+        let mut deferred: Vec<(u32, u64)> = Vec::new();
+        for (cell, n) in queue.drain(..) {
+            if cell >= initial_n_cent {
+                noop_cells.push(cell);
+                continue;
+            }
+            let cost = estimate_split_resident_bytes(n, dim);
+            if wave_cells.is_empty() || wave_bytes.saturating_add(cost) <= budget_bytes {
+                wave_cells.push(cell);
+                wave_bytes = wave_bytes.saturating_add(cost);
+            } else {
+                deferred.push((cell, n));
+            }
+        }
+        queue = deferred;
+        if wave_cells.is_empty() {
+            continue;
+        }
+        // Same refuse-and-shrink gate as the batched loop: reserve the wave
+        // against the connection budget; on denial shrink to the largest
+        // cell alone (which proceeds unreserved — parity with the batched
+        // path's single-split fallback), re-queueing the rest.
+        let wave_reservation: Option<Reservation> = match inner
+            .options
+            .connection_memory_budget
+            .try_reserve(usize::try_from(wave_bytes).unwrap_or(usize::MAX))
+        {
+            Ok(reservation) => Some(reservation),
+            Err(_) if wave_cells.len() > 1 => {
+                let requeue: Vec<(u32, u64)> = wave_cells
+                    .split_off(1)
+                    .into_iter()
+                    .map(|cell| (cell, cell_bytes.get(&cell).copied().unwrap_or(0)))
+                    .collect();
+                let mut restored = requeue;
+                restored.append(&mut queue);
+                queue = restored;
+                let single = estimate_split_resident_bytes(
+                    cell_bytes.get(&wave_cells[0]).copied().unwrap_or(0),
+                    dim,
+                );
+                inner
+                    .options
+                    .connection_memory_budget
+                    .try_reserve(usize::try_from(single).unwrap_or(usize::MAX))
+                    .ok()
+            }
+            Err(_) => None,
+        };
+        if wave_reservation.is_none() {
+            debug!(
+                cell = wave_cells[0],
+                "repack: budget denied; single-cell wave proceeds unreserved"
+            );
+        }
+
+        let jobs = live_split_extraction_jobs(&wave_cells, parents_by_cell, superseded_map);
+        let extracted = extract_split_cell_rows(inner, &column, now, jobs).await?;
+        let mut plan_inputs: Vec<ExtractedCellRows> = Vec::new();
+        for item in extracted {
+            if item.rows.len() < MIN_ROWS_TO_SPLIT_CELL {
+                noop_cells.push(item.cell);
+            } else {
+                plan_inputs.push(item);
+            }
+        }
+        if plan_inputs.is_empty() {
+            continue;
+        }
+        let plan_clusters = running_clusters.clone();
+        let planned_or_noop: Vec<Result<PlannedCellSplit, u32>> =
+            run_on_pool(Some(maint_pool()?), "repack wave planning", move || {
+                plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d)
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("repack wave planning: {e}")))?;
+        let mut planned: Vec<PlannedCellSplit> = Vec::new();
+        for item in planned_or_noop {
+            match item {
+                Ok(split) => planned.push(split),
+                Err(cell) => noop_cells.push(cell),
+            }
+        }
+        if planned.is_empty() {
+            continue;
+        }
+
+        // The wave's id fold lands on the RUNNING grid (waves are ordered
+        // largest-first, ascending parent order within a wave — a fixed,
+        // deterministic order for given counts).
+        planned.sort_unstable_by_key(|split| split.cell);
+        let fold_inputs: Vec<(u32, &[f32], usize)> = planned
+            .iter()
+            .map(|split| (split.cell, split.sub_centroids.as_slice(), split.k))
+            .collect();
+        let (next_clusters, ids_per_split) =
+            opann::insert_split_centroids_batch(&running_clusters, &fold_inputs);
+        drop(fold_inputs);
+        running_clusters = next_clusters;
+
+        // Route + spill + per-child streamed pack, splits fanning out on
+        // the maintenance pool. Children within a split build sequentially,
+        // bounding per-split scratch fds and memory; the wave's rows drop
+        // here. (047 L4 seam: `offer` rides this routing — distinct rows
+        // only — and `score_rows` rides the per-child pack.)
+        let wave_scratch = scratch.clone();
+        let wave_cfg = base_cfg.clone();
+        let build_jobs: Vec<(PlannedCellSplit, Vec<u32>)> =
+            planned.into_iter().zip(ids_per_split).collect();
+        let repacked: Vec<RepackedSplit> =
+            run_on_pool(Some(maint_pool()?), "repack wave child packs", move || {
+                build_jobs
+                    .into_par_iter()
+                    .map(|(split, child_ids)| {
+                        let PlannedCellSplit {
+                            cell,
+                            parent_ids,
+                            rows,
+                            assign,
+                            ..
+                        } = split;
+                        let mut groups: Vec<Vec<MaterializedIvfRow>> =
+                            (0..child_ids.len()).map(|_| Vec::new()).collect();
+                        for (row, &side) in rows.into_iter().zip(assign.iter()) {
+                            debug_assert!(
+                                (side as usize) < child_ids.len(),
+                                "planner assignment {side} outside {} children",
+                                child_ids.len()
+                            );
+                            groups[(side as usize).min(child_ids.len() - 1)].push(row);
+                        }
+                        let child_counts: Vec<u32> =
+                            groups.iter().map(|g| g.len() as u32).collect();
+                        let mut packed: Vec<(u32, SpilledPackedCell)> = Vec::new();
+                        for (group, &child_id) in groups.into_iter().zip(child_ids.iter()) {
+                            if group.is_empty() {
+                                continue;
+                            }
+                            let mut spills: HashMap<u32, MaterializedRowSpillWriter> =
+                                HashMap::new();
+                            let mut added: HashMap<u32, u32> = HashMap::new();
+                            for row in &group {
+                                spill_row_to_cell(
+                                    &mut spills,
+                                    &mut added,
+                                    &wave_scratch,
+                                    child_id,
+                                    row,
+                                )?;
+                            }
+                            drop(group);
+                            let spill = spills
+                                .remove(&child_id)
+                                .ok_or_else(|| {
+                                    BuildError::Store(
+                                        "repack: spill writer missing for child".into(),
+                                    )
+                                })?
+                                .finish()?;
+                            let packed_cell = build_spilled_packed_cell_from_rows(
+                                &wave_scratch,
+                                child_id,
+                                &spill,
+                                &wave_cfg,
+                            )?;
+                            spill.remove_files();
+                            packed.push((child_id, packed_cell));
+                        }
+                        Ok(RepackedSplit {
+                            cell,
+                            parent_ids,
+                            child_ids,
+                            child_counts,
+                            packed,
+                        })
+                    })
+                    .collect::<Result<Vec<RepackedSplit>, BuildError>>()
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("repack wave child packs: {e}")))??;
+
+        for split in repacked {
+            for parent in &split.parent_ids {
+                superseded_additions
+                    .entry(*parent)
+                    .or_default()
+                    .insert(split.cell);
+            }
+            count_updates.extend(
+                split
+                    .child_ids
+                    .iter()
+                    .copied()
+                    .zip(split.child_counts.iter().copied()),
+            );
+            committed_cells.push((
+                split.cell,
+                split
+                    .child_ids
+                    .iter()
+                    .copied()
+                    .zip(split.child_counts.iter().map(|&c| u64::from(c)))
+                    .collect(),
+            ));
+            packed_children.extend(split.packed);
+        }
+    }
+    if packed_children.is_empty() {
+        return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
+    }
+
+    // Counts apply AFTER the full fold (out-of-range keys are silently
+    // dropped by `apply_cell_count_updates`) — checked as an invariant.
+    if let Some(&bad) = count_updates
+        .keys()
+        .find(|&&cell| cell >= running_clusters.n_cent)
+    {
+        return Err(BuildError::Store(format!(
+            "repack: child id {bad} outside the folded grid ({} cells)",
+            running_clusters.n_cent
+        )));
+    }
+    let final_clusters = opann::apply_cell_count_updates(&running_clusters, &count_updates);
+
+    // Assemble each shard's packed superfile once, in parallel on the
+    // maintenance pool. (047 L4 seam: `observe_shard_views` rides this
+    // stage; `freeze` precedes it — the folded grid is final here.)
+    let shard_count = packed_cell_shard_count(&inner.options);
+    let buckets = group_cells_by_packed_shard(packed_children, shard_count);
+    let build_inner = Arc::clone(inner);
+    let build_scratch = scratch.clone();
+    let bucket_cells: HashMap<u32, Vec<u32>> = buckets
+        .iter()
+        .map(|(shard, cells)| (*shard, cells.iter().map(|(cell, _)| *cell).collect()))
+        .collect();
+    // Join by shard id, not position: the cell → entry pairing must not
+    // depend on the parallel collect preserving bucket order.
+    let prepared: Vec<(u32, PreparedSuperfile)> =
+        run_on_pool(Some(maint_pool()?), "repack shard assembly", move || {
+            buckets
+                .par_iter()
+                .map(|(shard, cells)| {
+                    build_prepared_from_spilled_cells(&build_inner, &build_scratch, *shard, cells)
+                        .map(|prepared| (*shard, prepared))
+                })
+                .collect::<Result<Vec<(u32, PreparedSuperfile)>, BuildError>>()
+        })
+        .await
+        .map_err(|e| BuildError::Store(format!("repack shard assembly: {e}")))??;
+    let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
+    for (shard, prepared_shard) in &prepared {
+        if let Some(cells) = bucket_cells.get(shard) {
+            for &cell in cells {
+                new_entries_by_cell.push((cell, Arc::clone(&prepared_shard.entry)));
+            }
+        }
+    }
+    let prepared: Vec<PreparedSuperfile> = prepared.into_iter().map(|(_, p)| p).collect();
+    let SuperfilePublishBatch {
+        new_entries,
+        to_remove: _,
+        pending_storage_writes,
+        // Parity with the batched split: no disk-cache warm fill.
+        pending_cache_inserts: _,
+        pending_store_inserts,
+    } = collect_prepared_superfiles(inner, prepared)?;
+
+    // Pin every shard BEFORE any byte moves (entries are metadata): one
+    // stamp covers the whole upload window — which can exceed the reclaim
+    // grace — with zero unprotected bytes, instead of the drain's per-shard
+    // incremental stamps. The commit's restamp clears the pin; a crash
+    // leaves the orphans pinned until the next slow-state stamp releases
+    // them (abandon-based recovery).
+    pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
+    let multipart_threshold = inner.options.put_multipart_threshold_bytes;
+    let uploads = pending_storage_writes.into_iter().map(|(uri, bytes)| {
+        let storage = Arc::clone(&storage);
+        async move {
+            put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                .await
+                .map_err(|error| BuildError::Store(error.to_string()))
+        }
+    });
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    while let Some(landed) = in_flight.next().await {
+        if let Err(error) = landed {
+            drop(in_flight);
+            return Err(unpin_after_failed_publish(inner, error).await);
+        }
+    }
+    drop(in_flight);
+
+    // ONE OCC commit for the whole reshape: shard entries + grown grid +
+    // superseded union. The commit's own slow-state restamp carries no
+    // pending state, so publication clears the upload pin atomically.
+    // (047 L4 seam: `finish` + the law stamp ride this commit.)
+    let list_metadata = CommitListMetadata {
+        partition_strategy: Some(PartitionStrategy::VectorCell {
+            column: column.clone(),
+            clusters: final_clusters,
+            routing,
+        }),
+        drained_ranges: None,
+        global_vector_index: None,
+        superseded_cells_additions: Some(superseded_additions),
+    };
+    let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+    let new_manifest = match persist_commit_async(
+        inner,
+        Arc::clone(&storage),
+        new_entries,
+        &no_removals,
+        Vec::new(),
+        Vec::new(),
+        list_metadata,
+    )
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(unpin_after_failed_publish(inner, BuildError::from(error)).await);
+        }
+    };
+    inner.manifest.store(Arc::new(new_manifest));
+    apply_pending_store_inserts(inner, pending_store_inserts);
+    schedule_background_storage_reclaim(Arc::clone(inner));
+
+    debug!(
+        cells = committed_cells.len(),
+        children = new_entries_by_cell.len(),
+        shards = bucket_cells.len(),
+        noops = noop_cells.len(),
+        wall_ms = now.elapsed().as_millis() as u64,
+        "cell split bulk repack committed"
+    );
+
+    let mut per_cell: Vec<(u32, Option<Vec<(u32, u64)>>)> = committed_cells
+        .into_iter()
+        .map(|(cell, children)| (cell, Some(children)))
+        .collect();
+    per_cell.extend(noop_cells.into_iter().map(|cell| (cell, None)));
+    Ok(SplitBatchOutcome {
+        per_cell,
+        new_entries_by_cell,
+    })
+}
+
+/// Split one over-cap **global cell** — the single-cell entry the unit tests
+/// and defensive callers use; the optimize pass batches cells via
+/// [`split_overflow_cells`]. Semantics live on [`split_overflow_cell_batch`];
+/// this wrapper scans the manifest for the cell's parents (the same one-pass
+/// index the pass driver amortizes across the whole pass) and runs a
+/// single-cell batch.
+///
+/// Returns the committed count delta — post-split `(cell_id, live_docs)`
+/// for every sub-cell (index 0 is the reused split-cell id; the rest are
+/// the appended ids). `None` is a defensive no-op result; the caller
+/// remembers it for this pass so unchanged physical counts cannot select
+/// the same cell repeatedly. User deletes are represented by the hidden
+/// resident deleted-id set rather than hidden tombstones, so a delete-heavy
+/// user table does not normally reach this branch.
+pub(in crate::supertable) async fn split_overflow_cell(
     inner: Arc<SupertableInner>,
-) -> Result<(), BuildError> {
-    // Safety bound only: a balanced (median) cut halves a cell each split, so a
-    // cell converges in ~log2(size / cap) splits — far below this. It just stops
-    // a pathological non-shrinking split from looping forever.
-    const MAX_SPLITS_PER_OPTIMIZE: usize = 4096;
+    split_cell: u32,
+    modality_d: f64,
+) -> Result<Option<Vec<(u32, u64)>>, BuildError> {
     let manifest = inner.manifest.load_full();
     if !matches!(
         manifest.get_partition_strategy(),
         PartitionStrategy::VectorCell { .. }
     ) {
-        return Ok(());
+        return Ok(None);
     }
-    // Compute physical counts once. Each successful split returns the two
-    // replacement counts, so later iterations update this table in O(1)
-    // instead of reopening every superfile for another full recount.
-    let superseded_map = manifest.get_superseded_cells();
-    let mut cell_counts: HashMap<u32, u64> = HashMap::new();
-    for entry in manifest.superfiles.iter() {
-        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
-        for (cell, n) in cell_doc_counts_for_entry(&inner, entry, superseded).await? {
-            *cell_counts.entry(cell).or_default() += u64::from(n);
-        }
-    }
+    let only_cell = [split_cell];
+    let (_cell_counts, parents_by_cell) =
+        scan_cell_parents(&inner, &manifest, Some(&only_cell)).await?;
+    let outcome =
+        split_overflow_cell_batch(&inner, &manifest, &only_cell, modality_d, &parents_by_cell)
+            .await?;
+    Ok(outcome
+        .per_cell
+        .into_iter()
+        .next()
+        .and_then(|(_, result)| result))
+}
 
-    // Defensive progress guard for cells whose split no-op'd this pass.
-    // Selection uses physical counts, so without this set any unchanged
-    // over-cap cell would be selected repeatedly up to the split bound.
-    // Hidden user deletes use the resident deleted-id set, not hidden
-    // tombstones; this is not the normal delete-heavy-table path.
-    let mut unsplittable: HashSet<u32> = HashSet::new();
-    let mut splits_committed = 0usize;
-    for iteration in 0..MAX_SPLITS_PER_OPTIMIZE {
-        let mut best: Option<(u32, u64)> = None;
-        for (cell, n) in &cell_counts {
-            let n = *n;
-            if opann::split_candidate(n)
-                && !unsplittable.contains(cell)
-                && best.is_none_or(|(_, b)| n > b)
-            {
-                best = Some((*cell, n));
-            }
-        }
-        let Some((split_cell, n)) = best else {
-            break;
-        };
-        if (n as usize) < MIN_ROWS_TO_SPLIT_CELL {
-            break;
-        }
-        match split_overflow_cell(
-            Arc::clone(&inner),
-            split_cell,
-            opann::cell_split_modality_d(),
-        )
-        .await?
-        {
-            Some(outcome) => {
-                splits_committed += 1;
-                for (cell, docs) in outcome.child_counts {
-                    cell_counts.insert(cell, docs);
+/// Fold one split outcome (batched or bulk repack) into the pass's live
+/// tables: replacement counts, unsplittable marks, and the cell → parents
+/// index (children extend it in O(children) — no rescans).
+fn apply_split_outcome_to_pass(
+    outcome: SplitBatchOutcome,
+    cell_counts: &mut HashMap<u32, u64>,
+    unsplittable: &mut HashSet<u32>,
+    parents_by_cell: &mut HashMap<u32, Vec<Arc<SuperfileEntry>>>,
+    splits_committed: &mut usize,
+) {
+    for (cell, entry) in outcome.new_entries_by_cell {
+        parents_by_cell.entry(cell).or_default().push(entry);
+    }
+    for (cell, result) in outcome.per_cell {
+        match result {
+            Some(child_counts) => {
+                *splits_committed += 1;
+                for (child, docs) in child_counts {
+                    cell_counts.insert(child, docs);
                     // A fresh split's children are already resolved — the modality
                     // recursion emits *unimodal* leaves. Mark any child that isn't
                     // itself over the hard cap unsplittable, so the modality
@@ -5593,19 +6717,171 @@ pub(in crate::supertable) async fn split_overflow_cells(
                     // selectable so the over-cap backstop re-splits them. No-op for
                     // the doc-cap path (its ≤cap children were never candidates).
                     if !opann::split_overflow_needed(docs) {
-                        unsplittable.insert(cell);
+                        unsplittable.insert(child);
                     }
                 }
             }
             None => {
-                unsplittable.insert(split_cell);
+                unsplittable.insert(cell);
             }
         }
-        if iteration + 1 == MAX_SPLITS_PER_OPTIMIZE {
-            tracing::warn!(
+    }
+}
+
+/// Split-then-merge phase 1: repeatedly split the largest over-cap global
+/// cells until every cell is within `cell_split_doc_cap`, in BYTE-BUDGETED
+/// BATCHES of one OCC commit each ([`split_overflow_cell_batch`]). When the
+/// eligible set spans most of the grid, a bulk repack
+/// ([`split_repack_bulk`]) runs first — one write, packed shards — and the
+/// batched loop mops up.
+/// Eligibility is read from the live grid counts (not a just-merged shard),
+/// which keeps the split its own snapshot-consistent phase — it never
+/// removes a superfile a later merge job planned to use — and lets an
+/// over-cap cell converge within one `optimize` rather than one split per
+/// pass. Each batch commits atomically ((grid, superseded, children)
+/// mutually consistent at every boundary), so a mid-pass failure leaves a
+/// valid, partially-split grid that the next `optimize` finishes — the
+/// per-split contract at coarser granularity. Children still over cap
+/// re-enter a later batch off the folded counts. Splitting first also avoids
+/// merging a cell that is about to be re-split (the merge output would be
+/// discarded immediately).
+pub(in crate::supertable) async fn split_overflow_cells(
+    inner: Arc<SupertableInner>,
+) -> Result<(), BuildError> {
+    // Safety bound only: a balanced (median) cut halves a cell each split, so a
+    // cell converges in ~log2(size / cap) splits — far below this. It just stops
+    // a pathological non-shrinking split from looping forever.
+    const MAX_SPLITS_PER_OPTIMIZE: usize = 4096;
+    let manifest = inner.manifest.load_full();
+    let (dim, n_cent) = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell { clusters, .. } => (clusters.dim, clusters.n_cent),
+        _ => return Ok(()),
+    };
+    // Compute physical counts AND the cell → holding-superfiles index once.
+    // Each committed split returns its replacement counts and child entries,
+    // so later batches update both tables in O(children) instead of
+    // reopening every superfile for another full recount (the singleton
+    // path additionally re-scanned the whole manifest PER SPLIT for parent
+    // discovery — this index is that scan's one-pass replacement).
+    let (mut cell_counts, mut parents_by_cell) = scan_cell_parents(&inner, &manifest, None).await?;
+
+    // Defensive progress guard for cells whose split no-op'd this pass.
+    // Selection uses physical counts, so without this set any unchanged
+    // over-cap cell would be selected repeatedly up to the split bound.
+    // Hidden user deletes use the resident deleted-id set, not hidden
+    // tombstones; this is not the normal delete-heavy-table path.
+    let mut unsplittable: HashSet<u32> = HashSet::new();
+    let mut splits_committed = 0usize;
+    let budget_bytes = split_batch_memory_budget_bytes();
+
+    // Bulk-reshape detection: when a large fraction of the grid is
+    // split-eligible (a bulk load's first optimize), take the repack path —
+    // children are born in their final packed shards and the table is
+    // written once — then let the batched loop below mop up any
+    // still-over-cap children. The repack is one pass, not a loop, so the
+    // per-optimize split bound doesn't gate it; the loop's bound still
+    // applies to everything after.
+    let eligible = split_candidates(&cell_counts, &unsplittable);
+    if !eligible.is_empty()
+        && eligible.len() as f64 >= f64::from(n_cent) * SPLIT_BULK_REPACK_MIN_CANDIDATE_FRACTION
+    {
+        let outcome = split_repack_bulk(
+            &inner,
+            &manifest,
+            eligible,
+            opann::cell_split_modality_d(),
+            &parents_by_cell,
+        )
+        .await?;
+        apply_split_outcome_to_pass(
+            outcome,
+            &mut cell_counts,
+            &mut unsplittable,
+            &mut parents_by_cell,
+            &mut splits_committed,
+        );
+    }
+    loop {
+        let mut batch = select_split_batch(
+            &cell_counts,
+            &unsplittable,
+            dim,
+            budget_bytes,
+            // Saturating: a very large repack can alone exceed the loop's
+            // split allowance (it is one pass, not a loop, so the bound
+            // doesn't gate it — but the remainder must not underflow).
+            MAX_SPLITS_PER_OPTIMIZE.saturating_sub(splits_committed),
+        );
+        if batch.is_empty() {
+            break;
+        }
+        let estimated_bytes: u64 = batch
+            .iter()
+            .map(|cell| {
+                estimate_split_resident_bytes(cell_counts.get(cell).copied().unwrap_or(0), dim)
+            })
+            .sum();
+        // Reserve the window against the connection budget — the same
+        // refuse-only gate compaction's merge uses. On denial, shrink to a
+        // single cell; a single split proceeds unreserved (the pre-batch
+        // path never reserved, and failing the pass here would regress it).
+        // Fail closed on narrow targets: an estimate that doesn't fit usize
+        // reserves usize::MAX, which is always denied and takes the shrink
+        // path below instead of silently under-reserving.
+        let reservation: Option<Reservation> = match inner
+            .options
+            .connection_memory_budget
+            .try_reserve(usize::try_from(estimated_bytes).unwrap_or(usize::MAX))
+        {
+            Ok(reservation) => Some(reservation),
+            Err(_) => {
+                if batch.len() > 1 {
+                    batch.truncate(1);
+                    let n = cell_counts.get(&batch[0]).copied().unwrap_or(0);
+                    let single_bytes = usize::try_from(estimate_split_resident_bytes(n, dim))
+                        .unwrap_or(usize::MAX);
+                    inner
+                        .options
+                        .connection_memory_budget
+                        .try_reserve(single_bytes)
+                        .ok()
+                } else {
+                    None
+                }
+            }
+        };
+        if reservation.is_none() {
+            debug!(
+                cell = batch[0],
+                "cell split: budget denied; single split proceeds unreserved"
+            );
+        }
+        // Freshest snapshot per batch — batch N+1 must see batch N's
+        // commit; the incrementally-maintained parents index shares this
+        // lineage.
+        let batch_manifest = inner.manifest.load_full();
+        let outcome = split_overflow_cell_batch(
+            &inner,
+            &batch_manifest,
+            &batch,
+            opann::cell_split_modality_d(),
+            &parents_by_cell,
+        )
+        .await?;
+        drop(reservation);
+        apply_split_outcome_to_pass(
+            outcome,
+            &mut cell_counts,
+            &mut unsplittable,
+            &mut parents_by_cell,
+            &mut splits_committed,
+        );
+        if splits_committed >= MAX_SPLITS_PER_OPTIMIZE {
+            warn!(
                 "cell split: hit per-optimize split bound ({MAX_SPLITS_PER_OPTIMIZE}); \
                  over-cap cells remain and will converge on the next optimize"
             );
+            break;
         }
     }
     // Convergence summary for this optimize's split pass. `over_cap > 0` here
@@ -5617,7 +6893,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
             .filter(|&&n| opann::split_overflow_needed(n))
             .count();
         let max_cell = cell_counts.values().copied().max().unwrap_or(0);
-        tracing::debug!(
+        debug!(
             splits = splits_committed,
             cells = cell_counts.len(),
             over_cap,
@@ -5627,6 +6903,400 @@ pub(in crate::supertable) async fn split_overflow_cells(
         );
     }
     Ok(())
+}
+
+/// Re-measure both probe laws (width + fine depth) over the CURRENT cell
+/// geometry, from stored bytes, and stamp them into the manifest routing.
+///
+/// Compaction reshapes exactly what the drain-time law was measured
+/// against: splits spread the true top-k over more, smaller cells
+/// (widening the width a query needs), and merges rebuild each merged
+/// cell's fine IVF (reshuffling the fine ranks the depth law counts).
+/// A law stamped pre-split therefore goes stale precisely when the
+/// hidden index is optimized — measured at 10M as post-optimize recall
+/// 0.982 against 0.993 under a fresh law. This pass reruns the drain's
+/// calibration machinery over live stored rows: a deterministic stride
+/// sample over the cell-ordered live-row enumeration picks the query
+/// rows (proportional-to-size per cell, reads only the sampled cells —
+/// the drain's reservoir needs a stream that is already flowing; here a
+/// full pre-read just to sample would double the pass), then ONE full
+/// sweep scores every live cell and observes fine ranks per superfile.
+/// The measured width REPLACES the stamped point (the fresh full-table
+/// measurement is authoritative, and width — the dominant cost term,
+/// every probed cell is a fetch — must be able to narrow after a merge
+/// pass); fine depth and rerank MAX-MERGE against the prior stamp
+/// (their shrink buys only intra-fetch compute, so keeping the deeper
+/// stamp is recall-safe insurance against a sample that under-measures
+/// a per-stage walk). Points the fresh sample could not support
+/// (measured `0`) keep their previous value under both rules. Skipped
+/// for never-calibrated tables (all-zero width law): the drain gate is
+/// the calibration entry point; this pass only refreshes.
+///
+/// Returns whether a new law was stamped.
+pub(in crate::supertable) async fn recalibrate_probe_laws(
+    inner: &Arc<SupertableInner>,
+) -> Result<bool, BuildError> {
+    let manifest = inner.manifest.load_full();
+    let (clusters, column, routing, metric, rot_seed) = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing,
+        } => {
+            // Resolve the config by the strategy's OWN column name — a
+            // positional `first()` would silently calibrate with the wrong
+            // metric/rotation if a table ever carries several vector columns.
+            // A VectorCell manifest whose column is missing from the options
+            // is an invariant violation, not a nothing-to-do: silently
+            // skipping would leave stale routing in place, so fail the
+            // optimize loudly instead.
+            let Some(vec_col) = inner
+                .options
+                .vector_columns
+                .iter()
+                .find(|cfg| cfg.column == column)
+            else {
+                return Err(BuildError::Store(format!(
+                    "vector routing column {column:?} missing from table options"
+                )));
+            };
+            (clusters, column, routing, vec_col.metric, vec_col.rot_seed)
+        }
+        _ => return Ok(false),
+    };
+    if clusters.n_cent == 0 || clusters.dim == 0 {
+        return Ok(false);
+    }
+    if routing.width_for_k.iter().all(|&w| w == 0) {
+        return Ok(false);
+    }
+    // A VectorCell table without storage cannot re-read committed bytes —
+    // like a missing column config, that is an invariant violation, not a
+    // nothing-to-do: silently skipping would leave stale routing while
+    // optimize() reports success.
+    let Some(storage) = inner.options.storage.clone() else {
+        return Err(BuildError::Store(
+            "probe-law recalibration requires configured storage".into(),
+        ));
+    };
+
+    let now = time::Instant::now();
+    let superseded_map = manifest.get_superseded_cells();
+    // Live (entry, (cell, docs)) work list — superseded and empty cells
+    // excluded, exactly as split selection excludes them.
+    let mut work: Vec<(Arc<SuperfileEntry>, Vec<(u32, u32)>)> = Vec::new();
+    let mut total_docs = 0u64;
+    for entry in manifest.superfiles.iter() {
+        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
+        let cells: Vec<(u32, u32)> = cell_doc_counts_for_entry(inner, entry, superseded)
+            .await?
+            .into_iter()
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        if !cells.is_empty() {
+            total_docs += cells.iter().map(|&(_, n)| u64::from(n)).sum::<u64>();
+            work.push((Arc::clone(entry), cells));
+        }
+    }
+    if work.is_empty() || total_docs == 0 {
+        return Ok(false);
+    }
+
+    // Evidence basis for the width stamp below: the exact superfile set
+    // this scan measures. A drain that commits between the scan and the
+    // stamp adds rows this evidence never saw.
+    let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
+    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
+    // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
+    // evenly spaced ordinals over the cell-ordered live-row enumeration —
+    // the law's noise floor is set by evidence size, and any fixed stride
+    // drifts off it near the boundaries (floor overshoots: 511 docs ->
+    // 511 picks; ceil undershoots: 257 docs -> 129 picks). Counts are
+    // physical (tombstones included); each picked ordinal is mapped
+    // proportionally onto the cell's live rows below.
+    let sample_count = total_docs.min(opann::WIDTH_LAW_QUERY_SAMPLE as u64);
+    // u128 intermediates: the products are provably in-range today only
+    // because doc counts are u32-bounded — widening makes the sampler
+    // correct unconditionally, at zero cost on this once-per-pass path.
+    let sample_ordinals: Vec<u64> = (0..sample_count)
+        .map(|i| ((u128::from(i) * u128::from(total_docs)) / u128::from(sample_count)) as u64)
+        .collect();
+    let mut picks: BTreeMap<(usize, u32), Vec<u32>> = BTreeMap::new();
+    let mut base = 0u64;
+    let mut next_pick = 0usize;
+    'outer: for (ei, (_, cells)) in work.iter().enumerate() {
+        for &(cell, n) in cells {
+            let end = base + u64::from(n);
+            while next_pick < sample_ordinals.len() && sample_ordinals[next_pick] < end {
+                picks
+                    .entry((ei, cell))
+                    .or_default()
+                    .push((sample_ordinals[next_pick] - base) as u32);
+                next_pick += 1;
+            }
+            if next_pick == sample_ordinals.len() {
+                break 'outer;
+            }
+            base = end;
+        }
+    }
+    for (&(ei, cell), ordinals) in &picks {
+        let (entry, cells) = &work[ei];
+        let rows =
+            load_materialized_rows_from_ivf_superfile(inner, entry, &column, now, Some(&[cell]))
+                .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        // Physical-to-live remap: the strides above were laid out over
+        // physical (tombstone-inclusive) counts, but `rows` is live-only.
+        // Scale each ordinal proportionally instead of clamping — in a
+        // heavily tombstoned cell a clamp collapses every tail pick onto
+        // the last live row, filling the reservoir with duplicates of one
+        // neighborhood and biasing the REPLACE stamp — and drop picks that
+        // land on an already-offered row (ordinals are increasing, so the
+        // proportional map is monotone and duplicates are adjacent).
+        let phys = cells
+            .iter()
+            .find(|&&(c, _)| c == cell)
+            .map(|&(_, n)| u64::from(n))
+            .unwrap_or(0)
+            .max(1);
+        let mut last_idx = usize::MAX;
+        for &ordinal in ordinals {
+            let idx = ((u128::from(ordinal) * rows.len() as u128) / u128::from(phys)) as usize;
+            let idx = idx.min(rows.len() - 1);
+            if idx == last_idx {
+                continue;
+            }
+            last_idx = idx;
+            cal.offer(&rows[idx]);
+        }
+    }
+    // Freeze rotates every sampled query and ranks it against the full
+    // grid — CPU work, bridged onto the maintenance pool via
+    // `run_on_pool` like every other compute wave in this pass (this IS
+    // the optimize path, so the maintenance pool is the right pool —
+    // unlike the drain's freeze, which rides the global pool). The grid
+    // moves into the task and comes back with the frozen state: no
+    // centroid clone.
+    let pool = maint_pool()?;
+    let clusters_for_freeze = clusters;
+    let (cal, clusters) = run_on_pool(Some(pool), "recalibration freeze", move || {
+        cal.freeze(&clusters_for_freeze, rot_seed);
+        (cal, clusters_for_freeze)
+    })
+    .await
+    .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
+    // Shared handle for the scoring sweep: chunks are MOVED onto the
+    // maintenance pool and awaited over a oneshot, so the tokio worker
+    // keeps driving the next chunk's loads instead of blocking under the
+    // compute (the standing rayon/tokio bridge contract).
+    let cal = Arc::new(cal);
+
+    // Single full sweep: score every live cell against the frozen queries,
+    // then observe fine ranks from each superfile's own bytes (mirrors the
+    // drain's per-shard observe: a superfile's candidates are always merged
+    // before its views are read). Cells are scored in pool-width chunks —
+    // loads stay sequential (async), the CPU fans out across the chunk on
+    // the maintenance pool (`vector.maintenance_threads`), and transient
+    // memory stays bounded at one chunk of materialized cells.
+    let chunk_cells = pool.current_num_threads().max(1);
+    for (entry, cells) in &work {
+        for chunk in cells.chunks(chunk_cells) {
+            let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
+            for &(cell, _) in chunk {
+                let rows = load_materialized_rows_from_ivf_superfile(
+                    inner,
+                    entry,
+                    &column,
+                    now,
+                    Some(&[cell]),
+                )
+                .await?;
+                loaded.push((cell, rows));
+            }
+            let chunk_cal = Arc::clone(&cal);
+            run_on_pool(Some(pool), "recalibration score", move || {
+                let result = loaded
+                    .par_iter()
+                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows));
+                // Release the shared handle BEFORE returning — the oneshot
+                // send follows the return, and the awaiting side unwraps
+                // the Arc after the final recv (a send-then-drop order
+                // raced it: the \"state still shared\" failure under test
+                // parallelism).
+                drop(chunk_cal);
+                result
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("recalibration score: {e}")))??;
+        }
+        // The fine observation reads subsection/stable-id bytes
+        // SYNCHRONOUSLY (`cell_fine_calibration_views` resolves through
+        // `try_get_range_sync`), and the lazy query opener only exposes
+        // sync bytes after a BACKGROUND mmap promotion — a fresh
+        // post-compaction output racing that promotion would silently
+        // skip its depth observation and keep the previous law, the
+        // staleness this pass exists to fix. Open the way compaction
+        // opens its own inputs: resident bytes guaranteed.
+        let reader = open_compaction_input(
+            &inner.options.store,
+            inner.options.disk_cache.as_ref(),
+            inner.options.storage.as_ref(),
+            entry,
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        // `None` here is a legacy single-cell layout — skip its depth
+        // observation; the finish fallback keeps the previous depth law
+        // rather than shallowing it on partial evidence.
+        if let Some(views) = reader
+            .vec()
+            .and_then(|v| v.cell_fine_calibration_views(&column))
+        {
+            // Depth ranking is CPU work — same bridge as the scoring
+            // chunks. The shared handle is released BEFORE the closure
+            // returns (the oneshot send follows the return; the awaiting
+            // side unwraps the Arc after the final recv).
+            let observe_cal = Arc::clone(&cal);
+            run_on_pool(Some(pool), "recalibration depth observation", move || {
+                observe_cal.observe_shard_views(&views);
+                drop(observe_cal);
+            })
+            .await
+            .map_err(|e| BuildError::Store(format!("recalibration depth observation: {e}")))?;
+        }
+    }
+    // Every chunk's oneshot was awaited, so this is the last reference.
+    let cal = Arc::into_inner(cal)
+        .ok_or_else(|| BuildError::Store("recalibration state still shared".into()))?;
+    // The final reduction (rank sorts, coverage crossings) is CPU work
+    // too — same bridge. The entry-snapshot grid is consumed here; the
+    // stamp loop below reloads the FRESH grid from the manifest.
+    let Some(laws) = run_on_pool(Some(pool), "recalibration finish", move || {
+        cal.finish(&clusters)
+    })
+    .await
+    .map_err(|e| BuildError::Store(format!("recalibration finish: {e}")))?
+    else {
+        return Ok(false);
+    };
+
+    // Stamp commit: one CAS attempt per FRESH strategy snapshot. The shared
+    // `persist_commit_async` re-applies its captured metadata verbatim on
+    // OCC retries — safe for the drain (user commits are serialized behind
+    // the writer slot) but not here: the compaction slot serializes hidden
+    // reorgs against each other, NOT against live drains (a writer commits
+    // mid-compaction by design), so a retry carrying this function's
+    // snapshot would revert a concurrent drain's newer grid counts and
+    // max-merged law. Re-derive the whole stamp — fresh clusters, fresh
+    // routing, measured deltas re-applied — from the freshly loaded
+    // manifest on every attempt instead. The measured laws themselves stay
+    // valid across attempts: cell geometry only changes under the
+    // compaction slot this pass already holds; concurrent drains bump
+    // counts, never the grid.
+    let max_retries = inner.options.max_commit_retries.max(1);
+    for attempt in 0..max_retries {
+        let manifest = inner.manifest.load_full();
+        let (clusters, fresh_routing) = match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell {
+                clusters, routing, ..
+            } => (clusters, routing),
+            _ => return Ok(false),
+        };
+        let mut routing = fresh_routing;
+        // Width REPLACEs — the fresh full-table measurement is authoritative,
+        // and narrowing after a merge pass is the cost half (every probed
+        // cell is a fetch) — but only while the scan's evidence is still
+        // current. A concurrent drain appends superfiles and max-merges a
+        // law measured on rows this scan never saw; REPLACING that with our
+        // older-evidence narrower width would under-probe the fresh rows.
+        // When the superfile set moved after the scan, fall back to the
+        // recall-safe max-merge; the next reshape's recalibration re-earns
+        // the narrow from current evidence.
+        let evidence_current = manifest
+            .superfiles
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect::<HashSet<Uuid>>()
+            == scan_ids;
+        for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
+            if evidence_current {
+                if measured > 0 {
+                    *slot = measured;
+                }
+            } else {
+                *slot = (*slot).max(measured);
+            }
+        }
+        // Fine depth and rerank MAX-MERGE against the live stamp, exactly as
+        // the drain does: a sample that under-measures a per-stage walk must
+        // never shallow a stamp the previous full measurement certified —
+        // that is the query-time under-probe this PR exists to fix. Their
+        // shrink direction buys only intra-fetch compute, so keeping the
+        // deeper value is recall-safe at bounded cost. A measured `0`
+        // (unsupported point) keeps the previous value under both rules.
+        for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+            *slot = (*slot).max(measured);
+        }
+        for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
+            *slot = (*slot).max(measured);
+        }
+        opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
+        if routing == fresh_routing {
+            // The live stamp already carries everything this pass measured
+            // (e.g. a concurrent drain max-merged past us) — nothing to
+            // commit.
+            return Ok(false);
+        }
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column: column.clone(),
+                clusters: clusters.clone(),
+                routing,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let base = Arc::new(list_metadata.apply(&manifest));
+        let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        match try_commit_attempt(
+            Arc::clone(&storage),
+            Arc::clone(&inner.options),
+            base,
+            &[],
+            &no_removals,
+            NewEntryBirthVersions::StampCommit,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+        {
+            Ok(new_manifest) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                info!(
+                    "supertable optimize: probe laws recalibrated over {} cells at k={WIDTH_LAW_KS:?}: width {:?}, fine depth {:?}, rerank {:?}",
+                    clusters.n_cent, routing.width_for_k, routing.fine_for_k, routing.rerank_for_k
+                );
+                return Ok(true);
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage)
+                    .await
+                    .map_err(BuildError::from)?;
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(BuildError::from(e));
+            }
+        }
+    }
+    Err(BuildError::from(
+        SupertableCommitError::WriteContentionExhausted,
+    ))
 }
 
 // OCC retry budget — read from
@@ -5750,7 +7420,7 @@ async fn previous_centroid_section(
     }
 }
 
-async fn stamp_slow_vector_state(
+pub(in crate::supertable) async fn stamp_slow_vector_state(
     inner: &SupertableInner,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
 ) -> Result<(), BuildError> {
@@ -7456,6 +9126,25 @@ mod tests {
         );
     }
 
+    /// Recalibration is a no-op on tables it does not own: a user table
+    /// (no `VectorCell` strategy) returns `false` without touching the
+    /// manifest or requiring storage — the drain gate is the calibration
+    /// entry point, and user tables never pass it.
+    #[test]
+    fn recalibration_skips_non_vector_cell_tables() {
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let before = st.inner().manifest.load_full().get_manifest_id();
+        let stamped = st
+            .block_on_query(recalibrate_probe_laws(st.inner()))
+            .expect("recalibrate on a user table is a clean no-op");
+        assert!(!stamped, "no VectorCell strategy, nothing to restamp");
+        assert_eq!(
+            st.inner().manifest.load_full().get_manifest_id(),
+            before,
+            "the no-op must not commit"
+        );
+    }
+
     // ---- writer slot exclusion ---------------------------------------
 
     #[test]
@@ -8198,6 +9887,104 @@ supertable:
         let mut w = st.writer().expect("writer");
         let err = w.delete(col("title").eq(lit("x"))).expect_err("no storage");
         assert!(matches!(err, MutationError::NoStorageAttached), "{err:?}");
+    }
+
+    /// `select_split_batch` packs largest-first within the byte budget: an
+    /// oversized candidate is skipped (not a stopper) and smaller cells fill
+    /// the remainder; cells below the candidate floor never enter.
+    #[test]
+    fn select_split_batch_packs_largest_first_within_budget() {
+        let dim = 128u32;
+        let counts: HashMap<u32, u64> = [(1, 1000), (2, 600), (3, 200), (4, 100), (5, 50)]
+            .into_iter()
+            .collect();
+        let none: HashSet<u32> = HashSet::new();
+        // Fits the largest cell plus the smallest candidate, but not the
+        // middle one — which must be skipped, not stop the packing.
+        let budget =
+            estimate_split_resident_bytes(1000, dim) + estimate_split_resident_bytes(200, dim);
+        let batch = select_split_batch(&counts, &none, dim, budget, usize::MAX);
+        assert_eq!(
+            batch,
+            vec![1, 3],
+            "largest first, middle skipped over budget, sub-floor cells (4, 5) excluded"
+        );
+    }
+
+    /// The first candidate is always admitted — a cell whose estimate alone
+    /// exceeds the window must still split (the singleton path had no budget
+    /// at all), one per batch.
+    #[test]
+    fn select_split_batch_always_admits_one() {
+        let counts: HashMap<u32, u64> = [(7, 1000), (9, 900)].into_iter().collect();
+        let none: HashSet<u32> = HashSet::new();
+        let batch = select_split_batch(&counts, &none, 128, 1, usize::MAX);
+        assert_eq!(batch, vec![7]);
+    }
+
+    /// Unsplittable cells are filtered, the pass allowance caps the batch,
+    /// and equal counts break ties by cell id (deterministic batches).
+    #[test]
+    fn select_split_batch_respects_unsplittable_allowance_and_ties() {
+        let counts: HashMap<u32, u64> = [(3, 400), (8, 400), (1, 400), (6, 400)]
+            .into_iter()
+            .collect();
+        let unsplittable: HashSet<u32> = [1].into_iter().collect();
+        let batch = select_split_batch(&counts, &unsplittable, 128, u64::MAX, 2);
+        assert_eq!(
+            batch,
+            vec![3, 6],
+            "id-order ties, unsplittable 1 dropped, capped at 2"
+        );
+    }
+
+    /// The pending-metadata schema probe recognizes both stamp producers
+    /// and rejects garbage — the drain's checkpoint loader keys its
+    /// ignore-foreign-pin behavior on it.
+    #[test]
+    fn pending_metadata_schema_probes_both_producers() {
+        let repack = serde_json::to_vec(&RepackCheckpoint {
+            schema: REPACK_CHECKPOINT_SCHEMA,
+        })
+        .expect("encode");
+        assert_eq!(
+            pending_metadata_schema(&repack),
+            Some(REPACK_CHECKPOINT_SCHEMA)
+        );
+        let drain = serde_json::to_vec(&serde_json::json!({
+            "schema": DRAIN_CHECKPOINT_SCHEMA,
+            "unrelated": true
+        }))
+        .expect("encode");
+        assert_eq!(
+            pending_metadata_schema(&drain),
+            Some(DRAIN_CHECKPOINT_SCHEMA)
+        );
+        assert_eq!(pending_metadata_schema(b"not json"), None);
+        assert_eq!(pending_metadata_schema(b"{}"), None);
+    }
+
+    /// `vector.compaction_max_memory_mb = 0` disables the MERGE byte
+    /// ceiling; the split window must not degenerate to zero with it (that
+    /// would silently collapse batching to one split per commit).
+    #[test]
+    fn split_batch_window_survives_disabled_merge_ceiling() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            split_batch_window_bytes(0),
+            4096 * MIB,
+            "0 falls back to the default"
+        );
+        assert_eq!(
+            split_batch_window_bytes(512),
+            512 * MIB,
+            "nonzero passes through"
+        );
+        assert_eq!(
+            split_batch_window_bytes(u64::MAX),
+            u64::MAX,
+            "saturates instead of overflowing"
+        );
     }
 
     #[test]

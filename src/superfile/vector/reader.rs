@@ -63,7 +63,11 @@ use crate::{
     },
 };
 
+/// Bytes per fp32 lane in the on-disk centroid region.
+const F32_BYTES: usize = 4;
 const OUTER_HEADER_SIZE: usize = format::vec::OUTER_HEADER_SIZE;
+const DOC_ID_BYTES: usize = format::vec::DOC_ID_BYTES;
+const STABLE_ID_BYTES: usize = format::vec::STABLE_ID_BYTES;
 const DIR_ENTRY_SIZE: usize = format::vec::DIR_ENTRY_SIZE;
 const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 
@@ -1994,6 +1998,117 @@ impl VectorReader {
         Some(out)
     }
 
+    /// One inline stable id, indexed by cell-local doc id. The single
+    /// owner of the region's 16-byte-le indexed read (the docs already
+    /// referred to this helper before it existed); `None` past the region
+    /// end.
+    pub(crate) fn stable_id_at(region: &[u8], local: usize) -> Option<i128> {
+        let start = local.checked_mul(STABLE_ID_BYTES)?;
+        let end = start.checked_add(STABLE_ID_BYTES)?;
+        Some(i128::from_le_bytes(
+            region.get(start..end)?.try_into().ok()?,
+        ))
+    }
+
+    /// Per-cell view for depth calibration: the raw fp32 centroid-region
+    /// bytes (ranked by the shared [`nearest_k_centroids_bytes`] scan —
+    /// no decode here) plus a stable-id -> fine-cluster map covering every
+    /// row of the cell, walked with the shared [`read_cluster_entry`] /
+    /// [`Self::stable_id_at`] parsers. Resident-only by design — the drain
+    /// observes freshly built shard bytes, where every range resolves
+    /// synchronously; `None` on any non-resident range (never a fetch), and
+    /// on single-cell v1 blobs (no cell ids to observe; the hidden drain
+    /// never produces them).
+    pub(crate) fn cell_fine_calibration_views(
+        &self,
+        column: &str,
+    ) -> Option<Vec<CellFineCalibrationView>> {
+        // In the packed multi-cell layout each subsection entry IS one grid
+        // cell of the SINGLE indexed vector column (`cell_ids` is parallel
+        // to `columns` — see the round-trip in the drain's cell build), so
+        // walking every entry is walking that column's cells, not mixing
+        // columns. The name gate rejects readers that don't carry the
+        // requested column; a second vector column cannot reach this path
+        // (the hidden index is single-column by construction, resolved by
+        // name at the calibration entry).
+        if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.columns.len());
+        for (index, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 {
+                continue;
+            }
+            let sub = self
+                .source
+                .try_get_range_sync(col.subsection_range.clone())?;
+            let n_fine = col.n_cent as usize;
+            // Corrupt-offset hardening: every region bound is validated
+            // before slicing — observation degrades to `None` (the caller's
+            // documented keep-previous-law fallback) instead of panicking
+            // on a malformed subsection.
+            let centroids_len = n_fine.checked_mul(col.dim)?.checked_mul(F32_BYTES)?;
+            let centroids_end = col.centroids_off.checked_add(centroids_len)?;
+            if centroids_end > sub.len() {
+                return None;
+            }
+            let fine_centroids_bytes = sub.slice(col.centroids_off..centroids_end);
+            // Stable ids are indexed by cell-local doc id; each cluster's
+            // doc-id block names its member rows' cell-local ids — walking
+            // both yields stable id -> fine cluster for every row.
+            let region = self
+                .source
+                .try_get_range_sync(col.stable_ids_region_range()?)?;
+            let idx_end = col
+                .cluster_idx_off
+                .checked_add(n_fine.checked_mul(CLUSTER_IDX_ENTRY_BYTES)?)?;
+            let idx_slice = sub.get(col.cluster_idx_off..idx_end)?;
+            let mut cluster_of_stable = HashMap::with_capacity(col.n_docs as usize);
+            for cluster in 0..n_fine {
+                let (off, cnt) = read_cluster_entry(idx_slice, cluster);
+                if cnt == 0 {
+                    continue;
+                }
+                let block = self
+                    .source
+                    .try_get_range_sync(col.cluster_codes_doc_ids_range(off, cnt))?;
+                let ids_start = (cnt as usize).checked_mul(col.quant.code_bytes())?;
+                for i in 0..cnt as usize {
+                    let p = ids_start.checked_add(i.checked_mul(DOC_ID_BYTES)?)?;
+                    let id_bytes = block.get(p..p.checked_add(DOC_ID_BYTES)?)?;
+                    let did = u32::from_le_bytes(id_bytes.try_into().ok()?);
+                    let stable = Self::stable_id_at(&region, did as usize)?;
+                    // One fine cluster per row, by construction — a stable
+                    // id claimed by two cluster blocks is an inconsistent
+                    // index, and calibrating depth from it would silently
+                    // under-stamp the laws. Degrade the whole read.
+                    if cluster_of_stable.insert(stable, cluster as u32).is_some() {
+                        return None;
+                    }
+                }
+            }
+            // Completeness: every row of the cell must be mapped (inserts
+            // are all-unique above, so len == the summed cluster counts).
+            // A partial view is partial depth evidence — degrade instead
+            // of calibrating from it.
+            if cluster_of_stable.len() != col.n_docs as usize {
+                return None;
+            }
+            // This walk is multi-cell-only (gated above), so every subsection
+            // must have a cell-id entry — a missing one is inconsistent
+            // metadata, and observations mapped without a cell would be
+            // silently dropped downstream. Degrade the whole read instead.
+            out.push(CellFineCalibrationView {
+                cell_id: Some(self.cell_ids.get(index).copied()?),
+                dim: col.dim,
+                n_fine,
+                fine_centroids_bytes,
+                cluster_of_stable,
+            });
+        }
+        Some(out)
+    }
+
     /// Remap a file-local allow/deny bitmap onto one packed cell's local
     /// id space (`0..n_docs`). IVF cluster blocks store cell-local ids;
     /// callers pass file-local bitmaps (parquet / packed-shard space).
@@ -2067,13 +2182,7 @@ impl VectorReader {
                 }
                 let region = region.as_ref()?;
                 let cell_local = file_local - bases[cell_idx];
-                let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
-                let end = p + format::vec::STABLE_ID_BYTES;
-                if end > region.len() {
-                    return None;
-                }
-                let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
-                out[output_idx] = i128::from_le_bytes(arr);
+                out[output_idx] = Self::stable_id_at(region, cell_local as usize)?;
             }
             return Some(out);
         }
@@ -2094,13 +2203,7 @@ impl VectorReader {
         };
         let mut out = Vec::with_capacity(locals.len());
         for &local in locals {
-            let p = (local as usize) * format::vec::STABLE_ID_BYTES;
-            let end = p + format::vec::STABLE_ID_BYTES;
-            if end > region.len() {
-                return None;
-            }
-            let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
-            out.push(i128::from_le_bytes(arr));
+            out.push(Self::stable_id_at(&region, local as usize)?);
         }
         Some(out)
     }
@@ -4250,6 +4353,22 @@ fn truncate_to_top_estimates(acc: &mut Vec<(u32, f32, u32, u32)>, limit: usize) 
         });
         acc.truncate(limit);
     }
+}
+
+/// Per-cell calibration view — see
+/// [`VectorReader::cell_fine_calibration_views`].
+pub(crate) struct CellFineCalibrationView {
+    /// Grid cell id (`None` on single-cell v1 blobs, which the hidden
+    /// drain never produces).
+    pub(crate) cell_id: Option<u32>,
+    pub(crate) dim: usize,
+    pub(crate) n_fine: usize,
+    /// Raw row-major `n_fine x dim` fp32-le centroid-region bytes — the
+    /// exact on-disk region query-time fine ranking scans, ranked by the
+    /// same [`nearest_k_centroids_bytes`] owner.
+    pub(crate) fine_centroids_bytes: Bytes,
+    /// Stable `_id` -> fine cluster index, one entry per row.
+    pub(crate) cluster_of_stable: HashMap<i128, u32>,
 }
 
 /// One 1-bit-scan survivor surfaced to the supertable's GLOBAL shortlist

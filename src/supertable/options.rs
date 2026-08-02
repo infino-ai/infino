@@ -193,9 +193,9 @@ const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
 /// committed (by this or another process) after it opened.
 ///
 /// Modeled on the same knob every object-store-native engine exposes
-/// (turbopuffer's per-query consistency level, LanceDB's
-/// `read_consistency_interval`): the *engine* re-checks the manifest
-/// pointer for the caller; the application never refreshes by hand.
+/// (turbopuffer's per-query consistency level is the best-known
+/// example): the *engine* re-checks the manifest pointer for the
+/// caller; the application never refreshes by hand.
 /// A same-process writer's commit is always visible immediately
 /// (read-your-writes) regardless of this setting — the policy only
 /// governs picking up *other* processes' commits.

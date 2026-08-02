@@ -1532,8 +1532,31 @@ pub mod vector {
                     && let PartitionStrategy::VectorCell { routing, .. } =
                         manifest.get_partition_strategy()
                 {
+                    // `nprobe_min..max` is the manifest's BASE routing; the
+                    // probe-width law (`width_for_k`, stamped by the drain and
+                    // applied per query, overriding those fields) is what
+                    // actually decides the sweep. Print it too — otherwise a
+                    // run cannot be read to tell whether the law is active.
+                    let law = if routing.width_for_k.iter().all(|&w| w == 0) {
+                        "law=none".to_string()
+                    } else {
+                        format!("law={:?}", routing.width_for_k)
+                    };
+                    // Same for the fine-depth law: a floor over the config's
+                    // `fine` value on the default path, so a run must show it
+                    // to be read correctly.
+                    let fine_law = if routing.fine_for_k.iter().all(|&f| f == 0) {
+                        "finelaw=none".to_string()
+                    } else {
+                        format!("finelaw={:?}", routing.fine_for_k)
+                    };
+                    let rerank_law = if routing.rerank_for_k.iter().all(|&r| r == 0) {
+                        "reranklaw=none".to_string()
+                    } else {
+                        format!("reranklaw={:?}", routing.rerank_for_k)
+                    };
                     return format!(
-                        "hidden: cells {}..{}, fine {}, {}, {rerank_label}",
+                        "hidden: cells {}..{}, {law}, fine {}, {fine_law}, {rerank_law}, {}, {rerank_label}",
                         routing.nprobe_min,
                         routing.nprobe_max,
                         routing.fine_nprobe,
@@ -1612,12 +1635,43 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> f32 {
+        mean_recall_timed(reader, column, queries, truths, k, nprobe, rerank).0
+    }
+
+    /// [`mean_recall`] plus the p50 query latency of the same pass, so a
+    /// probe sweep can price a setting on the same line that reports its
+    /// recall.
+    ///
+    /// Panics on a query/truth length mismatch or an empty battery: both
+    /// are harness bugs, and a measurement helper must fail loudly rather
+    /// than report a number computed from silently truncated pairs (or a
+    /// 0/0 = NaN recall, which the width-sweep tripwire would compare
+    /// unpredictably).
+    pub fn mean_recall_timed<R: VectorRead>(
+        reader: &R,
+        column: &str,
+        queries: &[Vec<f32>],
+        truths: &[Vec<u32>],
+        k: usize,
+        nprobe: usize,
+        rerank: usize,
+    ) -> (f32, Duration) {
+        assert_eq!(
+            queries.len(),
+            truths.len(),
+            "each query needs exactly one ground-truth row"
+        );
+        assert!(!queries.is_empty(), "recall over zero queries is undefined");
         let mut sum = 0f32;
+        let mut lat: Vec<Duration> = Vec::with_capacity(queries.len());
         for (q, t) in queries.iter().zip(truths) {
+            let started = Instant::now();
             let hits = reader.topk_global(column, q, k, nprobe, rerank);
+            lat.push(started.elapsed());
             sum += corpus::recall_at_k(&hits, t);
         }
-        sum / queries.len() as f32
+        let p50 = p50(&mut lat);
+        (sum / queries.len() as f32, p50)
     }
 
     /// Largest doc count that still calibrates with the exhaustive

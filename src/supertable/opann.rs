@@ -29,7 +29,10 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
+    },
 };
 
 use crate::{
@@ -40,17 +43,22 @@ use crate::{
             manifest_centroid_components_from_row,
         },
         distance::{
-            Metric, distance, nearest_k_centroids_transposed, normalize, relative_score_window,
+            Metric, distance, nearest_k_centroids_bytes, nearest_k_centroids_transposed, normalize,
+            relative_score_window,
         },
         kmeans::{kmeans, kmeans_pp},
+        quant::BitQuantizer,
+        reader::CellFineCalibrationView,
         reservoir::Reservoir,
+        rotation::RandomRotation,
         spill::SpilledCellRows,
     },
     supertable::{
         error::BuildError,
         manifest::{
             ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
-            RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitContext, list::WIDTH_LAW_KS,
+            RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitContext,
+            list::{WIDTH_LAW_KS, WIDTH_LAW_MAX_K},
         },
     },
 };
@@ -707,10 +715,33 @@ pub(crate) fn plan_sq8_split_kway(
 /// Corpus rows are the right calibration distribution — on Cohere-1M/768d,
 /// stored-row queries and the dataset's held-out test queries measured the
 /// same top-k cell spread.
-const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
-/// Mean top-k coverage a probe width must reach to be recorded in the law —
-/// the engine's recall@k acceptance bar.
-const WIDTH_LAW_TARGET_COVERAGE: f64 = 0.99;
+pub(crate) const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
+
+/// Coverage target for EVERY law stage (width, fine depth, rerank).
+/// Stage coverages compound multiplicatively toward the end-to-end
+/// recall bar (width x fine x rerank): stamping any stage at the 0.99
+/// bar itself leaves zero margin, and a crossing that lands exactly at
+/// target compounds the product to ~0.98 (measured, both ways: fine law
+/// 5 at a 0.99 target → post-drain 0.983; width at a 0.99 target over
+/// the post-split 3.5K-cell grid → post-compact 0.986-0.994 straddling
+/// the bar run-to-run, while stages that overshoot their crossing —
+/// width at 256 cells — deliver 0.996). 0.997 per stage keeps the
+/// three-stage product ≥ 0.991 even when every crossing is tight.
+const LAW_STAGE_TARGET_COVERAGE: f64 = 0.997;
+
+/// Rerank-law distractor pool: each calibration query counts 1-bit-estimate
+/// distractors only within its `RERANK_LAW_POOL_CELLS` grid-nearest cells —
+/// the pool a width-law sweep would actually scan. A `k` point whose
+/// measured width exceeds this stays uncalibrated (the pool under-counts
+/// its distractors), falling back to the configured `rerank_mult`.
+pub(crate) const RERANK_LAW_POOL_CELLS: usize = 64;
+
+/// Rerank-law estimate histogram resolution: per-query counts of pool-row
+/// 1-bit estimates, binned linearly over `[-Σ|q_rot|, +Σ|q_rot|]` (the
+/// sign-dot estimator's exact range). A candidate's distractor count reads
+/// the prefix INCLUDING its own bin — rank error is bounded by one bin's
+/// occupancy and always over-counts (a wider law, never a narrower one).
+const RERANK_LAW_EST_BINS: usize = 4096;
 /// Fixed seed for the calibration reservoir, so a re-drained identical
 /// corpus stamps an identical law.
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
@@ -766,7 +797,100 @@ pub(crate) struct WidthLawCalibration {
     /// slots and narrow the law. Lock poisoning is recovered, not
     /// propagated: each merge is an atomic append+truncate, so a panicked
     /// pack worker leaves the held data usable.
-    tops: Mutex<Vec<Vec<(f32, u32, i128)>>>,
+    tops: Mutex<Vec<Vec<(f32, u32, i128, f32)>>>,
+    /// `(query index, stable id, cell) -> fine-centroid rank` of that
+    /// candidate's fine cluster within THAT cell, recorded by
+    /// [`Self::observe_shard_views`] after each shard is packed (fine
+    /// clusters exist only post-pack). The cell is part of the key:
+    /// boundary replicas of one row live in several cells, and a rank
+    /// observed in one cell's fine geometry says nothing about another's —
+    /// the law walk looks up the SURVIVING copy's cell. Entries for
+    /// candidates later evicted from `tops` are harmless — the walk only
+    /// looks up ids that survived.
+    fine_ranks: Mutex<HashMap<(u32, i128, u32), u32>>,
+    /// Largest fine-cluster count observed across packed cells: the depth
+    /// law's search domain.
+    max_fine: AtomicU32,
+    /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
+    /// (e.g. planted test fixtures) measures no rerank law.
+    rerank: Option<RerankLawObservation>,
+}
+
+/// Streaming state for the rerank law: per query, the 1-bit-encoded query
+/// (same rotation + estimator as the scan's shortlist) and a histogram of
+/// pool-row estimates, from which each exact-top-k candidate's estimate
+/// rank — the survivor budget that keeps it — is read at [`finish`].
+///
+/// [`finish`]: WidthLawCalibration::finish
+struct RerankLawObservation {
+    quant: BitQuantizer,
+    /// Flat `n_queries x dim` rotated queries.
+    q_rot: Vec<f32>,
+    /// Per query `Σ q_rot[d]` — the estimator's per-query identity term.
+    q_total: Vec<f32>,
+    /// Per query `Σ |q_rot[d]|` — the estimate range for binning.
+    q_l1: Vec<f32>,
+    /// Per query: ascending cell ids of its `RERANK_LAW_POOL_CELLS`
+    /// grid-nearest cells.
+    pools: Vec<Vec<u32>>,
+    /// Per query estimate histogram (`RERANK_LAW_EST_BINS` bins,
+    /// bin 0 = best estimate). `u64` + saturating merges: a dense pool
+    /// on a large table must never wrap a bin and silently NARROW the
+    /// measured survivor budget.
+    hist: Mutex<Vec<Vec<u64>>>,
+}
+
+impl RerankLawObservation {
+    /// Histogram bin for `est` under this query's `[-l1, +l1]` range;
+    /// bin 0 holds the best (largest) estimates.
+    fn bin(&self, qi: usize, est: f32) -> usize {
+        let l1 = self.q_l1[qi];
+        if l1 <= 0.0 {
+            return RERANK_LAW_EST_BINS - 1;
+        }
+        let frac = ((l1 - est) / (2.0 * l1)).clamp(0.0, 1.0);
+        ((frac * RERANK_LAW_EST_BINS as f32) as usize).min(RERANK_LAW_EST_BINS - 1)
+    }
+}
+
+/// Both laws the drain calibration measures — cells for the width sweep,
+/// fine runs per probed cell for the depth floor. Same knots, same
+/// coverage target, same monotone flooring.
+pub(crate) struct CalibratedLaws {
+    pub(crate) width_for_k: [u32; WIDTH_LAW_KS.len()],
+    pub(crate) fine_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Global 1-bit-estimate survivor budget (rows) for 0.99 containment
+    /// of the exact top-k — the measured replacement for `k x rerank_mult`.
+    pub(crate) rerank_for_k: [u32; WIDTH_LAW_KS.len()],
+}
+
+/// Post-stamp guard shared by both stamp sites (drain max-merge and
+/// recalibration replace): a rerank point whose STAMPED width exceeds
+/// the calibration's distractor pool is cleared. The previous value was
+/// certified against a narrower geometry — its distractor counts stop
+/// at [`RERANK_LAW_POOL_CELLS`] cells — so carrying it into a wider law
+/// silently under-provisions the survivor budget; `0` falls back to the
+/// configured `rerank_mult`, which is the safe default for the width
+/// the pool never measured.
+pub(crate) fn clear_rerank_beyond_pool(
+    width_for_k: &[u32; WIDTH_LAW_KS.len()],
+    rerank_for_k: &mut [u32; WIDTH_LAW_KS.len()],
+) {
+    for (w, r) in width_for_k.iter().zip(rerank_for_k.iter_mut()) {
+        if *w as usize > RERANK_LAW_POOL_CELLS {
+            *r = 0;
+        }
+    }
+}
+
+/// Floor measured law points to be monotone in `k`, skipping unmeasured
+/// (`0`) points — shared by the width and fine-depth walks.
+fn floor_monotone(law: &mut [u32; WIDTH_LAW_KS.len()]) {
+    let mut floor = 0u32;
+    for w in law.iter_mut().filter(|w| **w > 0) {
+        *w = (*w).max(floor);
+        floor = *w;
+    }
 }
 
 impl WidthLawCalibration {
@@ -779,6 +903,9 @@ impl WidthLawCalibration {
             dequant_scratch: vec![0f32; dim],
             frozen: None,
             tops: Mutex::new(Vec::new()),
+            fine_ranks: Mutex::new(HashMap::new()),
+            max_fine: AtomicU32::new(0),
+            rerank: None,
         }
     }
 
@@ -795,12 +922,45 @@ impl WidthLawCalibration {
         }
     }
 
-    /// Freeze the sampled queries. Called once, after the last batch
-    /// spilled and before cell packing scores.
-    pub(crate) fn freeze(&mut self) {
+    /// Freeze the sampled queries and arm the rerank-law observation
+    /// (rotated queries, distractor pools from the grid, empty histograms).
+    /// Called once, after the last batch spilled and before cell packing
+    /// scores. The grid must be final by now — spills are already assigned
+    /// to its cells.
+    pub(crate) fn freeze(&mut self, grid: &ClusterCentroids, rot_seed: u64) {
         let queries = self.reservoir.sample().to_vec();
         let ids = self.slot_ids.clone();
-        *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); ids.len()];
+        let n_queries = ids.len();
+        *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); n_queries];
+        if n_queries > 0 && grid.n_cent > 0 {
+            let rotation = RandomRotation::new(self.dim, rot_seed);
+            let mut q_rot = vec![0f32; n_queries * self.dim];
+            let mut q_total = Vec::with_capacity(n_queries);
+            let mut q_l1 = Vec::with_capacity(n_queries);
+            let mut pools = Vec::with_capacity(n_queries);
+            for (qi, q) in queries.chunks_exact(self.dim).enumerate() {
+                let out = &mut q_rot[qi * self.dim..(qi + 1) * self.dim];
+                rotation.apply(q, out);
+                q_total.push(out.iter().sum());
+                q_l1.push(out.iter().map(|v| v.abs()).sum());
+                let mut pool: Vec<u32> = grid
+                    .rank_cells(self.metric, q)
+                    .into_iter()
+                    .take(RERANK_LAW_POOL_CELLS)
+                    .map(|(cell, _)| cell)
+                    .collect();
+                pool.sort_unstable();
+                pools.push(pool);
+            }
+            self.rerank = Some(RerankLawObservation {
+                quant: BitQuantizer::new(self.dim),
+                q_rot,
+                q_total,
+                q_l1,
+                pools,
+                hist: Mutex::new(vec![Vec::new(); n_queries]),
+            });
+        }
         self.frozen = Some(WidthLawQueries { queries, ids });
     }
 
@@ -817,52 +977,277 @@ impl WidthLawCalibration {
         if n_queries == 0 {
             return Ok(());
         }
-        let k_max = *WIDTH_LAW_KS.last().expect("law has k points");
-        let mut partial: Vec<Vec<(f32, u32, i128)>> = vec![Vec::new(); n_queries];
+        let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
+        let members = self.pool_members(cell);
+        let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
         let mut reader = spill.reader()?;
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
         while remaining > 0 {
             let chunk = reader.next_chunk(WIDTH_LAW_SCORE_CHUNK.min(remaining))?;
             remaining -= chunk.len();
-            for row in &chunk {
-                dequantize_row_into(&row.encoded, &mut scratch);
-                if self.metric == Metric::Cosine {
-                    // The rerank kernels divide by the stored row norm;
-                    // unit-normalizing the row lets the shared [`distance`]
-                    // kernel (which assumes unit inputs for cosine) score
-                    // with the same ranking. Query scaling is per-query
-                    // monotone and cannot reorder its candidates.
-                    normalize(&mut scratch);
-                }
-                for (qi, q) in frozen.queries.chunks_exact(self.dim).enumerate() {
-                    // Self-hit: a sampled query trivially covers itself.
-                    if row.stable_id == frozen.ids[qi] {
-                        continue;
-                    }
-                    partial[qi].push((distance(self.metric, q, &scratch), cell, row.stable_id));
-                }
-            }
-            // Bound the per-cell partials the same way the merge does.
-            for cand in &mut partial {
-                truncate_ascending(cand, k_max);
-            }
+            self.score_slice(
+                frozen,
+                cell,
+                &chunk,
+                &members,
+                &mut scratch,
+                &mut partial,
+                &mut hist_local,
+            );
         }
+        self.merge_partial(partial, hist_local);
+        Ok(())
+    }
+
+    /// [`Self::score_cell`] for already-materialized rows: the compaction
+    /// recalibration pass reads live rows back from stored superfiles
+    /// (no spill exists), then scores them through the same core.
+    pub(crate) fn score_rows(
+        &self,
+        cell: u32,
+        rows: &[MaterializedIvfRow],
+    ) -> Result<(), BuildError> {
+        let Some(frozen) = self.frozen.as_ref() else {
+            return Err(BuildError::Store(
+                "width-law score_rows before freeze".into(),
+            ));
+        };
+        let n_queries = frozen.ids.len();
+        if n_queries == 0 {
+            return Ok(());
+        }
+        let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
+        let members = self.pool_members(cell);
+        let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
+        let mut scratch = vec![0f32; self.dim];
+        for chunk in rows.chunks(WIDTH_LAW_SCORE_CHUNK) {
+            self.score_slice(
+                frozen,
+                cell,
+                chunk,
+                &members,
+                &mut scratch,
+                &mut partial,
+                &mut hist_local,
+            );
+        }
+        self.merge_partial(partial, hist_local);
+        Ok(())
+    }
+
+    /// One-lock merge of a cell's scored partials into the per-query
+    /// accumulators, plus its estimate-histogram deltas — the
+    /// correctness-bearing epilogue shared by [`Self::score_cell`] and
+    /// [`Self::score_rows`].
+    fn merge_partial(
+        &self,
+        partial: Vec<Vec<(f32, u32, i128, f32)>>,
+        hist_local: HashMap<usize, Vec<u64>>,
+    ) {
+        let k_max = WIDTH_LAW_MAX_K;
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
         for (qi, cand) in partial.into_iter().enumerate() {
             merge_candidates(&mut tops[qi], cand, k_max);
         }
-        Ok(())
+        drop(tops);
+        if let Some(rl) = self.rerank.as_ref()
+            && !hist_local.is_empty()
+        {
+            let mut hist = rl.hist.lock().unwrap_or_else(PoisonError::into_inner);
+            for (qi, delta) in hist_local {
+                let slot = &mut hist[qi];
+                if slot.is_empty() {
+                    *slot = delta;
+                } else {
+                    for (a, b) in slot.iter_mut().zip(delta) {
+                        *a = a.saturating_add(b);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queries whose rerank-law distractor pool contains `cell`.
+    fn pool_members(&self, cell: u32) -> Vec<usize> {
+        let Some(rl) = self.rerank.as_ref() else {
+            return Vec::new();
+        };
+        (0..rl.pools.len())
+            .filter(|&qi| rl.pools[qi].binary_search(&cell).is_ok())
+            .collect()
+    }
+
+    /// Shared scoring core: one chunk of rows against the frozen queries,
+    /// appended to `partial` and re-bounded to the merge's `k_max`. For
+    /// queries whose distractor pool contains `cell`, every row's 1-bit
+    /// estimate — the SAME `estimate_dot_rotated_with_total` the scan's
+    /// shortlist ranks by — is histogrammed into `hist_local`, and each
+    /// candidate carries its own estimate so [`Self::finish`] can read its
+    /// survivor rank; candidates outside the pool carry `NEG_INFINITY`
+    /// (unrankable — conservative).
+    fn score_slice(
+        &self,
+        frozen: &WidthLawQueries,
+        cell: u32,
+        rows: &[MaterializedIvfRow],
+        members: &[usize],
+        scratch: &mut [f32],
+        partial: &mut [Vec<(f32, u32, i128, f32)>],
+        hist_local: &mut HashMap<usize, Vec<u64>>,
+    ) {
+        let k_max = WIDTH_LAW_MAX_K;
+        let rl = self.rerank.as_ref();
+        let mut est_of = vec![f32::NEG_INFINITY; frozen.ids.len()];
+        for row in rows {
+            if let Some(rl) = rl
+                && row.rabitq_code.len() == rl.quant.code_bytes()
+            {
+                for &qi in members {
+                    // Self-hit: the sampled query's own row is not a
+                    // distractor. `finish` already excludes it from the
+                    // exact top-k (below), so counting it here would
+                    // inflate every measured rerank budget.
+                    if row.stable_id == frozen.ids[qi] {
+                        continue;
+                    }
+                    let q_rot = &rl.q_rot[qi * self.dim..(qi + 1) * self.dim];
+                    let est = rl.quant.estimate_dot_rotated_with_total(
+                        q_rot,
+                        &row.rabitq_code,
+                        rl.q_total[qi],
+                    );
+                    // A non-finite estimate (corrupt code, degenerate
+                    // quantizer) is not rank evidence: NaN casts to bin 0 —
+                    // the BEST bin — and would count as a top distractor in
+                    // every pooled query's histogram. Leave the candidate
+                    // unrankable (NEG_INFINITY), which the exact walk and
+                    // the dedup tie-break already treat conservatively.
+                    if est.is_finite() {
+                        est_of[qi] = est;
+                        let bins = hist_local
+                            .entry(qi)
+                            .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                        let bin = rl.bin(qi, est);
+                        bins[bin] = bins[bin].saturating_add(1);
+                    }
+                }
+            }
+            dequantize_row_into(&row.encoded, scratch);
+            if self.metric == Metric::Cosine {
+                // The rerank kernels divide by the stored row norm;
+                // unit-normalizing the row lets the shared [`distance`]
+                // kernel (which assumes unit inputs for cosine) score
+                // with the same ranking. Query scaling is per-query
+                // monotone and cannot reorder its candidates.
+                normalize(scratch);
+            }
+            for (qi, q) in frozen.queries.chunks_exact(self.dim).enumerate() {
+                // Self-hit: a sampled query trivially covers itself.
+                if row.stable_id == frozen.ids[qi] {
+                    continue;
+                }
+                partial[qi].push((
+                    distance(self.metric, q, scratch),
+                    cell,
+                    row.stable_id,
+                    est_of[qi],
+                ));
+            }
+            if rl.is_some() {
+                for &qi in members {
+                    est_of[qi] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        // Bound the per-cell partials the same way the merge does.
+        for cand in partial.iter_mut() {
+            truncate_ascending(cand, k_max);
+        }
+    }
+
+    /// Record each surviving candidate's fine-centroid rank within its
+    /// cell, from a freshly packed shard. Runs once per shard, after
+    /// [`Self::score_cell`] merged that shard's cells: fine clusters only
+    /// exist post-pack, so depth is observed here rather than at scoring.
+    /// Ranking mirrors query-time fine selection: raw fp32 centroid
+    /// distance, ascending, ties by lower cluster index.
+    pub(crate) fn observe_shard_views(&self, views: &[CellFineCalibrationView]) {
+        let Some(frozen) = self.frozen.as_ref() else {
+            return;
+        };
+        if frozen.ids.is_empty() {
+            return;
+        }
+        // Candidates per cell, gathered once — observation touches only
+        // rows that currently matter to some query's top-k.
+        let per_cell: HashMap<u32, Vec<(u32, i128)>> = {
+            let tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut map: HashMap<u32, Vec<(u32, i128)>> = HashMap::new();
+            for (qi, cands) in tops.iter().enumerate() {
+                for &(_, cell, id, _) in cands {
+                    map.entry(cell).or_default().push((qi as u32, id));
+                }
+            }
+            map
+        };
+        for view in views {
+            let Some(cell_id) = view.cell_id else {
+                continue;
+            };
+            let Some(cands) = per_cell.get(&cell_id) else {
+                continue;
+            };
+            if view.n_fine == 0 || view.dim != self.dim {
+                continue;
+            }
+            self.max_fine
+                .fetch_max(view.n_fine as u32, AtomicOrdering::Relaxed);
+            // Per-query fine ranking, computed once per query that has
+            // candidates in this cell.
+            let mut rank_cache: HashMap<u32, Vec<u32>> = HashMap::new();
+            let mut ranks = self
+                .fine_ranks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for &(qi, id) in cands {
+                let Some(&cluster) = view.cluster_of_stable.get(&id) else {
+                    continue;
+                };
+                let rank_of = rank_cache.entry(qi).or_insert_with(|| {
+                    let q = &frozen.queries[qi as usize * self.dim..(qi as usize + 1) * self.dim];
+                    // Full ranking (`k = n_fine`) through the shared
+                    // row-major centroid-scan owner — identical distance
+                    // and tie-break semantics to query-time fine selection.
+                    let ranked = nearest_k_centroids_bytes(
+                        self.metric,
+                        q,
+                        &view.fine_centroids_bytes,
+                        view.n_fine,
+                        view.dim,
+                        view.n_fine,
+                    );
+                    let mut rank_of = vec![0u32; view.n_fine];
+                    for (rank, (c, _)) in ranked.iter().enumerate() {
+                        rank_of[*c as usize] = rank as u32;
+                    }
+                    rank_of
+                });
+                if let Some(&r) = rank_of.get(cluster as usize) {
+                    ranks.insert((qi, id, cell_id), r);
+                }
+            }
+        }
     }
 
     /// Extract the width law: cells (in the grid's routing order) needed
-    /// for mean [`WIDTH_LAW_TARGET_COVERAGE`] coverage of the exact top-k
+    /// for mean [`LAW_STAGE_TARGET_COVERAGE`] coverage of the exact top-k
     /// at each [`WIDTH_LAW_KS`] point. Each point is measured over the
     /// queries whose candidate count reaches its `k` — one boundary-starved
     /// query excludes itself, not the whole sample. Points NO query can
     /// support stay `0` (uncalibrated). Measured points are floored to be
     /// monotone in `k`. `None` when nothing was sampled.
-    pub(crate) fn finish(self, grid: &ClusterCentroids) -> Option<[u32; WIDTH_LAW_KS.len()]> {
+    pub(crate) fn finish(self, grid: &ClusterCentroids) -> Option<CalibratedLaws> {
         let frozen = self.frozen?;
         let n_queries = frozen.ids.len();
         if n_queries == 0 || grid.n_cent == 0 {
@@ -879,6 +1264,43 @@ impl WidthLawCalibration {
         let mut law = [0u32; WIDTH_LAW_KS.len()];
         let mut coverage_sums: Vec<Vec<f64>> = vec![vec![0f64; n_cells]; WIDTH_LAW_KS.len()];
         let mut support = [0usize; WIDTH_LAW_KS.len()];
+        // Depth: same prefix-walk over fine-centroid ranks. A candidate
+        // whose rank was never observed counts as uncoverable (conservative
+        // — deepens the law rather than narrowing it).
+        let fine_ranks = self
+            .fine_ranks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let max_fine = self.max_fine.load(AtomicOrdering::Relaxed).max(1) as usize;
+        let mut fine_law = [0u32; WIDTH_LAW_KS.len()];
+        let mut fine_sums: Vec<Vec<f64>> = vec![vec![0f64; max_fine]; WIDTH_LAW_KS.len()];
+        // Rerank: per query, prefix sums of its estimate histogram give
+        // each candidate's distractor count (rows with a better-or-equal
+        // 1-bit estimate in its pool) — the survivor budget that keeps it.
+        let rerank_prefix: Option<Vec<Vec<u64>>> = self.rerank.as_ref().map(|rl| {
+            rl.hist
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|h| {
+                    let mut run = 0u64;
+                    h.iter()
+                        .map(|&c| {
+                            run = run.saturating_add(c);
+                            run
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+        let mut rerank_law = [0u32; WIDTH_LAW_KS.len()];
+        // Pooled candidate ranks per k point: mean coverage at budget N is
+        // #(query, candidate) pairs with rank <= N over (support x k), so
+        // the coverage crossing is EXACTLY the ceil(target x len)-th
+        // smallest pooled rank — the same mean-coverage semantic as the
+        // width and fine walks (a mean of per-query quantile budgets is
+        // NOT: easy queries would subsidize hard ones below target).
+        let mut rerank_ranks: [Vec<u64>; WIDTH_LAW_KS.len()] = Default::default();
         let mut rank_of_cell = vec![0u32; n_cells];
         for (qi, cand) in tops.iter().enumerate() {
             let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
@@ -902,7 +1324,7 @@ impl WidthLawCalibration {
                 // Per-rank counts of this query's top-k, then a prefix walk
                 // accumulates the mean coverage curve.
                 let mut per_rank = vec![0u32; n_cells];
-                for (_, cell, _) in &sorted[..k] {
+                for (_, cell, _, _) in &sorted[..k] {
                     // Candidate cell ids come from the same drain that built
                     // `grid` and split parents keep their slot when
                     // superseded, so an out-of-range id is unreachable today
@@ -917,15 +1339,69 @@ impl WidthLawCalibration {
                     covered += count;
                     coverage_sums[ki][rank] += f64::from(covered) / k as f64;
                 }
+                let mut per_fine_rank = vec![0u32; max_fine];
+                for (_, cell, id, _) in &sorted[..k] {
+                    // Look up the rank observed for the SURVIVING copy's
+                    // cell — a boundary replica's rank in another cell's
+                    // fine geometry would mis-measure the depth this
+                    // candidate actually needs at query time.
+                    if let Some(&r) = fine_ranks.get(&(qi as u32, *id, *cell)) {
+                        per_fine_rank[(r as usize).min(max_fine - 1)] += 1;
+                    }
+                }
+                if let (Some(rl), Some(prefix)) = (self.rerank.as_ref(), rerank_prefix.as_ref()) {
+                    // Pool every candidate's distractor count (rows with a
+                    // better-or-equal 1-bit estimate in the query's pool).
+                    // Unrankable candidates (outside the pool, or an empty
+                    // histogram) pool as MAX: they push the coverage
+                    // crossing up or leave the point unsupported —
+                    // conservative both ways.
+                    for (_, _, _, est) in &sorted[..k] {
+                        if est.is_finite() && !prefix[qi].is_empty() {
+                            rerank_ranks[ki].push(prefix[qi][rl.bin(qi, *est)]);
+                        } else {
+                            rerank_ranks[ki].push(u64::MAX);
+                        }
+                    }
+                }
+                let mut fine_covered = 0u32;
+                for (rank, count) in per_fine_rank.iter().enumerate() {
+                    fine_covered += count;
+                    fine_sums[ki][rank] += f64::from(fine_covered) / k as f64;
+                }
             }
         }
         for (ki, sums) in coverage_sums.iter().enumerate() {
             if support[ki] == 0 {
                 continue;
             }
-            let target = WIDTH_LAW_TARGET_COVERAGE * support[ki] as f64;
+            let target = LAW_STAGE_TARGET_COVERAGE * support[ki] as f64;
             if let Some(rank) = sums.iter().position(|&s| s >= target) {
                 law[ki] = (rank + 1) as u32;
+            }
+            let stage_target = LAW_STAGE_TARGET_COVERAGE * support[ki] as f64;
+            if let Some(rank) = fine_sums[ki].iter().position(|&s| s >= stage_target) {
+                fine_law[ki] = (rank + 1) as u32;
+            }
+        }
+        for (ki, &w) in law.iter().enumerate() {
+            // A k point is rerank-measurable only where the pool covered
+            // the measured width — beyond it the distractor counts are
+            // partial and the point stays uncalibrated.
+            let ranks = &mut rerank_ranks[ki];
+            if w == 0 || w as usize > RERANK_LAW_POOL_CELLS || ranks.is_empty() {
+                continue;
+            }
+            // Mean-coverage crossing at the stage target: the
+            // ceil(target x pooled)-th smallest pooled rank. MAX at the
+            // crossing means the evidence cannot certify the target —
+            // the point stays uncalibrated (constant fallback).
+            ranks.sort_unstable();
+            let needed = (LAW_STAGE_TARGET_COVERAGE * ranks.len() as f64).ceil() as usize;
+            if let Some(&crossing) = ranks.get(needed.saturating_sub(1).min(ranks.len() - 1))
+                && crossing != u64::MAX
+            {
+                rerank_law[ki] = crossing.min(u64::from(u32::MAX)) as u32;
             }
         }
         // Coverage need only grows with k, so each measured point is floored
@@ -933,12 +1409,14 @@ impl WidthLawCalibration {
         // must never let a larger k probe FEWER cells than a smaller one (a
         // recall inversion at query time). Unmeasured points (0) stay 0; the
         // interpolator skips them.
-        let mut floor = 0u32;
-        for w in law.iter_mut().filter(|w| **w > 0) {
-            *w = (*w).max(floor);
-            floor = *w;
-        }
-        (law.iter().any(|&w| w > 0)).then_some(law)
+        floor_monotone(&mut law);
+        floor_monotone(&mut fine_law);
+        floor_monotone(&mut rerank_law);
+        (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
+            width_for_k: law,
+            fine_for_k: fine_law,
+            rerank_for_k: rerank_law,
+        })
     }
 }
 
@@ -947,16 +1425,34 @@ impl WidthLawCalibration {
 /// one neighbor), then keep the ascending-best `cap`. The dedup must
 /// precede the truncate — replicated copies of near rows filling raw slots
 /// would evict distinct farther neighbors and stamp a narrower law than a
-/// real query experiences.
-fn merge_candidates(acc: &mut Vec<(f32, u32, i128)>, mut cand: Vec<(f32, u32, i128)>, cap: usize) {
+/// real query experiences. Equal-distance copies (the NORMAL case for a
+/// boundary replica — same vector, same exact distance) tie-break toward
+/// a rankable candidate: a copy scored outside the rerank pool carries
+/// `NEG_INFINITY` est, and keeping that one starves the rerank histogram
+/// of the row's rank, under-measuring the budget.
+fn merge_candidates(
+    acc: &mut Vec<(f32, u32, i128, f32)>,
+    mut cand: Vec<(f32, u32, i128, f32)>,
+    cap: usize,
+) {
     acc.append(&mut cand);
-    acc.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.total_cmp(&b.0)));
+    acc.sort_unstable_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then_with(|| a.0.total_cmp(&b.0))
+            .then_with(|| b.3.is_finite().cmp(&a.3.is_finite()))
+            // Total order: two equally-rankable equal-distance replicas
+            // tie-break on cell, or the kept copy would depend on merge
+            // order — and the fine-rank lookup is keyed by the SURVIVING
+            // copy's cell, so an arbitrary keep would make the stamped
+            // depth law nondeterministic across runs.
+            .then_with(|| a.1.cmp(&b.1))
+    });
     acc.dedup_by_key(|c| c.2);
     truncate_ascending(acc, cap);
 }
 
 /// Keep the ascending-best `cap` candidates in place.
-fn truncate_ascending(cand: &mut Vec<(f32, u32, i128)>, cap: usize) {
+fn truncate_ascending(cand: &mut Vec<(f32, u32, i128, f32)>, cap: usize) {
     if cand.len() > cap {
         cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         cand.truncate(cap);
@@ -985,6 +1481,11 @@ pub(crate) fn plan_sq8_split(
 /// `1..k` as fresh cells at the end of the grid. Returns the grown grid and the
 /// `k` sub-cell ids (index 0 == the reused `cell_id`; the rest are the new
 /// ids), aligned to `sub_centroids` (`k * dim` fp32).
+///
+/// Test-only since the batched split landed: production folds every split
+/// through [`insert_split_centroids_batch`], and this singleton remains as
+/// the reference implementation its equivalence test folds against.
+#[cfg(test)]
 pub(crate) fn insert_split_centroids(
     base: &ClusterCentroids,
     cell_id: u32,
@@ -1020,6 +1521,70 @@ pub(crate) fn insert_split_centroids(
     (updated, ids)
 }
 
+/// Fold every split of `splits` (`(parent_cell, sub_centroids, k)`, parent
+/// cells distinct) into ONE grown grid, in the given order. Equivalent to
+/// folding the singleton `insert_split_centroids` (now the test-only
+/// reference implementation) sequentially over `splits`, but with a single
+/// centroid-buffer allocation and one wire-invariant rebuild instead of one
+/// per split.
+///
+/// Child ids are positional ordinals minted off the end of the grid (the id
+/// IS the array index IS the reader routing key), so each split's appended
+/// ids start at `base.n_cent + Σ (k_j − 1)` over the splits before it —
+/// callers must fix the order BEFORE calling (the split pass uses ascending
+/// parent id) and must not compute ids per-split off the shared base.
+/// Returns the grown grid and, per split, its `k` child ids (index 0 == the
+/// reused parent id), aligned to that split's `sub_centroids` (`k * dim`
+/// fp32). New children carry count 0; the caller sets real counts on the
+/// GROWN grid via [`apply_cell_count_updates`] (out-of-range ids there are
+/// silently dropped, so count application must never precede this fold).
+pub(crate) fn insert_split_centroids_batch(
+    base: &ClusterCentroids,
+    splits: &[(u32, &[f32], usize)],
+) -> (ClusterCentroids, Vec<Vec<u32>>) {
+    debug_assert!(
+        {
+            let mut parents: Vec<u32> = splits.iter().map(|(p, _, _)| *p).collect();
+            parents.sort_unstable();
+            parents.windows(2).all(|w| w[0] != w[1])
+        },
+        "batch splits must target distinct parent cells"
+    );
+    let dim = base.dim as usize;
+    let old_n = base.n_cent as usize;
+    let appended: usize = splits.iter().map(|(_, _, k)| k - 1).sum();
+    let new_n = old_n + appended;
+
+    let mut fp32 = vec![0f32; new_n * dim];
+    for c in 0..old_n {
+        fp32[c * dim..(c + 1) * dim].copy_from_slice(base.centroid(c));
+    }
+    let mut ids_per_split = Vec::with_capacity(splits.len());
+    let mut next_id = old_n;
+    for &(cell_id, sub_centroids, k) in splits {
+        debug_assert_eq!(sub_centroids.len(), k * dim);
+        // Sub-cell 0 reuses the split cell's slot; 1..k append.
+        let p = cell_id as usize;
+        fp32[p * dim..(p + 1) * dim].copy_from_slice(&sub_centroids[..dim]);
+        let mut ids = vec![cell_id];
+        for j in 1..k {
+            fp32[next_id * dim..(next_id + 1) * dim]
+                .copy_from_slice(&sub_centroids[j * dim..(j + 1) * dim]);
+            ids.push(next_id as u32);
+            next_id += 1;
+        }
+        ids_per_split.push(ids);
+    }
+
+    // Counts must have one entry per cell (see the sibling comment in
+    // [`insert_split_centroids`]): a short counts vec silently passes
+    // in-memory but truncates the wire encoding.
+    let mut counts = base.counts.clone();
+    counts.resize(new_n, 0);
+    let updated = ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts);
+    (updated, ids_per_split)
+}
+
 /// Binary variant (`k = 2`): replace `cell_id`'s centroid and append one new
 /// sub-cell. Test-only wrapper preserving the single-new-id shape the unit
 /// tests use; the production split path calls [`insert_split_centroids`].
@@ -1037,7 +1602,18 @@ pub(crate) fn insert_split_centroid(
 mod tests {
     use std::sync::Arc;
 
+    use bytes::Bytes;
+
     use super::*;
+
+    /// Raw fp32-le centroid-region bytes for planted calibration views.
+    fn fp32_le_bytes(vals: &[f32]) -> Bytes {
+        Bytes::from(
+            vals.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+    }
 
     /// Boundary replicas must count as ONE neighbor in the width law:
     /// [`WidthLawCalibration::finish`] dedups candidates to the
@@ -1071,17 +1647,22 @@ mod tests {
         // (score, cell, stable id): id 1 replicated across cells 0 and 1;
         // ids 2..=8 fill the near cells; ids 9 and 10 sit in cell 3 and
         // only enter the top-10 once the replicas collapse to one slot.
-        let mut cands = vec![(0.01, 0, 1), (0.02, 1, 1), (0.03, 1, 1)];
-        cands.extend((2..=8).map(|id| (0.03 + id as f32 * 0.01, (id % 2) as u32, id as i128)));
-        cands.push((0.5, 3, 9));
-        cands.push((0.6, 3, 10));
+        let ninf = f32::NEG_INFINITY;
+        let mut cands = vec![(0.01, 0, 1, ninf), (0.02, 1, 1, ninf), (0.03, 1, 1, ninf)];
+        cands
+            .extend((2..=8).map(|id| (0.03 + id as f32 * 0.01, (id % 2) as u32, id as i128, ninf)));
+        cands.push((0.5, 3, 9, ninf));
+        cands.push((0.6, 3, 10, ninf));
         // Plant through the same merge the scorer uses — dedup happens
         // there, BEFORE the truncate, so replicas can never occupy slots.
         let mut acc = Vec::new();
-        merge_candidates(&mut acc, cands, *WIDTH_LAW_KS.last().expect("knots"));
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
-        let law = cal.finish(&grid).expect("law from planted candidates");
+        let law = cal
+            .finish(&grid)
+            .expect("law from planted candidates")
+            .width_for_k;
         // k=1: the best copy of id 1 sits in the top-ranked cell.
         assert_eq!(law[0], 1, "top-1 coverage is the nearest cell");
         // k=10: deduped top-10 = ids 1..=10, whose coverage needs the
@@ -1093,6 +1674,188 @@ mod tests {
         );
         // 10 deduped candidates cannot support the k=100/1000 points.
         assert_eq!(&law[2..], &[0, 0], "unsupported points stay uncalibrated");
+    }
+
+    /// The fine-depth law mirrors the width walk over fine-centroid
+    /// ranks: candidates observed via
+    /// [`WidthLawCalibration::observe_shard_views`] count at their fine
+    /// cluster's per-query rank and the coverage prefix walks to the same
+    /// 0.99 target. The fixture puts the top-1 in the rank-1 cluster and
+    /// the top-10 tail in the rank-2 cluster, so the two supported points
+    /// measure different depths.
+    #[test]
+    fn depth_law_walks_fine_ranks() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // Top-10 = ids 1..=10, all in cell 0, scores ascending by id.
+        let cands: Vec<(f32, u32, i128, f32)> = (1..=10)
+            .map(|id| (id as f32 * 0.01, 0u32, id as i128, f32::NEG_INFINITY))
+            .collect();
+        let mut acc = Vec::new();
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+
+        // Unit fine centroids ranked 0, 1, 2 against the e0 query.
+        let mut cluster_of_stable = HashMap::new();
+        cluster_of_stable.insert(1i128, 1u32);
+        for id in 2..=9i128 {
+            cluster_of_stable.insert(id, 0u32);
+        }
+        cluster_of_stable.insert(10i128, 2u32);
+        let view = CellFineCalibrationView {
+            cell_id: Some(0),
+            dim: DIM,
+            n_fine: 3,
+            fine_centroids_bytes: fp32_le_bytes(&[
+                1.0, 0.0, 0.0, 0.0, //
+                0.6, 0.8, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0,
+            ]),
+            cluster_of_stable,
+        };
+        cal.observe_shard_views(&[view]);
+
+        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        assert_eq!(laws.width_for_k[..2], [1, 1], "one cell holds everything");
+        assert_eq!(
+            laws.fine_for_k[0], 2,
+            "top-1 sits in the rank-1 fine cluster"
+        );
+        assert_eq!(
+            laws.fine_for_k[1], 3,
+            "top-10 coverage needs the rank-2 cluster"
+        );
+        assert_eq!(&laws.fine_for_k[2..], &[0, 0], "unsupported points stay 0");
+    }
+
+    /// A stamped width beyond the calibration pool clears the rerank
+    /// point (previous values were certified for narrower geometry and
+    /// under-provision the wider one); widths within the pool keep it.
+    #[test]
+    fn rerank_points_clear_when_stamped_width_outgrows_pool() {
+        let width = [
+            1,
+            RERANK_LAW_POOL_CELLS as u32,
+            (RERANK_LAW_POOL_CELLS + 1) as u32,
+            500,
+        ];
+        let mut rerank = [10, 20, 30, 40];
+        clear_rerank_beyond_pool(&width, &mut rerank);
+        assert_eq!(
+            rerank,
+            [10, 20, 0, 0],
+            "points at widths beyond the pool must fall back to the constant"
+        );
+    }
+
+    /// The rerank law reads each exact-top-k candidate's survivor budget
+    /// (distractor count) from the planted estimate histogram: the k=1
+    /// point takes the best candidate's rank, k=10 the worst's, and points
+    /// no query can support stay 0.
+    #[test]
+    fn rerank_law_reads_survivor_budget_from_histograms() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // Estimates: id 1 at 0.9 (3 pool rows at-or-better), ids 2..=10 at
+        // 0.5 (53 rows at-or-better). q_l1 = 1.0 makes bin() exact.
+        let rl = RerankLawObservation {
+            quant: BitQuantizer::new(DIM),
+            q_rot: vec![0.0; DIM],
+            q_total: vec![0.0],
+            q_l1: vec![1.0],
+            pools: vec![vec![0]],
+            hist: Mutex::new(vec![Vec::new()]),
+        };
+        let mut hist = vec![0u64; RERANK_LAW_EST_BINS];
+        hist[rl.bin(0, 0.9)] = 3;
+        hist[rl.bin(0, 0.5)] = 50;
+        *rl.hist.lock().unwrap_or_else(PoisonError::into_inner) = vec![hist];
+        cal.rerank = Some(rl);
+        let cands: Vec<(f32, u32, i128, f32)> = (1..=10)
+            .map(|id| {
+                let est = if id == 1 { 0.9 } else { 0.5 };
+                (id as f32 * 0.01, 0u32, id as i128, est)
+            })
+            .collect();
+        let mut acc = Vec::new();
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+
+        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        assert_eq!(
+            laws.rerank_for_k[0], 3,
+            "k=1 budget = the best candidate's distractor count"
+        );
+        assert_eq!(
+            laws.rerank_for_k[1], 53,
+            "k=10 budget = the worst top-10 candidate's distractor count"
+        );
+        assert_eq!(
+            &laws.rerank_for_k[2..],
+            &[0, 0],
+            "unsupported points stay uncalibrated"
+        );
+    }
+
+    /// A candidate whose fine rank was never observed stalls the coverage
+    /// walk below target: the point stays 0 (uncalibrated) instead of
+    /// stamping a floor shallower than the evidence supports. The stamp
+    /// sites treat a 0 point as "keep the previous value".
+    #[test]
+    fn depth_law_missing_rank_is_conservative() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        let cands: Vec<(f32, u32, i128, f32)> = (1..=10)
+            .map(|id| (id as f32 * 0.01, 0u32, id as i128, f32::NEG_INFINITY))
+            .collect();
+        let mut acc = Vec::new();
+        merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+
+        // id 10 is missing from the view: its rank is unobservable.
+        let mut cluster_of_stable = HashMap::new();
+        for id in 1..=9i128 {
+            cluster_of_stable.insert(id, 0u32);
+        }
+        let view = CellFineCalibrationView {
+            cell_id: Some(0),
+            dim: DIM,
+            n_fine: 2,
+            fine_centroids_bytes: fp32_le_bytes(&[
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0,
+            ]),
+            cluster_of_stable,
+        };
+        cal.observe_shard_views(&[view]);
+
+        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        assert_eq!(laws.fine_for_k[0], 1, "top-1 was observed at rank 0");
+        assert_eq!(
+            laws.fine_for_k[1], 0,
+            "k=10 misses id 10's rank: 9/10 < 0.99 coverage, point stays 0"
+        );
     }
 
     /// Per-query point support and the monotone floor. Query A (10
@@ -1124,10 +1887,10 @@ mod tests {
             queries,
             ids: vec![998, 999],
         });
-        let k_max = *WIDTH_LAW_KS.last().expect("knots");
+        let k_max = WIDTH_LAW_MAX_K;
         // A: distinct ids 1..=10 spread 2/2/3/3 over cells 0..=3, so its
         // 0.99 top-10 coverage needs the 4th-ranked cell.
-        let a: Vec<(f32, u32, i128)> = (1..=10)
+        let a: Vec<(f32, u32, i128, f32)> = (1..=10)
             .map(|id| {
                 let cell = match id {
                     1 | 2 => 0u32,
@@ -1135,19 +1898,22 @@ mod tests {
                     5..=7 => 2,
                     _ => 3,
                 };
-                (id as f32 * 0.01, cell, id as i128)
+                (id as f32 * 0.01, cell, id as i128, f32::NEG_INFINITY)
             })
             .collect();
         // B: distinct ids 100..=199, every one in the top-ranked cell.
-        let b: Vec<(f32, u32, i128)> = (100..200)
-            .map(|id| (id as f32 * 0.001, 0u32, id as i128))
+        let b: Vec<(f32, u32, i128, f32)> = (100..200)
+            .map(|id| (id as f32 * 0.001, 0u32, id as i128, f32::NEG_INFINITY))
             .collect();
         let (mut acc_a, mut acc_b) = (Vec::new(), Vec::new());
         merge_candidates(&mut acc_a, a, k_max);
         merge_candidates(&mut acc_b, b, k_max);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc_a, acc_b];
 
-        let law = cal.finish(&grid).expect("law from planted candidates");
+        let law = cal
+            .finish(&grid)
+            .expect("law from planted candidates")
+            .width_for_k;
         assert_eq!(law[0], 1, "top-1: both queries covered by the nearest cell");
         assert_eq!(
             law[1], 4,
@@ -1187,8 +1953,8 @@ mod tests {
         let mut acc = Vec::new();
         merge_candidates(
             &mut acc,
-            vec![(0.01, 7, 1)],
-            *WIDTH_LAW_KS.last().expect("knots"),
+            vec![(0.01, 7, 1, f32::NEG_INFINITY)],
+            WIDTH_LAW_MAX_K,
         );
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
         assert!(
@@ -1415,6 +2181,57 @@ mod tests {
             .expect("split grid must reopen from wire bytes");
         assert_eq!(decoded.n_cent, 5);
         assert_eq!(decoded.centroids.len(), 5 * base.dim as usize);
+    }
+
+    /// The batch fold must be indistinguishable from folding
+    /// [`insert_split_centroids`] sequentially in the same order — same
+    /// grown grid, same minted child ids. The batched split pass relies on
+    /// this equivalence: ids are positional ordinals, so any drift here
+    /// silently re-routes readers.
+    #[test]
+    fn insert_split_centroids_batch_matches_sequential_fold() {
+        let dim = 8usize;
+        let base = synth_centroids(6, dim as u32);
+        // Three splits with distinct k's; parents in ascending order (the
+        // executor's fixed fold order). Distinct value patterns per split so
+        // a misplaced copy shows up as a centroid mismatch, not a no-op.
+        let sub = |tag: f32, k: usize| -> Vec<f32> {
+            (0..k * dim).map(|i| tag + i as f32 * 0.01).collect()
+        };
+        let (s0, s2, s5) = (sub(1.0, 2), sub(2.0, 4), sub(3.0, 3));
+        let splits: Vec<(u32, &[f32], usize)> = vec![(0, &s0, 2), (2, &s2, 4), (5, &s5, 3)];
+
+        let (batched, batched_ids) = insert_split_centroids_batch(&base, &splits);
+
+        let mut folded = base.clone();
+        let mut folded_ids = Vec::new();
+        for &(cell, sub_centroids, k) in &splits {
+            let (next, ids) = insert_split_centroids(&folded, cell, sub_centroids, k);
+            folded = next;
+            folded_ids.push(ids);
+        }
+
+        assert_eq!(batched.n_cent, folded.n_cent);
+        assert_eq!(batched.dim, folded.dim);
+        assert_eq!(batched.centroids, folded.centroids);
+        assert_eq!(batched.counts, folded.counts);
+        assert_eq!(batched_ids, folded_ids);
+        // Prefix-sum id minting: appended ids are contiguous off the base
+        // grid's end, in fold order.
+        assert_eq!(batched_ids[0], vec![0, 6]);
+        assert_eq!(batched_ids[1], vec![2, 7, 8, 9]);
+        assert_eq!(batched_ids[2], vec![5, 10, 11]);
+        // Counts cover every cell (wire-encoding invariant) with new
+        // children zeroed until the caller applies real counts.
+        assert_eq!(batched.counts.len(), 12);
+        assert!(batched.counts[6..].iter().all(|&c| c == 0));
+
+        // Round-trips through the manifest wire format cleanly.
+        let bytes = crate::supertable::manifest::encoding::encode_cluster_centroids(&batched);
+        let decoded = crate::supertable::manifest::encoding::decode_cluster_centroids(&bytes)
+            .expect("batch-split grid must reopen from wire bytes");
+        assert_eq!(decoded.n_cent, 12);
+        assert_eq!(decoded.centroids.len(), 12 * dim);
     }
 
     #[test]

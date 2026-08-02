@@ -109,11 +109,18 @@ pub struct Instance {
 impl Default for Instance {
     fn default() -> Self {
         Self {
-            name: "c7gd.2xlarge".into(),
+            // Storage-optimized reference shape: the keep-warm tier of an
+            // object-storage-native service is provisioned for NVMe, so
+            // occupancy shares price against a storage-dense node. The
+            // previous default (c7gd.2xlarge, 237 GB NVMe) made cache
+            // occupancy look ~20x more expensive per GiB than the nodes a
+            // real deployment would buy. 8 vCPU / 64 GiB / 2x2500 GB NVMe,
+            // us-east-1 Linux on-demand (verified 2026-07-31).
+            name: "i3en.2xlarge".into(),
             vcpu: 8,
-            ram_gib: 16.0,
-            nvme_gb: 237.0,
-            usd_per_hour: 0.3629,
+            ram_gib: 64.0,
+            nvme_gb: 5000.0,
+            usd_per_hour: 0.904,
         }
     }
 }

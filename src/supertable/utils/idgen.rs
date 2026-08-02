@@ -195,6 +195,23 @@ impl fmt::Debug for IdGenerator {
 mod tests {
     use std::{collections::HashSet, thread::sleep, time};
 
+    /// The generator's identity surface: `Default` builds a working
+    /// generator, `worker_id()` reports the stamped 40-bit id, and
+    /// `Debug` prints it as fixed-width hex without leaking generator
+    /// internals.
+    #[test]
+    fn generator_identity_surface() {
+        let generator = IdGenerator::default();
+        let id = generator.next_id();
+        assert!(id > 0, "default generator mints time-ordered ids");
+        assert!(generator.worker_id() < (1 << 40), "worker id is 40-bit");
+        let debug = format!("{generator:?}");
+        assert!(
+            debug.contains("IdGenerator") && debug.contains("0x"),
+            "Debug is the hex identity form: {debug}"
+        );
+    }
+
     use super::*;
 
     /// Extract the `worker_id` field bits from a produced id.

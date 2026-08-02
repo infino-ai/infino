@@ -382,6 +382,14 @@ pub struct VectorSettings {
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
     pub drain_read_concurrency: ThreadCount,
+    /// CPU threads for maintenance-compaction compute (cell splits'
+    /// k-means, child builds, and the probe-law recalibration scan — the `optimize()` /
+    /// hidden-compaction path; nothing on the ingest commit path rides
+    /// this pool). `auto` (default) resolves to all hardware threads: an
+    /// explicit optimize owns the machine it runs on. Cap it when
+    /// optimize is scheduled CONCURRENTLY with latency-critical
+    /// foreground work and must not contend for CPU.
+    pub maintenance_threads: ThreadCount,
     /// Cell count for the **user** table's grid, trained at the first commit —
     /// controls user-superfile cell packing and pre-drain query routing.
     /// Stamped into the manifest at create; changing it later affects new
@@ -420,6 +428,7 @@ impl Default for VectorSettings {
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
             drain_consolidate: DrainConsolidate::Kmeans,
             drain_read_concurrency: ThreadCount::Auto,
+            maintenance_threads: ThreadCount::Auto,
             user_cell_count: DEFAULT_VECTOR_USER_CELL_COUNT,
             hidden_cell_count: DEFAULT_VECTOR_HIDDEN_CELL_COUNT,
             compaction_target_mb: DEFAULT_VECTOR_COMPACTION_TARGET_MB,

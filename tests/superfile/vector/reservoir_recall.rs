@@ -6,7 +6,7 @@
 //!
 //! Default reservoir size is `max(100K, min(500K, 64 × n_cent))`, so
 //! the normal-scale tests in `brute_force_oracle.rs` and
-//! `against_lance.rs` run with `n_docs ≤ sample_size` — the
+//! `recall_ceiling_debug.rs` run with `n_docs ≤ sample_size` — the
 //! reservoir holds the full corpus, and k-means training is
 //! exactly equivalent to the full-corpus training path. That's necessary for
 //! "no regression on small corpora" but doesn't probe the

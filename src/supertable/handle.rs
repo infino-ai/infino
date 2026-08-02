@@ -32,7 +32,10 @@ use tracing::{debug, warn};
 use super::{
     error::{BuildError, CommitError, OpenError},
     hidden_deleted::{self, HiddenDeletedError},
-    manifest::{ManifestSnapshot, list::CellRoutingParams},
+    manifest::{
+        ManifestSnapshot,
+        list::{CellRoutingParams, PartitionStrategy},
+    },
     options::SupertableOptions,
 };
 use crate::{
@@ -843,6 +846,99 @@ impl Supertable {
     /// pre-drain and post-drain search phases.
     fn drain_vectors_to_cells_sync(&self) -> Result<(), BuildError> {
         self.drain_hidden_vector_cells_sync()
+    }
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// Split the busiest populated hidden cell (modality trigger off, so any
+    /// cell with ≥ 2 live rows splits). Crash-test entry: the split fns are
+    /// `pub(in crate::supertable)` and the production trigger needs a cell
+    /// past the 500k `cell_split_doc_cap` — this reaches the batched split
+    /// commit from an integration test without that volume. Returns whether
+    /// a split committed.
+    fn split_busiest_hidden_cell_sync(&self) -> Result<bool, BuildError> {
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return Ok(false);
+        };
+        let manifest = hidden.inner.manifest.load_full();
+        if !matches!(
+            manifest.get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        ) {
+            return Ok(false);
+        }
+        // Physical postings, not grid counts: stamped counts can lag or
+        // fold in bootstrap-era routing, and a splittable cell needs real
+        // rows behind it.
+        let (scan_counts, _parents) = bridge_on_runtime(
+            super::writer::scan_cell_parents(&hidden.inner, &manifest, None),
+            &self.query_runtime(),
+        )?;
+        let busiest = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .max_by_key(|&(_, &n)| n)
+            .map(|(&cell, _)| cell);
+        let Some(cell) = busiest else {
+            return Ok(false);
+        };
+        let outcome = bridge_on_runtime(
+            super::writer::split_overflow_cell(Arc::clone(&hidden.inner), cell, 0.0),
+            &self.query_runtime(),
+        )?;
+        Ok(outcome.is_some())
+    }
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// Bulk-repack every populated hidden cell (modality trigger off, so
+    /// any cell with ≥ 2 live rows splits). Crash-test entry to the
+    /// write-once repack path ([`split_repack_bulk`] is
+    /// `pub(in crate::supertable)` and the production trigger needs most of
+    /// the grid split-eligible). Returns how many cells committed a split.
+    fn repack_all_hidden_cells_sync(&self) -> Result<usize, BuildError> {
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return Ok(0);
+        };
+        let manifest = hidden.inner.manifest.load_full();
+        if !matches!(
+            manifest.get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        ) {
+            return Ok(0);
+        }
+        // Candidates from the same physical scan that builds the parent
+        // index — grid counts can name cells with no live postings.
+        let (scan_counts, parents_by_cell) = bridge_on_runtime(
+            super::writer::scan_cell_parents(&hidden.inner, &manifest, None),
+            &self.query_runtime(),
+        )?;
+        let mut candidates: Vec<(u32, u64)> = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&cell, &n)| (cell, n))
+            .collect();
+        candidates.sort_unstable_by_key(|&(cell, _)| cell);
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let outcome = bridge_on_runtime(
+            super::writer::split_repack_bulk(
+                &hidden.inner,
+                &manifest,
+                candidates,
+                0.0,
+                &parents_by_cell,
+            ),
+            &self.query_runtime(),
+        )?;
+        Ok(outcome
+            .per_cell
+            .iter()
+            .filter(|(_, result)| result.is_some())
+            .count())
     }
     }
 
@@ -4287,6 +4383,870 @@ mod tests {
         );
     }
 
+    /// One BATCHED commit splits BOTH populated cells
+    /// (`split_overflow_cell_batch`): the hidden manifest advances exactly
+    /// one id (one OCC publish for the whole batch), the grid grows by every
+    /// split's appended children, each parent's split cell is superseded,
+    /// and per-cell doc counts are conserved into that split's children.
+    #[test]
+    fn split_overflow_cell_batch_commits_once_and_conserves_docs() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                writer::{scan_cell_parents, split_overflow_cell_batch},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // 8 rows at e_0 and 8 at e_1 → two distinct populated cells.
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let manifest_before = Arc::clone(hidden.reader().expect("reader").manifest());
+        let n_cent_before = match manifest_before.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent,
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+        let manifest_id_before = manifest_before.manifest_id;
+        let superfiles_before = manifest_before.superfiles.len();
+
+        let inner = hidden.inner().clone();
+        // Physical per-cell postings — the baseline the split pass selects
+        // and extracts from (the GRID's stamped counts also fold in the
+        // bootstrap commit's routing, so they can exceed the postings).
+        let (scan_counts, parents_by_cell) = hidden
+            .block_on_query(scan_cell_parents(&inner, &manifest_before, None))
+            .expect("cell index scan");
+        let mut populated: Vec<u32> = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&cell, _)| cell)
+            .collect();
+        populated.sort_unstable();
+        assert!(
+            populated.len() >= 2,
+            "two directions must drain into two cells, got {scan_counts:?}"
+        );
+        let outcome = hidden
+            .block_on_query(split_overflow_cell_batch(
+                &inner,
+                &manifest_before,
+                &populated,
+                0.0,
+                &parents_by_cell,
+            ))
+            .expect("batched split");
+
+        // Every batch cell split (no defensive no-ops on planted data), and
+        // each split's children conserve the parent's indexed doc count.
+        assert_eq!(outcome.per_cell.len(), populated.len());
+        let mut appended_total = 0u32;
+        for (cell, result) in &outcome.per_cell {
+            let children = result
+                .as_ref()
+                .unwrap_or_else(|| panic!("cell {cell} must split, not no-op"));
+            assert!(children.len() >= 2, "a split has at least two children");
+            assert_eq!(children[0].0, *cell, "child 0 reuses the parent id");
+            appended_total += children.len() as u32 - 1;
+            let child_sum: u64 = children.iter().map(|(_, n)| *n).sum();
+            assert_eq!(
+                child_sum,
+                scan_counts.get(cell).copied().unwrap_or(0),
+                "children of cell {cell} conserve its physical postings"
+            );
+        }
+
+        let reader = hidden.reader().expect("reader");
+        let manifest = reader.manifest();
+        // Membership publishes ONCE; the batch's upload pin is its own
+        // etag-CAS stamp, so the id advances by two.
+        assert_eq!(
+            manifest.manifest_id,
+            manifest_id_before + 2,
+            "one upload-pin stamp + ONE membership commit"
+        );
+        match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(
+                    clusters.n_cent,
+                    n_cent_before + appended_total,
+                    "grid grows by every split's appended children"
+                );
+                // The batch's count stamp landed AFTER the grid fold: every
+                // child id is in range and carries its routed count.
+                for (cell, result) in &outcome.per_cell {
+                    for (child, docs) in result.as_ref().expect("split") {
+                        assert!(*child < clusters.n_cent, "child id in folded grid");
+                        assert_eq!(
+                            u64::from(clusters.counts[*child as usize]),
+                            *docs,
+                            "cell {cell} child {child} count stamped"
+                        );
+                    }
+                }
+            }
+            other => panic!("still VectorCell, got {other:?}"),
+        }
+        let superseded = manifest
+            .get_superseded_cells()
+            .expect("persisted list carries a superseded map");
+        for cell in &populated {
+            let parent_superseded = manifest.superfiles.iter().any(|e| {
+                superseded
+                    .get(&e.superfile_id)
+                    .is_some_and(|cells| cells.contains(cell))
+            });
+            assert!(
+                parent_superseded,
+                "cell {cell}'s parent survives with the cell marked superseded"
+            );
+        }
+        assert!(
+            manifest.superfiles.len() > superfiles_before,
+            "child superfiles are appended, none removed"
+        );
+    }
+
+    /// The bulk repack (`split_repack_bulk`) splits BOTH populated cells and
+    /// lands every child in ONE packed shard superfile (1-thread writer pool
+    /// ⇒ shard_count 1): one commit, write-once output, docs conserved,
+    /// parents superseded, and the slow-CAS upload pin cleared by the
+    /// publish.
+    #[test]
+    fn split_repack_bulk_lands_children_in_packed_shards() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                slow_vector_state,
+                writer::{scan_cell_parents, split_repack_bulk},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let manifest_before = Arc::clone(hidden.reader().expect("reader").manifest());
+        let n_cent_before = match manifest_before.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent,
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+        let manifest_id_before = manifest_before.manifest_id;
+        let superfiles_before = manifest_before.superfiles.len();
+
+        let inner = hidden.inner().clone();
+        let (scan_counts, parents_by_cell) = hidden
+            .block_on_query(scan_cell_parents(&inner, &manifest_before, None))
+            .expect("cell index scan");
+        let mut candidates: Vec<(u32, u64)> = scan_counts
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&cell, &n)| (cell, n))
+            .collect();
+        candidates.sort_unstable();
+        assert!(
+            candidates.len() >= 2,
+            "two directions must drain into two cells, got {scan_counts:?}"
+        );
+
+        let outcome = hidden
+            .block_on_query(split_repack_bulk(
+                &inner,
+                &manifest_before,
+                candidates.clone(),
+                0.0,
+                &parents_by_cell,
+            ))
+            .expect("bulk repack");
+
+        let mut appended_total = 0u32;
+        for (cell, result) in &outcome.per_cell {
+            let children = result
+                .as_ref()
+                .unwrap_or_else(|| panic!("cell {cell} must split, not no-op"));
+            assert!(children.len() >= 2, "a split has at least two children");
+            assert_eq!(children[0].0, *cell, "child 0 reuses the parent id");
+            appended_total += children.len() as u32 - 1;
+            let child_sum: u64 = children.iter().map(|(_, n)| *n).sum();
+            let expected = candidates
+                .iter()
+                .find(|(c, _)| c == cell)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            assert_eq!(
+                child_sum, expected,
+                "children of cell {cell} conserve its physical postings"
+            );
+        }
+
+        let reader = hidden.reader().expect("reader");
+        let manifest = reader.manifest();
+        // Membership publishes ONCE; the single shard's slow-CAS upload pin
+        // is its own etag-CAS list+pointer stamp (the drain's per-shard
+        // checkpoint behavior), so the id advances by shards + 1.
+        assert_eq!(
+            manifest.manifest_id,
+            manifest_id_before + 2,
+            "one pin stamp (single shard) + ONE membership commit"
+        );
+        assert_eq!(
+            manifest.superfiles.len(),
+            superfiles_before + 1,
+            "every child lands in ONE packed shard superfile (shard_count 1) — write-once output"
+        );
+        match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(
+                    clusters.n_cent,
+                    n_cent_before + appended_total,
+                    "grid grows by every split's appended children"
+                );
+            }
+            other => panic!("still VectorCell, got {other:?}"),
+        }
+        let superseded = manifest
+            .get_superseded_cells()
+            .expect("persisted list carries a superseded map");
+        for (cell, _) in &candidates {
+            let parent_superseded = manifest.superfiles.iter().any(|e| {
+                superseded
+                    .get(&e.superfile_id)
+                    .is_some_and(|cells| cells.contains(cell))
+            });
+            assert!(
+                parent_superseded,
+                "cell {cell}'s parent survives with the cell marked superseded"
+            );
+        }
+        // The publish's own slow-state restamp carries no pending state:
+        // the upload pin is cleared atomically with the commit. The blob
+        // URI is relative to the HIDDEN table's prefixed provider, so load
+        // through it — not the user-root provider.
+        let (uri, hash) = manifest
+            .slow_vector_state_blob()
+            .expect("hidden manifest carries a slow-state ref");
+        let hidden_storage = inner
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let state = hidden
+            .block_on_query(slow_vector_state::load_full_state(
+                hidden_storage.as_ref(),
+                uri,
+                &hash,
+            ))
+            .expect("slow state loads");
+        assert!(
+            state.pending_drain.is_none(),
+            "the repack's upload pin is cleared by the publish"
+        );
+    }
+
+    /// Storage wrapper for split failure-path tests: delegates to LocalFS
+    /// but fails superfile-data PUTs once armed, so a split's upload phase
+    /// errors after its pin stamp has landed.
+    #[derive(Debug)]
+    struct FailingDataPutStorage {
+        inner: crate::storage::LocalFsStorageProvider,
+        fail_data_puts: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingDataPutStorage {
+        fn arm(&self) {
+            self.fail_data_puts
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for FailingDataPutStorage {
+        async fn head(
+            &self,
+            uri: &str,
+        ) -> Result<crate::storage::ObjectMeta, crate::storage::StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(
+            &self,
+            uri: &str,
+        ) -> Result<(bytes::Bytes, crate::storage::ObjectMeta), crate::storage::StorageError>
+        {
+            self.inner.get(uri).await
+        }
+        async fn get_range(
+            &self,
+            uri: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<bytes::Bytes, crate::storage::StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+        ) -> Result<Option<String>, crate::storage::StorageError> {
+            if self
+                .fail_data_puts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && uri.contains("data/")
+            {
+                return Err(crate::storage::StorageError::NotFound {
+                    uri: format!("injected data PUT failure: {uri}"),
+                });
+            }
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, crate::storage::StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(
+            &self,
+            uri: &str,
+        ) -> Result<Box<dyn object_store::MultipartUpload>, crate::storage::StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), crate::storage::StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
+    /// A publish that fails AFTER the pre-upload pin stamp must release the
+    /// pin on the way out — otherwise an idle table keeps the aborted
+    /// output in gc's live set forever.
+    #[test]
+    fn failed_split_publish_releases_upload_pin() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{slow_vector_state, writer::split_overflow_cell},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let failing = Arc::new(FailingDataPutStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            fail_data_puts: std::sync::atomic::AtomicBool::new(false),
+        });
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&failing) as Arc<dyn StorageProvider>;
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let superfiles_before = hidden.reader().expect("reader").manifest().superfiles.len();
+
+        // Child uploads fail from here on; the pin stamp and its unpin go
+        // to non-data prefixes and still succeed.
+        failing.arm();
+        let busiest = 0u32; // any populated cell works; 0 always exists
+        let result =
+            hidden.block_on_query(split_overflow_cell(hidden.inner().clone(), busiest, 0.0));
+        // Cell 0 may be unpopulated (defensive no-op) on some grids; make
+        // the test deterministic by trying every cell until one attempts a
+        // publish and fails.
+        let mut publish_failed = result.is_err();
+        if !publish_failed {
+            let n_cent = match hidden
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_partition_strategy()
+            {
+                crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                    clusters,
+                    ..
+                } => clusters.n_cent,
+                _ => 0,
+            };
+            for cell in 1..n_cent {
+                if hidden
+                    .block_on_query(split_overflow_cell(hidden.inner().clone(), cell, 0.0))
+                    .is_err()
+                {
+                    publish_failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(publish_failed, "injected data-PUT failure must surface");
+
+        let reader = hidden.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(
+            manifest.superfiles.len(),
+            superfiles_before,
+            "no membership published by the failed split"
+        );
+        // The pin was released on the failure path: pending state is clear.
+        let (uri, hash) = manifest
+            .slow_vector_state_blob()
+            .expect("hidden manifest carries a slow-state ref");
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let state = hidden
+            .block_on_query(slow_vector_state::load_full_state(
+                hidden_storage.as_ref(),
+                uri,
+                &hash,
+            ))
+            .expect("slow state loads");
+        assert!(
+            state.pending_drain.is_none(),
+            "the failed publish released its upload pin"
+        );
+    }
+
+    /// A stale repack upload pin in the slow-CAS pending state must not
+    /// brick the drain: the checkpoint loader recognizes the foreign schema
+    /// and ignores it (pre-fix this failed with a checkpoint decode error).
+    #[test]
+    fn drain_tolerates_foreign_repack_pin() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                slow_vector_state::PendingDrainState,
+                writer::{REPACK_CHECKPOINT_SCHEMA, stamp_slow_vector_state},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 4;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        // Plant a foreign (repack-schema) pin, as an aborted repack would
+        // leave behind.
+        let hidden = st.vector_index_table().expect("hidden index").clone();
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "schema": REPACK_CHECKPOINT_SCHEMA
+        }))
+        .expect("pin metadata");
+        hidden
+            .block_on_query(stamp_slow_vector_state(
+                hidden.inner(),
+                Some(PendingDrainState {
+                    metadata,
+                    entries: Vec::new(),
+                }),
+            ))
+            .expect("plant foreign pin");
+
+        // The drain must ignore the pin and proceed (its own checkpoint
+        // stamp then supersedes it, releasing any pinned orphans).
+        st.drain_vectors_to_cells_sync()
+            .expect("drain proceeds past a foreign repack pin");
+    }
+
+    /// The reverse direction of the pin/checkpoint coexistence: a split
+    /// whose pin stamp finds a stale DRAIN checkpoint in the pending slot
+    /// replaces it (with a warning) and proceeds — inside optimize the
+    /// drain phase precedes the split pass, so a surviving drain pin is
+    /// unconsumable by construction.
+    #[test]
+    fn split_pin_replaces_stale_drain_checkpoint() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                slow_vector_state::PendingDrainState,
+                writer::{DRAIN_CHECKPOINT_SCHEMA, split_overflow_cell, stamp_slow_vector_state},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Plant a stale DRAIN-schema checkpoint, as a crashed drain would
+        // leave behind if the next drain had nothing to resume.
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "schema": DRAIN_CHECKPOINT_SCHEMA
+        }))
+        .expect("pin metadata");
+        hidden
+            .block_on_query(stamp_slow_vector_state(
+                hidden.inner(),
+                Some(PendingDrainState {
+                    metadata,
+                    entries: Vec::new(),
+                }),
+            ))
+            .expect("plant stale drain checkpoint");
+
+        let split_cell = match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                .expect("cell"),
+            other => panic!("not VectorCell: {other:?}"),
+        };
+        let outcome = hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
+            .expect("split proceeds over the stale drain checkpoint");
+        assert!(outcome.is_some(), "split must commit");
+    }
+
     /// Directly exercises the over-cap cell split (`split_overflow_cell`). The
     /// normal `optimize` path only reaches it once a cell passes the 500k
     /// `cell_split_doc_cap`; calling the inner routine on a drained cell covers
@@ -4613,6 +5573,475 @@ mod tests {
                 "all docs resolve after reopen from post-split state (direction {direction})"
             );
         }
+    }
+
+    /// Regression for the stale-probe-law path: (1) a clean drain stamps
+    /// BOTH laws — probe width and fine depth — into the manifest routing
+    /// (fine depth is what a flat `fine_nprobe_floor` regressed at 10M:
+    /// post-drain 0.982 at floor 4 vs 0.996 at 8); (2) after a geometry
+    /// change (cell split), `recalibrate_probe_laws` re-measures from
+    /// stored bytes and restamps: width REPLACEs (fresh full-table
+    /// measurement is authoritative, must be able to narrow), fine depth
+    /// and rerank MAX-MERGE (never shallowed below a certified stamp),
+    /// and a point the fresh sample cannot support keeps its previous
+    /// value under both rules.
+    #[test]
+    fn drain_stamps_both_laws_and_recalibration_restamps_after_split() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                writer::{
+                    CommitListMetadata, persist_commit_async, recalibrate_probe_laws,
+                    split_overflow_cell,
+                },
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Identical embeddings route every doc into one global cell, so the
+        // drain calibrates over one populated cell and the later split has a
+        // cell to cut.
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // (1) The clean drain stamped both laws. Six identical rows support
+        // the k=1 and k=10 points (5 non-self candidates each), so both laws
+        // must be nonzero there; the fine depth comes from the post-pack
+        // shard observation.
+        let read_strategy = |hidden: &Supertable| match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell {
+                clusters,
+                column,
+                routing,
+            } => (clusters, column, routing),
+            other => panic!("hidden index must be VectorCell, got {other:?}"),
+        };
+        let (_, _, routing) = read_strategy(&hidden);
+        assert!(
+            routing.width_for_k[0] > 0,
+            "drain must stamp the width law, got {:?}",
+            routing.width_for_k
+        );
+        assert!(
+            routing.fine_for_k[0] > 0,
+            "drain must stamp the fine-depth law, got {:?}",
+            routing.fine_for_k
+        );
+        assert!(
+            routing.rerank_for_k[0] > 0,
+            "drain must stamp the rerank law, got {:?}",
+            routing.rerank_for_k
+        );
+
+        // Split the populated cell: the stamped law now describes a grid
+        // that no longer exists (the split swap ports routing verbatim).
+        let (clusters, _, _) = read_strategy(&hidden);
+        let split_cell = (0..clusters.n_cent)
+            .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+            .expect("at least one cell");
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
+            .expect("split")
+            .expect("live rows present, split must commit");
+
+        // Plant a stale law as an old-geometry stamp would carry: an
+        // over-wide width, a deeper-than-measurable fine point at k=1, and
+        // no rerank. Six rows cannot support k=100/1000, so the fresh
+        // measurement is 0 there and those planted points must survive the
+        // restamp; the deep fine point must survive too (fine max-merges —
+        // a fresh sample must never shallow a certified depth), while the
+        // over-wide width must be REPLACED by the fresh measurement.
+        const STALE_WIDTH: u32 = 33;
+        const STALE_FINE: u32 = 9;
+        let (clusters, column, mut planted) = read_strategy(&hidden);
+        planted.width_for_k = [STALE_WIDTH; 4];
+        planted.fine_for_k = [STALE_FINE, 0, 0, 0];
+        planted.rerank_for_k = [0; 4];
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: planted,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let no_removals = Vec::new();
+        // The hidden table's own scoped provider — its pointer file, not the
+        // user table's, is the CAS target.
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let planted_manifest = hidden
+            .block_on_query(persist_commit_async(
+                hidden.inner(),
+                hidden_storage,
+                Vec::new(),
+                &no_removals,
+                Vec::new(),
+                Vec::new(),
+                list_metadata,
+            ))
+            .expect("plant stale law");
+        hidden.inner().manifest.store(Arc::new(planted_manifest));
+
+        // (2) Recalibration re-measures both laws over the post-split grid
+        // from stored bytes and stamps the difference.
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate");
+        assert!(stamped, "a stale law over a changed grid must restamp");
+        let (clusters, _, routing) = read_strategy(&hidden);
+        assert!(
+            routing.width_for_k[0] >= 1 && routing.width_for_k[0] <= clusters.n_cent,
+            "k=1 width re-measured within the live grid, got {:?}",
+            routing.width_for_k
+        );
+        assert!(
+            routing.width_for_k[0] < STALE_WIDTH,
+            "measured points replace the stale value, got {:?}",
+            routing.width_for_k
+        );
+        // The distinguishing max-merge check: the fresh sample DOES measure
+        // fine depth at k=1 (a 1-2 on this tiny grid), so a REPLACE rule
+        // would stamp that shallow value — only max-merge keeps the deeper
+        // certified 9. (Fresh stamping from zero is evidenced by the rerank
+        // law below; end-to-end fine restamping by the recall-guard test in
+        // `query::vector::tests`.)
+        assert_eq!(
+            routing.fine_for_k[0], STALE_FINE,
+            "fine depth max-merges: recalibration must never shallow a \
+             stamp a previous measurement certified, got {:?}",
+            routing.fine_for_k
+        );
+        assert!(
+            routing.rerank_for_k[0] > 0,
+            "recalibration must stamp the rerank law, got {:?}",
+            routing.rerank_for_k
+        );
+        assert_eq!(
+            routing.width_for_k[3], STALE_WIDTH,
+            "a point the sample cannot support keeps its previous value"
+        );
+    }
+
+    /// Recalibration over a heavily tombstoned table, twice. (1) The query
+    /// sampler lays its strides over PHYSICAL (tombstone-inclusive) counts
+    /// but loads live-only rows — regression for the biased-sample review
+    /// finding: the old clamp collapsed every tail pick onto the last live
+    /// row, so a 10-live-of-50 cell filled the sample with one
+    /// neighborhood. With most rows deleted the pass must still measure
+    /// and stamp usable laws from the spread live sample. (2) Immediately
+    /// recalibrating again re-measures identical laws against an unchanged
+    /// grid and must return `false` — no empty stamp commit.
+    #[test]
+    fn recalibration_samples_live_rows_and_is_idempotent() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                writer::{CommitListMetadata, persist_commit_async, recalibrate_probe_laws},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // 48 identical embeddings (one populated cell); most rows carry the
+        // doomed title so the delete leaves the cell heavily tombstoned:
+        // 8 live of 48 physical.
+        const N: usize = 48;
+        const N_LIVE: usize = 8;
+        let titles = LargeStringArray::from(
+            (0..N)
+                .map(|i| {
+                    if i < N_LIVE {
+                        format!("keep-{i}")
+                    } else {
+                        "dropme".to_string()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let stats = st.delete(col("title").eq(lit("dropme"))).expect("delete");
+        assert_eq!(
+            stats.n_tombstoned() as usize,
+            N - N_LIVE,
+            "delete must tombstone the doomed rows"
+        );
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Plant an over-wide stale width so the first pass has a measurable
+        // change to stamp regardless of what the drain calibrated.
+        const STALE_WIDTH: u32 = 33;
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing: mut planted,
+        } = strategy
+        else {
+            panic!("hidden index must be VectorCell");
+        };
+        planted.width_for_k = [STALE_WIDTH; 4];
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: planted,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let no_removals = Vec::new();
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let planted_manifest = hidden
+            .block_on_query(persist_commit_async(
+                hidden.inner(),
+                hidden_storage,
+                Vec::new(),
+                &no_removals,
+                Vec::new(),
+                Vec::new(),
+                list_metadata,
+            ))
+            .expect("plant stale law");
+        hidden.inner().manifest.store(Arc::new(planted_manifest));
+
+        // (1) Heavily tombstoned recalibration measures from the live rows.
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate over tombstones");
+        assert!(stamped, "the planted stale width must restamp");
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell { routing, .. } = strategy else {
+            panic!("hidden index must stay VectorCell");
+        };
+        assert!(
+            routing.width_for_k[0] >= 1 && routing.width_for_k[0] < STALE_WIDTH,
+            "live-sample measurement replaces the stale width, got {:?}",
+            routing.width_for_k
+        );
+
+        // (2) Nothing changed since — the repeat pass must decline to stamp.
+        let restamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("repeat recalibrate");
+        assert!(
+            !restamped,
+            "an unchanged grid re-measures identical laws — no empty stamp commit"
+        );
+
+        // (3) A never-calibrated grid is left alone: zero the width law and
+        // recalibration must decline — the drain gate is the calibration
+        // entry point; this pass only refreshes an existing law.
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing: mut zeroed,
+        } = strategy
+        else {
+            panic!("hidden index must stay VectorCell");
+        };
+        zeroed.width_for_k = [0; 4];
+        let zero_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: zeroed,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+        };
+        let zero_manifest = hidden
+            .block_on_query(persist_commit_async(
+                hidden.inner(),
+                hidden
+                    .inner()
+                    .options
+                    .storage
+                    .clone()
+                    .expect("hidden table has storage"),
+                Vec::new(),
+                &no_removals,
+                Vec::new(),
+                Vec::new(),
+                zero_metadata,
+            ))
+            .expect("plant zero law");
+        hidden.inner().manifest.store(Arc::new(zero_manifest));
+        let stamped = hidden
+            .block_on_query(recalibrate_probe_laws(hidden.inner()))
+            .expect("recalibrate on an uncalibrated grid is a clean no-op");
+        assert!(
+            !stamped,
+            "an all-zero width law must not trigger calibration"
+        );
     }
 
     /// End-to-end reclaim loop: a cell split appends its children and marks the

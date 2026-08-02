@@ -771,6 +771,73 @@ mod tests {
         assert_spans_partition(err, "out of range");
     }
 
+    /// `decode_partition_key` is the exact inverse of
+    /// `encode_partition_key` for every strategy — including the
+    /// deliberate aliasing where an IngestionTime key decodes as
+    /// `TimeRange` (both are 8-byte LE milliseconds) — and rejects a
+    /// wrong-width key with a parse error naming the expected width.
+    #[test]
+    fn partition_key_decode_inverts_encode_and_rejects_bad_widths() {
+        use crate::supertable::manifest::ClusterCentroids;
+
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let cases: Vec<(PartitionStrategy, PartitionKey, usize)> = vec![
+            (
+                PartitionStrategy::TimeRange {
+                    column: "ts".into(),
+                    granularity_secs: 60,
+                },
+                PartitionKey::TimeRange(1_722_500_000_000),
+                8,
+            ),
+            (
+                PartitionStrategy::Hash {
+                    column: "_id".into(),
+                    n_buckets: 16,
+                },
+                PartitionKey::Hash(7),
+                4,
+            ),
+            (
+                PartitionStrategy::ColumnRange {
+                    column: "_id".into(),
+                    boundaries: vec![vec![]],
+                },
+                PartitionKey::ColumnRange(3),
+                2,
+            ),
+            (
+                PartitionStrategy::VectorCell {
+                    column: "emb".into(),
+                    clusters,
+                    routing: Default::default(),
+                },
+                PartitionKey::VectorCell(9),
+                4,
+            ),
+            (
+                PartitionStrategy::IngestionTime {
+                    granularity_secs: 60,
+                },
+                // Deliberate aliasing: same 8-byte LE ms shape.
+                PartitionKey::TimeRange(1_722_500_000_000),
+                8,
+            ),
+        ];
+        for (strategy, key, width) in cases {
+            let bytes = encode_partition_key(&key);
+            assert_eq!(bytes.len(), width, "{strategy:?} key width");
+            let decoded = decode_partition_key(&bytes, &strategy).expect("round trip");
+            assert_eq!(decoded, key);
+            let err =
+                decode_partition_key(&[0u8; 3], &strategy).expect_err("3 bytes fits no strategy");
+            assert!(
+                err.to_string().contains("partition_key must be"),
+                "error names the width contract: {err}"
+            );
+        }
+    }
+
     // ---- assign_partition: ColumnRange (currently unimplemented) -------
 
     #[test]
