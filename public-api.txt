@@ -69,6 +69,28 @@ impl core::marker::Unpin for infino::ColdFetchMode
 impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
+pub enum infino::Consistency
+pub infino::Consistency::BoundedStaleness(core::time::Duration)
+pub infino::Consistency::Snapshot
+pub infino::Consistency::Strong
+impl core::clone::Clone for infino::Consistency
+pub fn infino::Consistency::clone(&self) -> infino::Consistency
+impl core::cmp::Eq for infino::Consistency
+impl core::cmp::PartialEq for infino::Consistency
+pub fn infino::Consistency::eq(&self, &infino::Consistency) -> bool
+impl core::default::Default for infino::Consistency
+pub fn infino::Consistency::default() -> Self
+impl core::fmt::Debug for infino::Consistency
+pub fn infino::Consistency::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Consistency
+impl core::marker::StructuralPartialEq for infino::Consistency
+impl core::marker::Freeze for infino::Consistency
+impl core::marker::Send for infino::Consistency
+impl core::marker::Sync for infino::Consistency
+impl core::marker::Unpin for infino::Consistency
+impl core::marker::UnsafeUnpin for infino::Consistency
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Consistency
+impl core::panic::unwind_safe::UnwindSafe for infino::Consistency
 pub enum infino::GcError
 pub infino::GcError::NoStorage
 pub infino::GcError::Storage(infino::storage::StorageError)
@@ -217,6 +239,7 @@ pub fn infino::ConnectOptions::with_cache_budget_bytes(self, u64) -> Self
 pub fn infino::ConnectOptions::with_cache_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn infino::ConnectOptions::with_cold_fetch_mode(self, infino::ColdFetchMode) -> Self
 pub fn infino::ConnectOptions::with_connection_memory_budget_bytes(self, u64) -> Self
+pub fn infino::ConnectOptions::with_read_consistency(self, infino::Consistency) -> Self
 pub fn infino::ConnectOptions::with_storage_option(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::ConnectOptions::with_validate(self, bool) -> Self
 impl core::clone::Clone for infino::ConnectOptions
