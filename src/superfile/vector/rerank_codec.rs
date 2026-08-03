@@ -142,6 +142,10 @@ pub enum RerankCodec {
     /// scale/offset arrays; its only `codec_meta` is the per-doc
     /// dequantized-norm table (`n_docs × 4` for cosine/L2Sq), matching
     /// the Sq8 family so the cosine kernel divides by `‖d̂‖`.
+    ///
+    /// Cosine-only: the fixed `[-1, 1]` grid assumes unit-normalized input and
+    /// clamps any out-of-range component, so callers must normalize (the engine
+    /// and bindings do not normalize on your behalf).
     Sq16,
     /// No rerank column at all. The 1-bit RaBitQ shortlist is
     /// the final ranking. Opt-in — recall drops 0.05–0.15 on
@@ -158,8 +162,11 @@ pub enum RerankCodec {
 impl Default for RerankCodec {
     /// `Sq16` is the cosine default — a single 16-bit plane on the fixed
     /// `[-1, 1]` grid: finer per-component precision than `Sq8FixedResidual`
-    /// at the same 2 bytes/dim, faster rerank, and recall provably ≥. Metric-
-    /// aware constructors retain local residual encoding (`Sq8Residual`) for
+    /// at the same 2 bytes/dim and faster rerank. The strictly finer grid gives
+    /// a provably ≤ per-component quantization error, so recall is ≥ in
+    /// expectation (and ≥ in the codec-isolated measurements) — not a strict
+    /// per-query guarantee, since ranking can flip on a near-tie. Metric-aware
+    /// constructors retain local residual encoding (`Sq8Residual`) for
     /// non-cosine metrics, whose values are not bounded to `[-1, 1]`.
     fn default() -> Self {
         Self::Sq16

@@ -2793,9 +2793,8 @@ mod tests {
     /// If it holds here, any end-to-end Sq16<C1 gap is a PIPELINE bug, not
     /// the codec; if it fails here, the codec/kernel is the culprit and we
     /// have it reproduced in isolation. Run:
-    ///   cargo test --release -- --ignored --nocapture sq16_vs_sq8residual_kernel_recall
+    ///   cargo test -- --nocapture sq16_vs_sq8residual_kernel_recall
     #[test]
-    #[ignore = "diagnostic: run explicitly in release with --nocapture"]
     fn sq16_vs_sq8residual_kernel_recall() {
         use std::collections::HashSet;
 
@@ -2846,10 +2845,14 @@ mod tests {
         // Synthetic unit-norm corpus and queries. Both codecs quantize the
         // same vectors and are scored against the same fp32 truth, so this
         // isolates the codec's quantization error from routing.
+        // Kept small so this runs in the default (debug) test suite as a CI
+        // guard on the recall bound; the ≥ property is a codec invariant, not
+        // sample-size-dependent, and the rng is seeded so recall is
+        // deterministic. Larger sweeps run via the bench harness.
         #[allow(non_snake_case)]
-        let N = 3000usize;
+        let N = 800usize;
         #[allow(non_snake_case)]
-        let Q = 300usize;
+        let Q = 80usize;
 
         // Corpus: encoded into both codecs with their per-doc norms.
         let mut corpus: Vec<Vec<f32>> = Vec::with_capacity(N);

@@ -459,6 +459,13 @@ pub(crate) fn splice_fragments_into_cell(
         }
     }
 
+    // The residual family carries a per-cluster quantizer (`[scale|offset]`
+    // codec_meta blocks); the single-plane fixed-grid `Sq16` carries only the
+    // per-doc norm table. Splice supports both: the rerank bytes are copied
+    // verbatim regardless of codec, and the codec_meta write below branches on
+    // this to lay out either `[scale|offset|norms]` or norms-only.
+    let has_cluster_quant = codec.is_sq8_residual_family();
+
     let out_n_cent = fragments.len();
     let counts: Vec<u32> = fragments
         .iter()
@@ -486,8 +493,13 @@ pub(crate) fn splice_fragments_into_cell(
             &inp.sub[co..co + dim * 4],
             &mut out_centroids[k * dim..(k + 1) * dim],
         );
-        dst_scale[k * dim..(k + 1) * dim].copy_from_slice(&inp.scale[c * dim..c * dim + dim]);
-        dst_offset[k * dim..(k + 1) * dim].copy_from_slice(&inp.offset[c * dim..c * dim + dim]);
+        // Sq16 carries no per-cluster quantizer (empty scale/offset); its
+        // rerank bytes decode off the fixed grid. Only the residual family has
+        // per-cluster scale/offset to carry through.
+        if has_cluster_quant {
+            dst_scale[k * dim..(k + 1) * dim].copy_from_slice(&inp.scale[c * dim..c * dim + dim]);
+            dst_offset[k * dim..(k + 1) * dim].copy_from_slice(&inp.offset[c * dim..c * dim + dim]);
+        }
     }
 
     // Summary centroid = mean of fragment centroids.
@@ -512,14 +524,19 @@ pub(crate) fn splice_fragments_into_cell(
         &out_centroids,
     );
 
-    // Sq8 scale/offset blocks: one (dim) slot per output cluster.
-    let sq8_scale_block_off = layout.codec_meta_off;
-    let sq8_offset_block_off = sq8_scale_block_off + out_n_cent * dim * 4;
-    let sq8_norms_block_off = store_norm.then_some(sq8_offset_block_off + out_n_cent * dim * 4);
-    bytes[sq8_scale_block_off..sq8_scale_block_off + out_n_cent * dim * 4]
-        .copy_from_slice(cast_slice(&dst_scale));
-    bytes[sq8_offset_block_off..sq8_offset_block_off + out_n_cent * dim * 4]
-        .copy_from_slice(cast_slice(&dst_offset));
+    // codec_meta layout: the residual family writes per-cluster [scale|offset]
+    // blocks (one dim-slot per output cluster) then the per-doc norm table;
+    // single-plane Sq16 writes only the norm table at the codec_meta head.
+    let sq8_norms_block_off = if has_cluster_quant {
+        let scale_off = layout.codec_meta_off;
+        let offset_off = scale_off + out_n_cent * dim * 4;
+        bytes[scale_off..scale_off + out_n_cent * dim * 4].copy_from_slice(cast_slice(&dst_scale));
+        bytes[offset_off..offset_off + out_n_cent * dim * 4]
+            .copy_from_slice(cast_slice(&dst_offset));
+        store_norm.then_some(offset_off + out_n_cent * dim * 4)
+    } else {
+        store_norm.then_some(layout.codec_meta_off)
+    };
 
     let stable_ids_region_off = layout.stable_ids_off;
     let mut out_stable_ids = vec![0i128; n_docs as usize];
