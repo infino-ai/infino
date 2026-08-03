@@ -7,7 +7,9 @@
 //! already uses:
 //!
 //! 1. `update()` / `delete()` resolve the predicate against the
-//!    current manifest snapshot, capture the matching `_id` set,
+//!    latest committed manifest — refreshed regardless of the
+//!    connection's read consistency, so the target set agrees with
+//!    the manifest the commit lands on — capture the matching `_id` set,
 //!    pre-reserve any resources the WAL will need (an `_id`
 //!    range + a fresh superfile UUID for updates), and stash a
 //!    pending entry on the writer.
@@ -44,6 +46,7 @@ use crate::{
     supertable::{
         QueryError,
         error::BuildError,
+        manifest::ManifestLoadError,
         wal::{
             persistence::WalStoreError,
             pipeline::{AppendPhaseError, TombstonePhaseError},
@@ -183,6 +186,14 @@ pub enum MutationError {
     /// per-target bits in the sidecars.
     #[error("tombstone phase failed: {0}")]
     TombstonePhase(#[from] TombstonePhaseError),
+
+    /// Refreshing to the latest committed manifest failed while resolving the
+    /// mutation's target set. The target set must agree with the manifest the
+    /// commit lands on, so a failed refresh is surfaced rather than resolving
+    /// against a stale snapshot (which would drop a tombstone for a row
+    /// committed after that snapshot).
+    #[error("failed to refresh to the latest manifest for target resolution: {0}")]
+    TargetResolve(#[source] ManifestLoadError),
 }
 
 impl MutationError {

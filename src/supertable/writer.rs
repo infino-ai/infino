@@ -701,6 +701,20 @@ fn single_outcome(res: CommitResult) -> Result<MutationStats, InfinoError> {
         .ok_or_else(|| InfinoError::Backend("commit produced no mutation outcome".to_string()))
 }
 
+/// Map a manifest-refresh failure hit while resolving a mutation's target set
+/// to a [`MutationError`]. A vanished/absent pointer means the table was
+/// dropped and purged — report it gone, matching the read path; any other
+/// failure is a genuine inability to reach the latest manifest, surfaced rather
+/// than resolving the target set against a stale snapshot.
+fn target_resolve_err(e: ManifestLoadError) -> MutationError {
+    match e {
+        ManifestLoadError::PointerVanished | ManifestLoadError::PointerNotFound => {
+            MutationError::TableGone
+        }
+        other => MutationError::TargetResolve(other),
+    }
+}
+
 impl Supertable {
     /// Append one batch of rows and commit — durable when this returns.
     ///
@@ -1055,16 +1069,17 @@ impl SupertableWriter {
             .as_ref()
             .ok_or(MutationError::NoStorageAttached)?;
 
-        // Resolve the predicate against the current manifest
-        // snapshot. NOTE: the writer's pending-appends buffer
-        // is NOT flushed here. Captured-at-call semantics mean
-        // the delete sees the manifest as it stood at this
-        // call's instant; rows the caller appended in the same
+        // Resolve the predicate against the latest committed manifest, not a
+        // bounded-staleness snapshot: a stale resolve would miss a row
+        // committed after the snapshot and silently drop its tombstone (a lost
+        // delete). NOTE: the writer's pending-appends buffer is NOT flushed
+        // here. Captured-at-call semantics mean the delete sees the manifest as
+        // it stood at this call's instant; rows the caller appended in the same
         // writer session are not yet in the manifest.
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
-            .reader()
-            .map_err(|_| MutationError::TableGone)?
+            .reader_strong()
+            .map_err(target_resolve_err)?
             .scan_ids_matching(predicate)
             .map_err(MutationError::PredicateEval)?;
         let matched = target_ids.len();
@@ -1135,13 +1150,15 @@ impl SupertableWriter {
             )));
         }
 
-        // Resolve predicate against the manifest snapshot.
-        // Captured-at-call semantics: appends still in this
-        // writer's buffer don't count toward the match set.
+        // Resolve the predicate against the latest committed manifest, not a
+        // bounded-staleness snapshot: a stale resolve would miss a row
+        // committed after the snapshot and leave the old version live beside
+        // the replacement. Captured-at-call semantics still hold — appends
+        // still in this writer's buffer don't count toward the match set.
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
-            .reader()
-            .map_err(|_| MutationError::TableGone)?
+            .reader_strong()
+            .map_err(target_resolve_err)?
             .scan_ids_matching(predicate)
             .map_err(MutationError::PredicateEval)?;
         let matched = target_ids.len();

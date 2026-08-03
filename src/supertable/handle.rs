@@ -690,6 +690,43 @@ impl Supertable {
         Ok(())
     }
 
+    /// Force the in-memory snapshot to the latest committed manifest,
+    /// regardless of `read_consistency`, surfacing a failed pointer probe as
+    /// an error (like [`Consistency::Strong`]) rather than serving the current
+    /// snapshot.
+    ///
+    /// This is the freshness a *mutation* resolves its target set against.
+    /// [`ensure_fresh`](Self::ensure_fresh) honors `read_consistency`, so under
+    /// [`Consistency::BoundedStaleness`] it may leave the snapshot behind a
+    /// peer's commit. Resolving an update/delete predicate against such a
+    /// snapshot would miss a row committed after it and silently drop that
+    /// row's tombstone — a lost delete, or an update that leaves the old
+    /// version live beside the new one. The target set must instead agree with
+    /// the manifest the commit will CAS onto, so mutations always resolve
+    /// against the latest, independent of the read policy. Bounded staleness is
+    /// a read-latency contract for queries; it must never cause a write to lose
+    /// data.
+    pub(crate) fn ensure_fresh_strong(&self) -> Result<(), ManifestLoadError> {
+        if self.inner.options.storage.is_none() {
+            return Ok(());
+        }
+        bridge_sync_to_async(self.refresh())?;
+        Ok(())
+    }
+
+    /// A reader pinned to the latest committed manifest (force-refreshed via
+    /// [`ensure_fresh_strong`](Self::ensure_fresh_strong)), for resolving a
+    /// mutation's target set. Unlike [`reader`](Self::reader) this ignores
+    /// `read_consistency` — see `ensure_fresh_strong` for why mutations must
+    /// resolve against the latest manifest.
+    pub(crate) fn reader_strong(&self) -> Result<SupertableReader, ManifestLoadError> {
+        self.ensure_fresh_strong()?;
+        if self.pointer_vanished() {
+            return Err(ManifestLoadError::PointerVanished);
+        }
+        Ok(self.pinned_reader())
+    }
+
     /// Whether this handle's table was dropped and purged elsewhere, seen as
     /// its pointer disappearing during a freshness check. [`Self::ensure_fresh`]
     /// swallows errors by design, so this latch is how that fact escapes.
@@ -6555,6 +6592,77 @@ mod tests {
             1,
             "bounded staleness serves the last good snapshot when the probe fails"
         );
+    }
+
+    /// Regression: a mutation must resolve its target set against the latest
+    /// committed manifest even under `BoundedStaleness`, where a plain read
+    /// would serve a snapshot behind a peer's commit. Resolving the predicate
+    /// against such a snapshot would miss the peer-committed row and silently
+    /// drop its tombstone — a lost delete, or (for update) the old version left
+    /// live beside its replacement.
+    #[test]
+    fn a_mutation_resolves_its_target_against_a_peers_commit_under_bounded_staleness() {
+        use datafusion::prelude::{col, lit};
+
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // Producer creates the table and commits one row.
+        let producer = Supertable::create(opts().with_storage(Arc::clone(&inner))).expect("create");
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["keep"])).expect("append keep");
+        w.commit().expect("commit keep");
+        drop(w);
+
+        // Consumer opens under BoundedStaleness with a window long enough that a
+        // plain read never re-probes for the rest of the test.
+        let consumer = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&inner))
+                .with_read_consistency(Consistency::BoundedStaleness(Duration::from_secs(3600))),
+        )
+        .expect("open");
+        // One read pins the snapshot and stamps the pointer-check timestamp, so
+        // the window is now open — a later plain read would serve this snapshot.
+        assert_eq!(
+            bm25_title_hits(&consumer, "keep"),
+            1,
+            "sees the initial row"
+        );
+
+        // Producer commits a second row the consumer has NOT yet observed.
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["target"])).expect("append target");
+        w.commit().expect("commit target");
+        drop(w);
+
+        // The consumer deletes "target" while still inside its staleness window.
+        // A plain reader would resolve against the pre-commit snapshot and match
+        // zero rows; the mutation path force-refreshes, so it sees the peer's
+        // commit and tombstones the row.
+        let stats = consumer
+            .delete(col("title").eq(lit("target")))
+            .expect("delete");
+        assert_eq!(
+            stats.n_tombstoned(),
+            1,
+            "the delete must resolve against the peer's commit and tombstone the row"
+        );
+
+        // The row is gone for a fresh reader, and the untouched row survives.
+        let verifier = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&inner))
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("open verifier");
+        assert_eq!(
+            bm25_title_hits(&verifier, "target"),
+            0,
+            "target was deleted"
+        );
+        assert_eq!(bm25_title_hits(&verifier, "keep"), 1, "keep survives");
     }
 
     /// The typed shape of a deleted pointer on the read path, pinned at the
