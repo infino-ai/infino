@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
     Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32, nearest_centroid_transposed,
-    transpose_centroids_cluster_major,
+    nearest_k_centroids_transposed, transpose_centroids_cluster_major,
 };
 
 /// Offset added to a column's `rot_seed` to seed k-means. Keeps the
@@ -336,13 +336,114 @@ pub(crate) fn assign_to_centroids(
     if n == 0 {
         return;
     }
-    let transposed = transpose_centroids_cluster_major(centroids, k, dim);
+    if k < COARSE_ASSIGN_MIN_K {
+        // Exact O(n·k): cheap at small/bootstrap grids, and no misplacement risk.
+        let transposed = transpose_centroids_cluster_major(centroids, k, dim);
+        assignments
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(d, slot)| {
+                let v = &vectors[d * dim..(d + 1) * dim];
+                *slot = nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0;
+            });
+        return;
+    }
+    assign_coarse(vectors, centroids, dim, k, assignments);
+}
+
+/// Centroid count below which the exact O(n·k) assign is cheap enough; at or
+/// above it we route through an ephemeral coarse quantizer ([`assign_coarse`]).
+/// The bootstrap grid (256) stays exact; the accelerator only engages once
+/// splits have grown the grid into the thousands.
+const COARSE_ASSIGN_MIN_K: usize = 1024;
+/// Super-centroids probed per row in the coarse assign. Higher ⇒ closer to
+/// exact (fewer misplacements) at the cost of refining more candidate cells.
+const COARSE_SUPER_NPROBE: usize = 4;
+/// k-means iterations for the ephemeral super-centroids (over ~√k points).
+const COARSE_SUPER_ITERS: usize = 8;
+/// Fixed seed for the ephemeral super-centroid k-means (determinism).
+const COARSE_SUPER_SEED: u64 = 0x00C0_A55E;
+
+/// Accelerate the assign at large `k` with an ephemeral two-level index over
+/// the centroids: ~√k super-centroids (built per call — cheap vs the n·k assign
+/// it saves, and never persisted, so no on-disk format/compat impact). Each row
+/// routes to its top-[`COARSE_SUPER_NPROBE`] super-centroids, then takes the
+/// EXACT nearest centroid among only the cells beneath them. Recall-safe as long
+/// as the true nearest centroid's super is among the probed few; a row whose
+/// probed supers are all empty falls back to a full exact scan.
+fn assign_coarse(
+    vectors: &[f32],
+    centroids: &[f32],
+    dim: usize,
+    k: usize,
+    assignments: &mut [u32],
+) {
+    let m = (k as f64).sqrt().ceil() as usize;
+    let (supers, super_of) =
+        kmeans_with_assignments(centroids, dim, m, COARSE_SUPER_ITERS, COARSE_SUPER_SEED);
+    // Group cell ids by super, and build a per-super block-transposed centroid
+    // cache so the within-super refine uses the SAME SIMD scan as the exact path
+    // — v1's scalar per-candidate refine cancelled the fewer-distances win.
+    let mut cells_of_super: Vec<Vec<u32>> = vec![Vec::new(); m];
+    for (cid, &s) in super_of.iter().enumerate() {
+        cells_of_super[s as usize].push(cid as u32);
+    }
+    let super_blocks: Vec<Vec<f32>> = cells_of_super
+        .iter()
+        .map(|cids| {
+            let mut gathered = vec![0f32; cids.len() * dim];
+            for (li, &cid) in cids.iter().enumerate() {
+                gathered[li * dim..(li + 1) * dim]
+                    .copy_from_slice(&centroids[cid as usize * dim..(cid as usize + 1) * dim]);
+            }
+            transpose_centroids_cluster_major(&gathered, cids.len(), dim)
+        })
+        .collect();
+    let supers_t = transpose_centroids_cluster_major(&supers, m, dim);
+    let nprobe = COARSE_SUPER_NPROBE.min(m);
     assignments
         .par_iter_mut()
         .enumerate()
         .for_each(|(d, slot)| {
             let v = &vectors[d * dim..(d + 1) * dim];
-            *slot = nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0;
+            // top-`nprobe` super-centroids via the SIMD block-transposed kernel.
+            let top =
+                nearest_k_centroids_transposed(Metric::L2Sq, v, &supers_t, m, dim, None, nprobe);
+            // Exact nearest centroid among the cells under those supers; each
+            // super's cells are a contiguous transposed block, so this is SIMD.
+            let mut best_cid = u32::MAX;
+            let mut best_d2 = f32::INFINITY;
+            for &(s, _) in &top {
+                let cids = &cells_of_super[s as usize];
+                if cids.is_empty() {
+                    continue;
+                }
+                let (li, d2) = nearest_centroid_transposed(
+                    Metric::L2Sq,
+                    v,
+                    &super_blocks[s as usize],
+                    cids.len(),
+                    dim,
+                );
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_cid = cids[li as usize];
+                }
+            }
+            if best_cid == u32::MAX {
+                // All probed supers empty (rare) — exact scan over all cells.
+                // Direct scalar loop rather than an eager full transpose that
+                // every call would pay for but almost no row uses.
+                let mut bd = f32::INFINITY;
+                for c in 0..k {
+                    let d2 = l2_sq(v, &centroids[c * dim..(c + 1) * dim], dim);
+                    if d2 < bd {
+                        bd = d2;
+                        best_cid = c as u32;
+                    }
+                }
+            }
+            *slot = best_cid;
         });
 }
 
@@ -483,5 +584,127 @@ mod tests {
     #[should_panic(expected = "not multiple of dim")]
     fn panics_on_unaligned_input() {
         kmeans(&[1.0; 7], 8, 1, 5, 0);
+    }
+
+    #[test]
+    #[ignore] // timing spike — run with `--release ... -- --ignored --nocapture`
+    fn bench_coarse_vs_exact_assign_at_scale() {
+        use std::time::Instant;
+        let dim = 1024;
+        let k = 3587; // a large split-grown grid
+        let n = 500_000; // per-row cost is linear → extrapolate to the 4.7M drain batch
+        let mut rng = StdRng::seed_from_u64(1);
+        let centroids: Vec<f32> = (0..k * dim).map(|_| rng.random::<f32>()).collect();
+        let mut vectors = vec![0f32; n * dim];
+        for d in 0..n {
+            let c = rng.random_range(0..k);
+            for j in 0..dim {
+                vectors[d * dim + j] = centroids[c * dim + j] + (rng.random::<f32>() - 0.5) * 0.05;
+            }
+        }
+        // coarse (assign_to_centroids uses the coarse path since k > 1024)
+        let mut a_coarse = vec![0u32; n];
+        let t = Instant::now();
+        assign_to_centroids(&vectors, &centroids, dim, k, &mut a_coarse);
+        let coarse = t.elapsed().as_secs_f64();
+        // exact (inline the pre-coarse path)
+        let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
+        let mut a_exact = vec![0u32; n];
+        let t = Instant::now();
+        a_exact.par_iter_mut().enumerate().for_each(|(d, slot)| {
+            let v = &vectors[d * dim..(d + 1) * dim];
+            *slot = nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0;
+        });
+        let exact = t.elapsed().as_secs_f64();
+        let matches = (0..n).filter(|&d| a_coarse[d] == a_exact[d]).count();
+        eprintln!(
+            "ASSIGN n={n} k={k} dim={dim}: exact={exact:.2}s coarse={coarse:.2}s \
+             speedup={:.1}x match={:.2}% (extrapolated to 4.7M batch: exact~{:.0}s coarse~{:.0}s)",
+            exact / coarse,
+            matches as f64 / n as f64 * 100.0,
+            exact * 4_745_597.0 / n as f64,
+            coarse * 4_745_597.0 / n as f64,
+        );
+    }
+
+    #[test]
+    #[ignore] // timing spike — run with `--release ... -- --ignored --nocapture`
+    fn bench_coarse_vs_exact_sweep_k() {
+        use std::time::Instant;
+        let dim = 1024;
+        let n = 200_000;
+        eprintln!("SWEEP dim={dim} n={n} (coarse forced via assign_coarse, bypassing the gate)");
+        for &k in &[256usize, 512, 1024, 2048, 3587] {
+            let mut rng = StdRng::seed_from_u64(1);
+            let centroids: Vec<f32> = (0..k * dim).map(|_| rng.random::<f32>()).collect();
+            let mut vectors = vec![0f32; n * dim];
+            for d in 0..n {
+                let c = rng.random_range(0..k);
+                for j in 0..dim {
+                    vectors[d * dim + j] =
+                        centroids[c * dim + j] + (rng.random::<f32>() - 0.5) * 0.05;
+                }
+            }
+            let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
+            let mut a_exact = vec![0u32; n];
+            let t = Instant::now();
+            a_exact.par_iter_mut().enumerate().for_each(|(d, slot)| {
+                *slot = nearest_centroid_transposed(
+                    Metric::L2Sq,
+                    &vectors[d * dim..(d + 1) * dim],
+                    &transposed,
+                    k,
+                    dim,
+                )
+                .0;
+            });
+            let exact = t.elapsed().as_secs_f64();
+            let mut a_coarse = vec![0u32; n];
+            let t = Instant::now();
+            assign_coarse(&vectors, &centroids, dim, k, &mut a_coarse);
+            let coarse = t.elapsed().as_secs_f64();
+            let matches = (0..n).filter(|&d| a_coarse[d] == a_exact[d]).count();
+            eprintln!(
+                "  k={k}: exact={exact:.3}s coarse={coarse:.3}s speedup={:.2}x match={:.1}%",
+                exact / coarse,
+                matches as f64 / n as f64 * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn coarse_assign_tracks_exact_at_large_k() {
+        // k above COARSE_ASSIGN_MIN_K exercises the coarse-router path.
+        // Clustered data (vectors near random centers) mirrors real drain input.
+        let dim = 24;
+        let k = 1500usize; // > COARSE_ASSIGN_MIN_K
+        let n = 3000usize;
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        let centroids: Vec<f32> = (0..k * dim).map(|_| rng.random::<f32>()).collect();
+        let mut vectors = vec![0f32; n * dim];
+        for d in 0..n {
+            let c = rng.random_range(0..k);
+            for j in 0..dim {
+                vectors[d * dim + j] = centroids[c * dim + j] + (rng.random::<f32>() - 0.5) * 0.05;
+            }
+        }
+        let mut coarse = vec![0u32; n];
+        assign_to_centroids(&vectors, &centroids, dim, k, &mut coarse);
+        let exact: Vec<u32> = (0..n)
+            .map(|d| {
+                let v = &vectors[d * dim..(d + 1) * dim];
+                (0..k)
+                    .map(|c| (l2_sq(v, &centroids[c * dim..(c + 1) * dim], dim), c as u32))
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .expect("k > 0 so at least one centroid")
+                    .1
+            })
+            .collect();
+        assert!(coarse.iter().all(|&c| (c as usize) < k), "all cids valid");
+        let matches = (0..n).filter(|&d| coarse[d] == exact[d]).count();
+        assert!(
+            matches * 100 / n >= 95,
+            "coarse assign matched only {matches}/{n} of exact (expected >=95% on clustered data)"
+        );
     }
 }
