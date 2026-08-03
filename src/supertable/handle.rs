@@ -6665,6 +6665,86 @@ mod tests {
         assert_eq!(bm25_title_hits(&verifier, "keep"), 1, "keep survives");
     }
 
+    /// The update-path companion to the delete regression above. An update
+    /// resolves a 1:1 target set the same way, so under bounded staleness a stale
+    /// resolve would fail to see a row a peer committed after the handle's last
+    /// read — matching zero rows and failing the cardinality check — rather than
+    /// replacing it. With the target resolved against the latest manifest, the
+    /// update matches and swaps the row.
+    #[test]
+    fn an_update_resolves_its_target_against_a_peers_commit_under_bounded_staleness() {
+        use datafusion::prelude::{col, lit};
+
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // Producer creates the table and commits a baseline row.
+        let producer = Supertable::create(opts().with_storage(Arc::clone(&inner))).expect("create");
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["keep"])).expect("append keep");
+        w.commit().expect("commit keep");
+        drop(w);
+
+        // Consumer opens under BoundedStaleness with a window long enough that a
+        // plain read never re-probes for the rest of the test.
+        let consumer = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&inner))
+                .with_read_consistency(Consistency::BoundedStaleness(Duration::from_secs(3600))),
+        )
+        .expect("open");
+        // One read pins the snapshot and opens the window.
+        assert_eq!(
+            bm25_title_hits(&consumer, "keep"),
+            1,
+            "sees the initial row"
+        );
+
+        // Producer commits the update target the consumer has NOT yet observed.
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["stale-target"]))
+            .expect("append target");
+        w.commit().expect("commit target");
+        drop(w);
+
+        // The consumer updates "stale-target" → "fresh-value" while still inside
+        // its staleness window. A plain reader would resolve against the
+        // pre-commit snapshot, match zero rows, and fail the 1:1 cardinality
+        // check; the mutation path force-refreshes and matches the row.
+        let stats = consumer
+            .update(
+                col("title").eq(lit("stale-target")),
+                &title_batch(&["fresh-value"]),
+            )
+            .expect("update");
+        assert_eq!(
+            stats.matched(),
+            1,
+            "the update must resolve against the peer's commit and match the target row"
+        );
+
+        // A fresh reader sees the replacement, the old version gone, and the
+        // untouched row intact — no pre-update version left live beside it.
+        let verifier = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&inner))
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("open verifier");
+        assert_eq!(
+            bm25_title_hits(&verifier, "fresh-value"),
+            1,
+            "replacement is present"
+        );
+        assert_eq!(
+            bm25_title_hits(&verifier, "stale-target"),
+            0,
+            "old version was tombstoned"
+        );
+        assert_eq!(bm25_title_hits(&verifier, "keep"), 1, "keep survives");
+    }
+
     /// The typed shape of a deleted pointer on the read path, pinned at the
     /// layer that produces it. Both the error and the latch matter: callers
     /// above match the variant, and the catalog keys handle eviction on the
