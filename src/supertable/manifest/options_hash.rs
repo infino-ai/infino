@@ -599,11 +599,22 @@ mod tests {
         let residual = compute_options_hash(&mk(RerankCodec::Sq8Residual), &time_range());
         let fp32 = compute_options_hash(&mk(RerankCodec::Fp32), &time_range());
         let fixed = compute_options_hash(&mk(RerankCodec::Sq8FixedResidual), &time_range());
+        let sq16 = compute_options_hash(&mk(RerankCodec::Sq16), &time_range());
         assert_ne!(residual.0, fp32.0);
         assert_ne!(
             residual.0, fixed.0,
             "fixed residual must not reopen with local residual write options"
         );
+        // Sq16 is a distinct on-disk format — it must not collide with
+        // any other codec's options hash (else a table would reopen with
+        // the wrong reader layout).
+        for (other, label) in [
+            (residual.0, "sq8_residual"),
+            (fp32.0, "fp32"),
+            (fixed.0, "sq8_fixed_residual"),
+        ] {
+            assert_ne!(sq16.0, other, "sq16 options hash collides with {label}");
+        }
     }
 
     // ---- PartitionStrategy variants ------------------------------------

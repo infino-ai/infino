@@ -574,7 +574,7 @@ fn encode_rows(
             }
             derive_sq8_quantizer_from_min_max(&min, &max)
         }
-        RerankCodec::Fp32 | RerankCodec::RabitqOnly => {
+        RerankCodec::Fp32 | RerankCodec::Sq16 | RerankCodec::RabitqOnly => {
             return Err(format!(
                 "cell posting encode requires an Sq8 residual-family codec, got {}",
                 codec.name()
@@ -716,14 +716,20 @@ pub(crate) fn sq8_quant_params_equal(
         && offset_a == offset_b
 }
 
-/// Copy or Sq8-transcode one row into `out` (`[codes | residuals]`, length `2·dim`).
+/// Copy or Sq8-transcode one residual-family row into `out`
+/// (`[codes | residuals]`, length `2·dim`).
 ///
 /// When source quant matches the destination cluster quantizer, copies bytes
 /// verbatim. Otherwise re-quantizes per dimension from the folded scalar
 /// component one row at a time, without materializing a full fp32 corpus.
 ///
 /// Returns residual-corrected ||x||² when `store_norm` is true (L2Sq/Cosine).
-pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
+///
+/// Shared logic behind the `Sq8ResidualOps` / `Sq8FixedResidualOps`
+/// `RerankCodecOps::materialize_row_into_cluster_quant` impls; the residual
+/// family's private quantizer constants live here in `cell_posting`, so the
+/// helper stays co-located with them and the trait impls delegate in.
+pub(crate) fn residual_family_materialize_into_cluster_quant(
     row: &EncodedCellRow,
     dst_codec: RerankCodec,
     dst_scale: &[f32],
@@ -817,16 +823,17 @@ pub(crate) use crate::superfile::vector::distance::{
 /// Sq8+ε row → `dim` fp32 components (manifest centroids, medoid seeds, etc.).
 pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; dim];
-    dequantize_sq8_residual_into(
-        &row.scale,
-        &row.offset,
-        &row.codes,
-        &row.residuals,
-        row.rerank_codec
-            .residual_divisor()
-            .expect("encoded row uses residual-family codec"),
-        &mut out,
-    );
+    row.rerank_codec
+        .ops()
+        .expect("encoded row uses a quantized-rerank codec")
+        .dequantize_row_into(
+            &row.codes,
+            &row.residuals,
+            dim,
+            &row.scale,
+            &row.offset,
+            &mut out,
+        );
     out
 }
 
@@ -1068,7 +1075,7 @@ mod tests {
         );
 
         let mut encoded = vec![0; 4];
-        let encoded_norm = materialize_sq8_residual_row_into_cluster_quant(
+        let encoded_norm = residual_family_materialize_into_cluster_quant(
             &row,
             RerankCodec::Sq8Residual,
             &dst_scale,
@@ -1115,7 +1122,7 @@ mod tests {
             norm_sq: None,
         };
         let mut output = vec![0; dim * 2];
-        materialize_sq8_residual_row_into_cluster_quant(
+        residual_family_materialize_into_cluster_quant(
             &row,
             RerankCodec::Sq8FixedResidual,
             &row.scale,
@@ -1142,7 +1149,7 @@ mod tests {
             norm_sq: None,
         };
         let mut output = vec![0; 2];
-        let error = materialize_sq8_residual_row_into_cluster_quant(
+        let error = residual_family_materialize_into_cluster_quant(
             &row,
             RerankCodec::Sq8Residual,
             &row.scale,

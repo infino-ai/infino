@@ -27,10 +27,7 @@ use crate::superfile::{
             IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
             fixed_sq8_quantizer, write_ivf_cluster_blocks,
         },
-        cell_posting::{
-            EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
-            sq8_quant_params_equal, sq8_residual_norm_sq,
-        },
+        cell_posting::{EncodedCellRow, sq8_quant_params_equal},
         distance::{
             Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, decode_f32_le_vec,
             f64_acc_mean_into_f32, mean_f32_cluster_major,
@@ -143,7 +140,7 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     }
 
     let n_docs: u32 = parsed.iter().map(|p| p.n_docs).sum();
-    debug_assert!(codec.is_sq8_residual_family());
+    debug_assert!(codec.is_ivf_mergeable());
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = codec.per_vector_bytes(dim);
@@ -181,22 +178,34 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     // every slot — populated or empty — to carry the pinned scale/offset
     // bitwise, exactly as the direct build paths write them. Fitted codecs
     // keep the neutral 1.0/0.0 seed; their empty slots are never read.
-    let (mut dst_scale, mut dst_offset) = if codec.uses_fixed_quantizer() {
+    // Only the residual family seeds a per-cluster scale/offset table.
+    // Merge inputs are built exclusively for the residual family
+    // (`sq8_ivf_merge_input_at` is `is_ivf_mergeable`-gated), so
+    // the extra family check is a guard: single-plane Sq16 must never
+    // seed the fixed sq8 grid here.
+    // Only the residual family carries a per-cluster scale/offset table.
+    // Single-plane codecs (Sq16) quantize on a fixed grid with no per-cluster
+    // quantizer, so their `scale`/`offset` merge inputs are empty and never
+    // seeded, sliced, or written to codec_meta below.
+    let has_cluster_quant = codec.is_sq8_residual_family();
+    let (mut dst_scale, mut dst_offset) = if codec.uses_fixed_quantizer() && has_cluster_quant {
         let (scale, offset) = fixed_sq8_quantizer(dim);
         (scale.repeat(n_cent), offset.repeat(n_cent))
     } else {
         (vec![1.0f32; n_cent * dim], vec![0.0f32; n_cent * dim])
     };
-    for c in 0..n_cent {
-        for inp in parsed {
-            let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
-            if count == 0 {
-                continue;
+    if has_cluster_quant {
+        for c in 0..n_cent {
+            for inp in parsed {
+                let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+                if count == 0 {
+                    continue;
+                }
+                let off = c * dim;
+                dst_scale[off..off + dim].copy_from_slice(&inp.scale[off..off + dim]);
+                dst_offset[off..off + dim].copy_from_slice(&inp.offset[off..off + dim]);
+                break;
             }
-            let off = c * dim;
-            dst_scale[off..off + dim].copy_from_slice(&inp.scale[off..off + dim]);
-            dst_offset[off..off + dim].copy_from_slice(&inp.offset[off..off + dim]);
-            break;
         }
     }
 
@@ -230,21 +239,23 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
         &out_centroids,
     );
 
-    let sq8_scale_block_off = layout.codec_meta_off;
-    let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
-    let sq8_norms_block_off = if store_norm {
-        Some(sq8_offset_block_off + n_cent * dim * 4)
-    } else {
-        None
-    };
+    // codec_meta layout comes from the codec's own ops: the residual family
+    // lays out `[scale | offset | norms?]`; Sq16 lays out `[norms?]` at the
+    // head with no scale/offset arrays. The per-doc norm block offset follows
+    // whichever shape the codec declares.
+    let ops = codec.ops().expect("mergeable codec has cold-path ops");
+    let meta_layout = ops.codec_meta_layout(layout.codec_meta_off, n_cent, dim, metric);
+    let norms_block_off = meta_layout.norms_off;
 
-    for c in 0..n_cent {
-        let sc_off = sq8_scale_block_off + c * dim * 4;
-        bytes[sc_off..sc_off + dim * 4]
-            .copy_from_slice(cast_slice(&dst_scale[c * dim..c * dim + dim]));
-        let oc_off = sq8_offset_block_off + c * dim * 4;
-        bytes[oc_off..oc_off + dim * 4]
-            .copy_from_slice(cast_slice(&dst_offset[c * dim..c * dim + dim]));
+    if let (Some(scale_off), Some(offset_off)) = (meta_layout.scale_off, meta_layout.offset_off) {
+        for c in 0..n_cent {
+            let sc_off = scale_off + c * dim * 4;
+            bytes[sc_off..sc_off + dim * 4]
+                .copy_from_slice(cast_slice(&dst_scale[c * dim..c * dim + dim]));
+            let oc_off = offset_off + c * dim * 4;
+            bytes[oc_off..oc_off + dim * 4]
+                .copy_from_slice(cast_slice(&dst_offset[c * dim..c * dim + dim]));
+        }
     }
 
     let cluster_order = centroid_storage_order(&out_centroids, n_cent, dim);
@@ -282,8 +293,6 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                 if count == 0 {
                     continue;
                 }
-                let src_scale = &inp.scale[centroid_id * dim..centroid_id * dim + dim];
-                let src_offset = &inp.offset[centroid_id * dim..centroid_id * dim + dim];
                 let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
                 let doc_ids_at = block + count * inp.code_bytes;
                 let full_at = block + count * (inp.code_bytes + id_bytes);
@@ -320,19 +329,27 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
 
                     let rowb = full_at + i * inp.per_vec_bytes;
                     let full_off = blk.rerank_base + out_i * per_vec_bytes;
-                    let norm_sq =
+                    let norm_sq = if !has_cluster_quant {
+                        // Single-plane fixed-grid codec (Sq16): the body is
+                        // portable across cluster changes, so a merge is a
+                        // verbatim byte copy with the norm read off the grid.
+                        bytes[full_off..full_off + per_vec_bytes]
+                            .copy_from_slice(&inp.sub[rowb..rowb + per_vec_bytes]);
+                        store_norm.then(|| {
+                            ops.decoded_norm_sq(&inp.sub[rowb..rowb + per_vec_bytes], dim, &[], &[])
+                        })
+                    } else {
+                        let src_scale = &inp.scale[centroid_id * dim..centroid_id * dim + dim];
+                        let src_offset = &inp.offset[centroid_id * dim..centroid_id * dim + dim];
                         if sq8_quant_params_equal(src_scale, src_offset, scale_c, offset_c) {
                             bytes[full_off..full_off + dim * 2]
                                 .copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
                             store_norm.then(|| {
-                                sq8_residual_norm_sq(
+                                ops.decoded_norm_sq(
+                                    &inp.sub[rowb..rowb + dim * 2],
+                                    dim,
                                     scale_c,
                                     offset_c,
-                                    &inp.sub[rowb..rowb + dim],
-                                    &inp.sub[rowb + dim..rowb + dim + dim],
-                                    codec
-                                        .residual_divisor()
-                                        .expect("residual-family codec has divisor"),
                                 )
                             })
                         } else {
@@ -345,9 +362,8 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                                 residuals: inp.sub[rowb + dim..rowb + dim + dim].to_vec(),
                                 norm_sq: None,
                             };
-                            let n = materialize_sq8_residual_row_into_cluster_quant(
+                            let n = ops.materialize_row_into_cluster_quant(
                                 &encoded,
-                                codec,
                                 scale_c,
                                 offset_c,
                                 dim,
@@ -356,9 +372,10 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                             )?;
                             bytes[full_off..full_off + dim * 2].copy_from_slice(&row_buf);
                             n
-                        };
+                        }
+                    };
 
-                    if let (Some(norms_off), Some(n_sq)) = (sq8_norms_block_off, norm_sq) {
+                    if let (Some(norms_off), Some(n_sq)) = (norms_block_off, norm_sq) {
                         let n_off = norms_off + (blk.first_row + out_i) * 4;
                         bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
                     }
@@ -452,7 +469,7 @@ pub(crate) fn splice_fragments_into_cell(
         return Ok(None);
     }
 
-    debug_assert!(codec.is_sq8_residual_family());
+    debug_assert!(codec.is_ivf_mergeable());
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = codec.per_vector_bytes(dim);
@@ -553,15 +570,10 @@ pub(crate) fn splice_fragments_into_cell(
                 let full_off = blk.rerank_base + i * per_vec_bytes;
                 bytes[full_off..full_off + dim * 2].copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
                 if store_norm && let Some(norms_off) = sq8_norms_block_off {
-                    let n_sq = sq8_residual_norm_sq(
-                        scale_c,
-                        offset_c,
-                        &inp.sub[rowb..rowb + dim],
-                        &inp.sub[rowb + dim..rowb + dim + dim],
-                        codec
-                            .residual_divisor()
-                            .expect("residual-family codec has divisor"),
-                    );
+                    let n_sq = codec
+                        .ops()
+                        .expect("mergeable codec has cold-path ops")
+                        .decoded_norm_sq(&inp.sub[rowb..rowb + dim * 2], dim, scale_c, offset_c);
                     let n_off = norms_off + out_row * 4;
                     bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
                 }
@@ -714,7 +726,7 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
     rerank_codec: RerankCodec,
     stable_ids: Option<Vec<i128>>,
 ) -> Result<Sq8IvfMergeInput, BuildError> {
-    if !rerank_codec.is_sq8_residual_family() {
+    if !rerank_codec.is_ivf_mergeable() {
         return Err(BuildError::VectorSchemaMismatch(
             "fragment merge requires an Sq8 residual-family subsection".into(),
         ));

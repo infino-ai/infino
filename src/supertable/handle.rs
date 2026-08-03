@@ -1446,14 +1446,15 @@ fn build_vector_index_options(
         )));
     }
     let hidden_schema = Arc::new(arrow_schema::Schema::new(fields));
-    // Hidden maintenance reads residual-family rows without fp32
-    // reconstruction. Preserve a fixed/local residual user codec; non-residual
-    // user codecs retain the existing local-residual hidden representation.
+    // Hidden maintenance reads IVF-mergeable rows without fp32
+    // reconstruction. Preserve any IVF-mergeable user codec (the residual
+    // family and the single-plane Sq16); other user codecs retain the existing
+    // local-residual hidden representation.
     let hidden_vector_columns: Vec<VectorConfig> = user_opts
         .vector_columns
         .iter()
         .map(|vc| VectorConfig {
-            rerank_codec: if vc.rerank_codec.is_sq8_residual_family() {
+            rerank_codec: if vc.rerank_codec.is_ivf_mergeable() {
                 vc.rerank_codec
             } else {
                 RerankCodec::Sq8Residual

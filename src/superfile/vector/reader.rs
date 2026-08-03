@@ -47,9 +47,9 @@ use crate::{
         },
         lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan},
         vector::{
-            cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
+            cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::{
-                Metric, Sq8ResidualKernel, decode_f32_le_into, distance_bytes_codec,
+                Metric, Sq8ResidualKernel, Sq16Kernel, decode_f32_le_into, distance_bytes_codec,
                 nearest_k_centroids_bytes, sum_f32,
             },
             ivf_merge::Sq8IvfMergeInput,
@@ -57,7 +57,7 @@ use crate::{
                 BitQuantizer, LUT_BLOCK_ROWS, LutQuery, build_transposed_code_cache,
                 for_each_code_block_scores, lut_scan_supported,
             },
-            rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+            rerank_codec::{EncodedRowParts, RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             rotation::RandomRotation,
         },
     },
@@ -129,6 +129,11 @@ pub struct ColumnReader {
     /// the per-doc norms add `n_docs × 4` bytes (4 MB at 1M
     /// docs / column). Materialising here amortizes the parse
     /// across every search call.
+    /// Per-doc-norm carrier, shared by the residual family (`Sq8*`) and
+    /// the flat `Sq16` codec. For `Sq16` the `scale`/`offset` arrays are
+    /// empty (fixed grid) and only `per_doc_norms` is populated, so the
+    /// reader's `cand.pos` norm indexing is byte-for-byte the residual
+    /// family's. `None` for `Fp32` / `RabitqOnly`.
     pub(super) sq8_meta: Option<Sq8ColumnMeta>,
     lazy_sq8_parsed: OnceLock<Arc<Sq8ParsedMeta>>,
     /// Byte range of this column's subsection within the outer blob.
@@ -349,6 +354,22 @@ pub struct VectorReader {
 }
 
 impl VectorReader {
+    /// Test-only accessor: the per-doc dequantized-norm table this
+    /// reader loaded from a column's `codec_meta` region (residual
+    /// family or `Sq16`). Returns `None` for a codec that carries no
+    /// norms, an unknown column, or a lazily-open source that has not
+    /// materialised the norms eagerly. Used by the Sq16 store/read
+    /// localization test to compare the loaded table against the norms
+    /// recomputed from the on-disk `u16` codes.
+    #[cfg(test)]
+    pub(crate) fn per_doc_norms_for_test(&self, column: &str) -> Option<std::sync::Arc<[f32]>> {
+        let col = self.columns.iter().find(|c| c.name == column)?;
+        match col.sq8_meta.as_ref()? {
+            Sq8ColumnMeta::Eager { per_doc_norms, .. } => per_doc_norms.clone(),
+            Sq8ColumnMeta::Lazy { .. } => None,
+        }
+    }
+
     /// Open the reader. `columns_json` is the value of the
     /// legacy `inf.vec.columns` Parquet KV key (a JSON array of
     /// [`VectorColumnConfig`]).
@@ -1000,6 +1021,9 @@ impl VectorReader {
                 ))));
             }
             let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
+            // Sq16 carries a per-doc norm table for cosine/L2Sq (0 for
+            // NegDot), so it is not unconditionally zero-meta — its exact
+            // size is validated below against `codec_meta_bytes`.
             let codec_meta_required_zero =
                 matches!(rerank_codec, RerankCodec::Fp32 | RerankCodec::RabitqOnly);
 
@@ -1134,6 +1158,28 @@ impl VectorReader {
                         offset_abs_off: meta_abs_start + scale_end,
                         norms_abs_off: matches!(metric, Metric::L2Sq | Metric::Cosine)
                             .then_some(meta_abs_start + offset_end),
+                    })
+                }
+            } else if rerank_codec.is_sq16() && matches!(metric, Metric::L2Sq | Metric::Cosine) {
+                // Sq16 reuses the residual family's `Sq8ColumnMeta` norm
+                // carrier + `cand.pos` indexing verbatim; the only layout
+                // difference is that the per-doc norm table starts at the
+                // codec_meta head (no scale/offset arrays precede it), so
+                // `scale`/`offset` stay empty.
+                let meta_abs_start = subsection_off + codec_meta_off;
+                let norms_end = meta_abs_start + (col_n_docs as usize) * 4;
+                debug_assert_eq!(norms_end - meta_abs_start, actual_codec_meta_size);
+                if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..norms_end) {
+                    Some(Sq8ColumnMeta::Eager {
+                        scale: Vec::new(),
+                        offset: Vec::new(),
+                        per_doc_norms: Some(Arc::from(parse_f32_le_vec(&meta_bytes))),
+                    })
+                } else {
+                    Some(Sq8ColumnMeta::Lazy {
+                        scale_abs_off: meta_abs_start,
+                        offset_abs_off: meta_abs_start,
+                        norms_abs_off: Some(meta_abs_start),
                     })
                 }
             } else {
@@ -1294,6 +1340,7 @@ impl VectorReader {
                 value if value == u32::from(RerankCodec::Sq8FixedResidual.codec_id()) => {
                     RerankCodec::Sq8FixedResidual
                 }
+                value if value == u32::from(RerankCodec::Sq16.codec_id()) => RerankCodec::Sq16,
                 _ => {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "multi-cell directory has unknown rerank codec id {raw_codec}"
@@ -1735,6 +1782,25 @@ impl VectorReader {
                     offset_abs_off: meta_abs_start + scale_end,
                     norms_abs_off: matches!(metric, Metric::L2Sq | Metric::Cosine)
                         .then_some(meta_abs_start + offset_end),
+                })
+            }
+        } else if rerank_codec.is_sq16() && matches!(metric, Metric::L2Sq | Metric::Cosine) {
+            // Sq16: per-doc norm table only (no scale/offset), carried in
+            // the shared `Sq8ColumnMeta` so norm indexing matches the
+            // residual family. See the main open path for the rationale.
+            let meta_abs_start = subsection_off + codec_meta_off;
+            let norms_end = meta_abs_start + (col_n_docs as usize) * 4;
+            if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..norms_end) {
+                Some(Sq8ColumnMeta::Eager {
+                    scale: Vec::new(),
+                    offset: Vec::new(),
+                    per_doc_norms: Some(Arc::from(parse_f32_le_vec(&meta_bytes))),
+                })
+            } else {
+                Some(Sq8ColumnMeta::Lazy {
+                    scale_abs_off: meta_abs_start,
+                    offset_abs_off: meta_abs_start,
+                    norms_abs_off: Some(meta_abs_start),
                 })
             }
         } else {
@@ -2366,7 +2432,7 @@ impl VectorReader {
         let col = self.columns.get(col_idx).ok_or_else(|| {
             BuildError::VectorSchemaMismatch(format!("cell column index {col_idx} out of range"))
         })?;
-        if !col.rerank_codec.is_sq8_residual_family() {
+        if !col.rerank_codec.is_ivf_mergeable() {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.name.clone(),
                 codec: col.rerank_codec.name(),
@@ -2448,7 +2514,7 @@ impl VectorReader {
         let col = self.columns.get(col_idx).ok_or_else(|| {
             BuildError::VectorSchemaMismatch(format!("cell column index {col_idx} out of range"))
         })?;
-        if !col.rerank_codec.is_sq8_residual_family() {
+        if !col.rerank_codec.is_ivf_mergeable() {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.name.clone(),
                 codec: col.rerank_codec.name(),
@@ -2493,7 +2559,7 @@ impl VectorReader {
         col_idx: usize,
     ) -> Option<Vec<MaterializedIvfRow>> {
         let col = self.columns.get(col_idx)?;
-        if !col.rerank_codec.is_sq8_residual_family() {
+        if !col.rerank_codec.is_ivf_mergeable() {
             return None;
         }
         let dim = col.dim;
@@ -2689,10 +2755,7 @@ impl VectorReader {
         let per_vec = col.rerank_codec.per_vector_bytes(dim);
         let n_cent = col.n_cent as usize;
         let store_norm = matches!(col.metric, Metric::L2Sq | Metric::Cosine);
-        let divisor = col
-            .rerank_codec
-            .residual_divisor()
-            .ok_or(BuildError::VectorReadError)?;
+        let ops = col.rerank_codec.ops().ok_or(BuildError::VectorReadError)?;
         let u32_at = |p: usize| -> Result<u32, BuildError> {
             let bytes: [u8; 4] = sub
                 .get(p..p + 4)
@@ -2719,17 +2782,30 @@ impl VectorReader {
             let doc_ids_at = block + count * code_bytes;
             let full_at = block + count * (code_bytes + id_bytes);
             // Shared per-cluster backing: each row clones the Arc (refcount bump),
-            // not the dim-length scale/offset buffers.
-            let sc: std::sync::Arc<[f32]> = std::sync::Arc::from(
-                scale
-                    .get(c * dim..c * dim + dim)
-                    .ok_or(BuildError::VectorReadError)?,
-            );
-            let of: std::sync::Arc<[f32]> = std::sync::Arc::from(
-                offset
-                    .get(c * dim..c * dim + dim)
-                    .ok_or(BuildError::VectorReadError)?,
-            );
+            // not the dim-length scale/offset buffers. Only the residual family
+            // carries per-cluster scale/offset (`n_cent * dim` each); single-plane
+            // fixed-grid codecs (Sq16) decode off the fixed grid and store empty
+            // scale/offset, so there is nothing to slice per cluster.
+            let (sc, of): (std::sync::Arc<[f32]>, std::sync::Arc<[f32]>) =
+                if col.rerank_codec.is_sq8_residual_family() {
+                    (
+                        std::sync::Arc::from(
+                            scale
+                                .get(c * dim..c * dim + dim)
+                                .ok_or(BuildError::VectorReadError)?,
+                        ),
+                        std::sync::Arc::from(
+                            offset
+                                .get(c * dim..c * dim + dim)
+                                .ok_or(BuildError::VectorReadError)?,
+                        ),
+                    )
+                } else {
+                    (
+                        std::sync::Arc::from(Vec::new()),
+                        std::sync::Arc::from(Vec::new()),
+                    )
+                };
             for i in 0..count {
                 let local_id = u32_at(doc_ids_at + i * id_bytes)?;
                 let rabitq = sub
@@ -2737,16 +2813,14 @@ impl VectorReader {
                     .ok_or(BuildError::VectorReadError)?
                     .to_vec();
                 let rowb = full_at + i * per_vec;
-                let codes = sub
-                    .get(rowb..rowb + dim)
-                    .ok_or(BuildError::VectorReadError)?
-                    .to_vec();
-                let residuals = sub
-                    .get(rowb + dim..rowb + dim + dim)
-                    .ok_or(BuildError::VectorReadError)?
-                    .to_vec();
-                let norm_sq =
-                    store_norm.then(|| sq8_residual_norm_sq(&sc, &of, &codes, &residuals, divisor));
+                let row = sub
+                    .get(rowb..rowb + per_vec)
+                    .ok_or(BuildError::VectorReadError)?;
+                let EncodedRowParts {
+                    codes,
+                    residuals,
+                    norm_sq,
+                } = ops.parse_materialized_row(row, dim, &sc, &of, store_norm);
                 let stable_id = match stable_ids_rel {
                     Some(so) => {
                         let p = so + (local_id as usize) * format::vec::STABLE_ID_BYTES;
@@ -4849,6 +4923,69 @@ async fn rerank_candidates_from_blocks(
                     .collect()
             }
         }
+        RerankCodec::Sq16 => {
+            // Flat single-plane rerank with per-doc norm correction. One
+            // `Sq16Kernel` for the whole query (fixed grid — no
+            // per-cluster state); each survivor scores as
+            // `base - dot/‖d̂‖` (Cosine) using its stored dequantized
+            // norm. The norm table is carried in the SHARED
+            // `Sq8ColumnMeta` and indexed by `cand.pos` with the exact
+            // same expression the residual family uses
+            // (`score_sq8_residual_candidates`), so a candidate's norm is
+            // guaranteed to be its own — no parallel Sq16 norm path.
+            let norms: Option<Arc<[f32]>> = match col.sq8_meta.as_ref() {
+                Some(Sq8ColumnMeta::Eager { per_doc_norms, .. }) => per_doc_norms.clone(),
+                Some(Sq8ColumnMeta::Lazy { norms_abs_off, .. }) => {
+                    if let Some(meta_bytes) = lazy_sq8_meta_bytes {
+                        // Sq16's codec_meta region IS the norm table.
+                        Some(Arc::from(parse_f32_le_vec(meta_bytes)))
+                    } else if let Some(norms_abs_off) = norms_abs_off {
+                        let range = *norms_abs_off..*norms_abs_off + col.n_docs as usize * 4;
+                        let fetched = source
+                            .get_ranges_parallel(std::slice::from_ref(&range))
+                            .map_err(map_lazy)?;
+                        Some(Arc::from(parse_f32_le_vec(&fetched[0])))
+                    } else {
+                        None
+                    }
+                }
+                // NegDot (Sq16 is cosine-only in practice) → no norms.
+                None => None,
+            };
+            let kernel = Sq16Kernel::new(col.metric, query);
+            if candidates.len() >= PARALLEL_SCAN_MIN {
+                let kernel = Arc::new(kernel);
+                let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
+                let survivors: Option<Arc<Vec<Bytes>>> =
+                    survivor_full_rows.map(|s| Arc::new(s.to_vec()));
+                let norms = norms.clone();
+                par_map(
+                    candidates.to_vec(),
+                    move |cand: &RerankCandidate| {
+                        let bytes = candidate_full_bytes(
+                            &blocks,
+                            survivors.as_deref().map(|s| s.as_slice()),
+                            cand,
+                            stride,
+                        );
+                        let norm = norms.as_ref().map(|n| n[cand.pos as usize]);
+                        (cand.did, kernel.distance_with_norm(bytes, norm))
+                    },
+                    pool.clone(),
+                )
+                .await?
+            } else {
+                candidates
+                    .iter()
+                    .map(|cand| {
+                        let bytes =
+                            candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
+                        let norm = norms.as_ref().map(|n| n[cand.pos as usize]);
+                        (cand.did, kernel.distance_with_norm(bytes, norm))
+                    })
+                    .collect()
+            }
+        }
         RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
             let residual_divisor = col
                 .rerank_codec
@@ -5172,7 +5309,12 @@ fn validate_quantizer_meta(
             "column {column:?} has non-finite quantizer metadata"
         ))));
     }
-    if !rerank_codec.uses_fixed_quantizer() {
+    // The pinned-constant check is specific to the sq8-residual fixed
+    // grid (`SQ8_FIXED_*`). Only Sq8FixedResidual (fixed-quantizer AND
+    // residual-family) carries such an array. Sq16 is fixed-quantizer
+    // but stores no codec_meta, so it never reaches here with scale/
+    // offset arrays — return Ok vacuously if it ever did.
+    if !(rerank_codec.uses_fixed_quantizer() && rerank_codec.is_sq8_residual_family()) {
         return Ok(());
     }
     let valid = scale
@@ -6216,14 +6358,14 @@ mod tests {
         let dim = 32usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
-        // Register via the struct default for rerank_codec to pin
-        // that the build default is Sq8FixedResidual.
+        // Pin the Sq8FixedResidual round-trip explicitly (the cosine default
+        // is now Sq16; this case exercises the residual family specifically).
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::default(),
+            rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: None,
         })
         .expect("register column");

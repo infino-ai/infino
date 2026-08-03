@@ -38,10 +38,7 @@ use std::{
 use crate::{
     config,
     superfile::vector::{
-        cell_posting::{
-            EncodedCellRow, MaterializedIvfRow, dequantize_sq8_residual_into,
-            manifest_centroid_components_from_row,
-        },
+        cell_posting::{EncodedCellRow, MaterializedIvfRow, manifest_centroid_components_from_row},
         distance::{
             Metric, distance, nearest_k_centroids_bytes, nearest_k_centroids_transposed, normalize,
             relative_score_window,
@@ -330,16 +327,18 @@ fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
 /// [`dequantize_row`] into a caller-owned scratch (hot loops reuse one
 /// allocation). The scratch length is the row's `dim`.
 fn dequantize_row_into(row: &EncodedCellRow, out: &mut [f32]) {
-    dequantize_sq8_residual_into(
-        &row.scale,
-        &row.offset,
-        &row.codes,
-        &row.residuals,
-        row.rerank_codec
-            .residual_divisor()
-            .expect("encoded row uses residual-family codec"),
-        out,
-    );
+    let dim = out.len();
+    row.rerank_codec
+        .ops()
+        .expect("encoded row uses a quantized-rerank codec")
+        .dequantize_row_into(
+            &row.codes,
+            &row.residuals,
+            dim,
+            &row.scale,
+            &row.offset,
+            out,
+        );
 }
 
 /// Ashman D of a two-means partition, measured on the 1-D projection onto the

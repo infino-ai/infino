@@ -99,12 +99,12 @@ pub fn bench_rerank_codec(metric: Metric) -> RerankCodec {
     // Diagnostic (env-gated): force an EXACT fp32 rerank column to isolate Sq8
     // codec loss from routing/coverage. INFINO_BENCH_RERANK_CODEC=fp32 → if the
     // recall ceiling jumps to ~1.0, the residual gap was the Sq8 quantization.
-    let codec = if std::env::var("INFINO_BENCH_RERANK_CODEC").as_deref() == Ok("fp32") {
-        RerankCodec::Fp32
-    } else if metric == Metric::Cosine {
-        RerankCodec::default()
-    } else {
-        RerankCodec::Sq8Residual
+    let codec = match std::env::var("INFINO_BENCH_RERANK_CODEC").ok().as_deref() {
+        Some("fp32") => RerankCodec::Fp32,
+        Some("sq16") => RerankCodec::Sq16,
+        Some("sq8_fixed_residual") => RerankCodec::Sq8FixedResidual,
+        _ if metric == Metric::Cosine => RerankCodec::default(),
+        _ => RerankCodec::Sq8Residual,
     };
     assert!(
         codec.supports_metric(metric),

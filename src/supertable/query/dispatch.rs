@@ -108,12 +108,11 @@ pub(crate) fn verify_superfile_vector_codecs(
         QueryError::Execute("superfile is missing configured vector index".into())
     })?;
     for config in expected {
-        let expected_codec =
-            if vector.is_multi_cell() && !config.rerank_codec.is_sq8_residual_family() {
-                RerankCodec::Sq8Residual
-            } else {
-                config.rerank_codec
-            };
+        let expected_codec = if vector.is_multi_cell() && !config.rerank_codec.is_ivf_mergeable() {
+            RerankCodec::Sq8Residual
+        } else {
+            config.rerank_codec
+        };
         let mut matched = false;
         for column in vector
             .vector_columns_config()

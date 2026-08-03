@@ -759,7 +759,7 @@ impl SuperfileBuilder {
             .first()
             .ok_or(BuildError::VectorReadError)?
             .rerank_codec;
-        let expected_codec = if configured_codec.is_sq8_residual_family() {
+        let expected_codec = if configured_codec.is_ivf_mergeable() {
             configured_codec
         } else {
             RerankCodec::Sq8Residual
@@ -799,7 +799,7 @@ impl SuperfileBuilder {
             .vec()
             .and_then(|v| v.vector_columns_config().next())
             .ok_or_else(|| BuildError::VectorReadError)?;
-        if !vec_col.rerank_codec.is_sq8_residual_family() {
+        if !vec_col.rerank_codec.is_ivf_mergeable() {
             return Err(BuildError::VectorReadError);
         }
         let column = vec_col.name.clone();

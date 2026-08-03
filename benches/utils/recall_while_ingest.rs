@@ -45,7 +45,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::{Array, Decimal128Array, RecordBatch};
+use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::Schema;
 use infino::{OptimizeOptions, supertable::Supertable};
 use rayon::prelude::*;
@@ -189,11 +189,21 @@ fn build_queries(n_cent: usize, n_queries: usize) -> Vec<Vec<f32>> {
 
 /// One append batch straight off the streamed `flat` (no corpus retained),
 /// reusing the ingest path's `vector_array` builder so the column layout is
-/// byte-identical to what `options_for(Modality::Vector, _)` expects.
-fn vector_batch(schema: &Arc<Schema>, flat: &[f32], len: usize) -> RecordBatch {
+/// byte-identical to what `options_for(Modality::Vector, _)` expects. The
+/// `Modality::Vector` schema carries the filter-bucket column ahead of the
+/// vector, so the batch mirrors that field order — bucket terms are derived
+/// from each row's global doc id (`doc_base + i`), exactly as the bulk ingest
+/// path stamps them.
+fn vector_batch(schema: &Arc<Schema>, flat: &[f32], len: usize, doc_base: usize) -> RecordBatch {
+    let buckets: Vec<String> = (doc_base..doc_base + len)
+        .map(ingest::vector_filter_bucket_term)
+        .collect();
+    let bucket_col = Arc::new(LargeStringArray::from(
+        buckets.iter().map(String::as_str).collect::<Vec<_>>(),
+    )) as Arc<dyn Array>;
     RecordBatch::try_new(
         schema.clone(),
-        vec![ingest::vector_array(&flat[..len * DIM])],
+        vec![bucket_col, ingest::vector_array(&flat[..len * DIM])],
     )
     .expect("vector RecordBatch")
 }
@@ -607,7 +617,7 @@ pub fn run() {
                 retained.extend_from_slice(&flat[..sub * DIM]);
             }
             update_heaps(&mut heaps, &queries, &flat, (n + off) as u32, sub);
-            let batch = vector_batch(&schema, &flat, sub);
+            let batch = vector_batch(&schema, &flat, sub, n + off);
             {
                 let mut writer = st.writer().expect("writer");
                 writer.append(&batch).expect("append");

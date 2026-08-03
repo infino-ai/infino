@@ -484,7 +484,7 @@ impl Supertable {
             let sq8_merge = first_vec.and_then(|v| {
                 v.vector_columns_config()
                     .next()
-                    .map(|c| c.rerank_codec.is_sq8_residual_family())
+                    .map(|c| c.rerank_codec.is_ivf_mergeable())
             });
             if multi_cell && sq8_merge == Some(true) {
                 SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(

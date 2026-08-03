@@ -406,10 +406,11 @@ impl SpilledCellRows {
 }
 
 /// Byte length of one spilled row record for a `(dim, rabitq_len)` shape:
-/// the fixed prefix plus the RaBitQ code and the Sq8+epsilon `codes`/`residuals`
-/// legs (each `dim` bytes).
-fn record_bytes(dim: usize, rabitq_len: usize) -> usize {
-    ROW_SPILL_PREFIX_BYTES + rabitq_len + 2 * dim
+/// the fixed prefix plus the RaBitQ code and the codec's per-vector rerank body
+/// (`RerankCodec::per_vector_bytes(dim)` — `2·dim` for the residual family's
+/// `codes`/`residuals` legs).
+fn record_bytes(dim: usize, rabitq_len: usize, codec: RerankCodec) -> usize {
+    ROW_SPILL_PREFIX_BYTES + rabitq_len + codec.per_vector_bytes(dim)
 }
 
 /// Append-only spill for [`MaterializedIvfRow`]s of ONE cell, accumulated
@@ -495,7 +496,8 @@ impl MaterializedRowSpillWriter {
     ) -> Result<Self, BuildError> {
         let rows_path = dir.join(format!("cell-{cell}.rows"));
         let quants_path = dir.join(format!("cell-{cell}.quants"));
-        let rows_len = u64::from(state.n_rows) * record_bytes(state.dim, state.rabitq_len) as u64;
+        let rows_len = u64::from(state.n_rows)
+            * record_bytes(state.dim, state.rabitq_len, state.rerank_codec) as u64;
         let quants_len = u64::from(state.n_quants) * (2 * state.dim * size_of::<f32>()) as u64;
 
         let rows_file = OpenOptions::new().append(true).open(&rows_path)?;
@@ -530,17 +532,28 @@ impl MaterializedRowSpillWriter {
         } else {
             self.rerank_codec = Some(enc.rerank_codec);
         }
-        if enc.codes.len() != self.dim
-            || enc.residuals.len() != self.dim
-            || row.rabitq_code.len() != self.rabitq_len
-            || enc.scale.len() != self.dim
-            || enc.offset.len() != self.dim
-        {
+        // The residual family carries a two-plane body (`codes` + `residuals`,
+        // each `dim`) plus a per-cluster `dim`-length quantizer. Single-plane
+        // codecs (Sq16) carry only the `dim*2`-byte code plane on a fixed grid:
+        // no residual plane, no per-cluster quantizer sidecar.
+        let uses_cluster_quant = enc.rerank_codec.is_sq8_residual_family();
+        let shape_ok = if uses_cluster_quant {
+            enc.codes.len() == self.dim
+                && enc.residuals.len() == self.dim
+                && enc.scale.len() == self.dim
+                && enc.offset.len() == self.dim
+        } else {
+            enc.codes.len() == self.dim * 2
+                && enc.residuals.is_empty()
+                && enc.scale.is_empty()
+                && enc.offset.is_empty()
+        };
+        if !shape_ok || row.rabitq_code.len() != self.rabitq_len {
             return Err(BuildError::Io(Error::new(
                 ErrorKind::InvalidData,
                 format!(
                     "drain spill: row shape mismatch (codes {}, residuals {}, rabitq {}, \
-                     scale {}, offset {}) vs expected dim {} / rabitq {}",
+                     scale {}, offset {}) vs expected dim {} / rabitq {} / codec {}",
                     enc.codes.len(),
                     enc.residuals.len(),
                     row.rabitq_code.len(),
@@ -548,20 +561,27 @@ impl MaterializedRowSpillWriter {
                     enc.offset.len(),
                     self.dim,
                     self.rabitq_len,
+                    enc.rerank_codec.name(),
                 ),
             )));
         }
-        let ptr = Arc::as_ptr(&enc.scale) as *const () as usize;
-        let quant_idx = match self.quant_idx_by_ptr.get(&ptr) {
-            Some(&idx) => idx,
-            None => {
-                let idx = self.n_quants;
-                self.quants.write_all(cast_slice(enc.scale.as_ref()))?;
-                self.quants.write_all(cast_slice(enc.offset.as_ref()))?;
-                self.n_quants += 1;
-                self.quant_idx_by_ptr.insert(ptr, idx);
-                idx
+        let quant_idx = if uses_cluster_quant {
+            let ptr = Arc::as_ptr(&enc.scale) as *const () as usize;
+            match self.quant_idx_by_ptr.get(&ptr) {
+                Some(&idx) => idx,
+                None => {
+                    let idx = self.n_quants;
+                    self.quants.write_all(cast_slice(enc.scale.as_ref()))?;
+                    self.quants.write_all(cast_slice(enc.offset.as_ref()))?;
+                    self.n_quants += 1;
+                    self.quant_idx_by_ptr.insert(ptr, idx);
+                    idx
+                }
             }
+        } else {
+            // Single-plane codecs write no quantizer table; the index is a
+            // placeholder never consulted on read.
+            0
         };
         self.rows.write_all(&row.stable_id.to_le_bytes())?;
         self.rows.write_all(&row.cluster.to_le_bytes())?;
@@ -695,21 +715,35 @@ fn read_spilled_row(
         u32::from_le_bytes(prefix[20..24].try_into().expect("4-byte u32 slice")) as usize;
     let norm_flag = prefix[24];
     let norm = f32::from_le_bytes(prefix[25..29].try_into().expect("4-byte f32 slice"));
-    let (scale, offset) = quants.get(quant_idx).cloned().ok_or_else(|| {
-        BuildError::Io(Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "drain spill: quantizer index {quant_idx} out of range ({} entries)",
-                quants.len()
-            ),
-        ))
-    })?;
+    // Single-plane codecs (Sq16) carry no quantizer table; their scale/offset
+    // are empty and the parse below ignores them. The residual family looks up
+    // the per-cluster quantizer by the index stored in the row prefix.
+    let (scale, offset) = if rerank_codec.is_sq8_residual_family() {
+        quants.get(quant_idx).cloned().ok_or_else(|| {
+            BuildError::Io(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "drain spill: quantizer index {quant_idx} out of range ({} entries)",
+                    quants.len()
+                ),
+            ))
+        })?
+    } else {
+        let empty: Arc<[f32]> = Arc::from(Vec::new());
+        (empty.clone(), empty)
+    };
     let mut rabitq_code = vec![0u8; rabitq_len];
     reader.read_exact(&mut rabitq_code)?;
-    let mut codes = vec![0u8; dim];
-    reader.read_exact(&mut codes)?;
-    let mut residuals = vec![0u8; dim];
-    reader.read_exact(&mut residuals)?;
+    // The rerank body is stored as its already-encoded per-vector bytes; split
+    // it back into codes/residuals via the codec's ops. `store_norm = false`:
+    // the norm is carried explicitly in the row prefix, so the split must not
+    // recompute (and possibly diverge from) it.
+    let mut row_bytes = vec![0u8; rerank_codec.per_vector_bytes(dim)];
+    reader.read_exact(&mut row_bytes)?;
+    let parts = rerank_codec
+        .ops()
+        .expect("spilled row uses a quantized-rerank codec")
+        .parse_materialized_row(&row_bytes, dim, &scale, &offset, false);
     let norm_sq = (norm_flag == NORM_PRESENT).then_some(norm);
     Ok(MaterializedIvfRow {
         local_doc_id: 0,
@@ -721,8 +755,8 @@ fn read_spilled_row(
             rerank_codec,
             scale,
             offset,
-            codes,
-            residuals,
+            codes: parts.codes,
+            residuals: parts.residuals,
             norm_sq,
         },
     })

@@ -14,7 +14,19 @@
 //! - [`RerankCodec::Sq8FixedResidual`]: the same two-byte layout on a
 //!   fixed cosine-only grid (`offset=-1`, `scale=2/255`, residual
 //!   divisor `256`). The payload is portable across cluster changes.
-//!   Default codec.
+//! - [`RerankCodec::Sq16`]: a flat uniform 16-bit scalar quantizer on
+//!   a fixed cosine-only grid (`offset=-1`, `scale=2/65535`). Stores
+//!   one little-endian `u16` code per dimension (`dim × 2` bytes per
+//!   vector — the same footprint as `Sq8FixedResidual`'s
+//!   `[u8 code ‖ i8 residual]`, but a single plane scored in one pass
+//!   instead of two). No residual plane. Because the grid is fixed
+//!   constants, `Sq16` needs no per-cluster scale/offset arrays; its
+//!   only `codec_meta` is the per-doc dequantized-norm table
+//!   (`n_docs × 4` bytes for cosine/L2Sq), matching the Sq8 family so
+//!   the cosine kernel divides by `‖d̂‖`. The default cosine codec:
+//!   same footprint as the split-plane `Sq8FixedResidual` but scored in
+//!   one pass, and leaner on disk (norms only, no fixed scale/offset
+//!   arrays).
 //! - [`RerankCodec::RabitqOnly`]: no rerank column at all. The
 //!   1-bit RaBitQ shortlist is the final ranking — opt-in,
 //!   recall-degraded, shrinks the superfile by ~30× at 1M × 384.
@@ -44,7 +56,16 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::superfile::vector::distance::{Metric, SQ8_RESIDUAL_DIVISOR};
+use crate::superfile::{
+    BuildError,
+    vector::{
+        cell_posting::{EncodedCellRow, residual_family_materialize_into_cluster_quant},
+        distance::{
+            Metric, SQ8_RESIDUAL_DIVISOR, dequantize_sq8_residual_into, dequantize_sq16_into,
+            sq8_residual_norm_sq, sq16_decoded_norm_sq,
+        },
+    },
+};
 
 /// `dim` at and below which a column counts as "low-dim" for the
 /// rerank-floor calibration table in
@@ -82,6 +103,12 @@ pub(crate) const SQ8_FIXED_SCALE: f32 = 2.0 / 255.0;
 /// Residual divisor for the portable cosine-only Sq8 grid.
 pub(crate) const SQ8_FIXED_RESIDUAL_DIVISOR: f32 = 256.0;
 
+/// Absolute offset for the flat cosine-only Sq16 grid.
+pub(crate) const SQ16_FIXED_OFFSET: f32 = -1.0;
+/// Absolute scale for the flat cosine-only Sq16 grid: the full
+/// `u16` range (`0..=65535`) spans `[-1, 1]` in even steps.
+pub(crate) const SQ16_FIXED_SCALE: f32 = 2.0 / 65535.0;
+
 /// Per-vector-index rerank codec. Picks the on-disk byte layout of the
 /// per-vector rerank values inside the subsection's `full[]`
 /// region.
@@ -106,6 +133,16 @@ pub enum RerankCodec {
     /// yielding approximately 16-bit scalar precision while keeping bytes
     /// portable across drain, compaction, and split.
     Sq8FixedResidual,
+    /// Flat uniform 16-bit scalar quantizer on a fixed cosine-only
+    /// grid (`offset = -1`, `scale = 2/65535`). One little-endian
+    /// `u16` code per dimension (`dim × 2` bytes per vector), scored
+    /// in a single pass — no residual plane. Reconstruction is
+    /// `x = code × scale + offset`. The grid is fixed constants shared
+    /// by every cluster and file, so `Sq16` stores no per-cluster
+    /// scale/offset arrays; its only `codec_meta` is the per-doc
+    /// dequantized-norm table (`n_docs × 4` for cosine/L2Sq), matching
+    /// the Sq8 family so the cosine kernel divides by `‖d̂‖`.
+    Sq16,
     /// No rerank column at all. The 1-bit RaBitQ shortlist is
     /// the final ranking. Opt-in — recall drops 0.05–0.15 on
     /// typical normalized-Gaussian / image-embedding corpora;
@@ -119,10 +156,13 @@ pub enum RerankCodec {
 }
 
 impl Default for RerankCodec {
-    /// `Sq8FixedResidual` is the portable cosine default. Metric-aware
-    /// constructors retain local residual encoding for non-cosine metrics.
+    /// `Sq16` is the cosine default — a single 16-bit plane on the fixed
+    /// `[-1, 1]` grid: finer per-component precision than `Sq8FixedResidual`
+    /// at the same 2 bytes/dim, faster rerank, and recall provably ≥. Metric-
+    /// aware constructors retain local residual encoding (`Sq8Residual`) for
+    /// non-cosine metrics, whose values are not bounded to `[-1, 1]`.
     fn default() -> Self {
-        Self::Sq8FixedResidual
+        Self::Sq16
     }
 }
 
@@ -138,6 +178,7 @@ impl RerankCodec {
             Self::Sq8Residual => 1,
             Self::RabitqOnly => 2,
             Self::Sq8FixedResidual => 3,
+            Self::Sq16 => 4,
         }
     }
 
@@ -152,6 +193,7 @@ impl RerankCodec {
             1 => Some(Self::Sq8Residual),
             2 => Some(Self::RabitqOnly),
             3 => Some(Self::Sq8FixedResidual),
+            4 => Some(Self::Sq16),
             _ => None,
         }
     }
@@ -165,6 +207,7 @@ impl RerankCodec {
             Self::Sq8Residual => "sq8_residual",
             Self::RabitqOnly => "rabitq_only",
             Self::Sq8FixedResidual => "sq8_fixed_residual",
+            Self::Sq16 => "sq16",
         }
     }
 
@@ -174,8 +217,24 @@ impl RerankCodec {
     pub const fn per_vector_bytes(self, dim: usize) -> usize {
         match self {
             Self::Fp32 => dim * 4,
-            Self::Sq8Residual | Self::Sq8FixedResidual => dim * 2,
+            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 => dim * 2,
             Self::RabitqOnly => 0,
+        }
+    }
+
+    /// The vector `dim` implied by a materialized row's `codes` byte length.
+    /// The residual family stores a `dim`-byte u8 coarse plane, so the code
+    /// length *is* `dim`; the single-plane Sq16 stores a `dim*2`-byte u16
+    /// plane, so `dim` is half the code length. The drain spill sizes a
+    /// per-cell writer from the first row it materializes and must derive
+    /// `dim` this way — assuming `codes.len() == dim` doubles it for Sq16 and
+    /// trips the spill's row-shape check.
+    #[inline]
+    pub(crate) fn dim_from_codes_len(self, codes_len: usize) -> usize {
+        if self.is_sq8_residual_family() {
+            codes_len
+        } else {
+            codes_len / 2
         }
     }
 
@@ -200,14 +259,44 @@ impl RerankCodec {
     pub const fn is_implemented(self) -> bool {
         matches!(
             self,
-            Self::Fp32 | Self::Sq8Residual | Self::Sq8FixedResidual | Self::RabitqOnly
+            Self::Fp32 | Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 | Self::RabitqOnly
         )
     }
 
     /// Whether the codec uses the shared `[u8 code | i8 residual]` layout.
+    /// `Sq16` is deliberately **not** a member — it is a single `u16`
+    /// plane with its own scoring path, not the two-plane residual layout.
     #[inline]
     pub const fn is_sq8_residual_family(self) -> bool {
         matches!(self, Self::Sq8Residual | Self::Sq8FixedResidual)
+    }
+
+    /// Whether this codec participates in the IVF drain / merge / compaction
+    /// maintenance paths that re-quantize rows into a destination cluster
+    /// quantizer. True for the residual family (`Sq8Residual`,
+    /// `Sq8FixedResidual`) and for the single-plane `Sq16` codec, all of which
+    /// carry a cold-path `ops()` impl and so can be built-from-source, drained,
+    /// merged, and compacted. `Fp32` / `RabitqOnly` have their own (or no)
+    /// rerank plane and are never IVF-merged here.
+    ///
+    /// This is the gate predicate for the maintenance sites; it replaces the
+    /// former direct use of [`Self::is_sq8_residual_family`] at those sites so
+    /// the mergeable set is named for what it means (eligible for IVF merge)
+    /// rather than for the byte layout that happens to coincide with it today.
+    #[inline]
+    pub const fn is_ivf_mergeable(self) -> bool {
+        matches!(
+            self,
+            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16
+        )
+    }
+
+    /// Whether this is the flat single-plane `u16` codec. Scored via
+    /// [`crate::superfile::vector::distance::Sq16Kernel`] — the `Fp32`
+    /// distance path with a `u16 → f32` dequant front.
+    #[inline]
+    pub const fn is_sq16(self) -> bool {
+        matches!(self, Self::Sq16)
     }
 
     /// Residual divisor implied by the on-disk codec discriminator.
@@ -216,20 +305,32 @@ impl RerankCodec {
         match self {
             Self::Sq8Residual => Some(SQ8_RESIDUAL_DIVISOR),
             Self::Sq8FixedResidual => Some(SQ8_FIXED_RESIDUAL_DIVISOR),
-            Self::Fp32 | Self::RabitqOnly => None,
+            // `Sq16` is a single plane — no residual step, no divisor.
+            Self::Fp32 | Self::Sq16 | Self::RabitqOnly => None,
         }
     }
 
-    /// Whether every cluster uses the fixed absolute quantizer.
+    /// Whether the codec quantizes onto a fixed absolute `[-1, 1]`
+    /// grid shared by every cluster and file (rather than a per-cluster
+    /// fitted quantizer). True for both fixed-grid cosine codecs —
+    /// `Sq8FixedResidual` and `Sq16`.
+    ///
+    /// Note this describes the *grid*, not the on-disk metadata layout:
+    /// `Sq16` is fixed-quantizer **and** carries no `codec_meta`, so
+    /// per-cluster scale/offset-array sites must additionally gate on
+    /// [`Self::is_sq8_residual_family`] to stay off the single-plane
+    /// `Sq16` path.
     #[inline]
     pub const fn uses_fixed_quantizer(self) -> bool {
-        matches!(self, Self::Sq8FixedResidual)
+        matches!(self, Self::Sq8FixedResidual | Self::Sq16)
     }
 
-    /// Whether this codec supports the requested metric.
+    /// Whether this codec supports the requested metric. The
+    /// fixed-grid cosine codecs (`Sq8FixedResidual`, `Sq16`) pin the
+    /// quantizer to the `[-1, 1]` cosine range and so are Cosine-only.
     #[inline]
     pub const fn supports_metric(self, metric: Metric) -> bool {
-        !matches!(self, Self::Sq8FixedResidual) || matches!(metric, Metric::Cosine)
+        !matches!(self, Self::Sq8FixedResidual | Self::Sq16) || matches!(metric, Metric::Cosine)
     }
 
     /// Recommended **lower bound** on `rerank_mult` for this
@@ -249,7 +350,9 @@ impl RerankCodec {
     pub const fn recommended_rerank_mult_floor(self, dim: usize) -> Option<usize> {
         let high_dim = dim > LOW_DIM_RERANK_FLOOR_THRESHOLD;
         match self {
-            Self::Fp32 => Some(if high_dim {
+            // `Sq16` is ~16-bit clean, so its rerank floor matches
+            // `Fp32` rather than the lossier Sq8 first-pass.
+            Self::Fp32 | Self::Sq16 => Some(if high_dim {
                 FP32_HIGH_DIM_RERANK_FLOOR
             } else {
                 FP32_LOW_DIM_RERANK_FLOOR
@@ -273,6 +376,13 @@ impl RerankCodec {
     /// Stored immediately before the subsection's `full[]` region.
     ///
     /// - `Fp32` / `RabitqOnly`: `0` (no codec metadata).
+    /// - `Sq16`: per-doc `sum_x_decoded² : f32` table (`n_docs × 4`
+    ///   bytes) for `L2Sq`/`Cosine`, and **nothing else** — the grid is
+    ///   fixed constants, so there are no per-cluster scale/offset
+    ///   arrays. The per-doc norm lets the cosine kernel divide by the
+    ///   dequantized vector norm (`base − dot/‖d̂‖`), matching the Sq8
+    ///   family so the recall comparison is apples-to-apples. `NegDot`
+    ///   drops the table (0 bytes).
     /// - `Sq8Residual`: **per-cluster** per-dim `(scale, offset)` arrays
     ///   (`2 × n_cent × dim × 4` bytes) plus, for `L2Sq`/`Cosine`-metric
     ///   columns, a per-doc `sum_x_decoded² : f32` table
@@ -307,6 +417,13 @@ impl RerankCodec {
     ) -> usize {
         match self {
             Self::Fp32 | Self::RabitqOnly => 0,
+            // `Sq16`'s grid is fixed constants — no scale/offset arrays.
+            // It carries only the per-doc dequantized-norm table for the
+            // norm-corrected cosine (and L2Sq) kernel.
+            Self::Sq16 => match metric {
+                Metric::L2Sq | Metric::Cosine => n_docs * 4,
+                Metric::NegDot => 0,
+            },
             Self::Sq8Residual | Self::Sq8FixedResidual => {
                 let scale_offset_bytes = 2 * n_cent * dim * 4;
                 let norms_bytes = match metric {
@@ -325,17 +442,408 @@ impl fmt::Display for RerankCodec {
     }
 }
 
+/// The codes / residuals / per-doc norm parsed out of one materialized on-disk
+/// rerank row. `residuals` is empty for single-plane codecs (`Sq16`).
+pub(crate) struct EncodedRowParts {
+    pub codes: Vec<u8>,
+    pub residuals: Vec<u8>,
+    pub norm_sq: Option<f32>,
+}
+
+/// Absolute in-subsection byte offsets of a codec's `codec_meta` sub-regions,
+/// computed from the region's base offset. `None` marks a sub-region a codec
+/// does not carry: `Sq16` has no per-cluster `scale`/`offset` arrays (fixed
+/// grid), so `scale_off`/`offset_off` are `None`; `norms_off` is `None` for
+/// `NegDot` (no per-doc dequantized-norm table). Sites that write scale/offset
+/// arrays must skip when `scale_off == None` — a stale write corrupts the
+/// subsection.
+pub(crate) struct CodecMetaLayout {
+    pub scale_off: Option<usize>,
+    pub offset_off: Option<usize>,
+    pub norms_off: Option<usize>,
+}
+
+/// Per-codec operations for the cold paths (build-from-source, drain read-back,
+/// IVF merge, compaction) so those paths stop branching on the codec: a new
+/// codec is one `impl` + one arm in [`RerankCodec::ops`]. Implemented only by
+/// the quantized-rerank family (`Sq8Residual`, `Sq8FixedResidual`, `Sq16`);
+/// `ops()` returns `None` for `Fp32` / `RabitqOnly`, which carry no quantized
+/// rerank plane and keep their own paths. The HOT per-candidate scoring kernel
+/// is deliberately NOT part of this trait — it stays statically dispatched.
+pub(crate) trait RerankCodecOps: Sync {
+    /// Split one materialized on-disk rerank row into its codes/residuals planes
+    /// plus the per-doc dequantized norm (when `store_norm`). `scale`/`offset`
+    /// are the row's per-cluster quantizer (ignored by fixed-grid codecs).
+    /// `row.len()` must equal `RerankCodec::per_vector_bytes(dim)`.
+    fn parse_materialized_row(
+        &self,
+        row: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        store_norm: bool,
+    ) -> EncodedRowParts;
+
+    /// Dequantize one row's codes (plus `residuals`, ignored by single-plane
+    /// codecs) into fp32 `out` (`out.len() == dim`). `scale`/`offset` are the
+    /// row's per-cluster quantizer (ignored by fixed-grid codecs). The
+    /// residual family threads its codec's residual divisor internally so
+    /// callers no longer `residual_divisor().expect(...)` at the site.
+    fn dequantize_row_into(
+        &self,
+        codes: &[u8],
+        residuals: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        out: &mut [f32],
+    );
+
+    /// Dequantized-vector squared norm `Σ_d x[d]²` for one materialized
+    /// on-disk row. `code` is the contiguous per-vector body
+    /// (`RerankCodec::per_vector_bytes(dim)` bytes: `[codes ‖ residuals]` for
+    /// the residual family, a single `u16` plane for `Sq16`). `scale`/`offset`
+    /// are the row's per-cluster quantizer (ignored by fixed-grid codecs). The
+    /// residual family threads its residual divisor internally.
+    fn decoded_norm_sq(&self, code: &[u8], dim: usize, scale: &[f32], offset: &[f32]) -> f32;
+
+    /// Copy or transcode one source `row` into the destination cluster
+    /// quantizer, writing `out` (`RerankCodec::per_vector_bytes(dim)` bytes).
+    /// `self` is the destination codec's ops. Returns residual-corrected
+    /// `‖x‖²` when `store_norm` (L2Sq/Cosine). Errors if `row`'s codec does not
+    /// match this destination codec.
+    fn materialize_row_into_cluster_quant(
+        &self,
+        row: &EncodedCellRow,
+        dst_scale: &[f32],
+        dst_offset: &[f32],
+        dim: usize,
+        out: &mut [u8],
+        store_norm: bool,
+    ) -> Result<Option<f32>, BuildError>;
+
+    /// Absolute byte offsets of this codec's `codec_meta` sub-regions given the
+    /// region base `meta_off`. Mirrors `RerankCodec::codec_meta_bytes`'s layout:
+    /// residual family lays out `[scale ‖ offset ‖ norms?]`; `Sq16` carries only
+    /// `[norms?]` (no scale/offset arrays). `norms_off` is present only for
+    /// `L2Sq`/`Cosine`.
+    fn codec_meta_layout(
+        &self,
+        meta_off: usize,
+        n_cent: usize,
+        dim: usize,
+        metric: Metric,
+    ) -> CodecMetaLayout;
+}
+
+pub(crate) struct Sq8ResidualOps;
+pub(crate) struct Sq8FixedResidualOps;
+pub(crate) struct Sq16Ops;
+
+/// Shared residual-family row split: `dim` u8 coarse codes + `dim` i8 residual
+/// codes; norm via [`sq8_residual_norm_sq`] with the codec's `divisor`.
+fn parse_residual_family_row(
+    row: &[u8],
+    dim: usize,
+    scale: &[f32],
+    offset: &[f32],
+    divisor: f32,
+    store_norm: bool,
+) -> EncodedRowParts {
+    let codes = row[..dim].to_vec();
+    let residuals = row[dim..dim * 2].to_vec();
+    let norm_sq =
+        store_norm.then(|| sq8_residual_norm_sq(scale, offset, &codes, &residuals, divisor));
+    EncodedRowParts {
+        codes,
+        residuals,
+        norm_sq,
+    }
+}
+
+/// Shared residual-family dequant: delegate to [`dequantize_sq8_residual_into`]
+/// with the codec's residual `divisor`. `out.len()` fixes `dim`.
+fn dequantize_residual_family_into(
+    codes: &[u8],
+    residuals: &[u8],
+    scale: &[f32],
+    offset: &[f32],
+    divisor: f32,
+    out: &mut [f32],
+) {
+    dequantize_sq8_residual_into(scale, offset, codes, residuals, divisor, out);
+}
+
+/// Shared residual-family decoded-norm: split the contiguous per-vector body
+/// `[codes(dim) ‖ residuals(dim)]` and reduce via [`sq8_residual_norm_sq`]
+/// with the codec's residual `divisor`.
+fn residual_family_norm_sq(
+    code: &[u8],
+    dim: usize,
+    scale: &[f32],
+    offset: &[f32],
+    divisor: f32,
+) -> f32 {
+    sq8_residual_norm_sq(scale, offset, &code[..dim], &code[dim..dim * 2], divisor)
+}
+
+/// Shared residual-family `codec_meta` layout: `[scale ‖ offset ‖ norms?]`,
+/// mirroring [`RerankCodec::codec_meta_bytes`]. Norms present for L2Sq/Cosine.
+fn residual_family_codec_meta_layout(
+    meta_off: usize,
+    n_cent: usize,
+    dim: usize,
+    metric: Metric,
+) -> CodecMetaLayout {
+    let scale_off = meta_off;
+    let offset_off = scale_off + n_cent * dim * size_of::<f32>();
+    let norms_off = matches!(metric, Metric::L2Sq | Metric::Cosine)
+        .then_some(offset_off + n_cent * dim * size_of::<f32>());
+    CodecMetaLayout {
+        scale_off: Some(scale_off),
+        offset_off: Some(offset_off),
+        norms_off,
+    }
+}
+
+impl RerankCodecOps for Sq8ResidualOps {
+    fn parse_materialized_row(
+        &self,
+        row: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        store_norm: bool,
+    ) -> EncodedRowParts {
+        parse_residual_family_row(row, dim, scale, offset, SQ8_RESIDUAL_DIVISOR, store_norm)
+    }
+
+    fn dequantize_row_into(
+        &self,
+        codes: &[u8],
+        residuals: &[u8],
+        _dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        out: &mut [f32],
+    ) {
+        dequantize_residual_family_into(codes, residuals, scale, offset, SQ8_RESIDUAL_DIVISOR, out);
+    }
+
+    fn decoded_norm_sq(&self, code: &[u8], dim: usize, scale: &[f32], offset: &[f32]) -> f32 {
+        residual_family_norm_sq(code, dim, scale, offset, SQ8_RESIDUAL_DIVISOR)
+    }
+
+    fn materialize_row_into_cluster_quant(
+        &self,
+        row: &EncodedCellRow,
+        dst_scale: &[f32],
+        dst_offset: &[f32],
+        dim: usize,
+        out: &mut [u8],
+        store_norm: bool,
+    ) -> Result<Option<f32>, BuildError> {
+        residual_family_materialize_into_cluster_quant(
+            row,
+            RerankCodec::Sq8Residual,
+            dst_scale,
+            dst_offset,
+            dim,
+            out,
+            store_norm,
+        )
+    }
+
+    fn codec_meta_layout(
+        &self,
+        meta_off: usize,
+        n_cent: usize,
+        dim: usize,
+        metric: Metric,
+    ) -> CodecMetaLayout {
+        residual_family_codec_meta_layout(meta_off, n_cent, dim, metric)
+    }
+}
+
+impl RerankCodecOps for Sq8FixedResidualOps {
+    fn parse_materialized_row(
+        &self,
+        row: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        store_norm: bool,
+    ) -> EncodedRowParts {
+        parse_residual_family_row(
+            row,
+            dim,
+            scale,
+            offset,
+            SQ8_FIXED_RESIDUAL_DIVISOR,
+            store_norm,
+        )
+    }
+
+    fn dequantize_row_into(
+        &self,
+        codes: &[u8],
+        residuals: &[u8],
+        _dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        out: &mut [f32],
+    ) {
+        dequantize_residual_family_into(
+            codes,
+            residuals,
+            scale,
+            offset,
+            SQ8_FIXED_RESIDUAL_DIVISOR,
+            out,
+        );
+    }
+
+    fn decoded_norm_sq(&self, code: &[u8], dim: usize, scale: &[f32], offset: &[f32]) -> f32 {
+        residual_family_norm_sq(code, dim, scale, offset, SQ8_FIXED_RESIDUAL_DIVISOR)
+    }
+
+    fn materialize_row_into_cluster_quant(
+        &self,
+        row: &EncodedCellRow,
+        dst_scale: &[f32],
+        dst_offset: &[f32],
+        dim: usize,
+        out: &mut [u8],
+        store_norm: bool,
+    ) -> Result<Option<f32>, BuildError> {
+        residual_family_materialize_into_cluster_quant(
+            row,
+            RerankCodec::Sq8FixedResidual,
+            dst_scale,
+            dst_offset,
+            dim,
+            out,
+            store_norm,
+        )
+    }
+
+    fn codec_meta_layout(
+        &self,
+        meta_off: usize,
+        n_cent: usize,
+        dim: usize,
+        metric: Metric,
+    ) -> CodecMetaLayout {
+        residual_family_codec_meta_layout(meta_off, n_cent, dim, metric)
+    }
+}
+
+impl RerankCodecOps for Sq16Ops {
+    fn parse_materialized_row(
+        &self,
+        row: &[u8],
+        dim: usize,
+        _scale: &[f32],
+        _offset: &[f32],
+        store_norm: bool,
+    ) -> EncodedRowParts {
+        // Single u16 plane (dim*2 bytes); no residual plane. Norm is computed
+        // against the fixed grid, matching the streaming builder byte-for-byte.
+        let codes = row[..dim * 2].to_vec();
+        let norm_sq = store_norm.then(|| sq16_decoded_norm_sq(&codes, dim));
+        EncodedRowParts {
+            codes,
+            residuals: Vec::new(),
+            norm_sq,
+        }
+    }
+
+    fn dequantize_row_into(
+        &self,
+        codes: &[u8],
+        _residuals: &[u8],
+        _dim: usize,
+        _scale: &[f32],
+        _offset: &[f32],
+        out: &mut [f32],
+    ) {
+        // Single u16 plane; residuals/scale/offset are unused (fixed grid).
+        dequantize_sq16_into(codes, out);
+    }
+
+    fn decoded_norm_sq(&self, code: &[u8], dim: usize, _scale: &[f32], _offset: &[f32]) -> f32 {
+        // Single u16 plane (dim*2 bytes); norm against the fixed grid.
+        sq16_decoded_norm_sq(&code[..dim * 2], dim)
+    }
+
+    fn materialize_row_into_cluster_quant(
+        &self,
+        row: &EncodedCellRow,
+        _dst_scale: &[f32],
+        _dst_offset: &[f32],
+        dim: usize,
+        out: &mut [u8],
+        store_norm: bool,
+    ) -> Result<Option<f32>, BuildError> {
+        if row.rerank_codec != RerankCodec::Sq16 {
+            return Err(BuildError::VectorSchemaMismatch(format!(
+                "cannot transcode Sq16 row from {} to {}",
+                row.rerank_codec.name(),
+                RerankCodec::Sq16.name()
+            )));
+        }
+        // Fixed `[-1, 1]` grid: the `u16` plane is portable across cluster
+        // changes, so a merge is a verbatim byte copy (no transcode ever).
+        out[..dim * 2].copy_from_slice(&row.codes);
+        Ok(store_norm.then(|| {
+            row.norm_sq
+                .unwrap_or_else(|| sq16_decoded_norm_sq(&row.codes, dim))
+        }))
+    }
+
+    fn codec_meta_layout(
+        &self,
+        meta_off: usize,
+        _n_cent: usize,
+        _dim: usize,
+        metric: Metric,
+    ) -> CodecMetaLayout {
+        // Fixed grid — no per-cluster scale/offset arrays. The only codec_meta
+        // is the per-doc dequantized-norm table (L2Sq/Cosine), which sits at
+        // the head of the region.
+        let norms_off = matches!(metric, Metric::L2Sq | Metric::Cosine).then_some(meta_off);
+        CodecMetaLayout {
+            scale_off: None,
+            offset_off: None,
+            norms_off,
+        }
+    }
+}
+
+impl RerankCodec {
+    /// Cold-path ops for the quantized-rerank family; `None` for `Fp32` /
+    /// `RabitqOnly` (no quantized rerank plane — they keep their own paths).
+    pub(crate) fn ops(&self) -> Option<&'static dyn RerankCodecOps> {
+        match self {
+            Self::Sq8Residual => Some(&Sq8ResidualOps),
+            Self::Sq8FixedResidual => Some(&Sq8FixedResidualOps),
+            Self::Sq16 => Some(&Sq16Ops),
+            Self::Fp32 | Self::RabitqOnly => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Default codec is `Sq8FixedResidual`. Any change here is a
+    /// Default codec is `Sq16` (the cosine default). Any change here is a
     /// load-bearing format choice — every caller that uses
     /// `RerankCodec::default()` silently follows this pick, so
     /// the test pins the contract.
     #[test]
-    fn default_is_sq8_fixed_residual() {
-        assert_eq!(RerankCodec::default(), RerankCodec::Sq8FixedResidual);
+    fn default_is_sq16() {
+        assert_eq!(RerankCodec::default(), RerankCodec::Sq16);
     }
 
     /// `Fp32`'s codec_id is zero. Older superfiles have all-zero
@@ -357,6 +865,7 @@ mod tests {
             RerankCodec::Fp32,
             RerankCodec::Sq8Residual,
             RerankCodec::Sq8FixedResidual,
+            RerankCodec::Sq16,
             RerankCodec::RabitqOnly,
         ] {
             assert_eq!(
@@ -373,7 +882,7 @@ mod tests {
     /// guessing.
     #[test]
     fn unknown_codec_id_is_none() {
-        for id in [4u8, 5, 16, 200, 255] {
+        for id in [5u8, 6, 16, 200, 255] {
             assert_eq!(
                 RerankCodec::from_codec_id(id),
                 None,
@@ -390,7 +899,24 @@ mod tests {
         assert_eq!(RerankCodec::Fp32.per_vector_bytes(384), 1536);
         assert_eq!(RerankCodec::Sq8Residual.per_vector_bytes(384), 768);
         assert_eq!(RerankCodec::Sq8FixedResidual.per_vector_bytes(384), 768);
+        assert_eq!(RerankCodec::Sq16.per_vector_bytes(384), 768);
         assert_eq!(RerankCodec::RabitqOnly.per_vector_bytes(384), 0);
+    }
+
+    /// Regression guard for the drain spill: the per-cell spill writer is
+    /// sized from the first materialized row's `codes` length, which is `dim`
+    /// for the residual family (u8 coarse plane) but `dim*2` for Sq16 (u16
+    /// plane). Assuming `codes.len() == dim` doubled the Sq16 spill dim and
+    /// tripped the row-shape check ("codes N vs expected dim 2N"). This pins
+    /// the inverse so a single-plane codec resolves back to its true `dim`.
+    #[test]
+    fn dim_from_codes_len_inverts_code_plane_size() {
+        let dim = 1024usize;
+        // Residual family: code plane is `dim` u8 bytes.
+        assert_eq!(RerankCodec::Sq8Residual.dim_from_codes_len(dim), dim);
+        assert_eq!(RerankCodec::Sq8FixedResidual.dim_from_codes_len(dim), dim);
+        // Sq16: code plane is `dim*2` bytes (u16), so dim is half the length.
+        assert_eq!(RerankCodec::Sq16.dim_from_codes_len(dim * 2), dim);
     }
 
     /// `writes_full` is the inverse of "this codec is
@@ -403,6 +929,7 @@ mod tests {
             RerankCodec::Fp32,
             RerankCodec::Sq8Residual,
             RerankCodec::Sq8FixedResidual,
+            RerankCodec::Sq16,
             RerankCodec::RabitqOnly,
         ] {
             assert_eq!(
@@ -419,6 +946,7 @@ mod tests {
         assert!(RerankCodec::Fp32.is_implemented());
         assert!(RerankCodec::Sq8Residual.is_implemented());
         assert!(RerankCodec::Sq8FixedResidual.is_implemented());
+        assert!(RerankCodec::Sq16.is_implemented());
         assert!(RerankCodec::RabitqOnly.is_implemented());
     }
 
@@ -442,6 +970,11 @@ mod tests {
             RerankCodec::Sq8FixedResidual.recommended_rerank_mult_floor(384),
             Some(50)
         );
+        // Sq16 tracks the Fp32 floor (it is near-lossless).
+        assert_eq!(
+            RerankCodec::Sq16.recommended_rerank_mult_floor(384),
+            Some(20)
+        );
         assert_eq!(
             RerankCodec::RabitqOnly.recommended_rerank_mult_floor(384),
             None
@@ -458,6 +991,10 @@ mod tests {
         assert_eq!(
             RerankCodec::Sq8FixedResidual.recommended_rerank_mult_floor(1024),
             Some(100)
+        );
+        assert_eq!(
+            RerankCodec::Sq16.recommended_rerank_mult_floor(1024),
+            Some(50)
         );
         assert_eq!(
             RerankCodec::RabitqOnly.recommended_rerank_mult_floor(1024),
@@ -481,12 +1018,14 @@ mod tests {
             RerankCodec::Sq8FixedResidual.to_string(),
             "sq8_fixed_residual"
         );
+        assert_eq!(RerankCodec::Sq16.to_string(), "sq16");
         assert_eq!(RerankCodec::RabitqOnly.to_string(), "rabitq_only");
         // `Display` must agree with `name` byte-for-byte.
         for c in [
             RerankCodec::Fp32,
             RerankCodec::Sq8Residual,
             RerankCodec::Sq8FixedResidual,
+            RerankCodec::Sq16,
             RerankCodec::RabitqOnly,
         ] {
             assert_eq!(c.to_string(), c.name());
@@ -546,5 +1085,42 @@ mod tests {
         );
         assert!(RerankCodec::Sq8FixedResidual.uses_fixed_quantizer());
         assert!(RerankCodec::Sq8FixedResidual.is_sq8_residual_family());
+    }
+
+    /// `Sq16` is the flat single-plane codec: cosine-only, no residual
+    /// divisor, `dim × 2` bytes per vector, and — unlike the residual
+    /// family — it carries **no** `codec_meta` (fixed grid, no per-doc
+    /// norms). It must also stay out of `is_sq8_residual_family()` so
+    /// the reader routes it to its own scoring path.
+    #[test]
+    fn sq16_contract_is_flat_cosine_only_norms_meta() {
+        assert!(RerankCodec::Sq16.supports_metric(Metric::Cosine));
+        assert!(!RerankCodec::Sq16.supports_metric(Metric::L2Sq));
+        assert!(!RerankCodec::Sq16.supports_metric(Metric::NegDot));
+        assert_eq!(RerankCodec::Sq16.residual_divisor(), None);
+        assert!(RerankCodec::Sq16.is_sq16());
+        assert!(!RerankCodec::Sq16.is_sq8_residual_family());
+        // Sq16 is a fixed `[-1, 1]` grid, semantically like
+        // Sq8FixedResidual, so callers see it as fixed-quantizer — but
+        // (unlike the residual family) it still carries no codec_meta,
+        // asserted below.
+        assert!(RerankCodec::Sq16.uses_fixed_quantizer());
+        assert!(RerankCodec::Sq16.writes_full());
+        assert_eq!(RerankCodec::Sq16.per_vector_bytes(1024), 1024 * 2);
+        // codec_meta = per-doc norms only (no scale/offset arrays):
+        // n_docs*4 for cosine/L2Sq, 0 for NegDot. Crucially it excludes
+        // the residual family's 2*n_cent*dim*4 array bytes.
+        assert_eq!(
+            RerankCodec::Sq16.codec_meta_bytes(384, 1_000_000, 1024, Metric::Cosine),
+            1_000_000 * 4
+        );
+        assert_eq!(
+            RerankCodec::Sq16.codec_meta_bytes(384, 1_000_000, 1024, Metric::L2Sq),
+            1_000_000 * 4
+        );
+        assert_eq!(
+            RerankCodec::Sq16.codec_meta_bytes(384, 1_000_000, 1024, Metric::NegDot),
+            0
+        );
     }
 }

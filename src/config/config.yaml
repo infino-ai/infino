@@ -127,11 +127,14 @@ vector:
   # Default rerank codec for cosine vector columns. Non-cosine metrics
   # still use locally fitted sq8_residual (values are not bounded to
   # [-1, 1]). Override per column at table-create time when needed.
-  #   sq8_fixed_residual — fixed absolute grid (default; portable bytes)
+  #   sq16               — single 16-bit plane on the fixed [-1, 1] grid
+  #                        (default; finer grid than sq8_fixed_residual at
+  #                        the same 2 bytes/dim, faster rerank)
+  #   sq8_fixed_residual — coarse u8 + i8 residual on the fixed grid
   #   sq8_residual       — per-cluster fitted quantizer
   #   fp32               — full-precision rerank
   #   rabitq_only        — no rerank column
-  rerank_codec: sq8_fixed_residual
+  rerank_codec: sq16
 
   # Absolute cap on fine IVF centroids probed per vector search.
   # Empty (~) derives the budget from nprobe × eligible superfiles at

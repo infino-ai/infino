@@ -1191,7 +1191,7 @@ supertable:
         assert_eq!(cfg.vector.cell_split_doc_cap, 500_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
         assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
-        assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq8FixedResidual);
+        assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq16);
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Auto);
     }
 

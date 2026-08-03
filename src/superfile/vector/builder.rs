@@ -37,7 +37,9 @@ use crate::{
         },
         vector::{
             cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
-            distance::{Metric, dequantize_sq8_residual_into, distance, mean_f32_cluster_major},
+            distance::{
+                Metric, distance, encode_sq16_row, mean_f32_cluster_major, sq16_decoded_norm_sq,
+            },
             ivf_merge::MergedIvfSubsection,
             kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
             quant::BitQuantizer,
@@ -206,22 +208,33 @@ pub struct VectorConfig {
     pub provided_centroids: Option<std::sync::Arc<[f32]>>,
 }
 
+/// Pick the default rerank codec for a new index built with `metric`.
+/// Cosine columns use the configured
+/// [`crate::config::VectorSettings::rerank_codec`] (`Sq16` by default);
+/// metrics whose values are not bounded to `[-1, 1]` use locally fitted
+/// [`RerankCodec::Sq8Residual`]. A per-column codec set at table-create
+/// time overrides this default.
+fn default_rerank_codec_for(metric: Metric) -> RerankCodec {
+    if metric == Metric::Cosine {
+        config::global().vector.rerank_codec
+    } else {
+        RerankCodec::Sq8Residual
+    }
+}
+
 impl VectorConfig {
     /// Construct a config with the configured cosine default codec
-    /// ([`crate::config::VectorSettings::rerank_codec`], usually
-    /// [`RerankCodec::Sq8FixedResidual`]) and locally fitted residual
-    /// encoding for metrics whose values are not bounded to [-1, 1].
+    /// ([`crate::config::VectorSettings::rerank_codec`] — `Sq16`) and locally
+    /// fitted residual encoding ([`RerankCodec::Sq8Residual`]) for metrics
+    /// whose values are not bounded to [-1, 1]. Override per column with
+    /// [`Self::with_rerank_codec`].
     pub fn new(column: String, dim: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
             column,
             dim,
             rot_seed,
             metric,
-            rerank_codec: if metric == Metric::Cosine {
-                config::global().vector.rerank_codec
-            } else {
-                RerankCodec::Sq8Residual
-            },
+            rerank_codec: default_rerank_codec_for(metric),
             provided_centroids: None,
         }
     }
@@ -486,7 +499,7 @@ impl VectorBuilder {
                 column: format!("(unregistered vector column_id {column_id})"),
                 actual: "n/a".to_string(),
             })?;
-        if !col.config.rerank_codec.is_sq8_residual_family() {
+        if !col.config.rerank_codec.is_ivf_mergeable() {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.config.column.clone(),
                 codec: col.config.rerank_codec.name(),
@@ -1421,6 +1434,10 @@ enum BucketRecordPayload<'a> {
         codes: &'a [u8],
         residuals: &'a [u8],
     },
+    /// A single pre-encoded fixed-grid plane (the `dim*2`-byte Sq16 `u16`
+    /// codes), written verbatim. Single-plane codecs carry no residual plane
+    /// and no per-cluster quantizer, so there is no min/max to fold.
+    FixedPlane(&'a [u8]),
     Fp32(&'a [f32]),
 }
 
@@ -1449,6 +1466,9 @@ fn write_bucket_record(
         BucketRecordPayload::FixedSq8 { codes, residuals } => {
             writer.write_all(codes)?;
             writer.write_all(residuals)?;
+        }
+        BucketRecordPayload::FixedPlane(plane) => {
+            writer.write_all(plane)?;
         }
         BucketRecordPayload::Fp32(fp) => {
             writer.write_all(bytemuck::cast_slice(fp))?;
@@ -1497,17 +1517,18 @@ fn sample_spilled_materialized_rows(
                     "materialized spill mixes rerank codecs".into(),
                 ));
             }
-            dequantize_sq8_residual_into(
-                &row.encoded.scale,
-                &row.encoded.offset,
-                &row.encoded.codes,
-                &row.encoded.residuals,
-                row.encoded
-                    .rerank_codec
-                    .residual_divisor()
-                    .expect("materialized spill uses residual-family codec"),
-                &mut sample[target_idx * dim..(target_idx + 1) * dim],
-            );
+            row.encoded
+                .rerank_codec
+                .ops()
+                .expect("materialized spill uses a quantized-rerank codec")
+                .dequantize_row_into(
+                    &row.encoded.codes,
+                    &row.encoded.residuals,
+                    dim,
+                    &row.encoded.scale,
+                    &row.encoded.offset,
+                    &mut sample[target_idx * dim..(target_idx + 1) * dim],
+                );
             target_idx += 1;
         }
         row_base = row_end;
@@ -1541,6 +1562,13 @@ fn bucket_encoded_rows_chunk(
     let dim = cfg.dim;
     let code_bytes = dim.div_ceil(u8::BITS as usize);
     let fixed = cfg.rerank_codec.uses_fixed_quantizer();
+    // Single-plane fixed codecs (Sq16) store the whole `dim*2`-byte body in
+    // `codes`; the residual family splits it into `codes` + `residuals`.
+    let single_plane = cfg.rerank_codec.is_sq16();
+    let ops = cfg
+        .rerank_codec
+        .ops()
+        .expect("materialized rebuild uses a quantized-rerank codec");
     for row in rows {
         if row.encoded.rerank_codec != cfg.rerank_codec || row.rabitq_code.len() != code_bytes {
             return Err(BuildError::VectorSchemaMismatch(
@@ -1553,22 +1581,21 @@ fn bucket_encoded_rows_chunk(
         .par_chunks_mut(dim)
         .zip(rows.par_iter())
         .for_each(|(out, row)| {
-            dequantize_sq8_residual_into(
-                &row.encoded.scale,
-                &row.encoded.offset,
+            ops.dequantize_row_into(
                 &row.encoded.codes,
                 &row.encoded.residuals,
-                row.encoded
-                    .rerank_codec
-                    .residual_divisor()
-                    .expect("materialized row uses residual-family codec"),
+                dim,
+                &row.encoded.scale,
+                &row.encoded.offset,
                 out,
             );
         });
     let mut assignments = vec![0u32; rows.len()];
     assign_to_centroids(&decoded, centroids, dim, n_cent, &mut assignments);
     for (row_idx, (row, &cluster)) in rows.iter().zip(&assignments).enumerate() {
-        let payload = if fixed {
+        let payload = if single_plane {
+            BucketRecordPayload::FixedPlane(&row.encoded.codes)
+        } else if fixed {
             BucketRecordPayload::FixedSq8 {
                 codes: &row.encoded.codes,
                 residuals: &row.encoded.residuals,
@@ -1685,16 +1712,24 @@ fn stream_fp32_rows_to_buckets(
     let dim = cfg.dim;
     let n_docs = vectors.len() / dim;
     let fixed = cfg.rerank_codec.uses_fixed_quantizer();
+    // Single-plane fixed codecs (Sq16) encode one `dim*2`-byte `u16` plane on
+    // the fixed grid; the residual family encodes a `[codes | residual]` body
+    // against the same grid and carries a divisor.
+    let single_plane = cfg.rerank_codec.is_sq16();
     let mut min_max = sq8_min_max;
     let rotation = RandomRotation::new(dim, cfg.rot_seed);
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
-    let divisor = cfg
-        .rerank_codec
-        .residual_divisor()
-        .expect("residual-family codec has divisor");
     let (fixed_scale, fixed_offset) = fixed_sq8_quantizer(dim);
-    let encode_consts = Sq8EncodeConsts::from_scale_offset(&fixed_scale, &fixed_offset);
+    // Residual-family encode consts + divisor; unused by the single-plane path.
+    let residual_encode = (fixed && !single_plane).then(|| {
+        (
+            Sq8EncodeConsts::from_scale_offset(&fixed_scale, &fixed_offset),
+            cfg.rerank_codec
+                .residual_divisor()
+                .expect("residual-family codec has divisor"),
+        )
+    });
     let chunk_rows = materialized_chunk_rows_for_dim(dim);
     let mut chunk_rotated = vec![0.0f32; chunk_rows * dim];
     let mut chunk_codes = vec![0u8; chunk_rows * code_bytes];
@@ -1717,7 +1752,7 @@ fn stream_fp32_rows_to_buckets(
             .par_chunks_mut(code_bytes)
             .zip(chunk_rotated[..take * dim].par_chunks(dim))
             .for_each(|(code, rot)| quant.encode_rotated_into(rot, code));
-        if fixed {
+        if let Some((encode_consts, divisor)) = &residual_encode {
             chunk_payload[..take * dim * 2]
                 .par_chunks_mut(dim * 2)
                 .zip(chunk.par_chunks(dim))
@@ -1727,20 +1762,27 @@ fn stream_fp32_rows_to_buckets(
                         let (code_out, residual_out) = payload.split_at_mut(dim);
                         encode_sq8_residual_row(
                             row,
-                            &encode_consts,
+                            encode_consts,
                             &fixed_scale,
                             &fixed_offset,
                             code_out,
                             residual_out,
                             recon,
                             false,
-                            divisor,
+                            *divisor,
                         );
                     },
                 );
+        } else if single_plane {
+            chunk_payload[..take * dim * 2]
+                .par_chunks_mut(dim * 2)
+                .zip(chunk.par_chunks(dim))
+                .for_each(|(payload, row)| encode_sq16_row(row, payload));
         }
         for i in 0..take {
-            let payload = if fixed {
+            let payload = if single_plane {
+                BucketRecordPayload::FixedPlane(&chunk_payload[i * dim * 2..(i + 1) * dim * 2])
+            } else if fixed {
                 let (codes, residuals) =
                     chunk_payload[i * dim * 2..(i + 1) * dim * 2].split_at(dim);
                 BucketRecordPayload::FixedSq8 { codes, residuals }
@@ -1784,6 +1826,10 @@ fn stream_bucket_into_subsection(
     norms_offset: Option<usize>,
 ) -> Result<(), BuildError> {
     let fixed = codec.uses_fixed_quantizer();
+    // Single-plane fixed codecs (Sq16) store one `dim*2`-byte `u16` plane whose
+    // norm is read off the fixed grid; the residual family reconstructs the
+    // norm from the per-cluster quantizer + residual.
+    let single_plane = codec.is_sq16();
     let payload_bytes = if fixed {
         dim * 2
     } else {
@@ -1812,7 +1858,10 @@ fn stream_bucket_into_subsection(
             codes[row_idx * code_bytes..(row_idx + 1) * code_bytes]
                 .copy_from_slice(&record[id_end..code_end]);
             let rerank_row = &mut rerank[row_idx * dim * 2..(row_idx + 1) * dim * 2];
-            let norm = if fixed {
+            let norm = if single_plane {
+                rerank_row.copy_from_slice(&record[code_end..code_end + dim * 2]);
+                norms_offset.map(|_| sq16_decoded_norm_sq(rerank_row, dim))
+            } else if fixed {
                 rerank_row.copy_from_slice(&record[code_end..code_end + dim * 2]);
                 norms_offset.map(|_| {
                     sq8_residual_norm_sq(
@@ -1916,16 +1965,17 @@ fn sample_ram_materialized_rows(
     for s in 0..sample_size {
         let idx = sampled_index(s, sample_size, n_docs, seed);
         let enc = &rows[idx].encoded;
-        dequantize_sq8_residual_into(
-            &enc.scale,
-            &enc.offset,
-            &enc.codes,
-            &enc.residuals,
-            enc.rerank_codec
-                .residual_divisor()
-                .expect("residual-family source has divisor"),
-            &mut sample[s * dim..(s + 1) * dim],
-        );
+        enc.rerank_codec
+            .ops()
+            .expect("materialized source uses a quantized-rerank codec")
+            .dequantize_row_into(
+                &enc.codes,
+                &enc.residuals,
+                dim,
+                &enc.scale,
+                &enc.offset,
+                &mut sample[s * dim..(s + 1) * dim],
+            );
     }
     sample
 }
@@ -1966,7 +2016,7 @@ pub(crate) fn build_cell_subsection_from_source(
             "cell IVF build requires at least one row".into(),
         ));
     }
-    if !cfg.rerank_codec.is_sq8_residual_family() || !cfg.rerank_codec.supports_metric(cfg.metric) {
+    if !cfg.rerank_codec.is_ivf_mergeable() || !cfg.rerank_codec.supports_metric(cfg.metric) {
         return Err(BuildError::VectorSchemaMismatch(format!(
             "cell IVF build does not support codec {} with metric {:?}",
             cfg.rerank_codec.name(),
@@ -2159,17 +2209,22 @@ pub(crate) fn build_cell_subsection_from_source(
         open_region[idx + CLUSTER_IDX_COUNT_OFFSET..idx + CLUSTER_IDX_ENTRY_BYTES]
             .copy_from_slice(&(planned_block.count as u32).to_le_bytes());
     }
-    let scale_offset = layout.codec_meta_off;
-    let offset_offset = scale_offset + n_cent * dim * size_of::<f32>();
-    for (centroid, (scale, offset)) in quantizers.iter().enumerate() {
-        let start = centroid * dim * size_of::<f32>();
-        open_region[scale_offset + start..scale_offset + start + dim * size_of::<f32>()]
-            .copy_from_slice(bytemuck::cast_slice(scale));
-        open_region[offset_offset + start..offset_offset + start + dim * size_of::<f32>()]
-            .copy_from_slice(bytemuck::cast_slice(offset));
+    let meta_layout = codec
+        .ops()
+        .expect("build-from-source uses a quantized-rerank codec")
+        .codec_meta_layout(layout.codec_meta_off, n_cent, dim, cfg.metric);
+    if let (Some(scale_offset), Some(offset_offset)) =
+        (meta_layout.scale_off, meta_layout.offset_off)
+    {
+        for (centroid, (scale, offset)) in quantizers.iter().enumerate() {
+            let start = centroid * dim * size_of::<f32>();
+            open_region[scale_offset + start..scale_offset + start + dim * size_of::<f32>()]
+                .copy_from_slice(bytemuck::cast_slice(scale));
+            open_region[offset_offset + start..offset_offset + start + dim * size_of::<f32>()]
+                .copy_from_slice(bytemuck::cast_slice(offset));
+        }
     }
-    let norms_offset = matches!(cfg.metric, Metric::L2Sq | Metric::Cosine)
-        .then_some(offset_offset + n_cent * dim * size_of::<f32>());
+    let norms_offset = meta_layout.norms_off;
     let mut output = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -2493,7 +2548,11 @@ fn build_subsection_streaming(
                 )
             })
             .collect()
-    } else if codec.uses_fixed_quantizer() {
+    } else if codec.uses_fixed_quantizer() && codec.is_sq8_residual_family() {
+        // Only the residual family stores per-cluster scale/offset
+        // arrays. Sq16 is fixed-quantizer too, but single-plane with no
+        // codec_meta — it must NOT populate this table (its own pass-3
+        // arm encodes the u16 codes directly).
         (0..n_cent).map(|_| fixed_sq8_quantizer(dim)).collect()
     } else {
         Vec::new()
@@ -2606,6 +2665,14 @@ fn build_subsection_streaming(
     } else {
         None
     };
+    // Sq16's codec_meta is per-doc norms ONLY (no scale/offset), so the
+    // norm table starts at the codec_meta region head.
+    let sq16_norms_block_off =
+        if codec.is_sq16() && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
+            Some(layout.codec_meta_off)
+        } else {
+            None
+        };
 
     if sq8_family {
         for (cid, (scale_c, offset_c)) in sq8_quantizers.iter().enumerate().take(n_cent) {
@@ -2658,6 +2725,37 @@ fn build_subsection_streaming(
                 RerankCodec::Fp32 => {
                     bytes[blk.rerank_base..blk.rerank_base + blk.count * dim * 4]
                         .copy_from_slice(&full_block);
+                }
+                RerankCodec::Sq16 => {
+                    // Flat single-plane encode: quantize each fp32 row to
+                    // `dim` little-endian u16 codes on the fixed cosine
+                    // grid (no per-cluster quantizer). For cosine/L2Sq
+                    // also store the per-doc dequantized norm `‖d̂‖²`.
+                    //
+                    // The norm store uses the EXACT same position
+                    // convention as the residual family's
+                    // `encode_sq8_residual_cluster_simd`
+                    // (`norms_off + (blk.first_row + i) * 4`); the only
+                    // differences are the base offset (Sq16 has no
+                    // scale/offset arrays, so the norm table is the whole
+                    // codec_meta region) and the norm VALUE (u16 decode
+                    // via `sq16_decoded_norm_sq`). This guarantees norms
+                    // land at the same `pos` the reader indexes with
+                    // `cand.pos`, matching the residual family byte-for-
+                    // byte.
+                    let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
+                    for i in 0..blk.count {
+                        let src = &cluster_rows[i * dim..(i + 1) * dim];
+                        let row_off = blk.rerank_base + i * per_vec_bytes;
+                        encode_sq16_row(src, &mut bytes[row_off..row_off + per_vec_bytes]);
+                        if let Some(norms_off) = sq16_norms_block_off {
+                            let n_sq =
+                                sq16_decoded_norm_sq(&bytes[row_off..row_off + per_vec_bytes], dim);
+                            let pos = blk.first_row + i;
+                            let n_off = norms_off + pos * 4;
+                            bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
+                        }
+                    }
                 }
                 RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
                     let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
@@ -4252,6 +4350,113 @@ mod tests {
             VectorReader::open(Bytes::from(zero_codec), &json).is_err(),
             "zero codec id has no v2 compatibility fallback"
         );
+    }
+
+    /// Sq16 survives the IVF merge path: build Sq16 (cosine) materialized rows,
+    /// merge into a subsection, open, and verify the per-doc norm table round-trips
+    /// (the merge must write norms-at-head with NO stale scale/offset). Exercises
+    /// the Sq16 enablement of `build_merged_subsection_from_materialized` + the
+    /// `RerankCodecOps` merge path. Distinct per-vector norms so a mis-pairing or a
+    /// stale scale/offset write would corrupt the comparison.
+    #[test]
+    fn sq16_merge_round_trips_norms() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+
+        use crate::superfile::vector::{
+            cell_posting::EncodedCellRow,
+            distance::{Metric, sq16_decoded_norm_sq},
+            reader::VectorReader,
+            rerank_codec::RerankCodec,
+        };
+
+        let dim = 16usize;
+        let n = 6usize;
+        // Deterministic, distinct in-grid vectors (components in ~[-0.6, 0.6]); NOT
+        // normalized, so each row's ‖d̂‖² differs — the round-trip is meaningful.
+        let vecgen = |i: usize| -> Vec<f32> {
+            (0..dim)
+                .map(|j| (((i as f32 + 1.0) * 0.31 + (j as f32) * 0.11).sin()) * 0.6)
+                .collect::<Vec<f32>>()
+        };
+        let rows: Vec<MaterializedIvfRow> = (0..n)
+            .map(|i| {
+                let v = vecgen(i);
+                let mut codes = vec![0u8; dim * 2];
+                encode_sq16_row(&v, &mut codes);
+                let norm_sq = sq16_decoded_norm_sq(&codes, dim);
+                MaterializedIvfRow {
+                    local_doc_id: i as u32,
+                    stable_id: i as i128,
+                    cluster: 0,
+                    rabitq_code: vec![0u8; dim.div_ceil(8)],
+                    encoded: EncodedCellRow {
+                        stable_id: i as i128,
+                        rerank_codec: RerankCodec::Sq16,
+                        scale: Arc::from(Vec::<f32>::new()),
+                        offset: Arc::from(Vec::<f32>::new()),
+                        codes,
+                        residuals: Vec::new(),
+                        norm_sq: Some(norm_sq),
+                    },
+                }
+            })
+            .collect();
+        let mut expected: Vec<f32> = rows.iter().filter_map(|r| r.encoded.norm_sq).collect();
+
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim,
+            rot_seed: 1,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq16,
+            provided_centroids: None,
+        };
+        let sub = build_merged_subsection_from_materialized(cfg, 2, rows).expect("Sq16 merge");
+        let cells = vec![(0u32, sub)];
+        let blob = finish_multi_cell_blob(&cells).expect("pack Sq16");
+        let json = format!(
+            r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"cosine"}}]"#
+        );
+        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open merged Sq16");
+        assert_eq!(reader.n_docs(), n as u64);
+
+        // The merge preserves the per-doc norm table: the loaded set matches what the
+        // rows carried in (order may change under re-clustering, so compare as a set).
+        let norms = reader
+            .per_doc_norms_for_test("emb")
+            .expect("Sq16 cosine carries a per-doc norm table");
+        assert_eq!(norms.len(), n, "all Sq16 rows survived the merge");
+        let mut have: Vec<f32> = norms.to_vec();
+        expected.sort_by(|a, b| a.total_cmp(b));
+        have.sort_by(|a, b| a.total_cmp(b));
+        for (e, h) in expected.iter().zip(have.iter()) {
+            assert!((e - h).abs() < 1e-5, "Sq16 merged norm {h} != stored {e}");
+        }
+
+        // Drive the exact path the drain/optimize takes on a Sq16 column:
+        // `materialized_cells_rows_async` -> `parse_materialized_index_rows`.
+        // A single-plane codec carries empty scale/offset, so the per-cluster
+        // slice must be skipped — otherwise this returns `None` and the drain
+        // reports "missing Sq8Residual index".
+        let mat = block_on(reader.materialized_cells_rows_async(None))
+            .expect("Sq16 drain-read path (materialized_cells_rows_async) must yield rows");
+        let total: usize = mat.iter().map(|(_, rows)| rows.len()).sum();
+        assert_eq!(total, n, "drain materialize must return every Sq16 row");
+        for (_, rows) in &mat {
+            for r in rows {
+                assert_eq!(r.encoded.rerank_codec, RerankCodec::Sq16);
+                assert!(
+                    r.encoded.norm_sq.is_some(),
+                    "Sq16 cosine row carries a norm"
+                );
+                assert!(
+                    r.encoded.scale.is_empty() && r.encoded.offset.is_empty(),
+                    "Sq16 materialized row carries no per-cluster scale/offset"
+                );
+            }
+        }
     }
 
     #[test]

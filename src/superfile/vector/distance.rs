@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use wide::f32x8;
 
-use crate::superfile::vector::rerank_codec::RerankCodec;
+use crate::superfile::vector::rerank_codec::{RerankCodec, SQ16_FIXED_OFFSET, SQ16_FIXED_SCALE};
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
@@ -758,6 +758,12 @@ pub(crate) fn distance_bytes_codec(
                  norm context)"
             )
         }
+        RerankCodec::Sq16 => {
+            unreachable!(
+                "distance_bytes_codec called with Sq16 — Sq16 rerank goes through \
+                 Sq16Kernel (u16 → f32 dequant front on the fp32 distance path)"
+            )
+        }
         RerankCodec::RabitqOnly => {
             unreachable!(
                 "distance_bytes_codec called with RabitqOnly — RabitqOnly columns \
@@ -1039,6 +1045,185 @@ impl Sq8ResidualKernel {
             }
         }
     }
+}
+
+/// `Sq16` rerank context — the flat single-plane analogue of
+/// [`Sq8ResidualKernel`]. One `u16` code per dimension on the fixed
+/// cosine grid ([`SQ16_FIXED_OFFSET`] / [`SQ16_FIXED_SCALE`]), scored
+/// in a single pass. This is the [`distance`] fp32 path with a
+/// `u16 → f32` dequant folded into the query-side precompute.
+///
+/// Reconstruction is `x[d] = code[d] * scale + offset`, so folding the
+/// grid into the query once gives
+/// `dot(query, x) = Σ_d q_prime[d] * code[d] + q_dot_offset`, where
+/// `q_prime[d] = query[d] * SQ16_FIXED_SCALE` and
+/// `q_dot_offset = SQ16_FIXED_OFFSET * Σ_d query[d]`.
+///
+/// Because the grid is global constants (matching the codec's empty
+/// `codec_meta`), the kernel holds no per-cluster or per-doc state —
+/// one kernel per query, reused across every candidate.
+pub(crate) struct Sq16Kernel {
+    metric: Metric,
+    dim: usize,
+    /// `q_prime[d] = query[d] * SQ16_FIXED_SCALE`.
+    q_prime: Vec<f32>,
+    /// `SQ16_FIXED_OFFSET * Σ_d query[d]`. Folded in once per candidate.
+    q_dot_offset: f32,
+    /// `Σ_d query[d]²`. L2Sq only (Sq16 is cosine-only in practice).
+    q_norm_sq: f32,
+}
+
+impl Sq16Kernel {
+    /// Build the per-query kernel. No quantizer arrays or per-doc norms
+    /// are needed — the fixed grid is baked into the constants.
+    pub fn new(metric: Metric, query: &[f32]) -> Self {
+        let dim = query.len();
+        let mut q_prime = vec![0.0f32; dim];
+        let scale_v = f32x8::splat(SQ16_FIXED_SCALE);
+        let mut q_sum_acc = f32x8::ZERO;
+        let mut i = 0;
+        while i + F32X8_LANES <= dim {
+            let qc = f32x8::from(
+                <[f32; F32X8_LANES]>::try_from(&query[i..i + F32X8_LANES]).expect("len-8 slice"),
+            );
+            q_prime[i..i + F32X8_LANES].copy_from_slice(&(qc * scale_v).to_array());
+            q_sum_acc += qc;
+            i += F32X8_LANES;
+        }
+        let mut q_sum = q_sum_acc.reduce_add();
+        while i < dim {
+            q_prime[i] = query[i] * SQ16_FIXED_SCALE;
+            q_sum += query[i];
+            i += 1;
+        }
+        let q_dot_offset = SQ16_FIXED_OFFSET * q_sum;
+        let q_norm_sq = match metric {
+            Metric::L2Sq => dot(query, query),
+            Metric::Cosine | Metric::NegDot => 0.0,
+        };
+        Self {
+            metric,
+            dim,
+            q_prime,
+            q_dot_offset,
+            q_norm_sq,
+        }
+    }
+
+    /// Distance for one candidate whose `full[]` row is `dim`
+    /// little-endian `u16` codes (`code_bytes.len() == dim * 2`), with
+    /// its stored per-doc dequantized norm `‖d̂‖²` in `norm` (absent
+    /// only for NegDot, where the norm term cancels). Mirrors
+    /// [`Sq8ResidualKernel::distance_with_norm`] so the cosine ranking
+    /// is the norm-corrected `base − dot/‖d̂‖`, apples-to-apples with the
+    /// Sq8 family. Smaller = closer.
+    #[inline]
+    pub fn distance_with_norm(&self, code_bytes: &[u8], norm: Option<f32>) -> f32 {
+        debug_assert_eq!(code_bytes.len(), self.dim * 2);
+        let mut acc = f32x8::ZERO;
+        let mut i = 0;
+        while i + F32X8_LANES <= self.dim {
+            let qp: [f32; F32X8_LANES] = self.q_prime[i..i + F32X8_LANES]
+                .try_into()
+                .expect("q_prime[i..i+8] len 8");
+            let mut code = [0f32; F32X8_LANES];
+            for (j, lane) in code.iter_mut().enumerate() {
+                let b = 2 * (i + j);
+                *lane = u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]) as f32;
+            }
+            acc += f32x8::from(qp) * f32x8::from(code);
+            i += F32X8_LANES;
+        }
+        let mut cross = acc.reduce_add();
+        while i < self.dim {
+            let b = 2 * i;
+            let code = u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]) as f32;
+            cross += self.q_prime[i] * code;
+            i += 1;
+        }
+        // dot(query, x_decoded) = Σ q_prime[d]·code[d] + q_dot_offset.
+        let dot = cross + self.q_dot_offset;
+        match self.metric {
+            Metric::Cosine => {
+                let x_norm = norm
+                    .expect("Sq16Kernel + Cosine requires per_doc_norms")
+                    .sqrt();
+                if x_norm > 0.0 {
+                    COSINE_DISTANCE_BASE - dot / x_norm
+                } else {
+                    COSINE_DISTANCE_BASE - dot
+                }
+            }
+            Metric::NegDot => -dot,
+            Metric::L2Sq => {
+                let x_norm_sq = norm.expect("Sq16Kernel + L2Sq requires per_doc_norms");
+                self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
+            }
+        }
+    }
+}
+
+/// Encode one fp32 vector into `dim` little-endian `u16` Sq16 codes —
+/// the inverse of [`Sq16Kernel`]'s dequant. Per dimension:
+/// `code = round((v - SQ16_FIXED_OFFSET) / SQ16_FIXED_SCALE)` clamped
+/// to `0..=65535`. `out.len()` must be `src.len() * 2`.
+#[inline]
+pub(crate) fn encode_sq16_row(src: &[f32], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), src.len() * 2);
+    let inv_scale = 1.0 / SQ16_FIXED_SCALE;
+    for (d, &v) in src.iter().enumerate() {
+        let code = (((v - SQ16_FIXED_OFFSET) * inv_scale).round()).clamp(0.0, 65535.0) as u16;
+        let b = d * 2;
+        out[b..b + 2].copy_from_slice(&code.to_le_bytes());
+    }
+}
+
+/// Dequantize one row of `dim` little-endian `u16` Sq16 codes to fp32 —
+/// the inverse of [`encode_sq16_row`]. Per dimension:
+/// `x = code · SQ16_FIXED_SCALE + SQ16_FIXED_OFFSET`. `code.len()` must be
+/// `out.len() * 2`.
+#[inline]
+pub(crate) fn dequantize_sq16_into(code: &[u8], out: &mut [f32]) {
+    let dim = out.len();
+    debug_assert_eq!(code.len(), dim * 2);
+    for (d, slot) in out.iter_mut().enumerate() {
+        let b = d * 2;
+        let c = u16::from_le_bytes([code[b], code[b + 1]]) as f32;
+        *slot = c * SQ16_FIXED_SCALE + SQ16_FIXED_OFFSET;
+    }
+}
+
+/// Dequantized-vector squared norm `Σ_d (code[d]·scale + offset)²` for a
+/// row of `dim` little-endian `u16` Sq16 codes. This is the per-doc
+/// `‖d̂‖²` the encoder stores in `codec_meta` and the cosine
+/// [`Sq16Kernel::distance_with_norm`] divides by (after `sqrt`), so it
+/// must decode with the exact same grid the kernel uses.
+#[inline]
+pub(crate) fn sq16_decoded_norm_sq(code_bytes: &[u8], dim: usize) -> f32 {
+    debug_assert_eq!(code_bytes.len(), dim * 2);
+    let mut acc = f32x8::ZERO;
+    let off_v = f32x8::splat(SQ16_FIXED_OFFSET);
+    let scale_v = f32x8::splat(SQ16_FIXED_SCALE);
+    let mut i = 0;
+    while i + F32X8_LANES <= dim {
+        let mut code = [0f32; F32X8_LANES];
+        for (j, lane) in code.iter_mut().enumerate() {
+            let b = 2 * (i + j);
+            *lane = u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]) as f32;
+        }
+        let x = f32x8::from(code) * scale_v + off_v;
+        acc += x * x;
+        i += F32X8_LANES;
+    }
+    let mut s = acc.reduce_add();
+    while i < dim {
+        let b = 2 * i;
+        let code = u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]) as f32;
+        let x = code * SQ16_FIXED_SCALE + SQ16_FIXED_OFFSET;
+        s += x * x;
+        i += 1;
+    }
+    s
 }
 
 /// Dot-product reduction for `Sq8Kernel::distance_at`:
@@ -2459,6 +2644,475 @@ mod tests {
             (want - got).abs() <= 1e-4,
             "tail-dim Sq8 kernel: got {got} vs decoded ref {want}"
         );
+    }
+
+    /// Round-trip the flat Sq16 codec: encode a unit-normalized fp32
+    /// vector onto the fixed cosine grid, score it against a query with
+    /// [`Sq16Kernel`], and confirm the cosine distance tracks the exact
+    /// fp32 reference to ~16-bit precision. The fp32 reference is the
+    /// same raw-dot cosine (`1 − q·x`) the [`distance`] dispatch uses,
+    /// so this is an apples-to-apples quantization-error bound. Sweeps a
+    /// SIMD-aligned dim, a tail dim, and a production-shaped dim.
+    #[test]
+    fn sq16_round_trip_within_16bit_tolerance_of_fp32() {
+        fn normalize(v: &mut [f32]) {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= n;
+                }
+            }
+        }
+
+        for &dim in &[8usize, 13, 100, 384] {
+            // Deterministic pseudo-vectors in roughly [-1, 1], then
+            // unit-normalized so cosine semantics (raw dot) hold and
+            // every component lands inside the grid without clamping.
+            let mut query: Vec<f32> = (0..dim).map(|i| ((i as f32) * 0.017 - 0.4).sin()).collect();
+            let mut vec: Vec<f32> = (0..dim)
+                .map(|i| ((i as f32) * 0.023 + 0.11).cos())
+                .collect();
+            normalize(&mut query);
+            normalize(&mut vec);
+
+            // Encode onto the Sq16 grid exactly as the builder write
+            // path does (codes + per-doc dequantized norm), then score
+            // through the reader-side kernel with that stored norm.
+            let mut bytes = vec![0u8; dim * 2];
+            encode_sq16_row(&vec, &mut bytes);
+            let norm_sq = sq16_decoded_norm_sq(&bytes, dim);
+
+            let kernel = Sq16Kernel::new(Metric::Cosine, &query);
+            let got = kernel.distance_with_norm(&bytes, Some(norm_sq));
+            // fp32 reference: query and vec are both unit vectors, so the
+            // exact cosine distance is `1 - dot(query, vec)`.
+            let want = distance(Metric::Cosine, &query, &vec);
+
+            // Norm-corrected Sq16 tracks the fp32 cosine tighter than the
+            // uncorrected `1 - dot` did: the per-doc `‖d̂‖` division
+            // removes the dequantized-scale drift, leaving only direction
+            // quantization.
+            let rel = (got - want).abs() / want.abs();
+            assert!(
+                rel < 1e-4,
+                "dim {dim}: Sq16 cosine {got} vs fp32 ref {want} (rel err {rel:e})"
+            );
+
+            // Encode/decode/kernel self-consistency: decoding the stored
+            // codes and scoring with the SAME norm correction
+            // (`1 - dot/‖d̂‖`) must reproduce the kernel's value.
+            let decoded: Vec<f32> = (0..dim)
+                .map(|d| {
+                    let b = d * 2;
+                    let code = u16::from_le_bytes([bytes[b], bytes[b + 1]]);
+                    code as f32 * SQ16_FIXED_SCALE + SQ16_FIXED_OFFSET
+                })
+                .collect();
+            let decoded_norm = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let decoded_ref = COSINE_DISTANCE_BASE - dot(&query, &decoded) / decoded_norm;
+            assert!(
+                (got - decoded_ref).abs() <= 1e-4,
+                "dim {dim}: kernel {got} disagrees with decoded ref {decoded_ref}"
+            );
+        }
+    }
+
+    /// Recall/ordering sanity: the per-doc-norm correction must never
+    /// make Sq16's top-1 ranking worse than uncorrected `1 - dot`. This
+    /// plants a case where it is strictly better: the true nearest
+    /// neighbor is a unit vector aligned with the query, while a
+    /// distractor has a HIGHER raw dot (larger norm) but LOWER cosine.
+    /// Norm-corrected cosine ranks the true NN first; raw `1 - dot`
+    /// (no correction) wrongly ranks the distractor first.
+    #[test]
+    fn sq16_norm_correction_ranks_planted_case_at_least_as_well() {
+        let dim = 8usize;
+        let inv = 1.0 / (dim as f32).sqrt();
+        // Unit query with equal components.
+        let query = vec![inv; dim];
+        // True NN = query direction (cosine 1.0, unit norm).
+        let true_nn = query.clone();
+        // Unit vector `e ⊥ q` (even/odd sign split → dot(q,e)=0 for even
+        // dim, ‖e‖=1), used to build a cosine-0.9 direction.
+        let mut e = vec![0.0f32; dim];
+        for (i, ei) in e.iter_mut().enumerate() {
+            *ei = if i % 2 == 0 { inv } else { -inv };
+        }
+        let c = 0.9f32;
+        let s = (1.0 - c * c).sqrt();
+        let d_unit: Vec<f32> = (0..dim).map(|i| c * query[i] + s * e[i]).collect();
+        // Scale the distractor so raw dot (1.08) beats the true NN's
+        // (1.0) while its cosine (0.9) is lower. Components stay in the
+        // [-1, 1] Sq16 grid (asserted), so no clamping distorts the case.
+        let distractor: Vec<f32> = d_unit.iter().map(|v| v * 1.2).collect();
+        for &v in true_nn.iter().chain(distractor.iter()) {
+            assert!(v.abs() <= 1.0, "component {v} outside Sq16 grid");
+        }
+
+        let encode = |v: &[f32]| {
+            let mut b = vec![0u8; dim * 2];
+            encode_sq16_row(v, &mut b);
+            b
+        };
+        let nn_b = encode(&true_nn);
+        let dis_b = encode(&distractor);
+
+        let kernel = Sq16Kernel::new(Metric::Cosine, &query);
+        let nn_corr = kernel.distance_with_norm(&nn_b, Some(sq16_decoded_norm_sq(&nn_b, dim)));
+        let dis_corr = kernel.distance_with_norm(&dis_b, Some(sq16_decoded_norm_sq(&dis_b, dim)));
+        assert!(
+            nn_corr < dis_corr,
+            "norm-corrected: true NN {nn_corr} must rank before distractor {dis_corr}"
+        );
+
+        // Uncorrected `1 - dot` (the pre-correction behavior) ranks the
+        // distractor first — the exact failure the norm division fixes,
+        // so with-norm is here strictly better and never worse.
+        let decode = |b: &[u8]| -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let o = d * 2;
+                    u16::from_le_bytes([b[o], b[o + 1]]) as f32 * SQ16_FIXED_SCALE
+                        + SQ16_FIXED_OFFSET
+                })
+                .collect()
+        };
+        let nn_raw = COSINE_DISTANCE_BASE - dot(&query, &decode(&nn_b));
+        let dis_raw = COSINE_DISTANCE_BASE - dot(&query, &decode(&dis_b));
+        assert!(
+            dis_raw < nn_raw,
+            "sanity: uncorrected 1-dot should (wrongly) rank the distractor first \
+             (nn_raw {nn_raw}, dis_raw {dis_raw})"
+        );
+    }
+
+    /// Bisection: does Sq16 match/beat Sq8FixedResidual at the KERNEL
+    /// level, on identical data, isolated from routing/shortlist/
+    /// pos-mapping? Sq16's grid (2/65535) is finer than Sq8+8's effective
+    /// step (2/65280), so its recall@10 vs fp32 truth MUST be >= C1's.
+    /// If it holds here, any end-to-end Sq16<C1 gap is a PIPELINE bug, not
+    /// the codec; if it fails here, the codec/kernel is the culprit and we
+    /// have it reproduced in isolation. Run:
+    ///   cargo test --release -- --ignored --nocapture sq16_vs_sq8residual_kernel_recall
+    #[test]
+    #[ignore = "diagnostic: run explicitly in release with --nocapture"]
+    fn sq16_vs_sq8residual_kernel_recall() {
+        use std::collections::HashSet;
+
+        use crate::superfile::vector::{
+            rerank_codec::{SQ8_FIXED_OFFSET, SQ8_FIXED_RESIDUAL_DIVISOR, SQ8_FIXED_SCALE},
+            sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row},
+        };
+
+        fn next_u64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn next_f32(state: &mut u64) -> f32 {
+            let u = (next_u64(state) >> 40) as f32 / (1u64 << 24) as f32;
+            u * 2.0 - 1.0
+        }
+        fn fill_unit(state: &mut u64, out: &mut [f32]) {
+            for x in out.iter_mut() {
+                *x = next_f32(state);
+            }
+            let n = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if n > 0.0 {
+                for x in out.iter_mut() {
+                    *x /= n;
+                }
+            }
+        }
+        // Indices of the k smallest distances (ascending).
+        fn topk_asc(dists: &[f32], k: usize) -> Vec<usize> {
+            let mut idx: Vec<usize> = (0..dists.len()).collect();
+            idx.sort_by(|&a, &b| dists[a].total_cmp(&dists[b]));
+            idx.truncate(k);
+            idx
+        }
+
+        const K: usize = 10;
+        let dim = 768usize;
+        let mut rng = 0xDEAD_BEEF_1234_5678u64;
+
+        let scale = vec![SQ8_FIXED_SCALE; dim];
+        let offset = vec![SQ8_FIXED_OFFSET; dim];
+        let divisor = SQ8_FIXED_RESIDUAL_DIVISOR;
+        let consts = Sq8EncodeConsts::from_scale_offset(&scale, &offset);
+
+        // Synthetic unit-norm corpus and queries. Both codecs quantize the
+        // same vectors and are scored against the same fp32 truth, so this
+        // isolates the codec's quantization error from routing.
+        #[allow(non_snake_case)]
+        let N = 3000usize;
+        #[allow(non_snake_case)]
+        let Q = 300usize;
+
+        // Corpus: encoded into both codecs with their per-doc norms.
+        let mut corpus: Vec<Vec<f32>> = Vec::with_capacity(N);
+        let mut sq16_buf = vec![0u8; N * dim * 2];
+        let mut sq8_code = vec![0u8; N * dim];
+        let mut sq8_res = vec![0u8; N * dim];
+        let mut sq16_norms = vec![0.0f32; N];
+        let mut sq8_norms = vec![0.0f32; N];
+        let mut recon = vec![0.0f32; dim];
+        for i in 0..N {
+            let mut c = vec![0.0f32; dim];
+            fill_unit(&mut rng, &mut c);
+            let sc = &mut sq16_buf[i * dim * 2..(i + 1) * dim * 2];
+            encode_sq16_row(&c, sc);
+            sq16_norms[i] = sq16_decoded_norm_sq(sc, dim);
+            let n = encode_sq8_residual_row(
+                &c,
+                &consts,
+                &scale,
+                &offset,
+                &mut sq8_code[i * dim..(i + 1) * dim],
+                &mut sq8_res[i * dim..(i + 1) * dim],
+                &mut recon,
+                true,
+                divisor,
+            )
+            .expect("store_norm=true yields a per-doc norm");
+            sq8_norms[i] = n;
+            corpus.push(c);
+        }
+
+        let (mut r_sq16, mut r_sq16_nn, mut r_sq8, mut total) = (0usize, 0usize, 0usize, 0usize);
+        let mut rng_q = 0x0BAD_F00D_CAFE_BABEu64;
+        for _ in 0..Q {
+            let mut q = vec![0.0f32; dim];
+            fill_unit(&mut rng_q, &mut q);
+            // fp32 truth: both unit ⇒ cosine == dot; larger dot = closer.
+            let truth_scores: Vec<f32> = corpus.iter().map(|c| dot(&q, c)).collect();
+            let mut ti: Vec<usize> = (0..N).collect();
+            ti.sort_by(|&a, &b| truth_scores[b].total_cmp(&truth_scores[a]));
+            let truth: HashSet<usize> = ti.into_iter().take(K).collect();
+
+            let sq16_kernel = Sq16Kernel::new(Metric::Cosine, &q);
+            let sq8_kernel = Sq8ResidualKernel::new(Metric::Cosine, &q, &scale, &offset, divisor);
+
+            let sq16_d: Vec<f32> = (0..N)
+                .map(|i| {
+                    sq16_kernel.distance_with_norm(
+                        &sq16_buf[i * dim * 2..(i + 1) * dim * 2],
+                        Some(sq16_norms[i]),
+                    )
+                })
+                .collect();
+            let sq8_d: Vec<f32> = (0..N)
+                .map(|i| {
+                    sq8_kernel.distance_with_norm(
+                        &sq8_code[i * dim..(i + 1) * dim],
+                        &sq8_res[i * dim..(i + 1) * dim],
+                        Some(sq8_norms[i]),
+                    )
+                })
+                .collect();
+            // Sq16 without the norm division (raw 1 - dot on decoded).
+            let sq16_nn_d: Vec<f32> = (0..N)
+                .map(|i| {
+                    let base = i * dim * 2;
+                    let mut d = 0.0f32;
+                    for (j, &qj) in q.iter().enumerate().take(dim) {
+                        let b = base + j * 2;
+                        let code = u16::from_le_bytes([sq16_buf[b], sq16_buf[b + 1]]) as f32;
+                        d += qj * (code * SQ16_FIXED_SCALE + SQ16_FIXED_OFFSET);
+                    }
+                    COSINE_DISTANCE_BASE - d
+                })
+                .collect();
+
+            for &i in topk_asc(&sq16_d, K).iter() {
+                if truth.contains(&i) {
+                    r_sq16 += 1;
+                }
+            }
+            for &i in topk_asc(&sq16_nn_d, K).iter() {
+                if truth.contains(&i) {
+                    r_sq16_nn += 1;
+                }
+            }
+            for &i in topk_asc(&sq8_d, K).iter() {
+                if truth.contains(&i) {
+                    r_sq8 += 1;
+                }
+            }
+            total += K;
+        }
+
+        let rec = |x: usize| x as f64 / total as f64;
+        eprintln!(
+            "\n### Kernel-level recall@{K} vs fp32 truth (synthetic, N={N}, Q={Q}, dim={dim})"
+        );
+        eprintln!("Sq16 (norm)      : {:.4}", rec(r_sq16));
+        eprintln!("Sq16 (no-norm)   : {:.4}", rec(r_sq16_nn));
+        eprintln!("Sq8FixedResidual : {:.4}", rec(r_sq8));
+        eprintln!("Sq16norm - C1    : {:+.4}", rec(r_sq16) - rec(r_sq8));
+        eprintln!("Sq16norm - nonorm: {:+.4}", rec(r_sq16) - rec(r_sq16_nn));
+
+        // Theorem: the finer grid means Sq16 must not trail C1 at the
+        // kernel level. A loose margin absorbs tie-break noise; the
+        // printed numbers are the real diagnostic.
+        assert!(
+            rec(r_sq16) >= rec(r_sq8) - 0.002,
+            "Sq16 kernel recall {:.4} trails C1 {:.4} by >0.002 — codec-level bug reproduced",
+            rec(r_sq16),
+            rec(r_sq8)
+        );
+    }
+
+    /// Microbench: intrinsic per-candidate rerank scoring cost of the
+    /// two-leg `Sq8ResidualKernel` (u8 coarse + i8 residual) vs the
+    /// single-leg `Sq16Kernel` (one u16 plane), isolated from the
+    /// shortlist / IVF / IO. Both on the fixed cosine grid. This is the
+    /// "one leg vs two" cost the end-to-end query only shows diluted
+    /// (rerank is a small slice of total query time).
+    ///
+    /// Ignored by default (it allocates hundreds of MB and only means
+    /// anything in release). Run with:
+    ///   cargo test --release -- --ignored --nocapture rerank_kernel_leg_cost_microbench
+    #[test]
+    #[ignore = "microbench: run explicitly in release with --nocapture"]
+    fn rerank_kernel_leg_cost_microbench() {
+        use std::{hint::black_box, time::Instant};
+
+        use crate::superfile::vector::{
+            rerank_codec::{SQ8_FIXED_OFFSET, SQ8_FIXED_RESIDUAL_DIVISOR, SQ8_FIXED_SCALE},
+            sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row},
+        };
+
+        // Deterministic splitmix64 → f32 in [-1, 1]; no external RNG so
+        // the numbers reproduce bit-for-bit across runs.
+        fn next_u64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn next_f32(state: &mut u64) -> f32 {
+            let u = (next_u64(state) >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
+            u * 2.0 - 1.0
+        }
+        fn fill_unit(state: &mut u64, out: &mut [f32]) {
+            for x in out.iter_mut() {
+                *x = next_f32(state);
+            }
+            let n = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if n > 0.0 {
+                for x in out.iter_mut() {
+                    *x /= n;
+                }
+            }
+        }
+
+        const N: usize = 100_000;
+        const PASSES: usize = 7;
+        let mut rng = 0x1234_5678_9ABC_DEF0u64;
+
+        eprintln!("\n### Rerank kernel per-candidate cost — Sq8Residual (2 legs) vs Sq16 (1 leg)");
+        eprintln!("N = {N} candidates, cosine/fixed-grid, median of {PASSES} timed passes\n");
+        eprintln!(
+            "{:>6}  {:>16}  {:>16}  {:>10}",
+            "dim", "sq8_residual ns", "sq16 ns", "sq16/sq8"
+        );
+
+        for &dim in &[768usize, 1536] {
+            let scale = vec![SQ8_FIXED_SCALE; dim];
+            let offset = vec![SQ8_FIXED_OFFSET; dim];
+            let divisor = SQ8_FIXED_RESIDUAL_DIVISOR;
+            let consts = Sq8EncodeConsts::from_scale_offset(&scale, &offset);
+
+            // Random unit query, one kernel per codec (built once, as the
+            // reader does).
+            let mut query = vec![0.0f32; dim];
+            fill_unit(&mut rng, &mut query);
+            let sq16_kernel = Sq16Kernel::new(Metric::Cosine, &query);
+            let sq8_kernel =
+                Sq8ResidualKernel::new(Metric::Cosine, &query, &scale, &offset, divisor);
+
+            // Encode all N candidates once into each codec's on-disk
+            // byte layout. The fp32 source is dropped after encoding so
+            // only the packed codec buffers stay resident.
+            let mut sq16_buf = vec![0u8; N * dim * 2];
+            let mut sq8_code = vec![0u8; N * dim];
+            let mut sq8_res = vec![0u8; N * dim];
+            // Both codecs now carry per-doc dequantized norms for the
+            // norm-corrected cosine kernel; store both.
+            let mut sq8_norms = vec![0.0f32; N];
+            let mut sq16_norms = vec![0.0f32; N];
+            let mut cand = vec![0.0f32; dim];
+            let mut recon = vec![0.0f32; dim];
+            for i in 0..N {
+                fill_unit(&mut rng, &mut cand);
+                let sq16_code = &mut sq16_buf[i * dim * 2..(i + 1) * dim * 2];
+                encode_sq16_row(&cand, sq16_code);
+                sq16_norms[i] = sq16_decoded_norm_sq(sq16_code, dim);
+                let norm = encode_sq8_residual_row(
+                    &cand,
+                    &consts,
+                    &scale,
+                    &offset,
+                    &mut sq8_code[i * dim..(i + 1) * dim],
+                    &mut sq8_res[i * dim..(i + 1) * dim],
+                    &mut recon,
+                    true,
+                    divisor,
+                )
+                .expect("store_norm=true yields a per-doc norm");
+                sq8_norms[i] = norm;
+            }
+
+            // Score every candidate through the codec's per-candidate
+            // distance call — the exact call the reader makes. black_box
+            // on inputs + the accumulated sink so nothing folds away.
+            let time_sq16 = || {
+                let mut sink = 0.0f32;
+                for i in 0..N {
+                    let code = black_box(&sq16_buf[i * dim * 2..(i + 1) * dim * 2]);
+                    sink += sq16_kernel.distance_with_norm(code, Some(black_box(sq16_norms[i])));
+                }
+                black_box(sink);
+            };
+            let time_sq8 = || {
+                let mut sink = 0.0f32;
+                for i in 0..N {
+                    let code = black_box(&sq8_code[i * dim..(i + 1) * dim]);
+                    let res = black_box(&sq8_res[i * dim..(i + 1) * dim]);
+                    sink += sq8_kernel.distance_with_norm(code, res, Some(black_box(sq8_norms[i])));
+                }
+                black_box(sink);
+            };
+
+            let median = |f: &mut dyn FnMut()| -> f64 {
+                f(); // warm-up pass, not timed
+                let mut samples: Vec<f64> = (0..PASSES)
+                    .map(|_| {
+                        let t = Instant::now();
+                        f();
+                        t.elapsed().as_secs_f64()
+                    })
+                    .collect();
+                samples.sort_by(|a, b| a.total_cmp(b));
+                samples[PASSES / 2]
+            };
+
+            let mut sq16_fn = time_sq16;
+            let mut sq8_fn = time_sq8;
+            let sq16_secs = median(&mut sq16_fn);
+            let sq8_secs = median(&mut sq8_fn);
+            let sq16_ns = sq16_secs / N as f64 * 1e9;
+            let sq8_ns = sq8_secs / N as f64 * 1e9;
+            eprintln!(
+                "{dim:>6}  {sq8_ns:>16.2}  {sq16_ns:>16.2}  {:>10.3}",
+                sq16_ns / sq8_ns
+            );
+        }
+        eprintln!();
     }
 
     #[test]

@@ -2726,7 +2726,9 @@ fn spill_row_to_cell(
         Entry::Vacant(entry) => entry.insert(MaterializedRowSpillWriter::create(
             scratch,
             cell,
-            row.encoded.codes.len(),
+            row.encoded
+                .rerank_codec
+                .dim_from_codes_len(row.encoded.codes.len()),
             row.rabitq_code.len(),
         )?),
     };
@@ -4820,7 +4822,7 @@ fn assign_cells<'a>(
 fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig, usize) {
     debug_assert!(n_rows > 0);
     let dim = cfg.dim;
-    let rerank_codec = if cfg.rerank_codec.is_sq8_residual_family() {
+    let rerank_codec = if cfg.rerank_codec.is_ivf_mergeable() {
         cfg.rerank_codec
     } else {
         RerankCodec::Sq8Residual
