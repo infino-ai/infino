@@ -790,6 +790,19 @@ impl SuperfileBuilder {
     pub fn build_from_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+        let mut buf = Vec::new();
+        let stats = Self::build_from_sq8_ivf_readers_to(readers, &mut buf)?;
+        Ok((buf, stats))
+    }
+
+    /// Streaming counterpart of
+    /// [`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers): writes
+    /// the merged superfile to `output` instead of returning a `Vec<u8>`, so
+    /// the compaction caller can stream to a temp file.
+    pub(crate) fn build_from_sq8_ivf_readers_to<W: Write>(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        output: W,
+    ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
         let builder_opts = BuilderOptions::new_from_reader(&first.0);
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
@@ -837,9 +850,8 @@ impl SuperfileBuilder {
         let merged_sub = merge_sq8_ivf_subsections(&merge_refs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
-        let bytes = superfile_builder.finish()?;
-        let stats = SuperfileStats::from_children(stats_collector.as_slice());
-        Ok((bytes, stats))
+        superfile_builder.finish_to(output)?;
+        Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
     /// Merge multi-cell (v2) Sq8 IVF superfiles **per global cell id**, then
@@ -852,6 +864,23 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         superseded_per_reader: &[BTreeSet<u32>],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+        let mut buf = Vec::new();
+        let stats = Self::build_from_multi_cell_sq8_ivf_readers_to(
+            readers,
+            superseded_per_reader,
+            &mut buf,
+        )?;
+        Ok((buf, stats))
+    }
+
+    /// Streaming counterpart of
+    /// [`build_from_multi_cell_sq8_ivf_readers`](Self::build_from_multi_cell_sq8_ivf_readers):
+    /// writes the merged superfile to `output` instead of returning a `Vec<u8>`.
+    pub(crate) fn build_from_multi_cell_sq8_ivf_readers_to<W: Write>(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        superseded_per_reader: &[BTreeSet<u32>],
+        output: W,
+    ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
         let builder_opts = BuilderOptions::new_from_reader(&first.0);
         if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
@@ -1044,7 +1073,7 @@ impl SuperfileBuilder {
             // flows through `prepare_superfile` -> None -> NoDocsToBuild and the
             // compaction caller reclaims the dead inputs (removes them, writes no
             // replacement), instead of a hard schema error.
-            return Ok((Vec::new(), SuperfileStats::from_children(&[])));
+            return Ok(SuperfileStats::from_children(&[]));
         }
 
         // Parquet rows must follow the same cell-directory order as the packed
@@ -1059,7 +1088,7 @@ impl SuperfileBuilder {
         )?;
         superfile_builder.add_batch_ids_only(&scalar_batch)?;
         superfile_builder.set_prebuilt_multi_cell_ivfs(packed_cells)?;
-        let bytes = superfile_builder.finish()?;
+        superfile_builder.finish_to(output)?;
         let mut stats = SuperfileStats::from_children(stats_collector.as_slice());
         if scalar_schema.fields().len() == 1 {
             // Hidden id-only index: the merged doc set is exactly `all_stable_ids`
@@ -1071,7 +1100,7 @@ impl SuperfileBuilder {
             stats.id_min = all_stable_ids.iter().copied().min().unwrap_or(0);
             stats.id_max = all_stable_ids.iter().copied().max().unwrap_or(0);
         }
-        Ok((bytes, stats))
+        Ok(stats)
     }
 
     /// Add all data (Parquet + fts + vectors) from another [`SuperfileReader`] to this builder.
