@@ -25,7 +25,7 @@
 
 use std::{
     collections::HashMap,
-    io::{self, Cursor, Read, Write},
+    io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
     sync::Arc,
 };
 
@@ -44,6 +44,7 @@ use parquet::{
     },
     schema::types::ColumnPath,
 };
+use tempfile::NamedTempFile;
 
 use crate::superfile::{LazyByteSource, LazyByteSourceError, format::kv};
 
@@ -135,9 +136,13 @@ pub enum FooterError {
 /// holds everything that the CPU-bound column encode produced, ready for
 /// the cheap blob splice + footer rewrite.
 pub struct EncodedBody {
-    /// Parquet bytes truncated to the end of the last row group (footer
-    /// removed) — blobs and the rewritten footer get appended here.
-    buf: Vec<u8>,
+    /// Parquet body written to a scratch temp file and truncated to the end of
+    /// the last row group (footer removed). Streamed into the superfile at
+    /// splice time so the body — multi-GB at corpus scale — never materializes
+    /// as a whole `Vec`. Blobs and the rewritten footer get appended after it.
+    body_file: NamedTempFile,
+    /// Byte length of the footer-stripped body in `body_file`.
+    body_len: u64,
     /// Footer metadata decoded from the original write, carried through
     /// to the rewrite so row groups + column/offset indexes survive.
     metadata: ParquetMetaData,
@@ -171,40 +176,57 @@ pub fn encode_parquet_body(
             .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
     }
     let props = props_builder.build();
-    let mut buf: Vec<u8> = Vec::new();
+
+    // Encode the Parquet body to a scratch temp file rather than a `Vec`, so
+    // the body — multi-GB at corpus scale — never materializes whole in RAM.
+    // The footer is read back from the file, then the file is truncated to the
+    // end of the last row group; the splice appends the blobs + rewritten
+    // footer.
+    let mut body_file = NamedTempFile::new()?;
     {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))?;
+        let mut writer =
+            ArrowWriter::try_new(body_file.as_file_mut(), schema.clone(), Some(props))?;
         for batch in batches {
             writer.write(batch)?;
         }
         writer.close()?;
     }
 
-    // Locate the footer and decode it.
-    let n = buf.len();
-    if n < PARQUET_MIN_FILE_BYTES {
+    // Locate the footer and decode it, reading from the file end.
+    let file = body_file.as_file_mut();
+    let n = file.seek(SeekFrom::End(0))?;
+    if n < PARQUET_MIN_FILE_BYTES as u64 {
         return Err(FooterError::Malformed("parquet buffer too short"));
     }
-    if &buf[n - PARQUET_MAGIC_LEN..n] != b"PAR1" {
+    let mut suffix = [0u8; PARQUET_FOOTER_SUFFIX_BYTES];
+    file.seek(SeekFrom::Start(n - PARQUET_FOOTER_SUFFIX_BYTES as u64))?;
+    file.read_exact(&mut suffix)?;
+    if &suffix[PARQUET_FOOTER_LEN_FIELD_BYTES..] != b"PAR1" {
         return Err(FooterError::Malformed("missing trailing PAR1 magic"));
     }
-    let footer_len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = buf
-        [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
+    let footer_len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = suffix
+        [..PARQUET_FOOTER_LEN_FIELD_BYTES]
         .try_into()
         .map_err(|_| FooterError::Malformed("footer length not 4 bytes"))?;
-    let footer_len = u32::from_le_bytes(footer_len_bytes) as usize;
-    if n < PARQUET_FOOTER_SUFFIX_BYTES + footer_len {
+    let footer_len = u32::from_le_bytes(footer_len_bytes) as u64;
+    if n < PARQUET_FOOTER_SUFFIX_BYTES as u64 + footer_len {
         return Err(FooterError::Malformed("footer length out of range"));
     }
-    let footer_start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
-    let footer_bytes = buf[footer_start..n - PARQUET_FOOTER_SUFFIX_BYTES].to_vec();
+    let footer_start = n - PARQUET_FOOTER_SUFFIX_BYTES as u64 - footer_len;
+    let mut footer_bytes = vec![0u8; footer_len as usize];
+    file.seek(SeekFrom::Start(footer_start))?;
+    file.read_exact(&mut footer_bytes)?;
     let metadata = ParquetMetaDataReader::decode_metadata(&footer_bytes)?;
 
     // Truncate to end of last row group; blobs + the rewritten footer
-    // get appended in `splice_index_blobs`.
-    buf.truncate(footer_start);
+    // get appended by the splice.
+    file.set_len(footer_start)?;
 
-    Ok(EncodedBody { buf, metadata })
+    Ok(EncodedBody {
+        body_file,
+        body_len: footer_start,
+        metadata,
+    })
 }
 
 /// Splice the `fts_blob` and `vec_blob` between an [`EncodedBody`]'s last
@@ -222,8 +244,7 @@ pub fn splice_index_blobs(
     extra_kv: &[(String, String)],
 ) -> Result<ParquetParts, FooterError> {
     let mut bytes = Vec::with_capacity(
-        body.buf
-            .len()
+        (body.body_len as usize)
             .saturating_add(fts_blob.len())
             .saturating_add(vec_blob.len()),
     );
@@ -263,12 +284,22 @@ where
     F: Read,
     V: Read,
 {
-    let EncodedBody { buf, metadata } = body;
+    let EncodedBody {
+        body_file,
+        body_len,
+        metadata,
+    } = body;
     let mut output = CountingWriter {
         output: &mut output,
         written: 0,
     };
-    output.write_all(&buf)?;
+    // Stream the footer-stripped body from its scratch file; `reopen()` reads
+    // from offset 0 independently of the write handle.
+    let mut body_reader = BufReader::new(body_file.reopen()?);
+    let body_copied = io::copy(&mut body_reader, &mut output)?;
+    if body_copied != body_len {
+        return Err(FooterError::Malformed("body stream length mismatch"));
+    }
 
     let fts_offset = if fts_length > 0 {
         let offset = output.written;
