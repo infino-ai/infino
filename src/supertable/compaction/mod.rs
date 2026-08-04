@@ -524,38 +524,38 @@ impl Supertable {
                     .next()
                     .map(|c| c.rerank_codec.is_ivf_mergeable())
             });
-            if multi_cell && sq8_merge == Some(true) {
-                let (bytes, stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
-                    &readers_with_tombstones,
-                    &superseded_per_reader,
-                )?;
-                (Bytes::from(bytes), stats)
-            } else if sq8_merge == Some(true) {
-                let (bytes, stats) =
-                    SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?;
-                (Bytes::from(bytes), stats)
-            } else {
-                // FTS/SQL merge: stream the merged superfile to a temp file and
-                // mmap it back, so the corpus-sized merge output isn't held as an
-                // anon Vec — the allocation that OOMs compaction on a memory-tight
-                // host. Mapped pages are file-backed and reclaimable.
-                let mut output = NamedTempFile::new()
-                    .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
-                let stats = {
-                    let mut writer = BufWriter::new(output.as_file_mut());
-                    let stats = SuperfileBuilder::build_from_readers_to(
+            // Every merge kind streams its output to a temp file and mmaps it
+            // back, so the corpus-sized merge output is never held as an anon
+            // Vec — the allocation that OOMs compaction on a memory-tight host.
+            // Mapped pages are file-backed and reclaimable; downstream publish
+            // takes `Bytes` unchanged (large superfiles already stream via
+            // put_multipart).
+            let mut output = NamedTempFile::new()
+                .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
+            let stats = {
+                let mut writer = BufWriter::new(output.as_file_mut());
+                let stats = if multi_cell && sq8_merge == Some(true) {
+                    SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
+                        &readers_with_tombstones,
+                        &superseded_per_reader,
+                        &mut writer,
+                    )?
+                } else if sq8_merge == Some(true) {
+                    SuperfileBuilder::build_from_sq8_ivf_readers_to(
                         &readers_with_tombstones,
                         &mut writer,
-                    )?;
-                    writer
-                        .flush()
-                        .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
-                    stats
+                    )?
+                } else {
+                    SuperfileBuilder::build_from_readers_to(&readers_with_tombstones, &mut writer)?
                 };
-                let bytes = mmap_readonly_bytes(output.path())
-                    .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
-                (bytes, stats)
-            }
+                writer
+                    .flush()
+                    .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
+                stats
+            };
+            let bytes = mmap_readonly_bytes(output.path())
+                .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
+            (bytes, stats)
         };
 
         let shard = ShardOutput::new_with_params(
