@@ -81,7 +81,7 @@ use arrow_array::{Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatc
 use arrow_schema::{DataType, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
-use tempfile::tempfile;
+use tempfile::{NamedTempFile, tempfile};
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::{
@@ -1300,35 +1300,56 @@ impl SuperfileBuilder {
         let has_vector = vec_builder.is_some()
             || cell_posting_builder.is_some()
             || prebuilt_multi_cell.is_some();
-        let (body, fts_blob, vec_blob) = if has_vector {
-            let (fts_blob, vec_blob) = finish_index_blobs(
+
+        // Stream the FTS and vector blobs to scratch temp files instead of
+        // materializing them as `Vec<u8>`. At corpus scale the positional FTS
+        // blob is multi-GB; holding it, the vector blob, the Parquet body, and
+        // the buffered input all at once is what OOMs a memory-tight build. The
+        // splice below streams the body + on-disk blobs to `output`, so no full
+        // blob is ever resident. `reopen()` gives an independent handle at
+        // offset 0, so the write handle and the later read handle don't share a
+        // cursor.
+        let fts_file = NamedTempFile::new().map_err(BuildError::Io)?;
+        let vec_file = NamedTempFile::new().map_err(BuildError::Io)?;
+        let fts_write = fts_file.reopen().map_err(BuildError::Io)?;
+        let vec_write = vec_file.reopen().map_err(BuildError::Io)?;
+        let stream_blobs = move || -> Result<(), BuildError> {
+            let mut fw = BufWriter::new(fts_write);
+            let mut vw = BufWriter::new(vec_write);
+            finish_index_blobs_streamed(
                 fts_builder,
                 vec_builder,
                 cell_posting_builder,
                 prebuilt_multi_cell,
+                &mut fw,
+                &mut vw,
             )?;
-            let body = encode_body()?;
-            (body, fts_blob, vec_blob)
-        } else {
-            let (body_res, blobs_res) = rayon::join(encode_body, || {
-                finish_index_blobs(
-                    fts_builder,
-                    vec_builder,
-                    cell_posting_builder,
-                    prebuilt_multi_cell,
-                )
-            });
-            let body = body_res?;
-            let (fts_blob, vec_blob) = blobs_res?;
-            (body, fts_blob, vec_blob)
+            fw.flush().map_err(BuildError::Io)?;
+            vw.flush().map_err(BuildError::Io)?;
+            Ok(())
         };
 
+        // Same overlap policy as before: with a vector index present, finalize
+        // blobs first (the vector finalizer already saturates the pool), then
+        // encode the body; otherwise hide the body encode behind the blob
+        // finish.
+        let body = if has_vector {
+            stream_blobs()?;
+            encode_body()?
+        } else {
+            let (body_res, blobs_res) = rayon::join(encode_body, stream_blobs);
+            blobs_res?;
+            body_res?
+        };
+
+        let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
+        let vec_length = vec_file.as_file().metadata().map_err(BuildError::Io)?.len();
         let layout = splice_index_streams_to(
             body,
-            Cursor::new(fts_blob.as_slice()),
-            fts_blob.len() as u64,
-            Cursor::new(vec_blob.as_slice()),
-            vec_blob.len() as u64,
+            BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
+            fts_length,
+            BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
+            vec_length,
             &kvs,
             output,
         )?;
@@ -1558,42 +1579,56 @@ fn scalar_batch_in_stable_id_order(
     })
 }
 
-/// Finish the independent embedded index blobs. Once `add_batch` has
-/// routed scalar text and vectors into their builders, FTS and vector
-/// finalization do not share mutable state, so build them as sibling
-/// rayon jobs when both indexes are present.
-fn finish_index_blobs(
+/// Streaming counterpart of [`finish_index_blobs`]: writes the FTS blob to
+/// `fts_out` and the vector blob to `vec_out` instead of returning them as
+/// `Vec<u8>`, so the corpus-sized positional FTS blob (and the vector blob)
+/// never materialize whole in RAM. Same builder-combination semantics; the
+/// `FtsBuilder`/`VectorBuilder` finalizers already stream through a
+/// `Write` sink (spilling to their own scratch when a column overflowed).
+fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
-) -> Result<(Vec<u8>, Vec<u8>), BuildError> {
-    let vec_blob = if let Some(cells) = prebuilt_multi_cell {
-        crate::superfile::vector::builder::finish_multi_cell_blob(&cells)?
-    } else {
-        Vec::new()
-    };
-    match (
-        fts_builder,
-        vec_builder,
-        cell_posting_builder,
-        vec_blob.is_empty(),
-    ) {
-        (Some(fb), Some(vb), None, true) => {
-            let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
-            Ok((fts?, vec?))
+    fts_out: &mut Wf,
+    vec_out: &mut Wv,
+) -> Result<(), BuildError> {
+    if let Some(cells) = prebuilt_multi_cell {
+        if vec_builder.is_some() || cell_posting_builder.is_some() {
+            return Err(BuildError::VectorSchemaMismatch(
+                "mixed ivf, cell_posting, and multi-cell builders".into(),
+            ));
         }
-        (Some(fb), None, Some(cb), true) => Ok((fb.finish()?, cb.finish()?)),
-        (Some(fb), None, None, true) => Ok((fb.finish()?, Vec::new())),
-        (None, Some(vb), None, true) => Ok((Vec::new(), vb.finish()?)),
-        (None, None, Some(cb), true) => Ok((Vec::new(), cb.finish()?)),
-        (None, None, None, true) => Ok((Vec::new(), Vec::new())),
-        (Some(fb), None, None, false) => Ok((fb.finish()?, vec_blob)),
-        (None, None, None, false) => Ok((Vec::new(), vec_blob)),
-        _ => Err(BuildError::VectorSchemaMismatch(
-            "mixed ivf, cell_posting, and multi-cell builders".into(),
-        )),
+        let vec_blob = crate::superfile::vector::builder::finish_multi_cell_blob(&cells)?;
+        vec_out.write_all(&vec_blob).map_err(BuildError::Io)?;
+        if let Some(fb) = fts_builder {
+            fb.finish_to(fts_out)?;
+        }
+        return Ok(());
     }
+    match (fts_builder, vec_builder, cell_posting_builder) {
+        (Some(fb), Some(vb), None) => {
+            // Disjoint sinks, so the two finalizers can run concurrently.
+            let (fts_res, vec_res) =
+                rayon::join(|| fb.finish_to(fts_out), || vb.finish_to(vec_out));
+            fts_res?;
+            vec_res?;
+        }
+        (Some(fb), None, Some(cb)) => {
+            fb.finish_to(fts_out)?;
+            vec_out.write_all(&cb.finish()?).map_err(BuildError::Io)?;
+        }
+        (Some(fb), None, None) => fb.finish_to(fts_out)?,
+        (None, Some(vb), None) => vb.finish_to(vec_out)?,
+        (None, None, Some(cb)) => vec_out.write_all(&cb.finish()?).map_err(BuildError::Io)?,
+        (None, None, None) => {}
+        _ => {
+            return Err(BuildError::VectorSchemaMismatch(
+                "mixed ivf, cell_posting, and multi-cell builders".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reject user-supplied column names that would collide with
