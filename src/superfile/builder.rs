@@ -88,7 +88,7 @@ use crate::superfile::{
     BuildError, SuperfileReader,
     format::{
         self,
-        footer::{encode_parquet_body, splice_index_blobs, splice_index_streams_to},
+        footer::{ParquetLayout, encode_parquet_body, splice_index_streams_to},
         kv,
     },
     fts::{
@@ -1193,9 +1193,28 @@ impl SuperfileBuilder {
     /// If no `add_batch` calls have landed any rows, returns an
     /// empty `Vec<u8>` — there's no Parquet body to write and no
     /// FTS/vector blobs to embed.
-    pub fn finish(mut self) -> Result<Vec<u8>, BuildError> {
+    /// Finish the build, streaming the assembled superfile to `output`.
+    ///
+    /// Streaming counterpart of [`finish`](Self::finish): produces
+    /// byte-identical superfile bytes but writes them to an arbitrary
+    /// [`Write`] sink (e.g. a temp file) instead of returning a `Vec<u8>`,
+    /// so the caller never holds the whole superfile in RAM. Returns the
+    /// [`ParquetLayout`] (total size + blob offsets/lengths) so the caller
+    /// can build manifest metadata without re-parsing the output.
+    ///
+    /// The scalar Parquet body and the FTS/vector blobs are still assembled
+    /// in memory (each smaller than the whole superfile); only the final
+    /// splice — the largest resident value in [`finish`] — is streamed, so
+    /// the combined superfile is never materialized.
+    pub(crate) fn finish_to<W: Write>(mut self, output: W) -> Result<ParquetLayout, BuildError> {
         if self.next_local_doc_id == 0 {
-            return Ok(Vec::new());
+            return Ok(ParquetLayout {
+                total_size: 0,
+                fts_offset: 0,
+                fts_length: 0,
+                vec_offset: 0,
+                vec_length: 0,
+            });
         }
         let n_docs = self.next_local_doc_id as u64;
 
@@ -1263,8 +1282,27 @@ impl SuperfileBuilder {
             (body, fts_blob, vec_blob)
         };
 
-        let parts = splice_index_blobs(body, &fts_blob, &vec_blob, &kvs)?;
-        Ok(parts.bytes)
+        let layout = splice_index_streams_to(
+            body,
+            Cursor::new(fts_blob.as_slice()),
+            fts_blob.len() as u64,
+            Cursor::new(vec_blob.as_slice()),
+            vec_blob.len() as u64,
+            &kvs,
+            output,
+        )?;
+        Ok(layout)
+    }
+
+    /// Finish the build and return the assembled superfile bytes.
+    ///
+    /// Thin wrapper over [`finish_to`](Self::finish_to) that collects the
+    /// stream into a `Vec<u8>`. Prefer `finish_to` on the large-build path
+    /// (commit / compaction) so the whole superfile is never held in RAM.
+    pub fn finish(self) -> Result<Vec<u8>, BuildError> {
+        let mut buf = Vec::new();
+        self.finish_to(&mut buf)?;
+        Ok(buf)
     }
 
     /// Consume an ids-only builder and stream one packed MultiCellIvf
