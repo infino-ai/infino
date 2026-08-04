@@ -745,7 +745,8 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
 ) -> Result<Sq8IvfMergeInput, BuildError> {
     if !rerank_codec.is_ivf_mergeable() {
         return Err(BuildError::VectorSchemaMismatch(
-            "fragment merge requires an Sq8 residual-family subsection".into(),
+            "fragment merge requires an IVF-mergeable subsection (Sq8 residual family or Sq16)"
+                .into(),
         ));
     }
     if sub.len() < SUB_HEADER_SIZE + CRC_BYTES {
@@ -774,19 +775,30 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
             .expect("4-byte codec meta size"),
     ) as usize;
     let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
-    let so_bytes = n_cent * dim * 4;
-    if codec_meta_size < 2 * so_bytes {
-        return Err(BuildError::VectorSchemaMismatch(
-            "subsection codec meta too small for scale/offset blocks".into(),
-        ));
-    }
-    if sub.len() < codec_meta_off + 2 * so_bytes {
-        return Err(BuildError::VectorSchemaMismatch(
-            "subsection truncated before scale/offset blocks".into(),
-        ));
-    }
-    let scale = decode_f32_le_vec(&sub[codec_meta_off..codec_meta_off + so_bytes]);
-    let offset = decode_f32_le_vec(&sub[codec_meta_off + so_bytes..codec_meta_off + 2 * so_bytes]);
+    // The residual family stores per-cluster [scale|offset] blocks in codec_meta;
+    // Sq16's codec_meta is norms-only (no scale/offset). Splice reconstructs each
+    // row's norm from the codes, so the merge input carries empty scale/offset for
+    // Sq16 — parsing the norm table as scale/offset would error (small cell) or
+    // silently corrupt the reranker (large cell).
+    let (scale, offset) = if rerank_codec.is_sq8_residual_family() {
+        let so_bytes = n_cent * dim * 4;
+        if codec_meta_size < 2 * so_bytes {
+            return Err(BuildError::VectorSchemaMismatch(
+                "subsection codec meta too small for scale/offset blocks".into(),
+            ));
+        }
+        if sub.len() < codec_meta_off + 2 * so_bytes {
+            return Err(BuildError::VectorSchemaMismatch(
+                "subsection truncated before scale/offset blocks".into(),
+            ));
+        }
+        (
+            decode_f32_le_vec(&sub[codec_meta_off..codec_meta_off + so_bytes]),
+            decode_f32_le_vec(&sub[codec_meta_off + so_bytes..codec_meta_off + 2 * so_bytes]),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
@@ -933,6 +945,78 @@ mod tests {
         for id in left_ids.iter().chain(right_ids.iter()) {
             assert!(got.contains(id), "merged ids must include {id}");
         }
+    }
+
+    /// Sq16 build helper mirroring [`fixed_subsection_with_empty_clusters`] but
+    /// on the single-plane codec, whose codec_meta is norms-only (no per-cluster
+    /// scale/offset). Exercises the multi-batch splice read-back for Sq16.
+    fn sq16_subsection_with_empty_clusters(id_base: i128) -> MergedIvfSubsection {
+        let mut centroids = vec![0.0f32; N_CENT * DIM];
+        for c in 0..N_CENT {
+            centroids[c * DIM + c] = 1.0;
+        }
+        let mut vectors = Vec::with_capacity(ROWS * DIM);
+        for r in 0..ROWS {
+            let mut row = [0.0f32; DIM];
+            row[0] = 1.0;
+            row[4 + r % 4] = 0.05 + r as f32 * 0.01;
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            vectors.extend(row.iter().map(|v| v / norm));
+        }
+        let ids: Vec<i128> = (0..ROWS as i128).map(|i| id_base + i).collect();
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim: DIM,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq16,
+            provided_centroids: Some(Arc::from(centroids)),
+        };
+        build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids)
+            .expect("Sq16 cell build")
+    }
+
+    /// Sq16 multi-batch splice: a cell whose fragments span two drain batches
+    /// goes `merge_fragment_subsections` → `sq8_ivf_merge_input_from_subsection`
+    /// → `splice_fragments_into_cell`. All three must treat Sq16's codec_meta as
+    /// norms-only (no per-cluster scale/offset). Before the read-back fix, the
+    /// input parser decoded the norm table as scale/offset — erroring on a small
+    /// cell or silently corrupting the reranker on a large one.
+    #[test]
+    fn sq16_multi_batch_splice_round_trips() {
+        let left = sq16_subsection_with_empty_clusters(1_000);
+        let right = sq16_subsection_with_empty_clusters(2_000);
+        assert_eq!(left.rerank_codec, RerankCodec::Sq16);
+
+        // Read-back must parse norms-only → empty scale/offset (not the norm
+        // table misread as a quantizer).
+        let inp = sq8_ivf_merge_input_from_subsection(
+            &left.bytes,
+            DIM,
+            left.n_cent,
+            left.n_docs,
+            Metric::Cosine,
+            RerankCodec::Sq16,
+            None,
+        )
+        .expect("Sq16 read-back parses norms-only codec_meta");
+        assert!(
+            inp.scale.is_empty() && inp.offset.is_empty(),
+            "Sq16 carries no per-cluster scale/offset"
+        );
+
+        let left_ids: Vec<i128> = (0..ROWS as i128).map(|i| 1_000 + i).collect();
+        let right_ids: Vec<i128> = (0..ROWS as i128).map(|i| 2_000 + i).collect();
+        let (merged, ids) =
+            merge_fragment_subsections(&left, &left_ids, &right, &right_ids, DIM, Metric::Cosine)
+                .expect("Sq16 multi-batch splice merge");
+        assert_eq!(merged.rerank_codec, RerankCodec::Sq16);
+        assert_eq!(
+            merged.n_docs as usize,
+            2 * ROWS,
+            "spliced cell holds every doc from both batches"
+        );
+        assert_eq!(ids.len(), 2 * ROWS, "one stable id per spliced doc");
     }
 
     /// Splice-merging inputs that share an all-empty cluster must leave the
