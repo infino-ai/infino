@@ -1931,7 +1931,24 @@ fn build_one_shard_with_layout(
     let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
     let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_batches);
 
-    let bytes = Bytes::from(builder.finish()?);
+    // Stream the assembled superfile to a temp file, then mmap it back as
+    // zero-copy `Bytes`, rather than materializing the whole superfile as an
+    // anon `Vec<u8>` (which, on a corpus-sized single-shard build, is the
+    // dominant resident allocation and OOMs a memory-tight host). The mapped
+    // pages are file-backed and reclaimable; the downstream publish path takes
+    // `Bytes` unchanged and streams large superfiles via `put_multipart`. Same
+    // temp-file → mmap idiom the drain packed-shard path uses.
+    let mut output = NamedTempFile::new()
+        .map_err(|error| BuildError::Store(format!("shard temp create: {error}")))?;
+    {
+        let mut writer = BufWriter::new(output.as_file_mut());
+        builder.finish_to(&mut writer)?;
+        writer
+            .flush()
+            .map_err(|error| BuildError::Store(format!("shard temp flush: {error}")))?;
+    }
+    let bytes = mmap_readonly_bytes(output.path())
+        .map_err(|error| BuildError::Store(format!("shard mmap: {error}")))?;
 
     let (id_min, id_max) = if n_docs == 0 {
         (0, 0)
@@ -4995,7 +5012,21 @@ fn build_one_shard_from_packed_cells(
     let id_max = stable_ids.iter().copied().max().unwrap_or(0);
     let n_docs = stable_ids.len() as u64;
     let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
-    let bytes = Bytes::from(builder.finish()?);
+    // Stream the compacted superfile to a temp file, then mmap it back as
+    // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
+    // materializing the merged superfile as an anon `Vec<u8>` — the merge
+    // output is corpus-sized and OOMs a memory-tight host during compaction.
+    let mut output = NamedTempFile::new()
+        .map_err(|error| BuildError::Store(format!("compacted shard temp create: {error}")))?;
+    {
+        let mut writer = BufWriter::new(output.as_file_mut());
+        builder.finish_to(&mut writer)?;
+        writer
+            .flush()
+            .map_err(|error| BuildError::Store(format!("compacted shard temp flush: {error}")))?;
+    }
+    let bytes = mmap_readonly_bytes(output.path())
+        .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(ShardOutput {
         bytes,
@@ -5330,7 +5361,21 @@ fn build_one_packed_shard_via_drain(
         .map(|g| (g.cell_id, g.subsection))
         .collect();
     builder.set_prebuilt_multi_cell_ivfs(subsections)?;
-    let bytes = Bytes::from(builder.finish()?);
+    // Stream the compacted superfile to a temp file, then mmap it back as
+    // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
+    // materializing the merged superfile as an anon `Vec<u8>` — the merge
+    // output is corpus-sized and OOMs a memory-tight host during compaction.
+    let mut output = NamedTempFile::new()
+        .map_err(|error| BuildError::Store(format!("compacted shard temp create: {error}")))?;
+    {
+        let mut writer = BufWriter::new(output.as_file_mut());
+        builder.finish_to(&mut writer)?;
+        writer
+            .flush()
+            .map_err(|error| BuildError::Store(format!("compacted shard temp flush: {error}")))?;
+    }
+    let bytes = mmap_readonly_bytes(output.path())
+        .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(Some(ShardOutput {
         bytes,
