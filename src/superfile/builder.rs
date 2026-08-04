@@ -1171,6 +1171,20 @@ impl SuperfileBuilder {
     pub fn build_from_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+        let mut buf = Vec::new();
+        let stats = Self::build_from_readers_to(readers, &mut buf)?;
+        Ok((buf, stats))
+    }
+
+    /// Streaming counterpart of [`build_from_readers`](Self::build_from_readers):
+    /// merges the readers and writes the assembled superfile to `output`
+    /// instead of returning a `Vec<u8>`, so the compaction caller can stream
+    /// to a temp file and never hold the merged superfile in RAM. Returns the
+    /// merged [`SuperfileStats`].
+    pub(crate) fn build_from_readers_to<W: Write>(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        output: W,
+    ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
 
         let builder_opts = BuilderOptions::new_from_reader(&first.0);
@@ -1182,10 +1196,8 @@ impl SuperfileBuilder {
             stats_collector.push(stats);
         }
 
-        let bytes = superfile_builder.finish()?;
-        let stats = SuperfileStats::from_children(stats_collector.as_slice());
-
-        Ok((bytes, stats))
+        superfile_builder.finish_to(output)?;
+        Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
     /// Consume the builder and emit one self-contained superfile.
