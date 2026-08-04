@@ -21,13 +21,13 @@ name: Release prep
 # open PRs here (org policy), and PRs it creates wouldn't trigger CI.
 
 on:
-  # Weekly release train: Monday 09:00 IST (03:30 UTC; GitHub's scheduler
-  # can lag by some minutes). A scheduled run releases every package to its
-  # own next patch (scope `each`) and skips itself when there is nothing to
-  # release — no commits on main since the last release tag, or a release PR
-  # already open.
+  # Twice-daily release train: 09:00 and 21:00 IST (03:30 and 15:30 UTC;
+  # GitHub's scheduler can lag by some minutes). A scheduled run releases
+  # every package to its own next patch (scope `each`) and skips itself when
+  # there is nothing to release — no commits on main since the last release
+  # tag, or a release PR already open.
   schedule:
-    - cron: "30 3 * * 1"
+    - cron: "30 3,15 * * *"
   workflow_dispatch:
     inputs:
       package:
@@ -81,7 +81,7 @@ jobs:
 
       # A scheduled run skips itself when there is nothing to release: no
       # commits since the last release tag, or a release PR already open
-      # (an unmerged one from a previous week would collide on the branch).
+      # (an unmerged one from an earlier run would collide on the branch).
       # Manual dispatches always proceed.
       - name: Gate the scheduled run
         id: gate
@@ -101,7 +101,7 @@ jobs:
 
       # `package` is enum-safe (a choice input); `version` is free text, so it
       # goes through the environment, never interpolated into the script.
-      # A scheduled run has no inputs and defaults to the weekly `each` patch.
+      # A scheduled run has no inputs and defaults to the `each` patch.
       - name: Stamp version files
         if: steps.gate.outputs.skip != 'true'
         env:
