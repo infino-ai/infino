@@ -728,12 +728,45 @@ pub(crate) const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
 /// three-stage product ≥ 0.991 even when every crossing is tight.
 const LAW_STAGE_TARGET_COVERAGE: f64 = 0.997;
 
+/// Width-walk coverage target: the 0.99 bar itself, NOT the padded
+/// stage target below. Width is the dominant cost term — every probed
+/// cell is a fetch — and the 0.997 pad measured a 2x width tax on
+/// real embeddings (Cohere-1M: width 97 vs 53 at k=100; -7 ms @ k=100
+/// and -2.3 ms @ k=10 at equal recall class when dropped to 0.99).
+/// The padded target exists for PER-STAGE COMPOUNDING, and width is
+/// where compounding is cheapest to absorb: the 10M gate at this
+/// split (2026-08-02, vec10m-width99.log) holds every lifecycle state
+/// at 0.991-0.997 — the historical "width at 0.99 straddles the bar"
+/// measurement predates the recalibration repair and the rerank law
+/// actually serving, both of which carry the margin now.
+const WIDTH_LAW_TARGET_COVERAGE: f64 = 0.99;
+
 /// Rerank-law distractor pool: each calibration query counts 1-bit-estimate
 /// distractors only within its `RERANK_LAW_POOL_CELLS` grid-nearest cells —
 /// the pool a width-law sweep would actually scan. A `k` point whose
 /// measured width exceeds this stays uncalibrated (the pool under-counts
 /// its distractors), falling back to the configured `rerank_mult`.
 pub(crate) const RERANK_LAW_POOL_CELLS: usize = 64;
+
+/// Headroom multiplier when sizing a calibration's distractor pool from
+/// the stamped width law: the pool must cover the width queries will
+/// actually sweep, plus room for the width to grow between
+/// recalibrations (drains max-merge width upward; the pool is fixed at
+/// freeze time).
+const RERANK_LAW_POOL_MARGIN: usize = 2;
+
+/// Distractor-pool size for a calibration over a grid whose width law
+/// is already stamped: twice the widest stamped point, floored at the
+/// legacy [`RERANK_LAW_POOL_CELLS`] and capped at the grid. A fixed
+/// 64-cell pool under-covers fine geometries (measured on Cohere-1M:
+/// widths 79-104 at k >= 10), clearing exactly the rerank points the
+/// law-served default needs most.
+pub(crate) fn rerank_pool_hint(width_for_k: &[u32; WIDTH_LAW_KS.len()], n_cent: usize) -> usize {
+    let widest = width_for_k.iter().copied().max().unwrap_or(0) as usize;
+    (widest * RERANK_LAW_POOL_MARGIN)
+        .max(RERANK_LAW_POOL_CELLS)
+        .min(n_cent.max(1))
+}
 
 /// Rerank-law estimate histogram resolution: per-query counts of pool-row
 /// 1-bit estimates, binned linearly over `[-Σ|q_rot|, +Σ|q_rot|]` (the
@@ -810,6 +843,9 @@ pub(crate) struct WidthLawCalibration {
     /// Largest fine-cluster count observed across packed cells: the depth
     /// law's search domain.
     max_fine: AtomicU32,
+    /// Distractor-pool size (cells) chosen at [`Self::freeze`]; the
+    /// legacy floor until then.
+    pool_cells: usize,
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
@@ -861,6 +897,32 @@ pub(crate) struct CalibratedLaws {
     /// Global 1-bit-estimate survivor budget (rows) for 0.99 containment
     /// of the exact top-k — the measured replacement for `k x rerank_mult`.
     pub(crate) rerank_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Distractor-pool size (cells) this calibration measured rerank
+    /// against — the stamp records it so a later, wider law knows
+    /// whether the budget's evidence still covers it.
+    pub(crate) pool_cells: u32,
+}
+
+#[cfg(test)]
+mod pool_hint_tests {
+    use super::*;
+
+    /// The pool covers twice the widest stamped point, never dips below
+    /// the legacy floor, and never exceeds the grid.
+    #[test]
+    fn rerank_pool_hint_scales_with_the_stamped_width() {
+        // No stamp yet: legacy floor.
+        assert_eq!(rerank_pool_hint(&[0, 0, 0, 0], 256), RERANK_LAW_POOL_CELLS);
+        // Narrow law: floor still wins.
+        assert_eq!(rerank_pool_hint(&[1, 2, 8, 16], 256), RERANK_LAW_POOL_CELLS);
+        // The Cohere-1M shape that motivated this: widths 79-104 need a
+        // pool past the floor.
+        assert_eq!(rerank_pool_hint(&[33, 79, 97, 104], 256), 208);
+        // Grid caps the pool.
+        assert_eq!(rerank_pool_hint(&[33, 79, 97, 104], 150), 150);
+        // Tiny grids never zero the pool.
+        assert_eq!(rerank_pool_hint(&[1, 0, 0, 0], 0), 1);
+    }
 }
 
 /// Post-stamp guard shared by both stamp sites (drain max-merge and
@@ -874,11 +936,40 @@ pub(crate) struct CalibratedLaws {
 pub(crate) fn clear_rerank_beyond_pool(
     width_for_k: &[u32; WIDTH_LAW_KS.len()],
     rerank_for_k: &mut [u32; WIDTH_LAW_KS.len()],
+    pool_cells: &[u32; WIDTH_LAW_KS.len()],
 ) {
-    for (w, r) in width_for_k.iter().zip(rerank_for_k.iter_mut()) {
-        if *w as usize > RERANK_LAW_POOL_CELLS {
+    for ((w, r), pool) in width_for_k
+        .iter()
+        .zip(rerank_for_k.iter_mut())
+        .zip(pool_cells.iter())
+    {
+        if *w > *pool {
             *r = 0;
         }
+    }
+}
+
+/// Per-knot max-merge of a fresh rerank measurement into the live stamp,
+/// carrying pool provenance with each kept value: a knot keeps the pool
+/// of WHICHEVER calibration's value survives (ties keep the wider pool —
+/// the stronger certificate). Shared by both stamp sites so mixed-origin
+/// stamps stay per-knot honest — a surviving narrow-pool point must not
+/// invalidate fresh wide-pool neighbors, and a fresh pool must not
+/// launder an old point past the width its own evidence covered.
+pub(crate) fn merge_rerank_with_pools(
+    rerank: &mut [u32; WIDTH_LAW_KS.len()],
+    pools: &mut [u32; WIDTH_LAW_KS.len()],
+    measured: &[u32; WIDTH_LAW_KS.len()],
+    measured_pool: u32,
+) {
+    for ((slot, pool), m) in rerank.iter_mut().zip(pools.iter_mut()).zip(measured.iter()) {
+        if *m > *slot {
+            *slot = *m;
+            *pool = measured_pool;
+        } else if *m == *slot && *m > 0 {
+            *pool = (*pool).max(measured_pool);
+        }
+        // m < slot (incl. m == 0): keep the old value and its pool.
     }
 }
 
@@ -904,6 +995,7 @@ impl WidthLawCalibration {
             tops: Mutex::new(Vec::new()),
             fine_ranks: Mutex::new(HashMap::new()),
             max_fine: AtomicU32::new(0),
+            pool_cells: RERANK_LAW_POOL_CELLS,
             rerank: None,
         }
     }
@@ -926,7 +1018,14 @@ impl WidthLawCalibration {
     /// Called once, after the last batch spilled and before cell packing
     /// scores. The grid must be final by now — spills are already assigned
     /// to its cells.
-    pub(crate) fn freeze(&mut self, grid: &ClusterCentroids, rot_seed: u64) {
+    /// `pool_cells` sizes each query's distractor pool (see
+    /// [`rerank_pool_hint`]); clamped to `[RERANK_LAW_POOL_CELLS,
+    /// n_cent]` so a hint can never under-pool below the legacy floor
+    /// or over-pool past the grid.
+    pub(crate) fn freeze(&mut self, grid: &ClusterCentroids, rot_seed: u64, pool_cells: usize) {
+        self.pool_cells = pool_cells
+            .max(RERANK_LAW_POOL_CELLS)
+            .min((grid.n_cent as usize).max(1));
         let queries = self.reservoir.sample().to_vec();
         let ids = self.slot_ids.clone();
         let n_queries = ids.len();
@@ -945,7 +1044,7 @@ impl WidthLawCalibration {
                 let mut pool: Vec<u32> = grid
                     .rank_cells(self.metric, q)
                     .into_iter()
-                    .take(RERANK_LAW_POOL_CELLS)
+                    .take(self.pool_cells)
                     .map(|(cell, _)| cell)
                     .collect();
                 pool.sort_unstable();
@@ -1374,7 +1473,7 @@ impl WidthLawCalibration {
             if support[ki] == 0 {
                 continue;
             }
-            let target = LAW_STAGE_TARGET_COVERAGE * support[ki] as f64;
+            let target = WIDTH_LAW_TARGET_COVERAGE * support[ki] as f64;
             if let Some(rank) = sums.iter().position(|&s| s >= target) {
                 law[ki] = (rank + 1) as u32;
             }
@@ -1388,7 +1487,7 @@ impl WidthLawCalibration {
             // the measured width — beyond it the distractor counts are
             // partial and the point stays uncalibrated.
             let ranks = &mut rerank_ranks[ki];
-            if w == 0 || w as usize > RERANK_LAW_POOL_CELLS || ranks.is_empty() {
+            if w == 0 || w as usize > self.pool_cells || ranks.is_empty() {
                 continue;
             }
             // Mean-coverage crossing at the stage target: the
@@ -1415,6 +1514,7 @@ impl WidthLawCalibration {
             width_for_k: law,
             fine_for_k: fine_law,
             rerank_for_k: rerank_law,
+            pool_cells: self.pool_cells as u32,
         })
     }
 }
@@ -1746,7 +1846,11 @@ mod tests {
             500,
         ];
         let mut rerank = [10, 20, 30, 40];
-        clear_rerank_beyond_pool(&width, &mut rerank);
+        clear_rerank_beyond_pool(
+            &width,
+            &mut rerank,
+            &[RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
+        );
         assert_eq!(
             rerank,
             [10, 20, 0, 0],

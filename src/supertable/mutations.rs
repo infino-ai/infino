@@ -7,7 +7,9 @@
 //! already uses:
 //!
 //! 1. `update()` / `delete()` resolve the predicate against the
-//!    current manifest snapshot, capture the matching `_id` set,
+//!    latest committed manifest — refreshed regardless of the
+//!    connection's read consistency, so the target set agrees with
+//!    the manifest the commit lands on — capture the matching `_id` set,
 //!    pre-reserve any resources the WAL will need (an `_id`
 //!    range + a fresh superfile UUID for updates), and stash a
 //!    pending entry on the writer.
@@ -44,6 +46,7 @@ use crate::{
     supertable::{
         QueryError,
         error::BuildError,
+        manifest::ManifestLoadError,
         wal::{
             persistence::WalStoreError,
             pipeline::{AppendPhaseError, TombstonePhaseError},
@@ -183,6 +186,14 @@ pub enum MutationError {
     /// per-target bits in the sidecars.
     #[error("tombstone phase failed: {0}")]
     TombstonePhase(#[from] TombstonePhaseError),
+
+    /// Refreshing to the latest committed manifest failed while resolving the
+    /// mutation's target set. The target set must agree with the manifest the
+    /// commit lands on, so a failed refresh is surfaced rather than resolving
+    /// against a stale snapshot (which would drop a tombstone for a row
+    /// committed after that snapshot).
+    #[error("failed to refresh to the latest manifest for target resolution: {0}")]
+    TargetResolve(#[source] ManifestLoadError),
 }
 
 impl MutationError {
@@ -192,6 +203,22 @@ impl MutationError {
         match self {
             MutationError::PredicateEval(q) => q.over_budget(),
             _ => None,
+        }
+    }
+
+    /// True when the mutation lost a compare-and-set race — against another
+    /// writer's manifest commit, another writer's tombstone sidecar, or the
+    /// compactor. The whole `delete` / `update` call is safe to reissue: the
+    /// WAL either completes under the recovery sweep or is replayed
+    /// idempotently, and a retry re-resolves the predicate against fresh
+    /// state.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            MutationError::Storage(e) => e.is_conflict(),
+            MutationError::WalStore(e) => e.is_conflict(),
+            MutationError::AppendPhase(e) => e.is_conflict(),
+            MutationError::TombstonePhase(e) => e.is_conflict(),
+            _ => false,
         }
     }
 }
@@ -280,6 +307,18 @@ impl CommitError {
         match self {
             CommitError::AppendFlush(b) => b.over_budget(),
             CommitError::PartialCommit { cause, .. } => cause.over_budget(),
+        }
+    }
+
+    /// True when the commit failed because it lost a compare-and-set race.
+    ///
+    /// On `PartialCommit` this reports the *cause* of the stop; the
+    /// mutations that already landed stay landed, and the writer keeps the
+    /// unattempted ones buffered for the retry.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            CommitError::AppendFlush(b) => b.is_conflict(),
+            CommitError::PartialCommit { cause, .. } => cause.is_conflict(),
         }
     }
 }

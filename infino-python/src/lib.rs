@@ -58,6 +58,16 @@ create_exception!(
      the ingest, or raise the budget."
 );
 
+create_exception!(
+    infino,
+    ConflictError,
+    InfinoError,
+    "Raised when a concurrent writer won the commit race (an optimistic \
+     compare-and-set precondition failed) and the engine's own retries were \
+     exhausted. It is recoverable: nothing partial is visible, so catch it, \
+     back off, and reissue the append / update / delete."
+);
+
 /// Map a core engine error to the Python exception the caller sees.
 fn py_err(e: CoreError) -> PyErr {
     match e {
@@ -71,6 +81,8 @@ fn py_err(e: CoreError) -> PyErr {
         // A connection-memory-budget refusal: recoverable, so raise the typed
         // ConnectionMemoryBudgetError the caller can catch and back off on.
         CoreError::OverBudget(m) => ConnectionMemoryBudgetError::new_err(m),
+        // A lost CAS race: retryable
+        CoreError::Conflict(m) => ConflictError::new_err(m),
         // The core error is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => PyRuntimeError::new_err(other.to_string()),
@@ -897,5 +909,6 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ConnectionMemoryBudgetError",
         m.py().get_type::<ConnectionMemoryBudgetError>(),
     )?;
+    m.add("ConflictError", m.py().get_type::<ConflictError>())?;
     Ok(())
 }

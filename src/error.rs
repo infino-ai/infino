@@ -75,6 +75,19 @@ pub enum InfinoError {
     #[error("over budget: {0}")]
     OverBudget(String),
 
+    /// A concurrent writer won the race: an optimistic-concurrency
+    /// (compare-and-set) precondition failed and the operation's own retry
+    /// budget was exhausted.
+    ///
+    /// **Retryable.** Nothing partial is left visible — the losing writer's
+    /// manifest swap never published, and a mutation whose WAL did become
+    /// durable is completed idempotently by the recovery sweep. Reissuing
+    /// `append` / `update` / `delete` (ideally with backoff) resolves the
+    /// predicate against fresh state and can succeed. Persistent conflicts
+    /// mean genuine multi-writer contention on one table, not a fault.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Backend / internal failure that doesn't map to a more specific
     /// variant.
     #[error("backend: {0}")]
@@ -107,6 +120,7 @@ impl InfinoError {
             Self::Io(m) => Self::Io(format!("{prefix}: {m}")),
             Self::Query(m) => Self::Query(format!("{prefix}: {m}")),
             Self::OverBudget(m) => Self::OverBudget(format!("{prefix}: {m}")),
+            Self::Conflict(m) => Self::Conflict(format!("{prefix}: {m}")),
             Self::Backend(m) => Self::Backend(format!("{prefix}: {m}")),
             Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
         }
@@ -118,7 +132,7 @@ impl From<StorageError> for InfinoError {
         let msg = e.to_string();
         match e {
             StorageError::NotFound { .. } => InfinoError::NotFound(msg),
-            StorageError::PreconditionFailed { .. } => InfinoError::AlreadyExists(msg),
+            StorageError::PreconditionFailed { .. } => InfinoError::Conflict(msg),
             StorageError::TransientExhausted { .. } | StorageError::Permanent { .. } => {
                 InfinoError::Io(msg)
             }
@@ -173,6 +187,9 @@ impl From<SupertableBuildError> for InfinoError {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
+        if e.is_conflict() {
+            return InfinoError::Conflict(e.to_string());
+        }
         // A commit that found its table dropped and purged is not a schema
         // problem; it is the name no longer resolving. Same answer the read
         // path gives, so a caller can match one condition, not three.
@@ -190,6 +207,8 @@ impl From<SupertableCommitError> for InfinoError {
             // Reached by commit paths that surface the typed error directly
             // (the append path converts to `BuildError::TableGone` first).
             SupertableCommitError::PointerVanished => InfinoError::NotFound(msg),
+            // The OCC retry budget ran out on a contended pointer / part CAS.
+            e if e.is_conflict() => InfinoError::Conflict(msg),
             _ => InfinoError::Backend(msg),
         }
     }
@@ -197,6 +216,9 @@ impl From<SupertableCommitError> for InfinoError {
 
 impl From<OpenError> for InfinoError {
     fn from(e: OpenError) -> Self {
+        if e.is_conflict() {
+            return InfinoError::Conflict(e.to_string());
+        }
         InfinoError::Backend(e.to_string())
     }
 }
@@ -204,6 +226,9 @@ impl From<OpenError> for InfinoError {
 impl From<MutationError> for InfinoError {
     fn from(e: MutationError) -> Self {
         let msg = e.to_string();
+        if e.is_conflict() {
+            return InfinoError::Conflict(msg);
+        }
         match e {
             // Routes over-budget through From<QueryError> when the predicate
             // eval was the budget refusal.
@@ -224,6 +249,9 @@ impl From<MutationCommitError> for InfinoError {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
+        if e.is_conflict() {
+            return InfinoError::Conflict(e.to_string());
+        }
         // `Supertable::append` lands here, so this is the arm that decides what
         // appending to a purged table reports. Narrow on purpose: every other
         // append-flush failure keeps its existing `Backend` shape.
@@ -239,8 +267,16 @@ impl From<MutationCommitError> for InfinoError {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
-    use crate::storage::StorageError;
+    use crate::{
+        storage::StorageError,
+        supertable::wal::{
+            WalStoreError,
+            pipeline::{AppendPhaseError, TombstonePhaseError},
+        },
+    };
 
     #[test]
     fn display_messages_are_prefixed() {
@@ -259,6 +295,7 @@ mod tests {
         );
         assert_eq!(InfinoError::Io("t".into()).to_string(), "io: t");
         assert_eq!(InfinoError::Query("t".into()).to_string(), "query: t");
+        assert_eq!(InfinoError::Conflict("t".into()).to_string(), "conflict: t");
         assert_eq!(InfinoError::Backend("t".into()).to_string(), "backend: t");
         assert_eq!(InfinoError::Config("t".into()).to_string(), "config: t");
     }
@@ -270,6 +307,9 @@ mod tests {
 
         let err = InfinoError::Cardinality("mismatch".into()).with_context("update", None);
         assert_eq!(err.to_string(), "cardinality: update: mismatch");
+
+        let err = InfinoError::Conflict("lost the CAS".into()).with_context("delete", None);
+        assert_eq!(err.to_string(), "conflict: delete: lost the CAS");
     }
 
     #[test]
@@ -280,7 +320,7 @@ mod tests {
         ));
         assert!(matches!(
             InfinoError::from(StorageError::PreconditionFailed { uri: "u".into() }),
-            InfinoError::AlreadyExists(_)
+            InfinoError::Conflict(_)
         ));
         assert!(matches!(
             InfinoError::from(StorageError::TransientExhausted {
@@ -373,6 +413,113 @@ mod tests {
                 SupertableBuildError::NoDocsToBuild
             )),
             InfinoError::Backend(_)
+        ));
+    }
+
+    /// Every CAS-loss shape a public mutation can hit must arrive as the
+    /// retryable `Conflict`, not as an opaque `Backend`. One assertion per
+    /// path a caller can actually reach:
+    ///
+    /// - `append`  → append flush → manifest OCC exhausted;
+    /// - `delete`  → WAL state-doc CAS lost;
+    /// - `delete`  → tombstone-sidecar CAS budget exhausted;
+    /// - `update`  → append phase's manifest commit lost the race.
+    #[test]
+    fn cas_loss_maps_to_conflict_on_every_mutation_path() {
+        // The commit layer's own OCC exhaustion.
+        assert!(matches!(
+            InfinoError::from(SupertableCommitError::WriteContentionExhausted),
+            InfinoError::Conflict(_)
+        ));
+        // Commit → build conversion keeps the contention typed rather than
+        // stringifying it into `Store`, which is what let it read as a
+        // backend fault before.
+        assert!(matches!(
+            SupertableBuildError::from(SupertableCommitError::WriteContentionExhausted),
+            SupertableBuildError::WriteContention
+        ));
+        // `append`: writer flush → commit → OCC exhausted.
+        assert!(matches!(
+            InfinoError::from(MutationCommitError::AppendFlush(
+                SupertableBuildError::WriteContention
+            )),
+            InfinoError::Conflict(_)
+        ));
+        // `delete`: the WAL state doc lost its CAS mid-commit.
+        assert!(matches!(
+            InfinoError::from(MutationCommitError::PartialCommit {
+                committed_wal_ids: Vec::new(),
+                committed: 0,
+                total: 1,
+                cause: Box::new(MutationError::WalStore(WalStoreError::CasFailed {
+                    path: "wal/mutations/1.json".into()
+                })),
+            }),
+            InfinoError::Conflict(_)
+        ));
+        // `delete`: the per-superfile tombstone sidecar CAS budget ran out.
+        assert!(matches!(
+            InfinoError::from(MutationError::TombstonePhase(
+                TombstonePhaseError::CasRetryExhausted {
+                    superfile_id: Uuid::nil(),
+                    attempts: 8,
+                }
+            )),
+            InfinoError::Conflict(_)
+        ));
+        // `update`: the append phase's manifest commit lost the race.
+        assert!(matches!(
+            InfinoError::from(MutationError::AppendPhase(
+                AppendPhaseError::ManifestCommit(Box::new(
+                    SupertableCommitError::WriteContentionExhausted
+                ))
+            )),
+            InfinoError::Conflict(_)
+        ));
+        // A raw storage precondition failure anywhere under a mutation.
+        assert!(matches!(
+            InfinoError::from(MutationError::Storage(StorageError::PreconditionFailed {
+                uri: "u".into()
+            })),
+            InfinoError::Conflict(_)
+        ));
+        // Open bootstraps through the same CAS-fenced commit.
+        assert!(matches!(
+            InfinoError::from(OpenError::Commit(
+                SupertableCommitError::WriteContentionExhausted
+            )),
+            InfinoError::Conflict(_)
+        ));
+    }
+
+    /// The classifier has to stay narrow: failures that retrying cannot fix
+    /// must keep their existing variants.
+    #[test]
+    fn non_cas_failures_are_not_conflicts() {
+        // A duplicate WAL id is a create collision, not a lost race.
+        assert!(matches!(
+            InfinoError::from(MutationError::WalStore(WalStoreError::AlreadyExists {
+                path: "wal/mutations/1.json".into()
+            })),
+            InfinoError::Backend(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(MutationError::TombstonePhase(
+                TombstonePhaseError::IdLookupFailed {
+                    target_id: "7".into(),
+                    message: "boom".into(),
+                }
+            )),
+            InfinoError::Backend(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(SupertableCommitError::Encode("e".into())),
+            InfinoError::Backend(_)
+        ));
+        // A vanished pointer still outranks the conflict check.
+        assert!(matches!(
+            InfinoError::from(SupertableCommitError::PointerVanished),
+            InfinoError::NotFound(_)
         ));
     }
 

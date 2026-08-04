@@ -83,7 +83,7 @@ use crate::{
                 },
                 vector_exec::arg_to_query_vector,
             },
-            vector::user_placement_for_scalar_resolve,
+            vector::{calibrated_query, user_placement_for_scalar_resolve},
         },
     },
 };
@@ -139,11 +139,15 @@ impl SupertableReader {
         options: VectorSearchOptions,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        // Hybrid's vector arm enters without the sync wrappers — apply the
+        // cosine query calibration (#512) at this seam so hybrid scores
+        // match the public vector path.
+        let q_vec = calibrated_query(self, vec_col, q_vec);
         // Both retrievers run concurrently on the query runtime; each
         // inherits its own manifest skip and returns hits best-first.
         let (bm25_res, vector_res) = future::join(
             self.bm25_search_async(text_col, q_text, k, mode, Bm25Stats::PerSuperfile),
-            self.vector_search_user_table_async(vec_col, q_vec, k, options),
+            self.vector_search_user_table_async(vec_col, &q_vec, k, options),
         )
         .await;
         Ok(rrf_fuse(&bm25_res?, &vector_res?, k))

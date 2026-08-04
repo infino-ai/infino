@@ -214,6 +214,7 @@ pub(crate) fn status_to_error(op: &str, code: u16, body: &str) -> InfinoError {
     match code {
         404 => InfinoError::NotFound(format!("{op}: {body}")),
         409 => InfinoError::AlreadyExists(format!("{op}: {body}")),
+        412 => InfinoError::Conflict(format!("{op}: {body}")),
         401 | 403 => {
             InfinoError::Backend(format!("{op}: unauthorized (check the API key): {body}"))
         }
@@ -327,6 +328,10 @@ mod tests {
         assert!(matches!(
             status_to_error("create_table", 409, "exists"),
             InfinoError::AlreadyExists(_)
+        ));
+        assert!(matches!(
+            status_to_error("delete", 412, "lost the CAS"),
+            InfinoError::Conflict(_)
         ));
         assert!(matches!(
             status_to_error("append", 401, "bad key"),

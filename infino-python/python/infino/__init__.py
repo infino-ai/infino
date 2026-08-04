@@ -9,6 +9,7 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 
 from infino._infino import (
+    ConflictError,
     Connection,
     ConnectionMemoryBudgetError,
     GcReport,
@@ -30,6 +31,7 @@ __all__ = [
     "Connection",
     "InfinoError",
     "ConnectionMemoryBudgetError",
+    "ConflictError",
     "Table",
     "IndexSpec",
     "MutationStats",

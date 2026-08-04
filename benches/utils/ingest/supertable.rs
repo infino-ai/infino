@@ -77,9 +77,16 @@ pub const TEXT_COLUMN: &str = "title";
 /// uniform over [`VECTOR_FILTER_BUCKET_TERMS`] values, so every term
 /// matches exactly `1/VECTOR_FILTER_BUCKET_TERMS` of the corpus.
 pub const VECTOR_FILTER_COLUMN: &str = "filter_bucket";
-/// Distinct `filter_bucket` terms: 500 ⇒ every term is a 0.2%-selectivity
-/// predicate — the `single_rare` class the battery has always measured.
-pub const VECTOR_FILTER_BUCKET_TERMS: usize = 500;
+/// Distinct `filter_bucket` terms: ~0.2%-selectivity predicates — the
+/// `single_rare` class the battery has always measured. MUST stay coprime
+/// with the corpus mode count (`n_cent`, a power of two): buckets are
+/// `doc_id % TERMS` and vector modes are `centers[i % n_cent]`, so any
+/// shared factor g means each bucket holds rows from only `1/g` of the
+/// modes — most queries then have zero same-mode rows under the filter
+/// and the battery grades the generator's arithmetic, not the engine
+/// (measured at 10M: 0.726–0.748 with 500 vs gcd-free ~0.98). 499 is
+/// prime, so it is coprime with every power-of-two grid.
+pub const VECTOR_FILTER_BUCKET_TERMS: usize = 499;
 
 /// The bucket token stored for `doc_id` (and, symmetrically, the term a
 /// filter query uses to hit exactly one bucket).

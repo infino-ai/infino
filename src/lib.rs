@@ -179,7 +179,7 @@ pub use superfile::{
     vector::distance::Metric,
 };
 pub use supertable::{
-    GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
+    Consistency, GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
 };
 
 /// Convenience builders for test fixtures. Visible to:

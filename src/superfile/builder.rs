@@ -2521,9 +2521,14 @@ mod tests {
         // Verify values
         assert!((vectors[0][0] - 1.0).abs() < 1e-6);
         assert!((vectors[0][1] - 0.0).abs() < 1e-6);
-        assert!((vectors[1][0] - 1.0).abs() < 1e-6);
-        assert!((vectors[1][1] - 1.0).abs() < 1e-6);
-        assert!((vectors[1][15] - 1.0).abs() < 1e-6);
+        // Cosine ingest normalizes at the builder seam (#512): row 1 was
+        // fed as three unit components (norm √3) and is stored as its
+        // unit-normalized self — each surviving component is 1/√3. Row 0
+        // was already unit and passes through bit-for-bit above.
+        let unit = 3.0f32.sqrt().recip();
+        assert!((vectors[1][0] - unit).abs() < 1e-6);
+        assert!((vectors[1][1] - unit).abs() < 1e-6);
+        assert!((vectors[1][15] - unit).abs() < 1e-6);
     }
 
     #[test]

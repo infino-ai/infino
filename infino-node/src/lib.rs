@@ -79,6 +79,12 @@ fn map_err(e: InfinoError) -> Error {
             Status::GenericFailure,
             format!("ConnectionMemoryBudgetError: {m}"),
         ),
+        // A lost CAS race against a concurrent writer. Retryable, and prefixed
+        // with the same name Python raises (`ConflictError`) so a caller can
+        // tell it apart and reissue the operation.
+        InfinoError::Conflict(m) => {
+            Error::new(Status::GenericFailure, format!("ConflictError: {m}"))
+        }
         // `InfinoError` is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => Error::new(Status::GenericFailure, other.to_string()),

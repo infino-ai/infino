@@ -132,6 +132,21 @@ pub enum WalStoreError {
     },
 }
 
+impl WalStoreError {
+    /// True when the WAL write lost a compare-and-set race, so re-reading
+    /// and reissuing can succeed.
+    ///
+    /// `AlreadyExists` is deliberately excluded: a `create()` collision means
+    /// a duplicate `wal_id`, which retrying the same call cannot fix.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            WalStoreError::CasFailed { .. } => true,
+            WalStoreError::Storage { source, .. } => source.is_conflict(),
+            _ => false,
+        }
+    }
+}
+
 /// Storage prefix for WAL state-doc + sidecar objects.
 const WAL_DIR: &str = "wal/mutations";
 

@@ -110,6 +110,21 @@ pub enum StorageError {
     },
 }
 
+impl StorageError {
+    /// True when this error means a conditional write lost its race — the
+    /// object changed (or appeared) between the caller's read and its PUT.
+    ///
+    /// The distinguishing property is that reissuing the whole operation
+    /// against fresh state can succeed, which is what callers up the stack
+    /// key on when they decide between "retry" and "give up". Every layer
+    /// above has its own `is_conflict` that funnels into this one, and the
+    /// public boundary turns the answer into
+    /// [`InfinoError::Conflict`](crate::InfinoError::Conflict).
+    pub(crate) fn is_conflict(&self) -> bool {
+        matches!(self, StorageError::PreconditionFailed { .. })
+    }
+}
+
 /// I/O diagnostics that are not the usage ledger: timeline and phase spans.
 /// Request/byte counts and background tagging live in
 /// [`crate::runtime_metrics::io`] — import that module, not here.

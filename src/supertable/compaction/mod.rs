@@ -32,12 +32,16 @@ use uuid::Uuid;
 use crate::{
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
-    superfile::{builder::SuperfileBuilder, vector::layout::VectorLayout},
+    superfile::{
+        builder::SuperfileBuilder,
+        vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
+    },
     supertable::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri, Supertable,
         error::CompactionError,
         handle::hidden_vector_index_compaction_settings,
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
+        opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
@@ -270,6 +274,12 @@ impl Supertable {
             Err(_) => return Err(CompactionError::AlreadyCompacting),
         }
         let _slot = CompactionSlot(&inner.compaction_outstanding);
+        // #512 invariant tripwire, mirroring the drain's: merges and splits
+        // transcode Sq8 rows between per-cluster quantizers, and a
+        // destination grid that fails to cover its inputs saturates
+        // components silently. Snapshot the process tally; shout on exit if
+        // this pass added any.
+        let transcode_clamp_baseline = transcode_clamped_components();
 
         // Phase 1 (split-then-merge): split every over-cap cell first, from the
         // live grid, before merge-job selection. An over-cap cell is thus never
@@ -401,12 +411,36 @@ impl Supertable {
         // outputs committed): the probe laws were measured against the old
         // geometry, so re-measure and restamp both (width + fine depth)
         // while the compaction slot still serializes hidden reorgs.
-        if hidden_ivf && snapshot_ids() != pre_pass_ids {
+        // Repair trigger, independent of reshapes: a width law whose
+        // rerank points sit CLEARED (the stamped width outgrew the pool
+        // that measured them) never self-heals on a table that doesn't
+        // split or merge — the load -> optimize flow would otherwise
+        // leave the default path on the constant budget forever.
+        let rerank_lags = || match inner.manifest.load().partition_strategy() {
+            Some(PartitionStrategy::VectorCell {
+                routing, clusters, ..
+            }) => {
+                let achievable =
+                    rerank_pool_hint(&routing.width_for_k, clusters.n_cent as usize) as u32;
+                routing.rerank_law_lags_pool(achievable)
+            }
+            _ => false,
+        };
+        if hidden_ivf && (snapshot_ids() != pre_pass_ids || rerank_lags()) {
             recalibrate_probe_laws(inner)
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
         }
 
+        let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
+        if clamped_components > 0 {
+            eprintln!(
+                "[supertable compaction] BUG: {clamped_components} component(s) saturated \
+                 their destination Sq8 quantizer during this pass's merges/splits (#512 \
+                 failure mode) — a destination grid failed to cover its inputs; affected \
+                 rows' recall silently degrades.",
+            );
+        }
         Ok(())
     }
 

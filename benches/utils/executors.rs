@@ -1184,8 +1184,8 @@ pub mod fts {
             "+fetch Payload",
             "+fetch p50",
             "+fetch $/1M",
-            "cold open",
-            "cold search",
+            "cold open (median)",
+            "cold 1st query (median)",
             "cold GET/bytes",
             "Cold $/1M",
             "+fetch cold",
@@ -2070,8 +2070,8 @@ pub mod vector {
             );
         }
         if include_cold {
-            headers.push("cold open".to_string());
-            headers.push("cold search".to_string());
+            headers.push("cold open (median)".to_string());
+            headers.push("cold 1st query (median)".to_string());
             headers.push("cold GET/bytes".to_string());
             headers.push("Cold $/1M".to_string());
         }
@@ -2913,8 +2913,8 @@ pub mod sql {
             "warm p90",
             "warm p99",
             "Warm $/1M",
-            "cold open",
-            "cold search",
+            "cold open (median)",
+            "cold 1st query (median)",
             "cold GET/bytes",
             "Cold $/1M",
         ]

@@ -2062,7 +2062,11 @@ pub fn normalize(v: &mut [f32]) {
         }
         (acc.reduce_add() + tail_acc).sqrt()
     };
-    if mag > 0.0 {
+    // Normalize only when the magnitude is a normal float. Zero-norm
+    // vectors keep the existing leave-alone policy, and a subnormal
+    // magnitude joins it: `1.0 / mag` there rounds toward infinity and
+    // would poison every component with inf/NaN instead of normalizing.
+    if mag.is_normal() {
         let inv = 1.0 / mag;
         let inv_v = f32x8::splat(inv);
         let mut chunks = v.chunks_exact_mut(F32X8_LANES);
@@ -2395,6 +2399,20 @@ mod tests {
         let mut v: Vec<f32> = (1..=16).map(|i| i as f32).collect();
         normalize(&mut v);
         assert!(approx(dot(&v, &v), 1.0, 1e-5));
+    }
+
+    #[test]
+    fn normalize_degenerate_magnitude_never_produces_inf() {
+        // All-subnormal components: their squares flush to zero in f32,
+        // so the magnitude is zero or subnormal — the vector must be
+        // left alone rather than scaled by an infinite 1/mag.
+        let mut v = vec![f32::from_bits(1); 16]; // smallest positive subnormal
+        let before = v.clone();
+        normalize(&mut v);
+        assert_eq!(v, before);
+        for &x in &v {
+            assert!(x.is_finite());
+        }
     }
 
     // --- distance dispatch ---------------------------------------------

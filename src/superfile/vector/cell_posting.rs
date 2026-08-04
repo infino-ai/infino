@@ -6,7 +6,11 @@
 //! One superfile carries one cell's postings. Cold read = one range GET on
 //! `inf.vec.offset..+length`, then scan/rerank in memory.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 
 use roaring::RoaringBitmap;
 
@@ -703,6 +707,28 @@ pub struct MaterializedIvfRow {
     pub encoded: EncodedCellRow,
 }
 
+/// Overshoot (in code units) a transcoded component may exceed the
+/// destination grid by before it counts as CLAMPED: the residual byte
+/// corrects up to ~half a code step, so anything within half a code is
+/// recoverable and anything beyond is genuinely lossy.
+const SQ8_CLAMP_DETECT_SLACK_CODES: f32 = 0.5;
+
+/// Process-wide count of components that saturated their DESTINATION
+/// quantizer during an Sq8 transcode
+/// ([`residual_family_materialize_into_cluster_quant`]). A nonzero delta
+/// across a drain / merge / split means rows were re-encoded into a grid
+/// that cannot represent them — #512's failure mode, silent otherwise
+/// (-9.6 pts recall@10 when it shipped). Metric-agnostic by construction:
+/// the cosine fixed grid and L2/NegDot data-derived cluster grids all pass
+/// through the same transcode. Relaxed ordering; concurrent maintenance
+/// mixes into one process tally, which is fine for a bug tripwire.
+static TRANSCODE_CLAMPED_COMPONENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of [`TRANSCODE_CLAMPED_COMPONENTS`]; callers report deltas.
+pub(crate) fn transcode_clamped_components() -> u64 {
+    TRANSCODE_CLAMPED_COMPONENTS.load(AtomicOrdering::Relaxed)
+}
+
 /// True when two per-cluster Sq8 quantizers are bitwise identical.
 pub(crate) fn sq8_quant_params_equal(
     scale_a: &[f32],
@@ -786,9 +812,19 @@ pub(crate) fn residual_family_materialize_into_cluster_quant(
         .zip(dst_offset.iter())
         .map(|(s, o)| (-o).mul_add(1.0 / s, 0.5))
         .collect();
+    let mut clamped: u64 = 0;
     for d in 0..dim {
         let v = row_fp[d];
-        let q = v.mul_add(inv_scale[d], c2[d]).clamp(0.0, SQ8_CODE_MAX);
+        let q_raw = v.mul_add(inv_scale[d], c2[d]);
+        // #512 tripwire: a component landing beyond the grid (past what the
+        // residual byte can correct) is silently lossy — tally it for the
+        // maintenance-level bug shout.
+        if !(-SQ8_CLAMP_DETECT_SLACK_CODES..=SQ8_CODE_MAX + SQ8_CLAMP_DETECT_SLACK_CODES)
+            .contains(&q_raw)
+        {
+            clamped += 1;
+        }
+        let q = q_raw.clamp(0.0, SQ8_CODE_MAX);
         let code = q as u8;
         out[code_off + d] = code;
         let base = (code as f32).mul_add(dst_scale[d], dst_offset[d]);
@@ -801,6 +837,9 @@ pub(crate) fn residual_family_materialize_into_cluster_quant(
             0
         };
         out[res_off + d] = rq.to_le_bytes()[0];
+    }
+    if clamped > 0 {
+        TRANSCODE_CLAMPED_COMPONENTS.fetch_add(clamped, AtomicOrdering::Relaxed);
     }
     // Norm of the transcoded bytes through the one shared kernel (see
     // `compute_encoded_norms`) — the third hand-rolled copy of this formula
@@ -1209,5 +1248,75 @@ mod tests {
         let blob = b.finish().expect("finish");
         let hits = search_blob(&blob, &[1.0, 0.0, 0.0, 0.0], 1).expect("search");
         assert_eq!(hits[0].0, 0);
+    }
+
+    /// The transcode clamp tripwire (#512): re-encoding a row whose source
+    /// grid covers a wider range than the destination grid saturates the
+    /// out-of-range components and bumps the process tally; a transcode
+    /// whose destination covers the source adds nothing.
+    #[test]
+    fn transcode_counts_components_that_saturate_the_destination_grid() {
+        let dim = 4;
+        // Source: a raw-ingest-class data-derived grid decoding [-2.5, 2.5].
+        let raw_scale: Arc<[f32]> = vec![5.0 / f32::from(u8::MAX); dim].into();
+        let raw_offset: Arc<[f32]> = vec![-2.5; dim].into();
+        // Codes at the extremes decode to ±2.5 — far outside [-1, 1].
+        let row = EncodedCellRow {
+            stable_id: 0,
+            rerank_codec: RerankCodec::Sq8FixedResidual,
+            scale: Arc::clone(&raw_scale),
+            offset: Arc::clone(&raw_offset),
+            codes: vec![u8::MAX, 0, u8::MAX, 128],
+            residuals: vec![0; dim],
+            norm_sq: None,
+        };
+        let fixed_scale = vec![SQ8_FIXED_SCALE; dim];
+        let fixed_offset = vec![SQ8_FIXED_OFFSET; dim];
+        let mut out = vec![0u8; dim * ROW_BYTES_PER_DIM];
+        let ops = RerankCodec::Sq8FixedResidual
+            .ops()
+            .expect("Sq8FixedResidual ops");
+        let before = transcode_clamped_components();
+        ops.materialize_row_into_cluster_quant(
+            &row,
+            &fixed_scale,
+            &fixed_offset,
+            dim,
+            &mut out,
+            false,
+        )
+        .expect("transcode");
+        // Components 0..3 decode to 2.5 / -2.5 / 2.5 (clamp); component 3
+        // decodes near 0 (fits).
+        assert_eq!(
+            transcode_clamped_components() - before,
+            3,
+            "exactly the out-of-range components count"
+        );
+        // Reverse direction: fixed-grid rows fit inside the wide grid.
+        let unit_row = EncodedCellRow {
+            stable_id: 0,
+            rerank_codec: RerankCodec::Sq8FixedResidual,
+            scale: vec![SQ8_FIXED_SCALE; dim].into(),
+            offset: vec![SQ8_FIXED_OFFSET; dim].into(),
+            codes: vec![u8::MAX, 0, 128, 200],
+            residuals: vec![0; dim],
+            norm_sq: None,
+        };
+        let before = transcode_clamped_components();
+        ops.materialize_row_into_cluster_quant(
+            &unit_row,
+            &raw_scale,
+            &raw_offset,
+            dim,
+            &mut out,
+            false,
+        )
+        .expect("transcode");
+        assert_eq!(
+            transcode_clamped_components() - before,
+            0,
+            "a covering destination grid never clamps"
+        );
     }
 }

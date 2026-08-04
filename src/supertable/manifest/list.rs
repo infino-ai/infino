@@ -31,18 +31,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::supertable::manifest::{
-    add_sum_arrays,
-    bloom::Bloom,
-    column_hll, column_min_max, column_sum,
-    encoding::{
-        DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
-        decode_value_counts, encode_cluster_centroids, encode_length1_array, encode_value_counts,
+use crate::supertable::{
+    manifest::{
+        add_sum_arrays,
+        bloom::Bloom,
+        column_hll, column_min_max, column_sum,
+        encoding::{
+            DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
+            decode_value_counts, encode_cluster_centroids, encode_length1_array,
+            encode_value_counts,
+        },
+        hll::HllSketch,
+        merge_min_max_arrays,
+        part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
+        term_range::prefix_overlaps_range,
     },
-    hll::HllSketch,
-    merge_min_max_arrays,
-    part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
-    term_range::prefix_overlaps_range,
+    opann::RERANK_LAW_POOL_CELLS,
 };
 
 /// Wire format version for the manifest list.
@@ -387,6 +391,14 @@ pub struct CellRoutingParams {
     /// for the `k x rerank_mult` constant (expressed as the equivalent
     /// multiplier, `ceil(N / k)`). Absent on older manifests (all-zero).
     pub rerank_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Per-knot distractor-pool size (cells) each rerank point was
+    /// measured against. A point is valid only while the stamped width
+    /// at its knot stays within ITS pool; the clear/repair machinery
+    /// keys on it per knot, because a merge can keep points from
+    /// calibrations with different pools (an old narrow-pool point
+    /// surviving next to fresh wide-pool ones). Pre-provenance
+    /// manifests decode to the legacy floor.
+    pub rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
 }
 
 impl Default for CellRoutingParams {
@@ -399,11 +411,29 @@ impl Default for CellRoutingParams {
             width_for_k: [0; WIDTH_LAW_KS.len()],
             fine_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_for_k: [0; WIDTH_LAW_KS.len()],
+            rerank_pool_cells: [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
         }
     }
 }
 
 impl CellRoutingParams {
+    /// A calibrated width law whose rerank points were CLEARED — the
+    /// stamped width outgrew the pool that measured the budget, so the
+    /// default path is falling back to the constant `rerank_mult` — AND
+    /// a recalibration could do better: `achievable_pool` (the pool a
+    /// fresh calibration would size for this geometry) exceeds the
+    /// recorded one. The second condition keeps the repair trigger off
+    /// tables whose zeros are UNSUPPORTED rather than cleared (a small
+    /// corpus cannot measure high-k knots at any pool; re-firing there
+    /// would buy a full-sweep recalibration per optimize for nothing).
+    pub(crate) fn rerank_law_lags_pool(&self, achievable_pool: u32) -> bool {
+        self.width_for_k
+            .iter()
+            .zip(self.rerank_for_k.iter())
+            .zip(self.rerank_pool_cells.iter())
+            .any(|((w, r), pool)| *w > 0 && *r == 0 && *w > *pool && achievable_pool > *pool)
+    }
+
     /// Resolve the calibrated probe width for a query's `k`, or `None`
     /// when no usable law is persisted (all-zero, or every point at or
     /// around `k` is uncalibrated).
@@ -1282,6 +1312,17 @@ struct CellRoutingParamsDto {
     /// Rerank law; absent on pre-rerank-law manifests (all-zero).
     #[serde(default)]
     rerank_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Per-knot rerank measuring pools; absent on pre-provenance
+    /// manifests (decodes to the legacy floor, which is what stamped
+    /// them).
+    #[serde(default = "legacy_rerank_pool")]
+    rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
+}
+
+/// Serde default for [`CellRoutingParamsDto::rerank_pool_cells`]: every
+/// stamp before pool provenance existed measured at the legacy floor.
+fn legacy_rerank_pool() -> [u32; WIDTH_LAW_KS.len()] {
+    [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()]
 }
 
 impl From<CellRoutingParams> for CellRoutingParamsDto {
@@ -1294,6 +1335,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             width_for_k: r.width_for_k,
             fine_for_k: r.fine_for_k,
             rerank_for_k: r.rerank_for_k,
+            rerank_pool_cells: r.rerank_pool_cells,
         }
     }
 }
@@ -1316,6 +1358,7 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.width_for_k = d.width_for_k;
         r.fine_for_k = d.fine_for_k;
         r.rerank_for_k = d.rerank_for_k;
+        r.rerank_pool_cells = d.rerank_pool_cells.map(|p| p.max(1));
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -2794,6 +2837,41 @@ mod tests {
         assert_eq!(full.fine_for_k_at(100_000), Some(12), "clamps above range");
         assert_eq!(law([0, 0, 8, 0]).fine_for_k_at(1), Some(8), "zeros skip");
         assert_eq!(law([0; WIDTH_LAW_KS.len()]).fine_for_k_at(10), None);
+    }
+
+    /// The repair predicate fires exactly on the cleared-law signature:
+    /// a calibrated width past the measuring pool with a zeroed rerank
+    /// point — not on healthy laws, not on merely-unsupported points,
+    /// and not once the pool provenance covers the width.
+    #[test]
+    fn rerank_law_lags_pool_matches_the_cleared_signature() {
+        // `achievable` mirrors what a 256-cell grid's fresh calibration
+        // would pool for these widths (2x widest, grid-capped).
+        let mut r = CellRoutingParams::default();
+        // Uncalibrated table: no lag at any achievable pool.
+        assert!(!r.rerank_law_lags_pool(208));
+        // The measured vdbb-main state: widths past the 64 pools, rerank
+        // cleared at those knots, and a 208 pool achievable.
+        r.width_for_k = [33, 79, 97, 104];
+        r.rerank_for_k = [70, 0, 0, 0];
+        assert!(r.rerank_law_lags_pool(208));
+        // Small grid: nothing better is achievable — the zeros are
+        // unsupported, not repairable; never re-fire.
+        assert!(!r.rerank_law_lags_pool(64));
+        // Repaired MIXED-ORIGIN state: the old k=1 point keeps its
+        // narrow pool while fresh points carry the wide one — no lag,
+        // even though pools differ per knot (the scalar-provenance
+        // design cleared fresh points against the old pool here).
+        r.rerank_pool_cells = [64, 208, 208, 208];
+        r.rerank_for_k = [70, 900, 2400, 0];
+        assert!(
+            !r.rerank_law_lags_pool(208),
+            "a zero at a knot WITHIN its pool is 'unsupported', not cleared"
+        );
+        // Width outgrew one knot's recorded pool again AND the geometry
+        // affords a bigger one.
+        r.width_for_k = [33, 79, 97, 300];
+        assert!(r.rerank_law_lags_pool(256));
     }
 
     /// `rerank_for_k_at` never clamps ABOVE its calibrated range: the law

@@ -39,6 +39,11 @@ class ConnectionMemoryBudgetError(InfinoError):
     (set via ``connect(connection_memory_budget_bytes=...)``). Recoverable: catch
     it and back off, e.g. narrow the query, split the ingest, or raise the budget."""
 
+class ConflictError(InfinoError):
+    """Raised when a concurrent writer won the commit race and the engine's own
+    retries were exhausted. Recoverable: nothing partial is visible, so catch it,
+    back off, and reissue the append / update / delete."""
+
 class Connection:
     def create_database(self) -> None: ...
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...

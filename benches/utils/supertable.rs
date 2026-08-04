@@ -1649,7 +1649,10 @@ pub mod fts {
                         fmt_count(n_docs)
                     ),
                     "Pre-compact (post-ingest fanout): warm = shared consumer + disk cache; \
-                     cold open = construct only; cold search = first bm25_search. Δ vs previous run."
+                     cold open (median) = construct only; cold 1st query (median) = first \
+                     bm25_search on a fresh open, so each iteration re-pays one-time metadata \
+                     (the later metered-cold split reports first vs steady separately). \
+                     Δ vs previous run."
                         .to_string(),
                 )
             } else {

@@ -19,6 +19,7 @@ def test_package_metadata():
     assert isinstance(infino.__version__, str) and infino.__version__
     assert set(infino.__all__) == {
         "connect",
+        "ConflictError",
         "Connection",
         "InfinoError",
         "ConnectionMemoryBudgetError",

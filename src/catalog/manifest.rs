@@ -119,7 +119,8 @@ where
             Err(e) => return Err(InfinoError::from(e)),
         }
     }
-    Err(InfinoError::Backend(
+
+    Err(InfinoError::Conflict(
         "catalog commit exceeded its retry budget under contention".into(),
     ))
 }
@@ -454,8 +455,8 @@ mod tests {
             .await
             .expect_err("never lands under perpetual contention");
         assert!(
-            matches!(err, InfinoError::Backend(_)),
-            "budget exhaustion ⇒ Backend error, got {err:?}",
+            matches!(err, InfinoError::Conflict(_)),
+            "budget exhaustion ⇒ retryable Conflict, got {err:?}",
         );
         assert_eq!(
             mock.put_calls(),

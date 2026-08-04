@@ -3,6 +3,7 @@
 
 pub mod azure_helpers;
 pub mod compact_azure;
+pub mod fault_surfacing;
 pub mod rustfs_s3_wire;
 pub mod smoke_azure;
 pub mod smoke_gcs;

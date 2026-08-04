@@ -123,6 +123,15 @@ pub enum BuildError {
     #[error("table was dropped and purged while this handle was open")]
     TableGone,
 
+    /// A concurrent writer won the manifest CAS and the commit's retry
+    /// budget ran out. Carried as its own variant rather than folded into
+    /// [`Self::Store`] — a stringified error can't be matched on, and the
+    /// public mapping needs to report a retryable conflict rather than a
+    /// backend fault. See [`CommitError::WriteContentionExhausted`] and
+    /// `From<BuildError> for InfinoError`.
+    #[error("write contention: a concurrent writer won the commit race")]
+    WriteContention,
+
     #[error("merge needs more memory than the connection budget allows: {0}")]
     MemoryBudgetExceeded(String),
 
@@ -162,17 +171,28 @@ impl BuildError {
             _ => None,
         }
     }
+
+    /// True when the build failed because a concurrent writer won a
+    /// compare-and-set race, so reissuing against fresh state can succeed.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            BuildError::WriteContention => true,
+            BuildError::StorageConstruction(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
 }
 
 impl From<CommitError> for BuildError {
     /// Commit failures reach the build path as `Store` carrying the message —
-    /// except a vanished pointer, which keeps its own variant so the public
-    /// mapping can report the table missing rather than a backend fault. A
-    /// stringified error cannot be matched on, and the append path converts
-    /// here before any caller sees it.
+    /// except a vanished pointer and a lost commit race, which keep their own
+    /// variants so the public mapping can report a missing table or a
+    /// retryable conflict. A stringified error cannot be matched on,
+    /// and the append path converts here before any caller sees it.
     fn from(e: CommitError) -> Self {
         match e {
             CommitError::PointerVanished => BuildError::TableGone,
+            other if other.is_conflict() => BuildError::WriteContention,
             other => BuildError::Store(other.to_string()),
         }
     }
@@ -221,6 +241,23 @@ pub enum CommitError {
     /// was dropped and purged while this handle stayed open. Not retryable.
     #[error("manifest pointer was deleted while this handle was open")]
     PointerVanished,
+}
+
+impl CommitError {
+    /// True when the commit failed because a concurrent writer won the
+    /// pointer / part CAS, so reissuing against fresh state can succeed.
+    ///
+    /// A raw [`StorageError::PreconditionFailed`] can still reach here from a
+    /// sub-write that skipped the commit module's `translate_contention`, so
+    /// both shapes are classified together.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            CommitError::WriteContentionExhausted => true,
+            CommitError::Storage(e) => e.is_conflict(),
+            CommitError::Build(b) => b.is_conflict(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -309,6 +346,20 @@ pub enum OpenError {
     /// path.
     #[error("commit error during open")]
     Commit(#[from] CommitError),
+}
+
+impl OpenError {
+    /// True when the open lost a race against a concurrent writer — the
+    /// bootstrap commit an open-or-create performs is CAS-fenced like any
+    /// other, so a peer creating the same table first lands here.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            OpenError::PointerUnreadable(e) | OpenError::Storage(e) => e.is_conflict(),
+            OpenError::Build(b) => b.is_conflict(),
+            OpenError::Commit(c) => c.is_conflict(),
+            _ => false,
+        }
+    }
 }
 
 /// Errors raised by [`crate::Supertable::optimize`].

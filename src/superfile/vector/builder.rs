@@ -38,7 +38,8 @@ use crate::{
         vector::{
             cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
             distance::{
-                Metric, distance, encode_sq16_row, mean_f32_cluster_major, sq16_decoded_norm_sq,
+                Metric, distance, encode_sq16_row, mean_f32_cluster_major, normalize,
+                sq16_decoded_norm_sq,
             },
             ivf_merge::MergedIvfSubsection,
             kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
@@ -283,6 +284,15 @@ struct ColumnState {
     config: VectorConfig,
     n_docs: u32,
     reservoir: Reservoir,
+    /// Cosine ingest normalizes every corpus vector through this reused
+    /// scratch before anything downstream sees it (issue #512: the
+    /// portable fixed Sq8 grid silently clamps non-unit components at
+    /// encode — measured −9.6 pts recall@10 on raw Cohere input).
+    /// Normalizing at the ONE lossless-backing seam makes the reservoir,
+    /// k-means, all encoders, the drain, and the stored fp32 payload
+    /// inherit unit vectors. Cosine declares magnitude irrelevant, so
+    /// this is semantics-preserving; unit input is a fp-noise no-op.
+    unit_scratch: Vec<f32>,
     /// Lossless input backing while below the spill threshold.
     /// Holds vectors in insertion order, never overwrites. Drained
     /// to `Vec::new()` (releasing capacity) the moment the build
@@ -471,6 +481,7 @@ impl VectorBuilder {
             config,
             n_docs: 0,
             reservoir,
+            unit_scratch: Vec::new(),
             pre_spill_buffer: Vec::new(),
             spill: None,
             spill_threshold_bytes,
@@ -594,6 +605,17 @@ impl VectorBuilder {
                     actual: format!("vec.len()={} != dim={}", vec.len(), col.config.dim),
                 });
             }
+            // See `unit_scratch`: cosine corpus vectors are normalized
+            // here, at the single seam every downstream consumer reads
+            // through.
+            let vec: &[f32] = if col.config.metric == Metric::Cosine {
+                col.unit_scratch.clear();
+                col.unit_scratch.extend_from_slice(vec);
+                normalize(&mut col.unit_scratch);
+                &col.unit_scratch
+            } else {
+                vec
+            };
             col.reservoir.update(vec);
 
             // Append to the lossless input backing. Three cases,
@@ -2388,6 +2410,7 @@ fn build_subsection_streaming(
         config: cfg,
         n_docs: n_docs_u32,
         reservoir,
+        unit_scratch: _,
         pre_spill_buffer,
         spill,
         spill_threshold_bytes: _,

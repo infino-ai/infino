@@ -8,7 +8,7 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use crate::supertable::reader_cache::ColdFetchMode as InternalColdFetchMode;
+use crate::supertable::{Consistency, reader_cache::ColdFetchMode as InternalColdFetchMode};
 
 /// How a disk-cache miss is serviced when reading cold superfiles from
 /// object storage. The cache-servicing modes need a cache
@@ -68,6 +68,12 @@ pub struct ConnectOptions {
     /// can't exhaust process memory. Applies to the whole connection, shared
     /// across supertables.
     pub(crate) connection_memory_budget_bytes: Option<u64>,
+    /// Read-consistency policy for every table opened or created on this
+    /// connection (see [`Consistency`]). Default:
+    /// [`Consistency::BoundedStaleness`] with a 1s window — the engine default,
+    /// which amortizes the per-query manifest-pointer re-check. Set
+    /// [`Consistency::Strong`] for a pointer re-check on every query.
+    pub(crate) read_consistency: Consistency,
     /// Probe the backend at `connect`. Default `false`; opt in for
     /// fail-fast on bad credentials.
     pub(crate) validate: bool,
@@ -126,6 +132,15 @@ impl ConnectOptions {
         self
     }
 
+    /// Set the read-consistency policy for tables on this connection (see
+    /// [`Consistency`]). Unset defaults to [`Consistency::BoundedStaleness`]
+    /// with a 1s window (the engine default); pass [`Consistency::Strong`] to
+    /// re-check the manifest pointer on every query. Chainable.
+    pub fn with_read_consistency(mut self, consistency: Consistency) -> Self {
+        self.read_consistency = consistency;
+        self
+    }
+
     /// Probe the object store at `connect` (default `false`). `true`
     /// fails fast on bad credentials instead of on first use.
     pub fn with_validate(mut self, validate: bool) -> Self {
@@ -152,7 +167,24 @@ impl ConnectOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn read_consistency_defaults_to_bounded_staleness() {
+        assert_eq!(
+            ConnectOptions::new().read_consistency,
+            Consistency::BoundedStaleness(Duration::from_secs(1)),
+            "unset read consistency defaults to the engine's BoundedStaleness(1s)"
+        );
+    }
+
+    #[test]
+    fn with_read_consistency_overrides_the_default() {
+        let opts = ConnectOptions::new().with_read_consistency(Consistency::Strong);
+        assert_eq!(opts.read_consistency, Consistency::Strong);
+    }
 
     #[test]
     fn with_storage_option_round_trips() {

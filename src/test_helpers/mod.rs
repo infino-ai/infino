@@ -26,6 +26,36 @@
 
 pub mod brute_force_bm25;
 pub mod cas_conformance;
+pub mod fault_storage;
+
+/// Observability probe for the vector query path's EFFECTIVE served
+/// shortlist budget — the regression guard for the serve-the-law scope
+/// bug (#520 review): recall-floor tests are insensitive to a re-shadowed
+/// `options` (the `rm=256` constant yields MORE survivors, so recall
+/// stays equal-or-better and only latency regresses), but the served
+/// budget is not. The pooled warm arm records the limit and cell floor
+/// it passes to the global shortlist; tests read them after a query.
+pub mod served_shortlist_probe {
+    use std::sync::Mutex;
+
+    static RECORDS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+    /// Called by the query path (test-helpers builds only).
+    pub fn record(limit: usize, cell_floor: usize) {
+        RECORDS
+            .lock()
+            .expect("shortlist probe lock")
+            .push((limit, cell_floor));
+    }
+
+    /// Drain every `(limit, cell_floor)` recorded since the last drain.
+    /// Append-log semantics keep the probe race-tolerant under the test
+    /// binary's parallelism: a concurrent test adds tuples but can never
+    /// remove this test's — assert with `contains`, not equality.
+    pub fn drain() -> Vec<(usize, usize)> {
+        std::mem::take(&mut *RECORDS.lock().expect("shortlist probe lock"))
+    }
+}
 
 use std::{collections::HashSet, path::Path, sync::Arc};
 

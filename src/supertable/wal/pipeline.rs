@@ -70,6 +70,7 @@ use crate::{
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
         ManifestSnapshot, SupertableOptions,
+        error::CommitError as ManifestCommitError,
         handle::{Supertable, SupertableInner},
         manifest::{
             FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
@@ -178,10 +179,13 @@ pub enum AppendPhaseError {
     /// The manifest-commit machinery failed. Surfaces both the
     /// "I lost the pointer CAS" path (which the inner code
     /// retries on its own up to `max_commit_retries`) and any
-    /// permanent failure. Caller's handling is the same in both
-    /// cases: the WAL stays at whatever state was durable.
-    #[error("manifest commit failed: {message}")]
-    ManifestCommit { message: String },
+    /// permanent failure. Caller's handling of the WAL is the same
+    /// in both cases — it stays at whatever state was durable — but
+    /// the typed cause is carried rather than stringified so the
+    /// public boundary can still tell a retryable lost race from a
+    /// permanent fault.
+    #[error("manifest commit failed: {0}")]
+    ManifestCommit(#[source] Box<ManifestCommitError>),
 
     /// Underlying storage error.
     #[error("storage error: {0}")]
@@ -190,6 +194,19 @@ pub enum AppendPhaseError {
     /// WAL state-document I/O error from the persistence layer.
     #[error("WAL store error: {0}")]
     WalStore(#[from] WalStoreError),
+}
+
+impl AppendPhaseError {
+    /// True when the append phase lost a compare-and-set race, so reissuing
+    /// the mutation against fresh state can succeed.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            AppendPhaseError::ManifestCommit(e) => e.is_conflict(),
+            AppendPhaseError::Storage(e) => e.is_conflict(),
+            AppendPhaseError::WalStore(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
 }
 
 /// Drive one UPDATE WAL from `Intent` to `Appended`.
@@ -460,9 +477,7 @@ async fn do_apply(
         Vec::new(),
         CommitListMetadata::empty(),
     )
-    .map_err(|e| AppendPhaseError::ManifestCommit {
-        message: format!("{e}"),
-    })?;
+    .map_err(|e| AppendPhaseError::ManifestCommit(Box::new(e)))?;
 
     // Warm the in-memory reader cache with the freshly-published
     // bytes so this process's later reads (queries, tombstone
@@ -731,8 +746,10 @@ pub enum TombstonePhaseError {
     /// The post-sidecar manifest stamp (tombstone seqs) failed. The
     /// sidecar bits are durable and the WAL stays incomplete, so the
     /// recovery sweep re-runs the phase and re-attempts the stamp.
+    /// Carries the typed cause so a lost commit race stays
+    /// distinguishable from a permanent fault at the public boundary.
     #[error("tombstone-seq manifest stamp failed: {0}")]
-    ManifestStamp(String),
+    ManifestStamp(#[source] Box<ManifestCommitError>),
 
     /// Tombstone codec error from the sidecar layer.
     #[error("tombstone sidecar codec error: {0}")]
@@ -745,6 +762,26 @@ pub enum TombstonePhaseError {
     /// WAL state-document I/O error from the persistence layer.
     #[error("WAL store error: {0}")]
     WalStore(#[from] WalStoreError),
+}
+
+impl TombstonePhaseError {
+    /// True when the tombstone phase lost a race against a concurrent
+    /// writer or the compactor, so reissuing the mutation against fresh
+    /// state can succeed.
+    ///
+    /// Both retry-budget variants count: exhausting the sidecar CAS budget
+    /// or waiting out a compactor-sealed sidecar are contention outcomes,
+    /// not faults — the caller's move in each case is to retry the delete.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            TombstonePhaseError::CasRetryExhausted { .. }
+            | TombstonePhaseError::SealedSidecarRetryExhausted { .. } => true,
+            TombstonePhaseError::ManifestStamp(e) => e.is_conflict(),
+            TombstonePhaseError::Storage(e) => e.is_conflict(),
+            TombstonePhaseError::WalStore(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
 }
 
 /// Drive one WAL through the tombstone phase to `Complete`.
@@ -916,7 +953,7 @@ async fn do_tombstone_apply(
     if !touched.is_empty() {
         stamp_tombstone_seqs(inner, &touched)
             .await
-            .map_err(|e| TombstonePhaseError::ManifestStamp(e.to_string()))?;
+            .map_err(|e| TombstonePhaseError::ManifestStamp(Box::new(e)))?;
     }
 
     // Final transition: every entry is non-Pending; flip the

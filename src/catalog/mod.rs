@@ -63,7 +63,7 @@ use crate::{
     },
     supertable::{
         Supertable as SupertableHandle,
-        options::{Consistency, SupertableOptions},
+        options::SupertableOptions,
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
@@ -410,9 +410,9 @@ impl Connection {
                     opts = opts.with_disk_cache(cache);
                 }
 
-                // Match `open_table`'s memoized handles: Strong keeps every
-                // query re-checking the manifest pointer (see `open_table`).
-                opts = opts.with_read_consistency(Consistency::Strong);
+                // Honor the connection's read-consistency policy (default
+                // BoundedStaleness); `open_table` applies the same.
+                opts = opts.with_read_consistency(self.inner.options.read_consistency);
 
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a
@@ -546,10 +546,10 @@ impl Connection {
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
-                // Strong: re-check the manifest pointer per query (cheap,
-                // short-circuits when unchanged), matching the old rebuild's
-                // freshness without its cost.
-                opts = opts.with_read_consistency(Consistency::Strong);
+                // Honor the connection's read-consistency policy. Default is
+                // BoundedStaleness(1s): the per-query pointer re-check is
+                // amortized across the window rather than paid on every query.
+                opts = opts.with_read_consistency(self.inner.options.read_consistency);
                 let handle = SupertableHandle::open(opts)
                     .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
                 handles.insert(name.to_string(), handle.clone());
@@ -1093,6 +1093,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::Arc,
         thread,
+        time::Duration,
     };
 
     use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
@@ -1101,7 +1102,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode,
+        Bm25SearchOptions, BoolMode, Consistency,
         supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
     };
@@ -1498,8 +1499,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = dir.path().to_str().expect("utf8 path").to_string();
 
-        let writer = connect(&uri).expect("connect writer");
-        let peer = connect(&uri).expect("connect peer");
+        let writer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect writer");
+        let peer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect peer");
 
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
@@ -1558,9 +1567,18 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache dir");
         let uri = dir.path().to_str().expect("utf8 path").to_string();
 
-        let writer = connect(&uri).expect("connect writer");
-        let peer = connect_with(&uri, ConnectOptions::new().with_cache_dir(cache.path()))
-            .expect("connect peer");
+        let writer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect writer");
+        let peer = connect_with(
+            &uri,
+            ConnectOptions::new()
+                .with_cache_dir(cache.path())
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect peer");
 
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
@@ -1740,8 +1758,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = dir.path().to_str().expect("utf8 path").to_string();
 
-        let writer = connect(&uri).expect("connect writer");
-        let peer = connect(&uri).expect("connect peer");
+        let writer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect writer");
+        let peer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect peer");
 
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
@@ -2085,7 +2111,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = dir.path().to_str().expect("utf8 path").to_string();
 
-        let writer = connect(&uri).expect("connect writer");
+        let writer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect writer");
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
@@ -2093,7 +2123,11 @@ mod tests {
             .expect("append 1");
 
         // A separate connection memoizes + warms its own handle for `docs`.
-        let reader = connect(&uri).expect("connect reader");
+        let reader = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect reader");
         assert_eq!(count_rows(&reader, "docs"), 1);
 
         // The other connection commits a second row.
@@ -2947,6 +2981,113 @@ mod tests {
     fn connect_with_default_options_yields_empty_memory_catalog() {
         let db = connect_with("memory://", ConnectOptions::new()).expect("connect_with");
         assert!(db.list_tables().expect("list").is_empty());
+    }
+
+    #[test]
+    fn connection_read_consistency_flows_to_table_handles() {
+        let dir = std::env::temp_dir().join(format!("infino-consistency-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+
+        // Default connection → BoundedStaleness(1s), applied to both a created
+        // handle and a freshly opened one.
+        let db = connect_with(&uri, ConnectOptions::new()).expect("connect default");
+        let created = db
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        assert_eq!(
+            created.local_handle().options().read_consistency,
+            Consistency::BoundedStaleness(Duration::from_secs(1)),
+            "an unset connection defaults to BoundedStaleness(1s)"
+        );
+        assert_eq!(
+            db.open_table("docs")
+                .expect("open")
+                .local_handle()
+                .options()
+                .read_consistency,
+            Consistency::BoundedStaleness(Duration::from_secs(1)),
+            "open_table applies the same policy as create_table"
+        );
+
+        // An explicit policy on the connection flows through unchanged.
+        let dir2 = std::env::temp_dir().join(format!(
+            "infino-consistency-strong-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir2).expect("mkdir");
+        let uri2 = format!("file://{}", dir2.display());
+        let strong = connect_with(
+            &uri2,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect strong");
+        let created = strong
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        assert_eq!(
+            created.local_handle().options().read_consistency,
+            Consistency::Strong,
+            "with_read_consistency(Strong) reaches the table handle"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn bounded_staleness_default_is_stale_within_window_then_converges() {
+        // The default connection is BoundedStaleness(1s): a peer connection's
+        // commit is not visible within the staleness window, and becomes visible
+        // once it elapses. (Strong would show it immediately; that path is
+        // covered by `storage_memoized_handle_sees_another_connections_commit`.)
+        let dir = std::env::temp_dir().join(format!("infino-bs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+
+        let writer = connect(&uri).expect("connect writer");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append v1");
+
+        // A separate default (BoundedStaleness) connection. Its first read sees
+        // the first commit and stamps the per-window pointer check.
+        let reader = connect(&uri).expect("connect reader");
+        let hits = |r: &Connection| {
+            n_rows(
+                &r.open_table("docs")
+                    .expect("open")
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("search"),
+            )
+        };
+        assert_eq!(hits(&reader), 1, "reader sees the first commit");
+
+        // The writer commits a second matching doc.
+        writer
+            .open_table("docs")
+            .expect("open")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append v2");
+
+        // Within the 1s window the reader still serves its pinned snapshot.
+        assert_eq!(
+            hits(&reader),
+            1,
+            "within the bounded-staleness window the peer's commit is not yet visible"
+        );
+
+        // After the window elapses, the next read re-probes and converges.
+        thread::sleep(Duration::from_millis(1_100));
+        assert_eq!(
+            hits(&reader),
+            2,
+            "after the 1s window the reader picks up the peer's commit"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
