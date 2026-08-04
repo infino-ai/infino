@@ -131,8 +131,14 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
         // Debug form — so the hash stays in lockstep.
         let metric_str = format!("{:?}", v.metric).to_lowercase();
         push_str(&mut buf, &metric_str);
-        push_tag(&mut buf, b"rerank_codec");
-        push_str(&mut buf, v.rerank_codec.name());
+        // rerank_codec is deliberately NOT part of the identity hash. The codec
+        // is data-determined: it is recorded on disk in every superfile's
+        // subsection directory (`codec_id`), and the reader dispatches on that,
+        // so the caller-supplied codec is not an identity input and the reader
+        // never trusts it over the on-disk value. Hashing it only manufactured a
+        // false `OptionsHashMismatch` when the engine default changed (e.g.
+        // Sq8FixedResidual -> Sq16) and a caller reopened an existing cosine
+        // table with config derived from the new default.
     }
 
     // 5. partition_strategy.
@@ -579,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_options_hash_distinguishes_every_rerank_codec() {
+    fn compute_options_hash_ignores_rerank_codec() {
         let mk = |rerank_codec: RerankCodec| {
             SupertableOptions::new(
                 schema_title_emb(16),
@@ -596,24 +602,21 @@ mod tests {
             )
             .expect("opts")
         };
-        let residual = compute_options_hash(&mk(RerankCodec::Sq8Residual), &time_range());
-        let fp32 = compute_options_hash(&mk(RerankCodec::Fp32), &time_range());
-        let fixed = compute_options_hash(&mk(RerankCodec::Sq8FixedResidual), &time_range());
-        let sq16 = compute_options_hash(&mk(RerankCodec::Sq16), &time_range());
-        assert_ne!(residual.0, fp32.0);
-        assert_ne!(
-            residual.0, fixed.0,
-            "fixed residual must not reopen with local residual write options"
-        );
-        // Sq16 is a distinct on-disk format — it must not collide with
-        // any other codec's options hash (else a table would reopen with
-        // the wrong reader layout).
-        for (other, label) in [
-            (residual.0, "sq8_residual"),
-            (fp32.0, "fp32"),
-            (fixed.0, "sq8_fixed_residual"),
+        // rerank_codec is data-determined (on-disk `codec_id`, dispatched by the
+        // reader), not an identity input — changing only the codec must NOT move
+        // the hash, so a default flip cannot break reopening an existing table.
+        let base = compute_options_hash(&mk(RerankCodec::Sq8FixedResidual), &time_range());
+        for codec in [
+            RerankCodec::Sq16,
+            RerankCodec::Sq8Residual,
+            RerankCodec::Fp32,
+            RerankCodec::RabitqOnly,
         ] {
-            assert_ne!(sq16.0, other, "sq16 options hash collides with {label}");
+            assert_eq!(
+                compute_options_hash(&mk(codec), &time_range()).0,
+                base.0,
+                "options hash must not depend on rerank_codec ({codec:?})"
+            );
         }
     }
 
