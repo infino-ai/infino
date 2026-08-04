@@ -10,6 +10,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    io::{BufWriter, Write},
     mem,
     sync::{
         Arc,
@@ -25,9 +26,12 @@ use futures::{
     stream::{self, StreamExt},
 };
 use roaring::RoaringBitmap;
+use tempfile::NamedTempFile;
 use tokio::time;
 use tracing::warn;
 use uuid::Uuid;
+
+use crate::supertable::reader_cache::disk::mmap_readonly_bytes;
 
 use crate::{
     config::CompactionSettings,
@@ -510,7 +514,7 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
-        let (merged_bytes, superfile_stats) = {
+        let (merged_bytes, superfile_stats): (Bytes, _) = {
             let first_vec = readers_with_tombstones
                 .first()
                 .and_then(|(reader, _)| reader.vec());
@@ -521,17 +525,38 @@ impl Supertable {
                     .map(|c| c.rerank_codec.is_ivf_mergeable())
             });
             if multi_cell && sq8_merge == Some(true) {
-                SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
+                let (bytes, stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
                     &readers_with_tombstones,
                     &superseded_per_reader,
-                )?
+                )?;
+                (Bytes::from(bytes), stats)
             } else if sq8_merge == Some(true) {
-                SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
+                let (bytes, stats) =
+                    SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?;
+                (Bytes::from(bytes), stats)
             } else {
-                SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
+                // FTS/SQL merge: stream the merged superfile to a temp file and
+                // mmap it back, so the corpus-sized merge output isn't held as an
+                // anon Vec — the allocation that OOMs compaction on a memory-tight
+                // host. Mapped pages are file-backed and reclaimable.
+                let mut output = NamedTempFile::new()
+                    .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
+                let stats = {
+                    let mut writer = BufWriter::new(output.as_file_mut());
+                    let stats = SuperfileBuilder::build_from_readers_to(
+                        &readers_with_tombstones,
+                        &mut writer,
+                    )?;
+                    writer
+                        .flush()
+                        .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
+                    stats
+                };
+                let bytes = mmap_readonly_bytes(output.path())
+                    .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
+                (bytes, stats)
             }
         };
-        let merged_bytes = Bytes::from(merged_bytes);
 
         let shard = ShardOutput::new_with_params(
             merged_bytes,
