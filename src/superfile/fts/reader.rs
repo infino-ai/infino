@@ -1547,12 +1547,14 @@ impl FtsReader {
 
     /// Stream a column's postings for the FTS compaction merge: for every term
     /// (lex order) and every doc in its posting list (doc_ids ascending),
-    /// invoke `emit(term_bytes, local_doc_id, tf)`. Reuses the query-path
-    /// [`TermCursor`] block decode, so the doc_ids/tfs are exactly what a fresh
-    /// build would produce. Positions are read separately (a positional column
-    /// still yields the same `(doc_id, tf)` here; the caller pairs it with a
-    /// positions read). Tombstone filtering is the caller's job — this streams
-    /// every stored posting.
+    /// invoke `emit(term_bytes, local_doc_id, tf, positions)`. Reuses the
+    /// query-path [`TermCursor`] block decode for doc_ids/tfs and the
+    /// positional `decode_run` for positions, so what is streamed is exactly
+    /// what a fresh build produced. `positions` is empty for a non-positional
+    /// column; otherwise it holds the `tf` token offsets for this `(term, doc)`
+    /// (borrowed from a reused buffer — copy it if you need to retain it past
+    /// the call). Tombstone filtering is the caller's job — this streams every
+    /// stored posting.
     ///
     /// Synchronous: compaction opens its inputs over resident bytes, so every
     /// range resolves without a runtime. `emit` may return an error to abort.
@@ -1561,13 +1563,14 @@ impl FtsReader {
     pub(crate) fn for_each_term_posting(
         &self,
         column_id: u32,
-        mut emit: impl FnMut(&[u8], u32, u32) -> Result<(), FtsError>,
+        mut emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let positional = col_meta.positions;
         let n_docs = u64::from(self.n_docs);
         let column_name = col_meta.name.clone();
         let region_base = self.postings_range.start;
+        let positions_region = self.positions_range.clone();
 
         let fst_bytes = self.dict_bytes()?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
@@ -1583,15 +1586,22 @@ impl FtsReader {
         column_prefix.push(FST_SEPARATOR);
         let prefix_len = column_prefix.len();
 
+        // Reused across (term, doc) to hold the decoded position run.
+        let mut positions_buf: Vec<u32> = Vec::new();
+
         for (key, packed) in dict.iter_prefix(&column_prefix) {
             let term = &key[prefix_len..];
             match FstValue::unpack(packed) {
                 FstValue::Inline { doc_id, tf } => {
-                    // A positional column only inlines tf == 1 postings; score
-                    // with the implied tf, not the slot (which carries the
-                    // single position).
-                    let tf = if positional { 1 } else { tf };
-                    emit(term, doc_id, tf)?;
+                    // A positional column only inlines tf == 1 postings; the
+                    // slot then carries the term's single position and tf is
+                    // implied 1. Non-positional: `tf` is the frequency, no
+                    // positions.
+                    if positional {
+                        emit(term, doc_id, 1, &[tf])?;
+                    } else {
+                        emit(term, doc_id, tf, &[])?;
+                    }
                 }
                 FstValue::Pfor {
                     metadata_offset,
@@ -1614,14 +1624,49 @@ impl FtsReader {
                         start..start + postings_length,
                         "fts/merge postings",
                     )?;
+
+                    // For a positional column, this term's position runs live
+                    // contiguously in the positions region at `positions_offset`,
+                    // one `decode_run` per doc in posting order. Read the slice
+                    // once and walk it in lockstep with the doc cursor.
+                    let position_bytes = if positional {
+                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true)?;
+                        let region = positions_region.as_ref().ok_or_else(|| {
+                            FtsError::Read(ReadError::MalformedVersion(
+                                "positional column missing a positions region".into(),
+                            ))
+                        })?;
+                        let pstart = region.start + meta.positions_offset as usize;
+                        let pend = pstart + meta.positions_length as usize;
+                        Some(fetch_source_range(
+                            &self.source,
+                            pstart..pend,
+                            "fts/merge positions",
+                        )?)
+                    } else {
+                        None
+                    };
+                    let mut pos_at = 0usize;
+
                     let mut cursor = TermCursor::new(term_bytes, n_docs, positional, None)?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
-                            emit(
-                                term,
-                                cursor.block_doc_ids[cursor.pos],
-                                cursor.block_tfs[cursor.pos],
-                            )?;
+                            let doc_id = cursor.block_doc_ids[cursor.pos];
+                            let tf = cursor.block_tfs[cursor.pos];
+                            let positions: &[u32] = match &position_bytes {
+                                Some(bytes) => {
+                                    positions_buf.clear();
+                                    decode_run(bytes.as_ref(), &mut pos_at, tf, &mut positions_buf)
+                                        .ok_or_else(|| {
+                                            FtsError::Read(ReadError::MalformedVersion(
+                                                "truncated position run in merge read".into(),
+                                            ))
+                                        })?;
+                                    &positions_buf
+                                }
+                                None => &[],
+                            };
+                            emit(term, doc_id, tf, positions)?;
                             cursor.pos += 1;
                         }
                         cursor.next();
@@ -5548,7 +5593,11 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
 
         let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32)>> = BTreeMap::new();
-        r.for_each_term_posting(0, |term, doc_id, tf| {
+        r.for_each_term_posting(0, |term, doc_id, tf, positions| {
+            assert!(
+                positions.is_empty(),
+                "non-positional column yields no positions"
+            );
             got.entry(term.to_vec()).or_default().push((doc_id, tf));
             Ok(())
         })
@@ -5573,6 +5622,44 @@ mod tests {
         assert_eq!(got.get(&t("boot")).unwrap().as_slice(), &[(2, 1)]);
         // Every stored term was streamed exactly once.
         assert_eq!(got.len() as u32, r.n_terms());
+    }
+
+    #[test]
+    fn for_each_term_posting_round_trips_positions() {
+        use std::collections::BTreeMap;
+        // doc 0 "a b a", doc 1 "b a c". "a"/"b" are df=2 (PFOR path); "c" is
+        // df=1 (inline path). Positions are token offsets within each doc.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true)
+            .expect("register positional column");
+        b.add_doc(0, 0, "a b a").expect("add doc 0");
+        b.add_doc(0, 1, "b a c").expect("add doc 1");
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+
+        let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
+        r.for_each_term_posting(0, |term, doc_id, tf, positions| {
+            got.entry(term.to_vec())
+                .or_default()
+                .push((doc_id, tf, positions.to_vec()));
+            Ok(())
+        })
+        .expect("stream positional postings");
+
+        let t = |s: &str| s.as_bytes().to_vec();
+        // PFOR positional: multi-doc terms, tf and positions per doc.
+        assert_eq!(
+            got.get(&t("a")).unwrap().as_slice(),
+            &[(0, 2, vec![0, 2]), (1, 1, vec![1])]
+        );
+        assert_eq!(
+            got.get(&t("b")).unwrap().as_slice(),
+            &[(0, 1, vec![1]), (1, 1, vec![0])]
+        );
+        // Inline positional (df=1): the single position comes from the slot.
+        assert_eq!(got.get(&t("c")).unwrap().as_slice(), &[(1, 1, vec![2])]);
     }
 
     #[test]
