@@ -37,8 +37,9 @@ use arrow::compute::concat_batches;
 use arrow::error::ArrowError;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use arrow::ipc::{MessageHeader, root_as_message};
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -140,13 +141,191 @@ fn read_schema_ipc(bytes: &[u8]) -> Result<Schema> {
 }
 
 /// Read all record batches from an Arrow IPC stream.
+///
+/// Tolerates one known writer quirk: Apache Arrow JS serializes a Boolean
+/// column whose values are all null with a zero-length values buffer (the
+/// "fastest path" in its IPC assembler), which arrow-rs rejects during
+/// decode ("Need at least N bytes for bitmap in buffers[0]"). The plain
+/// decode runs first, so well-formed input never takes the repair path; on
+/// failure the stream's bytes are patched (see [`patch_all_null_bool_ipc`])
+/// and decoded again with full validation. If that fails too, the original
+/// error is the one reported.
 fn read_batches_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    match read_batches_ipc_strict(bytes) {
+        Ok(batches) => Ok(batches),
+        Err(strict_err) => match patch_all_null_bool_ipc(bytes) {
+            Some(patched) => read_batches_ipc_strict(&patched).map_err(|_| strict_err),
+            None => Err(strict_err),
+        },
+    }
+}
+
+/// The plain, fully-validated IPC stream decode.
+fn read_batches_ipc_strict(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(arrow_err)?;
     let mut batches = Vec::new();
     for batch in reader {
         batches.push(batch.map_err(arrow_err)?);
     }
     Ok(batches)
+}
+
+/// The end-of-stream / continuation marker in the Arrow IPC stream format.
+const IPC_CONTINUATION: u32 = 0xFFFF_FFFF;
+/// Byte width of one flatbuffer `Buffer` entry (i64 offset + i64 length).
+const IPC_BUFFER_ENTRY_BYTES: usize = 16;
+
+/// Repair an IPC stream whose all-null Boolean columns arrived with a
+/// zero-length values buffer, returning the patched bytes.
+///
+/// For such a column the validity bitmap is present, correctly sized, and
+/// all zeros — exactly the values bitmap we need. So the fix is a pure
+/// metadata edit: point the values-buffer entry at the validity buffer's
+/// region of the body. Buffer entries are fixed 16-byte structs inline in
+/// the flatbuffer, so the rewrite changes no sizes or offsets, and the
+/// caller re-runs the fully-validated decode on the result. Returns `None`
+/// (leaving the caller's original error to stand) if the stream is
+/// malformed, compressed, uses a layout we don't model, or needs no patch.
+fn patch_all_null_bool_ipc(bytes: &[u8]) -> Option<Vec<u8>> {
+    let schema = read_schema_ipc(bytes).ok()?;
+    let mut patched = bytes.to_vec();
+    let mut any = false;
+
+    // Walk the encapsulated messages: [continuation][u32 len][metadata][body].
+    let mut pos = 0usize;
+    while pos + 4 <= bytes.len() {
+        let word = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?);
+        let (meta_len, meta_start) = if word == IPC_CONTINUATION {
+            if pos + 8 > bytes.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?);
+            (len as usize, pos + 8)
+        } else {
+            (word as usize, pos + 4)
+        };
+        if meta_len == 0 {
+            break; // end-of-stream marker
+        }
+        let meta_end = meta_start.checked_add(meta_len)?;
+        let meta = bytes.get(meta_start..meta_end)?;
+        let message = root_as_message(meta).ok()?;
+        let body_len = usize::try_from(message.bodyLength()).ok()?;
+
+        if message.header_type() == MessageHeader::RecordBatch {
+            let batch = message.header_as_record_batch()?;
+            if batch.compression().is_some() {
+                return None; // entries index compressed frames; don't alias
+            }
+            let nodes = batch.nodes()?;
+            let buffers = batch.buffers()?;
+
+            // Pair nodes with their buffer indices by walking the schema in
+            // IPC (depth-first) order, collecting each Boolean node and the
+            // index of its values buffer.
+            let mut bools: Vec<(usize, usize)> = Vec::new();
+            let (mut node_idx, mut buf_idx) = (0usize, 0usize);
+            for field in schema.fields() {
+                walk_ipc_layout(field.data_type(), &mut node_idx, &mut buf_idx, &mut bools)?;
+            }
+            if node_idx != nodes.len() || buf_idx != buffers.len() {
+                return None; // layout mismatch — don't guess
+            }
+
+            for (node_i, values_i) in bools {
+                let node = nodes.get(node_i);
+                let rows = usize::try_from(node.length()).ok()?;
+                let nulls = usize::try_from(node.null_count()).ok()?;
+                let values = buffers.get(values_i);
+                if rows == 0 || nulls != rows || values.length() != 0 {
+                    continue;
+                }
+                // values_i > 0 always: a Boolean node's validity entry
+                // directly precedes its values entry.
+                let validity = buffers.get(values_i - 1);
+                if usize::try_from(validity.length()).ok()? * 8 < rows {
+                    return None; // validity absent/truncated — don't alias
+                }
+                // Overwrite the values entry (16 bytes, inline in the
+                // metadata section of the stream) with the validity entry.
+                let entry_pos =
+                    (values as *const _ as usize).checked_sub(bytes.as_ptr() as usize)?;
+                patched
+                    .get_mut(entry_pos..entry_pos + IPC_BUFFER_ENTRY_BYTES)?
+                    .copy_from_slice(&validity.0);
+                any = true;
+            }
+        }
+        pos = meta_end.checked_add(body_len)?;
+    }
+    any.then_some(patched)
+}
+
+/// Advance the node/buffer cursors across one field of the Arrow IPC
+/// record-batch layout, recording each Boolean node's index and the index
+/// of its values buffer into `bools`. Returns `None` for a type whose
+/// layout we don't model (the caller then abandons the patch).
+fn walk_ipc_layout(
+    data_type: &DataType,
+    node_idx: &mut usize,
+    buf_idx: &mut usize,
+    bools: &mut Vec<(usize, usize)>,
+) -> Option<()> {
+    let node = *node_idx;
+    *node_idx += 1;
+    match data_type {
+        DataType::Null => {} // one node, no buffers
+        DataType::Boolean => {
+            bools.push((node, *buf_idx + 1)); // [validity, values]
+            *buf_idx += 2;
+        }
+        // Fixed-width scalars: [validity, values].
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::FixedSizeBinary(_)
+        | DataType::Dictionary(_, _) => *buf_idx += 2, // dictionary: its keys
+        // Variable-length binary/strings: [validity, offsets, values].
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+            *buf_idx += 3
+        }
+        // Nested with offsets: [validity, offsets] + child.
+        DataType::List(field) | DataType::LargeList(field) | DataType::Map(field, _) => {
+            *buf_idx += 2;
+            walk_ipc_layout(field.data_type(), node_idx, buf_idx, bools)?;
+        }
+        // Nested without offsets: [validity] + child(ren).
+        DataType::FixedSizeList(field, _) => {
+            *buf_idx += 1;
+            walk_ipc_layout(field.data_type(), node_idx, buf_idx, bools)?;
+        }
+        DataType::Struct(fields) => {
+            *buf_idx += 1;
+            for field in fields {
+                walk_ipc_layout(field.data_type(), node_idx, buf_idx, bools)?;
+            }
+        }
+        // Views, unions, run-end encoding, …: not modeled here.
+        _ => return None,
+    }
+    Some(())
 }
 
 /// Serialize batches to an Arrow IPC stream the JS side reads with

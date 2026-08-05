@@ -246,7 +246,10 @@ function schemaToIpc(schema: any): Buffer {
 // built by hand. The schema here is ours (from the addon), so its types
 // are same-instance.
 function buildColumn(field: arrow.Field, rows: RowRecord[]): arrow.Vector {
-  const values = rows.map((r) => r[field.name]);
+  // An omitted key reads as `undefined`, which `vectorFromArray` would
+  // coerce to the type's zero value (0, "", NaN, false) rather than null —
+  // its null set is `[null]` only. Normalize so omitted == explicit null.
+  const values = rows.map((r) => r[field.name] ?? null);
   const t = field.type as any;
   if (t && typeof t.listSize === "number") {
     const flat = Float32Array.from((values as number[][]).flat());
