@@ -1656,6 +1656,88 @@ mod tests {
         }
     }
 
+    /// Ranked BM25 search must survive the k-way compaction merge. Two docs
+    /// with the same term frequency and the same document frequency but
+    /// different lengths must get *different*, length-normalized scores against
+    /// the merged-corpus average document length — the shorter one higher. That
+    /// only holds if the merge carried each input's per-doc lengths and token
+    /// totals across correctly; a merge that dropped them collapses the
+    /// length-normalization table (equal scores, or a panic on an empty table).
+    /// `token_match` (unranked) can't see this — it only checks presence — so
+    /// this exercises the ranked path through the actual `merge_superfiles`
+    /// dispatch + streamed temp-file output, complementing the builder oracle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_preserves_bm25_length_normalization() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+
+        // Superfile 1: a short "cat" doc. Superfile 2: a long "cat" doc. Across
+        // the merged corpus tf(cat)=1 and df(cat)=2 for both, so the score gap
+        // is purely BM25 length normalization against avgdl.
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&["cat", "dog"]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&[
+                "cat bird elephant giraffe hippo",
+                "dog",
+            ]))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader().expect("reader");
+        let mut superfiles: Vec<Arc<SuperfileEntry>> =
+            reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(superfiles.len(), 2, "two ingest superfiles");
+        // Merge input order fixes the output doc-id layout; order by id_min so
+        // the short-cat doc lands at merged doc 0 and the long-cat doc at 2.
+        superfiles.sort_by_key(|sf| sf.id_min);
+
+        let merged = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+        let merged_reader = merged
+            .open_reader()
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
+        assert_eq!(merged_reader.n_docs(), 4);
+
+        let hits = merged_reader
+            .bm25_search_pretokenized("title", &["cat"], 10, BoolMode::Or)
+            .await
+            .expect("ranked bm25 search on the merged superfile");
+        assert_eq!(hits.len(), 2, "both 'cat' docs must match after the merge");
+        for (doc, score) in &hits {
+            assert!(
+                score.is_finite() && *score > 0.0,
+                "doc {doc} score must be finite and positive, got {score}"
+            );
+        }
+        let score_of = |target: u32| -> f32 {
+            hits.iter()
+                .find(|(doc, _)| *doc == target)
+                .unwrap_or_else(|| panic!("expected a hit for merged doc {target}"))
+                .1
+        };
+        let short = score_of(0); // "cat" (length 1)
+        let long = score_of(2); // "cat bird elephant giraffe hippo" (length 5)
+        assert!(
+            short > long,
+            "BM25 length normalization must carry across the merge: \
+             short-doc score {short} must exceed long-doc score {long}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn merge_superfiles_respects_connection_memory_budget() {
         let dir = TempDir::new().expect("tempdir");
