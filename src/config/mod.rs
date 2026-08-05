@@ -207,6 +207,11 @@ const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
 // Compaction defaults
 const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
 const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
+/// Default fragment-count merge trigger for the user table: consolidate a
+/// partition once it accumulates this many sub-target superfiles, even when
+/// their combined live bytes are far below the size floor. Catches the
+/// small-append fragmentation that would otherwise never reach `min_fill_percent`.
+const DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 50;
 const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
 /// How old a tombstone sidecar seal has to be before compaction treats
@@ -223,6 +228,13 @@ pub struct CompactionSettings {
     /// Minimum estimated live bytes to trigger a merge,
     /// as a percentage of `target_superfile_size_mb`.
     pub min_fill_percent: u8,
+    /// Fragment-count merge trigger: consolidate a partition as soon as it has
+    /// this many sub-target superfiles, regardless of `min_fill_percent`. A
+    /// merge fires on size OR count, so a badly fragmented table (many tiny
+    /// appends) consolidates without lowering the byte floor for healthy
+    /// tables. Values below 2 are raised to 2 — merging fewer than two inputs
+    /// is a no-op rewrite.
+    pub min_superfiles_for_merge: u64,
     /// Maximum memory budget for materializing inputs during a single merge, in MiB.
     pub max_memory_mb: u64,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
@@ -235,6 +247,7 @@ impl Default for CompactionSettings {
         Self {
             target_superfile_size_mb: DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB,
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
+            min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
@@ -286,10 +299,12 @@ const DEFAULT_VECTOR_HIDDEN_CELL_COUNT: usize = 256;
 /// base shard stays a merge candidate and absorbs later deltas rather than
 /// being sealed as over-target on the first pass.
 const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 2048;
-/// Default hidden vector-index compaction min-fill: `0` disables the size leg,
-/// so a cell consolidates on the >= 2 fragment count alone — drain generations
-/// collapse and post-compact cold GET stays at the post-drain level.
-const DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT: u8 = 0;
+/// Default hidden vector-index fragment-count merge trigger: `2` means a cell
+/// consolidates on any two shards, so drain generations collapse and
+/// post-compact cold GET stays at the post-drain level. The hidden index keeps
+/// no byte floor of its own — it inherits the user table's `min_fill_percent`,
+/// which this count trigger dominates.
+const DEFAULT_VECTOR_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 2;
 /// Default hidden vector-index compaction per-pass memory ceiling (MiB). Must
 /// stay >= the target or it caps the packed inputs below a full output.
 const DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_VECTOR_COMPACTION_TARGET_MB + 2048;
@@ -404,9 +419,11 @@ pub struct VectorSettings {
     /// from the user table's `compaction.target_superfile_size_mb`; a
     /// packed cell shard stays a merge candidate until it reaches this.
     pub compaction_target_mb: u64,
-    /// Hidden vector-index compaction min-fill: a merge fires only once its
-    /// combined inputs reach this percentage of `compaction_target_mb`.
-    pub compaction_min_fill_percent: u8,
+    /// Hidden vector-index fragment-count merge trigger: consolidate a cell
+    /// once it has this many shards (default `2`, so any two shards merge). See
+    /// [`CompactionSettings::min_superfiles_for_merge`] for the size-OR-count
+    /// semantics; the hidden index carries no byte floor of its own.
+    pub compaction_min_superfiles_for_merge: u64,
     /// Hidden vector-index compaction per-pass memory ceiling (MiB). Caps
     /// the input bytes packed into one merge, so it must stay >=
     /// `compaction_target_mb` or the target is never reached.
@@ -432,7 +449,7 @@ impl Default for VectorSettings {
             user_cell_count: DEFAULT_VECTOR_USER_CELL_COUNT,
             hidden_cell_count: DEFAULT_VECTOR_HIDDEN_CELL_COUNT,
             compaction_target_mb: DEFAULT_VECTOR_COMPACTION_TARGET_MB,
-            compaction_min_fill_percent: DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT,
+            compaction_min_superfiles_for_merge: DEFAULT_VECTOR_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             compaction_max_memory_mb: DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB,
         }
     }

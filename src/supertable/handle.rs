@@ -1371,10 +1371,16 @@ const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 /// ~one compact packed shard object per partition key instead of many
 /// small delta files.
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
-    let vector = &crate::config::global().vector;
+    let cfg = crate::config::global();
+    let vector = &cfg.vector;
     crate::config::CompactionSettings {
         target_superfile_size_mb: vector.compaction_target_mb,
-        min_fill_percent: vector.compaction_min_fill_percent,
+        // The hidden index keeps no byte floor of its own: it derives
+        // `min_fill_percent` from the user table's `compaction` settings so the
+        // floor lives in one place. The fragment-count trigger below dominates
+        // it here (a cell merges on any two shards regardless of the floor).
+        min_fill_percent: cfg.compaction.min_fill_percent,
+        min_superfiles_for_merge: vector.compaction_min_superfiles_for_merge,
         max_memory_mb: vector.compaction_max_memory_mb,
         ..Default::default()
     }
@@ -3824,6 +3830,7 @@ mod tests {
         crate::config::CompactionSettings {
             target_superfile_size_mb: 1,
             min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
             max_memory_mb: 64,
             stale_seal_timeout_ms: crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         };

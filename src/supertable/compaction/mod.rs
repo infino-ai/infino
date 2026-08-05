@@ -130,11 +130,16 @@ pub struct CompactionJob {
 /// reach the floor are left for next time.
 pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
     let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
-    // `0%` disables the size leg: a merge then fires on the fragment-count
-    // floor alone (>= 2 inputs), which is how the hidden index consolidates
-    // drain generations that are far below any byte threshold.
+    // Size leg of the merge trigger: a job's combined live bytes must reach this
+    // fraction of the target. The count leg (`min_superfiles_for_merge`) fires
+    // independently, so a partition fragmented into many tiny superfiles still
+    // consolidates even when it sits far below this floor.
     let min_output_bytes =
         (target_bytes as u128 * cfg.min_fill_percent.clamp(0, 100) as u128 / 100) as u64;
+    // Count leg: merge once a partition has this many sub-target superfiles.
+    // Clamped to >= 2 — merging fewer than two inputs is a no-op rewrite, so a
+    // misconfigured smaller value is raised rather than rejected.
+    let min_superfiles_for_merge = cfg.min_superfiles_for_merge.max(2) as usize;
     let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
 
     let mut by_partition: BTreeMap<&[u8], Vec<&SuperfileStats>> = BTreeMap::new();
@@ -149,6 +154,7 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
             segs,
             target_bytes,
             min_output_bytes,
+            min_superfiles_for_merge,
             max_memory_bytes,
             &mut jobs,
         );
@@ -161,6 +167,7 @@ fn pack_partition(
     segs: Vec<&SuperfileStats>,
     target_bytes: u64,
     min_output_bytes: u64,
+    min_superfiles_for_merge: usize,
     max_memory_bytes: u64,
     jobs: &mut Vec<CompactionJob>,
 ) {
@@ -183,11 +190,11 @@ fn pack_partition(
     let mut pending = PendingJob::default();
     for s in candidates {
         if !pending.fits(s, target_bytes, max_memory_bytes) {
-            pending.emit(key, min_output_bytes, jobs);
+            pending.emit(key, min_output_bytes, min_superfiles_for_merge, jobs);
         }
         pending.push(s);
     }
-    pending.emit(key, min_output_bytes, jobs);
+    pending.emit(key, min_output_bytes, min_superfiles_for_merge, jobs);
 }
 
 #[derive(Default)]
@@ -209,9 +216,21 @@ impl PendingJob {
         self.live_bytes += s.live_bytes();
     }
 
-    /// Emit a CompactionJob if ≥ 2 inputs and live bytes reach `min_output_bytes`.
-    fn emit(&mut self, key: &[u8], min_output_bytes: u64, jobs: &mut Vec<CompactionJob>) {
-        if self.inputs.len() >= 2 && self.live_bytes >= min_output_bytes {
+    /// Emit a CompactionJob when the pending inputs clear either leg of the
+    /// merge trigger — size OR count:
+    /// - size: `>= 2` inputs and live bytes reach `min_output_bytes`;
+    /// - count: `>= min_superfiles_for_merge` inputs (already `>= 2`), which
+    ///   fires even when the live bytes sit far below the size floor.
+    fn emit(
+        &mut self,
+        key: &[u8],
+        min_output_bytes: u64,
+        min_superfiles_for_merge: usize,
+        jobs: &mut Vec<CompactionJob>,
+    ) {
+        let size_ready = self.inputs.len() >= 2 && self.live_bytes >= min_output_bytes;
+        let count_ready = self.inputs.len() >= min_superfiles_for_merge;
+        if size_ready || count_ready {
             jobs.push(CompactionJob {
                 partition_key: key.to_vec(),
                 inputs: mem::take(&mut self.inputs),
@@ -1084,12 +1103,13 @@ mod tests {
 
     #[test]
     fn pending_job_emit_requires_two_inputs() {
-        // A single-input pending job never emits even if it reaches
-        // the fill floor.
+        // A single-input pending job never emits even if it reaches the fill
+        // floor and the count trigger (emit takes a pre-clamped count of 2, so
+        // one input clears neither the size nor the count leg).
         let mut jobs = Vec::new();
         let mut p = PendingJob::default();
         p.push(&seg(1, 200, 1000, 0));
-        p.emit(&[], 0, &mut jobs);
+        p.emit(&[], 0, 2, &mut jobs);
         assert!(jobs.is_empty(), "single-input job must not emit");
         // Reset to default after emit attempt.
         assert_eq!(p.inputs.len(), 0);
@@ -1382,6 +1402,55 @@ mod tests {
             select(&segs, &byte_floored).is_empty(),
             "a byte floor must block consolidation of tiny fragments"
         );
+    }
+
+    #[test]
+    fn user_table_merges_tiny_fragments_on_count_below_size_floor() {
+        // Many tiny appends, each a sub-target superfile, whose combined live
+        // bytes stay far under the 80% size floor. Without the fragment-count
+        // trigger these never merge, so the superfile (and manifest-part) count
+        // grows without bound. The count leg consolidates them on count alone.
+        // A low `min_superfiles_for_merge` lets the test trip the trigger with a
+        // handful of fragments instead of the default 50.
+        let cfg = CompactionSettings {
+            min_superfiles_for_merge: 3,
+            ..CompactionSettings::default() // 1 GiB target, 80% floor (819 MiB)
+        };
+        // Two 1 MiB fragments: below the count trigger and far below the floor.
+        let two = vec![seg(1, 1, 1000, 0), seg(2, 1, 1000, 0)];
+        assert!(
+            select(&two, &cfg).is_empty(),
+            "2 < min_superfiles_for_merge (3) and 2 MiB << 819 MiB floor: no merge"
+        );
+        // A third fragment trips the count trigger even though 3 MiB << the floor.
+        let three = vec![seg(1, 1, 1000, 0), seg(2, 1, 1000, 0), seg(3, 1, 1000, 0)];
+        let jobs = select(&three, &cfg);
+        assert_eq!(jobs.len(), 1, "count trigger merges once inputs reach 3");
+        assert_eq!(jobs[0].inputs.len(), 3);
+    }
+
+    #[test]
+    fn min_superfiles_for_merge_below_two_is_clamped() {
+        // A degenerate config (< 2) must not fire single-input no-op merges: it
+        // is raised to 2, so one fragment never merges but two do — even under a
+        // floor that blocks the size leg entirely.
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 2048,
+            min_fill_percent: 100, // size leg unreachable for tiny fragments
+            min_superfiles_for_merge: 1,
+            ..CompactionSettings::default()
+        };
+        assert!(
+            select(&[seg(1, 1, 1000, 0)], &cfg).is_empty(),
+            "one input never merges (clamped floor is 2)"
+        );
+        let jobs = select(&[seg(1, 1, 1000, 0), seg(2, 1, 1000, 0)], &cfg);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "clamped count floor of 2 merges two fragments"
+        );
+        assert_eq!(jobs[0].inputs.len(), 2);
     }
 
     #[test]

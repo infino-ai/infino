@@ -116,6 +116,11 @@ compaction:
   # E.g. at 80% with a 1 GiB target, two 200 MiB superfiles (400 MiB) do not compact.
   min_fill_percent: 80
 
+  # Fragment-count merge trigger: merge once a partition has this many
+  # sub-target superfiles, even below the size floor. Fires on size OR count,
+  # so many tiny appends consolidate without lowering the floor. Min 2.
+  min_superfiles_for_merge: 50
+
   # Maximum memory budget for materializing inputs during a single merge, in MiB.
   max_memory_mb: 3072
 
@@ -194,7 +199,7 @@ vector:
   # at small scale (~0.998 vs ~0.94 at 100K, ~0.997 vs ~0.962 at 1M) and slightly
   # ahead at scale (0.991 vs 0.983 at 10M). The finer grid (~14x the cells) adds
   # per-cell drain generations, but compaction consolidates them
-  # (compaction_min_fill_percent = 0), so post-compact cold GET stays bounded.
+  # (compaction_min_superfiles_for_merge = 2), so post-compact cold GET stays bounded.
   # Set 0.0 to fall back to the fixed-grid path (cap trigger only).
   cell_split_modality_d: 8.0
 
@@ -261,15 +266,16 @@ vector:
   # bytes packed into one merge pass and must stay >= the target, or the
   # target is never reached.
   #
-  # 0 disables the byte floor, so a cell consolidates on fragment count alone
-  # (the >= 2 merge floor): drain generations collapse and post-compact cold
-  # GET stays at the post-drain level. Safe because the cell split is now the
-  # in-place append-child split (validated), so a merge that pushes a cell over
-  # the cap (or into multimodality with the trigger on) splits it correctly
-  # rather than hitting the old broken post-merge split path. Contrast the user
-  # table, which keeps an 80% floor to amortize writes on its transient data.
+  # The hidden index has no byte floor of its own: it derives min_fill_percent
+  # from the top-level `compaction:` section, and compaction_min_superfiles_for_merge
+  # (2 by default) dominates it — a cell consolidates on any two shards, so
+  # drain generations collapse and post-compact cold GET stays at the
+  # post-drain level. Safe because the cell split is now the in-place
+  # append-child split (validated), so a merge that pushes a cell over the cap
+  # (or into multimodality with the trigger on) splits it correctly rather than
+  # hitting the old broken post-merge split path.
   compaction_target_mb: 2048
-  compaction_min_fill_percent: 0
+  compaction_min_superfiles_for_merge: 2
   compaction_max_memory_mb: 4096
 
 # Diagnostic and hardware-capability toggles. Each gates

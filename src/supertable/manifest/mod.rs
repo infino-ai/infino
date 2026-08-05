@@ -1769,6 +1769,20 @@ impl ManifestSnapshot {
                     continue;
                 }
 
+                // All superfiles removed from this part → drop it from the list
+                // rather than keeping a zero-superfile stub. A merge that lifts
+                // every fragment out of a part would otherwise leave the empty
+                // part live in the list forever (it survives GC as referenced),
+                // inflating the part count and the open-time GET fan for no data.
+                // Dropping the last part is safe: a user manifest with zero parts
+                // is a handled state (an empty table — the load path guards
+                // `parts.is_empty()`, and hidden vector-index manifests always
+                // run with zero parts), and nothing else would ever collect a
+                // retained empty stub (compaction merges superfiles, not parts).
+                if final_superfile_entries.is_empty() {
+                    continue;
+                }
+
                 let (fresh_entry, fresh_encoded_part) =
                     rebuild_part_and_entry(vec![], final_superfile_entries, None, hidden_table);
 
@@ -4973,6 +4987,106 @@ mod tests {
         );
     }
 
+    /// Emptying one of several parts must DROP that part, not leave a
+    /// zero-superfile stub behind. A merge that lifts all fragments out of a
+    /// part would otherwise keep the empty part live in the list forever (it
+    /// survives GC as still-referenced), inflating the part count and the
+    /// open-time GET fan for no data. As long as another part survives, the
+    /// list must gain no zero-superfile entry. Repro for the empty-part-stub bug.
+    #[tokio::test]
+    async fn removing_all_superfiles_from_a_part_drops_it() {
+        let opts = make_opts();
+        let (_dir, storage) = local_storage();
+
+        // Two parts, one superfile each, resident in the parts cache.
+        let sf_a = make_new_entry(100);
+        let sf_b = make_new_entry(200);
+        let part_a = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: vec![sf_a.clone()],
+        };
+        let part_b = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: vec![sf_b.clone()],
+        };
+        let (pa_id, pb_id) = (part_a.part_id, part_b.part_id);
+
+        let part_entry = |part_id| ManifestPartEntry {
+            part_id,
+            uri: String::new(),
+            content_hash: ContentHash([0u8; 32]),
+            routing: None,
+            size_bytes_compressed: 0,
+            size_bytes_uncompressed: 0,
+            n_superfiles: 1,
+            id_range: (0, 0),
+            scalar_stats_agg: Default::default(),
+            fts_summary_agg: Default::default(),
+        };
+
+        let list = Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
+            tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 0,
+            options_hash: ContentHash([0u8; 32]),
+            schema: vec![],
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 2,
+            },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
+            parts: vec![part_entry(pa_id), part_entry(pb_id)],
+        };
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
+        parts_map.insert(pa_id, Arc::new(OnceCell::new_with(Some(Arc::new(part_a)))));
+        parts_map.insert(pb_id, Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))));
+
+        let manifest = Arc::new(ManifestSnapshot {
+            superfile_list: SuperfileList {
+                manifest_id: 0,
+                options: opts.clone(),
+                superfiles: vec![sf_a.clone(), sf_b.clone()],
+                vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
+            },
+            list: Some(list),
+            parts: parts_map,
+            loader: Some(Arc::new(loader)),
+            stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
+        });
+
+        // Remove every superfile from part A only → A is emptied, B untouched.
+        let (after, _parts) = manifest.update(&[], from_ref(&sf_a)).await.expect("remove");
+        let entries = after.get_all_list_entries();
+
+        assert!(
+            entries.iter().all(|e| e.n_superfiles > 0),
+            "an emptied part must not survive as a 0-superfile stub while another part lives, got n_superfiles {:?}",
+            entries.iter().map(|e| e.n_superfiles).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "part A dropped, part B survives → exactly one part, got {}",
+            entries.len(),
+        );
+    }
+
     /// A manifest whose list carries a slow-state ref hydrated its
     /// membership from the blob — hidden manifests write NO parts. The
     /// undrained load must trust the resident flat view there: summing
@@ -7417,10 +7531,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_remove_all_superfiles_empties_partition() {
-        // All superfiles in a partition are removed. Documents the current
-        // behavior: the list entry survives with n_superfiles=0 and the
-        // part has no superfiles (empty partition).
+    async fn update_remove_all_superfiles_drops_the_emptied_part() {
+        // Every superfile in the only part is removed. The part must be dropped
+        // from the list rather than kept as a zero-superfile stub: an empty stub
+        // survives GC as still-referenced and inflates the part count (and the
+        // open-time GET fan) forever. Exercises the PartWriter-produced path,
+        // complementing `removing_all_superfiles_from_a_part_drops_it`.
         let opts = make_opts();
         let (_dir, storage) = local_storage();
 
@@ -7498,11 +7614,10 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // Both superfiles removed: list entry remains with n_superfiles=0.
-        assert_eq!(list_entries.len(), 1);
-        assert_eq!(parts.len(), 1);
-        assert_eq!(list_entries[0].n_superfiles, 0);
-        assert_eq!(parts[0].part.superfiles.len(), 0);
+        // Both superfiles removed → the emptied part is dropped entirely, so the
+        // list has no entries and no parts remain (no zero-superfile stub).
+        assert!(list_entries.is_empty());
+        assert!(parts.is_empty());
     }
 
     #[tokio::test]
