@@ -31,8 +31,6 @@ use tokio::time;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::supertable::reader_cache::disk::mmap_readonly_bytes;
-
 use crate::{
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
@@ -47,6 +45,7 @@ use crate::{
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
+        reader_cache::disk::mmap_readonly_bytes,
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
