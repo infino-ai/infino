@@ -1677,6 +1677,27 @@ impl FtsReader {
         Ok(())
     }
 
+    /// Read a column's stored per-doc lengths (token counts), one `u32` per
+    /// local doc-id in `0..n_docs`. The FTS compaction merge carries these
+    /// forward (with the input's doc-id remap) rather than recomputing them
+    /// from text. These are the already-clamped values written at build time.
+    // Wired by the FTS compaction k-way merge (landing incrementally).
+    #[allow(dead_code)]
+    pub(crate) fn read_doc_lengths(&self, column_id: u32) -> Result<Vec<u32>, FtsError> {
+        let n = self.n_docs as usize;
+        let range = self.columns[column_id as usize].doc_lengths_range.clone();
+        let bytes = fetch_source_range(&self.source, range, "fts/merge doc_lengths")?;
+        let region = bytes.as_ref();
+        if region.len() < n * U32_BYTES {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "doc-lengths region shorter than n_docs entries".into(),
+            )));
+        }
+        Ok((0..n)
+            .map(|d| read_u32_le(&region[d * U32_BYTES..d * U32_BYTES + U32_BYTES]))
+            .collect())
+    }
+
     /// Walk the FST and collect every term registered under
     /// `column` whose bytes begin with `term_prefix`, in lex order.
     ///
@@ -5686,7 +5707,7 @@ mod tests {
             Ok(())
         })
         .expect("feed prebuilt postings");
-        b.set_prebuilt_doc_lengths(0, vec![3, 3]);
+        b.set_prebuilt_doc_lengths(0, ra.read_doc_lengths(0).expect("doc lengths"));
         let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
 
         // The two readers must expose identical postings (doc_ids, tfs,
@@ -5735,7 +5756,7 @@ mod tests {
             Ok(())
         })
         .expect("feed prebuilt postings");
-        b.set_prebuilt_doc_lengths(0, vec![4, 3, 3]);
+        b.set_prebuilt_doc_lengths(0, ra.read_doc_lengths(0).expect("doc lengths"));
         let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
 
         let collect = |r: &FtsReader| {
@@ -5754,6 +5775,18 @@ mod tests {
         );
         assert_eq!(rb.n_docs(), 3);
         assert_eq!(rb.n_terms(), ra.n_terms());
+    }
+
+    #[test]
+    fn read_doc_lengths_returns_token_counts() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "a b a").expect("doc 0"); // 3 tokens
+        b.add_doc(0, 1, "b a c d").expect("doc 1"); // 4 tokens
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(r.read_doc_lengths(0).expect("doc lengths"), vec![3, 4]);
     }
 
     #[test]
