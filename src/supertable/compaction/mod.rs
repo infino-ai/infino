@@ -545,7 +545,18 @@ impl Supertable {
                         &readers_with_tombstones,
                         &mut writer,
                     )?
+                } else if first_vec.is_none() {
+                    // FTS/scalar inputs (no vector index): carry each input's
+                    // already-built posting lists across instead of
+                    // re-tokenizing the whole corpus.
+                    SuperfileBuilder::build_from_readers_fts_merge_to(
+                        &readers_with_tombstones,
+                        &mut writer,
+                    )?
                 } else {
+                    // A vector index is present but not IVF-mergeable (e.g. an
+                    // fp32 rerank codec); the re-index path re-encodes both the
+                    // FTS and the vectors from the decoded rows.
                     SuperfileBuilder::build_from_readers_to(&readers_with_tombstones, &mut writer)?
                 };
                 writer

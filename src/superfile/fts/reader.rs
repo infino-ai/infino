@@ -1558,8 +1558,6 @@ impl FtsReader {
     ///
     /// Synchronous: compaction opens its inputs over resident bytes, so every
     /// range resolves without a runtime. `emit` may return an error to abort.
-    // Wired by the FTS compaction k-way merge (landing incrementally).
-    #[allow(dead_code)]
     pub(crate) fn for_each_term_posting(
         &self,
         column_id: u32,
@@ -1681,8 +1679,6 @@ impl FtsReader {
     /// local doc-id in `0..n_docs`. The FTS compaction merge carries these
     /// forward (with the input's doc-id remap) rather than recomputing them
     /// from text. These are the already-clamped values written at build time.
-    // Wired by the FTS compaction k-way merge (landing incrementally).
-    #[allow(dead_code)]
     pub(crate) fn read_doc_lengths(&self, column_id: u32) -> Result<Vec<u32>, FtsError> {
         let n = self.n_docs as usize;
         let range = self.columns[column_id as usize].doc_lengths_range.clone();

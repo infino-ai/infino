@@ -73,6 +73,8 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
     io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
+    mem,
+    str::from_utf8,
     sync::Arc,
 };
 
@@ -85,7 +87,7 @@ use tempfile::{NamedTempFile, tempfile};
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::{
-    BuildError, SuperfileReader,
+    BuildError, FtsError, ReadError, SuperfileReader,
     format::{
         self,
         footer::{ParquetLayout, encode_parquet_body, splice_index_streams_to},
@@ -697,6 +699,25 @@ impl SuperfileBuilder {
         Ok(())
     }
 
+    /// Append a scalar batch **without** indexing its text. The FTS blob is
+    /// supplied out of band via [`add_prebuilt_term_posting`](FtsBuilder::add_prebuilt_term_posting)
+    /// — used by the k-way FTS merge, which carries each input's already-built
+    /// posting lists across instead of re-tokenizing the corpus. Unlike
+    /// [`add_batch_ids_only`](Self::add_batch_ids_only) this deliberately skips
+    /// `index_fts_batch`: re-indexing here would double-count every term.
+    pub(crate) fn add_batch_scalar_only(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
+        if batch.schema().fields() != self.opts.schema.fields() {
+            return Err(BuildError::BatchSchemaMismatch {
+                batch: batch.schema().to_string(),
+                builder: self.opts.schema.to_string(),
+            });
+        }
+        let n_rows = batch.num_rows() as u32;
+        self.next_local_doc_id += n_rows;
+        self.batches.push(batch.clone());
+        Ok(())
+    }
+
     /// Index FTS text columns from `batch` starting at `self.next_local_doc_id`.
     /// Null cells index as empty strings so doc_lengths stay aligned with Parquet.
     fn index_fts_batch(&mut self, batch: &RecordBatch, n_rows: u32) -> Result<(), BuildError> {
@@ -1227,6 +1248,162 @@ impl SuperfileBuilder {
 
         superfile_builder.finish_to(output)?;
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
+    }
+
+    /// Merge FTS/scalar superfiles by **carrying each input's already-built
+    /// posting lists across** instead of re-tokenizing the corpus. The vector
+    /// merge does the analogous byte-level splice
+    /// ([`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers)); this
+    /// is the FTS counterpart, and the memory-bounded path for compacting a
+    /// large corpus into one superfile.
+    ///
+    /// Per input `i` with cumulative surviving-doc base `base_i`, for each FTS
+    /// column it streams the input's `(term, doc_id, tf, positions)` postings
+    /// ([`FtsReader::for_each_term_posting`]) into the builder's prebuilt
+    /// accumulator with `doc_id` remapped to `base_i + rank` (`rank` = position
+    /// among that input's surviving docs). Deleted docs are dropped and the
+    /// doc-id space stays dense, so it aligns row-for-row with the concatenated
+    /// Parquet body. Positions flow into the spilled positions blob on disk, not
+    /// RAM; doc-lengths are read from each input and concatenated — never
+    /// recomputed from tokens.
+    ///
+    /// Requires FTS/scalar inputs (no vector index); vector-bearing merges use
+    /// [`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers).
+    ///
+    /// Streams the assembled superfile to `output` (compaction feeds a temp
+    /// file it then mmaps) so the corpus-sized merge result is never held as an
+    /// anon `Vec`.
+    pub(crate) fn build_from_readers_fts_merge_to<W: Write>(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        output: W,
+    ) -> Result<SuperfileStats, BuildError> {
+        let first = readers.first().ok_or(BuildError::BatchReadError)?;
+        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        // FTS column ids run `0..n` in schema-declaration order, matching the
+        // reader's column order.
+        let n_fts_columns = builder_opts.fts_columns.len() as u32;
+        let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
+
+        // Per-column doc-lengths, concatenated across inputs in output-doc order.
+        let mut merged_doc_lengths: Vec<Vec<u32>> = vec![Vec::new(); n_fts_columns as usize];
+        let mut stats_collector = Vec::with_capacity(readers.len());
+        let mut base: u32 = 0;
+
+        for (idx, (reader, deleted)) in readers.iter().enumerate() {
+            superfile_builder.opts.check_mergeability(
+                reader.id_column(),
+                reader.schema(),
+                reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
+                reader
+                    .vec()
+                    .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+            )?;
+
+            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
+                BuildError::Io(Error::other(format!(
+                    "fts merge input {idx}: read RecordBatch failed: {e}"
+                )))
+            })?;
+            stats_collector.push(SuperfileStats::try_compute_from_record_batch(
+                &record_batch,
+            )?);
+
+            // Map each input-local doc id to its output doc id. Survivors get
+            // dense ids `base + rank`; deleted docs map to `None`. `rank` walks
+            // local ids in order skipping tombstones, so it ends at the surviving
+            // row count — the same count and order as `record_batch`.
+            let fts = reader.fts();
+            let n_local = fts.map(|f| f.n_docs()).unwrap_or(reader.n_docs() as u32);
+            let mut remap: Vec<Option<u32>> = vec![None; n_local as usize];
+            let mut rank: u32 = 0;
+            for d in 0..n_local {
+                let is_deleted = deleted.as_ref().is_some_and(|b| b.contains(d));
+                if !is_deleted {
+                    remap[d as usize] = Some(base + rank);
+                    rank += 1;
+                }
+            }
+
+            if let Some(fts) = fts {
+                for column_id in 0..n_fts_columns {
+                    let fb = superfile_builder
+                        .fts_builder
+                        .as_mut()
+                        .ok_or(BuildError::BatchReadError)?;
+                    // `for_each_term_posting` surfaces read errors as `FtsError`;
+                    // a builder push error is a `BuildError`, so capture it out of
+                    // band and re-raise after the walk (the sentinel `FtsError`
+                    // only stops iteration).
+                    let mut push_err: Option<BuildError> = None;
+                    let walk =
+                        fts.for_each_term_posting(column_id, |term, local_doc, tf, positions| {
+                            let Some(out_doc) = remap[local_doc as usize] else {
+                                return Ok(());
+                            };
+                            let term_str = from_utf8(term).map_err(|_| {
+                                FtsError::Read(ReadError::MalformedVersion(
+                                    "non-utf8 term in FTS merge input".into(),
+                                ))
+                            })?;
+                            if let Err(e) = fb.add_prebuilt_term_posting(
+                                column_id, term_str, out_doc, tf, positions,
+                            ) {
+                                push_err = Some(e);
+                                return Err(FtsError::Read(ReadError::MalformedVersion(
+                                    "prebuilt push aborted".into(),
+                                )));
+                            }
+                            Ok(())
+                        });
+                    if let Some(e) = push_err {
+                        return Err(e);
+                    }
+                    walk.map_err(|e| {
+                        BuildError::Io(Error::other(format!(
+                            "fts merge input {idx} column {column_id}: posting walk failed: {e}"
+                        )))
+                    })?;
+
+                    let dls = fts.read_doc_lengths(column_id).map_err(|e| {
+                        BuildError::Io(Error::other(format!(
+                            "fts merge input {idx} column {column_id}: read doc-lengths failed: {e}"
+                        )))
+                    })?;
+                    for (d, &len) in dls.iter().enumerate() {
+                        if remap[d].is_some() {
+                            merged_doc_lengths[column_id as usize].push(len);
+                        }
+                    }
+                }
+            }
+
+            base += record_batch.num_rows() as u32;
+            superfile_builder.add_batch_scalar_only(&record_batch)?;
+        }
+
+        if let Some(fb) = superfile_builder.fts_builder.as_mut() {
+            for column_id in 0..n_fts_columns {
+                fb.set_prebuilt_doc_lengths(
+                    column_id,
+                    mem::take(&mut merged_doc_lengths[column_id as usize]),
+                );
+            }
+        }
+
+        superfile_builder.finish_to(output)?;
+        Ok(SuperfileStats::from_children(stats_collector.as_slice()))
+    }
+
+    /// Thin `Vec<u8>` wrapper over
+    /// [`build_from_readers_fts_merge_to`](Self::build_from_readers_fts_merge_to)
+    /// for callers and tests that want the merged superfile in memory. Prefer
+    /// the streaming `_to` form on the large-corpus compaction path.
+    pub fn build_from_readers_fts_merge(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+        let mut buf = Vec::new();
+        let stats = Self::build_from_readers_fts_merge_to(readers, &mut buf)?;
+        Ok((buf, stats))
     }
 
     /// Consume the builder and emit one self-contained superfile.
@@ -2870,6 +3047,166 @@ mod tests {
         assert_eq!(merged_batch.num_rows(), 4);
     }
 
+    /// Turn a slice of file-local doc ids into a tombstone bitmap, or `None`
+    /// when the slice is empty (the "nothing deleted" case).
+    fn tombstones(ids: &[u32]) -> Option<Arc<RoaringBitmap>> {
+        if ids.is_empty() {
+            return None;
+        }
+        let mut b = RoaringBitmap::new();
+        for &id in ids {
+            b.insert(id);
+        }
+        Some(Arc::new(b))
+    }
+
+    /// Collect a superfile's full FTS content — every `(term, doc_id, tf,
+    /// positions)` posting plus the per-doc lengths — into comparable form. Two
+    /// superfiles with equal collections score every BM25 query identically:
+    /// same postings, same term frequencies, same doc-lengths (avgdl), same doc
+    /// order. Postings are sorted so insertion order can't mask a real mismatch.
+    fn collect_fts_content(
+        reader: &SuperfileReader,
+    ) -> (Vec<(Vec<u8>, u32, u32, Vec<u32>)>, Vec<u32>) {
+        let fts = reader.fts().expect("merged superfile has an FTS blob");
+        let n_cols = fts.fts_columns().count() as u32;
+        let mut postings: Vec<(Vec<u8>, u32, u32, Vec<u32>)> = Vec::new();
+        let mut doc_lengths: Vec<u32> = Vec::new();
+        for column_id in 0..n_cols {
+            fts.for_each_term_posting(column_id, |term, doc_id, tf, pos| {
+                postings.push((term.to_vec(), doc_id, tf, pos.to_vec()));
+                Ok(())
+            })
+            .expect("enumerate postings");
+            doc_lengths.extend(fts.read_doc_lengths(column_id).expect("doc-lengths"));
+        }
+        postings.sort();
+        (postings, doc_lengths)
+    }
+
+    /// The k-way FTS merge must be indistinguishable from re-indexing: it carries
+    /// each input's prebuilt postings across instead of re-tokenizing, so the
+    /// merged superfile must return the same query results — identical postings,
+    /// term frequencies, positions, doc-lengths, and doc order (Parquet body) —
+    /// as `build_from_readers` produces from the same inputs. This is the
+    /// correctness bar — byte-identical top-k and scores — proven here on
+    /// planted corpora spanning shared terms across inputs, the positional
+    /// codec, and tombstoned rows.
+    fn assert_fts_merge_matches_reindex(positions: bool, deletes: &[&[u32]]) {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+                positions,
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let schema = opts.schema.clone();
+
+        // Two inputs sharing terms (hello/world/rust/async) so the merge has to
+        // fold each input's postings into one term dictionary.
+        let build_input = |ids: Vec<u64>, titles: Vec<&str>, bodies: Vec<&str>| -> Vec<u8> {
+            let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(ids)),
+                    Arc::new(LargeStringArray::from(titles)),
+                    Arc::new(LargeStringArray::from(bodies)),
+                ],
+            )
+            .expect("build RecordBatch");
+            b.add_batch(&batch, &[]).expect("add_batch");
+            b.finish().expect("finish builder")
+        };
+
+        let bytes1 = build_input(
+            vec![10, 11, 12],
+            vec!["hello world", "rust async", "hello rust"],
+            vec!["a b", "c d", "e f"],
+        );
+        let bytes2 = build_input(
+            vec![20, 21],
+            vec!["world async", "hello world rust"],
+            vec!["g h", "i j"],
+        );
+
+        let reader1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open reader1");
+        let reader2 = SuperfileReader::open(Bytes::from(bytes2)).expect("open reader2");
+        let inputs = vec![
+            (
+                Arc::new(reader1),
+                tombstones(deletes.first().copied().unwrap_or(&[])),
+            ),
+            (
+                Arc::new(reader2),
+                tombstones(deletes.get(1).copied().unwrap_or(&[])),
+            ),
+        ];
+
+        let (reindex_bytes, reindex_stats) =
+            SuperfileBuilder::build_from_readers(&inputs).expect("re-index build");
+        let (merge_bytes, merge_stats) =
+            SuperfileBuilder::build_from_readers_fts_merge(&inputs).expect("k-way fts merge");
+
+        assert_eq!(
+            reindex_stats.n_docs, merge_stats.n_docs,
+            "merge and re-index must agree on surviving doc count"
+        );
+
+        let reindex_reader =
+            SuperfileReader::open(Bytes::from(reindex_bytes)).expect("open re-index reader");
+        let merge_reader =
+            SuperfileReader::open(Bytes::from(merge_bytes)).expect("open merge reader");
+
+        // Parquet body: identical rows in identical order (dense doc-id space).
+        let reindex_batch = reindex_reader
+            .get_record_batch(None)
+            .expect("re-index batch");
+        let merge_batch = merge_reader.get_record_batch(None).expect("merge batch");
+        assert_eq!(
+            reindex_batch, merge_batch,
+            "scalar body must match row-for-row (positions={positions}, deletes={deletes:?})"
+        );
+
+        // FTS: identical postings, tfs, positions, and doc-lengths → identical
+        // BM25 scores for every query.
+        let (reindex_postings, reindex_dls) = collect_fts_content(&reindex_reader);
+        let (merge_postings, merge_dls) = collect_fts_content(&merge_reader);
+        assert_eq!(
+            reindex_dls, merge_dls,
+            "doc-lengths must match (positions={positions}, deletes={deletes:?})"
+        );
+        assert_eq!(
+            reindex_postings, merge_postings,
+            "FTS postings must match (positions={positions}, deletes={deletes:?})"
+        );
+    }
+
+    #[test]
+    fn fts_merge_matches_reindex_non_positional() {
+        assert_fts_merge_matches_reindex(false, &[]);
+    }
+
+    #[test]
+    fn fts_merge_matches_reindex_positional() {
+        assert_fts_merge_matches_reindex(true, &[]);
+    }
+
+    #[test]
+    fn fts_merge_matches_reindex_with_deletes() {
+        // Drop row 1 of input 0 and row 0 of input 1; the surviving doc-id space
+        // must stay dense and aligned across the FTS blob and the Parquet body.
+        assert_fts_merge_matches_reindex(false, &[&[1], &[0]]);
+    }
+
+    #[test]
+    fn fts_merge_matches_reindex_positional_with_deletes() {
+        assert_fts_merge_matches_reindex(true, &[&[0], &[1]]);
+    }
+
     #[test]
     fn build_from_readers_preserves_vectors_and_fts() {
         let opts = BuilderOptions::new(
@@ -2916,6 +3253,83 @@ mod tests {
             merged_reader.vec().is_some(),
             "Vector index should be present"
         );
+    }
+
+    /// The definitive merge oracle: run real BM25 queries against a merged
+    /// superfile built by re-indexing vs. by the k-way FTS merge, and require
+    /// **identical (doc_id, score) top-k** for every query shape — single term,
+    /// multi-term OR, multi-term AND, and a term shared across both inputs. If
+    /// postings, doc-lengths, and corpus stats carry across the merge correctly,
+    /// the scores are bit-for-bit identical.
+    #[tokio::test]
+    async fn fts_merge_scores_match_reindex() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let schema = opts.schema.clone();
+
+        let build_input = |ids: Vec<u64>, titles: Vec<&str>| -> Vec<u8> {
+            let bodies: Vec<&str> = titles.iter().map(|_| "x").collect();
+            let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(ids)),
+                    Arc::new(LargeStringArray::from(titles)),
+                    Arc::new(LargeStringArray::from(bodies)),
+                ],
+            )
+            .expect("build RecordBatch");
+            b.add_batch(&batch, &[]).expect("add_batch");
+            b.finish().expect("finish builder")
+        };
+
+        let bytes1 = build_input(
+            vec![10, 11, 12],
+            vec!["hello world", "rust async await", "hello rust"],
+        );
+        let bytes2 = build_input(vec![20, 21], vec!["world async", "hello world rust async"]);
+        let open = |b: Vec<u8>| Arc::new(SuperfileReader::open(Bytes::from(b)).expect("open"));
+        let inputs = vec![(open(bytes1), None), (open(bytes2), None)];
+
+        let (reindex_bytes, _) =
+            SuperfileBuilder::build_from_readers(&inputs).expect("re-index build");
+        let (merge_bytes, _) =
+            SuperfileBuilder::build_from_readers_fts_merge(&inputs).expect("k-way fts merge");
+        let reindex_reader =
+            SuperfileReader::open(Bytes::from(reindex_bytes)).expect("open reindex");
+        let merge_reader = SuperfileReader::open(Bytes::from(merge_bytes)).expect("open merge");
+        let reindex_fts = reindex_reader.fts().expect("reindex fts");
+        let merge_fts = merge_reader.fts().expect("merge fts");
+
+        let queries: &[(&[&str], BoolMode)] = &[
+            (&["hello"], BoolMode::Or),
+            (&["world"], BoolMode::Or),
+            (&["hello", "async"], BoolMode::Or),
+            (&["hello", "rust"], BoolMode::And),
+            (&["rust", "async", "await"], BoolMode::Or),
+        ];
+        for (terms, mode) in queries {
+            let a = reindex_fts
+                .search("title", terms, 10, *mode)
+                .await
+                .expect("reindex search");
+            let b = merge_fts
+                .search("title", terms, 10, *mode)
+                .await
+                .expect("merge search");
+            assert_eq!(
+                a, b,
+                "merge scores must match re-index for query {terms:?} mode {mode:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1566,8 +1566,6 @@ impl FtsBuilder {
     /// transitions the column to the spilled accumulator (the same
     /// [`add_doc`]-time transition), after which each posting is written
     /// straight to the partition/position spill files.
-    // Wired by the FTS compaction k-way merge (landing incrementally).
-    #[allow(dead_code)]
     pub(crate) fn add_prebuilt_term_posting(
         &mut self,
         column_id: u32,
@@ -1778,11 +1776,18 @@ impl FtsBuilder {
     /// inputs' already-clamped stored lengths rather than recomputing them
     /// from text) and advance the builder's doc count so `finish` sizes the
     /// doc-lengths table and `n_docs` correctly.
-    // Wired by the FTS compaction k-way merge (landing incrementally).
-    #[allow(dead_code)]
+    ///
+    /// Also recomputes `total_tokens` as the sum of the lengths. `finish`
+    /// derives `avgdl = total_tokens / n_docs` from it, and a doc length *is*
+    /// its token count (`add_doc` clamps only at `u32::MAX`, never reached in
+    /// practice), so this sum equals what re-indexing the same corpus would
+    /// accumulate — keeping merged BM25 scores identical to a fresh build.
     pub(crate) fn set_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: Vec<u32>) {
         let n = doc_lengths.len() as u32;
-        self.columns[column_id as usize].doc_lengths = doc_lengths;
+        let total_tokens: u64 = doc_lengths.iter().map(|&dl| u64::from(dl)).sum();
+        let col = &mut self.columns[column_id as usize];
+        col.total_tokens = total_tokens;
+        col.doc_lengths = doc_lengths;
         self.n_docs = self.n_docs.max(n);
     }
 
