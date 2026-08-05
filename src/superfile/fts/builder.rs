@@ -1550,6 +1550,90 @@ impl FtsBuilder {
         }
     }
 
+    /// Push one prebuilt posting `(term, doc_id, tf, positions)` into the
+    /// column's accumulator without tokenizing — the FTS-compaction-merge
+    /// counterpart of [`add_doc`]. `positions` is empty for a non-positional
+    /// column; otherwise it holds the `tf` token offsets for this `(term,
+    /// doc)`. Callers feed postings with each term's docs in ascending doc-id
+    /// order (the merge reads them that way), so a term's posting list stays
+    /// sorted — matching what `add_doc` produces. Mirrors the in-RAM drain in
+    /// [`add_doc_inram`], minus the tokenize + per-doc position-chain walk.
+    ///
+    /// Doc lengths are fed separately via [`set_prebuilt_doc_lengths`] — the
+    /// merge carries the inputs' stored lengths rather than recomputing them.
+    ///
+    /// Currently the in-RAM accumulator only; once a column spills (large
+    /// merges) this errors. The spill transition + spilled push land next.
+    // Wired by the FTS compaction k-way merge (landing incrementally).
+    #[allow(dead_code)]
+    pub(crate) fn add_prebuilt_term_posting(
+        &mut self,
+        column_id: u32,
+        term: &str,
+        doc_id: u32,
+        tf: u32,
+        positions: &[u32],
+    ) -> Result<(), BuildError> {
+        let col_idx = column_id as usize;
+        let positional = self.columns[col_idx].positions;
+        match &mut self.postings[col_idx] {
+            ColumnPostings::InRam {
+                terms,
+                pos_runs,
+                bytes,
+            } => {
+                let term_len = term.len();
+                let mut new_bytes: usize = 0;
+                match terms.get_mut(term) {
+                    Some(acc) => {
+                        acc.push((doc_id, tf));
+                        new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
+                    }
+                    None => {
+                        terms.insert(Box::<str>::from(term), vec![(doc_id, tf)]);
+                        new_bytes = new_bytes.saturating_add(
+                            ACCUM_NEW_TERM_FIXED_BYTES + term_len + ACCUM_POSTING_BYTES,
+                        );
+                    }
+                }
+                if positional {
+                    match pos_runs.get_mut(term) {
+                        Some(run) => {
+                            let before = run.len();
+                            encode_run(run, positions);
+                            new_bytes = new_bytes.saturating_add(run.len() - before);
+                        }
+                        None => {
+                            let mut run = Vec::new();
+                            encode_run(&mut run, positions);
+                            new_bytes = new_bytes
+                                .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term_len + run.len());
+                            pos_runs.insert(Box::<str>::from(term), run);
+                        }
+                    }
+                }
+                *bytes = bytes.saturating_add(new_bytes);
+                Ok(())
+            }
+            ColumnPostings::Spilled { .. } => Err(BuildError::FtsColumnTypeInvalid {
+                column: format!("column_id {column_id}"),
+                actual: "prebuilt posting into a spilled column is not yet supported".to_string(),
+            }),
+        }
+    }
+
+    /// Set a column's per-doc lengths directly (the compaction merge feeds the
+    /// inputs' already-clamped stored lengths rather than recomputing them
+    /// from text) and advance the builder's doc count so `finish` sizes the
+    /// doc-lengths table and `n_docs` correctly.
+    // Wired by the FTS compaction k-way merge (landing incrementally).
+    #[allow(dead_code)]
+    pub(crate) fn set_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: Vec<u32>) {
+        let n = doc_lengths.len() as u32;
+        self.columns[column_id as usize].doc_lengths = doc_lengths;
+        self.n_docs = self.n_docs.max(n);
+    }
+
     /// Spilled-mode hot path. Per-token cost: intern lookup + dense-
     /// array tf bump; per-doc cost: drain `updated_terms` into the
     /// partition writers as 12-byte triples. Invariant maintained:

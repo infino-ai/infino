@@ -5663,6 +5663,53 @@ mod tests {
     }
 
     #[test]
+    fn add_prebuilt_term_posting_round_trips_read_to_write() {
+        use std::collections::BTreeMap;
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+
+        // Build A from text.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut a = FtsBuilder::new(tok.clone());
+        a.register_column("body".into(), true).expect("register a");
+        a.add_doc(0, 0, "a b a").expect("a doc 0");
+        a.add_doc(0, 1, "b a c").expect("a doc 1");
+        let ra = FtsReader::open(Bytes::from(a.finish().expect("finish a")), json).expect("open a");
+
+        // Build B by streaming A's postings straight into the prebuilt path —
+        // no re-tokenization. Doc lengths carried over ("a b a"/"b a c" = 3/3).
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true).expect("register b");
+        ra.for_each_term_posting(0, |term, doc_id, tf, positions| {
+            let term_str = std::str::from_utf8(term).expect("utf8 term");
+            b.add_prebuilt_term_posting(0, term_str, doc_id, tf, positions)
+                .expect("prebuilt push");
+            Ok(())
+        })
+        .expect("feed prebuilt postings");
+        b.set_prebuilt_doc_lengths(0, vec![3, 3]);
+        let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
+
+        // The two readers must expose identical postings (doc_ids, tfs,
+        // positions) for every term.
+        let collect = |r: &FtsReader| {
+            let mut m: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
+            r.for_each_term_posting(0, |t, d, tf, p| {
+                m.entry(t.to_vec()).or_default().push((d, tf, p.to_vec()));
+                Ok(())
+            })
+            .expect("collect");
+            m
+        };
+        assert_eq!(
+            collect(&ra),
+            collect(&rb),
+            "prebuilt-fed postings must match"
+        );
+        assert_eq!(rb.n_docs(), 2);
+        assert_eq!(rb.n_terms(), ra.n_terms());
+    }
+
+    #[test]
     fn open_rejects_bad_magic() {
         let (mut blob_vec, json) = build_blob();
         let mut bytes = blob_vec.to_vec();
