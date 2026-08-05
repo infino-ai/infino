@@ -2409,7 +2409,11 @@ pub(super) fn prepare_superfile_with_uri(
                 (Some(min), Some(max)) => (min.clone(), max.clone()),
                 _ => (Vec::new(), Vec::new()),
             };
-            let mut bloom_builder = BloomBuilder::new();
+            // Size the bloom to this superfile's distinct-term count rather
+            // than a fixed 64 KiB, which is ~1000x over-provisioned for a small
+            // superfile. Readers derive the block count from the byte length,
+            // so heterogeneous sizes coexist across superfiles.
+            let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
             for term in &terms {
                 bloom_builder.insert(term);
             }

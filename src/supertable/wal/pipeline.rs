@@ -594,7 +594,9 @@ fn build_fts_summary(
             (Some(min), Some(max)) => (min.clone(), max.clone()),
             _ => (Vec::new(), Vec::new()),
         };
-        let mut bloom_builder = BloomBuilder::new();
+        // Size the bloom to this superfile's distinct-term count rather than a
+        // fixed 64 KiB. Readers derive the block count from the byte length.
+        let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
         for term in &terms {
             bloom_builder.insert(term);
         }

@@ -1127,12 +1127,15 @@ impl FtsSummaryAgg {
     }
 }
 
-/// Bit-OR two same-shape blooms into their union. Different shapes can't be
-/// unioned (the block layout differs), so this returns `None` — "no bloom
-/// info", which the list-level pruner treats as always-keep.
+/// Bit-OR two blooms into their union. Per-superfile blooms are sized to their
+/// own distinct-term count, so a part can hold heterogeneous sizes; fold both
+/// down to the smaller block count first (block-blooms down-fold losslessly for
+/// may-contain) so the union is still valid. This preserves part-level skip
+/// even when a part mixes bloom sizes.
 fn union_blooms(a: &Bloom, b: &Bloom) -> Option<Bloom> {
-    let mut ab = a.to_bytes();
-    let bb = b.to_bytes();
+    let target = a.n_blocks().min(b.n_blocks());
+    let mut ab = a.folded_to(target)?.to_bytes();
+    let bb = b.folded_to(target)?.to_bytes();
     if ab.len() != bb.len() {
         return None;
     }
@@ -3185,15 +3188,20 @@ mod tests {
     }
 
     #[test]
-    fn fts_agg_merge_bloom_shape_mismatch_drops_to_none() {
-        // Different block counts can't be unioned → conservative "no info".
+    fn fts_agg_merge_bloom_shape_mismatch_folds_and_unions() {
+        // Different block counts are reconciled by folding the larger down to
+        // the smaller, so the part-level bloom is preserved (not dropped).
         let mut a = fts_agg(&[b"a"], 16, None);
         let b = fts_agg(&[b"b"], 8, None);
         a.merge_with(&b);
-        assert!(
-            a.term_bloom.is_none(),
-            "shape mismatch → no bloom info (always-keep)"
+        let bloom = a.term_bloom.as_ref().expect("folded union bloom");
+        assert_eq!(
+            bloom.n_blocks(),
+            8,
+            "union folds to the smaller block count"
         );
+        assert!(bloom.contains(b"a"), "self term survives fold+union");
+        assert!(bloom.contains(b"b"), "other term joins fold+union");
     }
 
     #[test]
@@ -3561,7 +3569,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_merge_drops_column_on_bloom_shape_mismatch() {
+    fn fts_merge_folds_column_on_bloom_shape_mismatch() {
         let mut into = BTreeMap::new();
         let mut other = BTreeMap::new();
         let mut b1 = super::super::bloom::BloomBuilder::with_n_blocks(16);
@@ -3583,8 +3591,12 @@ mod tests {
         into.insert("col".to_string(), summary1);
         other.insert("col".to_string(), summary2);
         FtsSummaryAgg::merge(&mut into, &other);
-        // Column should be dropped because bloom shapes don't match
-        assert!(into.is_empty());
+        // Mismatched shapes fold to the smaller and union — the column survives.
+        let merged = into.get("col").expect("column kept via fold+union");
+        let bloom = merged.term_bloom.as_ref().expect("folded union bloom");
+        assert_eq!(bloom.n_blocks(), 8, "folded to the smaller block count");
+        assert!(bloom.contains(b"test1"));
+        assert!(bloom.contains(b"test2"));
     }
 
     #[test]

@@ -76,6 +76,10 @@ pub const K: usize = 4;
 pub const DEFAULT_N_BLOCKS: usize = 1024;
 /// Default bloom byte size (64 KiB).
 pub const DEFAULT_BLOOM_BYTES: usize = DEFAULT_N_BLOCKS * BLOCK_BYTES;
+/// Target distinct terms per block when sizing a bloom to its term count.
+/// Matches the fixed default's loading (1024 blocks for ~100K terms), so a
+/// right-sized bloom keeps the same ~7% false-positive rate.
+const TERMS_PER_BLOCK: usize = 100;
 
 /// 64-bit golden-ratio constant (⌊2^64 / φ⌋, odd). Used as a
 /// multiplicative-avalanche mixer to decorrelate the in-block bit
@@ -152,6 +156,35 @@ impl Bloom {
         (self.n_blocks_mask as usize) + 1
     }
 
+    /// Down-fold to `target_blocks` (a power of two ≤ the current block count)
+    /// by OR-ing every source block into its residue class mod `target_blocks`.
+    /// A key present in the original is present in the fold (its block index
+    /// reduces by the same mask), so `contains` at the smaller size never turns
+    /// a hit into a miss — only the false-positive rate rises. Lets two blooms
+    /// of different sizes be unioned by folding both to the smaller. Returns
+    /// `None` if `target_blocks` is not a power of two ≤ the current count.
+    pub fn folded_to(&self, target_blocks: usize) -> Option<Bloom> {
+        let cur = self.n_blocks();
+        if target_blocks == 0 || !target_blocks.is_power_of_two() || target_blocks > cur {
+            return None;
+        }
+        if target_blocks == cur {
+            return Some(self.clone());
+        }
+        let mut words = vec![0u64; target_blocks * BLOCK_WORDS];
+        for src_block in 0..cur {
+            let dst = (src_block & (target_blocks - 1)) * BLOCK_WORDS;
+            let src = src_block * BLOCK_WORDS;
+            for w in 0..BLOCK_WORDS {
+                words[dst + w] |= self.words[src + w];
+            }
+        }
+        Some(Bloom {
+            words: words.into(),
+            n_blocks_mask: (target_blocks - 1) as u32,
+        })
+    }
+
     /// Total byte length.
     pub fn len(&self) -> usize {
         self.n_blocks() * BLOCK_BYTES
@@ -174,10 +207,27 @@ pub struct BloomBuilder {
     n_blocks_mask: u32,
 }
 
+/// Block count sized to the distinct-term count, preserving the default's
+/// ~100-terms-per-block loading (hence the target FPR), clamped to
+/// `[1, DEFAULT_N_BLOCKS]`. An 18-term superfile gets 1 block (64 B) instead
+/// of the fixed 1024 blocks (64 KiB); a 100K-term superfile still gets 1024.
+pub fn n_blocks_for_terms(n_terms: usize) -> usize {
+    n_terms
+        .div_ceil(TERMS_PER_BLOCK)
+        .max(1)
+        .next_power_of_two()
+        .min(DEFAULT_N_BLOCKS)
+}
+
 impl BloomBuilder {
     /// Builder sized at the default 64 KiB / 1024 blocks.
     pub fn new() -> Self {
         Self::with_n_blocks(DEFAULT_N_BLOCKS)
+    }
+
+    /// Builder sized to `n_terms` distinct terms. See [`n_blocks_for_terms`].
+    pub fn sized_for_terms(n_terms: usize) -> Self {
+        Self::with_n_blocks(n_blocks_for_terms(n_terms))
     }
 
     /// Builder with a caller-specified block count. Must be a
@@ -458,6 +508,44 @@ mod tests {
             n_collisions < probes.len(),
             "all probes false-positive — bloom appears saturated",
         );
+    }
+
+    // ---- adaptive sizing + fold ------------------------------------
+
+    #[test]
+    fn n_blocks_for_terms_sizes_down_and_clamps() {
+        // Tiny superfiles get a 1-block bloom; sizing tracks ~100 terms/block;
+        // and it never exceeds the 64 KiB / 1024-block ceiling no matter how
+        // many terms (so a >100K-term superfile is identical to today).
+        assert_eq!(n_blocks_for_terms(0), 1);
+        assert_eq!(n_blocks_for_terms(18), 1);
+        assert_eq!(n_blocks_for_terms(100), 1);
+        assert_eq!(n_blocks_for_terms(101), 2);
+        assert_eq!(n_blocks_for_terms(50_000), 512);
+        assert_eq!(n_blocks_for_terms(100_000), 1024);
+        assert_eq!(n_blocks_for_terms(1_000_000), DEFAULT_N_BLOCKS); // clamped
+        assert_eq!(n_blocks_for_terms(usize::MAX), DEFAULT_N_BLOCKS); // clamped
+    }
+
+    #[test]
+    fn fold_preserves_membership_and_halves_blocks() {
+        let mut b = BloomBuilder::with_n_blocks(16);
+        let keys: &[&[u8]] = &[b"alpha", b"beta", b"gamma", b"delta"];
+        for k in keys {
+            b.insert(k);
+        }
+        let big = b.finish();
+        let small = big.folded_to(4).expect("fold to a smaller power of two");
+        assert_eq!(small.n_blocks(), 4);
+        // A fold never turns a hit into a miss.
+        for k in keys {
+            assert!(small.contains(k), "membership survives the fold");
+        }
+        // Degenerate / invalid targets.
+        assert_eq!(big.folded_to(16).expect("same size").n_blocks(), 16);
+        assert!(big.folded_to(32).is_none(), "cannot fold up");
+        assert!(big.folded_to(3).is_none(), "target must be a power of two");
+        assert!(big.folded_to(0).is_none());
     }
 
     #[test]
