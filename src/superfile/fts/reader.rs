@@ -5628,15 +5628,30 @@ mod tests {
             );
         }
         let t = |s: &str| s.as_bytes().to_vec();
-        assert_eq!(got.get(&t("rust")).unwrap().as_slice(), &[(0, 1), (1, 1)]);
         assert_eq!(
-            got.get(&t("runtime")).unwrap().as_slice(),
+            got.get(&t("rust")).expect("term streamed").as_slice(),
             &[(0, 1), (1, 1)]
         );
-        assert_eq!(got.get(&t("async")).unwrap().as_slice(), &[(0, 1)]);
-        assert_eq!(got.get(&t("tokio")).unwrap().as_slice(), &[(1, 1)]);
-        assert_eq!(got.get(&t("java")).unwrap().as_slice(), &[(2, 1)]);
-        assert_eq!(got.get(&t("boot")).unwrap().as_slice(), &[(2, 1)]);
+        assert_eq!(
+            got.get(&t("runtime")).expect("term streamed").as_slice(),
+            &[(0, 1), (1, 1)]
+        );
+        assert_eq!(
+            got.get(&t("async")).expect("term streamed").as_slice(),
+            &[(0, 1)]
+        );
+        assert_eq!(
+            got.get(&t("tokio")).expect("term streamed").as_slice(),
+            &[(1, 1)]
+        );
+        assert_eq!(
+            got.get(&t("java")).expect("term streamed").as_slice(),
+            &[(2, 1)]
+        );
+        assert_eq!(
+            got.get(&t("boot")).expect("term streamed").as_slice(),
+            &[(2, 1)]
+        );
         // Every stored term was streamed exactly once.
         assert_eq!(got.len() as u32, r.n_terms());
     }
@@ -5668,15 +5683,18 @@ mod tests {
         let t = |s: &str| s.as_bytes().to_vec();
         // PFOR positional: multi-doc terms, tf and positions per doc.
         assert_eq!(
-            got.get(&t("a")).unwrap().as_slice(),
+            got.get(&t("a")).expect("term streamed").as_slice(),
             &[(0, 2, vec![0, 2]), (1, 1, vec![1])]
         );
         assert_eq!(
-            got.get(&t("b")).unwrap().as_slice(),
+            got.get(&t("b")).expect("term streamed").as_slice(),
             &[(0, 1, vec![1]), (1, 1, vec![0])]
         );
         // Inline positional (df=1): the single position comes from the slot.
-        assert_eq!(got.get(&t("c")).unwrap().as_slice(), &[(1, 1, vec![2])]);
+        assert_eq!(
+            got.get(&t("c")).expect("term streamed").as_slice(),
+            &[(1, 1, vec![2])]
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@
 
 use std::{
     collections::HashMap,
+    fs::File,
     io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
     sync::Arc,
 };
@@ -168,31 +169,73 @@ pub fn encode_parquet_body(
     row_group_size: usize,
     column_page_size_limits: &[(&str, usize)],
 ) -> Result<EncodedBody, FooterError> {
-    let mut props_builder = WriterProperties::builder()
-        .set_compression(compression)
-        .set_max_row_group_row_count(Some(row_group_size));
-    for (col, limit) in column_page_size_limits {
-        props_builder = props_builder
-            .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
+    let mut encoder =
+        ParquetBodyEncoder::new(schema, compression, row_group_size, column_page_size_limits)?;
+    for batch in batches {
+        encoder.write_batch(batch)?;
     }
-    let props = props_builder.build();
+    encoder.finish()
+}
 
-    // Encode the Parquet body to a scratch temp file rather than a `Vec`, so
-    // the body — multi-GB at corpus scale — never materializes whole in RAM.
-    // The footer is read back from the file, then the file is truncated to the
-    // end of the last row group; the splice appends the blobs + rewritten
-    // footer.
-    let mut body_file = NamedTempFile::new()?;
-    {
-        let mut writer =
-            ArrowWriter::try_new(body_file.as_file_mut(), schema.clone(), Some(props))?;
-        for batch in batches {
-            writer.write(batch)?;
+/// Incremental Parquet-body encoder: feeds row batches to an `ArrowWriter`
+/// one at a time so the caller can drop each batch after writing it, instead
+/// of holding every batch until a single [`encode_parquet_body`] call. A
+/// compaction merge that streams many inputs then never holds more than the
+/// in-flight input batch plus the writer's current row-group buffer.
+///
+/// Because `ArrowWriter` cuts row groups purely on accumulated row count (not
+/// on `write` boundaries), streaming batches yields byte-identical output to
+/// one `encode_parquet_body` over the same batches in the same order.
+pub(crate) struct ParquetBodyEncoder {
+    body_file: NamedTempFile,
+    writer: ArrowWriter<File>,
+}
+
+impl ParquetBodyEncoder {
+    pub(crate) fn new(
+        schema: &Arc<Schema>,
+        compression: Compression,
+        row_group_size: usize,
+        column_page_size_limits: &[(&str, usize)],
+    ) -> Result<Self, FooterError> {
+        let mut props_builder = WriterProperties::builder()
+            .set_compression(compression)
+            .set_max_row_group_row_count(Some(row_group_size));
+        for (col, limit) in column_page_size_limits {
+            props_builder = props_builder
+                .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
         }
-        writer.close()?;
+        let props = props_builder.build();
+
+        // Encode to a scratch temp file rather than a `Vec`, so the body —
+        // multi-GB at corpus scale — never materializes whole in RAM. The
+        // writer owns an independent handle to the same file (`reopen`); the
+        // struct's `body_file` handle reads the footer back after close, and
+        // their cursors don't alias.
+        let body_file = NamedTempFile::new()?;
+        let write_handle = body_file.reopen()?;
+        let writer = ArrowWriter::try_new(write_handle, schema.clone(), Some(props))?;
+        Ok(Self { body_file, writer })
     }
 
-    // Locate the footer and decode it, reading from the file end.
+    pub(crate) fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), FooterError> {
+        self.writer.write(batch)?;
+        Ok(())
+    }
+
+    /// Close the writer and strip the Parquet footer, yielding the same
+    /// [`EncodedBody`] as [`encode_parquet_body`].
+    pub(crate) fn finish(self) -> Result<EncodedBody, FooterError> {
+        let Self { body_file, writer } = self;
+        writer.close()?;
+        strip_parquet_footer(body_file)
+    }
+}
+
+/// Read back the just-written Parquet footer from `body_file`, decode its
+/// metadata, and truncate the file to the end of the last row group. The
+/// splice later appends the blobs + a rewritten footer.
+fn strip_parquet_footer(mut body_file: NamedTempFile) -> Result<EncodedBody, FooterError> {
     let file = body_file.as_file_mut();
     let n = file.seek(SeekFrom::End(0))?;
     if n < PARQUET_MIN_FILE_BYTES as u64 {

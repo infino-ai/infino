@@ -90,7 +90,10 @@ use crate::superfile::{
     BuildError, FtsError, ReadError, SuperfileReader,
     format::{
         self,
-        footer::{ParquetLayout, encode_parquet_body, splice_index_streams_to},
+        footer::{
+            EncodedBody, ParquetBodyEncoder, ParquetLayout, encode_parquet_body,
+            splice_index_streams_to,
+        },
         kv,
     },
     fts::{
@@ -699,25 +702,6 @@ impl SuperfileBuilder {
         Ok(())
     }
 
-    /// Append a scalar batch **without** indexing its text. The FTS blob is
-    /// supplied out of band via [`add_prebuilt_term_posting`](FtsBuilder::add_prebuilt_term_posting)
-    /// — used by the k-way FTS merge, which carries each input's already-built
-    /// posting lists across instead of re-tokenizing the corpus. Unlike
-    /// [`add_batch_ids_only`](Self::add_batch_ids_only) this deliberately skips
-    /// `index_fts_batch`: re-indexing here would double-count every term.
-    pub(crate) fn add_batch_scalar_only(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
-        if batch.schema().fields() != self.opts.schema.fields() {
-            return Err(BuildError::BatchSchemaMismatch {
-                batch: batch.schema().to_string(),
-                builder: self.opts.schema.to_string(),
-            });
-        }
-        let n_rows = batch.num_rows() as u32;
-        self.next_local_doc_id += n_rows;
-        self.batches.push(batch.clone());
-        Ok(())
-    }
-
     /// Index FTS text columns from `batch` starting at `self.next_local_doc_id`.
     /// Null cells index as empty strings so doc_lengths stay aligned with Parquet.
     fn index_fts_batch(&mut self, batch: &RecordBatch, n_rows: u32) -> Result<(), BuildError> {
@@ -1284,6 +1268,23 @@ impl SuperfileBuilder {
         let n_fts_columns = builder_opts.fts_columns.len() as u32;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
+        // Encode the Parquet body incrementally: each input's surviving rows are
+        // written and dropped in the loop below, so the body holds at most one
+        // input's batch plus the writer's row-group buffer — never the whole
+        // corpus in `self.batches`. This is the lever that bounds merge RSS.
+        let mut body_encoder = {
+            let id_page_limit = [(
+                superfile_builder.opts.id_column.as_str(),
+                superfile_builder.opts.id_page_size_limit,
+            )];
+            ParquetBodyEncoder::new(
+                &superfile_builder.opts.schema,
+                superfile_builder.opts.compression,
+                superfile_builder.opts.row_group_size,
+                &id_page_limit,
+            )?
+        };
+
         // Per-column doc-lengths, concatenated across inputs in output-doc order.
         let mut merged_doc_lengths: Vec<Vec<u32>> = vec![Vec::new(); n_fts_columns as usize];
         let mut stats_collector = Vec::with_capacity(readers.len());
@@ -1377,8 +1378,15 @@ impl SuperfileBuilder {
                 }
             }
 
-            base += record_batch.num_rows() as u32;
-            superfile_builder.add_batch_scalar_only(&record_batch)?;
+            // Stream this input's surviving rows straight into the Parquet body
+            // and drop the batch — the corpus is never accumulated in RAM. The
+            // FTS index for these rows was already fed above from the input's
+            // prebuilt postings.
+            let n_rows = record_batch.num_rows() as u32;
+            body_encoder.write_batch(&record_batch)?;
+            drop(record_batch);
+            superfile_builder.next_local_doc_id += n_rows;
+            base += n_rows;
         }
 
         if let Some(fb) = superfile_builder.fts_builder.as_mut() {
@@ -1390,7 +1398,13 @@ impl SuperfileBuilder {
             }
         }
 
-        superfile_builder.finish_to(output)?;
+        // Every input fully tombstoned → no rows: match `finish_to`'s
+        // empty-superfile contract (write nothing, return the merged stats).
+        if superfile_builder.next_local_doc_id == 0 {
+            return Ok(SuperfileStats::from_children(stats_collector.as_slice()));
+        }
+        let body = body_encoder.finish()?;
+        superfile_builder.finish_to_with_body(body, output)?;
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
@@ -1478,59 +1492,63 @@ impl SuperfileBuilder {
             || cell_posting_builder.is_some()
             || prebuilt_multi_cell.is_some();
 
-        // Stream the FTS and vector blobs to scratch temp files instead of
-        // materializing them as `Vec<u8>`. At corpus scale the positional FTS
-        // blob is multi-GB; holding it, the vector blob, the Parquet body, and
-        // the buffered input all at once is what OOMs a memory-tight build. The
-        // splice below streams the body + on-disk blobs to `output`, so no full
-        // blob is ever resident. `reopen()` gives an independent handle at
-        // offset 0, so the write handle and the later read handle don't share a
-        // cursor.
-        let fts_file = NamedTempFile::new().map_err(BuildError::Io)?;
-        let vec_file = NamedTempFile::new().map_err(BuildError::Io)?;
-        let fts_write = fts_file.reopen().map_err(BuildError::Io)?;
-        let vec_write = vec_file.reopen().map_err(BuildError::Io)?;
-        let stream_blobs = move || -> Result<(), BuildError> {
-            let mut fw = BufWriter::new(fts_write);
-            let mut vw = BufWriter::new(vec_write);
-            finish_index_blobs_streamed(
+        // Finalize the FTS + vector blobs to scratch temp files (see
+        // `stream_index_blobs_to_scratch`). Same overlap policy as the comment
+        // above: with a vector index present, finalize blobs first (the vector
+        // finalizer already saturates the pool), then encode the body;
+        // otherwise hide the body encode behind the blob finish.
+        let (body, fts_file, vec_file) = if has_vector {
+            let (fts_file, vec_file) = stream_index_blobs_to_scratch(
                 fts_builder,
                 vec_builder,
                 cell_posting_builder,
                 prebuilt_multi_cell,
-                &mut fw,
-                &mut vw,
             )?;
-            fw.flush().map_err(BuildError::Io)?;
-            vw.flush().map_err(BuildError::Io)?;
-            Ok(())
-        };
-
-        // Same overlap policy as before: with a vector index present, finalize
-        // blobs first (the vector finalizer already saturates the pool), then
-        // encode the body; otherwise hide the body encode behind the blob
-        // finish.
-        let body = if has_vector {
-            stream_blobs()?;
-            encode_body()?
+            (encode_body()?, fts_file, vec_file)
         } else {
-            let (body_res, blobs_res) = rayon::join(encode_body, stream_blobs);
-            blobs_res?;
-            body_res?
+            let (body_res, blobs_res) = rayon::join(encode_body, || {
+                stream_index_blobs_to_scratch(
+                    fts_builder,
+                    vec_builder,
+                    cell_posting_builder,
+                    prebuilt_multi_cell,
+                )
+            });
+            let (fts_file, vec_file) = blobs_res?;
+            (body_res?, fts_file, vec_file)
         };
+        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
+    }
 
-        let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
-        let vec_length = vec_file.as_file().metadata().map_err(BuildError::Io)?.len();
-        let layout = splice_index_streams_to(
-            body,
-            BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
-            fts_length,
-            BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
-            vec_length,
-            &kvs,
-            output,
+    /// Finish the build with a Parquet body the caller **already encoded** —
+    /// e.g. the FTS merge, which streams each input's row groups into a
+    /// [`ParquetBodyEncoder`] and drops them, so the corpus body is never held
+    /// whole. Finalizes the FTS/vector blobs and splices them onto `body`,
+    /// exactly as [`finish_to`](Self::finish_to) does after its own body encode.
+    ///
+    /// The caller must have advanced `next_local_doc_id` to the number of rows
+    /// written into `body`.
+    pub(crate) fn finish_to_with_body<W: Write>(
+        mut self,
+        body: EncodedBody,
+        output: W,
+    ) -> Result<ParquetLayout, BuildError> {
+        let n_docs = self.next_local_doc_id as u64;
+        let fts_builder = self.fts_builder.take();
+        let vec_builder = self.vec_builder.take();
+        let cell_posting_builder = self.cell_posting_builder.take();
+        let prebuilt_multi_cell = self.prebuilt_multi_cell.take();
+        let cell_ids: Option<Vec<u32>> = prebuilt_multi_cell
+            .as_ref()
+            .map(|cells| cells.iter().map(|(id, _)| *id).collect());
+        let kvs = superfile_kvs(&self.opts, n_docs, cell_ids.as_deref())?;
+        let (fts_file, vec_file) = stream_index_blobs_to_scratch(
+            fts_builder,
+            vec_builder,
+            cell_posting_builder,
+            prebuilt_multi_cell,
         )?;
-        Ok(layout)
+        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
     }
 
     /// Finish the build and return the assembled superfile bytes.
@@ -1754,6 +1772,60 @@ fn scalar_batch_in_stable_id_order(
         batch: format!("reordered scalar RecordBatch construct failed: {e}"),
         builder: schema.to_string(),
     })
+}
+
+/// Finalize the FTS + vector blobs to two scratch temp files. At corpus scale
+/// the positional FTS blob is multi-GB; streaming it (and the vector blob) to
+/// disk instead of a `Vec` keeps a memory-tight build or merge under its RSS
+/// budget. `reopen()` gives an independent handle at offset 0, so the write
+/// handle here and the read handle at splice time don't share a cursor.
+fn stream_index_blobs_to_scratch(
+    fts_builder: Option<FtsBuilder>,
+    vec_builder: Option<VectorBuilder>,
+    cell_posting_builder: Option<CellPostingBuilder>,
+    prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
+) -> Result<(NamedTempFile, NamedTempFile), BuildError> {
+    let fts_file = NamedTempFile::new().map_err(BuildError::Io)?;
+    let vec_file = NamedTempFile::new().map_err(BuildError::Io)?;
+    let fts_write = fts_file.reopen().map_err(BuildError::Io)?;
+    let vec_write = vec_file.reopen().map_err(BuildError::Io)?;
+    let mut fw = BufWriter::new(fts_write);
+    let mut vw = BufWriter::new(vec_write);
+    finish_index_blobs_streamed(
+        fts_builder,
+        vec_builder,
+        cell_posting_builder,
+        prebuilt_multi_cell,
+        &mut fw,
+        &mut vw,
+    )?;
+    fw.flush().map_err(BuildError::Io)?;
+    vw.flush().map_err(BuildError::Io)?;
+    Ok((fts_file, vec_file))
+}
+
+/// Splice an encoded body + the two on-disk blobs to `output`, streaming both
+/// blobs off disk so neither is ever resident. Cheap relative to the encode —
+/// byte appends + a footer rewrite.
+fn splice_body_and_blobs_to<W: Write>(
+    body: EncodedBody,
+    fts_file: NamedTempFile,
+    vec_file: NamedTempFile,
+    kvs: &[(String, String)],
+    output: W,
+) -> Result<ParquetLayout, BuildError> {
+    let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
+    let vec_length = vec_file.as_file().metadata().map_err(BuildError::Io)?.len();
+    let layout = splice_index_streams_to(
+        body,
+        BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
+        fts_length,
+        BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
+        vec_length,
+        kvs,
+        output,
+    )?;
+    Ok(layout)
 }
 
 /// Streaming counterpart of [`finish_index_blobs`]: writes the FTS blob to
