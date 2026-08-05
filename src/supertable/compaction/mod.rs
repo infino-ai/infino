@@ -893,21 +893,26 @@ async fn seal_with_bounded_retry(
 mod tests {
     use std::{collections::HashSet, mem, str, sync::Arc};
 
-    use arrow_array::LargeStringArray;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
     use tokio::task;
 
     use super::*;
     use crate::{
-        Bm25Stats, BoolMode,
+        Bm25Stats, BoolMode, VectorSearchOptions,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         memory::ConnectionMemoryBudget,
+        superfile::builder::FtsConfig,
         supertable::{
-            Supertable,
+            Supertable, SupertableOptions,
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
-        test_helpers::{build_title_batch, default_supertable_options},
+        test_helpers::{
+            build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
+        },
     };
 
     const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
@@ -1736,6 +1741,142 @@ mod tests {
             "BM25 length normalization must carry across the merge: \
              short-doc score {short} must exceed long-doc score {long}"
         );
+    }
+
+    /// Compaction dispatch: superfiles whose vector column is **not**
+    /// IVF-mergeable (an `Fp32` rerank codec) must take the re-index branch
+    /// (`build_from_readers_to`), which re-encodes both FTS and vectors — not
+    /// the FTS-only k-way merge, which carries no vectors. This guards that
+    /// routing: after merging such inputs the merged superfile must still have
+    /// a queryable vector index (and its FTS index). If the dispatch had
+    /// wrongly picked the FTS merge, `vec()` would be `None` here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_preserves_vectors_for_non_ivf_mergeable_inputs() {
+        const DIM: usize = 16;
+        let emb_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::clone(&emb_field), DIM as i32),
+                false,
+            ),
+        ]));
+
+        // `default_vector_config` uses RerankCodec::Fp32 — deliberately the
+        // non-IVF-mergeable case, so compaction routes to the re-index branch.
+        let opts = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![default_vector_config("emb", 42)],
+            Some(default_tokenizer()),
+        )
+        .expect("options with an fp32 vector column")
+        // One writer thread ⇒ one superfile per commit (deterministic doc-id
+        // layout), matching `default_supertable_options`.
+        .with_writer_pool(Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("1-thread writer pool"),
+        ));
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(opts.with_storage(Arc::clone(&storage))).expect("create");
+
+        // One-hot vectors so nearest-neighbour is unambiguous. `title` gives the
+        // FTS side something to index. `axes` are the hot dimension per row.
+        let make_batch = |titles: &[&str], axes: &[usize]| -> RecordBatch {
+            let mut flat = vec![0.0f32; titles.len() * DIM];
+            for (row, &ax) in axes.iter().enumerate() {
+                flat[row * DIM + ax] = 1.0;
+            }
+            let emb = FixedSizeListArray::try_new(
+                Arc::clone(&emb_field),
+                DIM as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )
+            .expect("fixed-size-list");
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(titles.to_vec())) as ArrayRef,
+                    Arc::new(emb) as ArrayRef,
+                ],
+            )
+            .expect("batch")
+        };
+
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&make_batch(
+                &["alpha", "alpha", "alpha", "alpha"],
+                &[0, 1, 2, 3],
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&make_batch(
+                &["beta", "beta", "beta", "beta"],
+                &[4, 5, 6, 7],
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader().expect("reader");
+        let mut superfiles: Vec<Arc<SuperfileEntry>> =
+            reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(superfiles.len(), 2, "two ingest superfiles");
+        // Deterministic output doc-id layout: first superfile's rows land at 0..4.
+        superfiles.sort_by_key(|sf| sf.id_min);
+
+        let merged = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+        let merged_reader = merged
+            .open_reader()
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
+
+        assert_eq!(merged_reader.n_docs(), 8);
+        // The re-index branch must preserve BOTH indexes.
+        assert!(
+            merged_reader.vec().is_some(),
+            "vector index must survive the merge (routing must not use the FTS-only path)"
+        );
+        assert!(
+            merged_reader.fts().is_some(),
+            "FTS index must survive the merge"
+        );
+
+        // Vectors are queryable end to end. Query the exact one-hot of merged
+        // doc 0 (first superfile, row 0, axis 0); with a full-cluster nprobe and
+        // exact fp32 rerank it must come back as the nearest.
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        let hits = merged_reader
+            .vector_hits_async("emb", &query, 8, VectorSearchOptions::new().with_nprobe(64))
+            .await
+            .expect("vector search on the merged superfile");
+        assert!(!hits.is_empty(), "vector search must return hits");
+        assert_eq!(hits[0].0, 0, "nearest to the axis-0 query is merged doc 0");
+
+        // FTS side re-encoded too: every first-superfile doc carries "alpha".
+        let fts_hits = merged_reader
+            .token_match("title", &["alpha"], BoolMode::And)
+            .await
+            .expect("token_match on merged superfile");
+        assert_eq!(fts_hits.len(), 4, "all four 'alpha' docs must match");
     }
 
     #[tokio::test(flavor = "multi_thread")]
