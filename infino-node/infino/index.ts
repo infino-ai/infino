@@ -316,19 +316,56 @@ function decode(buf: Buffer, asArrow?: boolean): RowRecord[] | arrow.Table {
   });
 }
 
+// --- hosted-API error status ---
+
+// The hosted transport types a few statuses before the number itself is
+// lost (the message keeps a stable prefix); every other HTTP failure it
+// reports as "<op>: server returned NNN: <body>". Both let the status be
+// recovered here. This table goes away once the transport carries the
+// status structurally.
+const PREFIX_STATUS: [string, number][] = [
+  ["NotFound: ", 404],
+  ["AlreadyExists: ", 409],
+  ["ConflictError: ", 412],
+];
+const SERVER_STATUS = /\bserver returned (\d{3}): /;
+
+/**
+ * Run a native call. On a hosted (Infino Cloud) connection, a failure is
+ * rethrown as-is but tagged with `status` — the HTTP status the API
+ * actually returned — so callers can branch (e.g. `409` = already exists,
+ * `503` = transient, retry) without parsing message text. Local
+ * connections rethrow untouched.
+ */
+function guard<T>(remote: boolean, fn: () => T): T {
+  if (!remote) return fn();
+  try {
+    return fn();
+  } catch (e) {
+    if (e instanceof Error && (e as any).status === undefined) {
+      const prefixed = PREFIX_STATUS.find(([prefix]) => e.message.startsWith(prefix));
+      const status = prefixed ? prefixed[1] : Number(SERVER_STATUS.exec(e.message)?.[1]);
+      if (Number.isFinite(status)) (e as any).status = status;
+    }
+    throw e;
+  }
+}
+
 // --- friendly handles ---
 
 /** A table handle. Obtain one from {@link Connection.createTable} or {@link Connection.openTable}. */
 export class Table {
   private inner: any;
+  private remote: boolean;
   /** @hidden */
-  constructor(inner: any) {
+  constructor(inner: any, remote = false) {
     this.inner = inner;
+    this.remote = remote;
   }
 
   /** The table's Arrow schema. */
   schema(): arrow.Schema {
-    return arrow.tableFromIPC(this.inner.schema()).schema;
+    return arrow.tableFromIPC(guard(this.remote, () => this.inner.schema())).schema;
   }
 
   /**
@@ -337,7 +374,8 @@ export class Table {
    * append == one commit.
    */
   append(data: AppendData): void {
-    this.inner.append(dataToIpc(data, () => this.schema()));
+    const ipc = dataToIpc(data, () => this.schema());
+    guard(this.remote, () => this.inner.append(ipc));
   }
 
   /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a
@@ -346,7 +384,7 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
-    const buf = this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection);
+    const buf = guard(this.remote, () => this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection));
     return decode(buf, opts.arrow);
   }
 
@@ -357,7 +395,7 @@ export class Table {
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts?: VectorSearchOptions): RowRecord[];
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = query instanceof Float32Array ? query : Float32Array.from(query);
-    const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection, opts.filter);
+    const buf = guard(this.remote, () => this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection, opts.filter));
     return decode(buf, opts.arrow);
   }
 
@@ -368,7 +406,7 @@ export class Table {
   hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts?: HybridSearchOptions): RowRecord[];
   hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts: HybridSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = vectorQuery instanceof Float32Array ? vectorQuery : Float32Array.from(vectorQuery);
-    const buf = this.inner.hybridSearch(textColumn, textQuery, vectorColumn, q, k, opts.mode, opts.nprobe, opts.projection);
+    const buf = guard(this.remote, () => this.inner.hybridSearch(textColumn, textQuery, vectorColumn, q, k, opts.mode, opts.nprobe, opts.projection));
     return decode(buf, opts.arrow);
   }
 
@@ -376,7 +414,7 @@ export class Table {
   tokenMatch(column: string, query: string, opts: TokenMatchOptions & { arrow: true }): arrow.Table;
   tokenMatch(column: string, query: string, opts?: TokenMatchOptions): RowRecord[];
   tokenMatch(column: string, query: string, opts: TokenMatchOptions = {}): RowRecord[] | arrow.Table {
-    const buf = this.inner.tokenMatch(column, query, opts.mode, opts.projection);
+    const buf = guard(this.remote, () => this.inner.tokenMatch(column, query, opts.mode, opts.projection));
     return decode(buf, opts.arrow);
   }
 
@@ -384,27 +422,28 @@ export class Table {
   exactMatch(column: string, value: string, opts: MatchOptions & { arrow: true }): arrow.Table;
   exactMatch(column: string, value: string, opts?: MatchOptions): RowRecord[];
   exactMatch(column: string, value: string, opts: MatchOptions = {}): RowRecord[] | arrow.Table {
-    const buf = this.inner.exactMatch(column, value, opts.projection);
+    const buf = guard(this.remote, () => this.inner.exactMatch(column, value, opts.projection));
     return decode(buf, opts.arrow);
   }
 
   /** Count rows matching a BM25 keyword `query` over `column`, without
    * fetching them. `mode` is `"or"` (default) or `"and"`. */
   count(column: string, query: string, opts: CountOptions = {}): number {
-    return this.inner.count(column, query, opts.mode);
+    return guard(this.remote, () => this.inner.count(column, query, opts.mode));
   }
 
   /** Replace rows matching a SQL predicate (e.g. `"status = 'spam'"`) with
    * `data` (same shapes as `append`), 1:1 — the matched count must equal the
    * replacement-row count. Requires durable storage (not `memory://`). */
   update(predicate: string, data: AppendData): MutationStats {
-    return this.inner.update(predicate, dataToIpc(data, () => this.schema()));
+    const ipc = dataToIpc(data, () => this.schema());
+    return guard(this.remote, () => this.inner.update(predicate, ipc));
   }
 
   /** Delete rows matching a SQL predicate (e.g. `"status = 'spam'"`).
    * Requires durable storage (not `memory://`). */
   delete(predicate: string): MutationStats {
-    return this.inner.delete(predicate);
+    return guard(this.remote, () => this.inner.delete(predicate));
   }
 
   /**
@@ -415,7 +454,7 @@ export class Table {
    * so calling this on a hosted (`https://…`) connection throws.
    */
   optimize(settings?: OptimizeOptions): void {
-    this.inner.optimize(settings);
+    guard(this.remote, () => this.inner.optimize(settings));
   }
 
   /**
@@ -427,16 +466,18 @@ export class Table {
    * calling this on a hosted connection throws.
    */
   gc(graceSecs: number): GcReport {
-    return this.inner.gc(graceSecs);
+    return guard(this.remote, () => this.inner.gc(graceSecs));
   }
 }
 
 /** A catalog connection. Create one with {@link connect}. */
 export class Connection {
   private inner: any;
+  private remote: boolean;
   /** @hidden */
-  constructor(inner: any) {
+  constructor(inner: any, remote = false) {
     this.inner = inner;
+    this.remote = remote;
   }
 
   /**
@@ -445,31 +486,32 @@ export class Connection {
    * catalog root is the database, so it is a no-op success.
    */
   createDatabase(): void {
-    this.inner.createDatabase();
+    guard(this.remote, () => this.inner.createDatabase());
   }
 
   /** Create a table from an apache-arrow `Schema` or `{ column: type }`. */
   createTable(name: string, schema: arrow.Schema | SchemaDescriptor | Buffer, indexes: IndexSpec): Table {
-    return new Table(this.inner.createTable(name, schemaToIpc(schema), indexes));
+    const ipc = schemaToIpc(schema);
+    return new Table(guard(this.remote, () => this.inner.createTable(name, ipc, indexes)), this.remote);
   }
 
   openTable(name: string): Table {
-    return new Table(this.inner.openTable(name));
+    return new Table(guard(this.remote, () => this.inner.openTable(name)), this.remote);
   }
 
   dropTable(name: string, purge?: boolean): void {
-    this.inner.dropTable(name, purge);
+    guard(this.remote, () => this.inner.dropTable(name, purge));
   }
 
   listTables(): string[] {
-    return this.inner.listTables();
+    return guard(this.remote, () => this.inner.listTables());
   }
 
   /** SQL across the catalog; rows as records (or an Arrow `Table`). */
   querySql(sql: string, opts: QueryOptions & { arrow: true }): arrow.Table;
   querySql(sql: string, opts?: QueryOptions): RowRecord[];
   querySql(sql: string, opts: QueryOptions = {}): RowRecord[] | arrow.Table {
-    return decode(this.inner.querySql(sql), opts.arrow);
+    return decode(guard(this.remote, () => this.inner.querySql(sql)), opts.arrow);
   }
 }
 
@@ -484,7 +526,10 @@ export class Connection {
  * For a hosted (`https://`) target, authenticate with an API key: pass
  * {@link ConnectOptions.apiKey}, or set the `INFINO_API_KEY` environment
  * variable. Storage and cache tuning the URI can't carry also goes in
- * `options` (see {@link ConnectOptions}).
+ * `options` (see {@link ConnectOptions}). An operation failure the hosted
+ * API reported carries the HTTP status it returned as `status` on the
+ * thrown Error (`409` create conflict, `404` missing, `503` transient —
+ * retry with backoff); errors on local connections have no `status`.
  *
  * ```ts
  * // local
@@ -494,5 +539,6 @@ export class Connection {
  * ```
  */
 export function connect(uri: string, options?: ConnectOptions): Connection {
-  return new Connection(nativeConnect(uri, options as any));
+  const remote = /^https?:\/\//.test(uri);
+  return new Connection(guard(remote, () => nativeConnect(uri, options as any)), remote);
 }

@@ -68,10 +68,15 @@ use infino::{
 fn map_err(e: InfinoError) -> Error {
     match e {
         InfinoError::NotFound(m) => Error::new(Status::GenericFailure, format!("NotFound: {m}")),
-        InfinoError::AlreadyExists(m)
-        | InfinoError::Schema(m)
-        | InfinoError::Cardinality(m)
-        | InfinoError::Query(m) => Error::new(Status::InvalidArg, m),
+        // Prefixed like `NotFound:` so callers (and, on a hosted connection,
+        // the JS wrapper attaching the 409 the API returned) can tell a
+        // duplicate create apart from a malformed argument.
+        InfinoError::AlreadyExists(m) => {
+            Error::new(Status::InvalidArg, format!("AlreadyExists: {m}"))
+        }
+        InfinoError::Schema(m) | InfinoError::Cardinality(m) | InfinoError::Query(m) => {
+            Error::new(Status::InvalidArg, m)
+        }
         InfinoError::Io(m) | InfinoError::Backend(m) => Error::new(Status::GenericFailure, m),
         // A recoverable connection-memory-budget refusal. Prefixed with the same
         // name Python raises (`ConnectionMemoryBudgetError`) so the concept reads
