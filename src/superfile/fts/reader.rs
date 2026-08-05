@@ -1545,6 +1545,93 @@ impl FtsReader {
         self.iter_terms_with_prefix(column, b"")
     }
 
+    /// Stream a column's postings for the FTS compaction merge: for every term
+    /// (lex order) and every doc in its posting list (doc_ids ascending),
+    /// invoke `emit(term_bytes, local_doc_id, tf)`. Reuses the query-path
+    /// [`TermCursor`] block decode, so the doc_ids/tfs are exactly what a fresh
+    /// build would produce. Positions are read separately (a positional column
+    /// still yields the same `(doc_id, tf)` here; the caller pairs it with a
+    /// positions read). Tombstone filtering is the caller's job — this streams
+    /// every stored posting.
+    ///
+    /// Synchronous: compaction opens its inputs over resident bytes, so every
+    /// range resolves without a runtime. `emit` may return an error to abort.
+    // Wired by the FTS compaction k-way merge (landing incrementally).
+    #[allow(dead_code)]
+    pub(crate) fn for_each_term_posting(
+        &self,
+        column_id: u32,
+        mut emit: impl FnMut(&[u8], u32, u32) -> Result<(), FtsError>,
+    ) -> Result<(), FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let positional = col_meta.positions;
+        let n_docs = u64::from(self.n_docs);
+        let column_name = col_meta.name.clone();
+        let region_base = self.postings_range.start;
+
+        let fst_bytes = self.dict_bytes()?;
+        let dict = DictReader::open(&fst_bytes).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
+        })?;
+
+        // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
+        // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
+        // read the posting metadata straight from the value — no re-lookup.
+        let mut column_prefix = column_name.as_bytes().to_vec();
+        column_prefix.push(FST_SEPARATOR);
+        let prefix_len = column_prefix.len();
+
+        for (key, packed) in dict.iter_prefix(&column_prefix) {
+            let term = &key[prefix_len..];
+            match FstValue::unpack(packed) {
+                FstValue::Inline { doc_id, tf } => {
+                    // A positional column only inlines tf == 1 postings; score
+                    // with the implied tf, not the slot (which carries the
+                    // single position).
+                    let tf = if positional { 1 } else { tf };
+                    emit(term, doc_id, tf)?;
+                }
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                } => {
+                    let start = region_base + metadata_offset as usize;
+                    let postings_length = match postings_length_hint {
+                        Some(len) => len as usize,
+                        None => {
+                            let header = fetch_source_range(
+                                &self.source,
+                                start..start + TERM_META_SIZE,
+                                "fts/merge header",
+                            )?;
+                            header_postings_length(header.as_ref())?
+                        }
+                    };
+                    let term_bytes = fetch_source_range(
+                        &self.source,
+                        start..start + postings_length,
+                        "fts/merge postings",
+                    )?;
+                    let mut cursor = TermCursor::new(term_bytes, n_docs, positional, None)?;
+                    while !cursor.is_exhausted() {
+                        while cursor.pos < cursor.block_n {
+                            emit(
+                                term,
+                                cursor.block_doc_ids[cursor.pos],
+                                cursor.block_tfs[cursor.pos],
+                            )?;
+                            cursor.pos += 1;
+                        }
+                        cursor.next();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Walk the FST and collect every term registered under
     /// `column` whose bytes begin with `term_prefix`, in lex order.
     ///
@@ -5450,6 +5537,42 @@ mod tests {
         assert_eq!(r.n_docs(), 3);
         assert!(r.n_terms() > 0);
         assert_eq!(r.fts_columns().collect::<Vec<_>>(), vec!["body"]);
+    }
+
+    #[test]
+    fn for_each_term_posting_round_trips_doc_ids_and_tfs() {
+        use std::collections::BTreeMap;
+        // Docs (from build_blob): 0 "rust async runtime", 1 "tokio is a rust
+        // runtime", 2 "java spring boot".
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+
+        let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32)>> = BTreeMap::new();
+        r.for_each_term_posting(0, |term, doc_id, tf| {
+            got.entry(term.to_vec()).or_default().push((doc_id, tf));
+            Ok(())
+        })
+        .expect("stream postings");
+
+        // doc_ids ascending within each term's list.
+        for postings in got.values() {
+            assert!(
+                postings.windows(2).all(|w| w[0].0 < w[1].0),
+                "doc_ids must be ascending"
+            );
+        }
+        let t = |s: &str| s.as_bytes().to_vec();
+        assert_eq!(got.get(&t("rust")).unwrap().as_slice(), &[(0, 1), (1, 1)]);
+        assert_eq!(
+            got.get(&t("runtime")).unwrap().as_slice(),
+            &[(0, 1), (1, 1)]
+        );
+        assert_eq!(got.get(&t("async")).unwrap().as_slice(), &[(0, 1)]);
+        assert_eq!(got.get(&t("tokio")).unwrap().as_slice(), &[(1, 1)]);
+        assert_eq!(got.get(&t("java")).unwrap().as_slice(), &[(2, 1)]);
+        assert_eq!(got.get(&t("boot")).unwrap().as_slice(), &[(2, 1)]);
+        // Every stored term was streamed exactly once.
+        assert_eq!(got.len() as u32, r.n_terms());
     }
 
     #[test]
