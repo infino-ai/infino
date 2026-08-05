@@ -1562,8 +1562,10 @@ impl FtsBuilder {
     /// Doc lengths are fed separately via [`set_prebuilt_doc_lengths`] — the
     /// merge carries the inputs' stored lengths rather than recomputing them.
     ///
-    /// Currently the in-RAM accumulator only; once a column spills (large
-    /// merges) this errors. The spill transition + spilled push land next.
+    /// Memory-bounded: while in-RAM, a push that crosses `spill_threshold_bytes`
+    /// transitions the column to the spilled accumulator (the same
+    /// [`add_doc`]-time transition), after which each posting is written
+    /// straight to the partition/position spill files.
     // Wired by the FTS compaction k-way merge (landing incrementally).
     #[allow(dead_code)]
     pub(crate) fn add_prebuilt_term_posting(
@@ -1575,8 +1577,15 @@ impl FtsBuilder {
         positions: &[u32],
     ) -> Result<(), BuildError> {
         let col_idx = column_id as usize;
+        if self.postings[col_idx].is_spilled() {
+            return self.push_prebuilt_spilled(col_idx, term, doc_id, tf, positions);
+        }
+
+        // In-RAM push, mirroring the `add_doc_inram` drain minus the tokenize +
+        // per-doc chain walk (positions arrive already decoded).
         let positional = self.columns[col_idx].positions;
-        match &mut self.postings[col_idx] {
+        let threshold = self.spill_threshold_bytes;
+        let crossed = match &mut self.postings[col_idx] {
             ColumnPostings::InRam {
                 terms,
                 pos_runs,
@@ -1613,13 +1622,156 @@ impl FtsBuilder {
                     }
                 }
                 *bytes = bytes.saturating_add(new_bytes);
-                Ok(())
+                *bytes > threshold
             }
-            ColumnPostings::Spilled { .. } => Err(BuildError::FtsColumnTypeInvalid {
-                column: format!("column_id {column_id}"),
-                actual: "prebuilt posting into a spilled column is not yet supported".to_string(),
-            }),
+            ColumnPostings::Spilled { .. } => unreachable!("spilled handled above"),
+        };
+
+        if crossed {
+            let (drained, drained_pos_runs) = match &mut self.postings[col_idx] {
+                ColumnPostings::InRam {
+                    terms, pos_runs, ..
+                } => (mem::take(terms), mem::take(pos_runs)),
+                ColumnPostings::Spilled { .. } => unreachable!("just pushed in-RAM"),
+            };
+            self.spill_inram_column(col_idx, drained, drained_pos_runs)?;
         }
+        Ok(())
+    }
+
+    /// Transition an in-RAM column to the spilled accumulator, draining the
+    /// given in-RAM maps into fresh spill partitions and building the term
+    /// interner. Same construction as the `add_doc_inram` threshold transition,
+    /// factored so the prebuilt-posting path reuses it. `drained_pos_runs` is
+    /// empty (and unused) for a non-positional column.
+    fn spill_inram_column(
+        &mut self,
+        col_idx: usize,
+        drained: FxHashMap<Box<str>, Vec<(u32, u32)>>,
+        drained_pos_runs: FxHashMap<Box<str>, Vec<u8>>,
+    ) -> Result<(), BuildError> {
+        let positional = self.columns[col_idx].positions;
+        let column_id = col_idx as u32;
+        let term_arena = Bump::new();
+        let mut term_to_id: TermIdMap = TermIdMap::default();
+        let mut id_to_term: Vec<&'static str> = Vec::with_capacity(drained.len());
+        let store = match positional {
+            false => {
+                let mut partitions = Self::open_partitions_for_column(
+                    self.scratch_dir.path(),
+                    column_id,
+                    self.spill_partitions,
+                )?;
+                Self::flush_in_ram_to_partitions(
+                    drained,
+                    &mut partitions,
+                    &mut term_to_id,
+                    &mut id_to_term,
+                    &term_arena,
+                )?;
+                SpillStore::Plain(partitions)
+            }
+            true => {
+                let mut partitions = Self::open_partitions_for_column(
+                    self.scratch_dir.path(),
+                    column_id,
+                    self.spill_partitions,
+                )?;
+                let mut blobs = Self::open_position_blobs_for_column(
+                    self.scratch_dir.path(),
+                    column_id,
+                    self.spill_partitions,
+                )?;
+                Self::flush_in_ram_to_positional_partitions(
+                    drained,
+                    drained_pos_runs,
+                    &mut partitions,
+                    &mut blobs,
+                    &mut term_to_id,
+                    &mut id_to_term,
+                    &term_arena,
+                )?;
+                SpillStore::Positional { partitions, blobs }
+            }
+        };
+        let dense_doc_tf = vec![0u32; id_to_term.len()];
+        let dense_doc_poshead = match positional {
+            true => vec![CHAIN_END; id_to_term.len()],
+            false => Vec::new(),
+        };
+        self.postings[col_idx] = ColumnPostings::Spilled {
+            partitions: store,
+            term_to_id,
+            id_to_term,
+            dense_doc_tf,
+            dense_doc_poshead,
+            updated_terms: Vec::new(),
+            term_arena,
+        };
+        Ok(())
+    }
+
+    /// Write one prebuilt posting straight to a spilled column's partition
+    /// (and position blob, for a positional column) as the fixed-size record
+    /// `add_doc_spilled` emits: interns the term, hash-selects the partition,
+    /// and appends the `(term_id, doc_id, tf[, pos_lo, pos_hi])` record. The
+    /// finish path k-way merges the partitions exactly as for a fresh build.
+    fn push_prebuilt_spilled(
+        &mut self,
+        col_idx: usize,
+        term: &str,
+        doc_id: u32,
+        tf: u32,
+        positions: &[u32],
+    ) -> Result<(), BuildError> {
+        let positional = self.columns[col_idx].positions;
+        let ColumnPostings::Spilled {
+            partitions,
+            term_to_id,
+            id_to_term,
+            dense_doc_tf,
+            dense_doc_poshead,
+            term_arena,
+            ..
+        } = &mut self.postings[col_idx]
+        else {
+            unreachable!("push_prebuilt_spilled on a non-spilled column");
+        };
+
+        let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, term);
+        if is_new {
+            // Keep the per-id parallel arrays in lockstep with the vocab.
+            dense_doc_tf.push(0);
+            if positional {
+                dense_doc_poshead.push(CHAIN_END);
+            }
+        }
+
+        match partitions {
+            SpillStore::Plain(parts) => {
+                let p = (term_id as usize) & (parts.len() - 1);
+                push_record_batched(&mut parts[p], [term_id, doc_id, tf])?;
+            }
+            SpillStore::Positional {
+                partitions: parts,
+                blobs,
+            } => {
+                let p = (term_id as usize) & (parts.len() - 1);
+                let blob = &mut blobs[p];
+                let writer = blob
+                    .writer
+                    .as_mut()
+                    .expect("positions blob writer open before finish");
+                let mut run = Vec::new();
+                encode_run(&mut run, positions);
+                writer.write_all(&run)?;
+                let pos_off = blob.len;
+                blob.len += run.len() as u64;
+                let (lo, hi) = pos_off_lanes(pos_off);
+                push_record_batched(&mut parts[p], [term_id, doc_id, tf, lo, hi])?;
+            }
+        }
+        Ok(())
     }
 
     /// Set a column's per-doc lengths directly (the compaction merge feeds the
