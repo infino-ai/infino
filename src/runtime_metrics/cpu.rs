@@ -102,10 +102,14 @@ pub(crate) fn thread_cpu_ns() -> Option<u128> {
 /// "no clock" means "no measured time", never an error. Must be called
 /// on the same thread that took `start`.
 pub(crate) fn thread_cpu_delta_ns(start: Option<u128>) -> u64 {
-    match (start, thread_cpu_ns()) {
-        (Some(t0), Some(t1)) => u64::try_from(t1.saturating_sub(t0)).unwrap_or(u64::MAX),
-        _ => 0,
-    }
+    // No opening reading (unmetered bracket, or procfs-less host) means
+    // no closing read either — the bracket must stay free when off.
+    let Some(t0) = start else {
+        return 0;
+    };
+    thread_cpu_ns().map_or(0, |t1| {
+        u64::try_from(t1.saturating_sub(t0)).unwrap_or(u64::MAX)
+    })
 }
 
 /// Run `f`, returning `(result, wall_duration, measured_on_cpu_seconds)`.

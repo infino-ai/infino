@@ -123,7 +123,10 @@ use crate::{
         error::{FtsError, ReadError},
         fts::{
             bm25,
-            reader::{Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet},
+            reader::{
+                Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet,
+                PreparedClauses,
+            },
         },
     },
     supertable::{
@@ -608,27 +611,35 @@ impl SupertableReader {
                             // kernels are bracketed below).
                             stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
                         }
-                        // Gate on posting mass, not term count: this scan
-                        // isn't sliced, so a rare-term query with many
-                        // terms can be cheaper than a common-term pair.
-                        if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS {
-                            let kernel_reader = Arc::clone(&r);
-                            let kernel_stats = op_stats.clone();
-                            run_on_pool(
-                                Some(&reader_pool),
-                                "un-ranged fts kernel: reader pool dropped result",
-                                move || {
-                                    op_stats::timed_kernel(&kernel_stats, || {
-                                        kernel_reader.run_prepared(prep)
-                                    })
-                                },
-                            )
-                            .await
-                            .map_err(|e| QueryError::Execute(e.to_string()))?
-                            .map_err(fts_read_error)?
-                        } else {
-                            op_stats::timed_kernel(&op_stats, || r.run_prepared(prep))
+                        match prep {
+                            // Already-final shapes: the walk (and its
+                            // kernel time) happened inside
+                            // `prepare_clauses`; `run_prepared` would be
+                            // a no-op move and the bracket two wasted
+                            // schedstat reads.
+                            PreparedClauses::Done { hits, .. } => hits,
+                            // Gate on posting mass, not term count: this
+                            // scan isn't sliced, so a rare-term query
+                            // with many terms can be cheaper than a
+                            // common-term pair.
+                            prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
+                                let kernel_reader = Arc::clone(&r);
+                                let kernel_stats = op_stats.clone();
+                                run_on_pool(
+                                    Some(&reader_pool),
+                                    "un-ranged fts kernel: reader pool dropped result",
+                                    move || {
+                                        op_stats::timed_kernel(&kernel_stats, || {
+                                            kernel_reader.run_prepared(prep)
+                                        })
+                                    },
+                                )
+                                .await
+                                .map_err(|e| QueryError::Execute(e.to_string()))?
                                 .map_err(fts_read_error)?
+                            }
+                            prep => op_stats::timed_kernel(&op_stats, || r.run_prepared(prep))
+                                .map_err(fts_read_error)?,
                         }
                     }
                 };

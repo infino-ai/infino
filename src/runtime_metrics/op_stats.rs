@@ -13,14 +13,16 @@
 //! these count what the plan *did*, not what the storage layer happened to
 //! fetch (the [`super::io::UsageMeter`] ledger keeps counting actuals).
 //!
-//! With no collector installed the per-flush cost is one `Option` check;
-//! counters accumulate locally in kernels and flush per superfile / work
-//! unit, never inside scoring loops.
+//! With no collector installed the per-flush cost is one `Option` check,
+//! and the superfile-level kernel-CPU brackets gate their procfs reads on
+//! [`metering_active`] (one relaxed atomic load); counters accumulate
+//! locally in kernels and flush per superfile / work unit, never inside
+//! scoring loops.
 
 use std::cell::RefCell;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -152,6 +154,32 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<OpStatsCollector>>> = const { RefCell::new(None) };
 }
 
+/// Live [`with_op_stats`] scopes, process-wide. Superfile-layer kernel
+/// brackets gate their procfs reads on this instead of a collector they
+/// cannot see (the collector rides the supertable reader, and the kernel
+/// may run on a different thread than the scope) — so an unmetered
+/// process pays one relaxed load per bracket, never a schedstat read.
+static ACTIVE_SCOPES: AtomicUsize = AtomicUsize::new(0);
+
+/// `true` while any [`with_op_stats`] scope is live anywhere in the
+/// process. A cross-thread gate, deliberately coarser than [`current`]:
+/// a kernel polled off the scope's thread must still measure.
+pub(crate) fn metering_active() -> bool {
+    ACTIVE_SCOPES.load(Ordering::Relaxed) > 0
+}
+
+/// Decrements [`ACTIVE_SCOPES`] when a [`with_op_stats`] scope ends
+/// (panic unwind included). [`suppressed`] never touches the counter:
+/// suppression detaches the thread-local inside a scope that is still
+/// running and still metering elsewhere.
+struct ActiveScopeGuard;
+
+impl Drop for ActiveScopeGuard {
+    fn drop(&mut self) {
+        ACTIVE_SCOPES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Restores the previously-installed collector when the scope ends, so
 /// nested [`with_op_stats`] scopes and panics both unwind cleanly.
 struct ScopeGuard {
@@ -177,6 +205,8 @@ pub fn with_op_stats<T>(f: impl FnOnce() -> T) -> (T, OpStats) {
     let collector = Arc::new(OpStatsCollector::default());
     let previous = CURRENT.with(|slot| slot.borrow_mut().replace(Arc::clone(&collector)));
     let _guard = ScopeGuard { previous };
+    ACTIVE_SCOPES.fetch_add(1, Ordering::Relaxed);
+    let _active = ActiveScopeGuard;
     let value = f();
     (value, collector.snapshot())
 }

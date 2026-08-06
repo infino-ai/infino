@@ -96,6 +96,7 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::{
+    runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
         fts::{
@@ -301,13 +302,20 @@ impl SupertableProvider {
     /// segment) scan. Gets its own object-store registry key so the
     /// restricted scan's registration can't collide with the parent's.
     pub(crate) fn restricted_to(&self, segments: HashSet<Uuid>) -> Self {
-        let mut restricted = Self::new(
-            Arc::clone(&self.schema),
-            Arc::clone(&self.manifest),
-            Arc::clone(&self.store),
-            self.disk_cache.clone(),
-            self.tombstone_cache.clone(),
-        );
+        // Suppressed: `Self::new` mints a transient scan store that
+        // captures the thread-local collector, but the restricted scan
+        // reuses the PARENT's store (replaced just below) — this clone
+        // runs mid-query on whatever thread drives the rewrite, and no
+        // mid-query code may consult the scope's thread-local.
+        let mut restricted = op_stats::suppressed(|| {
+            Self::new(
+                Arc::clone(&self.schema),
+                Arc::clone(&self.manifest),
+                Arc::clone(&self.store),
+                self.disk_cache.clone(),
+                self.tombstone_cache.clone(),
+            )
+        });
         restricted.segment_filter = Some(segments);
         restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
         restricted.scan_store = Arc::clone(&self.scan_store);

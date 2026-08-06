@@ -219,10 +219,15 @@ fn a_scoped_bm25_query_reports_kernel_cpu() {
     const KERNEL_CPU_BATCH: usize = 200;
     let st = demo_two_superfiles();
     let (_, stats) = with_op_stats(|| {
-        for _ in 0..KERNEL_CPU_BATCH {
+        for i in 0..KERNEL_CPU_BATCH {
+            // Alternate the single-term shape (whose walk finishes inside
+            // `prepare_clauses` and rides the `Done` result) with the
+            // multi-term OR (bracketed at `run_prepared`), so both kernel
+            // accounting paths contribute.
+            let query = if i % 2 == 0 { "rust" } else { "rust async web" };
             st.reader()
                 .expect("reader")
-                .bm25_hits("title", "rust async web", TOP_K, BoolMode::Or)
+                .bm25_hits("title", query, TOP_K, BoolMode::Or)
                 .expect("bm25");
         }
     });

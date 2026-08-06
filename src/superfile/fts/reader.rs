@@ -26,6 +26,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::runtime_metrics::cpu::{thread_cpu_delta_ns, thread_cpu_ns};
+use crate::runtime_metrics::op_stats::metering_active;
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -2027,7 +2028,8 @@ impl FtsReader {
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
             // its on-CPU time here (sync section, no awaits inside).
-            let kernel_start = thread_cpu_ns();
+            // Gated: an unmetered process must not pay the procfs reads.
+            let kernel_start = metering_active().then(thread_cpu_ns).flatten();
             let result =
                 self.run_atoms_search(column_id, must_atoms, should_atoms, k, filter, floor_eff)?;
             return Ok(PreparedClauses::Done {
@@ -2583,7 +2585,9 @@ impl FtsReader {
 
         // Everything below is the synchronous scoring walk (no awaits):
         // bracket it on this thread for the per-query kernel CPU stat.
-        let kernel_start = thread_cpu_ns();
+        // Gated: an unmetered process must not pay the procfs reads on
+        // the most common query shape.
+        let kernel_start = metering_active().then(thread_cpu_ns).flatten();
         let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
