@@ -539,6 +539,7 @@ impl SupertableReader {
                                 // its posting bytes exactly once.
                                 if let Some(stats) = &op_stats {
                                     stats.add_fts_postings_bytes(set.postings_bytes());
+                                    stats.add_planned_read_ranges(set.planned_ranges());
                                 }
                                 Ok(Arc::new(set))
                             })
@@ -594,6 +595,7 @@ impl SupertableReader {
                             .map_err(fts_read_error)?;
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(prep.postings_bytes());
+                            stats.add_planned_read_ranges(prep.planned_ranges());
                         }
                         // Gate on posting mass, not term count: this scan
                         // isn't sliced, so a rare-term query with many

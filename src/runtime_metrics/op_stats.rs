@@ -48,6 +48,12 @@ pub struct OpStats {
     /// serving state). The cold arm's immediate rerank is not yet
     /// attributed; its candidate scan above is.
     pub vector_rows_reranked: u64,
+    /// Byte-source ranges the plan requested, before coalescing and before
+    /// the cache decides whether a request becomes a local read or a GET —
+    /// the warm-equivalent request-work measure (FTS: one per term posting
+    /// range, two per phrase member; vector: cluster index + prefix/block
+    /// ranges per cell, one per rerank row).
+    pub planned_read_ranges: u64,
 }
 
 /// Accumulates one query's work counters across its fan-out (tokio unit
@@ -58,6 +64,7 @@ pub struct OpStatsCollector {
     vector_cells_scanned: AtomicU64,
     vector_candidates_scanned: AtomicU64,
     vector_rows_reranked: AtomicU64,
+    planned_read_ranges: AtomicU64,
 }
 
 impl OpStatsCollector {
@@ -79,6 +86,12 @@ impl OpStatsCollector {
         self.vector_rows_reranked.fetch_add(rows, Ordering::Relaxed);
     }
 
+    /// Flush a kernel's planned byte-source range count.
+    pub(crate) fn add_planned_read_ranges(&self, ranges: u64) {
+        self.planned_read_ranges
+            .fetch_add(ranges, Ordering::Relaxed);
+    }
+
     /// The counters accumulated so far.
     pub fn snapshot(&self) -> OpStats {
         OpStats {
@@ -86,6 +99,7 @@ impl OpStatsCollector {
             vector_cells_scanned: self.vector_cells_scanned.load(Ordering::Relaxed),
             vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
+            planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
         }
     }
 }

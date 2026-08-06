@@ -127,6 +127,33 @@ fn a_scoped_bm25_query_reports_its_posting_bytes() {
 }
 
 #[test]
+fn a_scoped_bm25_query_reports_its_planned_ranges() {
+    let st = demo_two_superfiles();
+    let (_, one_term) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+            .expect("bm25")
+    });
+    let (_, three_terms) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits("title", "rust async web", TOP_K, BoolMode::Or)
+            .expect("bm25")
+    });
+    assert!(
+        one_term.planned_read_ranges > 0,
+        "a PFOR term requests its posting range"
+    );
+    assert!(
+        three_terms.planned_read_ranges > one_term.planned_read_ranges,
+        "three terms request more ranges than one (three {}, one {})",
+        three_terms.planned_read_ranges,
+        one_term.planned_read_ranges
+    );
+}
+
+#[test]
 fn work_stats_are_deterministic_across_cache_temperature() {
     // The first run decodes from a cold state, the repeat hits every
     // warm structure — the whole point of the counter is that the
@@ -292,6 +319,13 @@ fn a_scoped_vector_query_reports_scan_and_rerank_work() {
     assert!(
         stats.vector_rows_reranked <= stats.vector_candidates_scanned,
         "rerank rows are shortlist survivors of the scanned candidates"
+    );
+    assert!(
+        stats.planned_read_ranges >= stats.vector_cells_scanned + stats.vector_rows_reranked,
+        "each scanned cell requests at least its cluster index and each          reranked row its survivor range (ranges {}, cells {}, rows {})",
+        stats.planned_read_ranges,
+        stats.vector_cells_scanned,
+        stats.vector_rows_reranked
     );
 }
 

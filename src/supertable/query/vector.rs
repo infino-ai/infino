@@ -2163,6 +2163,7 @@ impl SupertableReader {
                             .map_err(vector_read_query_error)?;
                         if let Some(stats) = &op_stats {
                             stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
+                            stats.add_planned_read_ranges(scan.ranges_requested);
                         }
                         if !scan.candidates.is_empty() {
                             scan_pool
@@ -2322,9 +2323,10 @@ impl SupertableReader {
                     })
                     .collect();
                 if let Some(stats) = &self.op_stats {
-                    stats.add_vector_rows_reranked(
-                        rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum(),
-                    );
+                    let rows: u64 = rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
+                    stats.add_vector_rows_reranked(rows);
+                    // Phase C gathers one survivor row range per winner.
+                    stats.add_planned_read_ranges(rows);
                 }
                 let column = Arc::clone(&column_arc2);
                 let query = Arc::clone(&query_arc2);

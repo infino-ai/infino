@@ -196,6 +196,9 @@ pub(crate) enum PreparedClauses {
     Done {
         hits: Vec<(u32, f32)>,
         postings_bytes: u64,
+        /// Byte-source ranges the inline walk requested (0 for the df=1
+        /// inline-FST and empty-resolution paths).
+        planned_ranges: u64,
     },
     /// AND-only: intersect `must_cursors`.
     Must {
@@ -249,6 +252,18 @@ fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
         .sum()
 }
 
+/// Byte-source ranges the atoms' builds requested: one per plain term's
+/// posting range, two per phrase member (postings + position runs).
+fn atom_planned_ranges(atoms: &[AnyCursor]) -> u64 {
+    atoms
+        .iter()
+        .map(|a| match a {
+            AnyCursor::Term(_) => 1,
+            AnyCursor::Phrase(p) => 2 * p.members.len() as u64,
+        })
+        .sum()
+}
+
 impl PreparedClauses {
     /// Scan-cost proxy callers gate reader-pool dispatch on: the driving
     /// (smallest) posting list for the AND-intersect shapes, the full
@@ -295,6 +310,31 @@ impl PreparedClauses {
             PreparedClauses::Or {
                 cursors, filter, ..
             } => term_cursor_bytes(cursors) + filter_bytes(filter),
+        }
+    }
+
+    /// Byte-source ranges this prepared query requested — one per term
+    /// posting range across every clause list (see
+    /// [`Self::postings_bytes`] for the byte-volume counterpart).
+    pub(crate) fn planned_ranges(&self) -> u64 {
+        let filter_ranges =
+            |filter: &Option<ExcludeFilter>| filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
+        match self {
+            PreparedClauses::Done { planned_ranges, .. } => *planned_ranges,
+            PreparedClauses::Must {
+                must_cursors,
+                filter,
+                ..
+            } => must_cursors.len() as u64 + filter_ranges(filter),
+            PreparedClauses::MustShould {
+                must_cursors,
+                should_cursors,
+                filter,
+                ..
+            } => must_cursors.len() as u64 + should_cursors.len() as u64 + filter_ranges(filter),
+            PreparedClauses::Or {
+                cursors, filter, ..
+            } => cursors.len() as u64 + filter_ranges(filter),
         }
     }
 }
@@ -1899,6 +1939,7 @@ impl FtsReader {
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
                 postings_bytes: 0,
+                planned_ranges: 0,
             });
         }
         if lists.no_positive_atoms() {
@@ -1906,6 +1947,7 @@ impl FtsReader {
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
                     postings_bytes: 0,
+                    planned_ranges: 0,
                 });
             }
             return Err(FtsError::NegationOnly);
@@ -1924,6 +1966,7 @@ impl FtsReader {
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
                     postings_bytes: atom_cursor_bytes(&built),
+                    planned_ranges: atom_planned_ranges(&built),
                 });
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
@@ -1949,6 +1992,9 @@ impl FtsReader {
             let postings_bytes = atom_cursor_bytes(&must_atoms)
                 + atom_cursor_bytes(&should_atoms)
                 + atom_cursor_bytes(&negative_atoms);
+            let planned_ranges = atom_planned_ranges(&must_atoms)
+                + atom_planned_ranges(&should_atoms)
+                + atom_planned_ranges(&negative_atoms);
             let filter = match negative_atoms.is_empty() {
                 true => None,
                 false => Some(AtomExcludeFilter::new(negative_atoms)),
@@ -1958,6 +2004,7 @@ impl FtsReader {
             return Ok(PreparedClauses::Done {
                 hits: result,
                 postings_bytes,
+                planned_ranges,
             });
         }
 
@@ -1987,12 +2034,17 @@ impl FtsReader {
                 .expect("one atom");
             let mut filter = neg_filter;
             let filter_postings_bytes = filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+            let filter_ranges = filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
             let (result, term_postings_bytes) = self
                 .search_single_term_bmw(column_id, term, k, filter.as_mut(), floor_eff)
                 .await?;
+            // The PFOR arm requested one posting range; the inline df=1 and
+            // absent-term arms requested none (bytes 0 implies ranges 0).
+            let term_ranges = u64::from(term_postings_bytes > 0);
             return Ok(PreparedClauses::Done {
                 hits: result,
                 postings_bytes: term_postings_bytes + filter_postings_bytes,
+                planned_ranges: term_ranges + filter_ranges,
             });
         }
 
@@ -2002,9 +2054,11 @@ impl FtsReader {
                 .await?;
             if cursors.is_empty() {
                 let postings_bytes = neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+                let planned_ranges = neg_filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
                     postings_bytes,
+                    planned_ranges,
                 });
             }
             return Ok(PreparedClauses::Or {
@@ -2023,9 +2077,12 @@ impl FtsReader {
         if must_cursors.len() != lists.musts.len() {
             let postings_bytes = term_cursor_bytes(&must_cursors)
                 + neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+            let planned_ranges = must_cursors.len() as u64
+                + neg_filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
                 postings_bytes,
+                planned_ranges,
             });
         }
         if lists.shoulds.is_empty() {
@@ -4140,6 +4197,11 @@ impl OrCursorSet {
     /// even when ranged slices share the set.
     pub(crate) fn postings_bytes(&self) -> u64 {
         term_cursor_bytes(&self.cursors)
+    }
+
+    /// Byte-source ranges the set's build requested (one per term).
+    pub(crate) fn planned_ranges(&self) -> u64 {
+        self.cursors.len() as u64
     }
 }
 

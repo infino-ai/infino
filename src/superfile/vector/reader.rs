@@ -3414,6 +3414,7 @@ impl VectorReader {
             rot_seed,
             cells_scanned: 0,
             candidates_scanned: 0,
+            ranges_requested: 0,
         };
         if k == 0 || self.n_docs == 0 {
             return Ok(outcome);
@@ -3495,12 +3496,17 @@ impl VectorReader {
                 let cb = col.quant.code_bytes();
                 let (cluster_meta, prefix_ranges) = chosen_cluster_meta(col, &cluster_idx, &locals);
                 if cluster_meta.is_empty() {
-                    return Ok((Vec::new(), Vec::new(), 0));
+                    // The cluster-index read itself was one planned range.
+                    return Ok((Vec::new(), Vec::new(), 0, 1));
                 }
-                // Work-stats tally, taken before the warm/cold branch so
-                // both arms count the codes their clusters hold.
+                // Work-stats tallies, taken before the warm/cold branch so
+                // both arms count the codes their clusters hold. Ranges:
+                // the cluster index plus one per prefix span (the warm
+                // arm's fetches; the cold arm's whole-cluster blocks are
+                // one range per chosen cluster, the same count).
                 let candidates_scanned: u64 =
                     cluster_meta.iter().map(|(_, _, cnt)| u64::from(*cnt)).sum();
+                let ranges_requested = 1 + prefix_ranges.len() as u64;
                 // Warm fast path: every prefix resident -> defer rerank.
                 let prefix_blocks: Option<Vec<Bytes>> = prefix_ranges
                     .iter()
@@ -3531,10 +3537,11 @@ impl VectorReader {
                             cell_idx,
                         })
                         .collect();
-                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64), VectorError>((
+                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64), VectorError>((
                         Vec::new(),
                         cands,
                         candidates_scanned,
+                        ranges_requested,
                     ));
                 }
                 // Cold (or RabitqOnly): probe-and-rerank now, width-divided.
@@ -3556,18 +3563,20 @@ impl VectorReader {
                         .collect(),
                     Vec::new(),
                     candidates_scanned,
+                    ranges_requested,
                 ))
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64)> =
+        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64)> =
             stream::iter(cell_scans)
                 .buffer_unordered(max_in_flight)
                 .try_collect()
                 .await?;
-        for (hits, cands, candidates_scanned) in per_cell_results {
+        for (hits, cands, candidates_scanned, ranges_requested) in per_cell_results {
             outcome.hits.extend(hits);
             outcome.candidates.extend(cands);
+            outcome.ranges_requested += ranges_requested;
             if candidates_scanned > 0 {
                 outcome.cells_scanned += 1;
                 outcome.candidates_scanned += candidates_scanned;
@@ -4497,6 +4506,10 @@ pub(crate) struct ScanOutcome {
     /// Quantized codes estimated: Σ cluster row counts over every chosen
     /// cluster, warm and cold arms alike.
     pub(crate) candidates_scanned: u64,
+    /// Byte-source ranges the scan requested per cell: the cluster index
+    /// plus one range per prefix block (warm arm) or chosen cluster's
+    /// blocks (cold arm).
+    pub(crate) ranges_requested: u64,
 }
 
 async fn build_shortlist(
