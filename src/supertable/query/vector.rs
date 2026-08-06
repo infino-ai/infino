@@ -2147,6 +2147,14 @@ impl SupertableReader {
         let total_candidates_body = Arc::clone(&total_candidates);
         let max_replica_overhead = Arc::new(AtomicU64::new(0));
         let max_replica_overhead_body = Arc::clone(&max_replica_overhead);
+        // (#537) Pin-arm plan rows: under an explicit caller nprobe every
+        // probed cell keeps the full k x rerank_mult depth (floor ==
+        // budget, cold arm undivided), so the plan's rerank rows are the
+        // per-cell kept counts summed — warm survivors pooled for phase C
+        // plus cold rows reranked in-scan, which are the same
+        // min(cell candidates, depth) per cell at either temperature.
+        let pinned_plan_rows = Arc::new(AtomicU64::new(0));
+        let pinned_plan_rows_body = Arc::clone(&pinned_plan_rows);
         let body =
             move |reader: Arc<SuperfileReader>,
                   entry: Arc<SuperfileEntry>,
@@ -2161,6 +2169,7 @@ impl SupertableReader {
                 let scan_pool = Arc::clone(&scan_pool_body);
                 let total_candidates = Arc::clone(&total_candidates_body);
                 let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
+                let pinned_plan_rows = Arc::clone(&pinned_plan_rows_body);
                 let op_stats = op_stats_scan.clone();
                 async move {
                     // Unfiltered user path on row-addressable locals: resolve the
@@ -2218,6 +2227,10 @@ impl SupertableReader {
                             .fetch_add(scan.candidates_scanned, atomic::Ordering::Relaxed);
                         max_replica_overhead
                             .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
+                        pinned_plan_rows.fetch_add(
+                            scan.candidates.len() as u64 + scan.rows_reranked,
+                            atomic::Ordering::Relaxed,
+                        );
                         if !scan.candidates.is_empty() {
                             scan_pool
                                 .lock()
@@ -2301,27 +2314,36 @@ impl SupertableReader {
         // units' estimates ever meet.
         if global_shortlist_width.is_some() {
             // Canonical rerank-leg pricing for the deferred plan: one
-            // planned survivor range per BUDGETED shortlist row —
-            // `min(shortlist limit, candidates scanned)` — flushed whether
-            // the winners rerank at phase C (warm) or already reranked
-            // inside their cell scans (cold). Same query, same table state
-            // → same priced count, at any cache temperature. (Under an
-            // explicit caller nprobe the per-cell floor can rerank a few
-            // rows beyond the budget; those stay unpriced.)
+            // planned survivor range per BUDGETED shortlist row, flushed
+            // whether the winners rerank at phase C (warm) or already
+            // reranked inside their cell scans (cold). Same query, same
+            // table state → same priced count, at any cache temperature.
+            // Law arm: the budget is the global shortlist cap —
+            // `min(shortlist limit, candidates scanned)`. Pin arm (#537):
+            // every probed cell keeps the full per-cell depth and cost is
+            // linear in the width the caller asked for, so the plan's
+            // rows are the per-cell kept counts summed (warm survivors +
+            // cold in-scan rows — the same min(candidates, depth) per
+            // cell at either temperature).
             if let Some(stats) = &self.op_stats {
-                let total = total_candidates.load(atomic::Ordering::Relaxed);
-                let overhead =
-                    usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
-                        .unwrap_or(0);
-                let limit = deferred_shortlist_limit(
-                    k,
-                    overhead,
-                    plan_rerank_mult,
-                    law_rerank_served,
-                    options.nprobe.is_some(),
-                    served_cells_over_width,
-                );
-                stats.add_planned_read_ranges((limit as u64).min(total));
+                let rows = if options.nprobe.is_some() {
+                    pinned_plan_rows.load(atomic::Ordering::Relaxed)
+                } else {
+                    let total = total_candidates.load(atomic::Ordering::Relaxed);
+                    let overhead =
+                        usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
+                            .unwrap_or(0);
+                    let limit = deferred_shortlist_limit(
+                        k,
+                        overhead,
+                        plan_rerank_mult,
+                        law_rerank_served,
+                        false,
+                        served_cells_over_width,
+                    );
+                    (limit as u64).min(total)
+                };
+                stats.add_planned_read_ranges(rows);
             }
             let pooled = {
                 let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2386,7 +2408,7 @@ impl SupertableReader {
                 // is linear in the width the caller asked for — the pin
                 // arm's stated semantics.
                 let cell_floor = if options.nprobe.is_some() {
-                    k.saturating_mul(rerank_mult)
+                    k.saturating_mul(plan_rerank_mult)
                 } else {
                     0
                 };
