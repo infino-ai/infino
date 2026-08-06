@@ -25,9 +25,13 @@ use std::sync::{
 
 use serde::{Deserialize, Serialize};
 
-/// Physical work one query performed. Every field is a plain count; the
-/// struct is `#[non_exhaustive]` because counters land modality by modality
-/// (FTS first; vector, SQL, planned-read, and CPU attribution follow).
+use super::cpu;
+
+/// Physical work one query performed. Every field except
+/// [`Self::kernel_cpu_ns`] is a deterministic plan count (same query, same
+/// table state → same value, warm or cold); `kernel_cpu_ns` is a measured
+/// time refinement and varies run to run. The struct is `#[non_exhaustive]`
+/// because counters land modality by modality.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct OpStats {
@@ -59,6 +63,11 @@ pub struct OpStats {
     /// (footer, page index, and data pages), independent of whether they
     /// were served from resident bytes or fetched.
     pub sql_page_bytes: u64,
+    /// On-CPU nanoseconds of the query's bracketed synchronous kernel
+    /// sections (thread-CPU clock, ns resolution). A refinement of — not a
+    /// replacement for — a consumer's own process-level CPU accounting:
+    /// fan-out glue and async awaits are outside the brackets.
+    pub kernel_cpu_ns: u64,
 }
 
 /// Accumulates one query's work counters across its fan-out (tokio unit
@@ -71,6 +80,7 @@ pub struct OpStatsCollector {
     vector_rows_reranked: AtomicU64,
     planned_read_ranges: AtomicU64,
     sql_page_bytes: AtomicU64,
+    kernel_cpu_ns: AtomicU64,
 }
 
 impl OpStatsCollector {
@@ -103,6 +113,11 @@ impl OpStatsCollector {
         self.sql_page_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Flush one bracketed kernel section's on-CPU nanoseconds.
+    pub(crate) fn add_kernel_cpu_ns(&self, ns: u64) {
+        self.kernel_cpu_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
     /// The counters accumulated so far.
     pub fn snapshot(&self) -> OpStats {
         OpStats {
@@ -112,6 +127,7 @@ impl OpStatsCollector {
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
             planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
+            kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -159,6 +175,27 @@ pub fn with_op_stats<T>(f: impl FnOnce() -> T) -> (T, OpStats) {
 /// the query fans out).
 pub(crate) fn current() -> Option<Arc<OpStatsCollector>> {
     CURRENT.with(|slot| slot.borrow().clone())
+}
+
+/// Bracket one synchronous kernel section with the thread-CPU clock and
+/// flush the on-CPU delta into `collector`. `f` must run entirely on the
+/// calling thread (rayon pool closures and inline kernel branches do);
+/// with no collector — or off Linux procfs — it is a plain call.
+pub(crate) fn timed_kernel<T>(
+    collector: &Option<Arc<OpStatsCollector>>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let Some(stats) = collector else {
+        return f();
+    };
+    let Some(start) = cpu::thread_cpu_ns() else {
+        return f();
+    };
+    let value = f();
+    if let Some(end) = cpu::thread_cpu_ns() {
+        stats.add_kernel_cpu_ns(u64::try_from(end.saturating_sub(start)).unwrap_or(u64::MAX));
+    }
+    value
 }
 
 /// Run `f` with NO collector installed, restoring the active scope after.

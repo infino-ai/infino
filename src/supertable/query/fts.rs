@@ -117,6 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::{
     InfinoError,
     runtime_bridge::run_on_pool,
+    runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
         error::{FtsError, ReadError},
@@ -550,25 +551,30 @@ impl SupertableReader {
                         if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
+                            let kernel_stats = op_stats.clone();
                             run_on_pool(
                                 Some(&reader_pool),
                                 "ranged fts kernel: reader pool dropped result",
                                 move || {
-                                    kernel_reader.bm25_search_or_range_prebuilt(
-                                        &kernel_set,
-                                        k,
-                                        start,
-                                        end,
-                                        floor,
-                                    )
+                                    op_stats::timed_kernel(&kernel_stats, || {
+                                        kernel_reader.bm25_search_or_range_prebuilt(
+                                            &kernel_set,
+                                            k,
+                                            start,
+                                            end,
+                                            floor,
+                                        )
+                                    })
                                 },
                             )
                             .await
                             .map_err(|e| QueryError::Execute(e.to_string()))?
                             .map_err(fts_read_error)?
                         } else {
-                            r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
-                                .map_err(fts_read_error)?
+                            op_stats::timed_kernel(&op_stats, || {
+                                r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
+                            })
+                            .map_err(fts_read_error)?
                         }
                     }
                     None => {
@@ -602,16 +608,22 @@ impl SupertableReader {
                         // terms can be cheaper than a common-term pair.
                         if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS {
                             let kernel_reader = Arc::clone(&r);
+                            let kernel_stats = op_stats.clone();
                             run_on_pool(
                                 Some(&reader_pool),
                                 "un-ranged fts kernel: reader pool dropped result",
-                                move || kernel_reader.run_prepared(prep),
+                                move || {
+                                    op_stats::timed_kernel(&kernel_stats, || {
+                                        kernel_reader.run_prepared(prep)
+                                    })
+                                },
                             )
                             .await
                             .map_err(|e| QueryError::Execute(e.to_string()))?
                             .map_err(fts_read_error)?
                         } else {
-                            r.run_prepared(prep).map_err(fts_read_error)?
+                            op_stats::timed_kernel(&op_stats, || r.run_prepared(prep))
+                                .map_err(fts_read_error)?
                         }
                     }
                 };

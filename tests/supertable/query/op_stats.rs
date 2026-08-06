@@ -104,6 +104,13 @@ fn demo_two_superfiles() -> Supertable {
     st
 }
 
+/// Zero the one measured-time field so determinism assertions compare only
+/// the plan counts (kernel CPU legitimately varies run to run).
+fn deterministic(mut stats: OpStats) -> OpStats {
+    stats.kernel_cpu_ns = 0;
+    stats
+}
+
 /// Posting bytes for one BM25 query run inside a fresh scope, minting the
 /// reader inside the scope (the pickup point).
 fn scoped_query_bytes(st: &Supertable, query: &str) -> u64 {
@@ -163,6 +170,28 @@ fn work_stats_are_deterministic_across_cache_temperature() {
     let cold = scoped_query_bytes(&st, "rust");
     let warm = scoped_query_bytes(&st, "rust");
     assert_eq!(cold, warm, "same plan, same table state, same work");
+}
+
+#[test]
+fn a_scoped_bm25_query_reports_kernel_cpu() {
+    // The thread-CPU clock (schedstat) advances at scheduler events, so a
+    // single microsecond kernel can legitimately read zero; a batch of
+    // queries crosses enough context switches that the cumulative
+    // bracketed time must register.
+    const KERNEL_CPU_BATCH: usize = 200;
+    let st = demo_two_superfiles();
+    let (_, stats) = with_op_stats(|| {
+        for _ in 0..KERNEL_CPU_BATCH {
+            st.reader()
+                .expect("reader")
+                .bm25_hits("title", "rust async web", TOP_K, BoolMode::Or)
+                .expect("bm25");
+        }
+    });
+    assert!(
+        stats.kernel_cpu_ns > 0,
+        "the bracketed FTS kernels report on-CPU time over {KERNEL_CPU_BATCH} queries; got 0"
+    );
 }
 
 #[test]
@@ -334,8 +363,8 @@ fn a_scoped_vector_query_reports_scan_and_rerank_work() {
 fn vector_work_stats_are_deterministic_across_cache_temperature() {
     let dir = TempDir::new().expect("tempdir");
     let st = drained_vector_table(&dir);
-    let cold = scoped_vector_stats(&st);
-    let warm = scoped_vector_stats(&st);
+    let cold = deterministic(scoped_vector_stats(&st));
+    let warm = deterministic(scoped_vector_stats(&st));
     assert_eq!(cold, warm, "same plan, same table state, same work");
 }
 
@@ -404,8 +433,8 @@ fn sql_work_stats_are_deterministic_across_cache_temperature() {
     let dir = TempDir::new().expect("tempdir");
     let db = sql_fixture(&dir);
     let sql = "SELECT rating FROM docs WHERE rating > 5";
-    let cold = scoped_sql_stats(&db, sql);
-    let warm = scoped_sql_stats(&db, sql);
+    let cold = deterministic(scoped_sql_stats(&db, sql));
+    let warm = deterministic(scoped_sql_stats(&db, sql));
     assert_eq!(cold, warm, "same plan, same table state, same work");
 }
 

@@ -84,6 +84,19 @@ pub fn cpu_seconds_since(start_ns: Option<u128>) -> Option<f64> {
     Some(end.saturating_sub(start) as f64 / NS_PER_SEC as f64)
 }
 
+/// Thread-local schedstat path (Linux): first field is this thread's
+/// cumulative on-CPU nanoseconds.
+const PROC_THREAD_SELF_SCHEDSTAT: &str = "/proc/thread-self/schedstat";
+
+/// The calling thread's own on-CPU nanoseconds (ns resolution, unlike the
+/// process-wide tick counter), or `None` off Linux procfs. Two reads
+/// bracket one synchronous kernel section for per-query CPU attribution;
+/// only valid when both reads happen on the same thread.
+pub(crate) fn thread_cpu_ns() -> Option<u128> {
+    let raw = fs::read_to_string(PROC_THREAD_SELF_SCHEDSTAT).ok()?;
+    raw.split_whitespace().next()?.parse().ok()
+}
+
 /// Run `f`, returning `(result, wall_duration, measured_on_cpu_seconds)`.
 ///
 /// Wall and on-CPU time are bracketed identically around the same work.
@@ -120,15 +133,6 @@ mod tests {
     const TEST_WORKER_BUSY_WINDOW: Duration = Duration::from_millis(50);
     /// Minimum process CPU seconds from exited workers.
     const TEST_MIN_EXITED_WORKER_CPU_S: f64 = 0.01;
-    /// Thread-local schedstat path (Linux).
-    const PROC_THREAD_SELF_SCHEDSTAT: &str = "/proc/thread-self/schedstat";
-
-    /// The calling thread's own on-CPU nanoseconds.
-    fn thread_cpu_ns() -> Option<u128> {
-        let raw = fs::read_to_string(PROC_THREAD_SELF_SCHEDSTAT).ok()?;
-        raw.split_whitespace().next()?.parse().ok()
-    }
-
     #[test]
     fn on_cpu_time_excludes_sleep() {
         let Some(start_busy) = thread_cpu_ns() else {
