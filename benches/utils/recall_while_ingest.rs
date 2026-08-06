@@ -563,9 +563,6 @@ fn measure_recall(
     id_map: &IdMap,
     nprobe: usize,
 ) -> f32 {
-    let reader = consumer.reader().expect("reader");
-    // nprobe == ENGINE_DEFAULT (0) keeps engine-default routing; a positive
-    // value overrides the coarse cell-probe width (breadth) via search_opts.
     // INFINO_BENCH_RERANK_MULT (diagnostic) overrides the Sq8 rerank shortlist
     // depth (candidates ≈ rerank_mult × k); default ENGINE_DEFAULT → 256. Tests
     // whether a deeper within-cell rerank recovers recall at COARSE grid cells.
@@ -573,6 +570,23 @@ fn measure_recall(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(exec_vec::ENGINE_DEFAULT);
+    measure_recall_rm(consumer, queries, heaps, id_map, nprobe, rerank_mult)
+}
+
+/// [`measure_recall`] with an explicit rerank multiplier — the oracle rung
+/// forces `ceil(rows / K)` so the budget covers every row regardless of the
+/// env override.
+fn measure_recall_rm(
+    consumer: &Supertable,
+    queries: &[Vec<f32>],
+    heaps: &[HeldTopK],
+    id_map: &IdMap,
+    nprobe: usize,
+    rerank_mult: usize,
+) -> f32 {
+    let reader = consumer.reader().expect("reader");
+    // nprobe == ENGINE_DEFAULT (0) keeps engine-default routing; a positive
+    // value overrides the coarse cell-probe width (breadth) via search_opts.
     let opts = exec_vec::search_opts(nprobe, rerank_mult);
     // Misrank audit (diagnostic): retrieve INFINO_BENCH_FETCH_K results but still
     // score against the GT top-K. fetch_k=1000 vs the default K=10 answers: are
@@ -1145,6 +1159,20 @@ pub fn run() {
         {
             let r = measure_recall(&st, &queries, &heaps, &id_map, np);
             eprintln!("[breadth-sweep] nprobe={np:<5} recall@10={r:.3}");
+        }
+        // Oracle rung (INFINO_BENCH_ORACLE=1): all cells at a rerank budget
+        // covering every row — with the width-independent per-cell budget
+        // (#537) this exact-scores the whole table through the stored
+        // rerank payloads, bypassing 1-bit selection entirely. Recall vs
+        // GT here is the engine's stored-payload ceiling (codec error
+        // only); the ladder above must approach it as nprobe grows. Costs
+        // a full-table rerank per query — gated off by default.
+        if cells_now > 0 && std::env::var("INFINO_BENCH_ORACLE").is_ok_and(|v| v == "1") {
+            let oracle_rm = n.div_ceil(K).max(1);
+            let r = measure_recall_rm(&st, &queries, &heaps, &id_map, cells_now, oracle_rm);
+            eprintln!(
+                "[breadth-sweep] nprobe={cells_now:<5} recall@10={r:.3} (oracle rm={oracle_rm})"
+            );
         }
         if miss_trace {
             trace_misses(&st, &queries, &heaps, &id_map, &retained);

@@ -11,7 +11,9 @@
 //! via the `served_shortlist_probe` test-helpers hook.
 //!
 //! The same probe pins the floor scoping from the same PR: law-served
-//! defaults run floor-free; an explicit caller `nprobe` gets `floor = k`.
+//! defaults run floor-free; an explicit caller `nprobe` arms the floor at
+//! the full per-cell budget (`k x rerank_mult`, so per-cell depth never
+//! shrinks as the caller widens — #537).
 
 #![deny(clippy::unwrap_used)]
 
@@ -145,7 +147,14 @@ async fn law_stamped_table_serves_the_law_not_the_constant() {
         "caller rerank_mult must override the law exactly; recorded: {recs:?}"
     );
 
-    // 3) Explicit caller nprobe re-arms the per-cell floor at k.
+    // 3) Explicit caller nprobe re-arms the per-cell floor — at the full
+    //    per-cell budget (#537: k x rerank_mult, width-independent), so
+    //    widening the probe adds cells at constant depth instead of
+    //    diluting a shared pool (the >=5M recall inversion). The floor
+    //    must EQUAL the pooled limit (replica overhead is 0 here, so both
+    //    are k x rerank_mult): per-cell depth == full budget is exactly
+    //    #538's behavior, and a revert to the old `floor = k` fails this
+    //    (the law-stamped budget on this fixture is above k).
     st.vector_search(
         "emb",
         &query,
@@ -157,7 +166,10 @@ async fn law_stamped_table_serves_the_law_not_the_constant() {
     .expect("pinned-nprobe search");
     let recs = served_shortlist_probe::drain();
     assert!(
-        recs.iter().any(|&(_, floor)| floor == K),
-        "explicit nprobe must arm the per-cell floor at k; recorded: {recs:?}"
+        recs.iter()
+            .any(|&(limit, floor)| floor == limit && floor > K),
+        "explicit nprobe must arm the per-cell floor at the full \
+         k x rerank_mult budget (== the pooled limit, > k on this \
+         fixture); recorded: {recs:?}"
     );
 }
