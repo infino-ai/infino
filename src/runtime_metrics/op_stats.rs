@@ -28,10 +28,14 @@ use serde::{Deserialize, Serialize};
 use super::cpu;
 
 /// Physical work one query performed. Every field except
-/// [`Self::kernel_cpu_ns`] is a deterministic plan count (same query, same
-/// table state → same value, warm or cold); `kernel_cpu_ns` is a measured
-/// time refinement and varies run to run. The struct is `#[non_exhaustive]`
-/// because counters land modality by modality.
+/// [`Self::kernel_cpu_ns`] (measured time, varies run to run) and
+/// [`Self::vector_rows_reranked`] (actual execution rows — the deferred
+/// path reranks cold cells in place, so the count can shift with cache
+/// temperature) is a deterministic plan count: same query, same table
+/// state → same value, warm or cold. The priced range counter stays
+/// canonical by charging the *plan's* rerank budget, never the executed
+/// row count — see [`Self::planned_read_ranges`]. The struct is
+/// `#[non_exhaustive]` because counters land modality by modality.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct OpStats {
@@ -47,17 +51,24 @@ pub struct OpStats {
     /// Quantized codes the cell scans estimated (Σ cluster row counts over
     /// every chosen cluster, warm and cold arms alike).
     pub vector_candidates_scanned: u64,
-    /// Rows rescored at full precision, across every arm: the
+    /// Rows actually rescored at full precision, across every arm: the
     /// global-shortlist rerank (phase C of the deferred path), the scan's
     /// immediate cold-cell rerank, and the immediate probe paths
-    /// (pre-drain user tables and filtered search).
+    /// (pre-drain user tables and filtered search). An execution
+    /// diagnostic, not a plan count: on the deferred path cold cells
+    /// rerank in place under a width-divided budget, so the total can
+    /// shift with cache temperature. Never priced — the range counter
+    /// below charges the plan's rerank budget instead.
     pub vector_rows_reranked: u64,
     /// Byte-source ranges the plan requested, before coalescing and before
     /// the cache decides whether a request becomes a local read or a GET —
-    /// the warm-equivalent request-work measure (FTS: one per term posting
-    /// range, two per phrase member; vector: cluster index + prefix/block
-    /// ranges per cell, one per rerank row; SQL: one per Parquet range the
-    /// scan requests).
+    /// the warm-equivalent request-work measure. FTS: one per term posting
+    /// range, two per phrase member. Vector: per scanned cell, its cluster
+    /// index plus one prefix/block range per chosen cluster; plus the
+    /// plan's rerank budget — `min(k × rerank_mult, candidates)` on the
+    /// deferred path, the immediate probes' shortlist rows elsewhere —
+    /// one range per budgeted row, identical warm or cold on both arms.
+    /// SQL: one per Parquet range the scan requests.
     pub planned_read_ranges: u64,
     /// Parquet bytes SQL scans requested through the DataFusion store
     /// (footer, page index, and data pages), independent of whether they
@@ -119,7 +130,7 @@ impl OpStatsCollector {
     }
 
     /// The counters accumulated so far.
-    pub fn snapshot(&self) -> OpStats {
+    pub(crate) fn snapshot(&self) -> OpStats {
         OpStats {
             fts_postings_bytes: self.fts_postings_bytes.load(Ordering::Relaxed),
             vector_cells_scanned: self.vector_cells_scanned.load(Ordering::Relaxed),
@@ -188,13 +199,9 @@ pub(crate) fn timed_kernel<T>(
     let Some(stats) = collector else {
         return f();
     };
-    let Some(start) = cpu::thread_cpu_ns() else {
-        return f();
-    };
+    let start = cpu::thread_cpu_ns();
     let value = f();
-    if let Some(end) = cpu::thread_cpu_ns() {
-        stats.add_kernel_cpu_ns(u64::try_from(end.saturating_sub(start)).unwrap_or(u64::MAX));
-    }
+    stats.add_kernel_cpu_ns(cpu::thread_cpu_delta_ns(start));
     value
 }
 
@@ -211,6 +218,8 @@ pub(crate) fn suppressed<T>(f: impl FnOnce() -> T) -> T {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::catch_unwind;
+
     use super::*;
 
     #[test]
@@ -251,7 +260,7 @@ mod tests {
     #[test]
     fn a_panicking_scope_still_restores_the_previous_collector() {
         let (_, outer) = with_op_stats(|| {
-            let result = std::panic::catch_unwind(|| {
+            let result = catch_unwind(|| {
                 let (_, _) = with_op_stats(|| panic!("kernel failure"));
             });
             assert!(result.is_err());

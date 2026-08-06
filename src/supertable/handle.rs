@@ -595,17 +595,33 @@ impl Supertable {
     /// Pin the current in-memory manifest without a storage freshness check.
     /// Hidden vector queries use this for slow-state residency while their
     /// fast delete/watermark refresh runs concurrently with data I/O.
+    ///
+    /// Consults the caller's [`with_op_stats`] scope — valid only on the
+    /// thread that opened the scope, which the public search entry points
+    /// (reader mint on the caller's thread) satisfy. Mid-query mints run
+    /// on runtime threads where the scope's thread-local is invisible, so
+    /// they go through [`Self::pinned_reader_with`] and inherit the outer
+    /// reader's collector instead.
     fn pinned_reader(&self) -> SupertableReader {
+        self.pinned_reader_with(op_stats::current())
+    }
+    }
+
+    /// [`Self::pinned_reader`] with an explicitly supplied per-query
+    /// collector — the mint for readers created *mid-query* (the hidden
+    /// vector-index legs), which must inherit the driving reader's
+    /// collector rather than consult a thread-local that runtime threads
+    /// never see.
+    pub(crate) fn pinned_reader_with(
+        &self,
+        op_stats: Option<Arc<OpStatsCollector>>,
+    ) -> SupertableReader {
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
             tombstone_cache: self.inner.tombstone_cache.clone(),
             inner: Arc::clone(&self.inner),
-            // The public search methods mint their reader on the caller's
-            // thread, so this is the one point where an active
-            // `with_op_stats` scope hands its collector to the query.
-            op_stats: op_stats::current(),
+            op_stats,
         }
-    }
     }
 
     test_visible! {

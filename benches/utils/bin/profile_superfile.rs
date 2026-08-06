@@ -161,7 +161,7 @@ fn mean_recall_filtered(
             None,
         ))
         .expect("vector_hits_filtered");
-        sum += corpus::recall_at_k(&hits, truth);
+        sum += corpus::recall_at_k(&hits.0, truth);
     }
     sum / queries.len() as f32
 }

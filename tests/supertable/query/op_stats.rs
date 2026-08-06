@@ -10,11 +10,14 @@
 #![deny(clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::thread;
 
-use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    IndexSpec, connect,
+    Connection, IndexSpec, Metric, connect,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
@@ -158,6 +161,41 @@ fn a_scoped_bm25_query_reports_its_planned_ranges() {
         "three terms request more ranges than one (three {}, one {})",
         three_terms.planned_read_ranges,
         one_term.planned_read_ranges
+    );
+}
+
+#[test]
+fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
+    // Every fixture term is PFOR (df >= 2) in every superfile, so the
+    // plan is EXACTLY one posting range per term per superfile. An exact
+    // pin: a double flush (2x), a missed superfile, or a phantom extra
+    // range all fail an equality that the >0 assertions would pass.
+    let st = demo_two_superfiles();
+    let n_superfiles = st.reader().expect("reader").n_superfiles() as u64;
+    assert!(
+        n_superfiles >= 2,
+        "fixture must fan out; got {n_superfiles}"
+    );
+    let (_, one_term) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+            .expect("bm25")
+    });
+    assert_eq!(
+        one_term.planned_read_ranges, n_superfiles,
+        "one PFOR term = one posting range per superfile"
+    );
+    let (_, three_terms) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits("title", "rust async web", TOP_K, BoolMode::Or)
+            .expect("bm25")
+    });
+    assert_eq!(
+        three_terms.planned_read_ranges,
+        3 * n_superfiles,
+        "three PFOR terms = three posting ranges per superfile"
     );
 }
 
@@ -360,6 +398,32 @@ fn a_scoped_vector_query_reports_scan_and_rerank_work() {
 }
 
 #[test]
+fn a_full_width_probe_scans_every_row_exactly_once() {
+    // nprobe >= the hidden cell count chooses every cluster, so the scan
+    // estimates every stored code exactly once: candidates == rows in
+    // the table. An exact pin — any double flush would report 2x.
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let (hits, stats) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_ROWS),
+            None,
+            None,
+        )
+        .expect("vector search")
+    });
+    assert!(!hits.is_empty());
+    assert_eq!(
+        stats.vector_candidates_scanned, VECTOR_ROWS as u64,
+        "a full-width probe estimates each stored code exactly once"
+    );
+}
+
+#[test]
 fn vector_work_stats_are_deterministic_across_cache_temperature() {
     let dir = TempDir::new().expect("tempdir");
     let st = drained_vector_table(&dir);
@@ -375,11 +439,11 @@ const SQL_ROWS: usize = 64;
 
 /// A storage-backed catalog connection with one FTS-indexed table whose
 /// scans and search TVFs exercise the per-query SQL channel.
-fn sql_fixture(dir: &TempDir) -> infino::Connection {
+fn sql_fixture(dir: &TempDir) -> Connection {
     let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
     let schema = Arc::new(Schema::new(vec![
         Field::new("title", DataType::LargeUtf8, false),
-        Field::new("rating", arrow_schema::DataType::Int64, false),
+        Field::new("rating", DataType::Int64, false),
     ]));
     let docs = db
         .create_table("docs", schema.clone(), IndexSpec::new().fts("title"))
@@ -396,16 +460,14 @@ fn sql_fixture(dir: &TempDir) -> infino::Connection {
     let title_arr: ArrayRef = Arc::new(LargeStringArray::from(
         titles.iter().map(String::as_str).collect::<Vec<_>>(),
     ));
-    let ratings: ArrayRef = Arc::new(arrow_array::Int64Array::from(
-        (0..SQL_ROWS as i64).collect::<Vec<_>>(),
-    ));
+    let ratings: ArrayRef = Arc::new(Int64Array::from((0..SQL_ROWS as i64).collect::<Vec<_>>()));
     let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
     docs.append(&batch).expect("append");
     db
 }
 
 /// One scoped SQL statement's work stats.
-fn scoped_sql_stats(db: &infino::Connection, sql: &str) -> OpStats {
+fn scoped_sql_stats(db: &Connection, sql: &str) -> OpStats {
     let (batches, stats) = with_op_stats(|| db.query_sql(sql).expect("query_sql"));
     assert!(!batches.is_empty(), "fixture SQL {sql:?} must return");
     stats
@@ -436,6 +498,116 @@ fn sql_work_stats_are_deterministic_across_cache_temperature() {
     let cold = deterministic(scoped_sql_stats(&db, sql));
     let warm = deterministic(scoped_sql_stats(&db, sql));
     assert_eq!(cold, warm, "same plan, same table state, same work");
+}
+
+/// A storage-backed catalog connection whose table also carries a
+/// drained vector index, so SQL vector TVFs run the hidden-index path.
+fn sql_vector_fixture(dir: &TempDir) -> Connection {
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            false,
+        ),
+    ]));
+    let docs = db
+        .create_table(
+            "docs",
+            schema.clone(),
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", DIM, Metric::L2Sq),
+        )
+        .expect("create_table");
+    docs.append(&vector_batch(schema)).expect("append");
+    docs.local_handle()
+        .drain_vectors_to_cells_sync()
+        .expect("drain");
+    db
+}
+
+#[test]
+fn a_scope_minted_reader_meters_hidden_work_from_any_thread() {
+    // The collector is picked up at reader mint and must TRAVEL with the
+    // reader — never be re-read from a thread-local mid-query. The
+    // drained path mints the hidden vector-index reader mid-query, and
+    // real drivers (DataFusion partitions, spawned fan-out bodies) poll
+    // kernels on runtime threads where the caller's scope is invisible.
+    // Regression: run the query on a scope-less thread; the hidden mint
+    // used to consult that thread's empty slot and report zero vector
+    // work for exactly the query class the token meter is anchored on.
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let (hits, stats) = with_op_stats(|| {
+        let reader = st.reader().expect("reader minted inside the scope");
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    reader
+                        .vector_hits(
+                            "emb",
+                            &query,
+                            VECTOR_K,
+                            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                            None,
+                        )
+                        .expect("vector hits off-thread")
+                })
+                .join()
+                .expect("query thread")
+        })
+    });
+    assert!(!hits.is_empty(), "fixture vector query must match");
+    assert!(
+        stats.vector_cells_scanned > 0,
+        "the hidden-index leg meters cells from a scope-less thread; got 0"
+    );
+    assert!(
+        stats.vector_candidates_scanned > 0,
+        "the hidden-index leg meters candidates from a scope-less thread; got 0"
+    );
+    assert!(
+        stats.planned_read_ranges > 0,
+        "the hidden-index leg meters planned ranges from a scope-less thread; got 0"
+    );
+}
+
+#[test]
+fn a_vector_tvf_inside_sql_reports_vector_work() {
+    // The hidden-index reader is minted MID-QUERY, on a DataFusion
+    // runtime thread where the caller's `with_op_stats` thread-local is
+    // invisible — the collector must arrive by inheritance from the
+    // TVF's reader. Regression: this path used to report zero vector
+    // work for exactly the query class the token is anchored on.
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_vector_fixture(&dir);
+    let csv = row_vec(3)
+        .iter()
+        .map(f32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let stats = scoped_sql_stats(
+        &db,
+        &format!("SELECT _id, score FROM vector_search('docs', 'emb', '{csv}', {VECTOR_K})"),
+    );
+    assert!(
+        stats.vector_cells_scanned > 0,
+        "the hidden-index leg inside SQL scans cells; got 0"
+    );
+    assert!(
+        stats.vector_candidates_scanned > 0,
+        "the hidden-index leg inside SQL estimates candidates; got 0"
+    );
+    assert!(
+        stats.planned_read_ranges > 0,
+        "the hidden-index leg inside SQL plans ranges; got 0"
+    );
 }
 
 #[test]

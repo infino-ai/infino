@@ -70,7 +70,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     future::Future,
     mem,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{self, AtomicU64},
+    },
     time::Instant,
 };
 
@@ -1156,12 +1159,17 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     }
     let user_manifest = user_reader.manifest();
     let id_column = user_reader.options().id_column.as_str();
-    let hidden_manifest = user_reader
-        .vector_index_table()
-        .map(|vit| Arc::clone(vit.pinned_reader().manifest()));
-    let deleted = user_reader
-        .vector_index_table()
-        .and_then(|vit| vit.pinned_reader().hidden_deleted_ids().ok());
+    let hidden_manifest = user_reader.vector_index_table().map(|vit| {
+        Arc::clone(
+            vit.pinned_reader_with(user_reader.op_stats.clone())
+                .manifest(),
+        )
+    });
+    let deleted = user_reader.vector_index_table().and_then(|vit| {
+        vit.pinned_reader_with(user_reader.op_stats.clone())
+            .hidden_deleted_ids()
+            .ok()
+    });
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
     let mut placement_requests: Vec<(usize, i128)> = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
@@ -2065,6 +2073,11 @@ impl SupertableReader {
         } else {
             None
         };
+        // The PLAN's rerank multiplier — post-law, pre-width-divide. The
+        // canonical rerank-row pricing and phase C's selection cap both
+        // read this value; the divided cold budget below is an execution
+        // detail that must never leak into the priced count.
+        let (_, plan_rerank_mult) = options.resolve(filtered);
         let mut cold_rerank_mult = 0;
         let options = match sweep_width {
             Some(w) if w > 1 => {
@@ -2105,6 +2118,13 @@ impl SupertableReader {
         let scan_pool: Arc<Mutex<Vec<(usize, u64, usize, Vec<ScanCandidate>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let scan_pool_body = Arc::clone(&scan_pool);
+        // Deferred-arm plan inputs for the canonical rerank-row pricing:
+        // total candidates across every scanned unit (cold cells included,
+        // which never reach `scan_pool`), and the widest replica overhead.
+        let total_candidates = Arc::new(AtomicU64::new(0));
+        let total_candidates_body = Arc::clone(&total_candidates);
+        let max_replica_overhead = Arc::new(AtomicU64::new(0));
+        let max_replica_overhead_body = Arc::clone(&max_replica_overhead);
         let body =
             move |reader: Arc<SuperfileReader>,
                   entry: Arc<SuperfileEntry>,
@@ -2117,6 +2137,8 @@ impl SupertableReader {
                 let budget = budget.clone();
                 let storage = storage.clone();
                 let scan_pool = Arc::clone(&scan_pool_body);
+                let total_candidates = Arc::clone(&total_candidates_body);
+                let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
                 let op_stats = op_stats_scan.clone();
                 async move {
                     // Unfiltered user path on row-addressable locals: resolve the
@@ -2164,10 +2186,16 @@ impl SupertableReader {
                         if let Some(stats) = &op_stats {
                             stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
                             stats.add_planned_read_ranges(scan.ranges_requested);
-                            // Cold cells rerank immediately inside the scan;
-                            // warm survivors are counted at phase C below.
+                            // Actual rows only: cold cells rerank immediately
+                            // inside the scan, warm winners at phase C. The
+                            // PRICED rerank ranges are the canonical plan
+                            // budget, flushed once after the fan-out.
                             stats.add_vector_rows_reranked(scan.rows_reranked);
                         }
+                        total_candidates
+                            .fetch_add(scan.candidates_scanned, atomic::Ordering::Relaxed);
+                        max_replica_overhead
+                            .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
                         if !scan.candidates.is_empty() {
                             scan_pool
                                 .lock()
@@ -2176,14 +2204,24 @@ impl SupertableReader {
                         }
                         scan.hits
                     } else {
-                        let (hits, rows_reranked) = reader
+                        let (hits, tally) = reader
                             .vector_search_clusters_filtered(
                                 &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
                             )
                             .await
                             .map_err(vector_read_query_error)?;
                         if let Some(stats) = &op_stats {
-                            stats.add_vector_rows_reranked(rows_reranked);
+                            stats.add_vector_scan(tally.cells_scanned, tally.candidates_scanned);
+                            // The immediate probe's shortlist rows ARE its
+                            // plan's rerank set — fixed by budget and
+                            // candidates, not by temperature — and each is
+                            // one planned survivor range (a cold probe
+                            // serves them in-block; the plan is priced
+                            // identically either way).
+                            stats.add_planned_read_ranges(
+                                tally.ranges_requested + tally.rows_reranked,
+                            );
+                            stats.add_vector_rows_reranked(tally.rows_reranked);
                         }
                         hits
                     };
@@ -2240,6 +2278,29 @@ impl SupertableReader {
         // column, table-wide — asserted here at the only place different
         // units' estimates ever meet.
         if global_shortlist_width.is_some() {
+            // Canonical rerank-leg pricing for the deferred plan: one
+            // planned survivor range per BUDGETED shortlist row —
+            // `min(shortlist limit, candidates scanned)` — flushed whether
+            // the winners rerank at phase C (warm) or already reranked
+            // inside their cell scans (cold). Same query, same table state
+            // → same priced count, at any cache temperature. (Under an
+            // explicit caller nprobe the per-cell floor can rerank a few
+            // rows beyond the budget; those stay unpriced.)
+            if let Some(stats) = &self.op_stats {
+                let total = total_candidates.load(atomic::Ordering::Relaxed);
+                let overhead =
+                    usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
+                        .unwrap_or(0);
+                let limit = deferred_shortlist_limit(
+                    k,
+                    overhead,
+                    plan_rerank_mult,
+                    law_rerank_served,
+                    options.nprobe.is_some(),
+                    served_cells_over_width,
+                );
+                stats.add_planned_read_ranges((limit as u64).min(total));
+            }
             let pooled = {
                 let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
                 mem::take(&mut *guard)
@@ -2256,7 +2317,6 @@ impl SupertableReader {
                         "pooled 1-bit estimates require one rotation seed per column".into(),
                     ));
                 }
-                let (_, rerank_mult) = options.resolve(filtered);
                 // Mirror phase A/C's `k_fetch = k + replica_overhead` in the
                 // global cut so boundary replicas (dormant today: overhead
                 // is 0 with replication off) cannot take shortlist slots
@@ -2300,16 +2360,14 @@ impl SupertableReader {
                 // decisive geometry serves width == stamp and is
                 // unchanged. Explicit caller rerank_mult stays an exact,
                 // unscaled request.
-                let (served, stamped_width) = served_cells_over_width;
-                let shortlist_limit = if law_rerank_served && options.nprobe.is_none() {
-                    k.saturating_add(replica_overhead)
-                        .saturating_mul(rerank_mult)
-                        .saturating_mul(served)
-                        .div_ceil(stamped_width)
-                } else {
-                    k.saturating_add(replica_overhead)
-                        .saturating_mul(rerank_mult)
-                };
+                let shortlist_limit = deferred_shortlist_limit(
+                    k,
+                    replica_overhead,
+                    plan_rerank_mult,
+                    law_rerank_served,
+                    options.nprobe.is_some(),
+                    served_cells_over_width,
+                );
                 // Regression probe for the serve-the-law scope bug: recall
                 // floors can't see a re-shadowed `options` (the constant
                 // budget only ADDS survivors); the served limit can.
@@ -2330,10 +2388,11 @@ impl SupertableReader {
                     })
                     .collect();
                 if let Some(stats) = &self.op_stats {
+                    // Actual winner rows; their planned ranges were priced
+                    // canonically above, from the budget these winners were
+                    // selected under.
                     let rows: u64 = rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
                     stats.add_vector_rows_reranked(rows);
-                    // Phase C gathers one survivor row range per winner.
-                    stats.add_planned_read_ranges(rows);
                 }
                 let column = Arc::clone(&column_arc2);
                 let query = Arc::clone(&query_arc2);
@@ -2614,7 +2673,12 @@ impl SupertableReader {
         }
         let drained = self
             .vector_index_table()
-            .map(|hidden| hidden.pinned_reader().manifest().get_drained_ranges())
+            .map(|hidden| {
+                hidden
+                    .pinned_reader_with(self.op_stats.clone())
+                    .manifest()
+                    .get_drained_ranges()
+            })
             .unwrap_or_default();
         let mut drained_allow = HashMap::new();
         let mut undrained_user = Vec::new();
@@ -2698,7 +2762,7 @@ impl SupertableReader {
             });
         }
         if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.pinned_reader();
+            let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let drained = hidden_manifest.get_drained_ranges();
             let superfiles = hidden_manifest
@@ -2821,7 +2885,7 @@ impl SupertableReader {
         let Some(vit) = self.vector_index_table() else {
             return Ok(HashMap::new());
         };
-        let hidden_reader = vit.pinned_reader();
+        let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
         let superfiles = hidden_manifest
             .get_all_superfiles_loaded()
@@ -2873,7 +2937,11 @@ impl SupertableReader {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn diag_hidden_probe_laws(&self) -> Option<(Vec<u32>, Vec<u32>, Vec<u32>)> {
         let vit = self.vector_index_table()?;
-        match vit.pinned_reader().manifest().get_partition_strategy() {
+        match vit
+            .pinned_reader_with(self.op_stats.clone())
+            .manifest()
+            .get_partition_strategy()
+        {
             PartitionStrategy::VectorCell { routing, .. } => Some((
                 routing.width_for_k.to_vec(),
                 routing.fine_for_k.to_vec(),
@@ -2896,7 +2964,7 @@ impl SupertableReader {
         let allow_set: Arc<HashSet<i128>> =
             Arc::new(allow_stable_ids.iter().copied().collect::<HashSet<i128>>());
         if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.pinned_reader();
+            let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let drained = hidden_manifest.get_drained_ranges();
             let superfiles = hidden_manifest
@@ -3026,7 +3094,7 @@ impl SupertableReader {
             let vit = self.vector_index_table().ok_or_else(|| {
                 QueryError::Execute("prepared hidden allow-set but no hidden index table".into())
             })?;
-            let hidden_reader = vit.pinned_reader();
+            let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let superfiles = hidden_reader
                 .manifest()
                 .get_all_superfiles_loaded()
@@ -3184,7 +3252,7 @@ impl SupertableReader {
         // Wave 1: search the pinned hidden slow state while refreshing only the
         // fast delete state and loading any user parts known to be newer than
         // this exact hidden residency watermark.
-        let hidden_reader = vit.pinned_reader();
+        let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
         let drained = hidden_manifest.get_drained_ranges();
         let hidden_entries = hidden_manifest
@@ -3202,7 +3270,7 @@ impl SupertableReader {
         };
         let fast_state = async {
             vit.ensure_fresh_async().await;
-            vit.pinned_reader()
+            vit.pinned_reader_with(self.op_stats.clone())
                 .hidden_deleted_ids()
                 .map_err(|error| QueryError::Execute(error.to_string()))
         };
@@ -3488,6 +3556,30 @@ fn apply_width_pin(
         Some(width.min(populated_cells))
     } else {
         None
+    }
+}
+
+/// The deferred-rerank plan's global shortlist budget. Phase C's selection
+/// cap and the canonical priced rerank-row count both derive from this one
+/// formula so the two can never drift: `(k + replica_overhead) x
+/// rerank_mult`, scaled by served-cells-over-stamped-width when the LAW's
+/// budget (not an explicit caller request) is serving a widened sweep.
+fn deferred_shortlist_limit(
+    k: usize,
+    replica_overhead: usize,
+    rerank_mult: usize,
+    law_rerank_served: bool,
+    caller_nprobe: bool,
+    served_cells_over_width: (usize, usize),
+) -> usize {
+    let base = k
+        .saturating_add(replica_overhead)
+        .saturating_mul(rerank_mult);
+    if law_rerank_served && !caller_nprobe {
+        let (served, stamped_width) = served_cells_over_width;
+        base.saturating_mul(served).div_ceil(stamped_width)
+    } else {
+        base
     }
 }
 

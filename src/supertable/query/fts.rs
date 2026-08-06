@@ -602,6 +602,11 @@ impl SupertableReader {
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(prep.postings_bytes());
                             stats.add_planned_read_ranges(prep.planned_ranges());
+                            // Single-term / phrase shapes finish inside
+                            // `prepare_clauses`; their walk's on-CPU time
+                            // rides the `Done` (0 for cursor shapes, whose
+                            // kernels are bracketed below).
+                            stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
                         }
                         // Gate on posting mass, not term count: this scan
                         // isn't sliced, so a rare-term query with many

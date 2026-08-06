@@ -59,7 +59,7 @@ use crate::{
         },
         vector::{
             layout::VectorLayout,
-            reader::{self as vector_reader, ScanCandidate, ScanOutcome, VectorReader},
+            reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
     supertable::query::provider::tombstone_access_plan,
@@ -1435,8 +1435,8 @@ impl SuperfileReader {
     /// shortlist, so the returned top-k is the true k-nearest among
     /// matching rows — pushdown, not post-filter, with no underflow.
     /// `allow == None` is identical to [`Self::vector_hits_async`].
-    /// Returns the hits plus the rows the probe reranked at full
-    /// precision, for the per-query work stats.
+    /// Returns the hits plus the probe's work tallies for the per-query
+    /// work stats.
     pub async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -1447,7 +1447,7 @@ impl SuperfileReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (nprobe, rerank_mult) = options.resolve(filtered);
         let v = self
@@ -1493,8 +1493,8 @@ impl SuperfileReader {
     /// ranking to the `local_doc_id`s in `allow` (a per-superfile
     /// predicate allow-set), applied inside the coarse shortlist.
     /// `allow == None` is identical to [`Self::vector_search_clusters`].
-    /// Returns the hits plus the rows the probe reranked at full
-    /// precision, for the per-query work stats.
+    /// Returns the hits plus the probe's work tallies for the per-query
+    /// work stats.
     pub async fn vector_search_clusters_filtered(
         &self,
         column: &str,
@@ -1506,7 +1506,7 @@ impl SuperfileReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
         let v = self

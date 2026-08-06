@@ -25,6 +25,7 @@ use std::{
 use bytes::Bytes;
 use serde::Deserialize;
 
+use crate::runtime_metrics::cpu::{thread_cpu_delta_ns, thread_cpu_ns};
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -49,6 +50,11 @@ use crate::superfile::{
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
+
+/// Planned byte-source ranges per phrase member: its postings range plus
+/// its position runs — positional verification is exactly the work that
+/// separates phrase cost from term cost.
+const PHRASE_MEMBER_PLANNED_RANGES: u64 = 2;
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
@@ -199,6 +205,11 @@ pub(crate) enum PreparedClauses {
         /// Byte-source ranges the inline walk requested (0 for the df=1
         /// inline-FST and empty-resolution paths).
         planned_ranges: u64,
+        /// On-CPU nanoseconds of the walk that produced `hits` inside
+        /// `prepare_clauses` (single-term BMW, atoms search) — the
+        /// kernel time `run_prepared` never sees for already-final
+        /// shapes. 0 for the trivial early returns.
+        kernel_cpu_ns: u64,
     },
     /// AND-only: intersect `must_cursors`.
     Must {
@@ -253,13 +264,13 @@ fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
 }
 
 /// Byte-source ranges the atoms' builds requested: one per plain term's
-/// posting range, two per phrase member (postings + position runs).
+/// posting range, [`PHRASE_MEMBER_PLANNED_RANGES`] per phrase member.
 fn atom_planned_ranges(atoms: &[AnyCursor]) -> u64 {
     atoms
         .iter()
         .map(|a| match a {
             AnyCursor::Term(_) => 1,
-            AnyCursor::Phrase(p) => 2 * p.members.len() as u64,
+            AnyCursor::Phrase(p) => PHRASE_MEMBER_PLANNED_RANGES * p.members.len() as u64,
         })
         .sum()
 }
@@ -313,12 +324,23 @@ impl PreparedClauses {
         }
     }
 
+    /// On-CPU nanoseconds already spent producing an inline `Done`
+    /// result (0 for the cursor-carrying shapes, whose kernels are
+    /// bracketed at `run_prepared`).
+    pub(crate) fn inline_kernel_cpu_ns(&self) -> u64 {
+        match self {
+            PreparedClauses::Done { kernel_cpu_ns, .. } => *kernel_cpu_ns,
+            _ => 0,
+        }
+    }
+
     /// Byte-source ranges this prepared query requested — one per term
     /// posting range across every clause list (see
     /// [`Self::postings_bytes`] for the byte-volume counterpart).
     pub(crate) fn planned_ranges(&self) -> u64 {
-        let filter_ranges =
-            |filter: &Option<ExcludeFilter>| filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
+        let filter_ranges = |filter: &Option<ExcludeFilter>| {
+            filter.as_ref().map_or(0, ExcludeFilter::planned_ranges)
+        };
         match self {
             PreparedClauses::Done { planned_ranges, .. } => *planned_ranges,
             PreparedClauses::Must {
@@ -1940,6 +1962,7 @@ impl FtsReader {
                 hits: Vec::new(),
                 postings_bytes: 0,
                 planned_ranges: 0,
+                kernel_cpu_ns: 0,
             });
         }
         if lists.no_positive_atoms() {
@@ -1948,6 +1971,7 @@ impl FtsReader {
                     hits: Vec::new(),
                     postings_bytes: 0,
                     planned_ranges: 0,
+                    kernel_cpu_ns: 0,
                 });
             }
             return Err(FtsError::NegationOnly);
@@ -1967,6 +1991,7 @@ impl FtsReader {
                     hits: Vec::new(),
                     postings_bytes: atom_cursor_bytes(&built),
                     planned_ranges: atom_planned_ranges(&built),
+                    kernel_cpu_ns: 0,
                 });
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
@@ -1999,12 +2024,17 @@ impl FtsReader {
                 true => None,
                 false => Some(AtomExcludeFilter::new(negative_atoms)),
             };
+            // The atom walk is the whole kernel for phrase shapes —
+            // `run_prepared` sees only the finished `Done` — so bracket
+            // its on-CPU time here (sync section, no awaits inside).
+            let kernel_start = thread_cpu_ns();
             let result =
                 self.run_atoms_search(column_id, must_atoms, should_atoms, k, filter, floor_eff)?;
             return Ok(PreparedClauses::Done {
                 hits: result,
                 postings_bytes,
                 planned_ranges,
+                kernel_cpu_ns: thread_cpu_delta_ns(kernel_start),
             });
         }
 
@@ -2034,8 +2064,8 @@ impl FtsReader {
                 .expect("one atom");
             let mut filter = neg_filter;
             let filter_postings_bytes = filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
-            let filter_ranges = filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
-            let (result, term_postings_bytes) = self
+            let filter_ranges = filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
+            let (result, term_postings_bytes, kernel_cpu_ns) = self
                 .search_single_term_bmw(column_id, term, k, filter.as_mut(), floor_eff)
                 .await?;
             // The PFOR arm requested one posting range; the inline df=1 and
@@ -2045,6 +2075,7 @@ impl FtsReader {
                 hits: result,
                 postings_bytes: term_postings_bytes + filter_postings_bytes,
                 planned_ranges: term_ranges + filter_ranges,
+                kernel_cpu_ns,
             });
         }
 
@@ -2054,11 +2085,12 @@ impl FtsReader {
                 .await?;
             if cursors.is_empty() {
                 let postings_bytes = neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
-                let planned_ranges = neg_filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
+                let planned_ranges = neg_filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
                     postings_bytes,
                     planned_ranges,
+                    kernel_cpu_ns: 0,
                 });
             }
             return Ok(PreparedClauses::Or {
@@ -2078,11 +2110,12 @@ impl FtsReader {
             let postings_bytes = term_cursor_bytes(&must_cursors)
                 + neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
             let planned_ranges = must_cursors.len() as u64
-                + neg_filter.as_ref().map_or(0, |f| f.cursors.len() as u64);
+                + neg_filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
                 postings_bytes,
                 planned_ranges,
+                kernel_cpu_ns: 0,
             });
         }
         if lists.shoulds.is_empty() {
@@ -2472,6 +2505,11 @@ impl FtsReader {
     /// posting lists with high score variance — e.g. very long lists
     /// where most blocks contain mid-relevance docs and the top-k is
     /// dominated by a few outliers.
+    /// Returns `(hits, postings bytes indexed, on-CPU ns of the scoring
+    /// walk)` — the walk runs inside `prepare_clauses`, so its kernel
+    /// time must travel with the result (single-term is the most common
+    /// query shape; leaving it unbracketed would make `kernel_cpu_ns`
+    /// incomparable across clause shapes).
     async fn search_single_term_bmw(
         &self,
         column_id: u32,
@@ -2479,7 +2517,7 @@ impl FtsReader {
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<(Vec<(u32, f32)>, u64), FtsError> {
+    ) -> Result<(Vec<(u32, f32)>, u64, u64), FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
@@ -2489,7 +2527,7 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let key = make_key(&col_meta.name, term);
         let Some(packed) = dict.lookup(&key) else {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, 0));
         };
         let (metadata_offset, postings_length) = match FstValue::unpack(packed) {
             FstValue::Inline { doc_id, tf } => {
@@ -2513,14 +2551,14 @@ impl FtsReader {
                 if let Some(f) = filter.as_deref_mut()
                     && !f.admits(doc_id)
                 {
-                    return Ok((Vec::new(), 0));
+                    return Ok((Vec::new(), 0, 0));
                 }
                 let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 if score <= floor_eff {
-                    return Ok((Vec::new(), 0));
+                    return Ok((Vec::new(), 0, 0));
                 }
-                return Ok((vec![(doc_id, score)], 0));
+                return Ok((vec![(doc_id, score)], 0, 0));
             }
             FstValue::Pfor {
                 metadata_offset,
@@ -2543,6 +2581,9 @@ impl FtsReader {
         let postings = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
+        // Everything below is the synchronous scoring walk (no awaits):
+        // bracket it on this thread for the per-query kernel CPU stat.
+        let kernel_start = thread_cpu_ns();
         let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
@@ -2609,7 +2650,11 @@ impl FtsReader {
             }
         }
 
-        Ok((drain_top_k_desc(heap), term_bytes.len() as u64))
+        Ok((
+            drain_top_k_desc(heap),
+            term_bytes.len() as u64,
+            thread_cpu_delta_ns(kernel_start),
+        ))
     }
 
     /// Build one `TermCursor` per term that resolves in the FST.
@@ -4717,6 +4762,12 @@ impl ExcludeFilter {
     /// [`PreparedClauses::postings_bytes`].
     fn postings_bytes(&self) -> u64 {
         term_cursor_bytes(&self.cursors)
+    }
+
+    /// Byte-source ranges the negation cursors' builds requested (one per
+    /// term) — see [`PreparedClauses::planned_ranges`].
+    fn planned_ranges(&self) -> u64 {
+        self.cursors.len() as u64
     }
 }
 

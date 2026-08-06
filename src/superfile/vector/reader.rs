@@ -3100,10 +3100,10 @@ impl VectorReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), ProbeTally::default()));
         }
         let centroid_stride = col.dim * 4;
         let sub_start = col.subsection_range.start;
@@ -3130,7 +3130,7 @@ impl VectorReader {
         let Some((nprobe_eff, rerank_mult_eff)) =
             effective_filtered_params(&allow, col.n_docs, col.n_cent, nprobe, rerank_mult)
         else {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), ProbeTally::default()));
         };
         // 2. Score centroids → top `nprobe` clusters.
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
@@ -3153,8 +3153,12 @@ impl VectorReader {
             pool,
             budget,
         };
-        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
-            .await
+        let (hits, mut tally) = self
+            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .await?;
+        // The centroid + cluster-index span above was one planned range.
+        tally.ranges_requested += 1;
+        Ok((hits, tally))
     }
 
     /// Async IVF probe over an **externally chosen** set of cluster ids.
@@ -3180,7 +3184,7 @@ impl VectorReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         if self.is_multi_cell() {
             return self
                 .search_clusters_async_multi_cell(
@@ -3198,7 +3202,7 @@ impl VectorReader {
         }
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), ProbeTally::default()));
         }
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
@@ -3220,7 +3224,7 @@ impl VectorReader {
         // every probed fragment (measured 70 ms survivor gather + 52 ms
         // Sq8 rerank per filtered query at 1M).
         if allow.as_ref().is_some_and(|bm| bm.is_empty()) {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), ProbeTally::default()));
         }
         let ctx = ProbeCtx {
             q_rot: &q_rot,
@@ -3231,8 +3235,12 @@ impl VectorReader {
             pool,
             budget,
         };
-        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
-            .await
+        let (hits, mut tally) = self
+            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .await?;
+        // The cluster-index fetch above was one planned range.
+        tally.ranges_requested += 1;
+        Ok((hits, tally))
     }
 
     /// Map flat cluster ids to per-cell probe work on a multi-cell
@@ -3280,7 +3288,7 @@ impl VectorReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         if !self.column_id_by_name.contains_key(column) {
             return Err(VectorError::UnknownColumn(column.to_string()));
         }
@@ -3296,12 +3304,12 @@ impl VectorReader {
             });
         }
         if k == 0 || self.n_docs == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), ProbeTally::default()));
         }
 
         let per_cell = self.resolve_cells_for_clusters(clusters);
         if per_cell.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), ProbeTally::default()));
         }
 
         // Probe the selected cells CONCURRENTLY — the same wave shape the
@@ -3348,14 +3356,16 @@ impl VectorReader {
                     pool,
                     budget,
                 };
-                let (hits, rows_reranked) = self
+                let (hits, mut tally) = self
                     .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
                     .await?;
-                Ok::<(Vec<(u32, f32)>, u64), VectorError>((
+                // Each probed cell fetched its own cluster index above.
+                tally.ranges_requested += 1;
+                Ok::<(Vec<(u32, f32)>, ProbeTally), VectorError>((
                     hits.into_iter()
                         .map(|(local_id, score)| (base.saturating_add(local_id), score))
                         .collect(),
-                    rows_reranked,
+                    tally,
                 ))
             })
         });
@@ -3364,18 +3374,24 @@ impl VectorReader {
         // many-celled shard must not open unbounded simultaneous
         // range reads / cold fetches.
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell: Vec<(Vec<(u32, f32)>, u64)> = stream::iter(cell_probes)
+        let per_cell: Vec<(Vec<(u32, f32)>, ProbeTally)> = stream::iter(cell_probes)
             .buffer_unordered(max_in_flight)
             .try_collect()
             .await?;
-        let rows_reranked: u64 = per_cell.iter().map(|(_, rows)| rows).sum();
+        let mut tally = ProbeTally::default();
+        for (_, cell_tally) in &per_cell {
+            tally.cells_scanned += cell_tally.cells_scanned;
+            tally.candidates_scanned += cell_tally.candidates_scanned;
+            tally.ranges_requested += cell_tally.ranges_requested;
+            tally.rows_reranked += cell_tally.rows_reranked;
+        }
         let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
         // Distance ascending (smaller = closer), matching every other vector
         // search path. Descending here kept the farthest k hits and collapsed
         // packed-shard recall to ~0.
         merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         merged.truncate(k);
-        Ok((merged, rows_reranked))
+        Ok((merged, tally))
     }
 
     /// Deferred-rerank scan for the supertable's GLOBAL shortlist selection
@@ -3500,16 +3516,26 @@ impl VectorReader {
                 let (cluster_meta, prefix_ranges) = chosen_cluster_meta(col, &cluster_idx, &locals);
                 if cluster_meta.is_empty() {
                     // The cluster-index read itself was one planned range.
-                    return Ok((Vec::new(), Vec::new(), 0, 1, 0));
+                    let tally = ProbeTally {
+                        ranges_requested: 1,
+                        ..ProbeTally::default()
+                    };
+                    return Ok((Vec::new(), Vec::new(), tally));
                 }
                 // Work-stats tallies, taken before the warm/cold branch so
                 // both arms count the codes their clusters hold. Ranges:
                 // the cluster index plus one per prefix span (the warm
                 // arm's fetches; the cold arm's whole-cluster blocks are
                 // one range per chosen cluster, the same count).
-                let candidates_scanned: u64 =
-                    cluster_meta.iter().map(|(_, _, cnt)| u64::from(*cnt)).sum();
-                let ranges_requested = 1 + prefix_ranges.len() as u64;
+                let mut tally = ProbeTally {
+                    cells_scanned: 1,
+                    candidates_scanned: cluster_meta
+                        .iter()
+                        .map(|(_, _, cnt)| u64::from(*cnt))
+                        .sum(),
+                    ranges_requested: 1 + prefix_ranges.len() as u64,
+                    rows_reranked: 0,
+                };
                 // Warm fast path: every prefix resident -> defer rerank.
                 let prefix_blocks: Option<Vec<Bytes>> = prefix_ranges
                     .iter()
@@ -3540,9 +3566,11 @@ impl VectorReader {
                             cell_idx,
                         })
                         .collect();
-                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64, u64), VectorError>(
-                        (Vec::new(), cands, candidates_scanned, ranges_requested, 0),
-                    );
+                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>, ProbeTally), VectorError>((
+                        Vec::new(),
+                        cands,
+                        tally,
+                    ));
                 }
                 // Cold (or RabitqOnly): probe-and-rerank now, width-divided.
                 let ctx = ProbeCtx {
@@ -3554,35 +3582,36 @@ impl VectorReader {
                     pool,
                     budget,
                 };
-                let (hits, rows_reranked) = self
+                let (hits, probe_tally) = self
                     .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
                     .await?;
+                // Only the rerank rows come from the probe: this scan
+                // already counted the cell, its candidates, and its
+                // cluster-index + prefix ranges before the branch, and the
+                // probe's own tallies cover the same clusters.
+                tally.rows_reranked = probe_tally.rows_reranked;
                 Ok((
                     hits.into_iter()
                         .map(|(local_id, score)| (base.saturating_add(local_id), score))
                         .collect(),
                     Vec::new(),
-                    candidates_scanned,
-                    ranges_requested,
-                    rows_reranked,
+                    tally,
                 ))
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64, u64)> =
+        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, ProbeTally)> =
             stream::iter(cell_scans)
                 .buffer_unordered(max_in_flight)
                 .try_collect()
                 .await?;
-        for (hits, cands, candidates_scanned, ranges_requested, rows_reranked) in per_cell_results {
+        for (hits, cands, tally) in per_cell_results {
             outcome.hits.extend(hits);
             outcome.candidates.extend(cands);
-            outcome.ranges_requested += ranges_requested;
-            outcome.rows_reranked += rows_reranked;
-            if candidates_scanned > 0 {
-                outcome.cells_scanned += 1;
-                outcome.candidates_scanned += candidates_scanned;
-            }
+            outcome.cells_scanned += tally.cells_scanned;
+            outcome.candidates_scanned += tally.candidates_scanned;
+            outcome.ranges_requested += tally.ranges_requested;
+            outcome.rows_reranked += tally.rows_reranked;
         }
         // Cold hits merge to this file's top-k exactly as the immediate
         // path does; candidates stay unbounded here (per-cell heaps
@@ -3746,12 +3775,21 @@ impl VectorReader {
         ctx: &ProbeCtx<'_>,
         cluster_idx: &[u8],
         chosen: &[usize],
-    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         let cb = col.quant.code_bytes();
         let (cluster_meta, cluster_prefix_ranges) = chosen_cluster_meta(col, cluster_idx, chosen);
         if cluster_meta.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), ProbeTally::default()));
         }
+        // Plan tallies, fixed before the warm/cold fetch branch: both arms
+        // scan the same clusters and request one prefix/block range each
+        // (the caller counts the cluster-index range it fetched).
+        let mut tally = ProbeTally {
+            cells_scanned: 1,
+            candidates_scanned: cluster_meta.iter().map(|&(_, _, cnt)| u64::from(cnt)).sum(),
+            ranges_requested: cluster_meta.len() as u64,
+            rows_reranked: 0,
+        };
         let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
         // Warm fast path: every prefix already resident → sync zero-copy.
         let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
@@ -3860,7 +3898,7 @@ impl VectorReader {
                 if let Some(t0) = shortlist_t0 {
                     io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
                 }
-                return Ok((out, 0));
+                return Ok((out, tally));
             }
             ShortlistOutcome::Rerank {
                 candidates,
@@ -3885,7 +3923,7 @@ impl VectorReader {
             io_counters::phase_record("vec.survivor_fetch", t0.elapsed().as_micros() as u64);
         }
 
-        let rows_reranked = candidates.len() as u64;
+        tally.rows_reranked = candidates.len() as u64;
         let hits = io_counters::phase_timed_async("vec.rerank", async {
             rerank_candidates_from_blocks(
                 &self.source,
@@ -3901,7 +3939,7 @@ impl VectorReader {
             .await
         })
         .await?;
-        Ok((hits, rows_reranked))
+        Ok((hits, tally))
     }
 
     /// Look up the column by name and validate `query.len() == col.dim`
@@ -4491,6 +4529,32 @@ pub(crate) struct ScanCandidate {
     pub(crate) cluster_id: u32,
     /// Cell directory index within this superfile.
     pub(crate) cell_idx: usize,
+}
+
+/// Work tallies from one cell probe (immediate arm) or one scanned cell
+/// (deferred arm) — named counters, so a flush or merge site can never
+/// silently swap two positional `u64`s and still type-check.
+/// `pub` (not `pub(crate)`) because the carrying search fns are the
+/// test-helpers-widened surface benches call; the module gate in
+/// `lib.rs` keeps all of it crate-private in normal builds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProbeTally {
+    /// Cells that contributed at least one chosen, non-empty cluster
+    /// (0 or 1 from a single probe; summed by multi-cell callers).
+    pub cells_scanned: u64,
+    /// Σ row counts over every chosen cluster — the quantized codes the
+    /// 1-bit estimator scanned. Identical warm or cold.
+    pub candidates_scanned: u64,
+    /// Byte-source ranges the probe plan requested: one prefix/block
+    /// range per chosen cluster, plus the cell's cluster index where the
+    /// probing fn fetched it itself. Rerank row ranges are NOT counted
+    /// here — the supertable charges the plan's rerank budget so the
+    /// priced count stays identical across the warm (survivor-fetch)
+    /// and cold (rows-in-block) executions.
+    pub ranges_requested: u64,
+    /// Rows this probe actually reranked at full precision (execution
+    /// diagnostic — see `OpStats::vector_rows_reranked`).
+    pub rows_reranked: u64,
 }
 
 /// Result of a deferred-rerank scan over one superfile
@@ -9854,6 +9918,79 @@ mod tests {
             .await
             .expect("out-of-range clusters");
         assert!(none.is_empty(), "ids >= n_cent are ignored");
+    }
+
+    #[tokio::test]
+    async fn probe_tallies_are_identical_warm_and_cold() {
+        // The plan tallies must not depend on residency: an eager
+        // (always warm) reader and a lazy reader with sync reads
+        // disabled (always cold) take different fetch branches — warm
+        // survivor-only gather vs cold rows-in-block — yet must report
+        // the same cells, candidates, planned ranges, AND rows: the
+        // immediate probe's shortlist is decided before the branch.
+        let (blob, json, all) = build_search_corpus();
+        let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let r_lazy = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&counting) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("lazy open");
+        counting.disable_sync();
+
+        let clusters: Vec<u32> = (0..4).collect();
+        let (_, cold) = r_lazy
+            .search_clusters_async(
+                "embedding",
+                &all[19],
+                5,
+                &clusters,
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("cold probe");
+        let (_, warm) = r_eager
+            .search_clusters_async(
+                "embedding",
+                &all[19],
+                5,
+                &clusters,
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("warm probe");
+        assert!(
+            warm.cells_scanned >= 1 && warm.candidates_scanned > 0,
+            "fixture probe must do real work (cells {}, candidates {})",
+            warm.cells_scanned,
+            warm.candidates_scanned
+        );
+        assert_eq!(
+            warm.cells_scanned, cold.cells_scanned,
+            "cells are plan-derived"
+        );
+        assert_eq!(
+            warm.candidates_scanned, cold.candidates_scanned,
+            "candidates are plan-derived"
+        );
+        assert_eq!(
+            warm.ranges_requested, cold.ranges_requested,
+            "planned ranges are cache-normalized: warm prefix fetches and cold \
+             whole-cluster blocks plan the same count"
+        );
+        assert_eq!(
+            warm.rows_reranked, cold.rows_reranked,
+            "the immediate probe's rerank set is fixed before the fetch branch"
+        );
     }
 
     #[tokio::test]

@@ -97,6 +97,17 @@ pub(crate) fn thread_cpu_ns() -> Option<u128> {
     raw.split_whitespace().next()?.parse().ok()
 }
 
+/// On-CPU nanoseconds this thread accrued since `start` (a prior
+/// [`thread_cpu_ns`] reading). 0 when either reading is unavailable —
+/// "no clock" means "no measured time", never an error. Must be called
+/// on the same thread that took `start`.
+pub(crate) fn thread_cpu_delta_ns(start: Option<u128>) -> u64 {
+    match (start, thread_cpu_ns()) {
+        (Some(t0), Some(t1)) => u64::try_from(t1.saturating_sub(t0)).unwrap_or(u64::MAX),
+        _ => 0,
+    }
+}
+
 /// Run `f`, returning `(result, wall_duration, measured_on_cpu_seconds)`.
 ///
 /// Wall and on-CPU time are bracketed identically around the same work.
