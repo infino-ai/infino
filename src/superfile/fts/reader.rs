@@ -52,11 +52,6 @@ use crate::superfile::{
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
 
-/// Planned byte-source ranges per phrase member: its postings range plus
-/// its position runs — positional verification is exactly the work that
-/// separates phrase cost from term cost.
-const PHRASE_MEMBER_PLANNED_RANGES: u64 = 2;
-
 /// Largest gap worth overfetching when adjacent term postings share a request.
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
@@ -264,16 +259,65 @@ fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
         .sum()
 }
 
-/// Byte-source ranges the atoms' builds requested: one per plain term's
-/// posting range, [`PHRASE_MEMBER_PLANNED_RANGES`] per phrase member.
+/// Byte-source ranges a cursor set's build requested — one per PFOR
+/// term. Inline (df=1) cursors plan no fetch (their `bytes` is empty),
+/// matching the single-term arm's "bytes 0 implies ranges 0".
+fn term_cursor_ranges(cursors: &[TermCursor]) -> u64 {
+    cursors.iter().filter(|c| !c.bytes.is_empty()).count() as u64
+}
+
+/// Byte-source ranges the atoms' builds requested: one per PFOR term's
+/// posting range; a phrase member adds one for its postings and one for
+/// its position runs. Inline legs (empty buffers) plan no fetch.
 fn atom_planned_ranges(atoms: &[AnyCursor]) -> u64 {
     atoms
         .iter()
         .map(|a| match a {
-            AnyCursor::Term(_) => 1,
-            AnyCursor::Phrase(p) => PHRASE_MEMBER_PLANNED_RANGES * p.members.len() as u64,
+            AnyCursor::Term(c) => u64::from(!c.bytes.is_empty()),
+            AnyCursor::Phrase(p) => p
+                .members
+                .iter()
+                .map(|m| u64::from(!m.cursor.bytes.is_empty()) + u64::from(!m.positions.is_empty()))
+                .sum(),
         })
         .sum()
+}
+
+/// Work tallies from one unranked match / dictionary walk — the posting
+/// bytes indexed and the byte-source ranges the plan requested. Returned
+/// alongside match results so the supertable flushes once per superfile;
+/// `pub` because the carrying fns are the test-helpers-widened surface
+/// (the module gate in `lib.rs` keeps it crate-private in normal builds).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MatchWork {
+    /// Posting (and phrase-position / header) bytes the walk indexed into.
+    pub postings_bytes: u64,
+    /// Byte-source ranges the walk's build requested, pre-coalesce.
+    pub planned_ranges: u64,
+}
+
+impl MatchWork {
+    /// Tallies for a plain term-cursor set.
+    fn for_cursors(cursors: &[TermCursor]) -> Self {
+        Self {
+            postings_bytes: term_cursor_bytes(cursors),
+            planned_ranges: term_cursor_ranges(cursors),
+        }
+    }
+
+    /// Tallies for a heterogeneous atom set (terms + phrases).
+    fn for_atoms(atoms: &[AnyCursor]) -> Self {
+        Self {
+            postings_bytes: atom_cursor_bytes(atoms),
+            planned_ranges: atom_planned_ranges(atoms),
+        }
+    }
+
+    /// Fold another walk's tallies into this one (e.g. a negation set).
+    pub fn merge(&mut self, other: MatchWork) {
+        self.postings_bytes += other.postings_bytes;
+        self.planned_ranges += other.planned_ranges;
+    }
 }
 
 impl PreparedClauses {
@@ -348,16 +392,20 @@ impl PreparedClauses {
                 must_cursors,
                 filter,
                 ..
-            } => must_cursors.len() as u64 + filter_ranges(filter),
+            } => term_cursor_ranges(must_cursors) + filter_ranges(filter),
             PreparedClauses::MustShould {
                 must_cursors,
                 should_cursors,
                 filter,
                 ..
-            } => must_cursors.len() as u64 + should_cursors.len() as u64 + filter_ranges(filter),
+            } => {
+                term_cursor_ranges(must_cursors)
+                    + term_cursor_ranges(should_cursors)
+                    + filter_ranges(filter)
+            }
             PreparedClauses::Or {
                 cursors, filter, ..
-            } => cursors.len() as u64 + filter_ranges(filter),
+            } => term_cursor_ranges(cursors) + filter_ranges(filter),
         }
     }
 }
@@ -1593,27 +1641,23 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, FtsError> {
+    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
         let built = self
             .build_atom_cursors(column_id, terms, phrases, None)
             .await?;
-        let atoms: Vec<AnyCursor> = match mode {
-            BoolMode::And => {
-                if built.iter().any(Option::is_none) {
-                    return Ok(Vec::new());
-                }
-                built.into_iter().flatten().collect()
-            }
-            BoolMode::Or => built.into_iter().flatten().collect(),
-        };
-        if atoms.is_empty() {
-            return Ok(Vec::new());
+        let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
+        let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
+        // The atoms that DID build cost their bytes even when a missing
+        // AND atom empties the result — mirrors `prepare_clauses`.
+        let work = MatchWork::for_atoms(&atoms);
+        if missing_and_atom || atoms.is_empty() {
+            return Ok((Vec::new(), work));
         }
         let mut out = Vec::new();
         self.walk_atoms_match(atoms, mode, None, |d| out.push(d))?;
-        Ok(out)
+        Ok((out, work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -1624,27 +1668,21 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<u64, FtsError> {
+    ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
         let built = self
             .build_atom_cursors(column_id, terms, phrases, None)
             .await?;
-        let atoms: Vec<AnyCursor> = match mode {
-            BoolMode::And => {
-                if built.iter().any(Option::is_none) {
-                    return Ok(0);
-                }
-                built.into_iter().flatten().collect()
-            }
-            BoolMode::Or => built.into_iter().flatten().collect(),
-        };
-        if atoms.is_empty() {
-            return Ok(0);
+        let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
+        let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
+        let work = MatchWork::for_atoms(&atoms);
+        if missing_and_atom || atoms.is_empty() {
+            return Ok((0, work));
         }
         let mut n = 0u64;
         self.walk_atoms_match(atoms, mode, None, |_| n += 1)?;
-        Ok(n)
+        Ok((n, work))
     }
 
     /// Resolve a column name to its dense column_id, or
@@ -2111,7 +2149,7 @@ impl FtsReader {
         if must_cursors.len() != lists.musts.len() {
             let postings_bytes = term_cursor_bytes(&must_cursors)
                 + neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
-            let planned_ranges = must_cursors.len() as u64
+            let planned_ranges = term_cursor_ranges(&must_cursors)
                 + neg_filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
@@ -2207,24 +2245,28 @@ impl FtsReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, FtsError> {
+    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self.build_term_cursors(column_id, tokens, None).await?;
-        Ok(match mode {
+        // Tallied before the mode branch: the cursors that DID build cost
+        // their bytes even when a missing AND token empties the result.
+        let work = MatchWork::for_cursors(&cursors);
+        let docs = match mode {
             BoolMode::And => {
                 // AND needs every token present; a missing token ⇒ empty
                 // set. Otherwise intersect via the same optimized
                 // block flat-merge the ranked scorer uses.
                 if cursors.len() != tokens.len() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), work));
                 }
                 self.collect_and_intersect(column_id, cursors)
             }
             BoolMode::Or => or_merge_unranked(cursors),
-        })
+        };
+        Ok((docs, work))
     }
 
     /// Unranked token-match **count** — the cardinality
@@ -2238,21 +2280,23 @@ impl FtsReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<u64, FtsError> {
+    ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
-            return Ok(0);
+            return Ok((0, MatchWork::default()));
         }
         let cursors = self.build_term_cursors(column_id, tokens, None).await?;
-        Ok(match mode {
+        let work = MatchWork::for_cursors(&cursors);
+        let n = match mode {
             BoolMode::And => {
                 if cursors.len() != tokens.len() {
-                    return Ok(0);
+                    return Ok((0, work));
                 }
                 self.count_and_intersect(column_id, cursors)
             }
             BoolMode::Or => or_count_unranked(cursors),
-        })
+        };
+        Ok((n, work))
     }
 
     /// Document frequency for each of `tokens` in `column` — the number
@@ -2269,10 +2313,14 @@ impl FtsReader {
     /// ranges into a minimal set of parallel GETs). This matters on the
     /// global-statistics path, where a superfile is probed for every
     /// scored term of a query at once.
-    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, FtsError> {
+    pub async fn term_dfs(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default()));
         }
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
@@ -2305,19 +2353,24 @@ impl FtsReader {
             }
         }
 
-        // One coalesced fetch for every PFOR header; `df` is its first 4 bytes.
+        // One coalesced fetch for every PFOR header; `df` is its first 4
+        // bytes. Each header is one planned range (pre-coalesce), and its
+        // bytes count as indexed work — the walk read them.
+        let mut work = MatchWork::default();
         if !header_ranges.is_empty() {
             let fetched = self.fetch_term_postings(&header_ranges).await?;
+            work.planned_ranges = header_ranges.len() as u64;
             for (fetched_idx, &slot) in pfor_slots.iter().enumerate() {
                 let header = fetched.get(fetched_idx).ok_or_else(|| {
                     FtsError::Read(ReadError::MalformedVersion(
                         "term_dfs: fetched fewer headers than requested".into(),
                     ))
                 })?;
+                work.postings_bytes += header.len() as u64;
                 dfs[slot] = read_u32_le(&header.as_ref()[0..4]) as u64;
             }
         }
-        Ok(dfs)
+        Ok((dfs, work))
     }
 
     /// Document frequency of a single `token` in `column`. Thin wrapper
@@ -2327,8 +2380,9 @@ impl FtsReader {
     /// `WHERE` predicate's match count *ahead of* running `token_match`,
     /// so a predicate matching a large fraction of the superfile can
     /// fall back to a plain scan instead of a (losing) index pushdown.
-    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, FtsError> {
-        Ok(self.term_dfs(column, &[token]).await?.pop().unwrap_or(0))
+    pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), FtsError> {
+        let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
+        Ok((dfs.pop().unwrap_or(0), work))
     }
 
     /// Multi-term OR BM25 search constrained to a doc_id sub-range.
@@ -4248,9 +4302,9 @@ impl OrCursorSet {
         term_cursor_bytes(&self.cursors)
     }
 
-    /// Byte-source ranges the set's build requested (one per term).
+    /// Byte-source ranges the set's build requested (one per PFOR term).
     pub(crate) fn planned_ranges(&self) -> u64 {
-        self.cursors.len() as u64
+        term_cursor_ranges(&self.cursors)
     }
 }
 
@@ -4769,9 +4823,9 @@ impl ExcludeFilter {
     }
 
     /// Byte-source ranges the negation cursors' builds requested (one per
-    /// term) — see [`PreparedClauses::planned_ranges`].
+    /// PFOR term) — see [`PreparedClauses::planned_ranges`].
     fn planned_ranges(&self) -> u64 {
-        self.cursors.len() as u64
+        term_cursor_ranges(&self.cursors)
     }
 }
 
@@ -6081,21 +6135,24 @@ mod tests {
         assert_eq!(
             r.token_match("body", &["rust"], BoolMode::Or)
                 .await
-                .expect("single"),
+                .expect("single")
+                .0,
             vec![0, 1]
         );
         // OR = union (rust ∪ java).
         assert_eq!(
             r.token_match("body", &["rust", "java"], BoolMode::Or)
                 .await
-                .expect("or"),
+                .expect("or")
+                .0,
             vec![0, 1, 2]
         );
         // AND = intersection (rust ∩ runtime).
         assert_eq!(
             r.token_match("body", &["rust", "runtime"], BoolMode::And)
                 .await
-                .expect("and"),
+                .expect("and")
+                .0,
             vec![0, 1]
         );
         // AND with an absent token → empty.
@@ -6103,13 +6160,15 @@ mod tests {
             r.token_match("body", &["rust", "zzz"], BoolMode::And)
                 .await
                 .expect("and absent")
+                .0
                 .is_empty()
         );
         // OR ignores an absent token.
         assert_eq!(
             r.token_match("body", &["java", "zzz"], BoolMode::Or)
                 .await
-                .expect("or absent"),
+                .expect("or absent")
+                .0,
             vec![2]
         );
         // Empty token list → empty.
@@ -6117,6 +6176,7 @@ mod tests {
             r.token_match("body", &[], BoolMode::And)
                 .await
                 .expect("empty")
+                .0
                 .is_empty()
         );
     }
@@ -6142,11 +6202,13 @@ mod tests {
                 .token_match("body", tokens, *mode)
                 .await
                 .expect("token_match")
+                .0
                 .len() as u64;
             let count = r
                 .token_match_count("body", tokens, *mode)
                 .await
-                .expect("token_match_count");
+                .expect("token_match_count")
+                .0;
             assert_eq!(count, len, "count vs len for {tokens:?} {mode:?}");
         }
     }
@@ -6192,11 +6254,13 @@ mod tests {
                 .token_match("body", terms, BoolMode::Or)
                 .await
                 .expect("token_match")
+                .0
                 .len() as u64;
             let count = r
                 .token_match_count("body", terms, BoolMode::Or)
                 .await
-                .expect("token_match_count");
+                .expect("token_match_count")
+                .0;
             assert_eq!(
                 count, merge_len,
                 "windowed count vs merge len for {terms:?}"
@@ -6208,7 +6272,8 @@ mod tests {
         assert_eq!(
             r.token_match_count("body", &["alpha"], BoolMode::Or)
                 .await
-                .expect("count"),
+                .expect("count")
+                .0,
             N_DOCS as u64
         );
     }
@@ -6229,7 +6294,8 @@ mod tests {
         let boolean = r
             .token_match("body", &["rust", "java"], BoolMode::Or)
             .await
-            .expect("boolean");
+            .expect("boolean")
+            .0;
         assert_eq!(bm25, boolean, "boolean Or doc set == bm25 doc set");
     }
 
@@ -6802,10 +6868,10 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
         // common → df 3 (PFOR header read), rust → df 2 (PFOR),
         // uniqzero → df 1 (inline FST value), absent → 0.
-        assert_eq!(r.term_df("body", "common").await.expect("df"), 3);
-        assert_eq!(r.term_df("body", "rust").await.expect("df"), 2);
-        assert_eq!(r.term_df("body", "uniqzero").await.expect("df"), 1);
-        assert_eq!(r.term_df("body", "missing").await.expect("df"), 0);
+        assert_eq!(r.term_df("body", "common").await.expect("df").0, 3);
+        assert_eq!(r.term_df("body", "rust").await.expect("df").0, 2);
+        assert_eq!(r.term_df("body", "uniqzero").await.expect("df").0, 1);
+        assert_eq!(r.term_df("body", "missing").await.expect("df").0, 0);
     }
 
     #[tokio::test]
@@ -6825,11 +6891,11 @@ mod tests {
         // path (which fetches only the PFOR headers, then scatters the
         // results back) would surface as a mismatch here.
         let tokens = ["rust", "missing", "uniqzero", "common", "absent2"];
-        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs");
+        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs").0;
         // Element-wise identical to resolving each token on its own.
         let mut per_term = Vec::with_capacity(tokens.len());
         for t in tokens {
-            per_term.push(r.term_df("body", t).await.expect("term_df"));
+            per_term.push(r.term_df("body", t).await.expect("term_df").0);
         }
         assert_eq!(
             batched, per_term,
@@ -6839,7 +6905,7 @@ mod tests {
         // uniqzero=1 inline, absent tokens=0).
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
-        assert!(r.term_dfs("body", &[]).await.expect("empty").is_empty());
+        assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
     }
 
     // ---- phrase atoms ----

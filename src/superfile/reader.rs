@@ -53,7 +53,8 @@ use crate::{
         format::{self, footer, kv},
         fts::{
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FtsReader, OrCursorSet, PreparedClauses,
+                self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
+                PreparedClauses,
             },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
@@ -1019,7 +1020,7 @@ impl SuperfileReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, ReadError> {
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1035,7 +1036,7 @@ impl SuperfileReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<u64, ReadError> {
+    ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1053,7 +1054,7 @@ impl SuperfileReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, ReadError> {
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1068,7 +1069,7 @@ impl SuperfileReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<u64, ReadError> {
+    ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1079,7 +1080,7 @@ impl SuperfileReader {
     /// header-only read used to estimate a predicate's match count
     /// before running `token_match`. Delegates to
     /// [`FtsReader::term_df`].
-    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, ReadError> {
+    pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1090,7 +1091,11 @@ impl SuperfileReader {
     /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
     /// resolves the whole set with one FST parse and one coalesced header
     /// fetch. Delegates to [`FtsReader::term_dfs`].
-    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, ReadError> {
+    pub async fn term_dfs(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1112,7 +1117,12 @@ impl SuperfileReader {
     /// Returns the verified `local_doc_id`s in ascending order. Works
     /// for single-word and multi-word strings alike — the token count
     /// only affects pruning, never the raw-string comparison.
-    pub async fn exact_match(&self, column: &str, value: &str) -> Result<Vec<u32>, ReadError> {
+    /// Returns the verified ids plus the prune pass's posting-walk work.
+    pub async fn exact_match(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
         // string's tokens (a superset of the exact matches). Tokenize
         // with the column's configured tokenizer to match the index.
@@ -1122,15 +1132,15 @@ impl SuperfileReader {
             .and_then(|f| f.column_tokenizer(column).ok())
             .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
         let tokens: Vec<String> = tok.tokenize(value).collect();
-        let candidates: Vec<u32> = if tokens.is_empty() {
+        let (candidates, work): (Vec<u32>, MatchWork) = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
-            (0..self.n_docs() as u32).collect()
+            ((0..self.n_docs() as u32).collect(), MatchWork::default())
         } else {
             let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
             self.token_match(column, &refs, BoolMode::And).await?
         };
         if candidates.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), work));
         }
 
         // Pass 2 — verify raw-string equality on the decoded text.
@@ -1153,7 +1163,7 @@ impl SuperfileReader {
                 out.push(doc);
             }
         }
-        Ok(out)
+        Ok((out, work))
     }
 
     /// Pre-tokenized BM25 search over explicit clause lists — the
@@ -2293,12 +2303,14 @@ mod tests {
         let and = r
             .token_match("title", &["rust", "runtime"], BoolMode::And)
             .await
-            .expect("and");
+            .expect("and")
+            .0;
         assert_eq!(and, vec![0]);
         let or = r
             .token_match("title", &["rust", "runtime"], BoolMode::Or)
             .await
-            .expect("or");
+            .expect("or")
+            .0;
         assert_eq!(or, vec![0, 2]);
     }
 
@@ -2306,8 +2318,8 @@ mod tests {
     async fn term_df_counts_documents() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
-        assert_eq!(r.term_df("title", "rust").await.expect("df"), 2);
-        assert_eq!(r.term_df("title", "absent").await.expect("df"), 0);
+        assert_eq!(r.term_df("title", "rust").await.expect("df").0, 2);
+        assert_eq!(r.term_df("title", "absent").await.expect("df").0, 0);
     }
 
     #[tokio::test]
@@ -2319,10 +2331,11 @@ mod tests {
         let hits = r
             .exact_match("title", "rust async runtime")
             .await
-            .expect("exact_match");
+            .expect("exact_match")
+            .0;
         assert_eq!(hits, vec![0]);
         // No row stores just "rust", so the exact comparison yields none.
-        let none = r.exact_match("title", "rust").await.expect("exact_match");
+        let none = r.exact_match("title", "rust").await.expect("exact_match").0;
         assert!(none.is_empty());
     }
 
@@ -2658,7 +2671,8 @@ mod tests {
         let hits = r
             .exact_match("title", "rust javascript")
             .await
-            .expect("exact_match");
+            .expect("exact_match")
+            .0;
         assert!(hits.is_empty());
     }
 

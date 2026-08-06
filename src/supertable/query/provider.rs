@@ -828,21 +828,30 @@ impl TableProvider for SupertableProvider {
             // overhead. The floor keeps the pushdown active on small
             // superfiles; the density cap binds even under the floor so
             // an all-matching predicate never takes the index path.
-            let est = candidate_plan
+            let (est, est_work) = candidate_plan
                 .estimate(prepared.reader.as_ref())
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64)
                 .max(PUSHDOWN_MIN_ROWS);
             let density_cap = (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
+            let mut predicate_work = est_work;
             let candidates = if est > gate || est >= density_cap {
                 None
             } else {
-                candidate_plan
+                let (bitmap, eval_work) = candidate_plan
                     .evaluate(prepared.reader.as_ref())
                     .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                predicate_work.merge(eval_work);
+                bitmap
             };
+            // The pushdown predicate's df probes + posting walks, flushed
+            // through the same collector that meters this scan's pages.
+            if let Some(stats) = self.scan_store.op_stats() {
+                stats.add_fts_postings_bytes(predicate_work.postings_bytes);
+                stats.add_planned_read_ranges(predicate_work.planned_ranges);
+            }
 
             // This superfile's tombstoned rows (empty when no overlay).
             let tombstones = match self.tombstone_cache.as_ref() {

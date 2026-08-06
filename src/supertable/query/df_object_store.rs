@@ -90,6 +90,13 @@ impl SuperfileObjectStore {
         }
     }
 
+    /// The per-query collector this store captured at construction — the
+    /// provider flushes its predicate-walk work through the same channel
+    /// that meters this scan's page bytes.
+    pub(crate) fn op_stats(&self) -> Option<Arc<OpStatsCollector>> {
+        self.op_stats.clone()
+    }
+
     /// Build the store from the superfile byte sources gathered during a
     /// scan. Each key is the path the matching `PartitionedFile` is
     /// created with.

@@ -691,6 +691,7 @@ impl SupertableReader {
         let column_arc = Arc::new(column.to_owned());
         let terms_arc: Arc<Vec<String>> = Arc::new(terms.to_vec());
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let op_stats = self.op_stats.clone();
         let per_sf: Vec<Vec<u64>> = dispatch::fanout_with(
             self,
             units,
@@ -699,15 +700,23 @@ impl SupertableReader {
             move |r, _entry, _sidecars, _now, _params: ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
+                let op_stats = op_stats.clone();
                 async move {
                     // One FST parse + one coalesced header fetch for all
                     // scored terms in this superfile, rather than a parse
                     // and fetch per term.
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
-                    let dfs = r
+                    let (dfs, work) = r
                         .term_dfs(&column_arc, &refs)
                         .await
                         .map_err(fts_read_error)?;
+                    // The global-stats pre-pass reads real header ranges;
+                    // it is part of the query's plan and counts like any
+                    // other posting work.
+                    if let Some(stats) = &op_stats {
+                        stats.add_fts_postings_bytes(work.postings_bytes);
+                        stats.add_planned_read_ranges(work.planned_ranges);
+                    }
                     Ok::<Vec<u64>, QueryError>(dfs)
                 }
             },
@@ -995,18 +1004,20 @@ impl SupertableReader {
         let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
         let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
+        let op_stats = self.op_stats.clone();
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
             let phrase_arc = Arc::clone(&phrase_arc);
             let neg_arc = Arc::clone(&neg_arc);
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
+            let op_stats = op_stats.clone();
             async move {
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 // Any phrase atom (match or negated) takes the
                 // phrase-aware walk; plain-token queries keep the
                 // optimized token_match path unchanged.
-                let docs = match phrase_involved {
+                let (docs, mut work) = match phrase_involved {
                     true => r
                         .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
                         .await
@@ -1022,7 +1033,7 @@ impl SupertableReader {
                 // materialized walk over both sets.
                 let docs = if has_negatives {
                     let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                    let excluded: RoaringBitmap = match neg_ph_arc.is_empty() {
+                    let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                         true => r
                             .token_match(&column_arc, &neg_refs, BoolMode::Or)
                             .await
@@ -1031,15 +1042,20 @@ impl SupertableReader {
                             .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
                             .await
                             .map_err(fts_read_error)?,
-                    }
-                    .into_iter()
-                    .collect();
+                    };
+                    work.merge(neg_work);
+                    let excluded: RoaringBitmap = neg_docs.into_iter().collect();
                     docs.into_iter()
                         .filter(|d| !excluded.contains(*d))
                         .collect::<Vec<_>>()
                 } else {
                     docs
                 };
+                // One flush per superfile: positive + negation walks.
+                if let Some(stats) = &op_stats {
+                    stats.add_fts_postings_bytes(work.postings_bytes);
+                    stats.add_planned_read_ranges(work.planned_ranges);
+                }
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
@@ -1099,12 +1115,14 @@ impl SupertableReader {
         // spawns + opens each superfile concurrently, and short-circuits
         // on the first error. The per-superfile body returns this
         // superfile's match count; the totals are summed.
+        let op_stats = self.op_stats.clone();
         let per_superfile = dispatch::fanout_with(
             self,
             units,
             true,
             true,
             move |r, entry, tombstone_cache, now, _params: ()| {
+                let op_stats = op_stats.clone();
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
                 let phrase_arc = Arc::clone(&phrase_arc);
@@ -1128,7 +1146,7 @@ impl SupertableReader {
                     // matches, then drop any doc carrying a negated term
                     // (union of the negatives) or a tombstone.
                     if has_negatives || tomb.is_some() {
-                        let docs = match phrase_involved {
+                        let (docs, mut work) = match phrase_involved {
                             true => r
                                 .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
                                 .await
@@ -1140,7 +1158,7 @@ impl SupertableReader {
                         };
                         let excluded: RoaringBitmap = if has_negatives {
                             let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                            match neg_ph_arc.is_empty() {
+                            let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                                 true => r
                                     .token_match(&column_arc, &neg_refs, BoolMode::Or)
                                     .await
@@ -1154,12 +1172,16 @@ impl SupertableReader {
                                     )
                                     .await
                                     .map_err(fts_read_error)?,
-                            }
-                            .into_iter()
-                            .collect()
+                            };
+                            work.merge(neg_work);
+                            neg_docs.into_iter().collect()
                         } else {
                             RoaringBitmap::new()
                         };
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(work.postings_bytes);
+                            stats.add_planned_read_ranges(work.planned_ranges);
+                        }
                         let n = docs
                             .iter()
                             .filter(|d| {
@@ -1173,7 +1195,7 @@ impl SupertableReader {
                     // without materializing ids — a single token resolves
                     // O(1) from the stored df, multi-token tallies the
                     // match walk through the counting sink.
-                    let n = if single_term {
+                    let (n, work) = if single_term {
                         r.term_df(&column_arc, &term_arc[0])
                             .await
                             .map_err(fts_read_error)?
@@ -1186,6 +1208,10 @@ impl SupertableReader {
                             .await
                             .map_err(fts_read_error)?
                     };
+                    if let Some(stats) = &op_stats {
+                        stats.add_fts_postings_bytes(work.postings_bytes);
+                        stats.add_planned_read_ranges(work.planned_ranges);
+                    }
                     Ok(n)
                 }
             },
@@ -1232,6 +1258,7 @@ impl SupertableReader {
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
         let tokens_arc = Arc::new(term_strings);
+        let op_stats = self.op_stats.clone();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
@@ -1240,14 +1267,23 @@ impl SupertableReader {
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
+            let op_stats = op_stats.clone();
             async move {
                 let candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
                 } else {
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
-                    r.token_match(&column_arc, &refs, BoolMode::And)
+                    let (docs, work) = r
+                        .token_match(&column_arc, &refs, BoolMode::And)
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    // The prune pass's posting walk; the verify pass's row
+                    // decode is CPU-side (its take path reports no ranges).
+                    if let Some(stats) = &op_stats {
+                        stats.add_fts_postings_bytes(work.postings_bytes);
+                        stats.add_planned_read_ranges(work.planned_ranges);
+                    }
+                    docs
                 };
                 if candidates.is_empty() {
                     return Ok(Vec::new());

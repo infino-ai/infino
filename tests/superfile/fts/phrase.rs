@@ -353,7 +353,8 @@ async fn unranked_ids_and_count_agree_with_oracle() {
             let ids = r
                 .atoms_match_ids("title", &terms, &phrases, mode)
                 .await
-                .expect("atoms_match_ids");
+                .expect("atoms_match_ids")
+                .0;
             let got: HashSet<u64> = ids.into_iter().map(u64::from).collect();
             assert_eq!(
                 got, want,
@@ -363,7 +364,8 @@ async fn unranked_ids_and_count_agree_with_oracle() {
             let count = r
                 .atoms_match_count("title", &terms, &phrases, mode)
                 .await
-                .expect("atoms_match_count");
+                .expect("atoms_match_count")
+                .0;
             assert_eq!(
                 count as usize,
                 want.len(),

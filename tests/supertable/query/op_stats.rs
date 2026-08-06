@@ -21,7 +21,10 @@ use infino::{
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
-    supertable::{Supertable, SupertableOptions, query::vector::VectorSearchOptions},
+    supertable::{
+        Supertable, SupertableOptions,
+        query::vector::{VectorFilter, VectorSearchOptions},
+    },
     test_helpers::{default_tokenizer, default_vector_config},
 };
 use tempfile::TempDir;
@@ -267,6 +270,103 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
     );
 }
 
+#[test]
+fn an_inline_df1_term_plans_no_posting_range() {
+    // "filler0x0" is unique to one doc: inline in the FST of its home
+    // superfile (zero fetches planned), absent everywhere else. Adding
+    // it to a query must not change the planned range count — a phantom
+    // range per inline term was the old behavior.
+    let st = demo_two_superfiles();
+    let (_, base) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+            .expect("bm25")
+    });
+    let (_, with_inline) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits("title", "rust filler0x0", TOP_K, BoolMode::Or)
+            .expect("bm25")
+    });
+    assert_eq!(
+        with_inline.planned_read_ranges, base.planned_read_ranges,
+        "an inline df=1 term plans no fetch, so it must add no range"
+    );
+    assert!(
+        with_inline.fts_postings_bytes >= base.fts_postings_bytes,
+        "byte counts never shrink when a term is added"
+    );
+}
+
+#[test]
+fn a_scoped_token_match_reports_posting_work() {
+    let st = demo_two_superfiles();
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .token_match("title", "rust async", BoolMode::Or)
+            .expect("token_match")
+    });
+    assert!(!hits.is_empty());
+    assert!(
+        stats.fts_postings_bytes > 0,
+        "an unranked match walks posting bytes; got 0"
+    );
+    assert!(
+        stats.planned_read_ranges > 0,
+        "each PFOR term is one planned range; got 0"
+    );
+}
+
+#[test]
+fn a_scoped_count_reports_posting_work() {
+    let st = demo_two_superfiles();
+    // Single term: the df fast path reads one header range per superfile.
+    let (n_single, single) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .count("title", "rust", BoolMode::Or)
+            .expect("count")
+    });
+    assert!(n_single > 0);
+    assert!(
+        single.planned_read_ranges > 0 && single.fts_postings_bytes > 0,
+        "the df fast path reads real header ranges (ranges {}, bytes {})",
+        single.planned_read_ranges,
+        single.fts_postings_bytes
+    );
+    // Multi-term: the counting walk indexes full posting lists.
+    let (n_multi, multi) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .count("title", "rust async", BoolMode::Or)
+            .expect("count")
+    });
+    assert!(n_multi > 0);
+    assert!(
+        multi.fts_postings_bytes > single.fts_postings_bytes,
+        "the counting walk indexes posting lists, not just headers"
+    );
+}
+
+#[test]
+fn a_scoped_exact_match_reports_posting_work() {
+    let st = demo_two_superfiles();
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .exact_match("title", "filler0x0 rust")
+            .expect("exact_match")
+    });
+    // The exact string exists as doc 0 of segment 0.
+    assert!(!hits.is_empty(), "fixture exact value must match");
+    assert!(
+        stats.fts_postings_bytes > 0,
+        "the prune pass walks posting bytes; got 0"
+    );
+}
+
 // ---- Vector: the drained (hidden-index) deferred-rerank path ----
 
 /// `default_vector_config` is dim=16.
@@ -317,7 +417,9 @@ fn vector_batch(schema: Arc<Schema>) -> RecordBatch {
     let mut titles = Vec::with_capacity(VECTOR_ROWS);
     for i in 0..VECTOR_ROWS {
         flat.extend(row_vec(i));
-        titles.push(format!("row{i:03}"));
+        // "vec" appears in every row (df >= 2 ⇒ PFOR postings), so a
+        // text predicate on it exercises real posting-walk work.
+        titles.push(format!("vec row{i:03}"));
     }
     let fsl = FixedSizeListArray::try_new(
         Arc::new(Field::new("item", DataType::Float32, true)),
@@ -425,6 +527,41 @@ fn a_full_width_probe_scans_every_row_exactly_once() {
     assert_eq!(
         stats.vector_candidates_scanned, VECTOR_ROWS as u64,
         "a full-width probe estimates each stored code exactly once"
+    );
+}
+
+#[test]
+fn a_filtered_vector_query_meters_its_predicate_leg() {
+    // Filtered kNN first resolves the text predicate on the user table
+    // (posting walks), then ranks among matching rows. Both legs are
+    // real work and both must land in the counters — the predicate leg
+    // used to be invisible.
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let (hits, stats) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            Some(VectorFilter {
+                column: "title",
+                query: "vec",
+                mode: BoolMode::Or,
+            }),
+            None,
+        )
+        .expect("filtered vector search")
+    });
+    assert!(!hits.is_empty(), "the fixture predicate matches every row");
+    assert!(
+        stats.fts_postings_bytes > 0,
+        "the predicate leg walks posting bytes; got 0"
+    );
+    assert!(
+        stats.vector_candidates_scanned > 0,
+        "the vector leg still scans candidates; got 0"
     );
 }
 

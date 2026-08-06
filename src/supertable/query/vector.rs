@@ -2623,15 +2623,24 @@ impl SupertableReader {
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
+        let op_stats = self.op_stats.clone();
         self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
             let filter_col_arc = Arc::clone(&filter_col_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
+            let op_stats = op_stats.clone();
             async move {
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
-                r.token_match(&filter_col_arc, &refs, mode)
+                let (docs, work) = r
+                    .token_match(&filter_col_arc, &refs, mode)
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))
-                    .map(|docs| docs.into_iter().collect::<RoaringBitmap>())
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                // The predicate-resolution leg of filtered vector search
+                // is FTS work like any other; flush it per superfile.
+                if let Some(stats) = &op_stats {
+                    stats.add_fts_postings_bytes(work.postings_bytes);
+                    stats.add_planned_read_ranges(work.planned_ranges);
+                }
+                Ok(docs.into_iter().collect::<RoaringBitmap>())
             }
         })
         .await
@@ -3214,17 +3223,26 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
+        let op_stats = self.op_stats.clone();
         self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
             let plan = Arc::clone(&plan_arc);
+            let op_stats = op_stats.clone();
             async move {
-                plan.evaluate(r.as_ref())
+                let (bitmap, work) = plan
+                    .evaluate(r.as_ref())
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?
-                    .ok_or_else(|| {
-                        QueryError::Execute(
-                            "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
-                        )
-                    })
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                // The SQL predicate's posting walks, summed across the
+                // plan tree — the pushdown leg of the vector TVF.
+                if let Some(stats) = &op_stats {
+                    stats.add_fts_postings_bytes(work.postings_bytes);
+                    stats.add_planned_read_ranges(work.planned_ranges);
+                }
+                bitmap.ok_or_else(|| {
+                    QueryError::Execute(
+                        "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                    )
+                })
             }
         })
         .await

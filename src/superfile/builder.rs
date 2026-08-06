@@ -3504,7 +3504,8 @@ mod tests {
         let hits = fts_reader_merged
             .token_match("title", &["common"], BoolMode::Or)
             .await
-            .expect("token_match on merged");
+            .expect("token_match on merged")
+            .0;
         assert_eq!(
             hits.len() as u64,
             total_docs,

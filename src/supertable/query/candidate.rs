@@ -51,7 +51,10 @@ use roaring::RoaringBitmap;
 use crate::{
     superfile::{
         ReadError, SuperfileReader,
-        fts::{reader::BoolMode, tokenize::Tokenizer},
+        fts::{
+            reader::{BoolMode, MatchWork},
+            tokenize::Tokenizer,
+        },
     },
     supertable::{
         error::QueryError,
@@ -111,44 +114,53 @@ impl CandidatePlan {
     /// — scan all rows"; `Ok(Some(bitmap))` is the candidate
     /// `local_doc_id` superset (possibly empty). `TermsAll` is one
     /// `token_match(.., And)`; `And`/`Or` intersect/union children.
+    /// The second element sums the posting-walk work of every `TermsAll`
+    /// leaf the evaluation touched (an early-out keeps the work already
+    /// done), so the caller can flush it per superfile.
     pub(crate) fn evaluate<'a>(
         &'a self,
         reader: &'a SuperfileReader,
-    ) -> BoxFuture<'a, Result<Option<RoaringBitmap>, ReadError>> {
+    ) -> BoxFuture<'a, Result<(Option<RoaringBitmap>, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
-                CandidatePlan::Unbounded => Ok(None),
+                CandidatePlan::Unbounded => Ok((None, MatchWork::default())),
                 CandidatePlan::TermsAll { column, tokens } => {
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                    let docs = reader.token_match(column, &refs, BoolMode::And).await?;
-                    Ok(Some(docs.into_iter().collect()))
+                    let (docs, work) = reader.token_match(column, &refs, BoolMode::And).await?;
+                    Ok((Some(docs.into_iter().collect()), work))
                 }
                 CandidatePlan::And(children) => {
                     let mut acc: Option<RoaringBitmap> = None;
+                    let mut work = MatchWork::default();
                     for c in children {
-                        if let Some(bm) = c.evaluate(reader).await? {
+                        let (child, child_work) = c.evaluate(reader).await?;
+                        work.merge(child_work);
+                        if let Some(bm) = child {
                             acc = Some(match acc {
                                 Some(a) => a & bm,
                                 None => bm,
                             });
                             if acc.as_ref().is_some_and(RoaringBitmap::is_empty) {
-                                return Ok(Some(RoaringBitmap::new()));
+                                return Ok((Some(RoaringBitmap::new()), work));
                             }
                         }
                         // A `None` (unbounded) child adds no constraint.
                     }
-                    Ok(acc)
+                    Ok((acc, work))
                 }
                 CandidatePlan::Or(children) => {
                     let mut acc = RoaringBitmap::new();
+                    let mut work = MatchWork::default();
                     for c in children {
-                        match c.evaluate(reader).await? {
+                        let (child, child_work) = c.evaluate(reader).await?;
+                        work.merge(child_work);
+                        match child {
                             Some(bm) => acc |= bm,
                             // An unbounded branch makes the union unbounded.
-                            None => return Ok(None),
+                            None => return Ok((None, work)),
                         }
                     }
-                    Ok(Some(acc))
+                    Ok((Some(acc), work))
                 }
             }
         })
@@ -248,43 +260,47 @@ impl CandidatePlan {
     /// predicate would match a large fraction of the superfile — there the
     /// matches saturate the data pages so an index `RowSelection` can't
     /// skip any, and a plain scan is cheaper.
+    /// The second element sums the header-fetch work of every leaf df
+    /// probe, so the caller can flush it per superfile.
     pub(crate) fn estimate<'a>(
         &'a self,
         reader: &'a SuperfileReader,
-    ) -> BoxFuture<'a, Result<u64, ReadError>> {
+    ) -> BoxFuture<'a, Result<(u64, MatchWork), ReadError>> {
         Box::pin(async move {
             let n_docs = reader.n_docs();
             match self {
-                CandidatePlan::Unbounded => Ok(n_docs),
+                CandidatePlan::Unbounded => Ok((n_docs, MatchWork::default())),
                 CandidatePlan::TermsAll { column, tokens } => {
                     if tokens.is_empty() {
-                        return Ok(n_docs);
+                        return Ok((n_docs, MatchWork::default()));
                     }
                     // Intersection ≤ the rarest token's df — resolved with
                     // one batched df lookup (single FST parse + coalesced
                     // header fetch) rather than one parse + fetch per token.
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                    let min_df = reader
-                        .term_dfs(column, &refs)
-                        .await?
-                        .into_iter()
-                        .min()
-                        .unwrap_or(u64::MAX);
-                    Ok(min_df.min(n_docs))
+                    let (dfs, work) = reader.term_dfs(column, &refs).await?;
+                    let min_df = dfs.into_iter().min().unwrap_or(u64::MAX);
+                    Ok((min_df.min(n_docs), work))
                 }
                 CandidatePlan::And(children) => {
                     let mut m = n_docs;
+                    let mut work = MatchWork::default();
                     for c in children {
-                        m = m.min(c.estimate(reader).await?);
+                        let (child, child_work) = c.estimate(reader).await?;
+                        work.merge(child_work);
+                        m = m.min(child);
                     }
-                    Ok(m)
+                    Ok((m, work))
                 }
                 CandidatePlan::Or(children) => {
                     let mut sum: u64 = 0;
+                    let mut work = MatchWork::default();
                     for c in children {
-                        sum = sum.saturating_add(c.estimate(reader).await?);
+                        let (child, child_work) = c.estimate(reader).await?;
+                        work.merge(child_work);
+                        sum = sum.saturating_add(child);
                     }
-                    Ok(sum.min(n_docs))
+                    Ok((sum.min(n_docs), work))
                 }
             }
         })

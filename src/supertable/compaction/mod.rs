@@ -1722,7 +1722,7 @@ mod tests {
 
         // Each batch has 2 docs sharing a unique word — search for each batch's unique term
         for term in &["alpha", "beta", "gamma"] {
-            let hits = merged_reader
+            let (hits, _) = merged_reader
                 .token_match("title", &[*term], BoolMode::And)
                 .await
                 .unwrap_or_else(|_| panic!("token_match for '{term}'"));
@@ -1944,7 +1944,8 @@ mod tests {
         let fts_hits = merged_reader
             .token_match("title", &["alpha"], BoolMode::And)
             .await
-            .expect("token_match on merged superfile");
+            .expect("token_match on merged superfile")
+            .0;
         assert_eq!(fts_hits.len(), 4, "all four 'alpha' docs must match");
     }
 
@@ -2053,7 +2054,8 @@ mod tests {
         let only_hits = merged_reader
             .token_match("title", &["only"], BoolMode::And)
             .await
-            .expect("token_match for 'only'");
+            .expect("token_match for 'only'")
+            .0;
         assert_eq!(
             only_hits.len(),
             1,
@@ -2063,7 +2065,8 @@ mod tests {
         let second_hits = merged_reader
             .token_match("title", &["second"], BoolMode::And)
             .await
-            .expect("token_match for 'second'");
+            .expect("token_match for 'second'")
+            .0;
         assert_eq!(
             second_hits.len(),
             1,

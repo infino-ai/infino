@@ -755,7 +755,8 @@ pub mod fts {
                     return self
                         .atoms_match_count(column, &refs, &owned, eff_mode)
                         .await
-                        .expect("superfile atoms_match_count");
+                        .expect("superfile atoms_match_count")
+                        .0;
                 }
                 let refs: Vec<&str> = terms.iter().map(|t| &**t).collect();
                 // Single term: df is the exact match count, read O(1) from
@@ -768,10 +769,12 @@ pub mod fts {
                     self.term_df(column, refs[0])
                         .await
                         .expect("superfile term_df")
+                        .0
                 } else {
                     self.token_match_count(column, &refs, eff_mode)
                         .await
                         .expect("superfile token_match_count")
+                        .0
                 }
             })
         }

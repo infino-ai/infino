@@ -4685,8 +4685,8 @@ mod tests {
         }
         for term in ["common", "medium", "uniqueonce", "dupdup"] {
             assert_eq!(
-                ra.term_df("title", term).await.expect("df a"),
-                rb.term_df("title", term).await.expect("df b"),
+                ra.term_df("title", term).await.expect("df a").0,
+                rb.term_df("title", term).await.expect("df b").0,
                 "df diverged for {term}"
             );
         }
@@ -4760,8 +4760,8 @@ mod tests {
             assert!(!a.is_empty());
         }
         assert_eq!(
-            v1.term_df("title", "common").await.expect("v1 df"),
-            v2.term_df("title", "common").await.expect("v2 df"),
+            v1.term_df("title", "common").await.expect("v1 df").0,
+            v2.term_df("title", "common").await.expect("v2 df").0,
         );
     }
 
@@ -4881,17 +4881,19 @@ mod tests {
         // Count + df fast paths agree too (df reads the term meta's
         // first bytes — layout-stable across the stride change).
         for term in ["common", "medium", "uniqueonce", "dupdup"] {
-            let a = v1.term_df("title", term).await.expect("v1 df");
-            let b = v2.term_df("title", term).await.expect("v2 df");
+            let a = v1.term_df("title", term).await.expect("v1 df").0;
+            let b = v2.term_df("title", term).await.expect("v2 df").0;
             assert_eq!(a, b, "df diverged for {term}");
             let ca = v1
                 .token_match_count("title", &[term], BoolMode::Or)
                 .await
-                .expect("v1 count");
+                .expect("v1 count")
+                .0;
             let cb = v2
                 .token_match_count("title", &[term], BoolMode::Or)
                 .await
-                .expect("v2 count");
+                .expect("v2 count")
+                .0;
             assert_eq!(ca, cb, "count diverged for {term}");
         }
     }
@@ -4932,7 +4934,8 @@ mod tests {
         let shared_body = r
             .token_match_count("body", &["shared"], BoolMode::Or)
             .await
-            .expect("shared body");
+            .expect("shared body")
+            .0;
         assert_eq!(shared_body, BLOCK_LEN as u64 + 9);
     }
 }

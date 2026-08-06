@@ -194,11 +194,13 @@ async fn open_lazy_reads_positional_v2_blob_like_eager() {
     let lazy_hits = lazy
         .token_match("title", &["special"], BoolMode::And)
         .await
-        .expect("lazy match");
+        .expect("lazy match")
+        .0;
     let eager_hits = eager
         .token_match("title", &["special"], BoolMode::And)
         .await
-        .expect("eager match");
+        .expect("eager match")
+        .0;
     assert_eq!(lazy_hits, eager_hits);
     assert_eq!(lazy_hits, vec![0, 2]);
 }
