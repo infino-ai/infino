@@ -3,10 +3,11 @@
 
 //! In-engine metering signals for benches and `features = ["metering"]`.
 //!
-//! Three resource families — parallel names, one ownership home:
+//! Four resource families — parallel names, one ownership home:
 //! - [`io`] — object-store request/byte ledger (+ background attribution)
 //! - [`cpu`] — process on-CPU time
 //! - [`rss`] — process resident set / peak sampler
+//! - [`op_stats`] — per-query execution work counters
 //!
 //! Storage providers `record_*` into [`UsageMeter`]; they do not own it.
 //! Benches and platform must use these APIs rather than reimplement
@@ -15,6 +16,7 @@
 pub mod cpu;
 pub mod ingest;
 pub mod io;
+pub mod op_stats;
 pub mod rss;
 
 pub use ingest::classify_batch_bytes;

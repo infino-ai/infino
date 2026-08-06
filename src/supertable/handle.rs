@@ -41,6 +41,7 @@ use super::{
 use crate::{
     config,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{PrefixedStorageProvider, StorageError},
     superfile::{
         builder::VectorConfig,
@@ -599,6 +600,10 @@ impl Supertable {
             manifest: self.inner.manifest.load_full(),
             tombstone_cache: self.inner.tombstone_cache.clone(),
             inner: Arc::clone(&self.inner),
+            // The public search methods mint their reader on the caller's
+            // thread, so this is the one point where an active
+            // `with_op_stats` scope hands its collector to the query.
+            op_stats: op_stats::current(),
         }
     }
     }
@@ -1784,6 +1789,12 @@ pub struct SupertableReader {
     /// keeps the runtime alive for the reader's lifetime, so a reader
     /// captured before its parent `Supertable` drops can still query.
     inner: Arc<SupertableInner>,
+    /// Per-query work collector, picked up from the caller's active
+    /// [`with_op_stats`](crate::runtime_metrics::op_stats::with_op_stats)
+    /// scope at mint time. `None` (the default) makes every counter
+    /// flush a no-op branch. Query kernels clone the `Arc` into their
+    /// fan-out bodies; the thread-local is never consulted past mint.
+    pub(crate) op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 /// A non-owning handle to a pinned reader snapshot, held by the SQL
@@ -1908,6 +1919,12 @@ impl SupertableReader {
             manifest,
             tombstone_cache,
             inner,
+            // A `WeakReader` is cached inside a `SessionContext` that
+            // outlives individual queries, so a collector captured here
+            // would mis-attribute later queries to an earlier scope. The
+            // SQL path gets its own per-query attribution channel; until
+            // then TVF-driven searches deliberately record no work stats.
+            op_stats: None,
         }
     }
 

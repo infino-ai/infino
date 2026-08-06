@@ -454,6 +454,7 @@ impl SupertableReader {
         // excluded from the merge so deleted rows never raise the bar.
         let shared = SharedTopK::new(k);
         let tombstones = self.tombstone_cache.clone();
+        let op_stats = self.op_stats.clone();
         let now = Instant::now();
 
         // Ranged units are slices of ONE superfile: share its cursor build
@@ -493,6 +494,7 @@ impl SupertableReader {
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
             let global_idf = global_idf.clone();
+            let op_stats = op_stats.clone();
             async move {
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
@@ -524,14 +526,21 @@ impl SupertableReader {
                             .get_or_try_init(|| async {
                                 let should_refs: Vec<&str> =
                                     should_arc.iter().map(|s| s.as_str()).collect();
-                                r.bm25_or_cursor_set(
-                                    &column_arc,
-                                    &should_refs,
-                                    global_idf.as_deref(),
-                                )
-                                .await
-                                .map(Arc::new)
-                                .map_err(fts_read_error)
+                                let set = r
+                                    .bm25_or_cursor_set(
+                                        &column_arc,
+                                        &should_refs,
+                                        global_idf.as_deref(),
+                                    )
+                                    .await
+                                    .map_err(fts_read_error)?;
+                                // Flushed inside the OnceCell init so slices
+                                // sharing this superfile's cursor set count
+                                // its posting bytes exactly once.
+                                if let Some(stats) = &op_stats {
+                                    stats.add_fts_postings_bytes(set.postings_bytes());
+                                }
+                                Ok(Arc::new(set))
                             })
                             .await?;
                         // Heavy kernels go to the reader pool; trivial ones
@@ -583,6 +592,9 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(fts_read_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(prep.postings_bytes());
+                        }
                         // Gate on posting mass, not term count: this scan
                         // isn't sliced, so a rare-term query with many
                         // terms can be cheaper than a common-term pair.

@@ -9,6 +9,7 @@ pub mod hierarchical;
 pub mod hybrid_search;
 mod id_resolve;
 pub mod match_search;
+mod op_stats;
 mod query_errors;
 mod query_surface;
 pub mod skip_pruning;

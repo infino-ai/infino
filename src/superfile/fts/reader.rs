@@ -189,8 +189,14 @@ impl ClauseLists<'_> {
 /// cursors for one clause shape still to score. Owns its `ExcludeFilter`
 /// rather than borrowing it, so it can move into a `'static` closure.
 pub(crate) enum PreparedClauses {
-    /// Already final — nothing left for `run_prepared` to do.
-    Done(Vec<(u32, f32)>),
+    /// Already final — nothing left for `run_prepared` to do. Carries
+    /// the posting (and phrase-position) bytes the inline walk indexed
+    /// into, so the fast paths report work like the cursor-carrying
+    /// shapes do.
+    Done {
+        hits: Vec<(u32, f32)>,
+        postings_bytes: u64,
+    },
     /// AND-only: intersect `must_cursors`.
     Must {
         column_id: u32,
@@ -219,13 +225,37 @@ pub(crate) enum PreparedClauses {
     },
 }
 
+/// Sum of the posting-byte ranges a cursor set indexes into (each cursor's
+/// term metadata + skip table + posting blocks). Feeds the per-query work
+/// stats ([`crate::runtime_metrics::op_stats`]).
+fn term_cursor_bytes(cursors: &[TermCursor]) -> u64 {
+    cursors.iter().map(|c| c.bytes.len() as u64).sum()
+}
+
+/// [`term_cursor_bytes`] for heterogeneous atoms: a phrase member counts
+/// its posting bytes **and** its position runs — positional verification
+/// is exactly the work that separates phrase cost from term cost.
+fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
+    atoms
+        .iter()
+        .map(|a| match a {
+            AnyCursor::Term(c) => c.bytes.len() as u64,
+            AnyCursor::Phrase(p) => p
+                .members
+                .iter()
+                .map(|m| m.cursor.bytes.len() as u64 + m.positions.len() as u64)
+                .sum(),
+        })
+        .sum()
+}
+
 impl PreparedClauses {
     /// Scan-cost proxy callers gate reader-pool dispatch on: the driving
     /// (smallest) posting list for the AND-intersect shapes, the full
     /// union for OR. `Done` has nothing left to scan, so it's zero.
     pub(crate) fn posting_mass(&self) -> u64 {
         match self {
-            PreparedClauses::Done(_) => 0,
+            PreparedClauses::Done { .. } => 0,
             PreparedClauses::Must { must_cursors, .. } => {
                 must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
             }
@@ -233,6 +263,38 @@ impl PreparedClauses {
                 must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
             }
             PreparedClauses::Or { cursors, .. } => cursors.iter().map(|c| c.df).sum(),
+        }
+    }
+
+    /// Posting-list bytes resident for this prepared query — what the
+    /// kernels index into across musts, shoulds, OR terms, and negation
+    /// filters (plus phrase position runs on the inline `Done` path).
+    /// Deterministic for a given query against a given superfile (cache
+    /// temperature never changes it) — the per-query work stats flush
+    /// this once per superfile.
+    pub(crate) fn postings_bytes(&self) -> u64 {
+        let filter_bytes =
+            |filter: &Option<ExcludeFilter>| filter.as_ref().map_or(0, |f| f.postings_bytes());
+        match self {
+            PreparedClauses::Done { postings_bytes, .. } => *postings_bytes,
+            PreparedClauses::Must {
+                must_cursors,
+                filter,
+                ..
+            } => term_cursor_bytes(must_cursors) + filter_bytes(filter),
+            PreparedClauses::MustShould {
+                must_cursors,
+                should_cursors,
+                filter,
+                ..
+            } => {
+                term_cursor_bytes(must_cursors)
+                    + term_cursor_bytes(should_cursors)
+                    + filter_bytes(filter)
+            }
+            PreparedClauses::Or {
+                cursors, filter, ..
+            } => term_cursor_bytes(cursors) + filter_bytes(filter),
         }
     }
 }
@@ -1834,11 +1896,17 @@ impl FtsReader {
     ) -> Result<PreparedClauses, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if k == 0 {
-            return Ok(PreparedClauses::Done(Vec::new()));
+            return Ok(PreparedClauses::Done {
+                hits: Vec::new(),
+                postings_bytes: 0,
+            });
         }
         if lists.no_positive_atoms() {
             if lists.no_negative_atoms() {
-                return Ok(PreparedClauses::Done(Vec::new()));
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    postings_bytes: 0,
+                });
             }
             return Err(FtsError::NegationOnly);
         }
@@ -1850,8 +1918,13 @@ impl FtsReader {
                 .build_atom_cursors(column_id, lists.musts, lists.must_phrases, lists.global_idf)
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
-                // A must atom can never match in this superfile.
-                return Ok(PreparedClauses::Done(Vec::new()));
+                // A must atom can never match in this superfile. The
+                // atoms that DID build still cost their bytes.
+                let built: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    postings_bytes: atom_cursor_bytes(&built),
+                });
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
             let should_atoms: Vec<AnyCursor> = self
@@ -1873,13 +1946,19 @@ impl FtsReader {
                 .into_iter()
                 .flatten()
                 .collect();
+            let postings_bytes = atom_cursor_bytes(&must_atoms)
+                + atom_cursor_bytes(&should_atoms)
+                + atom_cursor_bytes(&negative_atoms);
             let filter = match negative_atoms.is_empty() {
                 true => None,
                 false => Some(AtomExcludeFilter::new(negative_atoms)),
             };
             let result =
                 self.run_atoms_search(column_id, must_atoms, should_atoms, k, filter, floor_eff)?;
-            return Ok(PreparedClauses::Done(result));
+            return Ok(PreparedClauses::Done {
+                hits: result,
+                postings_bytes,
+            });
         }
 
         let neg_filter = match lists.negatives {
@@ -1907,10 +1986,14 @@ impl FtsReader {
                 .next()
                 .expect("one atom");
             let mut filter = neg_filter;
-            let result = self
+            let filter_postings_bytes = filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+            let (result, term_postings_bytes) = self
                 .search_single_term_bmw(column_id, term, k, filter.as_mut(), floor_eff)
                 .await?;
-            return Ok(PreparedClauses::Done(result));
+            return Ok(PreparedClauses::Done {
+                hits: result,
+                postings_bytes: term_postings_bytes + filter_postings_bytes,
+            });
         }
 
         if lists.musts.is_empty() {
@@ -1918,7 +2001,11 @@ impl FtsReader {
                 .build_term_cursors(column_id, lists.shoulds, lists.global_idf)
                 .await?;
             if cursors.is_empty() {
-                return Ok(PreparedClauses::Done(Vec::new()));
+                let postings_bytes = neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    postings_bytes,
+                });
             }
             return Ok(PreparedClauses::Or {
                 column_id,
@@ -1934,7 +2021,12 @@ impl FtsReader {
             .build_term_cursors(column_id, lists.musts, lists.global_idf)
             .await?;
         if must_cursors.len() != lists.musts.len() {
-            return Ok(PreparedClauses::Done(Vec::new()));
+            let postings_bytes = term_cursor_bytes(&must_cursors)
+                + neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+            return Ok(PreparedClauses::Done {
+                hits: Vec::new(),
+                postings_bytes,
+            });
         }
         if lists.shoulds.is_empty() {
             return Ok(PreparedClauses::Must {
@@ -1973,7 +2065,7 @@ impl FtsReader {
     /// cursors it fetched. No I/O, so it can run on the reader pool.
     pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
         match prep {
-            PreparedClauses::Done(result) => Ok(result),
+            PreparedClauses::Done { hits, .. } => Ok(hits),
             PreparedClauses::Must {
                 column_id,
                 must_cursors,
@@ -2330,7 +2422,7 @@ impl FtsReader {
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
@@ -2340,7 +2432,7 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let key = make_key(&col_meta.name, term);
         let Some(packed) = dict.lookup(&key) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         let (metadata_offset, postings_length) = match FstValue::unpack(packed) {
             FstValue::Inline { doc_id, tf } => {
@@ -2359,17 +2451,19 @@ impl FtsReader {
                 let idf_t = bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
+                // The inline slot read no postings-region bytes; the
+                // work-stats byte count for this path is genuinely zero.
                 if let Some(f) = filter.as_deref_mut()
                     && !f.admits(doc_id)
                 {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), 0));
                 }
                 let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 if score <= floor_eff {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), 0));
                 }
-                return Ok(vec![(doc_id, score)]);
+                return Ok((vec![(doc_id, score)], 0));
             }
             FstValue::Pfor {
                 metadata_offset,
@@ -2458,7 +2552,7 @@ impl FtsReader {
             }
         }
 
-        Ok(drain_top_k_desc(heap))
+        Ok((drain_top_k_desc(heap), term_bytes.len() as u64))
     }
 
     /// Build one `TermCursor` per term that resolves in the FST.
@@ -4040,6 +4134,13 @@ impl OrCursorSet {
     pub(crate) fn len(&self) -> usize {
         self.cursors.len()
     }
+
+    /// Posting-list bytes this set's cursors index into — see
+    /// [`PreparedClauses::postings_bytes`]. Counted once per superfile
+    /// even when ranged slices share the set.
+    pub(crate) fn postings_bytes(&self) -> u64 {
+        term_cursor_bytes(&self.cursors)
+    }
 }
 
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
@@ -4548,6 +4649,12 @@ impl ExcludeFilter {
             cursors,
             last_doc: 0,
         }
+    }
+
+    /// Posting-list bytes the negation cursors index into — see
+    /// [`PreparedClauses::postings_bytes`].
+    fn postings_bytes(&self) -> u64 {
+        term_cursor_bytes(&self.cursors)
     }
 }
 
