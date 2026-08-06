@@ -13,6 +13,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_array::Array;
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
+    InfinoError,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::fts::reader::{Bm25Stats, BoolMode},
     supertable::{
@@ -372,6 +373,68 @@ async fn writer_update_cardinality_mismatch_is_rejected() {
             new_rows: 2
         }
     ));
+}
+
+/// The folded `Supertable::update` treats a predicate matching no rows as a
+/// zero-count no-op: the writer buffers nothing, so there is no commit outcome
+/// to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn folded_update_with_no_matches_is_a_zero_count_no_op() {
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    )
+    .expect("create");
+    st.append(&build_title_batch(&["alpha", "bravo"]))
+        .expect("append");
+
+    let stats = st
+        .update(col("title").eq(lit("not-present")), &build_title_batch(&[]))
+        .expect("a zero-match update is a no-op, not a fault");
+    assert_eq!(stats.matched(), 0);
+    assert_eq!(stats.n_tombstoned(), 0);
+    assert_eq!(stats.n_not_found(), 0);
+
+    // The no-op left the table exactly as it was.
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT title FROM supertable")
+        .expect("sql");
+    let n_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(n_rows, 2);
+}
+
+/// Zero matches with replacement rows supplied is still a cardinality error —
+/// the no-op path must not swallow rows the caller handed over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn folded_update_with_no_matches_but_replacement_rows_is_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    )
+    .expect("create");
+    st.append(&build_title_batch(&["alpha"])).expect("append");
+
+    let err = st
+        .update(
+            col("title").eq(lit("not-present")),
+            &build_title_batch(&["replacement"]),
+        )
+        .expect_err("zero matches against one replacement row is a mismatch");
+    assert!(matches!(err, InfinoError::Cardinality(_)), "got: {err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

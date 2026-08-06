@@ -105,6 +105,17 @@ impl MutationStats {
         self.n_not_found
     }
 
+    /// Zero-count stats for a mutation that resolved to no rows. No WAL ran, so
+    /// `wal_id` is left nil.
+    pub(crate) fn empty() -> Self {
+        Self {
+            wal_id: WalId(0),
+            matched: 0,
+            n_tombstoned: 0,
+            n_not_found: 0,
+        }
+    }
+
     /// Build stats from a hosted (remote) mutation response. `wal_id` is a
     /// server-side recovery detail with no meaning — and no public accessor —
     /// for a remote client, so it is left nil.
