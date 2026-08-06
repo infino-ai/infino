@@ -2086,6 +2086,7 @@ impl SupertableReader {
         let query_arc = Arc::new(query.to_vec());
         let column_arc2 = Arc::clone(&column_arc);
         let query_arc2 = Arc::clone(&query_arc);
+        let op_stats_scan = self.op_stats.clone();
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
         // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
         let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
@@ -2116,6 +2117,7 @@ impl SupertableReader {
                 let budget = budget.clone();
                 let storage = storage.clone();
                 let scan_pool = Arc::clone(&scan_pool_body);
+                let op_stats = op_stats_scan.clone();
                 async move {
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
@@ -2159,6 +2161,9 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(vector_read_query_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
+                        }
                         if !scan.candidates.is_empty() {
                             scan_pool
                                 .lock()
@@ -2316,6 +2321,11 @@ impl SupertableReader {
                             .map(|sel| (Arc::clone(entry), sel))
                     })
                     .collect();
+                if let Some(stats) = &self.op_stats {
+                    stats.add_vector_rows_reranked(
+                        rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum(),
+                    );
+                }
                 let column = Arc::clone(&column_arc2);
                 let query = Arc::clone(&query_arc2);
                 let reader_pool = Arc::clone(&manifest.options.reader_pool);

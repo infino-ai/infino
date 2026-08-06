@@ -3412,6 +3412,8 @@ impl VectorReader {
             hits: Vec::new(),
             candidates: Vec::new(),
             rot_seed,
+            cells_scanned: 0,
+            candidates_scanned: 0,
         };
         if k == 0 || self.n_docs == 0 {
             return Ok(outcome);
@@ -3493,8 +3495,12 @@ impl VectorReader {
                 let cb = col.quant.code_bytes();
                 let (cluster_meta, prefix_ranges) = chosen_cluster_meta(col, &cluster_idx, &locals);
                 if cluster_meta.is_empty() {
-                    return Ok((Vec::new(), Vec::new()));
+                    return Ok((Vec::new(), Vec::new(), 0));
                 }
+                // Work-stats tally, taken before the warm/cold branch so
+                // both arms count the codes their clusters hold.
+                let candidates_scanned: u64 =
+                    cluster_meta.iter().map(|(_, _, cnt)| u64::from(*cnt)).sum();
                 // Warm fast path: every prefix resident -> defer rerank.
                 let prefix_blocks: Option<Vec<Bytes>> = prefix_ranges
                     .iter()
@@ -3525,9 +3531,10 @@ impl VectorReader {
                             cell_idx,
                         })
                         .collect();
-                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>), VectorError>((
+                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64), VectorError>((
                         Vec::new(),
                         cands,
+                        candidates_scanned,
                     ));
                 }
                 // Cold (or RabitqOnly): probe-and-rerank now, width-divided.
@@ -3548,17 +3555,23 @@ impl VectorReader {
                         .map(|(local_id, score)| (base.saturating_add(local_id), score))
                         .collect(),
                     Vec::new(),
+                    candidates_scanned,
                 ))
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>)> = stream::iter(cell_scans)
-            .buffer_unordered(max_in_flight)
-            .try_collect()
-            .await?;
-        for (hits, cands) in per_cell_results {
+        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64)> =
+            stream::iter(cell_scans)
+                .buffer_unordered(max_in_flight)
+                .try_collect()
+                .await?;
+        for (hits, cands, candidates_scanned) in per_cell_results {
             outcome.hits.extend(hits);
             outcome.candidates.extend(cands);
+            if candidates_scanned > 0 {
+                outcome.cells_scanned += 1;
+                outcome.candidates_scanned += candidates_scanned;
+            }
         }
         // Cold hits merge to this file's top-k exactly as the immediate
         // path does; candidates stay unbounded here (per-cell heaps
@@ -4478,6 +4491,12 @@ pub(crate) struct ScanOutcome {
     /// The column's rotation seed — the supertable asserts every pooled
     /// unit agrees before comparing estimates across superfiles.
     pub(crate) rot_seed: u64,
+    /// Cells this scan probed (chose ≥1 cluster in), for the per-query
+    /// work stats.
+    pub(crate) cells_scanned: u64,
+    /// Quantized codes estimated: Σ cluster row counts over every chosen
+    /// cluster, warm and cold arms alike.
+    pub(crate) candidates_scanned: u64,
 }
 
 async fn build_shortlist(

@@ -11,14 +11,16 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    runtime_metrics::op_stats::with_op_stats,
+    runtime_metrics::op_stats::{OpStats, with_op_stats},
+    storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
-    supertable::{Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
+    supertable::{Supertable, SupertableOptions, query::vector::VectorSearchOptions},
+    test_helpers::{default_tokenizer, default_vector_config},
 };
+use tempfile::TempDir;
 
 /// Docs per committed segment. Commits row-shard across the writer
 /// pool, so this must keep every term's per-superfile df ≥ 2 —
@@ -163,4 +165,141 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
         stats.fts_postings_bytes, 0,
         "pickup happens at reader mint, not at query time"
     );
+}
+
+// ---- Vector: the drained (hidden-index) deferred-rerank path ----
+
+/// `default_vector_config` is dim=16.
+const DIM: usize = 16;
+/// Rows in the vector fixture — enough for a non-degenerate drain.
+const VECTOR_ROWS: usize = 64;
+/// Top-k for the vector work-stats queries.
+const VECTOR_K: usize = 4;
+/// Probe width > 1 so the drained table takes the deferred-rerank path
+/// (immediate-rerank widths report no scan tallies yet).
+const VECTOR_NPROBE: usize = 2;
+/// Random-rotation seed for the fixture's vector index.
+const VECTOR_ROT_SEED: u64 = 13;
+
+/// Deterministic non-degenerate vector for row `i`.
+fn row_vec(i: usize) -> Vec<f32> {
+    (0..DIM)
+        .map(|d| ((i * 31 + d * 17 + 7) % 97) as f32 / 97.0 + 0.05)
+        .collect()
+}
+
+fn vector_options() -> SupertableOptions {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            false,
+        ),
+    ]));
+    SupertableOptions::new(
+        schema,
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+        Some(default_tokenizer()),
+    )
+    .expect("valid options")
+}
+
+fn vector_batch(schema: Arc<Schema>) -> RecordBatch {
+    let mut flat = Vec::<f32>::with_capacity(VECTOR_ROWS * DIM);
+    let mut titles = Vec::with_capacity(VECTOR_ROWS);
+    for i in 0..VECTOR_ROWS {
+        flat.extend(row_vec(i));
+        titles.push(format!("row{i:03}"));
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(LargeStringArray::from(titles)) as ArrayRef,
+            Arc::new(fsl),
+        ],
+    )
+    .expect("batch")
+}
+
+/// A committed + drained vector table (hidden cell index built), so
+/// queries run the deferred-rerank serving path the counters cover.
+fn drained_vector_table(dir: &TempDir) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(vector_options().with_storage(storage)).expect("create");
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&vector_batch(schema)).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    st.drain_vectors_to_cells_sync().expect("drain");
+    st
+}
+
+/// One scoped vector query over the drained table.
+fn scoped_vector_stats(st: &Supertable) -> OpStats {
+    let query = row_vec(3);
+    let (hits, stats) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+        .expect("vector search")
+    });
+    assert!(!hits.is_empty(), "fixture vector query must match");
+    stats
+}
+
+#[test]
+fn a_scoped_vector_query_reports_scan_and_rerank_work() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let stats = scoped_vector_stats(&st);
+    assert!(
+        stats.vector_cells_scanned >= VECTOR_NPROBE as u64,
+        "a width-{VECTOR_NPROBE} probe scans at least that many cells; got {}",
+        stats.vector_cells_scanned
+    );
+    assert!(
+        stats.vector_candidates_scanned >= stats.vector_cells_scanned,
+        "every scanned cell holds at least one code (candidates {}, cells {})",
+        stats.vector_candidates_scanned,
+        stats.vector_cells_scanned
+    );
+    assert!(
+        stats.vector_rows_reranked > 0,
+        "the global shortlist reranks a non-empty winner set"
+    );
+    assert!(
+        stats.vector_rows_reranked <= stats.vector_candidates_scanned,
+        "rerank rows are shortlist survivors of the scanned candidates"
+    );
+}
+
+#[test]
+fn vector_work_stats_are_deterministic_across_cache_temperature() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let cold = scoped_vector_stats(&st);
+    let warm = scoped_vector_stats(&st);
+    assert_eq!(cold, warm, "same plan, same table state, same work");
 }

@@ -36,6 +36,18 @@ pub struct OpStats {
     /// (musts, shoulds, plain OR terms, and negation filters). Counted once
     /// per superfile even when ranged slices share a cursor set.
     pub fts_postings_bytes: u64,
+    /// Vector cells the query's scans actually probed, summed across
+    /// superfiles (a cell counts once per superfile scan that chose at
+    /// least one of its clusters).
+    pub vector_cells_scanned: u64,
+    /// Quantized codes the cell scans estimated (Σ cluster row counts over
+    /// every chosen cluster, warm and cold arms alike).
+    pub vector_candidates_scanned: u64,
+    /// Rows rescored at full precision by the global-shortlist rerank
+    /// (phase C of the deferred-rerank path — the steady post-drain
+    /// serving state). The cold arm's immediate rerank is not yet
+    /// attributed; its candidate scan above is.
+    pub vector_rows_reranked: u64,
 }
 
 /// Accumulates one query's work counters across its fan-out (tokio unit
@@ -43,6 +55,9 @@ pub struct OpStats {
 #[derive(Debug, Default)]
 pub struct OpStatsCollector {
     fts_postings_bytes: AtomicU64,
+    vector_cells_scanned: AtomicU64,
+    vector_candidates_scanned: AtomicU64,
+    vector_rows_reranked: AtomicU64,
 }
 
 impl OpStatsCollector {
@@ -51,10 +66,26 @@ impl OpStatsCollector {
         self.fts_postings_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Flush one superfile scan's cell + candidate tallies.
+    pub(crate) fn add_vector_scan(&self, cells: u64, candidates: u64) {
+        self.vector_cells_scanned
+            .fetch_add(cells, Ordering::Relaxed);
+        self.vector_candidates_scanned
+            .fetch_add(candidates, Ordering::Relaxed);
+    }
+
+    /// Flush the global-shortlist rerank's row count.
+    pub(crate) fn add_vector_rows_reranked(&self, rows: u64) {
+        self.vector_rows_reranked.fetch_add(rows, Ordering::Relaxed);
+    }
+
     /// The counters accumulated so far.
     pub fn snapshot(&self) -> OpStats {
         OpStats {
             fts_postings_bytes: self.fts_postings_bytes.load(Ordering::Relaxed),
+            vector_cells_scanned: self.vector_cells_scanned.load(Ordering::Relaxed),
+            vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
+            vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
         }
     }
 }
