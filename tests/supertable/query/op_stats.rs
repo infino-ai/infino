@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    IndexSpec, connect,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
@@ -336,4 +337,90 @@ fn vector_work_stats_are_deterministic_across_cache_temperature() {
     let cold = scoped_vector_stats(&st);
     let warm = scoped_vector_stats(&st);
     assert_eq!(cold, warm, "same plan, same table state, same work");
+}
+
+// ---- SQL: the per-query channel through the catalog `query_sql` path ----
+
+/// Rows in the SQL fixture.
+const SQL_ROWS: usize = 64;
+
+/// A storage-backed catalog connection with one FTS-indexed table whose
+/// scans and search TVFs exercise the per-query SQL channel.
+fn sql_fixture(dir: &TempDir) -> infino::Connection {
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("rating", arrow_schema::DataType::Int64, false),
+    ]));
+    let docs = db
+        .create_table("docs", schema.clone(), IndexSpec::new().fts("title"))
+        .expect("create_table");
+    let titles: Vec<String> = (0..SQL_ROWS)
+        .map(|i| {
+            let mut t = format!("filler{i}");
+            if i % 2 == 0 {
+                t.push_str(" rust");
+            }
+            t
+        })
+        .collect();
+    let title_arr: ArrayRef = Arc::new(LargeStringArray::from(
+        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    let ratings: ArrayRef = Arc::new(arrow_array::Int64Array::from(
+        (0..SQL_ROWS as i64).collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
+    docs.append(&batch).expect("append");
+    db
+}
+
+/// One scoped SQL statement's work stats.
+fn scoped_sql_stats(db: &infino::Connection, sql: &str) -> OpStats {
+    let (batches, stats) = with_op_stats(|| db.query_sql(sql).expect("query_sql"));
+    assert!(!batches.is_empty(), "fixture SQL {sql:?} must return");
+    stats
+}
+
+#[test]
+fn a_scoped_sql_scan_reports_page_bytes() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    // A row-returning range scan cannot fold to manifest statistics, so it
+    // must decode Parquet pages through the DataFusion store.
+    let stats = scoped_sql_stats(&db, "SELECT rating FROM docs WHERE rating > 5");
+    assert!(
+        stats.sql_page_bytes > 0,
+        "a scan-backed SQL query requests Parquet bytes; got 0"
+    );
+    assert!(
+        stats.planned_read_ranges > 0,
+        "each Parquet request is a planned range"
+    );
+}
+
+#[test]
+fn sql_work_stats_are_deterministic_across_cache_temperature() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let sql = "SELECT rating FROM docs WHERE rating > 5";
+    let cold = scoped_sql_stats(&db, sql);
+    let warm = scoped_sql_stats(&db, sql);
+    assert_eq!(cold, warm, "same plan, same table state, same work");
+}
+
+#[test]
+fn a_search_tvf_inside_sql_reports_fts_work() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    // The TVF resolves its reader on a runtime thread; the collector must
+    // arrive via the registration-time capture, not the thread-local.
+    let stats = scoped_sql_stats(
+        &db,
+        "SELECT _id, score FROM bm25_search('docs', 'title', 'rust', 10)",
+    );
+    assert!(
+        stats.fts_postings_bytes > 0,
+        "the BM25 leg inside SQL indexes posting bytes; got 0"
+    );
 }

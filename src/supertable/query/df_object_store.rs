@@ -41,6 +41,7 @@ use object_store::{
     PutPayload, PutResult, Result as OsResult, path::Path as ObjPath,
 };
 
+use crate::runtime_metrics::op_stats::{self, OpStatsCollector};
 use crate::superfile::{LazyByteSource, lazy_source::Source};
 
 /// Fixed `last_modified` reported for every registered superfile.
@@ -56,6 +57,11 @@ const SUPERFILE_LAST_MODIFIED: DateTime<Utc> = DateTime::UNIX_EPOCH;
 /// [`Self::insert_source`] as immutable files are first opened, and reuses it
 /// for every DataFusion scan of that manifest.
 pub(crate) struct SuperfileObjectStore {
+    /// Per-query work collector, captured at construction — the provider
+    /// (and therefore this store) is built per query on the caller's
+    /// thread inside `query_sql`, so the capture is per-query by
+    /// construction and can never leak across queries.
+    op_stats: Option<Arc<OpStatsCollector>>,
     /// One byte source per surviving superfile, keyed by the same path
     /// used to build the superfile's `PartitionedFile`.
     sources: Arc<DashMap<ObjPath, Arc<dyn LazyByteSource>>>,
@@ -79,6 +85,7 @@ impl SuperfileObjectStore {
     /// Empty registry filled lazily as a pinned provider prepares files.
     pub(crate) fn new() -> Self {
         Self {
+            op_stats: op_stats::current(),
             sources: Arc::new(DashMap::new()),
         }
     }
@@ -155,6 +162,14 @@ impl ObjectStore for SuperfileObjectStore {
 
         let range = resolve_range(options.range, size);
         let len = range.end.saturating_sub(range.start);
+        if let Some(stats) = &self.op_stats
+            && len > 0
+        {
+            // Parquet-driven plan reads: page/footer ranges the scan needs,
+            // counted before the byte source decides resident vs fetch.
+            stats.add_sql_page_bytes(len);
+            stats.add_planned_read_ranges(1);
+        }
         let bytes = if len == 0 {
             Bytes::new()
         } else {

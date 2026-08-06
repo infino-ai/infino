@@ -1814,6 +1814,12 @@ pub(crate) struct WeakReader {
     inner: Weak<SupertableInner>,
     manifest: Arc<ManifestSnapshot>,
     tombstone_cache: Option<Arc<SidecarCache>>,
+    /// Per-query work collector carried through the weak round-trip. Safe
+    /// because TVF exec plans are built per query; state that outlives a
+    /// query (the cached SQL `SessionContext`) is constructed under
+    /// [`op_stats::suppressed`] and from a detached reader, so no
+    /// long-lived `WeakReader` ever holds a scope's collector.
+    op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 impl fmt::Debug for WeakReader {
@@ -1829,6 +1835,7 @@ impl WeakReader {
             inner: Arc::downgrade(reader.inner_arc()),
             manifest: Arc::clone(reader.manifest()),
             tombstone_cache: reader.tombstone_cache.clone(),
+            op_stats: reader.op_stats.clone(),
         }
     }
 
@@ -1840,6 +1847,7 @@ impl WeakReader {
             inner,
             Arc::clone(&self.manifest),
             self.tombstone_cache.clone(),
+            self.op_stats.clone(),
         )))
     }
 }
@@ -1914,17 +1922,13 @@ impl SupertableReader {
         inner: Arc<SupertableInner>,
         manifest: Arc<ManifestSnapshot>,
         tombstone_cache: Option<Arc<SidecarCache>>,
+        op_stats: Option<Arc<OpStatsCollector>>,
     ) -> Self {
         Self {
             manifest,
             tombstone_cache,
             inner,
-            // A `WeakReader` is cached inside a `SessionContext` that
-            // outlives individual queries, so a collector captured here
-            // would mis-attribute later queries to an earlier scope. The
-            // SQL path gets its own per-query attribution channel; until
-            // then TVF-driven searches deliberately record no work stats.
-            op_stats: None,
+            op_stats,
         }
     }
 

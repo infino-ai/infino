@@ -52,8 +52,13 @@ pub struct OpStats {
     /// the cache decides whether a request becomes a local read or a GET —
     /// the warm-equivalent request-work measure (FTS: one per term posting
     /// range, two per phrase member; vector: cluster index + prefix/block
-    /// ranges per cell, one per rerank row).
+    /// ranges per cell, one per rerank row; SQL: one per Parquet range the
+    /// scan requests).
     pub planned_read_ranges: u64,
+    /// Parquet bytes SQL scans requested through the DataFusion store
+    /// (footer, page index, and data pages), independent of whether they
+    /// were served from resident bytes or fetched.
+    pub sql_page_bytes: u64,
 }
 
 /// Accumulates one query's work counters across its fan-out (tokio unit
@@ -65,6 +70,7 @@ pub struct OpStatsCollector {
     vector_candidates_scanned: AtomicU64,
     vector_rows_reranked: AtomicU64,
     planned_read_ranges: AtomicU64,
+    sql_page_bytes: AtomicU64,
 }
 
 impl OpStatsCollector {
@@ -92,6 +98,11 @@ impl OpStatsCollector {
             .fetch_add(ranges, Ordering::Relaxed);
     }
 
+    /// Flush one SQL Parquet range request's byte length.
+    pub(crate) fn add_sql_page_bytes(&self, bytes: u64) {
+        self.sql_page_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// The counters accumulated so far.
     pub fn snapshot(&self) -> OpStats {
         OpStats {
@@ -100,6 +111,7 @@ impl OpStatsCollector {
             vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
             planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
+            sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -147,6 +159,17 @@ pub fn with_op_stats<T>(f: impl FnOnce() -> T) -> (T, OpStats) {
 /// the query fans out).
 pub(crate) fn current() -> Option<Arc<OpStatsCollector>> {
     CURRENT.with(|slot| slot.borrow().clone())
+}
+
+/// Run `f` with NO collector installed, restoring the active scope after.
+/// For constructing state that outlives the current query (e.g. a cached
+/// `SessionContext`): anything capturing [`current`] inside `f` stays
+/// detached, so a long-lived cache can never bill later queries into this
+/// scope.
+pub(crate) fn suppressed<T>(f: impl FnOnce() -> T) -> T {
+    let previous = CURRENT.with(|slot| slot.borrow_mut().take());
+    let _guard = ScopeGuard { previous };
+    f()
 }
 
 #[cfg(test)]

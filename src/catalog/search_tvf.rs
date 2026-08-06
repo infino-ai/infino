@@ -33,6 +33,7 @@ use datafusion::{
 };
 
 use super::Connection;
+use crate::runtime_metrics::op_stats::{self, OpStatsCollector};
 use crate::supertable::{
     handle::SupertableReader,
     query::exec::{
@@ -57,6 +58,11 @@ struct ResolvedTable {
 struct TableResolver {
     conn: Connection,
     cache: Mutex<HashMap<String, ResolvedTable>>,
+    /// Per-query work collector, captured when the TVFs are registered —
+    /// registration happens per query on the caller's thread inside
+    /// `query_sql`, while resolution runs later on runtime threads where
+    /// the scope's thread-local is invisible.
+    op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 impl fmt::Debug for TableResolver {
@@ -70,6 +76,7 @@ impl TableResolver {
         Self {
             conn,
             cache: Mutex::new(HashMap::new()),
+            op_stats: op_stats::current(),
         }
     }
 
@@ -90,10 +97,14 @@ impl TableResolver {
         // `reader()` applies the read-consistency freshness check itself (and,
         // under Strong, fails rather than serving a stale snapshot), so there
         // is no separate `ensure_fresh` call here.
+        let mut reader = table.reader().map_err(|e| {
+            DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
+        })?;
+        // The mint ran on a runtime thread where the scope's thread-local
+        // is invisible; hand it the collector captured at registration.
+        reader.op_stats = self.op_stats.clone();
         let resolved = ResolvedTable {
-            reader: Arc::new(table.reader().map_err(|e| {
-                DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
-            })?),
+            reader: Arc::new(reader),
             scalar_schema: table.options().scalar_schema(),
         };
         self.cache
