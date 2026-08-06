@@ -1423,8 +1423,10 @@ impl SuperfileReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_hits_filtered_async(column, query, k, options, None, None, None, None)
-            .await
+        Ok(self
+            .vector_hits_filtered_async(column, query, k, options, None, None, None, None)
+            .await?
+            .0)
     }
 
     /// As [`Self::vector_hits_async`], but restricts the kNN ranking to
@@ -1433,6 +1435,8 @@ impl SuperfileReader {
     /// shortlist, so the returned top-k is the true k-nearest among
     /// matching rows — pushdown, not post-filter, with no underflow.
     /// `allow == None` is identical to [`Self::vector_hits_async`].
+    /// Returns the hits plus the rows the probe reranked at full
+    /// precision, for the per-query work stats.
     pub async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -1443,7 +1447,7 @@ impl SuperfileReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
         let filtered = allow.is_some();
         let (nprobe, rerank_mult) = options.resolve(filtered);
         let v = self
@@ -1477,16 +1481,20 @@ impl SuperfileReader {
         clusters: &[u32],
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_search_clusters_filtered(
-            column, query, k, clusters, options, None, None, None, None,
-        )
-        .await
+        Ok(self
+            .vector_search_clusters_filtered(
+                column, query, k, clusters, options, None, None, None, None,
+            )
+            .await?
+            .0)
     }
 
     /// As [`Self::vector_search_clusters`], but restricts the kNN
     /// ranking to the `local_doc_id`s in `allow` (a per-superfile
     /// predicate allow-set), applied inside the coarse shortlist.
     /// `allow == None` is identical to [`Self::vector_search_clusters`].
+    /// Returns the hits plus the rows the probe reranked at full
+    /// precision, for the per-query work stats.
     pub async fn vector_search_clusters_filtered(
         &self,
         column: &str,
@@ -1498,7 +1506,7 @@ impl SuperfileReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
         let v = self

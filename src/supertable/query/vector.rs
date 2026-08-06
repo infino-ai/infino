@@ -2164,6 +2164,9 @@ impl SupertableReader {
                         if let Some(stats) = &op_stats {
                             stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
                             stats.add_planned_read_ranges(scan.ranges_requested);
+                            // Cold cells rerank immediately inside the scan;
+                            // warm survivors are counted at phase C below.
+                            stats.add_vector_rows_reranked(scan.rows_reranked);
                         }
                         if !scan.candidates.is_empty() {
                             scan_pool
@@ -2173,12 +2176,16 @@ impl SupertableReader {
                         }
                         scan.hits
                     } else {
-                        reader
+                        let (hits, rows_reranked) = reader
                             .vector_search_clusters_filtered(
                                 &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
                             )
                             .await
-                            .map_err(vector_read_query_error)?
+                            .map_err(vector_read_query_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_vector_rows_reranked(rows_reranked);
+                        }
+                        hits
                     };
                     let mut tagged = dispatch::tag_hits(&entry, hits);
                     // Prefer manifest span arithmetic; only touch `_id` pages /

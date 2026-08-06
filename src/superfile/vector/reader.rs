@@ -3100,10 +3100,10 @@ impl VectorReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let centroid_stride = col.dim * 4;
         let sub_start = col.subsection_range.start;
@@ -3130,7 +3130,7 @@ impl VectorReader {
         let Some((nprobe_eff, rerank_mult_eff)) =
             effective_filtered_params(&allow, col.n_docs, col.n_cent, nprobe, rerank_mult)
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         // 2. Score centroids → top `nprobe` clusters.
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
@@ -3180,7 +3180,7 @@ impl VectorReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
         if self.is_multi_cell() {
             return self
                 .search_clusters_async_multi_cell(
@@ -3198,7 +3198,7 @@ impl VectorReader {
         }
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
@@ -3220,7 +3220,7 @@ impl VectorReader {
         // every probed fragment (measured 70 ms survivor gather + 52 ms
         // Sq8 rerank per filtered query at 1M).
         if allow.as_ref().is_some_and(|bm| bm.is_empty()) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let ctx = ProbeCtx {
             q_rot: &q_rot,
@@ -3280,7 +3280,7 @@ impl VectorReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
         if !self.column_id_by_name.contains_key(column) {
             return Err(VectorError::UnknownColumn(column.to_string()));
         }
@@ -3296,12 +3296,12 @@ impl VectorReader {
             });
         }
         if k == 0 || self.n_docs == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         let per_cell = self.resolve_cells_for_clusters(clusters);
         if per_cell.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         // Probe the selected cells CONCURRENTLY — the same wave shape the
@@ -3348,14 +3348,15 @@ impl VectorReader {
                     pool,
                     budget,
                 };
-                let hits = self
+                let (hits, rows_reranked) = self
                     .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
                     .await?;
-                Ok::<Vec<(u32, f32)>, VectorError>(
+                Ok::<(Vec<(u32, f32)>, u64), VectorError>((
                     hits.into_iter()
                         .map(|(local_id, score)| (base.saturating_add(local_id), score))
                         .collect(),
-                )
+                    rows_reranked,
+                ))
             })
         });
         // Wave-cap the concurrent probes to the pool width (the same
@@ -3363,17 +3364,18 @@ impl VectorReader {
         // many-celled shard must not open unbounded simultaneous
         // range reads / cold fetches.
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell: Vec<Vec<(u32, f32)>> = stream::iter(cell_probes)
+        let per_cell: Vec<(Vec<(u32, f32)>, u64)> = stream::iter(cell_probes)
             .buffer_unordered(max_in_flight)
             .try_collect()
             .await?;
-        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flatten().collect();
+        let rows_reranked: u64 = per_cell.iter().map(|(_, rows)| rows).sum();
+        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
         // Distance ascending (smaller = closer), matching every other vector
         // search path. Descending here kept the farthest k hits and collapsed
         // packed-shard recall to ~0.
         merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         merged.truncate(k);
-        Ok(merged)
+        Ok((merged, rows_reranked))
     }
 
     /// Deferred-rerank scan for the supertable's GLOBAL shortlist selection
@@ -3415,6 +3417,7 @@ impl VectorReader {
             cells_scanned: 0,
             candidates_scanned: 0,
             ranges_requested: 0,
+            rows_reranked: 0,
         };
         if k == 0 || self.n_docs == 0 {
             return Ok(outcome);
@@ -3497,7 +3500,7 @@ impl VectorReader {
                 let (cluster_meta, prefix_ranges) = chosen_cluster_meta(col, &cluster_idx, &locals);
                 if cluster_meta.is_empty() {
                     // The cluster-index read itself was one planned range.
-                    return Ok((Vec::new(), Vec::new(), 0, 1));
+                    return Ok((Vec::new(), Vec::new(), 0, 1, 0));
                 }
                 // Work-stats tallies, taken before the warm/cold branch so
                 // both arms count the codes their clusters hold. Ranges:
@@ -3537,12 +3540,9 @@ impl VectorReader {
                             cell_idx,
                         })
                         .collect();
-                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64), VectorError>((
-                        Vec::new(),
-                        cands,
-                        candidates_scanned,
-                        ranges_requested,
-                    ));
+                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64, u64), VectorError>(
+                        (Vec::new(), cands, candidates_scanned, ranges_requested, 0),
+                    );
                 }
                 // Cold (or RabitqOnly): probe-and-rerank now, width-divided.
                 let ctx = ProbeCtx {
@@ -3554,7 +3554,7 @@ impl VectorReader {
                     pool,
                     budget,
                 };
-                let hits = self
+                let (hits, rows_reranked) = self
                     .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
                     .await?;
                 Ok((
@@ -3564,19 +3564,21 @@ impl VectorReader {
                     Vec::new(),
                     candidates_scanned,
                     ranges_requested,
+                    rows_reranked,
                 ))
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64)> =
+        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, u64, u64, u64)> =
             stream::iter(cell_scans)
                 .buffer_unordered(max_in_flight)
                 .try_collect()
                 .await?;
-        for (hits, cands, candidates_scanned, ranges_requested) in per_cell_results {
+        for (hits, cands, candidates_scanned, ranges_requested, rows_reranked) in per_cell_results {
             outcome.hits.extend(hits);
             outcome.candidates.extend(cands);
             outcome.ranges_requested += ranges_requested;
+            outcome.rows_reranked += rows_reranked;
             if candidates_scanned > 0 {
                 outcome.cells_scanned += 1;
                 outcome.candidates_scanned += candidates_scanned;
@@ -3734,6 +3736,9 @@ impl VectorReader {
     /// Used by [`Self::search_async`] (clusters from this superfile's
     /// centroid scoring) and [`Self::search_clusters_async`] (clusters
     /// from the global cross-superfile selector).
+    /// Returns the hits plus the number of rows the probe reranked at
+    /// full precision (0 on the `RabitqOnly` and empty-shortlist paths),
+    /// for the per-query work stats.
     async fn probe_clusters_async(
         &self,
         col: &ColumnReader,
@@ -3741,11 +3746,11 @@ impl VectorReader {
         ctx: &ProbeCtx<'_>,
         cluster_idx: &[u8],
         chosen: &[usize],
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
         let cb = col.quant.code_bytes();
         let (cluster_meta, cluster_prefix_ranges) = chosen_cluster_meta(col, cluster_idx, chosen);
         if cluster_meta.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
         // Warm fast path: every prefix already resident → sync zero-copy.
@@ -3855,7 +3860,7 @@ impl VectorReader {
                 if let Some(t0) = shortlist_t0 {
                     io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
                 }
-                return Ok(out);
+                return Ok((out, 0));
             }
             ShortlistOutcome::Rerank {
                 candidates,
@@ -3880,7 +3885,8 @@ impl VectorReader {
             io_counters::phase_record("vec.survivor_fetch", t0.elapsed().as_micros() as u64);
         }
 
-        io_counters::phase_timed_async("vec.rerank", async {
+        let rows_reranked = candidates.len() as u64;
+        let hits = io_counters::phase_timed_async("vec.rerank", async {
             rerank_candidates_from_blocks(
                 &self.source,
                 lazy_sq8_meta_bytes.as_ref(),
@@ -3894,7 +3900,8 @@ impl VectorReader {
             )
             .await
         })
-        .await
+        .await?;
+        Ok((hits, rows_reranked))
     }
 
     /// Look up the column by name and validate `query.len() == col.dim`
@@ -4510,6 +4517,9 @@ pub(crate) struct ScanOutcome {
     /// plus one range per prefix block (warm arm) or chosen cluster's
     /// blocks (cold arm).
     pub(crate) ranges_requested: u64,
+    /// Rows the cold arm reranked immediately (warm survivors defer to the
+    /// supertable's global selection and are counted at phase C instead).
+    pub(crate) rows_reranked: u64,
 }
 
 async fn build_shortlist(
@@ -6111,11 +6121,11 @@ mod tests {
         let q = &all[0];
         let (k, rerank, n_cent) = (5usize, 5usize, 64u32);
 
-        let full = r
+        let (full, _) = r
             .search_async("v", q, k, n_cent as usize, rerank, None, None, None, None)
             .await
             .expect("search_async");
-        let probed = r
+        let (probed, _) = r
             .search_clusters_async(
                 "v",
                 q,
@@ -6140,7 +6150,7 @@ mod tests {
         );
 
         // Probing no clusters returns nothing.
-        let none = r
+        let (none, _) = r
             .search_clusters_async("v", q, k, &[], rerank, None, None, None, None)
             .await
             .expect("search_clusters_async empty");
@@ -6536,11 +6546,11 @@ mod tests {
         )
         .await
         .expect("lazy open");
-        let eager_hits = eager
+        let (eager_hits, _) = eager
             .search_async("v", &vectors[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("eager search");
-        let lazy_hits = lazy
+        let (lazy_hits, _) = lazy
             .search_async("v", &vectors[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("lazy search");
@@ -6564,11 +6574,11 @@ mod tests {
         )
         .await
         .expect("lazy open");
-        let eager_hits = eager
+        let (eager_hits, _) = eager
             .search_async("v", &vectors[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("eager search");
-        let lazy_hits = lazy
+        let (lazy_hits, _) = lazy
             .search_async("v", &vectors[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("lazy search");
@@ -6643,11 +6653,11 @@ mod tests {
         .expect("lazy multi-cell open");
 
         let q = vec![0.0f32; dim];
-        let eager_hits = eager
+        let (eager_hits, _) = eager
             .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None, None, None)
             .await
             .expect("eager multi-cell search");
-        let lazy_hits = lazy
+        let (lazy_hits, _) = lazy
             .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None, None, None)
             .await
             .expect("lazy multi-cell search");
@@ -9377,7 +9387,7 @@ mod tests {
             .await
             .expect("selected rerank");
         assert_eq!(
-            immediate, deferred,
+            immediate.0, deferred,
             "deferred scan+select+rerank must equal the immediate probe's top-k"
         );
     }
@@ -9598,11 +9608,11 @@ mod tests {
         .await
         .expect("open_lazy");
 
-        let hits_lazy = r_lazy
+        let (hits_lazy, _) = r_lazy
             .search_async("v", &all[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("lazy cold Sq8 search_async");
-        let hits_eager = r_eager
+        let (hits_eager, _) = r_eager
             .search_async("v", &all[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("eager Sq8 search_async");
@@ -9677,7 +9687,7 @@ mod tests {
         .expect("open_lazy");
 
         let budget = ConnectionMemoryBudget::measured();
-        let hits = r_lazy
+        let (hits, _) = r_lazy
             .search_async(
                 "v",
                 &all[0],
@@ -9724,7 +9734,7 @@ mod tests {
         let r_eager = VectorReader::open(blob, &json).expect("eager open");
         let budget = ConnectionMemoryBudget::with_limit(1);
 
-        let hits = r_eager
+        let (hits, _) = r_eager
             .search_async(
                 "v",
                 &all[0],
@@ -9755,7 +9765,7 @@ mod tests {
         );
         assert_eq!(budget.peak(), 0, "warm search commits no bytes");
         let denials_after_first = budget.denials();
-        let hits = r_eager
+        let (hits, _) = r_eager
             .search_async(
                 "v",
                 &all[0],
@@ -9795,7 +9805,7 @@ mod tests {
         counting.disable_sync();
 
         let clusters: Vec<u32> = (0..4).collect();
-        let hits_lazy = r_lazy
+        let (hits_lazy, _) = r_lazy
             .search_clusters_async(
                 "embedding",
                 &all[19],
@@ -9809,7 +9819,7 @@ mod tests {
             )
             .await
             .expect("lazy cold search_clusters_async");
-        let hits_eager = r_eager
+        let (hits_eager, _) = r_eager
             .search_clusters_async(
                 "embedding",
                 &all[19],
@@ -9829,7 +9839,7 @@ mod tests {
         );
         // Out-of-range cluster ids are ignored; an empty selection yields
         // no hits.
-        let none = r_lazy
+        let (none, _) = r_lazy
             .search_clusters_async(
                 "embedding",
                 &all[19],
@@ -9860,7 +9870,7 @@ mod tests {
             .await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
-        let empty = r
+        let (empty, _) = r
             .search_async("embedding", &[0.0; 16], 0, 4, 5, None, None, None, None)
             .await
             .expect("k=0 empty");

@@ -43,10 +43,10 @@ pub struct OpStats {
     /// Quantized codes the cell scans estimated (Σ cluster row counts over
     /// every chosen cluster, warm and cold arms alike).
     pub vector_candidates_scanned: u64,
-    /// Rows rescored at full precision by the global-shortlist rerank
-    /// (phase C of the deferred-rerank path — the steady post-drain
-    /// serving state). The cold arm's immediate rerank is not yet
-    /// attributed; its candidate scan above is.
+    /// Rows rescored at full precision, across every arm: the
+    /// global-shortlist rerank (phase C of the deferred path), the scan's
+    /// immediate cold-cell rerank, and the immediate probe paths
+    /// (pre-drain user tables and filtered search).
     pub vector_rows_reranked: u64,
     /// Byte-source ranges the plan requested, before coalescing and before
     /// the cache decides whether a request becomes a local read or a GET —

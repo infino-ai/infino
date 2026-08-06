@@ -1256,7 +1256,7 @@ pub mod vector {
                 None,
             ))
             .expect("filtered sweep query");
-            sum += corpus::recall_at_k(&hits, gt);
+            sum += corpus::recall_at_k(&hits.0, gt);
         }
         sum / q_corr.len() as f32
     }
@@ -1583,7 +1583,7 @@ pub mod vector {
                             None,
                         ))
                         .expect("filtered recall query");
-                        recalls.push(corpus::recall_at_k(&hits, gt));
+                        recalls.push(corpus::recall_at_k(&hits.0, gt));
                     }
                     let mean: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
                     eprintln!(
@@ -1664,7 +1664,7 @@ pub mod vector {
                             ))
                             .expect("filtered vector search");
                             samples.push(t0.elapsed());
-                            recall_samples.push(corpus::recall_at_k(&hits, &gt[qi]));
+                            recall_samples.push(corpus::recall_at_k(&hits.0, &gt[qi]));
                         }
                     }
                     samples.sort_unstable();

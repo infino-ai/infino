@@ -4672,7 +4672,7 @@ mod tests {
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
         let reader = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let q = vec![0.0f32; dim];
-        let hits = reader
+        let (hits, _) = reader
             .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None, None, None)
             .await
             .expect("search");
@@ -4749,7 +4749,7 @@ mod tests {
         allow.insert(5);
         allow.insert(6);
         let q = vec![0.0f32; dim];
-        let hits = reader
+        let (hits, _) = reader
             .search_clusters_async(
                 "emb",
                 &q,
