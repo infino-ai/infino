@@ -183,11 +183,11 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     // (`sq8_ivf_merge_input_at` is `is_ivf_mergeable`-gated), so
     // the extra family check is a guard: single-plane Sq16 must never
     // seed the fixed sq8 grid here.
-    // Only the residual family carries a per-cluster scale/offset table.
-    // Single-plane codecs (Sq16) quantize on a fixed grid with no per-cluster
-    // quantizer, so their `scale`/`offset` merge inputs are empty and never
-    // seeded, sliced, or written to codec_meta below.
-    let has_cluster_quant = codec.is_sq8_residual_family();
+    // Only cluster-quant codecs carry a per-cluster scale/offset table.
+    // The fixed-grid single-plane codec (Sq16) quantizes on a fixed grid with no
+    // per-cluster quantizer, so its `scale`/`offset` merge inputs are empty and
+    // never seeded, sliced, or written to codec_meta below.
+    let has_cluster_quant = codec.carries_cluster_quant_meta();
     let (mut dst_scale, mut dst_offset) = if codec.uses_fixed_quantizer() && has_cluster_quant {
         let (scale, offset) = fixed_sq8_quantizer(dim);
         (scale.repeat(n_cent), offset.repeat(n_cent))
@@ -195,6 +195,12 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
         (vec![1.0f32; n_cent * dim], vec![0.0f32; n_cent * dim])
     };
     if has_cluster_quant {
+        // Copy the first contributing input's per-cluster ruler as the
+        // destination grid; per-row transcode below re-encodes the other inputs
+        // onto it (clamping any out-of-range component). This matches the
+        // existing merge behavior for every fitted/fixed cluster-quant codec.
+        // (Sizing the destination grid to cover every input's range so no
+        // component clamps is a separate future change, not bundled here.)
         for c in 0..n_cent {
             for inp in parsed {
                 let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
@@ -353,13 +359,26 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                                 )
                             })
                         } else {
+                            // Body layout depends on the codec: the residual
+                            // family splits `[codes(dim) ‖ residuals(dim)]`,
+                            // while the single-`u16`-plane `Sq16Adaptive` keeps
+                            // the whole `dim*2`-byte plane as `codes` with no
+                            // residual leg.
+                            let (codes, residuals) = if inp.rerank_codec.writes_single_u16_plane() {
+                                (inp.sub[rowb..rowb + dim * 2].to_vec(), Vec::new())
+                            } else {
+                                (
+                                    inp.sub[rowb..rowb + dim].to_vec(),
+                                    inp.sub[rowb + dim..rowb + dim + dim].to_vec(),
+                                )
+                            };
                             let encoded = EncodedCellRow {
                                 stable_id: 0,
                                 rerank_codec: inp.rerank_codec,
                                 scale: std::sync::Arc::from(src_scale),
                                 offset: std::sync::Arc::from(src_offset),
-                                codes: inp.sub[rowb..rowb + dim].to_vec(),
-                                residuals: inp.sub[rowb + dim..rowb + dim + dim].to_vec(),
+                                codes,
+                                residuals,
                                 norm_sq: None,
                             };
                             let n = ops.materialize_row_into_cluster_quant(
@@ -464,7 +483,7 @@ pub(crate) fn splice_fragments_into_cell(
     // per-doc norm table. Splice supports both: the rerank bytes are copied
     // verbatim regardless of codec, and the codec_meta write below branches on
     // this to lay out either `[scale|offset|norms]` or norms-only.
-    let has_cluster_quant = codec.is_sq8_residual_family();
+    let has_cluster_quant = codec.carries_cluster_quant_meta();
 
     let out_n_cent = fragments.len();
     let counts: Vec<u32> = fragments
@@ -780,7 +799,7 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
     // row's norm from the codes, so the merge input carries empty scale/offset for
     // Sq16 — parsing the norm table as scale/offset would error (small cell) or
     // silently corrupt the reranker (large cell).
-    let (scale, offset) = if rerank_codec.is_sq8_residual_family() {
+    let (scale, offset) = if rerank_codec.carries_cluster_quant_meta() {
         let so_bytes = n_cent * dim * 4;
         if codec_meta_size < 2 * so_bytes {
             return Err(BuildError::VectorSchemaMismatch(
@@ -1017,6 +1036,66 @@ mod tests {
             "spliced cell holds every doc from both batches"
         );
         assert_eq!(ids.len(), 2 * ROWS, "one stable id per spliced doc");
+    }
+
+    /// The genuine build-path guard for the 16-bit-vs-8-bit fit bug: build the
+    /// SAME corpus through the real `Sq16Adaptive` and `Sq8Residual` build/fit
+    /// paths and read back each fitted per-cluster ruler. The only difference
+    /// must be the code max — `Sq16Adaptive` fits `scale = span/65535`,
+    /// `Sq8Residual` fits `span/255` — so the per-dim ratio is exactly
+    /// `255/65535`. Before the fix both used `span/255` (ratio 1.0), i.e.
+    /// `Sq16Adaptive` was silently an 8-bit quantizer. Rotation-agnostic: both
+    /// codecs fit the same rotated min/max, so the raw span never enters.
+    #[test]
+    fn sq16_adaptive_fit_uses_full_u16_range_not_8bit() {
+        const D: usize = 8;
+        const NR: usize = 64;
+        // One-centroid grid so every row lands in cluster 0; wide, varied
+        // per-dim values so the fitted span is comfortably non-degenerate.
+        let centroids = vec![0.0f32; D];
+        let mut vectors = Vec::with_capacity(NR * D);
+        for r in 0..NR {
+            for d in 0..D {
+                vectors.push(((r * 7 + d * 13) % 97) as f32 - 40.0);
+            }
+        }
+        let ids: Vec<i128> = (0..NR as i128).collect();
+        let fitted_scale = |codec: RerankCodec| -> Vec<f32> {
+            let cfg = VectorConfig {
+                column: "emb".into(),
+                dim: D,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: codec,
+                provided_centroids: Some(Arc::from(centroids.clone())),
+            };
+            let sub = build_merged_subsection_from_fp32(cfg, 1, Arc::new(vectors.clone()), &ids)
+                .expect("cell build");
+            sq8_ivf_merge_input_from_subsection(
+                &sub.bytes,
+                D,
+                1,
+                sub.n_docs,
+                Metric::L2Sq,
+                codec,
+                None,
+            )
+            .expect("parse fitted ruler")
+            .scale
+        };
+        let s8 = fitted_scale(RerankCodec::Sq8Residual);
+        let s16 = fitted_scale(RerankCodec::Sq16Adaptive);
+        let expected = 255.0f32 / 65535.0;
+        for d in 0..D {
+            if s8[d] > 0.0 {
+                let ratio = s16[d] / s8[d];
+                assert!(
+                    (ratio - expected).abs() <= expected * 0.05,
+                    "dim {d}: Sq16Adaptive ruler must be span/65535 — {expected}x Sq8Residual's \
+                     span/255 — got ratio {ratio} (1.0 ⇒ Sq16Adaptive is secretly 8-bit)"
+                );
+            }
+        }
     }
 
     /// Splice-merging inputs that share an all-empty cluster must leave the

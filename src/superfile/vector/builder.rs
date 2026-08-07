@@ -36,8 +36,8 @@ use crate::superfile::{
     vector::{
         cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
         distance::{
-            Metric, distance, encode_sq16_row, mean_f32_cluster_major, normalize,
-            sq16_decoded_norm_sq,
+            Metric, distance, encode_sq16_adaptive_row, encode_sq16_row, mean_f32_cluster_major,
+            normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
         },
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
@@ -157,11 +157,6 @@ const N_CENT_MEDIUM: usize = 1024;
 /// Maximum IVF centroids for small physical vector indexes.
 const N_CENT_SMALL: usize = 64;
 
-/// Maximum Sq8 code value: each component quantizes to one unsigned
-/// byte, so the per-dim scale maps a cluster's value span onto
-/// `[0, SQ8_CODE_MAX]`.
-const SQ8_CODE_MAX: f32 = 255.0;
-
 fn n_cent_row_count_cap(n_docs: usize) -> usize {
     if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
         N_CENT_LARGE
@@ -209,24 +204,25 @@ pub struct VectorConfig {
 /// Pick the default rerank codec for a new index built with `metric`.
 /// Cosine columns use the configured
 /// [`crate::config::VectorSettings::rerank_codec`] (`Sq16` by default);
-/// metrics whose values are not bounded to `[-1, 1]` use locally fitted
-/// [`RerankCodec::Sq8Residual`]. A per-column codec set at table-create
-/// time overrides this default.
+/// metrics whose values are not bounded to `[-1, 1]` use the 16-bit,
+/// per-cluster-fitted [`RerankCodec::Sq16Adaptive`] — the same 2 bytes/dim as
+/// the older `Sq8Residual` but a single `u16` plane with no residual leg. A
+/// per-column codec set at table-create time overrides this default; existing
+/// `Sq8Residual` tables keep their stored codec on reopen.
 fn default_rerank_codec_for(metric: Metric) -> RerankCodec {
     if metric == Metric::Cosine {
         RerankCodec::default()
     } else {
-        RerankCodec::Sq8Residual
+        RerankCodec::Sq16Adaptive
     }
 }
 
 impl VectorConfig {
     /// Construct a config with the engine's cosine default codec
-    /// ([`RerankCodec::default`] — `Sq16`) and locally fitted residual
-    /// encoding ([`RerankCodec::Sq8Residual`]) for metrics whose values
-    /// are not bounded to [-1, 1]. The codec is internal — not a config
-    /// knob, not part of the public spec; tests override per column with
-    /// [`Self::with_rerank_codec`].
+    /// ([`RerankCodec::default`] — `Sq16`) and the 16-bit, per-cluster-fitted
+    /// [`RerankCodec::Sq16Adaptive`] for metrics whose values are not bounded to
+    /// [-1, 1]. The codec is internal — not a config knob, not part of the
+    /// public spec; tests override per column with [`Self::with_rerank_codec`].
     pub fn new(column: String, dim: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
             column,
@@ -1584,9 +1580,12 @@ fn bucket_encoded_rows_chunk(
     let dim = cfg.dim;
     let code_bytes = dim.div_ceil(u8::BITS as usize);
     let fixed = cfg.rerank_codec.uses_fixed_quantizer();
-    // Single-plane fixed codecs (Sq16) store the whole `dim*2`-byte body in
-    // `codes`; the residual family splits it into `codes` + `residuals`.
-    let single_plane = cfg.rerank_codec.is_sq16();
+    // Only the fixed-grid single-plane codec (Sq16) can byte-copy its whole
+    // `dim*2`-byte body from `codes`; the fitted single-plane codec
+    // (Sq16Adaptive) must round-trip through fp32 below so re-bucketing re-fits
+    // its ruler, and the residual family splits the body into `codes` +
+    // `residuals`.
+    let fixed_single_plane = cfg.rerank_codec.is_sq16();
     let ops = cfg
         .rerank_codec
         .ops()
@@ -1615,7 +1614,7 @@ fn bucket_encoded_rows_chunk(
     let mut assignments = vec![0u32; rows.len()];
     assign_to_centroids(&decoded, centroids, dim, n_cent, &mut assignments);
     for (row_idx, (row, &cluster)) in rows.iter().zip(&assignments).enumerate() {
-        let payload = if single_plane {
+        let payload = if fixed_single_plane {
             BucketRecordPayload::FixedPlane(&row.encoded.codes)
         } else if fixed {
             BucketRecordPayload::FixedSq8 {
@@ -1734,17 +1733,19 @@ fn stream_fp32_rows_to_buckets(
     let dim = cfg.dim;
     let n_docs = vectors.len() / dim;
     let fixed = cfg.rerank_codec.uses_fixed_quantizer();
-    // Single-plane fixed codecs (Sq16) encode one `dim*2`-byte `u16` plane on
-    // the fixed grid; the residual family encodes a `[codes | residual]` body
-    // against the same grid and carries a divisor.
-    let single_plane = cfg.rerank_codec.is_sq16();
+    // The fixed-grid single-plane codec (Sq16) encodes one `dim*2`-byte `u16`
+    // plane on the fixed grid; the residual family encodes a `[codes | residual]`
+    // body against the same grid and carries a divisor. The fitted single-plane
+    // codec (Sq16Adaptive) is neither fixed nor residual here — it is buffered as
+    // fp32 and encoded against its cluster ruler downstream.
+    let fixed_single_plane = cfg.rerank_codec.is_sq16();
     let mut min_max = sq8_min_max;
     let rotation = RandomRotation::new(dim, cfg.rot_seed);
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let (fixed_scale, fixed_offset) = fixed_sq8_quantizer(dim);
     // Residual-family encode consts + divisor; unused by the single-plane path.
-    let residual_encode = (fixed && !single_plane).then(|| {
+    let residual_encode = (fixed && !fixed_single_plane).then(|| {
         (
             Sq8EncodeConsts::from_scale_offset(&fixed_scale, &fixed_offset),
             cfg.rerank_codec
@@ -1795,14 +1796,14 @@ fn stream_fp32_rows_to_buckets(
                         );
                     },
                 );
-        } else if single_plane {
+        } else if fixed_single_plane {
             chunk_payload[..take * dim * 2]
                 .par_chunks_mut(dim * 2)
                 .zip(chunk.par_chunks(dim))
                 .for_each(|(payload, row)| encode_sq16_row(row, payload));
         }
         for i in 0..take {
-            let payload = if single_plane {
+            let payload = if fixed_single_plane {
                 BucketRecordPayload::FixedPlane(&chunk_payload[i * dim * 2..(i + 1) * dim * 2])
             } else if fixed {
                 let (codes, residuals) =
@@ -1848,10 +1849,17 @@ fn stream_bucket_into_subsection(
     norms_offset: Option<usize>,
 ) -> Result<(), BuildError> {
     let fixed = codec.uses_fixed_quantizer();
-    // Single-plane fixed codecs (Sq16) store one `dim*2`-byte `u16` plane whose
-    // norm is read off the fixed grid; the residual family reconstructs the
-    // norm from the per-cluster quantizer + residual.
-    let single_plane = codec.is_sq16();
+    let single_u16 = codec.writes_single_u16_plane();
+    // The two single-plane cases split on the body-shape × ruler axes:
+    //   fixed_single_plane  (Sq16): the bucket record holds pre-encoded
+    //     fixed-grid `u16` codes, copied verbatim; norm read off the fixed grid.
+    //   fitted_single_plane (Sq16Adaptive): the bucket record holds raw fp32,
+    //     re-encoded against this cluster's fitted ruler; no residual leg, no
+    //     divisor.
+    // The residual family reconstructs the norm from the per-cluster quantizer
+    // + residual.
+    let fixed_single_plane = single_u16 && fixed;
+    let fitted_single_plane = single_u16 && !fixed;
     let payload_bytes = if fixed {
         dim * 2
     } else {
@@ -1861,7 +1869,10 @@ fn stream_bucket_into_subsection(
     let chunk_rows = (MATERIALIZED_BUCKET_CHUNK_BYTES / record_bytes.max(1)).max(1);
     let mut reader = BufReader::new(File::open(bucket_path)?);
     let mut rows_done = 0usize;
-    let encode_consts = (!fixed).then(|| Sq8EncodeConsts::from_scale_offset(scale, offset));
+    // Only the two-plane residual encode path reads these reciprocals; the
+    // fitted single-plane codec encodes via encode_sq16_adaptive_row instead.
+    let encode_consts =
+        (!fixed && !single_u16).then(|| Sq8EncodeConsts::from_scale_offset(scale, offset));
     let mut recon = vec![0.0f32; dim];
     let mut fp_row = vec![0.0f32; dim];
     while rows_done < block.count {
@@ -1880,9 +1891,18 @@ fn stream_bucket_into_subsection(
             codes[row_idx * code_bytes..(row_idx + 1) * code_bytes]
                 .copy_from_slice(&record[id_end..code_end]);
             let rerank_row = &mut rerank[row_idx * dim * 2..(row_idx + 1) * dim * 2];
-            let norm = if single_plane {
+            let norm = if fixed_single_plane {
                 rerank_row.copy_from_slice(&record[code_end..code_end + dim * 2]);
                 norms_offset.map(|_| sq16_decoded_norm_sq(rerank_row, dim))
+            } else if fitted_single_plane {
+                for (value, bytes) in fp_row
+                    .iter_mut()
+                    .zip(record[code_end..].chunks_exact(size_of::<f32>()))
+                {
+                    *value = f32::from_le_bytes(bytes.try_into().expect("4-byte f32 bucket value"));
+                }
+                encode_sq16_adaptive_row(&fp_row, scale, offset, rerank_row);
+                norms_offset.map(|_| sq16_adaptive_norm_sq(rerank_row, dim, scale, offset))
             } else if fixed {
                 rerank_row.copy_from_slice(&record[code_end..code_end + dim * 2]);
                 norms_offset.map(|_| {
@@ -2124,7 +2144,7 @@ pub(crate) fn build_cell_subsection_from_source(
         ));
     }
     let mut bucket_counts = vec![0u32; n_cent];
-    let fit_quantizer = matches!(cfg.rerank_codec, RerankCodec::Sq8Residual);
+    let fit_quantizer = cfg.rerank_codec.fits_per_cluster_ruler();
     let (mut sq8_min, mut sq8_max) = if fit_quantizer {
         (
             vec![f32::INFINITY; n_cent * dim],
@@ -2183,9 +2203,10 @@ pub(crate) fn build_cell_subsection_from_source(
         (0..n_cent)
             .map(|centroid| {
                 let start = centroid * dim;
-                derive_sq8_quantizer_from_min_max(
+                derive_quantizer_from_min_max(
                     &sq8_min[start..start + dim],
                     &sq8_max[start..start + dim],
+                    cfg.rerank_codec.code_max(),
                 )
             })
             .collect()
@@ -2505,10 +2526,13 @@ fn build_subsection_streaming(
             codec.name()
         )));
     }
-    // Residual-family codecs use per-cluster scale/offset codec_meta plus
-    // an i8 residual sidecar in `full[]`.
-    let sq8_family = codec.is_sq8_residual_family();
-    let fit_sq8_quantizer = matches!(codec, RerankCodec::Sq8Residual);
+    // Codecs that carry per-cluster scale/offset in codec_meta (the residual
+    // family and `Sq16Adaptive`). Named `sq8_family` historically; it now gates
+    // the codec_meta scale/offset+norm layout, which `Sq16Adaptive` shares.
+    let sq8_family = codec.carries_cluster_quant_meta();
+    // Codecs that FIT the per-cluster ruler from the data (Sq8Residual +
+    // Sq16Adaptive); the fixed-grid residual codec seeds a fixed quantizer below.
+    let fit_sq8_quantizer = codec.fits_per_cluster_ruler();
     let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if fit_sq8_quantizer {
         (
             vec![f32::INFINITY; n_cent * dim],
@@ -2565,9 +2589,10 @@ fn build_subsection_streaming(
         (0..n_cent)
             .map(|c| {
                 let off = c * dim;
-                derive_sq8_quantizer_from_min_max(
+                derive_quantizer_from_min_max(
                     &sq8_min_arr[off..off + dim],
                     &sq8_max_arr[off..off + dim],
+                    codec.code_max(),
                 )
             })
             .collect()
@@ -2780,6 +2805,37 @@ fn build_subsection_streaming(
                         }
                     }
                 }
+                RerankCodec::Sq16Adaptive => {
+                    // Single `u16` plane like `Sq16`, but quantized against this
+                    // cluster's fitted ruler (like the residual family) instead
+                    // of the fixed grid. Norms use the residual-family position
+                    // convention (`sq8_norms_block_off`, which sits after the
+                    // scale/offset arrays) since `Sq16Adaptive` carries those
+                    // arrays in codec_meta.
+                    let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
+                    let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
+                    for i in 0..blk.count {
+                        let src = &cluster_rows[i * dim..(i + 1) * dim];
+                        let row_off = blk.rerank_base + i * per_vec_bytes;
+                        encode_sq16_adaptive_row(
+                            src,
+                            scale_c,
+                            offset_c,
+                            &mut bytes[row_off..row_off + per_vec_bytes],
+                        );
+                        if let Some(norms_off) = sq8_norms_block_off {
+                            let n_sq = sq16_adaptive_norm_sq(
+                                &bytes[row_off..row_off + per_vec_bytes],
+                                dim,
+                                scale_c,
+                                offset_c,
+                            );
+                            let pos = blk.first_row + i;
+                            let n_off = norms_off + pos * 4;
+                            bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
+                        }
+                    }
+                }
                 RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
                     let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                     let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
@@ -2884,7 +2940,11 @@ fn encode_sq8_residual_cluster_simd(
 /// Sq8 per-cluster (min, max) → (scale, offset) derivation. Shared with the
 /// cell-posting encode path so both derive the quantizer identically.
 #[inline]
-pub(crate) fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn derive_quantizer_from_min_max(
+    min: &[f32],
+    max: &[f32],
+    code_max: f32,
+) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(min.len(), max.len());
     let dim = min.len();
     let mut scale = vec![0.0f32; dim];
@@ -2893,7 +2953,7 @@ pub(crate) fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Ve
         let span = max[d] - min[d];
         if span > 0.0 && span.is_finite() {
             offset[d] = min[d];
-            scale[d] = span / SQ8_CODE_MAX;
+            scale[d] = span / code_max;
         } else {
             offset[d] = if min[d].is_finite() { min[d] } else { 0.0 };
             scale[d] = 1.0;
@@ -3278,6 +3338,23 @@ mod tests {
     use crate::superfile::vector::{
         cell_posting::EncodedCellRow, reader::VectorReader, spill::MaterializedRowSpillWriter,
     };
+
+    /// The default rerank codec by metric: non-cosine
+    /// metrics (L2Sq / NegDot) default to the per-cluster-fitted `Sq16Adaptive`;
+    /// Cosine keeps the fixed-grid `Sq16`. A change here silently reshapes every
+    /// newly built table that doesn't override `rerank_codec`, so it's pinned.
+    #[test]
+    fn default_rerank_codec_is_sq16adaptive_for_non_cosine() {
+        assert_eq!(
+            default_rerank_codec_for(Metric::L2Sq),
+            RerankCodec::Sq16Adaptive
+        );
+        assert_eq!(
+            default_rerank_codec_for(Metric::NegDot),
+            RerankCodec::Sq16Adaptive
+        );
+        assert_eq!(default_rerank_codec_for(Metric::Cosine), RerankCodec::Sq16);
+    }
 
     /// Drive an async reader call to completion. The materialized read-back is
     /// async (the drain fetches-on-miss); these tests use in-memory readers, so

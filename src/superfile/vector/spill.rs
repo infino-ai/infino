@@ -532,22 +532,27 @@ impl MaterializedRowSpillWriter {
         } else {
             self.rerank_codec = Some(enc.rerank_codec);
         }
-        // The residual family carries a two-plane body (`codes` + `residuals`,
-        // each `dim`) plus a per-cluster `dim`-length quantizer. Single-plane
-        // codecs (Sq16) carry only the `dim*2`-byte code plane on a fixed grid:
-        // no residual plane, no per-cluster quantizer sidecar.
-        let uses_cluster_quant = enc.rerank_codec.is_sq8_residual_family();
-        let shape_ok = if uses_cluster_quant {
-            enc.codes.len() == self.dim
-                && enc.residuals.len() == self.dim
-                && enc.scale.len() == self.dim
-                && enc.offset.len() == self.dim
+        // Two independent axes: body shape and ruler presence.
+        // - body: the residual family is two-plane (`codes` + `residuals`, each
+        //   `dim`); the single-u16-plane codecs (`Sq16`, `Sq16Adaptive`) carry a
+        //   `dim*2`-byte code plane and no residual plane.
+        // - ruler: `Sq8Residual`/`Sq8FixedResidual`/`Sq16Adaptive` carry a
+        //   per-cluster `dim`-length scale/offset; fixed-grid `Sq16` carries none.
+        // `Sq16Adaptive` is the combination that splits these apart (single-plane
+        // body WITH a per-cluster ruler), so the checks can't be a single branch.
+        let single_plane = enc.rerank_codec.writes_single_u16_plane();
+        let has_ruler = enc.rerank_codec.carries_cluster_quant_meta();
+        let body_ok = if single_plane {
+            enc.codes.len() == self.dim * 2 && enc.residuals.is_empty()
         } else {
-            enc.codes.len() == self.dim * 2
-                && enc.residuals.is_empty()
-                && enc.scale.is_empty()
-                && enc.offset.is_empty()
+            enc.codes.len() == self.dim && enc.residuals.len() == self.dim
         };
+        let ruler_ok = if has_ruler {
+            enc.scale.len() == self.dim && enc.offset.len() == self.dim
+        } else {
+            enc.scale.is_empty() && enc.offset.is_empty()
+        };
+        let shape_ok = body_ok && ruler_ok;
         if !shape_ok || row.rabitq_code.len() != self.rabitq_len {
             return Err(BuildError::Io(Error::new(
                 ErrorKind::InvalidData,
@@ -565,7 +570,7 @@ impl MaterializedRowSpillWriter {
                 ),
             )));
         }
-        let quant_idx = if uses_cluster_quant {
+        let quant_idx = if has_ruler {
             let ptr = Arc::as_ptr(&enc.scale) as *const () as usize;
             match self.quant_idx_by_ptr.get(&ptr) {
                 Some(&idx) => idx,
@@ -715,10 +720,11 @@ fn read_spilled_row(
         u32::from_le_bytes(prefix[20..24].try_into().expect("4-byte u32 slice")) as usize;
     let norm_flag = prefix[24];
     let norm = f32::from_le_bytes(prefix[25..29].try_into().expect("4-byte f32 slice"));
-    // Single-plane codecs (Sq16) carry no quantizer table; their scale/offset
-    // are empty and the parse below ignores them. The residual family looks up
-    // the per-cluster quantizer by the index stored in the row prefix.
-    let (scale, offset) = if rerank_codec.is_sq8_residual_family() {
+    // The fixed-grid codec (Sq16) carries no quantizer table; its scale/offset
+    // are empty and the parse below ignores them. The cluster-quant codecs (the
+    // residual family and the fitted single-plane Sq16Adaptive) look up the
+    // per-cluster quantizer by the index stored in the row prefix.
+    let (scale, offset) = if rerank_codec.carries_cluster_quant_meta() {
         quants.get(quant_idx).cloned().ok_or_else(|| {
             BuildError::Io(Error::new(
                 ErrorKind::InvalidData,

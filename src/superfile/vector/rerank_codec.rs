@@ -61,8 +61,9 @@ use crate::superfile::{
     vector::{
         cell_posting::{EncodedCellRow, residual_family_materialize_into_cluster_quant},
         distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, dequantize_sq8_residual_into, dequantize_sq16_into,
-            sq8_residual_norm_sq, sq16_decoded_norm_sq,
+            Metric, SQ8_RESIDUAL_DIVISOR, dequantize_sq8_residual_into,
+            dequantize_sq16_adaptive_into, dequantize_sq16_into, encode_sq16_adaptive_row,
+            sq8_residual_norm_sq, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
         },
     },
 };
@@ -147,6 +148,20 @@ pub enum RerankCodec {
     /// clamps any out-of-range component, so callers must normalize (the engine
     /// and bindings do not normalize on your behalf).
     Sq16,
+    /// `Sq16`'s single-plane `u16` body over a **per-cluster, data-fitted**
+    /// range instead of the fixed `[-1, 1]` grid — i.e. the 16-bit,
+    /// variable-ruler counterpart of [`Self::Sq8Residual`], with no residual
+    /// plane (the 16-bit grid is fine enough that the residual leg is
+    /// unnecessary). One little-endian `u16` per dim (`dim × 2` bytes — the same
+    /// storage as `Sq8Residual`), reconstructed as `x = code × scale_c[d] +
+    /// offset_c[d]` from the cluster's stored quantizer. On merge the
+    /// destination cluster reuses the first contributing input's ruler and
+    /// re-encodes the rest onto it, clamping any component that falls outside
+    /// that range (the same first-input-ruler behaviour as the residual family;
+    /// a wider destination ruler that covers every input's range is future
+    /// work). Metric-agnostic (not pinned to `[-1, 1]`); the default rerank
+    /// codec for L2Sq / NegDot.
+    Sq16Adaptive,
     /// No rerank column at all. The 1-bit RaBitQ shortlist is
     /// the final ranking. Opt-in — recall drops 0.05–0.15 on
     /// typical normalized-Gaussian / image-embedding corpora;
@@ -166,7 +181,7 @@ impl Default for RerankCodec {
     /// a provably ≤ per-component quantization error, so recall is ≥ in
     /// expectation (and ≥ in the codec-isolated measurements) — not a strict
     /// per-query guarantee, since ranking can flip on a near-tie. Metric-aware
-    /// constructors retain local residual encoding (`Sq8Residual`) for
+    /// constructors use the data-fitted `Sq16Adaptive` ruler for
     /// non-cosine metrics, whose values are not bounded to `[-1, 1]`.
     fn default() -> Self {
         Self::Sq16
@@ -186,6 +201,7 @@ impl RerankCodec {
             Self::RabitqOnly => 2,
             Self::Sq8FixedResidual => 3,
             Self::Sq16 => 4,
+            Self::Sq16Adaptive => 5,
         }
     }
 
@@ -201,6 +217,7 @@ impl RerankCodec {
             2 => Some(Self::RabitqOnly),
             3 => Some(Self::Sq8FixedResidual),
             4 => Some(Self::Sq16),
+            5 => Some(Self::Sq16Adaptive),
             _ => None,
         }
     }
@@ -215,6 +232,7 @@ impl RerankCodec {
             Self::RabitqOnly => "rabitq_only",
             Self::Sq8FixedResidual => "sq8_fixed_residual",
             Self::Sq16 => "sq16",
+            Self::Sq16Adaptive => "sq16_adaptive",
         }
     }
 
@@ -224,7 +242,7 @@ impl RerankCodec {
     pub const fn per_vector_bytes(self, dim: usize) -> usize {
         match self {
             Self::Fp32 => dim * 4,
-            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 => dim * 2,
+            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 | Self::Sq16Adaptive => dim * 2,
             Self::RabitqOnly => 0,
         }
     }
@@ -266,7 +284,12 @@ impl RerankCodec {
     pub const fn is_implemented(self) -> bool {
         matches!(
             self,
-            Self::Fp32 | Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 | Self::RabitqOnly
+            Self::Fp32
+                | Self::Sq8Residual
+                | Self::Sq8FixedResidual
+                | Self::Sq16
+                | Self::Sq16Adaptive
+                | Self::RabitqOnly
         )
     }
 
@@ -281,10 +304,10 @@ impl RerankCodec {
     /// Whether this codec participates in the IVF drain / merge / compaction
     /// maintenance paths that re-quantize rows into a destination cluster
     /// quantizer. True for the residual family (`Sq8Residual`,
-    /// `Sq8FixedResidual`) and for the single-plane `Sq16` codec, all of which
-    /// carry a cold-path `ops()` impl and so can be built-from-source, drained,
-    /// merged, and compacted. `Fp32` / `RabitqOnly` have their own (or no)
-    /// rerank plane and are never IVF-merged here.
+    /// `Sq8FixedResidual`) and for the single-plane codecs (`Sq16`,
+    /// `Sq16Adaptive`), all of which carry a cold-path `ops()` impl and so can be
+    /// built-from-source, drained, merged, and compacted. `Fp32` / `RabitqOnly`
+    /// have their own (or no) rerank plane and are never IVF-merged here.
     ///
     /// This is the gate predicate for the maintenance sites; it replaces the
     /// former direct use of [`Self::is_sq8_residual_family`] at those sites so
@@ -294,8 +317,57 @@ impl RerankCodec {
     pub const fn is_ivf_mergeable(self) -> bool {
         matches!(
             self,
-            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16
+            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 | Self::Sq16Adaptive
         )
+    }
+
+    /// Whether the codec's per-vector body is a single little-endian `u16`
+    /// plane (`Sq16`, `Sq16Adaptive`) rather than the two-plane
+    /// `[u8 code ‖ i8 residual]` layout of the residual family. Both single
+    /// -plane codecs share the same body/parse/dequant code — they differ only
+    /// in the ruler (fixed grid vs per-cluster fitted).
+    #[inline]
+    pub const fn writes_single_u16_plane(self) -> bool {
+        matches!(self, Self::Sq16 | Self::Sq16Adaptive)
+    }
+
+    /// Largest quantizer code value for this codec's coarse plane: `65535` for
+    /// the single-`u16`-plane codecs, `255` for the `u8`-coarse residual family.
+    /// The per-cluster ruler is fit as `scale = (max - min) / code_max`, so this
+    /// MUST match the plane's integer width — fitting a `u16` plane with the
+    /// `u8` `255` confines every code to `0..=255` and silently throws away 8
+    /// bits of the 16-bit grid.
+    #[inline]
+    pub const fn code_max(self) -> f32 {
+        if self.writes_single_u16_plane() {
+            65535.0
+        } else {
+            255.0
+        }
+    }
+
+    /// Whether the codec stores per-cluster `scale`/`offset` quantizer arrays in
+    /// `codec_meta` (so open/merge must load them). True for the residual family
+    /// and for `Sq16Adaptive`; **not** `Sq16` (fixed grid, no arrays). This is
+    /// the ruler-storage axis, distinct from the body-layout axis
+    /// ([`Self::is_sq8_residual_family`]) — `Sq16Adaptive` carries the arrays
+    /// but is single-plane, so the two axes no longer coincide.
+    #[inline]
+    pub const fn carries_cluster_quant_meta(self) -> bool {
+        matches!(
+            self,
+            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16Adaptive
+        )
+    }
+
+    /// Whether the codec fits its per-cluster ruler from the data (rather than
+    /// pinning a fixed grid): the build path scans each cluster's `[min,max]`,
+    /// and a merge reuses the first contributing input's ruler for the
+    /// destination cluster. True for `Sq8Residual` and `Sq16Adaptive`; the
+    /// fixed-grid codecs (`Sq8FixedResidual`, `Sq16`) are excluded.
+    #[inline]
+    pub const fn fits_per_cluster_ruler(self) -> bool {
+        matches!(self, Self::Sq8Residual | Self::Sq16Adaptive)
     }
 
     /// Whether this is the flat single-plane `u16` codec. Scored via
@@ -312,8 +384,8 @@ impl RerankCodec {
         match self {
             Self::Sq8Residual => Some(SQ8_RESIDUAL_DIVISOR),
             Self::Sq8FixedResidual => Some(SQ8_FIXED_RESIDUAL_DIVISOR),
-            // `Sq16` is a single plane — no residual step, no divisor.
-            Self::Fp32 | Self::Sq16 | Self::RabitqOnly => None,
+            // `Sq16`/`Sq16Adaptive` are single planes — no residual step, no divisor.
+            Self::Fp32 | Self::Sq16 | Self::Sq16Adaptive | Self::RabitqOnly => None,
         }
     }
 
@@ -357,9 +429,9 @@ impl RerankCodec {
     pub const fn recommended_rerank_mult_floor(self, dim: usize) -> Option<usize> {
         let high_dim = dim > LOW_DIM_RERANK_FLOOR_THRESHOLD;
         match self {
-            // `Sq16` is ~16-bit clean, so its rerank floor matches
-            // `Fp32` rather than the lossier Sq8 first-pass.
-            Self::Fp32 | Self::Sq16 => Some(if high_dim {
+            // `Sq16`/`Sq16Adaptive` are ~16-bit clean, so their rerank floor
+            // matches `Fp32` rather than the lossier Sq8 first-pass.
+            Self::Fp32 | Self::Sq16 | Self::Sq16Adaptive => Some(if high_dim {
                 FP32_HIGH_DIM_RERANK_FLOOR
             } else {
                 FP32_LOW_DIM_RERANK_FLOOR
@@ -431,7 +503,10 @@ impl RerankCodec {
                 Metric::L2Sq | Metric::Cosine => n_docs * 4,
                 Metric::NegDot => 0,
             },
-            Self::Sq8Residual | Self::Sq8FixedResidual => {
+            // Residual family and `Sq16Adaptive` all carry per-cluster
+            // scale/offset arrays; `Sq16Adaptive` differs only in the body
+            // (single u16 plane), not the codec_meta shape.
+            Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16Adaptive => {
                 let scale_offset_bytes = 2 * n_cent * dim * 4;
                 let norms_bytes = match metric {
                     Metric::L2Sq | Metric::Cosine => n_docs * 4,
@@ -546,6 +621,7 @@ pub(crate) trait RerankCodecOps: Sync {
 pub(crate) struct Sq8ResidualOps;
 pub(crate) struct Sq8FixedResidualOps;
 pub(crate) struct Sq16Ops;
+pub(crate) struct Sq16AdaptiveOps;
 
 /// Shared residual-family row split: `dim` u8 coarse codes + `dim` i8 residual
 /// codes; norm via [`sq8_residual_norm_sq`] with the codec's `divisor`.
@@ -827,6 +903,90 @@ impl RerankCodecOps for Sq16Ops {
     }
 }
 
+/// `Sq16Adaptive` = `Sq16`'s single-`u16`-plane body over a per-cluster fitted
+/// ruler. It reuses the body/parse layout of [`Sq16Ops`] and overrides only the
+/// ruler: the arithmetic reads the passed `scale`/`offset` (via the
+/// `*_adaptive_*` distance functions) instead of the fixed grid, its
+/// `codec_meta` carries the per-cluster scale/offset arrays like the residual
+/// family, and a merge transcodes rather than byte-copies (source and
+/// destination cluster grids differ, so each row is decoded against its source
+/// ruler and re-encoded against the destination ruler).
+impl RerankCodecOps for Sq16AdaptiveOps {
+    fn parse_materialized_row(
+        &self,
+        row: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        store_norm: bool,
+    ) -> EncodedRowParts {
+        let codes = row[..dim * 2].to_vec();
+        let norm_sq = store_norm.then(|| sq16_adaptive_norm_sq(&codes, dim, scale, offset));
+        EncodedRowParts {
+            codes,
+            residuals: Vec::new(),
+            norm_sq,
+        }
+    }
+
+    fn dequantize_row_into(
+        &self,
+        codes: &[u8],
+        _residuals: &[u8],
+        _dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        out: &mut [f32],
+    ) {
+        dequantize_sq16_adaptive_into(codes, scale, offset, out);
+    }
+
+    fn decoded_norm_sq(&self, code: &[u8], dim: usize, scale: &[f32], offset: &[f32]) -> f32 {
+        sq16_adaptive_norm_sq(&code[..dim * 2], dim, scale, offset)
+    }
+
+    fn materialize_row_into_cluster_quant(
+        &self,
+        row: &EncodedCellRow,
+        dst_scale: &[f32],
+        dst_offset: &[f32],
+        dim: usize,
+        out: &mut [u8],
+        store_norm: bool,
+    ) -> Result<Option<f32>, BuildError> {
+        if row.rerank_codec != RerankCodec::Sq16Adaptive {
+            return Err(BuildError::VectorSchemaMismatch(format!(
+                "cannot transcode Sq16Adaptive row from {} to {}",
+                row.rerank_codec.name(),
+                RerankCodec::Sq16Adaptive.name()
+            )));
+        }
+        // Per-cluster grids differ across source and destination, so transcode:
+        // decode against the source ruler, re-encode against the destination
+        // ruler. The destination reuses the first input's ruler, so a component
+        // outside that range is clamped by encode_sq16_adaptive_row; feed the
+        // clamp count to the maintenance tripwire so a destination ruler that
+        // fails to cover its inputs shouts rather than silently losing recall.
+        let mut decoded = vec![0.0f32; dim];
+        dequantize_sq16_adaptive_into(&row.codes, &row.scale, &row.offset, &mut decoded);
+        let clamped = encode_sq16_adaptive_row(&decoded, dst_scale, dst_offset, out);
+        super::cell_posting::note_transcode_clamped_components(clamped);
+        Ok(store_norm.then(|| sq16_adaptive_norm_sq(out, dim, dst_scale, dst_offset)))
+    }
+
+    fn codec_meta_layout(
+        &self,
+        meta_off: usize,
+        n_cent: usize,
+        dim: usize,
+        metric: Metric,
+    ) -> CodecMetaLayout {
+        // Same `[scale ‖ offset ‖ norms?]` layout as the residual family — the
+        // ruler storage is identical; only the row body differs.
+        residual_family_codec_meta_layout(meta_off, n_cent, dim, metric)
+    }
+}
+
 impl RerankCodec {
     /// Cold-path ops for the quantized-rerank family; `None` for `Fp32` /
     /// `RabitqOnly` (no quantized rerank plane — they keep their own paths).
@@ -835,6 +995,7 @@ impl RerankCodec {
             Self::Sq8Residual => Some(&Sq8ResidualOps),
             Self::Sq8FixedResidual => Some(&Sq8FixedResidualOps),
             Self::Sq16 => Some(&Sq16Ops),
+            Self::Sq16Adaptive => Some(&Sq16AdaptiveOps),
             Self::Fp32 | Self::RabitqOnly => None,
         }
     }
@@ -873,6 +1034,7 @@ mod tests {
             RerankCodec::Sq8Residual,
             RerankCodec::Sq8FixedResidual,
             RerankCodec::Sq16,
+            RerankCodec::Sq16Adaptive,
             RerankCodec::RabitqOnly,
         ] {
             assert_eq!(
@@ -883,13 +1045,47 @@ mod tests {
         }
     }
 
+    /// `Sq16Adaptive` sits on both axes the codebase used to conflate: it shares
+    /// the single-`u16` body with `Sq16` but the per-cluster fitted ruler with
+    /// `Sq8Residual`. Pins each predicate so a future refactor can't silently
+    /// re-route it (e.g. onto the fixed grid, or the two-plane body).
+    #[test]
+    fn sq16_adaptive_sits_on_both_axes() {
+        let c = RerankCodec::Sq16Adaptive;
+        // additive id, 2 bytes/dim (storage-neutral vs Sq8Residual)
+        assert_eq!(c.codec_id(), 5);
+        assert_eq!(c.per_vector_bytes(384), 384 * 2);
+        // u16 plane ⇒ the ruler MUST be fit to the full 16-bit range, not 255
+        // (fitting with 255 confines codes to 0..=255 and drops 8 bits — the
+        // recall bug this guards).
+        assert_eq!(c.code_max(), 65535.0);
+        assert_eq!(RerankCodec::Sq8Residual.code_max(), 255.0);
+        // single-u16 body (like Sq16), NOT the two-plane residual body
+        assert!(c.writes_single_u16_plane());
+        assert!(!c.is_sq8_residual_family());
+        // per-cluster fitted ruler (like Sq8Residual), NOT a fixed grid
+        assert!(c.fits_per_cluster_ruler());
+        assert!(c.carries_cluster_quant_meta());
+        assert!(!c.uses_fixed_quantizer());
+        // single plane ⇒ no residual divisor; IVF-mergeable; metric-agnostic
+        assert_eq!(c.residual_divisor(), None);
+        assert!(c.is_ivf_mergeable());
+        assert!(c.supports_metric(Metric::L2Sq) && c.supports_metric(Metric::NegDot));
+        // dim recovered as half the u16 code length
+        assert_eq!(c.dim_from_codes_len(384 * 2), 384);
+    }
+
     /// Unknown discriminator bytes (any value not currently
-    /// assigned, e.g. `5`, `255`) return `None`. The reader
+    /// assigned, e.g. `6`, `255`) return `None`. The reader
     /// upgrades that into a `MalformedVersion` error rather than
-    /// guessing.
+    /// guessing. Id `5` now maps to `Sq16Adaptive`.
     #[test]
     fn unknown_codec_id_is_none() {
-        for id in [5u8, 6, 16, 200, 255] {
+        assert_eq!(
+            RerankCodec::from_codec_id(5),
+            Some(RerankCodec::Sq16Adaptive)
+        );
+        for id in [6u8, 16, 200, 255] {
             assert_eq!(
                 RerankCodec::from_codec_id(id),
                 None,

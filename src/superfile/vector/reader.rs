@@ -1131,7 +1131,7 @@ impl VectorReader {
                 ))));
             }
 
-            let sq8_meta = if rerank_codec.is_sq8_residual_family() {
+            let sq8_meta = if rerank_codec.carries_cluster_quant_meta() {
                 let meta_abs_start = subsection_off + codec_meta_off;
                 let meta_abs_end = meta_abs_start + actual_codec_meta_size;
                 let so_block_bytes = (n_cent as usize) * dim * 4;
@@ -1345,6 +1345,9 @@ impl VectorReader {
                     RerankCodec::Sq8FixedResidual
                 }
                 value if value == u32::from(RerankCodec::Sq16.codec_id()) => RerankCodec::Sq16,
+                value if value == u32::from(RerankCodec::Sq16Adaptive.codec_id()) => {
+                    RerankCodec::Sq16Adaptive
+                }
                 _ => {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "multi-cell directory has unknown rerank codec id {raw_codec}"
@@ -1756,7 +1759,7 @@ impl VectorReader {
             ))));
         }
 
-        let sq8_meta = if rerank_codec.is_sq8_residual_family() {
+        let sq8_meta = if rerank_codec.carries_cluster_quant_meta() {
             let meta_abs_start = subsection_off + codec_meta_off;
             let meta_abs_end = meta_abs_start + codec_meta_size;
             let so_block_bytes = n_cent * dim * 4;
@@ -2791,7 +2794,7 @@ impl VectorReader {
             // fixed-grid codecs (Sq16) decode off the fixed grid and store empty
             // scale/offset, so there is nothing to slice per cluster.
             let (sc, of): (std::sync::Arc<[f32]>, std::sync::Arc<[f32]>) =
-                if col.rerank_codec.is_sq8_residual_family() {
+                if col.rerank_codec.carries_cluster_quant_meta() {
                     (
                         std::sync::Arc::from(
                             scale
@@ -5035,6 +5038,90 @@ pub(crate) fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u3
 /// - **Sq8Residual**: builds one [`Sq8ResidualKernel`] per selected cluster and
 ///   scores every RaBitQ shortlist survivor with both stored bytes. The
 ///   per-doc decoded norm cached at encode time short-circuits `Σx²` for L2Sq.
+/// Fetch per-cluster quantizer rulers (scale/offset) and the per-doc norms for
+/// exactly the probed clusters directly from the lazy source, for the
+/// no-prefetch fallback. Shared by every cluster-quant codec's lazy path; the
+/// caller then builds its own per-cluster kernel and scores. Returns the deduped
+/// probed cluster ids, their `(scale, offset)` rulers keyed by cluster, and —
+/// when the column stores norms — a candidate-position → norm map.
+fn fetch_lazy_cluster_meta(
+    source: &Source,
+    candidates: &[RerankCandidate],
+    rerank_codec: RerankCodec,
+    dim: usize,
+    scale_abs_off: usize,
+    offset_abs_off: usize,
+    norms_abs_off: Option<usize>,
+) -> Result<
+    (
+        Vec<u32>,
+        HashMap<u32, (Vec<f32>, Vec<f32>)>,
+        Option<HashMap<u32, f32>>,
+    ),
+    VectorError,
+> {
+    let map_lazy = |e: LazyByteSourceError| VectorError::LazySource(e.to_string());
+    let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
+    clusters.sort_unstable();
+    clusters.dedup();
+
+    let cluster_meta_len = dim * 4;
+    let mut ranges = Vec::with_capacity(clusters.len() * 2);
+    for &cluster_id in &clusters {
+        let c = cluster_id as usize;
+        let scale_start = scale_abs_off + c * cluster_meta_len;
+        let offset_start = offset_abs_off + c * cluster_meta_len;
+        ranges.push(scale_start..scale_start + cluster_meta_len);
+        ranges.push(offset_start..offset_start + cluster_meta_len);
+    }
+    let bytes = source.get_ranges_parallel(&ranges).map_err(map_lazy)?;
+    let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
+        HashMap::with_capacity(clusters.len());
+    for (idx, &cluster_id) in clusters.iter().enumerate() {
+        let scale = parse_f32_le_vec(&bytes[idx * 2]);
+        let offset = parse_f32_le_vec(&bytes[idx * 2 + 1]);
+        validate_quantizer_meta(rerank_codec, &scale, &offset, "lazy per-cluster metadata")?;
+        scale_offset_by_cluster.insert(cluster_id, (scale, offset));
+    }
+
+    let norm_by_pos = if let Some(norms_abs_off) = norms_abs_off {
+        let mut spans: HashMap<u32, (u32, u32)> = HashMap::new();
+        for cand in candidates {
+            spans
+                .entry(cand.cluster_id)
+                .and_modify(|(lo, hi)| {
+                    *lo = (*lo).min(cand.pos);
+                    *hi = (*hi).max(cand.pos);
+                })
+                .or_insert((cand.pos, cand.pos));
+        }
+        let mut span_items: Vec<(u32, u32, u32)> = spans
+            .into_iter()
+            .map(|(cluster_id, (lo, hi))| (cluster_id, lo, hi))
+            .collect();
+        span_items.sort_unstable_by_key(|&(cluster_id, _, _)| cluster_id);
+        let norm_ranges: Vec<Range<usize>> = span_items
+            .iter()
+            .map(|&(_, lo, hi)| {
+                let start = norms_abs_off + lo as usize * 4;
+                start..start + (hi - lo + 1) as usize * 4
+            })
+            .collect();
+        let norm_bytes = source.get_ranges_parallel(&norm_ranges).map_err(map_lazy)?;
+        let mut out = HashMap::new();
+        for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
+            let vals = parse_f32_le_vec(&bytes);
+            for (i, pos) in (lo..=hi).enumerate() {
+                out.insert(pos, vals[i]);
+            }
+        }
+        Some(out)
+    } else {
+        None
+    };
+    Ok((clusters, scale_offset_by_cluster, norm_by_pos))
+}
+
 async fn rerank_candidates_from_blocks(
     source: &Source,
     lazy_sq8_meta_bytes: Option<&Bytes>,
@@ -5251,70 +5338,15 @@ async fn rerank_candidates_from_blocks(
                         .await?;
                         return Ok((finalize_reranked(scored, k), kernel_ns + ns));
                     }
-                    let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
-                    clusters.sort_unstable();
-                    clusters.dedup();
-
-                    let cluster_meta_len = dim * 4;
-                    let mut ranges = Vec::with_capacity(clusters.len() * 2);
-                    for &cluster_id in &clusters {
-                        let c = cluster_id as usize;
-                        let scale_start = *scale_abs_off + c * cluster_meta_len;
-                        let offset_start = *offset_abs_off + c * cluster_meta_len;
-                        ranges.push(scale_start..scale_start + cluster_meta_len);
-                        ranges.push(offset_start..offset_start + cluster_meta_len);
-                    }
-                    let bytes = source.get_ranges_parallel(&ranges).map_err(map_lazy)?;
-                    let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
-                        HashMap::with_capacity(clusters.len());
-                    for (idx, &cluster_id) in clusters.iter().enumerate() {
-                        let scale = parse_f32_le_vec(&bytes[idx * 2]);
-                        let offset = parse_f32_le_vec(&bytes[idx * 2 + 1]);
-                        validate_quantizer_meta(
-                            col.rerank_codec,
-                            &scale,
-                            &offset,
-                            "lazy per-cluster metadata",
-                        )?;
-                        scale_offset_by_cluster.insert(cluster_id, (scale, offset));
-                    }
-
-                    let norm_by_pos = if let Some(norms_abs_off) = norms_abs_off {
-                        let mut spans: HashMap<u32, (u32, u32)> = HashMap::new();
-                        for cand in candidates {
-                            spans
-                                .entry(cand.cluster_id)
-                                .and_modify(|(lo, hi)| {
-                                    *lo = (*lo).min(cand.pos);
-                                    *hi = (*hi).max(cand.pos);
-                                })
-                                .or_insert((cand.pos, cand.pos));
-                        }
-                        let mut span_items: Vec<(u32, u32, u32)> = spans
-                            .into_iter()
-                            .map(|(cluster_id, (lo, hi))| (cluster_id, lo, hi))
-                            .collect();
-                        span_items.sort_unstable_by_key(|&(cluster_id, _, _)| cluster_id);
-                        let norm_ranges: Vec<Range<usize>> = span_items
-                            .iter()
-                            .map(|&(_, lo, hi)| {
-                                let start = *norms_abs_off + lo as usize * 4;
-                                start..start + (hi - lo + 1) as usize * 4
-                            })
-                            .collect();
-                        let norm_bytes =
-                            source.get_ranges_parallel(&norm_ranges).map_err(map_lazy)?;
-                        let mut out = HashMap::new();
-                        for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
-                            let vals = parse_f32_le_vec(&bytes);
-                            for (i, pos) in (lo..=hi).enumerate() {
-                                out.insert(pos, vals[i]);
-                            }
-                        }
-                        Some(out)
-                    } else {
-                        None
-                    };
+                    let (clusters, scale_offset_by_cluster, norm_by_pos) = fetch_lazy_cluster_meta(
+                        source,
+                        candidates,
+                        col.rerank_codec,
+                        dim,
+                        *scale_abs_off,
+                        *offset_abs_off,
+                        *norms_abs_off,
+                    )?;
 
                     let kernels: HashMap<u32, Sq8ResidualKernel> = clusters
                         .into_iter()
@@ -5366,6 +5398,125 @@ async fn rerank_candidates_from_blocks(
                 }
             }
         }
+        RerankCodec::Sq16Adaptive => {
+            // Single-`u16`-plane rerank over per-cluster fitted rulers. Reuses
+            // the residual family's `Sq8ColumnMeta` (scale/offset + per-doc
+            // norms) and the same Eager/Lazy meta-fetch; only the kernel
+            // (per-cluster `Sq16Kernel::new_adaptive`) and the single-plane body
+            // differ — no residual divisor.
+            let meta = col
+                .sq8_meta
+                .as_ref()
+                .expect("Sq16Adaptive column must carry sq8_meta (built in open_with)");
+            let dim = col.dim;
+            match meta {
+                Sq8ColumnMeta::Eager {
+                    scale,
+                    offset,
+                    per_doc_norms,
+                } => {
+                    let (scored, ns) = score_sq16_adaptive_candidates(
+                        candidates,
+                        cluster_blocks,
+                        survivor_full_rows,
+                        col.metric,
+                        dim,
+                        query,
+                        scale,
+                        offset,
+                        per_doc_norms.clone(),
+                        pool.clone(),
+                        stride,
+                    )
+                    .await?;
+                    kernel_ns += ns;
+                    scored
+                }
+                Sq8ColumnMeta::Lazy {
+                    scale_abs_off,
+                    offset_abs_off,
+                    norms_abs_off,
+                } => {
+                    if let Some(meta_bytes) = lazy_sq8_meta_bytes {
+                        if col.lazy_sq8_parsed.get().is_none() {
+                            let parsed = parse_sq8_meta_bytes(
+                                meta_bytes,
+                                col.n_cent as usize,
+                                dim,
+                                col.n_docs as usize,
+                                norms_abs_off.is_some(),
+                                col.rerank_codec,
+                            )?;
+                            let _ = col.lazy_sq8_parsed.set(Arc::new(parsed));
+                        }
+                        let parsed = Arc::clone(
+                            col.lazy_sq8_parsed
+                                .get()
+                                .expect("lazy Sq8 meta set just above"),
+                        );
+                        let (scored, ns) = score_sq16_adaptive_candidates(
+                            candidates,
+                            cluster_blocks,
+                            survivor_full_rows,
+                            col.metric,
+                            dim,
+                            query,
+                            parsed.scale.as_slice(),
+                            parsed.offset.as_slice(),
+                            parsed.per_doc_norms.clone(),
+                            pool.clone(),
+                            stride,
+                        )
+                        .await?;
+                        return Ok((finalize_reranked(scored, k), kernel_ns + ns));
+                    }
+                    let (clusters, scale_offset_by_cluster, norm_by_pos) = fetch_lazy_cluster_meta(
+                        source,
+                        candidates,
+                        col.rerank_codec,
+                        dim,
+                        *scale_abs_off,
+                        *offset_abs_off,
+                        *norms_abs_off,
+                    )?;
+
+                    let kernels: HashMap<u32, Sq16Kernel> = clusters
+                        .into_iter()
+                        .map(|cluster_id| {
+                            let (scale, offset) = scale_offset_by_cluster
+                                .get(&cluster_id)
+                                .expect("cluster metadata fetched");
+                            (
+                                cluster_id,
+                                Sq16Kernel::new_adaptive(col.metric, query, scale, offset),
+                            )
+                        })
+                        .collect();
+                    let (scored, ns) = timed_section(|| {
+                        candidates
+                            .iter()
+                            .map(|cand| {
+                                let row = candidate_full_bytes(
+                                    cluster_blocks,
+                                    survivor_full_rows,
+                                    cand,
+                                    stride,
+                                );
+                                let kernel = kernels
+                                    .get(&cand.cluster_id)
+                                    .expect("invariant: kernel built for every candidate cluster");
+                                let norm = norm_by_pos
+                                    .as_ref()
+                                    .and_then(|norms| norms.get(&cand.pos).copied());
+                                (cand.did, kernel.distance_with_norm(row, norm))
+                            })
+                            .collect()
+                    });
+                    kernel_ns += ns;
+                    scored
+                }
+            }
+        }
         RerankCodec::RabitqOnly => unreachable!(
             "rerank_candidates_in_run reached with None codec — None columns \
              have no full[] region and should short-circuit before the rerank step"
@@ -5383,40 +5534,40 @@ fn finalize_reranked(mut reranked: Vec<(u32, f32)>, k: usize) -> Vec<(u32, f32)>
     reranked
 }
 
-/// Score every RaBitQ shortlist survivor with its full Sq8+residual payload.
-/// Builds one [`Sq8ResidualKernel`] per distinct probed cluster and parallelizes
-/// once the shortlist exceeds [`PARALLEL_SCAN_MIN`].
+/// Score every RaBitQ shortlist survivor with its per-cluster rerank kernel,
+/// building one kernel per distinct probed cluster and parallelizing once the
+/// shortlist exceeds [`PARALLEL_SCAN_MIN`].
 ///
-/// Both code paths keep their own data-access strategy (eager mmap vs
-/// lazy range GETs); only the scoring math is shared here.
-async fn score_sq8_residual_candidates(
+/// Generic over the kernel type `K` so the two-plane residual codecs and the
+/// single-`u16`-plane `Sq16Adaptive` codec share the cluster-dedup, per-cluster
+/// kernel map, and serial/parallel fan-out. The caller supplies `build_kernel`
+/// (cluster id → kernel, folding that cluster's ruler) and `score_row` (kernel,
+/// full row bytes, optional norm → distance), which is where the body layout
+/// (two-plane `[code | residual]` vs single `u16` plane) and any divisor live.
+/// Both code paths keep their own data-access strategy (eager mmap vs lazy range
+/// GETs); only the scoring fan-out is shared here.
+#[allow(clippy::too_many_arguments)]
+async fn score_candidates_with_kernel<K, B, S>(
     candidates: &[RerankCandidate],
     cluster_blocks: &[Bytes],
     survivor_full_rows: Option<&[Bytes]>,
-    metric: Metric,
-    dim: usize,
-    query: &[f32],
-    scale: &[f32],
-    offset: &[f32],
     per_doc_norms: Option<Arc<[f32]>>,
-    residual_divisor: f32,
     pool: Option<Arc<ThreadPool>>,
     stride: usize,
-) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
+    build_kernel: B,
+    score_row: S,
+) -> Result<(Vec<(u32, f32)>, u64), VectorError>
+where
+    K: Send + Sync + 'static,
+    B: Fn(usize) -> K,
+    S: Fn(&K, &[u8], Option<f32>) -> f32 + Send + Sync + 'static,
+{
     let mut cids: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
     cids.sort_unstable();
     cids.dedup();
-    let kernels: HashMap<u32, Sq8ResidualKernel> = cids
+    let kernels: HashMap<u32, K> = cids
         .into_iter()
-        .map(|cid| {
-            let c = cid as usize;
-            let scale_c = &scale[c * dim..(c + 1) * dim];
-            let offset_c = &offset[c * dim..(c + 1) * dim];
-            (
-                cid,
-                Sq8ResidualKernel::new(metric, query, scale_c, offset_c, residual_divisor),
-            )
-        })
+        .map(|cid| (cid, build_kernel(cid as usize)))
         .collect();
     let score_one = |cand: &RerankCandidate| {
         let row = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
@@ -5424,10 +5575,7 @@ async fn score_sq8_residual_candidates(
             .get(&cand.cluster_id)
             .expect("invariant: kernel prebuilt for every probed cluster");
         let norm = per_doc_norms.as_ref().map(|norms| norms[cand.pos as usize]);
-        (
-            cand.did,
-            kernel.distance_with_norm(&row[..dim], &row[dim..dim * 2], norm),
-        )
+        (cand.did, score_row(kernel, row, norm))
     };
     if candidates.len() >= PARALLEL_SCAN_MIN {
         // Every candidate is independent and the caller sorts the completed
@@ -5445,15 +5593,11 @@ async fn score_sq8_residual_candidates(
                     cand,
                     stride,
                 );
-                let code = &row[..dim];
                 let kernel = kernels
                     .get(&cand.cluster_id)
                     .expect("invariant: kernel prebuilt for every probed cluster");
                 let norm = norms.as_ref().map(|norms| norms[cand.pos as usize]);
-                (
-                    cand.did,
-                    kernel.distance_with_norm(code, &row[dim..dim * 2], norm),
-                )
+                (cand.did, score_row(kernel, row, norm))
             },
             pool,
         )
@@ -5461,6 +5605,77 @@ async fn score_sq8_residual_candidates(
     } else {
         Ok(timed_section(|| candidates.iter().map(score_one).collect()))
     }
+}
+
+/// Score survivors with their full Sq8+residual payload: one
+/// [`Sq8ResidualKernel`] per probed cluster, two-plane `[code | residual]` body.
+#[allow(clippy::too_many_arguments)]
+async fn score_sq8_residual_candidates(
+    candidates: &[RerankCandidate],
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    metric: Metric,
+    dim: usize,
+    query: &[f32],
+    scale: &[f32],
+    offset: &[f32],
+    per_doc_norms: Option<Arc<[f32]>>,
+    residual_divisor: f32,
+    pool: Option<Arc<ThreadPool>>,
+    stride: usize,
+) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
+    score_candidates_with_kernel(
+        candidates,
+        cluster_blocks,
+        survivor_full_rows,
+        per_doc_norms,
+        pool,
+        stride,
+        |c| {
+            let scale_c = &scale[c * dim..(c + 1) * dim];
+            let offset_c = &offset[c * dim..(c + 1) * dim];
+            Sq8ResidualKernel::new(metric, query, scale_c, offset_c, residual_divisor)
+        },
+        move |kernel: &Sq8ResidualKernel, row: &[u8], norm| {
+            kernel.distance_with_norm(&row[..dim], &row[dim..dim * 2], norm)
+        },
+    )
+    .await
+}
+
+/// Adaptive-ruler twin: score survivors with their single-`u16`-plane
+/// `Sq16Adaptive` payload, building one [`Sq16Kernel`] per probed cluster via
+/// `new_adaptive` (folding that cluster's fitted ruler). The whole `stride`-byte
+/// row is the `u16` codes; no residual divisor.
+#[allow(clippy::too_many_arguments)]
+async fn score_sq16_adaptive_candidates(
+    candidates: &[RerankCandidate],
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    metric: Metric,
+    dim: usize,
+    query: &[f32],
+    scale: &[f32],
+    offset: &[f32],
+    per_doc_norms: Option<Arc<[f32]>>,
+    pool: Option<Arc<ThreadPool>>,
+    stride: usize,
+) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
+    score_candidates_with_kernel(
+        candidates,
+        cluster_blocks,
+        survivor_full_rows,
+        per_doc_norms,
+        pool,
+        stride,
+        |c| {
+            let scale_c = &scale[c * dim..(c + 1) * dim];
+            let offset_c = &offset[c * dim..(c + 1) * dim];
+            Sq16Kernel::new_adaptive(metric, query, scale_c, offset_c)
+        },
+        |kernel: &Sq16Kernel, row: &[u8], norm| kernel.distance_with_norm(row, norm),
+    )
+    .await
 }
 
 fn parse_sq8_meta_bytes(
@@ -7240,6 +7455,61 @@ mod tests {
         assert!(
             hits[0].1 <= 1.0,
             "Sq8 self-query distance {} should be small (≤ 1.0)",
+            hits[0].1
+        );
+    }
+
+    /// `Sq16Adaptive` build + open + self-query recovers the planted
+    /// self-vector at top-1 (L2Sq — the new default codec for non-cosine
+    /// metrics). Exercises the whole single-`u16`-plane + per-cluster-ruler
+    /// path end-to-end: the pass-3 adaptive encode, the codec_meta scale/offset
+    /// + norm layout, the open-side `Sq8ColumnMeta` load, and the per-cluster
+    /// `Sq16Kernel::new_adaptive` rerank dispatch. Any layout drift surfaces as
+    /// a wrong-doc or out-of-bounds. The 16-bit grid is strictly finer than
+    /// Sq8, so the round-trip error is smaller.
+    #[tokio::test]
+    async fn sq16_adaptive_self_query_round_trips_top1_l2sq() {
+        let dim = 32usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            rot_seed: 13,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq16Adaptive,
+            provided_centroids: None,
+        })
+        .expect("register column");
+        let make = |i: u32| -> Vec<f32> {
+            (0..dim)
+                .map(|j| ((i.wrapping_mul(17) + j as u32 * 3) % 64) as f32 * 0.5)
+                .collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let hits = r
+            .search("v", &all[17], 5, 4, 20)
+            .await
+            .expect("search must succeed on Sq16Adaptive column");
+        assert_eq!(
+            hits[0].0, 17,
+            "Sq16Adaptive self-query must recover self at top-1"
+        );
+        // 16-bit per-dim step is ~256x finer than Sq8, so the self-distance is
+        // near zero; a generous bound keeps the test RNG-robust.
+        assert!(
+            hits[0].1 <= 1.0,
+            "Sq16Adaptive self-query distance {} should be small (≤ 1.0)",
             hits[0].1
         );
     }

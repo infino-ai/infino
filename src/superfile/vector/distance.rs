@@ -758,10 +758,11 @@ pub(crate) fn distance_bytes_codec(
                  norm context)"
             )
         }
-        RerankCodec::Sq16 => {
+        RerankCodec::Sq16 | RerankCodec::Sq16Adaptive => {
             unreachable!(
-                "distance_bytes_codec called with Sq16 — Sq16 rerank goes through \
-                 Sq16Kernel (u16 → f32 dequant front on the fp32 distance path)"
+                "distance_bytes_codec called with a single-u16-plane codec — Sq16 / \
+                 Sq16Adaptive rerank goes through Sq16Kernel (u16 → f32 dequant front \
+                 on the fp32 distance path; adaptive folds the per-cluster ruler)"
             )
         }
         RerankCodec::RabitqOnly => {
@@ -1110,6 +1111,35 @@ impl Sq16Kernel {
         }
     }
 
+    /// Adaptive-ruler counterpart of [`Self::new`]: the single-`u16`-plane
+    /// kernel over a per-cluster fitted grid (`Sq16Adaptive`) instead of the
+    /// fixed `[-1, 1]` constants. The scoring body ([`Self::distance_with_norm`])
+    /// is identical — only the query fold differs, so this is the sole ruler
+    /// override. `q_prime[d] = query[d]·scale[d]` and `q_dot_offset =
+    /// Σ_d offset[d]·query[d]` (vs the fixed grid's `OFFSET·Σq`). `scale`/`offset`
+    /// are the probed cluster's stored quantizer (`scale.len() == query.len()`).
+    pub fn new_adaptive(metric: Metric, query: &[f32], scale: &[f32], offset: &[f32]) -> Self {
+        let dim = query.len();
+        debug_assert_eq!(scale.len(), dim);
+        debug_assert_eq!(offset.len(), dim);
+        let mut q_prime = vec![0.0f32; dim];
+        for d in 0..dim {
+            q_prime[d] = query[d] * scale[d];
+        }
+        let q_dot_offset = dot(query, offset);
+        let q_norm_sq = match metric {
+            Metric::L2Sq => dot(query, query),
+            Metric::Cosine | Metric::NegDot => 0.0,
+        };
+        Self {
+            metric,
+            dim,
+            q_prime,
+            q_dot_offset,
+            q_norm_sq,
+        }
+    }
+
     /// Distance for one candidate whose `full[]` row is `dim`
     /// little-endian `u16` codes (`code_bytes.len() == dim * 2`), with
     /// its stored per-doc dequantized norm `‖d̂‖²` in `norm` (absent
@@ -1222,6 +1252,96 @@ pub(crate) fn sq16_decoded_norm_sq(code_bytes: &[u8], dim: usize) -> f32 {
         let x = code * SQ16_FIXED_SCALE + SQ16_FIXED_OFFSET;
         s += x * x;
         i += 1;
+    }
+    s
+}
+
+/// Adaptive-ruler counterparts of [`encode_sq16_row`] /
+/// [`dequantize_sq16_into`] / [`sq16_decoded_norm_sq`]: identical single-`u16`
+/// -plane layout, but the grid is the cluster's fitted `scale[d]`/`offset[d]`
+/// (`x = code·scale[d] + offset[d]`) instead of the fixed `[-1, 1]` constants.
+/// Used by `Sq16Adaptive`; `scale.len() == offset.len() == dim`.
+///
+/// On the build path the ruler is fit to the cluster's own `[min,max]`, so
+/// every component lands in `0..=65535` and the clamp never trips. On merge the
+/// destination reuses the first input's ruler, so a component of a later input
+/// that falls outside that range is clamped to the grid edge here.
+///
+/// Returns the number of components that landed beyond the grid (past a
+/// half-code slack) and were clamped. Build callers ignore it; the merge
+/// transcode feeds it to the maintenance clamp tripwire so a destination ruler
+/// that fails to cover its inputs shouts instead of silently losing recall.
+#[inline]
+pub(crate) fn encode_sq16_adaptive_row(
+    src: &[f32],
+    scale: &[f32],
+    offset: &[f32],
+    out: &mut [u8],
+) -> u64 {
+    debug_assert_eq!(out.len(), src.len() * 2);
+    debug_assert_eq!(scale.len(), src.len());
+    debug_assert_eq!(offset.len(), src.len());
+    let mut clamped = 0u64;
+    for (d, &v) in src.iter().enumerate() {
+        // A zero-span dimension (min == max) has scale 0; map every value to
+        // code 0 so decode returns the constant offset exactly.
+        let code = if scale[d] > 0.0 {
+            let q = (v - offset[d]) / scale[d];
+            if !(-SQ16_CLAMP_DETECT_SLACK_CODES..=65535.0 + SQ16_CLAMP_DETECT_SLACK_CODES)
+                .contains(&q)
+            {
+                clamped += 1;
+            }
+            q.round().clamp(0.0, 65535.0) as u16
+        } else {
+            0
+        };
+        let b = d * 2;
+        out[b..b + 2].copy_from_slice(&code.to_le_bytes());
+    }
+    clamped
+}
+
+/// Half-code slack before an out-of-grid `Sq16Adaptive` component counts as
+/// clamped, mirroring the residual family's tripwire tolerance.
+const SQ16_CLAMP_DETECT_SLACK_CODES: f32 = 0.5;
+
+/// Inverse of [`encode_sq16_adaptive_row`]. `code.len() == out.len() * 2`.
+#[inline]
+pub(crate) fn dequantize_sq16_adaptive_into(
+    code: &[u8],
+    scale: &[f32],
+    offset: &[f32],
+    out: &mut [f32],
+) {
+    let dim = out.len();
+    debug_assert_eq!(code.len(), dim * 2);
+    debug_assert_eq!(scale.len(), dim);
+    debug_assert_eq!(offset.len(), dim);
+    for (d, slot) in out.iter_mut().enumerate() {
+        let b = d * 2;
+        let c = u16::from_le_bytes([code[b], code[b + 1]]) as f32;
+        *slot = c * scale[d] + offset[d];
+    }
+}
+
+/// Adaptive-ruler [`sq16_decoded_norm_sq`]: `Σ_d (code[d]·scale[d] + offset[d])²`.
+#[inline]
+pub(crate) fn sq16_adaptive_norm_sq(
+    code_bytes: &[u8],
+    dim: usize,
+    scale: &[f32],
+    offset: &[f32],
+) -> f32 {
+    debug_assert_eq!(code_bytes.len(), dim * 2);
+    debug_assert_eq!(scale.len(), dim);
+    debug_assert_eq!(offset.len(), dim);
+    let mut s = 0.0f32;
+    for d in 0..dim {
+        let b = 2 * d;
+        let c = u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]) as f32;
+        let x = c * scale[d] + offset[d];
+        s += x * x;
     }
     s
 }
@@ -2732,6 +2852,72 @@ mod tests {
                 (got - decoded_ref).abs() <= 1e-4,
                 "dim {dim}: kernel {got} disagrees with decoded ref {decoded_ref}"
             );
+        }
+    }
+
+    /// `Sq16Adaptive`: a per-cluster fitted ruler (NOT the fixed `[-1, 1]`
+    /// grid) round-trips within its per-dim step, and the adaptive kernel's L2
+    /// distance matches the exact fp32 L2 — i.e. overriding only the ruler is
+    /// arithmetically sound. Uses arbitrary (non-normalized, out-of-`[-1,1]`)
+    /// values the fixed grid could not represent, sizing the ruler from the
+    /// corpus's per-dim `[min,max]` exactly as the build/merge path does.
+    #[test]
+    fn sq16_adaptive_round_trip_and_kernel_match_fp32_l2() {
+        for &dim in &[8usize, 13, 100, 384] {
+            let corpus: Vec<Vec<f32>> = (0..16)
+                .map(|c| {
+                    (0..dim)
+                        .map(|i| ((c * 7 + i) as f32 * 0.031).sin() * 5.0 - 1.0)
+                        .collect()
+                })
+                .collect();
+            // Per-dim ruler = union of the corpus range (min-of-mins / max-of-maxes),
+            // then scale = span / 65535, offset = min — the u16 analogue of the
+            // build path's `derive_sq8_quantizer_from_min_max`.
+            let mut min = vec![f32::INFINITY; dim];
+            let mut max = vec![f32::NEG_INFINITY; dim];
+            for v in &corpus {
+                for d in 0..dim {
+                    min[d] = min[d].min(v[d]);
+                    max[d] = max[d].max(v[d]);
+                }
+            }
+            let scale: Vec<f32> = (0..dim)
+                .map(|d| {
+                    let s = max[d] - min[d];
+                    if s > 0.0 { s / 65535.0 } else { 0.0 }
+                })
+                .collect();
+            let offset = min.clone();
+            let query = &corpus[3];
+            let kernel = Sq16Kernel::new_adaptive(Metric::L2Sq, query, &scale, &offset);
+            for v in &corpus {
+                let mut bytes = vec![0u8; dim * 2];
+                encode_sq16_adaptive_row(v, &scale, &offset, &mut bytes);
+
+                // Round-trip: every component within one quant step (no clamp,
+                // because the ruler covers the corpus by construction).
+                let mut decoded = vec![0.0f32; dim];
+                dequantize_sq16_adaptive_into(&bytes, &scale, &offset, &mut decoded);
+                for d in 0..dim {
+                    assert!(
+                        (decoded[d] - v[d]).abs() <= scale[d] + 1e-4,
+                        "dim {dim} d{d}: decoded {} vs {} (step {})",
+                        decoded[d],
+                        v[d],
+                        scale[d]
+                    );
+                }
+
+                // Adaptive kernel L2 vs exact fp32 L2.
+                let norm = sq16_adaptive_norm_sq(&bytes, dim, &scale, &offset);
+                let got = kernel.distance_with_norm(&bytes, Some(norm));
+                let want = distance(Metric::L2Sq, query, v);
+                assert!(
+                    (got - want).abs() <= 1e-2 + 1e-3 * want.abs(),
+                    "dim {dim}: adaptive L2 {got} vs fp32 {want}"
+                );
+            }
         }
     }
 

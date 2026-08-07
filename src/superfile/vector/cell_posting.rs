@@ -19,7 +19,7 @@ use crate::superfile::{
     builder::VectorConfig,
     format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
-        builder::derive_sq8_quantizer_from_min_max,
+        builder::derive_quantizer_from_min_max,
         distance::{Metric, Sq8ResidualKernel},
         rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
     },
@@ -576,9 +576,12 @@ fn encode_rows(
                     max[d] = max[d].max(src[d]);
                 }
             }
-            derive_sq8_quantizer_from_min_max(&min, &max)
+            derive_quantizer_from_min_max(&min, &max, SQ8_CODE_MAX)
         }
-        RerankCodec::Fp32 | RerankCodec::Sq16 | RerankCodec::RabitqOnly => {
+        RerankCodec::Fp32
+        | RerankCodec::Sq16
+        | RerankCodec::Sq16Adaptive
+        | RerankCodec::RabitqOnly => {
             return Err(format!(
                 "cell posting encode requires an Sq8 residual-family codec, got {}",
                 codec.name()
@@ -727,6 +730,15 @@ static TRANSCODE_CLAMPED_COMPONENTS: AtomicU64 = AtomicU64::new(0);
 /// Snapshot of [`TRANSCODE_CLAMPED_COMPONENTS`]; callers report deltas.
 pub(crate) fn transcode_clamped_components() -> u64 {
     TRANSCODE_CLAMPED_COMPONENTS.load(AtomicOrdering::Relaxed)
+}
+
+/// Add to the transcode-clamp tally. Used by single-plane codecs whose merge
+/// re-encode lives outside this module (the Sq8 residual transcode above bumps
+/// the counter inline); a no-op for the common zero-clamp row.
+pub(crate) fn note_transcode_clamped_components(n: u64) {
+    if n > 0 {
+        TRANSCODE_CLAMPED_COMPONENTS.fetch_add(n, AtomicOrdering::Relaxed);
+    }
 }
 
 /// True when two per-cluster Sq8 quantizers are bitwise identical.
