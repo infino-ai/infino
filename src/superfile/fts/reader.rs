@@ -347,6 +347,15 @@ fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
     cursors.len() >= OR_WINDOW_MIN_TERMS && no_dominant_term_ub(cursors)
 }
 
+/// Minimum dominant-term df for the deep-`k` reroute to the windowed
+/// scorer to pay off. Below this the union is small enough that
+/// MaxScore's scalar full scan beats the windowed scorer's fixed
+/// per-window setup, so short unions stay on MaxScore. Calibrated on the
+/// warm FTS bench: the win concentrates on dominant lists in the millions
+/// (~corpus-scale), the mid range is a wash, and lists shorter than this
+/// regressed. See [`or_topk_pruning_ineffective`].
+const OR_WINDOWED_MIN_DOMINANT_DF: u64 = 100_000;
+
 /// True when block-max pruning (MaxScore / WAND) can no longer skip
 /// blocks at this `k`, so both degrade to a full union scan — at which
 /// point the SIMD windowed scorer does that same scan far faster than
@@ -368,12 +377,29 @@ fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
 /// pruning is dead. This is `df`-only — no extra reads — and
 /// self-correcting: a "rare" second term that is actually long keeps
 /// `rest_df` high, leaves pruning alive, and stays on MaxScore.
+///
+/// Reroute only when the dominant list is also *long* (`max_df >=`
+/// [`OR_WINDOWED_MIN_DOMINANT_DF`]). Once pruning is dead both scorers
+/// scan the whole union, but the windowed scorer's per-window bookkeeping
+/// (a 4096-wide score accumulator + presence bitset) only pays off when
+/// the dominant list is long enough to amortize it; on a short union it
+/// is pure overhead and MaxScore's scalar scan is faster. A union with
+/// fewer than the floor's matches can't have a longer dominant list than
+/// the floor, so this gates out exactly the small-union case that
+/// regressed on the bench.
 fn or_topk_pruning_ineffective(cursors: &[TermCursor], k: usize) -> bool {
-    if cursors.len() < 2 {
-        return false;
-    }
     let max_df = cursors.iter().map(|c| c.df).max().unwrap_or(0);
     let total_df: u64 = cursors.iter().map(|c| c.df).sum();
+    or_reroute_by_df(max_df, total_df, cursors.len(), k)
+}
+
+/// Pure df-math behind [`or_topk_pruning_ineffective`], split out so the
+/// routing decision can be unit-tested at df values (hundreds of
+/// thousands) that a fast in-memory corpus can't reach.
+fn or_reroute_by_df(max_df: u64, total_df: u64, n_terms: usize, k: usize) -> bool {
+    if n_terms < 2 || max_df < OR_WINDOWED_MIN_DOMINANT_DF {
+        return false;
+    }
     let rest_df = total_df.saturating_sub(max_df);
     k as u64 >= rest_df
 }
@@ -7472,6 +7498,51 @@ mod tests {
         assert!(
             !two_term_has_rare_anchor(&uniform),
             "two common terms should not anchor"
+        );
+    }
+
+    #[test]
+    fn deep_k_dominant_union_reroutes_only_when_list_is_long() {
+        // The deep-k reroute to the windowed scorer fires only when
+        // pruning is dead (k reaches the rarer terms' combined df) AND the
+        // dominant list is long enough to amortize the window setup.
+        const LONG: u64 = 3_000_000; // dominant common term
+        const RARE: u64 = 500; // rare second term
+        let total = LONG + RARE;
+
+        // Deep k (>= rest_df) over a long dominant list: reroute.
+        assert!(
+            or_reroute_by_df(LONG, total, 2, 1000),
+            "deep k over a long dominant list should reroute to windowed"
+        );
+        // Shallow k (< rest_df): the rare term still fills the heap, pruning
+        // is alive, stay on MaxScore.
+        assert!(
+            !or_reroute_by_df(LONG, total, 2, 100),
+            "k below the rare term's df keeps pruning alive → MaxScore"
+        );
+        // Long list but only one term: not an OR.
+        assert!(
+            !or_reroute_by_df(LONG, LONG, 1, 1000),
+            "single term is not a union"
+        );
+        // Small union (dominant list below the floor): too little work to
+        // amortize the window; stay on MaxScore even at deep k. This is the
+        // case that regressed before the floor was added.
+        let small = OR_WINDOWED_MIN_DOMINANT_DF - 1;
+        assert!(
+            !or_reroute_by_df(small, small + RARE, 2, 1_000_000),
+            "a union below the dominant-df floor must not reroute"
+        );
+        // Exactly at the floor with deep k: reroute.
+        assert!(
+            or_reroute_by_df(
+                OR_WINDOWED_MIN_DOMINANT_DF,
+                OR_WINDOWED_MIN_DOMINANT_DF + RARE,
+                2,
+                1000
+            ),
+            "at the dominant-df floor a deep-k union reroutes"
         );
     }
 
