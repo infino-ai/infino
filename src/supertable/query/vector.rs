@@ -2192,21 +2192,11 @@ impl SupertableReader {
         let scan_pool: Arc<Mutex<Vec<(usize, u64, usize, Vec<ScanCandidate>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let scan_pool_body = Arc::clone(&scan_pool);
-        // Deferred-arm plan inputs for the canonical rerank-row pricing:
-        // total candidates across every scanned unit (cold cells included,
-        // which never reach `scan_pool`), and the widest replica overhead.
-        let total_candidates = Arc::new(AtomicU64::new(0));
-        let total_candidates_body = Arc::clone(&total_candidates);
+        // Widest replica overhead across every scanned unit — phase C's
+        // selection cap reads it so pooled-set membership (which shifts
+        // with cache temperature) can never shrink the cap.
         let max_replica_overhead = Arc::new(AtomicU64::new(0));
         let max_replica_overhead_body = Arc::clone(&max_replica_overhead);
-        // (#537) Pin-arm plan rows: under an explicit caller nprobe every
-        // probed cell keeps the full k x rerank_mult depth (floor ==
-        // budget, cold arm undivided), so the plan's rerank rows are the
-        // per-cell kept counts summed — warm survivors pooled for phase C
-        // plus cold rows reranked in-scan, which are the same
-        // min(cell candidates, depth) per cell at either temperature.
-        let pinned_plan_rows = Arc::new(AtomicU64::new(0));
-        let pinned_plan_rows_body = Arc::clone(&pinned_plan_rows);
         let body =
             move |reader: Arc<SuperfileReader>,
                   entry: Arc<SuperfileEntry>,
@@ -2219,9 +2209,7 @@ impl SupertableReader {
                 let budget = budget.clone();
                 let storage = storage.clone();
                 let scan_pool = Arc::clone(&scan_pool_body);
-                let total_candidates = Arc::clone(&total_candidates_body);
                 let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
-                let pinned_plan_rows = Arc::clone(&pinned_plan_rows_body);
                 let op_stats = op_stats_scan.clone();
                 async move {
                     // Unfiltered user path on row-addressable locals: resolve the
@@ -2268,22 +2256,16 @@ impl SupertableReader {
                             .map_err(vector_read_query_error)?;
                         if let Some(stats) = &op_stats {
                             stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
+                            // Request-shaped ranges only (cluster index +
+                            // prefixes/blocks + Sq8 meta). Rerank rows are
+                            // diagnostics; their cost rides the priced
+                            // CPU watermark.
                             stats.add_planned_read_ranges(scan.ranges_requested);
-                            // Actual rows only: cold cells rerank immediately
-                            // inside the scan, warm winners at phase C. The
-                            // PRICED rerank ranges are the canonical plan
-                            // budget, flushed once after the fan-out.
                             stats.add_vector_rows_reranked(scan.rows_reranked);
                             stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
                         }
-                        total_candidates
-                            .fetch_add(scan.candidates_scanned, atomic::Ordering::Relaxed);
                         max_replica_overhead
                             .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
-                        pinned_plan_rows.fetch_add(
-                            scan.candidates.len() as u64 + scan.rows_reranked,
-                            atomic::Ordering::Relaxed,
-                        );
                         if !scan.candidates.is_empty() {
                             scan_pool
                                 .lock()
@@ -2300,15 +2282,12 @@ impl SupertableReader {
                             .map_err(vector_read_query_error)?;
                         if let Some(stats) = &op_stats {
                             stats.add_vector_scan(tally.cells_scanned, tally.candidates_scanned);
-                            // The immediate probe's shortlist rows ARE its
-                            // plan's rerank set — fixed by budget and
-                            // candidates, not by temperature — and each is
-                            // one planned survivor range (a cold probe
-                            // serves them in-block; the plan is priced
-                            // identically either way).
-                            stats.add_planned_read_ranges(
-                                tally.ranges_requested + tally.rows_reranked,
-                            );
+                            // Request-shaped ranges only — rerank rows are
+                            // diagnostics; their cost rides the priced CPU
+                            // watermark (survivor fetches coalesce into a
+                            // handful of real requests, so counting one
+                            // range per row would not be request-shaped).
+                            stats.add_planned_read_ranges(tally.ranges_requested);
                             stats.add_vector_rows_reranked(tally.rows_reranked);
                             stats.add_kernel_cpu_ns(tally.kernel_cpu_ns);
                         }
@@ -2374,38 +2353,14 @@ impl SupertableReader {
         // column, table-wide — asserted here at the only place different
         // units' estimates ever meet.
         if global_shortlist_width.is_some() {
-            // Canonical rerank-leg pricing for the deferred plan: one
-            // planned survivor range per BUDGETED shortlist row, flushed
-            // whether the winners rerank at phase C (warm) or already
-            // reranked inside their cell scans (cold). Same query, same
-            // table state → same priced count, at any cache temperature.
-            // Law arm: the budget is the global shortlist cap —
-            // `min(shortlist limit, candidates scanned)`. Pin arm (#537):
-            // every probed cell keeps the full per-cell depth and cost is
-            // linear in the width the caller asked for, so the plan's
-            // rows are the per-cell kept counts summed (warm survivors +
-            // cold in-scan rows — the same min(candidates, depth) per
-            // cell at either temperature).
-            if let Some(stats) = &self.op_stats {
-                let rows = if options.nprobe.is_some() {
-                    pinned_plan_rows.load(atomic::Ordering::Relaxed)
-                } else {
-                    let total = total_candidates.load(atomic::Ordering::Relaxed);
-                    let overhead =
-                        usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
-                            .unwrap_or(0);
-                    let limit = deferred_shortlist_limit(
-                        k,
-                        overhead,
-                        plan_rerank_mult,
-                        law_rerank_served,
-                        false,
-                        served_cells_over_width,
-                    );
-                    (limit as u64).min(total)
-                };
-                stats.add_planned_read_ranges(rows);
-            }
+            // Rerank rows are deliberately NOT in the priced range
+            // counter: `planned_read_ranges` is request-shaped (numbers
+            // commensurate with real object-store requests, which
+            // coalesce survivor rows into a handful of GETs), and the
+            // platform prices it at a per-request rate. The rerank leg's
+            // cost is CPU-dominated and carried by the priced CPU
+            // watermark; the row counts stay visible in the
+            // rows-reranked / candidates diagnostics.
             let pooled = {
                 let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
                 mem::take(&mut *guard)

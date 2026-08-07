@@ -49,10 +49,8 @@ use super::cpu;
 /// [`Self::vector_rows_reranked`] (actual execution rows — the deferred
 /// path reranks cold cells in place, so the count can shift with cache
 /// temperature) is a deterministic plan count: same query, same table
-/// state → same value, warm or cold. The priced range counter stays
-/// canonical by charging the *plan's* rerank budget, never the executed
-/// row count — see [`Self::planned_read_ranges`]. The struct is
-/// `#[non_exhaustive]` because counters land modality by modality.
+/// state → same value, warm or cold. The struct is `#[non_exhaustive]`
+/// because counters land modality by modality.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct OpStats {
@@ -74,24 +72,28 @@ pub struct OpStats {
     /// (pre-drain user tables and filtered search). An execution
     /// diagnostic, not a plan count: on the deferred path cold cells
     /// rerank in place under a width-divided budget, so the total can
-    /// shift with cache temperature. Never priced — the range counter
-    /// below charges the plan's rerank budget instead.
+    /// shift with cache temperature. Never priced — the rerank leg's
+    /// cost is CPU-dominated and carried by a consumer's process-level
+    /// CPU accounting; rows are deliberately NOT folded into the
+    /// request-shaped range counter below (survivor fetches coalesce
+    /// into a handful of real requests, so one-range-per-row would
+    /// inflate it far past request scale).
     pub vector_rows_reranked: u64,
     /// Byte-source ranges the plan requested, before coalescing and before
     /// the cache decides whether a request becomes a local read or a GET —
-    /// the warm-equivalent request-work measure. FTS: one per PFOR term
-    /// posting range (two when a hint-less slot forces a header probe),
-    /// one per phrase-member posting and position-run range, one per
-    /// dictionary fetch a build performs, and one per df-header probe.
-    /// Vector: per scanned cell, its cluster index plus one prefix/block
-    /// range per chosen cluster (plus the lazy Sq8 meta table when the
-    /// column stores one); plus the plan's rerank budget —
-    /// `min(k × rerank_mult, candidates)` on the deferred path, the
-    /// immediate probes' shortlist rows elsewhere — one range per
-    /// budgeted row, identical warm or cold on both arms; plus one per
-    /// stable-id region / `_id` remap read. SQL: one per Parquet range
-    /// the scan requests. Materialization: one per data range a
-    /// projection take requests.
+    /// the warm-equivalent request-work measure, kept REQUEST-SHAPED:
+    /// its magnitudes stay commensurate with real object-store requests
+    /// so a consumer can price it at a per-request rate. FTS: one per
+    /// PFOR term posting range (two when a hint-less slot forces a
+    /// header probe), one per phrase-member posting and position-run
+    /// range, one per dictionary fetch a build performs, and one per
+    /// df-header probe. Vector: per scanned cell, its cluster index plus
+    /// one prefix/block range per chosen cluster (plus the lazy Sq8 meta
+    /// table when the column stores one), plus one per stable-id region
+    /// / `_id` remap read / hydrated-section cell read. Rerank rows are
+    /// deliberately excluded — see [`Self::vector_rows_reranked`]. SQL:
+    /// one per Parquet range the scan requests. Materialization: one per
+    /// data range a projection take requests.
     pub planned_read_ranges: u64,
     /// Parquet **data-page** bytes SQL scans requested through the
     /// DataFusion store, independent of whether they were served from

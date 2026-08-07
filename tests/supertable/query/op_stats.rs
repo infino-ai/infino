@@ -567,10 +567,17 @@ fn a_scoped_vector_query_reports_scan_and_rerank_work() {
         "rerank rows are shortlist survivors of the scanned candidates"
     );
     assert!(
-        stats.planned_read_ranges >= stats.vector_cells_scanned + stats.vector_rows_reranked,
-        "each scanned cell requests at least its cluster index and each          reranked row its survivor range (ranges {}, cells {}, rows {})",
+        stats.planned_read_ranges >= 2 * stats.vector_cells_scanned,
+        "each scanned cell requests its cluster index plus at least one \
+         prefix/block range (ranges {}, cells {})",
         stats.planned_read_ranges,
-        stats.vector_cells_scanned,
+        stats.vector_cells_scanned
+    );
+    assert!(
+        stats.planned_read_ranges < stats.vector_rows_reranked + 64 * stats.vector_cells_scanned,
+        "the range counter stays request-shaped: rerank rows must not be \
+         folded into it (ranges {}, rows {})",
+        stats.planned_read_ranges,
         stats.vector_rows_reranked
     );
 }
