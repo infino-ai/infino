@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    Connection, IndexSpec, Metric, connect,
+    ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
@@ -764,6 +764,44 @@ fn sql_work_stats_are_deterministic_across_cache_temperature() {
     let cold = deterministic(scoped_sql_stats(&db, sql));
     let warm = deterministic(scoped_sql_stats(&db, sql));
     assert_eq!(cold, warm, "same plan, same table state, same work");
+}
+
+#[test]
+fn sql_work_stats_do_not_depend_on_reader_open_shape() {
+    // A predicated scan makes DataFusion consult the Parquet page index.
+    // An eagerly-opened reader's footer parse already carries it; a cold
+    // disk-cache open serves the query through a lazy reader whose
+    // open-time parse is footer-only. The provider must serve DataFusion
+    // an index-complete parse loaded through the reader's own byte
+    // source — otherwise the opener fetches the index bytes through the
+    // metered store on the lazy shape only, and the same query prices
+    // differently depending on how its readers happened to be opened.
+    //
+    // The writer connection populates only its own in-memory reader
+    // tier, so the cache-backed connection's first query really takes
+    // the cold lazy-open path.
+    let dir = TempDir::new().expect("tempdir");
+    let cache = TempDir::new().expect("cache tempdir");
+    let sql = "SELECT rating FROM docs WHERE rating > 5";
+    let eager = {
+        let db = sql_fixture(&dir);
+        deterministic(scoped_sql_stats(&db, sql))
+    };
+    let lazy_db = connect_with(
+        dir.path().to_str().expect("utf-8 path"),
+        ConnectOptions::new().with_cache_dir(cache.path()),
+    )
+    .expect("connect with cold disk cache");
+    let lazy_cold = deterministic(scoped_sql_stats(&lazy_db, sql));
+    let lazy_warm = deterministic(scoped_sql_stats(&lazy_db, sql));
+    assert_eq!(
+        lazy_cold, lazy_warm,
+        "same plan, same table state, same work"
+    );
+    assert_eq!(
+        lazy_cold, eager,
+        "reader open shape (cold disk cache vs eager) must not change reported work"
+    );
 }
 
 /// A storage-backed catalog connection whose table also carries a

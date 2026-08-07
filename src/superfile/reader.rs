@@ -476,12 +476,21 @@ impl SuperfileReader {
         &self.parquet_meta
     }
 
-    /// Parquet metadata with offset indexes loaded when available.
+    /// Parquet metadata with the page indexes (column + offset) loaded
+    /// when available.
     ///
-    /// Eager readers return their open-time metadata. Lazy readers fetch only
-    /// the page-index metadata range through their existing byte source; a
-    /// [`OnceCell`] coalesces concurrent first callers and keeps all later
-    /// targeted row reads local.
+    /// Eager readers return their open-time metadata. Lazy readers fetch
+    /// only the page-index metadata range through their existing byte
+    /// source; a [`OnceCell`] coalesces concurrent first callers and keeps
+    /// all later targeted row reads local.
+    ///
+    /// Both indexes load together even though the take path needs only the
+    /// offset index: the SQL scan serves this same parse to DataFusion's
+    /// parquet opener, whose page pruning short-circuits only when the
+    /// column index is present too. An index-complete parse here means the
+    /// opener never fetches index bytes through the metered DataFusion
+    /// store — which would make `sql_page_bytes` depend on how the reader
+    /// happened to be opened (see `SuperfileObjectStore`).
     pub(crate) async fn parquet_metadata_with_page_index(
         &self,
     ) -> Result<Arc<ParquetMetaData>, ReadError> {
@@ -498,7 +507,7 @@ impl SuperfileReader {
                 let mut fetch = LazyMetadataFetch { source };
                 let mut loader =
                     ParquetMetaDataReader::new_with_metadata((*self.parquet_meta).clone())
-                        .with_column_index_policy(PageIndexPolicy::Skip)
+                        .with_column_index_policy(PageIndexPolicy::Optional)
                         .with_offset_index_policy(PageIndexPolicy::Optional);
                 loader
                     .load_page_index(&mut fetch)

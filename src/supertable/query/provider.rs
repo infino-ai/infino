@@ -488,7 +488,16 @@ impl SupertableProvider {
                 let path = ObjPath::from(entry.uri.storage_path());
                 let source = reader.byte_source();
                 let size = source.size();
-                let parquet_meta = Arc::clone(reader.parquet_metadata());
+                // Index-complete metadata (column + offset page indexes),
+                // loaded through the reader's own byte source. Serving
+                // DataFusion a footer-only parse would make its opener
+                // fetch the page-index bytes through the metered store on
+                // predicated scans — but only for lazily-opened readers,
+                // making `sql_page_bytes` depend on reader-cache state.
+                let parquet_meta = reader
+                    .parquet_metadata_with_page_index()
+                    .await
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
                 let row_counts: Arc<[u32]> = parquet_meta
                     .row_groups()
                     .iter()
@@ -931,10 +940,12 @@ impl TableProvider for SupertableProvider {
                 .with_pushdown_filters(true)
                 .with_reorder_filters(true);
         }
-        // Serve DataFusion's opener the footers the readers already
-        // parsed — without this the opener re-reads + re-parses every
-        // superfile's footer on every query (~half the warm flat cost
-        // at 256 superfiles).
+        // Serve DataFusion's opener the index-complete footers the
+        // readers already parsed — without this the opener re-reads +
+        // re-parses every superfile's footer on every query (~half the
+        // warm flat cost at 256 superfiles), and on predicated scans it
+        // would fetch page-index bytes through the metered store for
+        // lazily-opened readers (a cache-state-dependent priced counter).
         source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
             store: Arc::clone(&store),
             metas: Arc::clone(&self.scan_metas),
