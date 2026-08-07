@@ -729,6 +729,14 @@ fn a_scoped_sql_scan_reports_page_bytes() {
         stats.planned_read_ranges > 0,
         "each Parquet request is a planned range"
     );
+    assert!(
+        stats.rows_materialized > 0,
+        "the scan's decoded rows come from DataFusion's own metrics; got 0"
+    );
+    assert!(
+        stats.kernel_cpu_ns > 0,
+        "the plan's elapsed compute comes from DataFusion's own metrics; got 0"
+    );
 }
 
 #[test]

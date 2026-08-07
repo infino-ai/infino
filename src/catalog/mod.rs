@@ -34,7 +34,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use dashmap::DashMap;
-use datafusion::{config::Dialect, error::DataFusionError};
+use datafusion::{config::Dialect, error::DataFusionError, physical_plan::collect as collect_plan};
 use futures::future::try_join_all;
 pub use index_spec::IndexSpec;
 use manifest::{
@@ -52,6 +52,7 @@ use crate::{
     memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::io::{UsageMeter, UsageSnapshot},
+    runtime_metrics::op_stats,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageError, StorageProvider,
@@ -64,6 +65,7 @@ use crate::{
     supertable::{
         Supertable as SupertableHandle,
         options::SupertableOptions,
+        query::exec::common::harvest_datafusion_metrics,
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
@@ -806,6 +808,9 @@ impl Connection {
         search_tvf::register_search_tvfs(&ctx, self.clone());
 
         let sql = sql.to_owned();
+        // Caller-thread pickup, same as reader mint: the drive future may
+        // poll on runtime threads where the scope's slot is invisible.
+        let op_stats = op_stats::current();
         let drive = async move {
             let df = ctx
                 .sql(&sql)
@@ -820,10 +825,19 @@ impl Connection {
             // columns are already coerced back to `LargeUtf8` here by
             // `expand_views_at_output`, so the schema needs no further fixup.
             let output_schema: SchemaRef = df.schema().inner().clone();
-            let batches = df
-                .collect()
+            // Execute through the physical plan (what `DataFrame::collect`
+            // does internally) so the plan handle survives execution and
+            // DataFusion's own operator metrics — elapsed compute, scan
+            // output rows — can be folded into the per-query stats.
+            let task_ctx = ctx.task_ctx();
+            let plan = df
+                .create_physical_plan()
                 .await
                 .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+            let batches = collect_plan(Arc::clone(&plan), task_ctx)
+                .await
+                .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+            harvest_datafusion_metrics(&plan, &op_stats);
             if batches.is_empty() {
                 Ok(vec![RecordBatch::new_empty(output_schema)])
             } else {

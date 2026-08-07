@@ -24,6 +24,7 @@ use bytes::Bytes;
 use datafusion::{
     error::{DataFusionError, Result as DfResult},
     logical_expr::Expr,
+    physical_plan::ExecutionPlan,
     scalar::ScalarValue,
 };
 use futures::{
@@ -88,6 +89,44 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// by every public row-returning search method (`bm25_search`,
 /// `vector_search`, `token_match`, `exact_match`); `what` labels error
 /// messages with the calling method.
+/// Fold DataFusion's own operator instrumentation into the per-query
+/// stats after a SQL plan has executed. Every operator's
+/// `elapsed_compute` (DataFusion brackets its synchronous poll sections
+/// with an `Instant` timer — approximately on-CPU for compute-bound
+/// operators, and excluding async I/O waits) sums into the kernel
+/// counter; leaf (source) operators' `output_rows` sum into
+/// `rows_materialized` — the rows the scans decoded from storage.
+/// Infino's own TVF exec nodes report no DataFusion metrics (their
+/// kernels bracket and flush internally), so nothing double-counts.
+pub(crate) fn harvest_datafusion_metrics(
+    plan: &Arc<dyn ExecutionPlan>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) {
+    fn walk(node: &Arc<dyn ExecutionPlan>, compute_ns: &mut u64, leaf_rows: &mut u64) {
+        if let Some(metrics) = node.metrics() {
+            if let Some(ns) = metrics.elapsed_compute() {
+                *compute_ns += ns as u64;
+            }
+            if node.children().is_empty()
+                && let Some(rows) = metrics.output_rows()
+            {
+                *leaf_rows += rows as u64;
+            }
+        }
+        for child in node.children() {
+            walk(child, compute_ns, leaf_rows);
+        }
+    }
+    let Some(stats) = op_stats else {
+        return;
+    };
+    let mut compute_ns = 0u64;
+    let mut leaf_rows = 0u64;
+    walk(plan, &mut compute_ns, &mut leaf_rows);
+    stats.add_kernel_cpu_ns(compute_ns);
+    stats.add_rows_materialized(leaf_rows);
+}
+
 pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],

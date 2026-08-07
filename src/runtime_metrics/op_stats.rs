@@ -100,15 +100,19 @@ pub struct OpStats {
     /// module's exclusions) — so they are deliberately not in here.
     pub sql_page_bytes: u64,
     /// Rows decoded from stored columns to build results — the scalar
-    /// projection decode (`resolve_columns`), including the `_id` stamping
-    /// fallback it serves. The id-score arithmetic fast path decodes
-    /// nothing and counts nothing; remap/tombstone-internal id reads count
-    /// planned ranges only, never rows.
+    /// projection decode (`resolve_columns`, including the `_id` stamping
+    /// fallback it serves) plus, for SQL, the scan operators' output rows
+    /// from DataFusion's own metrics. The id-score arithmetic fast path
+    /// decodes nothing and counts nothing; remap/tombstone-internal id
+    /// reads count planned ranges only, never rows.
     pub rows_materialized: u64,
-    /// On-CPU nanoseconds of the query's bracketed synchronous kernel
-    /// sections (thread-CPU clock, ns resolution). A refinement of — not a
-    /// replacement for — a consumer's own process-level CPU accounting:
-    /// fan-out glue and async awaits are outside the brackets.
+    /// Nanoseconds of the query's bracketed synchronous kernel sections.
+    /// Engine kernels use the thread-CPU clock; SQL operator sections use
+    /// DataFusion's own `elapsed_compute` instrumentation (an `Instant`
+    /// timer around synchronous poll work — approximately on-CPU for
+    /// compute-bound operators, excluding async I/O waits). A refinement
+    /// of — not a replacement for — a consumer's own process-level CPU
+    /// accounting: fan-out glue and async awaits are outside the brackets.
     pub kernel_cpu_ns: u64,
 }
 
