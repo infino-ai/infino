@@ -2403,8 +2403,17 @@ impl SupertableReader {
                 // Mirror phase A/C's `k_fetch = k + replica_overhead` in the
                 // global cut so boundary replicas (dormant today: overhead
                 // is 0 with replication off) cannot take shortlist slots
-                // from distinct rows before the stable-id dedup.
-                let replica_overhead = pooled.iter().map(|(_, _, o, _)| *o).max().unwrap_or(0);
+                // from distinct rows before the stable-id dedup. Taken
+                // over ALL scanned units — not just the pooled (warm)
+                // ones — so under replication the selection cap is
+                // temperature-invariant and always agrees with the
+                // canonical priced budget above, which uses the same max.
+                // (Pooled membership shifts with cache temperature: a
+                // fully cold unit reranks in-scan and pools nothing, so
+                // a pooled-only max could shrink the cap on cold runs.)
+                let replica_overhead =
+                    usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
+                        .unwrap_or(0);
                 let mut flat: Vec<(usize, ScanCandidate)> = pooled
                     .into_iter()
                     .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
