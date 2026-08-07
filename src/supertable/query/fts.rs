@@ -879,7 +879,7 @@ impl SupertableReader {
                         }
                     }
                     None => {
-                        let (hits, work, kernel_ns) = r
+                        let (hits, work) = r
                             .bm25_search_prefix(&column_arc, &prefix_arc, k)
                             .await
                             .map_err(fts_read_error)?;
@@ -887,7 +887,6 @@ impl SupertableReader {
                             stats.add_fts_postings_bytes(work.postings_bytes);
                             stats.add_planned_read_ranges(work.planned_ranges);
                             stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                            stats.add_kernel_cpu_ns(kernel_ns);
                         }
                         Ok(hits)
                     }
@@ -1329,7 +1328,7 @@ impl SupertableReader {
                     r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
                         .map_err(|e| QueryError::Parquet(e.to_string()))?
                 } else {
-                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()], op_stats.clone())
+                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
                         .await
                         .map_err(|e| QueryError::Execute(e.to_string()))?
                 };

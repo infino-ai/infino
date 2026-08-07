@@ -2008,15 +2008,16 @@ impl FtsReader {
     /// [`Self::search`] that also returns the walk's work — posting
     /// bytes, planned ranges, and the bracketed kernel on-CPU ns
     /// (`prepare_clauses`' inline walks plus the `run_prepared`
-    /// section). Prefix search reports through this so an expansion to
-    /// thousands of terms carries its cost like any other query shape.
+    /// section), all carried on the one [`MatchWork`]. Prefix search
+    /// reports through this so an expansion to thousands of terms
+    /// carries its cost like any other query shape.
     pub(crate) async fn search_with_work(
         &self,
         column: &str,
         terms: &[&str],
         k: usize,
         mode: BoolMode,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), FtsError> {
+    ) -> Result<(Vec<(u32, f32)>, MatchWork), FtsError> {
         let (musts, shoulds): (&[&str], &[&str]) = match mode {
             BoolMode::And => (terms, &[]),
             BoolMode::Or => (&[], terms),
@@ -2033,21 +2034,20 @@ impl FtsReader {
                 f32::NEG_INFINITY,
             )
             .await?;
-        let work = MatchWork {
+        let mut work = MatchWork {
             postings_bytes: prep.postings_bytes(),
             planned_ranges: prep.planned_ranges(),
-            kernel_cpu_ns: 0,
+            kernel_cpu_ns: prep.inline_kernel_cpu_ns(),
         };
-        let mut kernel_ns = prep.inline_kernel_cpu_ns();
         let hits = match prep {
             PreparedClauses::Done { hits, .. } => hits,
             prep => {
                 let (hits, run_ns) = timed_section(|| self.run_prepared(prep));
-                kernel_ns += run_ns;
+                work.kernel_cpu_ns += run_ns;
                 hits?
             }
         };
-        Ok((hits, work, kernel_ns))
+        Ok((hits, work))
     }
 
     /// BM25 search over explicit clause lists, with negated terms
@@ -2484,7 +2484,13 @@ impl FtsReader {
                     ))
                 })?;
                 work.postings_bytes += header.len() as u64;
-                dfs[slot] = read_u32_le(&header.as_ref()[0..4]) as u64;
+                let header_bytes = header.as_ref();
+                if header_bytes.len() < U32_BYTES {
+                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                        "term_dfs: short postings header".into(),
+                    )));
+                }
+                dfs[slot] = read_u32_le(&header_bytes[0..U32_BYTES]) as u64;
             }
         }
         Ok((dfs, work))

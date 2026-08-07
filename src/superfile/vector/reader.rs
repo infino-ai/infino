@@ -3392,6 +3392,7 @@ impl VectorReader {
             tally.candidates_scanned += cell_tally.candidates_scanned;
             tally.ranges_requested += cell_tally.ranges_requested;
             tally.rows_reranked += cell_tally.rows_reranked;
+            tally.kernel_cpu_ns += cell_tally.kernel_cpu_ns;
         }
         let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
         // Distance ascending (smaller = closer), matching every other vector
@@ -5231,7 +5232,7 @@ async fn rerank_candidates_from_blocks(
                         let parsed = Arc::clone(
                             col.lazy_sq8_parsed
                                 .get()
-                                .expect("lazy Sq8 meta set just above"),
+                                .expect("invariant: lazy Sq8 meta set just above"),
                         );
                         let (scored, ns) = score_sq8_residual_candidates(
                             candidates,
@@ -5345,7 +5346,7 @@ async fn rerank_candidates_from_blocks(
                                 );
                                 let kernel = kernels
                                     .get(&cand.cluster_id)
-                                    .expect("kernel built for every candidate cluster");
+                                    .expect("invariant: kernel built for every candidate cluster");
                                 let norm = norm_by_pos
                                     .as_ref()
                                     .and_then(|norms| norms.get(&cand.pos).copied());
@@ -5421,7 +5422,7 @@ async fn score_sq8_residual_candidates(
         let row = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
         let kernel = kernels
             .get(&cand.cluster_id)
-            .expect("kernel prebuilt for every probed cluster");
+            .expect("invariant: kernel prebuilt for every probed cluster");
         let norm = per_doc_norms.as_ref().map(|norms| norms[cand.pos as usize]);
         (
             cand.did,
@@ -5447,7 +5448,7 @@ async fn score_sq8_residual_candidates(
                 let code = &row[..dim];
                 let kernel = kernels
                     .get(&cand.cluster_id)
-                    .expect("kernel prebuilt for every probed cluster");
+                    .expect("invariant: kernel prebuilt for every probed cluster");
                 let norm = norms.as_ref().map(|norms| norms[cand.pos as usize]);
                 (
                     cand.did,

@@ -1066,7 +1066,7 @@ async fn read_ids_for_locals(
         }
         return id_values_from_batch(&batch?);
     }
-    let batch = take_rows_byte_source(&reader, local_ids, &[id_column], op_stats.clone())
+    let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
         .await
         .map_err(|error| QueryError::Execute(error.to_string()))?;
     id_values_from_batch(&batch)
@@ -3725,7 +3725,10 @@ fn deferred_shortlist_limit(
         .saturating_mul(rerank_mult);
     if law_rerank_served && !caller_nprobe {
         let (served, stamped_width) = served_cells_over_width;
-        base.saturating_mul(served).div_ceil(stamped_width)
+        // Total over a degenerate zero stamp: the law path never
+        // produces one today ((1, 1) default, `.max(1)` at assignment),
+        // but a plain helper must not be able to panic.
+        base.saturating_mul(served).div_ceil(stamped_width.max(1))
     } else {
         base
     }

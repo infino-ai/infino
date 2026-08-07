@@ -302,7 +302,7 @@ pub(crate) async fn attach_stable_ids(
         }
         batch?
     } else {
-        take_rows_byte_source(reader, &locals, &[id_column], op_stats.clone())
+        take_rows_byte_source(reader, &locals, &[id_column])
             .await
             .map_err(|error| QueryError::Execute(error.to_string()))?
     };
@@ -405,7 +405,6 @@ pub(crate) async fn apply_resolved_tombstone_filter(
             reader.n_docs(),
             &locals,
             &[id_column],
-            op_stats.clone(),
         )
         .await
         .map_err(|e| QueryError::Execute(e.to_string()))?

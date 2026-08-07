@@ -580,14 +580,10 @@ async fn resolve_columns(
         .map_err(|e| DataFusionError::Execution(e.to_string()))
     };
 
-    let op_stats = reader.op_stats.clone();
-    let cold_wave = try_join_all(cold_units.into_iter().map(|(i, rd, locals)| {
-        let op_stats = op_stats.clone();
-        async move {
-            take_rows_byte_source(rd, locals, names, op_stats)
-                .await
-                .map(|batch| (i, batch))
-        }
+    let cold_wave = try_join_all(cold_units.into_iter().map(|(i, rd, locals)| async move {
+        take_rows_byte_source(rd, locals, names)
+            .await
+            .map(|batch| (i, batch))
     }));
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
@@ -620,45 +616,6 @@ async fn resolve_columns(
     let batches: Vec<&RecordBatch> = per_superfile.iter().collect();
     interleave_record_batch(&batches, &placement)
         .map_err(|error| DataFusionError::Execution(error.to_string()))
-}
-
-/// [`AsyncFileReader`] adapter that counts every requested data range into
-/// the per-query collector — the take/materialize sibling of the DataFusion
-/// scan store's `get_opts` accounting. Counts are planned (pre-coalesce),
-/// so warm zero-copy resolution and cold GETs report identically. Metadata
-/// requests are NOT counted: the byte-source arm serves them from the
-/// reader-cached parse and the object-store arm's footer read is open-time
-/// amortized state, so counting either would make the tally depend on
-/// reader lifetime rather than the plan.
-struct CountedFileReader<R> {
-    inner: R,
-    op_stats: Option<Arc<OpStatsCollector>>,
-}
-
-impl<R: AsyncFileReader + Send> AsyncFileReader for CountedFileReader<R> {
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-        if let Some(stats) = &self.op_stats {
-            stats.add_planned_read_ranges(1);
-        }
-        self.inner.get_bytes(range)
-    }
-
-    fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
-    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        if let Some(stats) = &self.op_stats {
-            stats.add_planned_read_ranges(ranges.len() as u64);
-        }
-        self.inner.get_byte_ranges(ranges)
-    }
-
-    fn get_metadata<'a>(
-        &'a mut self,
-        options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-        self.inner.get_metadata(options)
-    }
 }
 
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.
@@ -717,12 +674,16 @@ impl AsyncFileReader for ByteSourceAsyncReader {
 }
 
 /// Stream projected rows through a reader's cache-aware byte source.
-/// Data-page requests count into `op_stats` as planned ranges.
+///
+/// Deliberately reports NO planned ranges: whether a take streams page
+/// ranges (lazy reader) or decodes resident bytes in place (promoted
+/// reader) is reader-cache state, so counting the streamed ranges would
+/// make the priced counter cache-dependent. The invariant materialization
+/// signals are `rows_materialized` and the decode CPU brackets.
 pub(crate) async fn take_rows_byte_source(
     reader: &SuperfileReader,
     local_doc_ids: &[u32],
     names: &[&str],
-    op_stats: Option<Arc<OpStatsCollector>>,
 ) -> DfResult<RecordBatch> {
     let metadata = reader
         .parquet_metadata_with_page_index()
@@ -738,7 +699,6 @@ pub(crate) async fn take_rows_byte_source(
         reader.n_docs(),
         local_doc_ids,
         names,
-        op_stats,
     )
     .await
 }
@@ -756,22 +716,13 @@ pub(crate) async fn take_rows_object_store(
     n_docs: u64,
     local_doc_ids: &[u32],
     names: &[&str],
-    op_stats: Option<Arc<OpStatsCollector>>,
 ) -> DfResult<RecordBatch> {
     let mut object_reader = ParquetObjectReader::new(store, path).with_preload_offset_index(true);
     if let Some(size) = file_size.filter(|&s| s > 0) {
         // Skip the size-discovery HEAD when the manifest already knows it.
         object_reader = object_reader.with_file_size(size);
     }
-    take_rows_async(
-        object_reader,
-        file_schema,
-        n_docs,
-        local_doc_ids,
-        names,
-        op_stats,
-    )
-    .await
+    take_rows_async(object_reader, file_schema, n_docs, local_doc_ids, names).await
 }
 
 async fn take_rows_async<R>(
@@ -780,15 +731,10 @@ async fn take_rows_async<R>(
     n_docs: u64,
     local_doc_ids: &[u32],
     names: &[&str],
-    op_stats: Option<Arc<OpStatsCollector>>,
 ) -> DfResult<RecordBatch>
 where
     R: AsyncFileReader + Unpin + Send + 'static,
 {
-    let input = CountedFileReader {
-        inner: input,
-        op_stats,
-    };
     // Projected column indices (file order) + output fields (caller order).
     let mut col_indices = Vec::with_capacity(names.len());
     let mut out_fields: Vec<Field> = Vec::with_capacity(names.len());
@@ -1489,7 +1435,6 @@ mod tests {
             n_docs,
             &[2, 0, 3],
             &["title"],
-            None,
         )
         .await
         .expect("take rows");
@@ -1515,7 +1460,6 @@ mod tests {
             n_docs,
             &[1, 1, 0],
             &["title"],
-            None,
         )
         .await
         .expect("take rows");
@@ -1531,10 +1475,9 @@ mod tests {
         let (schema, n_docs) = schema_and_n_docs(&bytes);
         let (store, path) = object_store_with(&bytes).await;
 
-        let batch =
-            take_rows_object_store(store, path, None, &schema, n_docs, &[4], &["title"], None)
-                .await
-                .expect("take rows");
+        let batch = take_rows_object_store(store, path, None, &schema, n_docs, &[4], &["title"])
+            .await
+            .expect("take rows");
 
         assert_eq!(titles_of(&batch), vec!["echo"]);
     }
@@ -1553,7 +1496,6 @@ mod tests {
             n_docs,
             &[],
             &["title"],
-            None,
         )
         .await
         .expect("empty ids");
@@ -1576,7 +1518,6 @@ mod tests {
             n_docs,
             &[n_docs as u32],
             &["title"],
-            None,
         )
         .await
         .expect_err("doc id past n_docs must error");
@@ -1600,7 +1541,6 @@ mod tests {
             n_docs,
             &[0],
             &["nope"],
-            None,
         )
         .await
         .expect_err("unknown column must error");

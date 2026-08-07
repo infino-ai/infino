@@ -1224,25 +1224,25 @@ impl SuperfileReader {
     ///
     /// Returns an empty `Vec` if no indexed term begins with
     /// `prefix` or if `k == 0`.
-    /// Returns the hits plus the expansion's posting work and the
-    /// bracketed kernel on-CPU ns, so a prefix expanding to thousands
-    /// of terms carries its cost like any other query shape.
+    /// Returns the hits plus the expansion's posting + kernel work, so
+    /// a prefix expanding to thousands of terms carries its cost like
+    /// any other query shape.
     pub async fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
         k: usize,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         if k == 0 {
-            return Ok((Vec::new(), MatchWork::default(), 0));
+            return Ok((Vec::new(), MatchWork::default()));
         }
         let lowered = prefix.to_ascii_lowercase();
         let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
-            return Ok((Vec::new(), MatchWork::default(), 0));
+            return Ok((Vec::new(), MatchWork::default()));
         }
         // FST keys are valid UTF-8 by construction (AsciiLower
         // tokenizer only emits ASCII bytes); the from_utf8 below
@@ -2350,7 +2350,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         // "rust" is a prefix of "rust" (docs 0,2); "ru" expands to it too.
-        let (hits, work, _kernel_ns) = r
+        let (hits, work) = r
             .bm25_search_prefix("title", "ru", 5)
             .await
             .expect("prefix search");

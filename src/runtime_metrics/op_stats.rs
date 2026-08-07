@@ -30,9 +30,12 @@
 //! index's per-generation fast state; and phase C's bookkeeping
 //! refetches (cluster index + Sq8 meta re-reads on the warm-only rerank
 //! wave — cold runs have no phase C, so pricing them would make the one
-//! priced counter temperature-dependent). Their expected cost is
-//! recovered through a consumer's calibrated rates, never surcharged on
-//! the query that happened to pay them.
+//! priced counter temperature-dependent); and the materialization takes'
+//! streamed page ranges (a promoted resident reader decodes in place —
+//! reader-cache state again; `rows_materialized` carries that leg
+//! invariantly). Their expected cost is recovered through a consumer's
+//! calibrated rates, never surcharged on the query that happened to pay
+//! them.
 
 use std::cell::RefCell;
 use std::sync::{
@@ -92,8 +95,11 @@ pub struct OpStats {
     /// table when the column stores one), plus one per stable-id region
     /// / `_id` remap read / hydrated-section cell read. Rerank rows are
     /// deliberately excluded — see [`Self::vector_rows_reranked`]. SQL:
-    /// one per Parquet range the scan requests. Materialization: one per
-    /// data range a projection take requests.
+    /// one per Parquet range the scan requests. Materialization takes are
+    /// deliberately excluded (a promoted resident reader decodes in place
+    /// while a lazy reader streams ranges — reader-cache state, so
+    /// counting them would break the warm/cold invariance);
+    /// [`Self::rows_materialized`] is that leg's invariant signal.
     pub planned_read_ranges: u64,
     /// Parquet **data-page** bytes SQL scans requested through the
     /// DataFusion store, independent of whether they were served from
@@ -121,7 +127,7 @@ pub struct OpStats {
 /// Accumulates one query's work counters across its fan-out (tokio unit
 /// tasks and rayon kernel waves both add through the same `Arc`).
 #[derive(Debug, Default)]
-pub struct OpStatsCollector {
+pub(crate) struct OpStatsCollector {
     fts_postings_bytes: AtomicU64,
     vector_cells_scanned: AtomicU64,
     vector_candidates_scanned: AtomicU64,

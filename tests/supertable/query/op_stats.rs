@@ -113,10 +113,14 @@ fn demo_two_superfiles() -> Supertable {
     st
 }
 
-/// Zero the one measured-time field so determinism assertions compare only
-/// the plan counts (kernel CPU legitimately varies run to run).
+/// Zero the fields the determinism contract exempts: kernel CPU is
+/// measured time (varies run to run), and reranked rows are actual
+/// execution counts that the deferred path's cold arm can legitimately
+/// shift (they ARE deterministic at a fixed temperature, but this
+/// helper serves the cross-temperature comparisons).
 fn deterministic(mut stats: OpStats) -> OpStats {
     stats.kernel_cpu_ns = 0;
+    stats.vector_rows_reranked = 0;
     stats
 }
 
