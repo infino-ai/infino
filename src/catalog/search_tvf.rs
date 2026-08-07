@@ -33,15 +33,17 @@ use datafusion::{
 };
 
 use super::Connection;
-use crate::runtime_metrics::op_stats::{self, OpStatsCollector};
-use crate::supertable::{
-    handle::SupertableReader,
-    query::exec::{
-        common::arg_to_string,
-        fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
-        hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
-        match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
-        vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
+use crate::{
+    runtime_metrics::op_stats::{self, OpStatsCollector},
+    supertable::{
+        handle::SupertableReader,
+        query::exec::{
+            common::arg_to_string,
+            fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
+            hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
+            match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
+            vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
+        },
     },
 };
 

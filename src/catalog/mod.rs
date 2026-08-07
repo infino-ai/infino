@@ -51,8 +51,10 @@ use crate::{
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
-    runtime_metrics::io::{UsageMeter, UsageSnapshot},
-    runtime_metrics::op_stats,
+    runtime_metrics::{
+        io::{UsageMeter, UsageSnapshot},
+        op_stats,
+    },
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageError, StorageProvider,

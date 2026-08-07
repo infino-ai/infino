@@ -9,8 +9,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
-use std::thread;
+use std::{sync::Arc, thread};
 
 use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,

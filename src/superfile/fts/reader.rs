@@ -25,31 +25,35 @@ use std::{
 use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::runtime_metrics::cpu::{thread_cpu_delta_ns, thread_cpu_ns};
-use crate::runtime_metrics::op_stats::{metering_active, timed_section};
-use crate::superfile::{
-    ReadError,
-    error::FtsError,
-    format::{
-        self, FST_SEPARATOR,
-        checksum::crc32c,
+use crate::{
+    runtime_metrics::{
+        cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+        op_stats::{metering_active, timed_section},
+    },
+    superfile::{
+        ReadError,
+        error::FtsError,
+        format::{
+            self, FST_SEPARATOR,
+            checksum::crc32c,
+            fts::{
+                HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr,
+                skip_entry, term_meta,
+            },
+        },
         fts::{
-            HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr,
-            skip_entry, term_meta,
+            bm25,
+            builder::{
+                DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
+            },
+            dict::{DictReader, make_key},
+            fst_value::FstValue,
+            positions::{decode_run, skip_run},
+            posting::{BLOCK_LEN, decode_block},
+            tokenize::{Tokenizer, tokenizer_for_name},
         },
+        lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
-    fts::{
-        bm25,
-        builder::{
-            DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
-        },
-        dict::{DictReader, make_key},
-        fst_value::FstValue,
-        positions::{decode_run, skip_run},
-        posting::{BLOCK_LEN, decode_block},
-        tokenize::{Tokenizer, tokenizer_for_name},
-    },
-    lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
 
 /// Largest gap worth overfetching when adjacent term postings share a request.

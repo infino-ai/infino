@@ -41,8 +41,10 @@ use object_store::{
     PutPayload, PutResult, Result as OsResult, path::Path as ObjPath,
 };
 
-use crate::runtime_metrics::op_stats::{self, OpStatsCollector};
-use crate::superfile::{LazyByteSource, lazy_source::Source};
+use crate::{
+    runtime_metrics::op_stats::{self, OpStatsCollector},
+    superfile::{LazyByteSource, lazy_source::Source},
+};
 
 /// Fixed `last_modified` reported for every registered superfile.
 /// Superfiles are immutable once committed, so a wall-clock timestamp

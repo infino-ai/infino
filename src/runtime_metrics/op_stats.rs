@@ -37,10 +37,12 @@
 //! calibrated rates, never surcharged on the query that happened to pay
 //! them.
 
-use std::cell::RefCell;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};

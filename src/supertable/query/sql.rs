@@ -65,9 +65,9 @@ use datafusion::{
     logical_expr::{Expr, LogicalPlan},
 };
 
-use crate::runtime_metrics::op_stats;
 use crate::{
     memory::budgeted_session_context,
+    runtime_metrics::op_stats,
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
