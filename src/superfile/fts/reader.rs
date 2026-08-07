@@ -347,6 +347,37 @@ fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
     cursors.len() >= OR_WINDOW_MIN_TERMS && no_dominant_term_ub(cursors)
 }
 
+/// True when block-max pruning (MaxScore / WAND) can no longer skip
+/// blocks at this `k`, so both degrade to a full union scan — at which
+/// point the SIMD windowed scorer does that same scan far faster than
+/// MaxScore's scalar per-doc f-way merge.
+///
+/// Pruning stays alive only while the top-k threshold sits *above* the
+/// common (low-idf, longest-list) term's score upper bound: only then
+/// can that term's blocks be skipped. The threshold holds there only as
+/// long as the rarer terms alone can fill the heap. Once `k` reaches the
+/// combined df of every term *except* the single longest list, the heap
+/// must admit docs from that longest list's tail — docs whose only
+/// matching term is the common one — the threshold collapses toward its
+/// low upper bound, and no block clears the skip test any more.
+///
+/// `rest_df` (sum of all dfs but the largest) is a conservative bound on
+/// how many docs the rarer terms can contribute: it ignores overlap, so
+/// the true fillable count is `<= rest_df`. When `k >= rest_df` the heap
+/// therefore *cannot* be filled without the common term's tail, and
+/// pruning is dead. This is `df`-only — no extra reads — and
+/// self-correcting: a "rare" second term that is actually long keeps
+/// `rest_df` high, leaves pruning alive, and stays on MaxScore.
+fn or_topk_pruning_ineffective(cursors: &[TermCursor], k: usize) -> bool {
+    if cursors.len() < 2 {
+        return false;
+    }
+    let max_df = cursors.iter().map(|c| c.df).max().unwrap_or(0);
+    let total_df: u64 = cursors.iter().map(|c| c.df).sum();
+    let rest_df = total_df.saturating_sub(max_df);
+    k as u64 >= rest_df
+}
+
 /// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
 ///
 /// `docs_in_scope` bounds the distinct doc_ids that can ever enter the
@@ -3972,6 +4003,17 @@ impl FtsReader {
         // cross-segment floor (`floor_eff` unset) — seeding WAND's
         // threshold from a floor mis-prunes, so a live floor stays on
         // MaxScore.
+        // The dominance heuristic (`prefer_windowed_union`) assumes a
+        // dominant term means MaxScore prunes hard — true only at small
+        // `k`. At large `k` relative to the rarer terms' combined df the
+        // top-k threshold collapses to the common term's upper bound,
+        // MaxScore can skip nothing, and it degrades to a *scalar* full
+        // scan. `or_topk_pruning_ineffective` catches exactly that case
+        // (including a 2-term rare+common OR too deep for WAND) and
+        // routes it to the SIMD windowed scorer, which does the same
+        // full scan without the per-doc f-way merge. Small-`k`
+        // dominant-term ORs fail this test and stay on MaxScore, where
+        // pruning still wins.
         let no_floor = floor_eff == f32::NEG_INFINITY;
         if cursors.len() == 2
             && k <= WAND_BMW_2TERM_MAX_K
@@ -3980,7 +4022,7 @@ impl FtsReader {
             && two_term_has_rare_anchor(&cursors)
         {
             self.run_wand_bmw(column_id, cursors, k)
-        } else if prefer_windowed_union(&cursors) {
+        } else if prefer_windowed_union(&cursors) || or_topk_pruning_ineffective(&cursors, k) {
             self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         } else {
             self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
