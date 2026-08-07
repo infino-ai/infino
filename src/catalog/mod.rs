@@ -427,13 +427,16 @@ impl Connection {
                 let _built = gate.lock().expect("catalog build gate poisoned");
 
                 let name_owned = name.to_string();
-                bridge_sync_to_async(commit_catalog(root.as_ref(), move |body| {
-                    if body.tables.contains_key(&name_owned) {
-                        return Err(InfinoError::AlreadyExists(name_owned.clone()));
-                    }
-                    body.tables.insert(name_owned.clone(), entry.clone());
-                    Ok(())
-                }))
+                bridge_on_runtime(
+                    commit_catalog(root.as_ref(), move |body| {
+                        if body.tables.contains_key(&name_owned) {
+                            return Err(InfinoError::AlreadyExists(name_owned.clone()));
+                        }
+                        body.tables.insert(name_owned.clone(), entry.clone());
+                        Ok(())
+                    }),
+                    &shared_io_runtime(),
+                )
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
 
                 // Seed the memo: `query_sql` reads back through this same
@@ -651,12 +654,15 @@ impl Connection {
                 // succeed). `location` then stays `None`, so the purge below is
                 // skipped — there is nothing left to reclaim.
                 let mut location: Option<String> = None;
-                bridge_sync_to_async(commit_catalog(root.as_ref(), |body| {
-                    if let Some(entry) = body.tables.remove(name) {
-                        location = Some(entry.location);
-                    }
-                    Ok(())
-                }))
+                bridge_on_runtime(
+                    commit_catalog(root.as_ref(), |body| {
+                        if let Some(entry) = body.tables.remove(name) {
+                            location = Some(entry.location);
+                        }
+                        Ok(())
+                    }),
+                    &shared_io_runtime(),
+                )
                 .map_err(|e| e.with_context("drop_table", Some(name)))?;
                 if let (true, Some(location)) = (purge, location) {
                     // Delete everything under the table's unique
@@ -664,11 +670,14 @@ impl Connection {
                     // location sharing a string prefix never matches;
                     // deletes are idempotent, so re-running after a
                     // partial failure converges.
-                    bridge_sync_to_async(async {
-                        let objects = root.list_with_prefix(&location).await?;
-                        try_join_all(objects.iter().map(|uri| root.delete(uri))).await?;
-                        Ok::<(), StorageError>(())
-                    })
+                    bridge_on_runtime(
+                        async {
+                            let objects = root.list_with_prefix(&location).await?;
+                            try_join_all(objects.iter().map(|uri| root.delete(uri))).await?;
+                            Ok::<(), StorageError>(())
+                        },
+                        &shared_io_runtime(),
+                    )
                     .map_err(|e| InfinoError::from(e).with_context("drop_table", Some(name)))?;
                 }
                 Ok(())

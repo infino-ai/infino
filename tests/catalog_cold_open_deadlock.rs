@@ -289,3 +289,73 @@ fn cold_open_same_table_concurrently_over_object_store() {
 
     let _ = done.send(());
 }
+
+#[test]
+fn create_table_same_name_concurrently_over_object_store() {
+    let Some((uri, opts)) = object_store_target() else {
+        eprintln!("skipping: no object store available (see module docs)");
+        return;
+    };
+
+    let done = arm_watchdog("create_table: N+1 concurrent same-name creates");
+
+    runtime("caller").block_on(async {
+        let conn = Arc::new(connect_with(&uri, opts).expect("connect"));
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+
+        let tasks: Vec<_> = (0..CONTENDERS)
+            .map(|_| {
+                let conn = Arc::clone(&conn);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    conn.create_table(TABLE, schema_id_title(), IndexSpec::new().fts("title"))
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            let _ = task.await.expect("create_table task panicked");
+        }
+    });
+
+    let _ = done.send(());
+}
+
+#[test]
+fn drop_table_same_name_concurrently_over_object_store() {
+    let Some((uri, opts)) = object_store_target() else {
+        eprintln!("skipping: no object store available (see module docs)");
+        return;
+    };
+
+    {
+        let conn = connect_with(&uri, opts.clone()).expect("connect (seed)");
+        conn.create_table(TABLE, schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+    }
+
+    let done = arm_watchdog("drop_table: N+1 concurrent same-name drops");
+
+    runtime("caller").block_on(async {
+        let conn = Arc::new(connect_with(&uri, opts).expect("connect"));
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+
+        let tasks: Vec<_> = (0..CONTENDERS)
+            .map(|_| {
+                let conn = Arc::clone(&conn);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    conn.drop_table(TABLE, true)
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            let _ = task.await.expect("drop_table task panicked");
+        }
+    });
+
+    let _ = done.send(());
+}
