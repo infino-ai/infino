@@ -123,9 +123,9 @@ fn deterministic(mut stats: OpStats) -> OpStats {
     stats
 }
 
-/// Posting bytes for one BM25 query run inside a fresh scope, minting the
-/// reader inside the scope (the pickup point).
-fn scoped_query_bytes(st: &Supertable, query: &str) -> u64 {
+/// One BM25 query's full work stats, run inside a fresh scope, minting
+/// the reader inside the scope (the pickup point).
+fn scoped_fts_stats(st: &Supertable, query: &str) -> OpStats {
     let (hits, stats) = with_op_stats(|| {
         st.reader()
             .expect("reader")
@@ -133,7 +133,12 @@ fn scoped_query_bytes(st: &Supertable, query: &str) -> u64 {
             .expect("bm25")
     });
     assert!(!hits.is_empty(), "fixture query {query:?} must match");
-    stats.fts_postings_bytes
+    stats
+}
+
+/// Posting bytes for one BM25 query run inside a fresh scope.
+fn scoped_query_bytes(st: &Supertable, query: &str) -> u64 {
+    scoped_fts_stats(st, query).fts_postings_bytes
 }
 
 #[test]
@@ -215,10 +220,12 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
 fn work_stats_are_deterministic_across_cache_temperature() {
     // The first run decodes from a cold state, the repeat hits every
     // warm structure — the whole point of the counter is that the
-    // reported work is identical either way.
+    // reported work is identical either way. Compare the full masked
+    // snapshot (like the vector/SQL siblings), not just posting bytes,
+    // so a warm/cold divergence in any FTS counter is caught.
     let st = demo_two_superfiles();
-    let cold = scoped_query_bytes(&st, "rust");
-    let warm = scoped_query_bytes(&st, "rust");
+    let cold = deterministic(scoped_fts_stats(&st, "rust"));
+    let warm = deterministic(scoped_fts_stats(&st, "rust"));
     assert_eq!(cold, warm, "same plan, same table state, same work");
 }
 

@@ -59,10 +59,17 @@ const SUPERFILE_LAST_MODIFIED: DateTime<Utc> = DateTime::UNIX_EPOCH;
 /// [`Self::insert_source`] as immutable files are first opened, and reuses it
 /// for every DataFusion scan of that manifest.
 pub(crate) struct SuperfileObjectStore {
-    /// Per-query work collector, captured at construction — the provider
-    /// (and therefore this store) is built per query on the caller's
-    /// thread inside `query_sql`, so the capture is per-query by
-    /// construction and can never leak across queries.
+    /// Per-query work collector, captured at construction. On the catalog
+    /// path (`Connection::query_sql`) the provider — and therefore this
+    /// store — is built fresh per query on the caller's thread, so the
+    /// capture is per-query by construction and can never leak across
+    /// queries. The reader-level cached `SessionContext`
+    /// (`sql_session_context`) instead builds its provider under
+    /// `op_stats::suppressed`, so this is `None` there by design — a
+    /// collector riding a cached context would bill later queries into
+    /// an old scope. That cached path serves mutation id-capture
+    /// (`scan_ids_matching`) and the test-only reader `query_sql`,
+    /// neither of which is part of the metered read surface.
     op_stats: Option<Arc<OpStatsCollector>>,
     /// One byte source per surviving superfile, keyed by the same path
     /// used to build the superfile's `PartitionedFile`.

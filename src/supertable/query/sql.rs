@@ -207,6 +207,13 @@ impl SupertableReader {
     /// Sync API. The first call allocates a tokio Runtime
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
+    ///
+    /// Not metered: this entry runs on the cached, collector-detached
+    /// [`SessionContext`] (see [`Self::sql_session_context`]), so a
+    /// surrounding `with_op_stats` scope reports zero SQL work for it.
+    /// The metered SQL surface is the catalog `Connection::query_sql`,
+    /// which builds a fresh per-query provider that carries the scope's
+    /// collector.
     // Single-table SQL — off the public surface; catalog-level SQL is the
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
