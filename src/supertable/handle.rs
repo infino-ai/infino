@@ -244,6 +244,107 @@ impl SupertableInner {
         }
         cache.reconcile(tombstone_seq_view(&manifest));
     }
+
+    /// Re-read the manifest pointer from storage and advance this supertable's in-memory state to
+    /// whatever it now names.
+    ///
+    /// The pointer is probed with the last etag this handle saw, so an unchanged pointer answers
+    /// without a body. When it has advanced, the new manifest list is loaded, the parts that did
+    /// not change are inherited from the current `ManifestSnapshot` by content hash, only the
+    /// newly-referenced parts are fetched, and the resulting `ManifestSnapshot` is swapped in.
+    /// A `SupertableReader` built before the swap keeps the snapshot it pinned and never sees it.
+    ///
+    /// Three outcomes:
+    ///
+    /// - i) `Ok(true)` when a newer manifest was loaded and swapped in.
+    /// - ii) `Ok(false)` when there was nothing newer to load, either because the pointer had not
+    ///   moved or because this process's own commit already put that version in memory.
+    /// - iii) `Err(PointerVanished)` when the pointer is gone, which also latches
+    ///   `pointer_vanished` on this handle.
+    ///
+    /// Lives on the inner because the deferred storage reclaim holds only an `Arc<SupertableInner>`
+    /// and still has to resolve the committed manifest when it fires.
+    /// [`Supertable::refresh`] is the handle-level spelling of the same call.
+    pub(super) async fn refresh(&self) -> Result<bool, ManifestLoadError> {
+        let storage = self
+            .options
+            .storage
+            .as_ref()
+            // With no storage attached there is no pointer to refresh against. The read path stops
+            // before this (`pointer_refresh_due` is false without storage), so only a direct caller
+            // ever sees the error.
+            .ok_or(ManifestLoadError::NoLoaderAttached)?
+            .clone();
+
+        // Probing with the last-seen etag keeps the steady-state cost of a freshness check at one
+        // roundtrip: an unchanged pointer answers as a bodyless 304, with nothing to transfer or
+        // parse.
+        let prev_etag = self
+            .last_pointer_etag
+            .lock()
+            .expect("last_pointer_etag mutex poisoned")
+            .clone();
+        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref()).await?;
+        let (pointer, meta) = match probe {
+            // An absent pointer means the table was dropped and purged, never that it has not been
+            // committed yet: this handle exists, and every path that builds one over storage
+            // already has a pointer by then, since `open` fails with `PointerNotFound` without one
+            // and `create` publishes an empty manifest first.
+            PointerProbe::Absent => {
+                let _ = self.pointer_vanished.set(());
+                return Err(ManifestLoadError::PointerVanished);
+            }
+            PointerProbe::NotModified => return Ok(false),
+            PointerProbe::Read(pointer, meta) => (pointer, meta),
+        };
+
+        // The etag is recorded only once this pointer version has actually been accounted for,
+        // meaning after a successful load or when the in-memory state already covers it. Recording
+        // it before the load would leave the etag ahead of the snapshot whenever the load fails,
+        // say because a manifest is not yet visible to this process, and the next conditional probe
+        // would then answer `NotModified` and never retry. That pins the handle to the pre-commit
+        // manifest and serves its rows as empty, for good.
+        let current = self.manifest.load_full();
+        let manifest = match ManifestSnapshot::load_with_pointer(
+            Some(current),
+            storage,
+            None,
+            pointer,
+        )
+        .await
+        {
+            Ok(manifest) => manifest,
+            // The pointer moved but the in-memory state already covers that version, which is what
+            // this process's own commit leaves behind. Nothing newer to load, so record the etag
+            // and let the next probe be a cheap 304.
+            Err(ManifestLoadError::AlreadyLoaded) => {
+                *self
+                    .last_pointer_etag
+                    .lock()
+                    .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
+                return Ok(false);
+            }
+            // Leaving the etag unchanged on a failed load is what makes the next probe read the
+            // pointer again and retry, instead of short-circuiting to a 304.
+            Err(err) => return Err(err),
+        };
+
+        self.manifest.store(manifest);
+
+        self.reconcile_tombstone_seqs();
+
+        *self
+            .last_pointer_etag
+            .lock()
+            .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
+
+        debug!(
+            manifest_id = self.manifest.load().manifest_id,
+            "refreshed manifest"
+        );
+
+        Ok(true)
+    }
 }
 
 impl Supertable {
@@ -452,106 +553,15 @@ impl Supertable {
         create_table_async(options, vector_index_table, vector_index_storage_prefix).await
     }
 
-    /// Re-read the manifest pointer from storage.
-    /// If the pointer names a newer `manifest_id` than this
-    /// supertable's current in-memory state, load the new
-    /// list, **inherit** unchanged parts from the current
-    /// `ManifestSnapshot` via content-addressed lookup, eager-fetch
-    /// the newly-referenced parts, and `ArcSwap` the new
-    /// `ManifestSnapshot` into place. Pre-refresh `SupertableReader`s
-    /// keep their pinned snapshot — the swap is invisible to
-    /// them.
+    /// Re-read the manifest pointer from storage and advance this supertable to whatever it names.
+    /// See [`SupertableInner::refresh`] for the mechanism and the three outcomes.
     ///
-    /// Returns `Ok(true)` iff a newer manifest was loaded.
-    /// `Ok(false)` if the pointer hasn't advanced (the cheap
-    /// no-op refresh path).
-    ///
-    /// `pub(crate)` — not a public verb. Freshness is engine-driven
-    /// via [`Supertable::ensure_fresh`] on the read path, governed by
-    /// [`crate::supertable::options::Consistency`]. This is the
-    /// mechanism that drives the pointer re-check.
+    /// Not a public verb, despite the name. Freshness is engine-driven through
+    /// [`Supertable::ensure_fresh`] on the read path and governed by
+    /// [`crate::supertable::options::Consistency`]; this is the call underneath that drives the
+    /// pointer re-check.
     pub(crate) async fn refresh(&self) -> Result<bool, ManifestLoadError> {
-        let storage = self
-            .inner
-            .options
-            .storage
-            .as_ref()
-            // No storage attached ⇒ nothing to refresh against. The read path
-            // never reaches here (`pointer_refresh_due` returns false without
-            // storage); surfaced for direct callers.
-            .ok_or(ManifestLoadError::NoLoaderAttached)?
-            .clone();
-
-        // Conditional pointer probe: with the last-seen etag in hand,
-        // an unchanged pointer answers as a bodyless 304 — the
-        // steady-state cost of the consistency check is one
-        // roundtrip, no transfer, no parse.
-        let prev_etag = self
-            .inner
-            .last_pointer_etag
-            .lock()
-            .expect("last_pointer_etag mutex poisoned")
-            .clone();
-        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref()).await?;
-        let (pointer, meta) = match probe {
-            // Absent means the pointer was deleted — the table was
-            // dropped and purged. It is never "not committed yet": this handle
-            // exists, and every path that builds one over storage has a
-            // pointer by then (`open` fails with `PointerNotFound` without
-            // one; `create` publishes an empty manifest first). A handle with
-            // no storage never reaches here — `refresh` requires it above.
-            PointerProbe::Absent => {
-                let _ = self.inner.pointer_vanished.set(());
-                return Err(ManifestLoadError::PointerVanished);
-            }
-            PointerProbe::NotModified => return Ok(false),
-            PointerProbe::Read(pointer, meta) => (pointer, meta),
-        };
-
-        // Record the new pointer etag only once we've actually accounted for
-        // this pointer version — after a successful load, or when our in-memory
-        // state already covers it. Recording it *before* the load would, on a
-        // load failure (e.g. a manifest not yet visible to this process),
-        // advance the etag while the snapshot stays behind: the next conditional
-        // probe would then see `NotModified` and never retry the load, pinning
-        // the handle to the pre-commit manifest and serving its rows as empty.
-        let current = self.inner.manifest.load_full();
-        let manifest = match ManifestSnapshot::load_with_pointer(
-            Some(current),
-            storage,
-            None,
-            pointer,
-        )
-        .await
-        {
-            Ok(manifest) => manifest,
-            // Pointer changed but our in-memory state already covers it (e.g.
-            // this process's own commit rewrote the pointer) — nothing newer to
-            // load. Record the etag so the next probe is a cheap 304.
-            Err(ManifestLoadError::AlreadyLoaded) => {
-                *self
-                    .inner
-                    .last_pointer_etag
-                    .lock()
-                    .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
-                return Ok(false);
-            }
-            // Load failed. Leave the etag unchanged so the next probe reads the
-            // pointer again and retries rather than short-circuiting to 304.
-            Err(err) => return Err(err),
-        };
-        self.inner.manifest.store(manifest);
-        self.inner.reconcile_tombstone_seqs();
-        *self
-            .inner
-            .last_pointer_etag
-            .lock()
-            .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
-        debug!(
-            manifest_id = self.inner.manifest.load().manifest_id,
-            "refreshed manifest"
-        );
-        Ok(true)
+        self.inner.refresh().await
     }
 
     /// Current manifest's id, without pinning a reader. Useful for

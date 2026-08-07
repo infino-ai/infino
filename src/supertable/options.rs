@@ -214,6 +214,13 @@ pub enum Consistency {
     /// read replicas / time-bounded scans that never want surprise
     /// pointer reads.
     ///
+    /// This governs the *read* path. Calling `gc` (directly or through
+    /// `optimize`) still re-reads the pointer and advances the handle,
+    /// because a sweep decides what to delete from the committed
+    /// manifest and would otherwise delete superfiles another process
+    /// committed after this handle opened. Readers already pinned keep
+    /// their snapshot; the next one taken sees the advance.
+    ///
     /// Do not hold a `Snapshot` handle open longer than the GC safety
     /// gap (default 24 hours). GC removes old manifests once they age
     /// past that threshold; a handle whose pinned manifest has been

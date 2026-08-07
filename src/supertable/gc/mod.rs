@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashSet,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -10,7 +11,7 @@ use tracing::{debug, warn};
 
 use crate::{
     runtime_bridge::bridge_on_runtime,
-    storage::StorageError,
+    storage::{StorageError, StorageProvider},
     supertable::{
         ManifestSnapshot, Supertable,
         error::GcError,
@@ -46,16 +47,28 @@ pub struct GcReport {
     pub delete_errors: u64,
 }
 
+/// Every storage key this manifest version references, and whether its superfile membership was
+/// fully resident. Anything absent from the returned set is an orphan as far as the caller is
+/// concerned, so a key that belongs here and is missed, gets deleted.
 fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     let mut live = HashSet::new();
+
+    // The pointer, and the one manifest list it names. Superseded lists are left out on purpose:
+    // being unreferenced here is exactly what makes them reclaimable.
     live.insert(POINTER_PATH.to_string());
     live.insert(manifest_uri(manifest.manifest_id));
+
+    // The part fan this list is built from, plus each part's routing sibling where it has one.
     for entry in manifest.get_all_list_entries() {
         live.insert(entry.uri.clone());
         if let Some(routing) = &entry.routing {
             live.insert(routing.uri.clone());
         }
     }
+
+    // Every superfile, but only when the parts are all loaded. A partial view names some of the
+    // superfiles and no more, so the caller must skip `data/` entirely rather than treat the ones
+    // it cannot see as orphans. That is what the flag carries.
     let superfiles_complete = if let Some(superfiles) = manifest.complete_flat_superfiles() {
         for sf in superfiles {
             live.insert(sf.uri.storage_path());
@@ -64,20 +77,24 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     } else {
         false
     };
-    // Slow-CAS objects (routing-shaped state blob + fp32 centroid
-    // section): the URIs are read straight off the manifest-list refs —
-    // sync, no fetch. Superseded generations (older drains) are absent
-    // from the current list and get swept once past the safety gap.
+
+    // The slow-CAS state blob and its centroid section, read straight off the list refs with no
+    // fetch. Older drains are absent from the current list and age out past the safety gap.
     if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
     }
     if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
         live.insert(centroids.uri.clone());
     }
+
+    // Each resident superfile's tombstone sidecar. `superfiles/` is swept whatever the flag says,
+    // so these have to be named here or a sidecar past the gap is deleted and its deleted rows
+    // come back. The superfile paths repeat what the complete view above already inserted.
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
         live.insert(WalStore::tombstones_path(sf.superfile_id));
     }
+
     (live, superfiles_complete)
 }
 
@@ -95,16 +112,47 @@ impl Supertable {
     }
 }
 
-/// Delete storage objects not referenced by the current manifest once they are
-/// older than `safety_gap`. Supersedes inline post-commit deletes so readers
-/// pinned to an older snapshot cannot lose bytes mid-fetch.
-pub(super) async fn gc_storage_sweep_for_inner(
+/// Everything one manifest version references, with the `manifest_id` it came from and whether its
+/// superfile membership was fully resident (see [`build_live_set`]).
+struct LiveSet {
+    uris: HashSet<String>,
+    superfiles_complete: bool,
+    manifest_id: u64,
+}
+
+/// Advance the handle to the committed manifest, so the keep-set built next describes the table
+/// rather than one handle's memory of it. A superfile another handle committed after that snapshot
+/// is missing from the cached view, and a sweep built on it deletes a file the manifest still
+/// references, which nothing notices until a later read or compaction fails with `not found`.
+///
+/// Costs one conditional pointer GET while the pointer is unchanged, and inherits already-loaded
+/// parts when it has moved.
+///
+/// Any failure aborts the sweep rather than falling back to the cached snapshot, because a keep-set
+/// that cannot be verified is the input that deletes live data. That includes `PointerVanished`,
+/// where the table was dropped and purged and reclaiming the remains belongs to the purge.
+async fn refresh_to_committed(inner: &SupertableInner) -> Result<(), GcError> {
+    inner.refresh().await.map(|_advanced| ()).map_err(|error| {
+        GcError::Storage(StorageError::Permanent {
+            uri: POINTER_PATH.to_string(),
+            source: Box::new(error),
+        })
+    })
+}
+
+/// Keep-set for the manifest this handle currently holds. Callers run [`refresh_to_committed`]
+/// first; this reads no pointer of its own.
+///
+/// Not cheap on a table carrying slow-CAS vector state: hydrating the pending drain re-fetches that
+/// blob and re-hashes it, which is multi-GiB work on a large table. Build it once per manifest
+/// version, never speculatively.
+async fn live_set(
     inner: &SupertableInner,
-    safety_gap: Duration,
-) -> Result<GcReport, GcError> {
-    let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
+    storage: &Arc<dyn StorageProvider>,
+) -> Result<LiveSet, GcError> {
     let manifest = inner.manifest.load_full();
-    let (mut live, superfiles_complete) = build_live_set(&manifest);
+    let (mut uris, superfiles_complete) = build_live_set(&manifest);
+
     if let Some((uri, hash)) = manifest.slow_vector_state_blob() {
         // An unreadable slow-state blob is a permanent storage-level failure
         // on that URI (missing, corrupt, or hash-mismatched bytes) — surface
@@ -119,9 +167,39 @@ pub(super) async fn gc_storage_sweep_for_inner(
                 })
             })?;
         if let Some(pending) = state.pending_drain {
-            live.extend(pending.entries.iter().map(|entry| entry.uri.storage_path()));
+            uris.extend(pending.entries.iter().map(|entry| entry.uri.storage_path()));
         }
     }
+
+    Ok(LiveSet {
+        uris,
+        superfiles_complete,
+        manifest_id: manifest.manifest_id,
+    })
+}
+
+/// Delete storage objects not referenced by the current manifest once they are
+/// older than `safety_gap`. Supersedes inline post-commit deletes so readers
+/// pinned to an older snapshot cannot lose bytes mid-fetch.
+///
+/// Listing and deleting are not atomic against a commit, so liveness is resolved twice — once
+/// before listing and once more before deleting — and an object referenced by either version is
+/// kept. Unioning the two keep-sets rather than replacing the first is the point: a commit that
+/// lands mid-sweep would otherwise fall between them.
+pub(super) async fn gc_storage_sweep_for_inner(
+    inner: &SupertableInner,
+    safety_gap: Duration,
+) -> Result<GcReport, GcError> {
+    let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
+
+    refresh_to_committed(inner).await?;
+
+    let LiveSet {
+        uris: live_uris,
+        superfiles_complete,
+        manifest_id: live_manifest_id,
+    } = live_set(inner, &storage).await?;
+
     let cutoff = SystemTime::now()
         .checked_sub(safety_gap)
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -139,10 +217,12 @@ pub(super) async fn gc_storage_sweep_for_inner(
     if superfiles_complete {
         prefixes.push(SUPERFILE_DATA_DIR);
     }
+
+    let mut candidates: Vec<(String, u64)> = Vec::new();
     for prefix in prefixes {
         let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
-            if live.contains(&key) {
+            if live_uris.contains(&key) {
                 report.objects_skipped_live += 1;
                 continue;
             }
@@ -150,15 +230,52 @@ pub(super) async fn gc_storage_sweep_for_inner(
                 report.objects_skipped_too_new += 1;
                 continue;
             }
-            match storage.delete(&key).await {
-                Ok(()) => {
-                    report.objects_deleted += 1;
-                    report.bytes_freed += meta.size;
-                }
-                Err(e) => {
-                    warn!(object = %key, error = %e, "gc: failed to delete orphan object");
-                    report.delete_errors += 1;
-                }
+            candidates.push((key, meta.size));
+        }
+    }
+
+    // Nothing is deleted until the listing is complete and the pointer has been re-read once more,
+    // so candidates accumulate across every prefix first. That also keeps the re-read below at one
+    // probe per sweep rather than one per prefix.
+    //
+    // The first keep-set is spent at this point and holds a `String` per referenced object, so
+    // release it rather than carry it alongside the second.
+    drop(live_uris);
+
+    // A commit may have landed while the listing ran, so re-read the pointer and put back anything
+    // the newer manifest references. Only the pointer is re-read up front: rebuilding the keep-set
+    // costs a slow-state fetch on a vector table, so it happens solely when the manifest actually
+    // moved. Candidates can only be removed here, never added, so a re-check that comes back with a
+    // partial view keeps more than it should rather than deleting something it cannot see.
+    if !candidates.is_empty() {
+        refresh_to_committed(inner).await?;
+        if inner.manifest.load().manifest_id != live_manifest_id {
+            let recheck = live_set(inner, &storage).await?;
+            let before = candidates.len();
+            candidates.retain(|(key, _)| !recheck.uris.contains(key));
+
+            let rescued = before - candidates.len();
+            report.objects_skipped_live += rescued as u64;
+            if rescued > 0 {
+                debug!(
+                    rescued,
+                    from_manifest = live_manifest_id,
+                    to_manifest = recheck.manifest_id,
+                    "gc: a commit landed mid-sweep; keeping objects it references"
+                );
+            }
+        }
+    }
+
+    for (key, size) in candidates {
+        match storage.delete(&key).await {
+            Ok(()) => {
+                report.objects_deleted += 1;
+                report.bytes_freed += size;
+            }
+            Err(e) => {
+                warn!(object = %key, error = %e, "gc: failed to delete orphan object");
+                report.delete_errors += 1;
             }
         }
     }

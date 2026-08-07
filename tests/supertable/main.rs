@@ -13,6 +13,9 @@
 //!   pruning end-to-end, brute-force BM25 oracle for
 //!   multi-superfile search.
 //! - **manifest/**: the eager-vs-lazy-open threshold path.
+//! - **compact_gc / gc_stale_snapshot**: reclaiming orphaned
+//!   objects, and the keep-set freshness that decides which
+//!   objects those are.
 //! - **disk_cache/**: the cold-fetch coordinator + hybrid /
 //!   sweep policies + supertable-disk-cache integration.
 //! - **storage/**: the supertable-driven S3 smoke run.
@@ -23,11 +26,14 @@
 //! audit (`license_audit.rs`) stay at the top level of
 //! `tests/` because they need their own binary.
 
+#![deny(clippy::unwrap_used)]
+
 mod bioasq_admit_diag;
 mod commit;
 mod compact_gc;
 mod disk_cache;
 mod drain_tombstones;
+mod gc_stale_snapshot;
 mod manifest;
 mod query;
 mod storage;
