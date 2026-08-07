@@ -276,6 +276,13 @@ pub(crate) fn timed_kernel<T>(
     collector: &Option<Arc<OpStatsCollector>>,
     f: impl FnOnce() -> T,
 ) -> T {
+    // Gate on the live-scope counter like the superfile-level brackets:
+    // a reader held past its scope still carries a collector, and its
+    // queries must not keep paying procfs reads into an Arc nobody
+    // snapshots.
+    if !metering_active() {
+        return f();
+    }
     let Some(stats) = collector else {
         return f();
     };

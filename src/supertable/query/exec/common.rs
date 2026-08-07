@@ -15,7 +15,7 @@
 //!
 //! [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use arrow::compute::{concat_batches, interleave_record_batch, take};
 use arrow_array::{ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions};
@@ -102,7 +102,18 @@ pub(crate) fn harvest_datafusion_metrics(
     plan: &Arc<dyn ExecutionPlan>,
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) {
-    fn walk(node: &Arc<dyn ExecutionPlan>, compute_ns: &mut u64, leaf_rows: &mut u64) {
+    // Deduped by node identity: plans are trees in practice, but nothing
+    // forbids an operator `Arc` appearing under two parents, and a shared
+    // node's metrics must not be added once per path.
+    fn walk(
+        node: &Arc<dyn ExecutionPlan>,
+        seen: &mut HashSet<usize>,
+        compute_ns: &mut u64,
+        leaf_rows: &mut u64,
+    ) {
+        if !seen.insert(Arc::as_ptr(node) as *const () as usize) {
+            return;
+        }
         if let Some(metrics) = node.metrics() {
             if let Some(ns) = metrics.elapsed_compute() {
                 *compute_ns += ns as u64;
@@ -114,15 +125,16 @@ pub(crate) fn harvest_datafusion_metrics(
             }
         }
         for child in node.children() {
-            walk(child, compute_ns, leaf_rows);
+            walk(child, seen, compute_ns, leaf_rows);
         }
     }
     let Some(stats) = op_stats else {
         return;
     };
+    let mut seen = HashSet::new();
     let mut compute_ns = 0u64;
     let mut leaf_rows = 0u64;
-    walk(plan, &mut compute_ns, &mut leaf_rows);
+    walk(plan, &mut seen, &mut compute_ns, &mut leaf_rows);
     stats.add_kernel_cpu_ns(compute_ns);
     stats.add_rows_materialized(leaf_rows);
 }
