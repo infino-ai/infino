@@ -1310,7 +1310,7 @@ impl SupertableReader {
                     let (docs, work) = r
                         .token_match(&column_arc, &refs, BoolMode::And)
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                        .map_err(fts_read_error)?;
                     // The prune pass's posting walk. The verify pass's
                     // row reads count through the take path's own
                     // collector accounting below.
