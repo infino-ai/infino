@@ -81,7 +81,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
-use tokio::join;
+use tokio::{join, sync::OnceCell};
 use uuid::Uuid;
 
 use super::{
@@ -96,6 +96,7 @@ pub use crate::superfile::reader::VectorSearchOptions;
 use crate::test_helpers::{admit_trace, served_shortlist_probe};
 use crate::{
     config,
+    runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::io_counters,
     superfile::{
@@ -118,6 +119,7 @@ use crate::{
             list::{CellRoutingParams, PartitionStrategy},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
+        options::{GappedPlacementCell, GappedPlacementIndex},
         slow_vector_state::{CentroidSection, fetch_centroid_section},
         tombstones::SidecarCache,
     },
@@ -861,8 +863,13 @@ async fn lookup_user_placements_by_id(
         .map_err(QueryError::ManifestLoad)?;
     let mut placements: Vec<Option<(Arc<SuperfileEntry>, u32)>> = vec![None; user_row_ids.len()];
     let mut gapped = Vec::new();
+    // Uris in the current fresh read list, to evict cache entries for superfiles
+    // that have since been superseded/GC'd (keeps the cache bounded to the live
+    // set, no process-lifetime growth).
+    let mut live_uris: HashSet<SuperfileUri> = HashSet::new();
 
     for entry in entries {
+        live_uris.insert(entry.uri);
         let matching: Vec<usize> = user_row_ids
             .iter()
             .enumerate()
@@ -889,35 +896,67 @@ async fn lookup_user_placements_by_id(
         }
     }
 
-    let decoded = try_join_all(gapped.into_iter().map(|entry| async move {
-        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
-        // Cell-packed user files carry stable ids inline in Parquet row order.
-        // Read each compact cell region once instead of decoding the full
-        // Parquet `_id` column to place a top-k scalar projection.
-        let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true, op_stats).await?;
-        Ok::<_, QueryError>((entry, ids))
-    }))
-    .await?;
-    let mut requested: HashMap<i128, Vec<usize>> = HashMap::new();
-    for (index, &id) in user_row_ids.iter().enumerate() {
-        if placements[index].is_none() {
-            requested.entry(id).or_default().push(index);
-        }
-    }
-    for (entry, ids) in decoded {
-        for (local, id) in ids.into_iter().enumerate() {
-            let Some(indexes) = requested.get(&id) else {
-                continue;
-            };
-            let local = u32::try_from(local).map_err(|_| {
-                QueryError::Execute(format!(
-                    "local_doc_id out of range in user superfile {:?}",
-                    entry.uri
-                ))
-            })?;
-            for &index in indexes {
-                if placements[index].is_none() {
-                    placements[index] = Some((Arc::clone(&entry), local));
+    // Resolve ids still unplaced (they live in GAPPED superfiles) via a
+    // read-time cache: one immutable sorted `stable_id -> local` index per
+    // gapped superfile, keyed by (immutable) uri. Contiguous entries were
+    // placed by arithmetic above and are never cached, so an all-contiguous
+    // table caches nothing. A data change only builds the NEW superfiles;
+    // unchanged ones stay cached and are never stale (#556).
+    if !gapped.is_empty() {
+        let slot = Arc::clone(&manifest.options.gapped_id_placement_cache);
+        let version = manifest.get_manifest_id();
+        // Under one short lock: prune MONOTONICALLY (only a generation at least
+        // as new as the last prune may evict, so an older concurrent snapshot
+        // never drops a newer snapshot's freshly-built maps — which would thrash
+        // rebuilds under load), then take/create the per-uri single-flight cell
+        // for each gapped superfile. Holding the `Arc<OnceCell>` keeps a
+        // concurrent prune from dropping the cell out from under the build.
+        let cells: Vec<(Arc<SuperfileEntry>, GappedPlacementCell)> = {
+            let mut cache = slot.lock().await;
+            if version >= cache.pruned_through {
+                cache.entries.retain(|uri, _| live_uris.contains(uri));
+                cache.pruned_through = version;
+            }
+            gapped
+                .iter()
+                .map(|e| {
+                    let cell = Arc::clone(
+                        cache
+                            .entries
+                            .entry(e.uri)
+                            .or_insert_with(|| Arc::new(OnceCell::new())),
+                    );
+                    (Arc::clone(e), cell)
+                })
+                .collect()
+        };
+        // Build outside the lock. Each cell single-flights its superfile's index
+        // (a second concurrent cold query for the same uri awaits this build,
+        // not a duplicate one); the CPU inversion runs on the reader pool, not
+        // the tokio blocking pool. `try_join_all` preserves `cells` order, so
+        // the probe below stays deterministic in manifest order.
+        let built: Vec<(Arc<SuperfileEntry>, Arc<GappedPlacementIndex>)> =
+            try_join_all(cells.into_iter().map(|(entry, cell)| async move {
+                let index = cell
+                    .get_or_try_init(|| {
+                        build_gapped_placement_index(manifest, &entry, id_column, op_stats)
+                    })
+                    .await?;
+                Ok::<_, QueryError>((entry, Arc::clone(index)))
+            }))
+            .await?;
+        // Probe in manifest (gapped) order: if an id is resident in two live
+        // superfiles — an updated row's tombstoned-old copy plus its live copy,
+        // both physical rows to `read_ids_for_locals` — first-wins resolves it to
+        // the same superfile the pre-cache full scan did.
+        for (entry, index) in &built {
+            for (i, &id) in user_row_ids.iter().enumerate() {
+                if placements[i].is_none()
+                    && id >= entry.id_min
+                    && id <= entry.id_max
+                    && let Some(local) = index.local_for(id)
+                {
+                    placements[i] = Some((Arc::clone(entry), local));
                 }
             }
         }
@@ -942,6 +981,52 @@ fn id_values_from_batch(batch: &RecordBatch) -> Result<Vec<i128>, QueryError> {
         .downcast_ref::<Decimal128Array>()
         .map(|a| a.values().to_vec())
         .ok_or_else(|| QueryError::Execute("_id column missing".into()))
+}
+
+/// Build one gapped superfile's sorted `stable_id -> local` index (#556): read
+/// its `_id` column once, reserve the resident bytes against the connection
+/// budget (degrading to an unreserved build under pressure rather than failing
+/// the query — the vector scan degrades the same way), then sort + dedup on the
+/// reader pool. Memoized per uri by the caller's single-flight cell.
+async fn build_gapped_placement_index(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    id_column: &str,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Arc<GappedPlacementIndex>, QueryError> {
+    let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+    let ids = read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await?;
+    // ~20 B resident per row (i128 id + u32 local). Reserve up front; on refusal
+    // build anyway, just unaccounted (correctness is unchanged, only the memo's
+    // budget bookkeeping) — same graceful fallback the transposed-code cache uses.
+    let bytes = ids.len() * (std::mem::size_of::<i128>() + std::mem::size_of::<u32>());
+    let reservation = manifest
+        .options
+        .connection_memory_budget
+        .try_reserve(bytes)
+        .ok();
+    let pool = Arc::clone(&manifest.options.reader_pool);
+    let index = run_on_pool(
+        Some(&pool),
+        "gapped id-map: reader pool dropped result",
+        move || {
+            let mut pairs: Vec<(i128, u32)> = ids.into_iter().zip(locals).collect();
+            // Sort by id, ties by local, so dedup keeps the SMALLEST local for a
+            // repeated id — first-wins in Parquet row order, matching the old scan.
+            pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            pairs.dedup_by_key(|p| p.0);
+            let mut sorted_ids = Vec::with_capacity(pairs.len());
+            let mut sorted_locals = Vec::with_capacity(pairs.len());
+            for (id, local) in pairs {
+                sorted_ids.push(id);
+                sorted_locals.push(local);
+            }
+            GappedPlacementIndex::new(sorted_ids, sorted_locals, reservation)
+        },
+    )
+    .await
+    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    Ok(Arc::new(index))
 }
 
 /// Resolve a stable row id from manifest span arithmetic when the superfile
@@ -4019,7 +4104,7 @@ mod tests {
             Supertable, SupertableOptions,
             error::QueryError,
             manifest::{
-                ClusterCentroids,
+                ClusterCentroids, ManifestSnapshot,
                 list::{CellRoutingParams, PartitionStrategy},
             },
             writer::{recalibrate_probe_laws, split_overflow_cell},
@@ -4603,6 +4688,249 @@ mod tests {
             .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("query");
         assert!(hits.is_empty());
+    }
+
+    // ---- Gapped id->local placement cache: direct-call coverage (#556) ----
+    //
+    // `lookup_user_placements_by_id` resolves each vector hit's stable `_id`
+    // to its owning (superfile, local-row). Contiguous superfiles resolve by
+    // span arithmetic; a GAPPED superfile (drained/cell-packed, or any span
+    // != n_docs) has no stable_id->local index, so the reverse map is built
+    // by reading its `_id` column once and memoized per (immutable) superfile
+    // uri. These tests pin the placement result across both kinds and the
+    // cache contract: built once then reused, contiguous entries never cached,
+    // and eviction to the live read set (no unbounded growth).
+
+    /// One plain (non-cell) superfile whose `_id` column holds exactly `ids`,
+    /// serialized. Mirrors `build_oracle_superfile` but with an explicit
+    /// (possibly gapped) id set.
+    fn superfile_bytes_with_ids(ids: &[i128], dim: usize) -> bytes::Bytes {
+        let scalar_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "_id",
+                DataType::Decimal128(
+                    crate::supertable::options::DECIMAL128_PRECISION,
+                    crate::supertable::options::DECIMAL128_SCALE,
+                ),
+                false,
+            ),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            scalar_schema.clone(),
+            "_id",
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
+            }],
+            Some(tok()),
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let id_arr = Decimal128Array::from(ids.to_vec())
+            .with_precision_and_scale(
+                crate::supertable::options::DECIMAL128_PRECISION,
+                crate::supertable::options::DECIMAL128_SCALE,
+            )
+            .expect("decimal128");
+        let titles = LargeStringArray::from(
+            (0..ids.len())
+                .map(|i| format!("doc {i}"))
+                .collect::<Vec<_>>(),
+        );
+        let scalar_batch =
+            RecordBatch::try_new(scalar_schema, vec![Arc::new(id_arr), Arc::new(titles)])
+                .expect("scalar batch");
+        let mut flat = Vec::<f32>::with_capacity(ids.len() * dim);
+        for i in 0..ids.len() {
+            for d in 0..dim {
+                flat.push(if d == i % dim { 1.0 } else { 0.0 });
+            }
+        }
+        b.add_batch(&scalar_batch, &[flat.as_slice()])
+            .expect("add_batch");
+        bytes::Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// A gapped `SuperfileEntry` (span != n_docs, so
+    /// `row_id_from_manifest_entry` returns `None`) carrying `ids`, with its
+    /// bytes registered in `store` under a `seed`-derived uri.
+    fn insert_gapped_entry(
+        ids: &[i128],
+        dim: usize,
+        store: &Arc<dyn crate::supertable::reader_cache::SuperfileReaderCache>,
+        seed: u128,
+    ) -> Arc<SuperfileEntry> {
+        let id = Uuid::from_u128(seed);
+        let uri = SuperfileUri(id);
+        store
+            .insert(uri, superfile_bytes_with_ids(ids, dim))
+            .expect("insert superfile bytes");
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri,
+            n_docs: ids.len() as u64,
+            id_min: *ids.iter().min().expect("nonempty ids"),
+            id_max: *ids.iter().max().expect("nonempty ids"),
+            scalar_stats: std::collections::HashMap::new(),
+            fts_summary: std::collections::HashMap::new(),
+            vector_summary: std::collections::HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
+
+    /// A contiguous `SuperfileEntry` (span == n_docs) spanning
+    /// `id_min..id_min+n_docs`. Resolved by arithmetic, never read, never
+    /// cached, so it needs no bytes in the store.
+    fn contiguous_entry(id_min: i128, n_docs: u64, seed: u128) -> Arc<SuperfileEntry> {
+        let id = Uuid::from_u128(seed);
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs,
+            id_min,
+            id_max: id_min + n_docs as i128 - 1,
+            scalar_stats: std::collections::HashMap::new(),
+            fts_summary: std::collections::HashMap::new(),
+            vector_summary: std::collections::HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gapped_id_placement_cache_places_reuses_and_prunes_monotonically() {
+        let dim = 16;
+        let opts = options_one_superfile_per_commit(dim);
+        let store = Arc::clone(&opts.store);
+        let opts = Arc::new(opts);
+
+        // Gapped: ids {0,5,10} -> span 11 != n_docs 3.
+        let gapped = insert_gapped_entry(&[0, 5, 10], dim, &store, 0xA1);
+        // Contiguous: ids {100,101,102} -> span 3 == n_docs 3 (arithmetic).
+        let contig = contiguous_entry(100, 3, 0xC0);
+
+        let m = ManifestSnapshot::new(
+            1,
+            Arc::clone(&opts),
+            vec![Arc::clone(&gapped), Arc::clone(&contig)],
+            None,
+            None,
+        );
+
+        // Placement is correct for both kinds (same result the old full-scan
+        // produced): gapped ids resolve to their Parquet row, contiguous by
+        // arithmetic.
+        let got = super::lookup_user_placements_by_id(&m, &[0, 5, 10, 100], &None)
+            .await
+            .expect("placements");
+        assert_eq!((got[0].0.uri, got[0].1), (gapped.uri, 0));
+        assert_eq!((got[1].0.uri, got[1].1), (gapped.uri, 1));
+        assert_eq!((got[2].0.uri, got[2].1), (gapped.uri, 2));
+        assert_eq!((got[3].0.uri, got[3].1), (contig.uri, 0));
+
+        // Only the gapped superfile is cached; contiguous never is.
+        let first_index = {
+            let cache = opts.gapped_id_placement_cache.lock().await;
+            assert_eq!(
+                cache.entries.len(),
+                1,
+                "only the gapped superfile is cached"
+            );
+            assert!(cache.entries.contains_key(&gapped.uri));
+            assert!(
+                !cache.entries.contains_key(&contig.uri),
+                "contiguous entries resolve by arithmetic and are never cached"
+            );
+            Arc::clone(
+                cache
+                    .entries
+                    .get(&gapped.uri)
+                    .expect("cell")
+                    .get()
+                    .expect("index built"),
+            )
+        };
+
+        // A second query reuses the same index (built once, not per query).
+        super::lookup_user_placements_by_id(&m, &[5], &None)
+            .await
+            .expect("2nd query");
+        {
+            let cache = opts.gapped_id_placement_cache.lock().await;
+            let second_index = Arc::clone(
+                cache
+                    .entries
+                    .get(&gapped.uri)
+                    .expect("cell")
+                    .get()
+                    .expect("index built"),
+            );
+            assert!(
+                Arc::ptr_eq(&first_index, &second_index),
+                "cached index reused, not rebuilt"
+            );
+        }
+
+        // A NEWER generation whose live set drops the old gapped superfile
+        // evicts its map (bounded to the live read set, no lifetime growth).
+        let gapped2 = insert_gapped_entry(&[200, 205, 210], dim, &store, 0xB2);
+        let m_next =
+            ManifestSnapshot::new(2, Arc::clone(&opts), vec![Arc::clone(&gapped2)], None, None);
+        super::lookup_user_placements_by_id(&m_next, &[200, 210], &None)
+            .await
+            .expect("next-gen query");
+        {
+            let cache = opts.gapped_id_placement_cache.lock().await;
+            assert!(
+                !cache.entries.contains_key(&gapped.uri),
+                "superseded gapped superfile is evicted by the newer generation"
+            );
+            assert!(
+                cache.entries.contains_key(&gapped2.uri),
+                "the live gapped superfile is cached"
+            );
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.pruned_through, 2);
+        }
+
+        // An OLDER generation (version 1 < the watermark 2) must NOT evict the
+        // newer generation's map, even though gapped2 isn't in its live set --
+        // otherwise concurrent MVCC snapshots ping-pong rebuilds. It only
+        // rebuilds its own gapped map.
+        super::lookup_user_placements_by_id(&m, &[0], &None)
+            .await
+            .expect("older-gen query");
+        {
+            let cache = opts.gapped_id_placement_cache.lock().await;
+            assert!(
+                cache.entries.contains_key(&gapped2.uri),
+                "older generation did not evict the newer generation's map"
+            );
+            assert!(
+                cache.entries.contains_key(&gapped.uri),
+                "older generation rebuilt its own map"
+            );
+            assert_eq!(cache.entries.len(), 2);
+            assert_eq!(
+                cache.pruned_through, 2,
+                "prune watermark stays at the newest generation seen"
+            );
+        }
     }
 
     #[test]

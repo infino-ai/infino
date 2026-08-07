@@ -39,7 +39,7 @@
 //! [`utils::vector_split::split_vectors`]: super::utils::vector_split::split_vectors
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -47,7 +47,7 @@ use std::{
 
 use arrow_schema::{DataType, Field, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use super::{
     error::BuildError,
@@ -58,7 +58,7 @@ use super::{
 };
 use crate::{
     config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, Reservation},
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageProvider,
@@ -70,10 +70,62 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
-        manifest::{UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy},
+        manifest::{
+            SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
+        },
         slow_vector_state::CentroidSection,
     },
 };
+
+/// Sorted reverse index for one gapped user superfile (#556): `ids` ascending
+/// and deduped (ties broken by local so a repeated id keeps its SMALLEST local
+/// — first-wins in Parquet row order, matching the pre-cache full scan), with
+/// `locals[i]` the local Parquet row for `ids[i]`. Parallel arrays rather than
+/// a hashmap so resident cost is ~20 B/row (≈half a hash) and the build is a
+/// sort (bandwidth-bound). Any budget reservation rides along and releases on
+/// drop when the entry is evicted.
+pub(crate) struct GappedPlacementIndex {
+    ids: Vec<i128>,
+    locals: Vec<u32>,
+    /// Held only for its `Drop`: releases the reserved bytes back to the
+    /// connection budget when this index is evicted. `None` under a
+    /// measure-only budget or when the reservation was declined.
+    #[allow(dead_code)]
+    reservation: Option<Reservation>,
+}
+
+impl GappedPlacementIndex {
+    pub(crate) fn new(ids: Vec<i128>, locals: Vec<u32>, reservation: Option<Reservation>) -> Self {
+        Self {
+            ids,
+            locals,
+            reservation,
+        }
+    }
+
+    /// The local row for `id` via binary search, or `None` if this superfile
+    /// doesn't hold it.
+    pub(crate) fn local_for(&self, id: i128) -> Option<u32> {
+        self.ids.binary_search(&id).ok().map(|i| self.locals[i])
+    }
+}
+
+/// Per-uri single-flight cell: coalesces concurrent cold builds for one
+/// superfile (the second caller awaits the first's build). Errors are not
+/// cached — a failed build leaves the cell empty for the next caller to retry.
+pub(crate) type GappedPlacementCell = Arc<OnceCell<Arc<GappedPlacementIndex>>>;
+
+/// Read-time reverse-lookup cache backing scalar projection over gapped user
+/// superfiles (#556). One immutable sorted index per (immutable) superfile uri.
+/// Pruned MONOTONICALLY to the live read set: only a manifest generation at
+/// least as new as the last prune may evict, so an older concurrent snapshot
+/// (MVCC) never drops maps a newer one just built — which would thrash rebuilds
+/// under load. The interim of a write-time on-disk index.
+#[derive(Default)]
+pub(crate) struct GappedIdPlacementCache {
+    pub(crate) entries: HashMap<SuperfileUri, GappedPlacementCell>,
+    pub(crate) pruned_through: u64,
+}
 
 /// Vector column dim must be in this inclusive range. Mirrors
 /// `superfile::error::BuildError::VectorDimOutOfRange`.
@@ -357,6 +409,12 @@ pub struct SupertableOptions {
     /// it). Serves the stripped-summary admit rescore from a local
     /// temp-file spill instead of per-cell object-store reads.
     pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
+    /// Read-time reverse (`stable_id -> local`) lookup backing scalar
+    /// projection over gapped user superfiles, so a hit resolves in O(k) after
+    /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
+    /// scan. Contiguous entries resolve by arithmetic and are never cached (no
+    /// RAM). The interim of a write-time on-disk index (#556).
+    pub(crate) gapped_id_placement_cache: Arc<TokioMutex<GappedIdPlacementCache>>,
     /// Single-slot cache for the user table's fp32 fine centroids, hydrated
     /// once per manifest generation from the FULL manifest parts on the
     /// first stripped-summary rescore (consumers open with routing parts,
@@ -656,6 +714,7 @@ impl SupertableOptions {
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
+            gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
