@@ -1340,23 +1340,37 @@ impl SupertableReader {
         let deferred = if deferred.is_empty() {
             deferred
         } else if let Some(section) = self.centroid_section().await {
-            let mut leftovers = Vec::new();
-            for d in deferred {
-                let entry = &superfiles[d.si];
-                let read = section
-                    .read_cell(entry.superfile_id, column, d.cell_id)
-                    .map_err(|e| {
-                        QueryError::Execute(format!("centroid section spill read: {e}"))
-                    })?;
-                let Some(fp32) = read else {
-                    leftovers.push(d);
-                    continue;
-                };
-                if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
-                    leftovers.push(d);
+            // Sync section: the preads block the thread (off-CPU), so one
+            // bracket around the whole loop attributes only the fp32
+            // scoring. Each successful cell read is one planned range —
+            // a real per-query pread of the hydrated section, identical
+            // at any cache temperature.
+            let mut cells_read = 0u64;
+            let (leftovers, rescore_ns) = op_stats::timed_section(|| {
+                let mut leftovers = Vec::new();
+                for d in deferred {
+                    let entry = &superfiles[d.si];
+                    let read = section
+                        .read_cell(entry.superfile_id, column, d.cell_id)
+                        .map_err(|e| {
+                            QueryError::Execute(format!("centroid section spill read: {e}"))
+                        })?;
+                    let Some(fp32) = read else {
+                        leftovers.push(d);
+                        continue;
+                    };
+                    cells_read += 1;
+                    if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
+                        leftovers.push(d);
+                    }
                 }
+                Ok::<_, QueryError>(leftovers)
+            });
+            if let Some(stats) = &self.op_stats {
+                stats.add_planned_read_ranges(cells_read);
+                stats.add_kernel_cpu_ns(rescore_ns);
             }
-            leftovers
+            leftovers?
         } else {
             deferred
         };
@@ -1366,24 +1380,32 @@ impl SupertableReader {
         let deferred = if deferred.is_empty() {
             deferred
         } else if let Some(cache) = self.manifest().user_centroids_for_rescore().await {
-            let mut leftovers = Vec::new();
-            for d in deferred {
-                let entry = &superfiles[d.si];
-                let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
-                    leftovers.push(d);
-                    continue;
-                };
-                if !score_cell_fp32(
-                    superfiles,
-                    column,
-                    &d,
-                    fp32.as_slice(),
-                    query,
-                    metric,
-                    candidates,
-                ) {
-                    leftovers.push(d);
+            // RAM-hydrated per-generation cache: no read to count, only
+            // the fp32 scoring CPU.
+            let (leftovers, rescore_ns) = op_stats::timed_section(|| {
+                let mut leftovers = Vec::new();
+                for d in deferred {
+                    let entry = &superfiles[d.si];
+                    let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
+                        leftovers.push(d);
+                        continue;
+                    };
+                    if !score_cell_fp32(
+                        superfiles,
+                        column,
+                        &d,
+                        fp32.as_slice(),
+                        query,
+                        metric,
+                        candidates,
+                    ) {
+                        leftovers.push(d);
+                    }
                 }
+                leftovers
+            });
+            if let Some(stats) = &self.op_stats {
+                stats.add_kernel_cpu_ns(rescore_ns);
             }
             leftovers
         } else {
