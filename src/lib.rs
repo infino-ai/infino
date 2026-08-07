@@ -172,8 +172,14 @@ pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect,
 pub use config::{CompactionSettings, GcSettings, OptimizeOptions};
 /// The single public error type for the curated API.
 pub use error::InfinoError;
-/// Value types named by the public method signatures.
+// `VectorSearchOptions` (probe width / rerank budget) is deliberately
+// NOT part of the public surface: serving is drain-calibrated, and
+// manual tuning is a test-and-bench-only instrument (recall sweeps,
+// the exact-scan oracle). Reachable only under `test-helpers`, which
+// the `cargo-public-api` snapshot excludes — users cannot set these.
+#[cfg(feature = "test-helpers")]
 pub use superfile::VectorSearchOptions;
+/// Value types named by the public method signatures.
 pub use superfile::{
     fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
     vector::distance::Metric,

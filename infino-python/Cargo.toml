@@ -1,6 +1,6 @@
 [package]
 name = "infino-python"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -34,3 +34,10 @@ pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
 # datafusion version so the `Expr` type unifies with the core signatures;
 # feature unification reuses infino's already-compiled datafusion.
 datafusion = "54"
+
+[features]
+# Diagnostic wheel: exposes `nprobe` / `rerank_mult` kwargs on
+# `vector_search` / `hybrid_search` for recall sweeps and the exact-scan
+# oracle (all cells at rerank_mult = ceil(rows/k)). Never enabled for
+# published wheels — the shipped surface has no vector tuning knobs.
+diagnostics = ["infino/test-helpers"]

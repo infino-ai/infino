@@ -16,7 +16,7 @@
 use std::{sync::Arc, time::Duration};
 
 use infino::{
-    BoolMode, IndexSpec, Metric, OptimizeOptions, VectorSearchOptions,
+    BoolMode, IndexSpec, Metric, OptimizeOptions,
     arrow_array::{
         Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
     },
@@ -136,7 +136,6 @@ fn public_surface_search_maintain_query_and_drop() {
             "emb",
             &unit_embedding(0),
             SEARCH_TOP_K,
-            VectorSearchOptions::new(),
             None,
             Some(&["_id", "title", "score"]),
         )
@@ -152,7 +151,6 @@ fn public_surface_search_maintain_query_and_drop() {
             BoolMode::Or,
             "emb",
             &unit_embedding(FIRST_BATCH.len()),
-            VectorSearchOptions::new(),
             SEARCH_TOP_K,
             Some(&["_id", "title", "score"]),
         )
@@ -197,7 +195,6 @@ fn public_surface_search_maintain_query_and_drop() {
             "emb",
             &unit_embedding(0),
             SEARCH_TOP_K,
-            VectorSearchOptions::new(),
             None,
             Some(&["_id", "title", "score"]),
         )
@@ -247,7 +244,6 @@ fn open_table_returns_a_live_handle_on_a_fresh_connection() {
             "emb",
             &unit_embedding(1),
             SEARCH_TOP_K,
-            VectorSearchOptions::new(),
             None,
             Some(&["_id", "title", "score"]),
         )

@@ -20,7 +20,8 @@ use datafusion::prelude::Expr;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, VectorFilter, VectorSearchOptions, supertable::Supertable as SupertableHandle,
+    OptimizeOptions, VectorFilter, superfile::VectorSearchOptions,
+    supertable::Supertable as SupertableHandle,
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -268,21 +269,52 @@ impl Supertable {
     }
 
     /// Vector (IVF kNN) search over one vector column.
+    ///
+    /// Probe width and rerank budget are decided by the engine — the
+    /// drain-time calibration stamps them per table and per `k`, and
+    /// serving extends them only on the query's own evidence. There is
+    /// no caller tuning surface; manual overrides are a test-and-bench
+    /// instrument behind `test-helpers` (`vector_search_with_options`).
     pub fn vector_search(
         &self,
         column: &str,
         query: &[f32],
         k: usize,
-        opts: VectorSearchOptions,
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        self.inner
-            .vector_search(column, query, k, opts, filter, projection)
+        self.inner.vector_search(
+            column,
+            query,
+            k,
+            VectorSearchOptions::default(),
+            filter,
+            projection,
+        )
     }
 
-    /// Hybrid (BM25 + vector) search.
-    #[allow(clippy::too_many_arguments)]
+    test_visible! {
+        /// Test-and-bench-only [`Self::vector_search`] with explicit
+        /// probe-width / rerank overrides — recall sweeps and the
+        /// exact-scan oracle (all cells at `rerank_mult = ceil(rows/k)`).
+        /// Off the public surface: the `cargo-public-api` snapshot is
+        /// generated without `test-helpers`.
+        fn vector_search_with_options(
+            &self,
+            column: &str,
+            query: &[f32],
+            k: usize,
+            opts: VectorSearchOptions,
+            filter: Option<VectorFilter<'_>>,
+            projection: Option<&[&str]>,
+        ) -> Result<Vec<RecordBatch>, InfinoError> {
+            self.inner
+                .vector_search(column, query, k, opts, filter, projection)
+        }
+    }
+
+    /// Hybrid (BM25 + vector) search. As with [`Self::vector_search`],
+    /// vector probe width and rerank budget are engine-decided.
     pub fn hybrid_search(
         &self,
         text_column: &str,
@@ -290,7 +322,6 @@ impl Supertable {
         mode: BoolMode,
         vector_column: &str,
         vector_query: &[f32],
-        opts: VectorSearchOptions,
         k: usize,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
@@ -300,10 +331,39 @@ impl Supertable {
             mode,
             vector_column,
             vector_query,
-            opts,
+            VectorSearchOptions::default(),
             k,
             projection,
         )
+    }
+
+    test_visible! {
+        /// Test-and-bench-only [`Self::hybrid_search`] with explicit
+        /// vector probe-width / rerank overrides. Off the public
+        /// surface, exactly as [`Self::vector_search_with_options`].
+        #[allow(clippy::too_many_arguments)]
+        fn hybrid_search_with_options(
+            &self,
+            text_column: &str,
+            text_query: &str,
+            mode: BoolMode,
+            vector_column: &str,
+            vector_query: &[f32],
+            opts: VectorSearchOptions,
+            k: usize,
+            projection: Option<&[&str]>,
+        ) -> Result<Vec<RecordBatch>, InfinoError> {
+            self.inner.hybrid_search(
+                text_column,
+                text_query,
+                mode,
+                vector_column,
+                vector_query,
+                opts,
+                k,
+                projection,
+            )
+        }
     }
 
     /// Optimize (compact) the table.

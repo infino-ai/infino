@@ -125,7 +125,7 @@ test("hybridSearch", { skip }, () => {
     assert.ok(hits.length >= 1);
     assert.equal(typeof hits[0]._id, "bigint");
 
-    // The SQL TVF fixes mode="or" and default nprobe, so the direct call matches.
+    // The SQL TVF fixes mode="or"; vector serving is engine-decided, so the direct call matches.
     const qvec = onehot(0).join(",");
     const tvf = db.querySql(`SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '${qvec}', 10)`);
     assert.ok(tvf.length >= 1);

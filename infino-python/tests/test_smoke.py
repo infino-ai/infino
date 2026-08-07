@@ -453,9 +453,9 @@ def test_vector_search_end_to_end():
     assert hits.num_rows >= 1
     assert "_id" in hits.column_names and "score" in hits.column_names
 
-    # rerank_mult tunes recall/latency without breaking the search.
-    tuned = t.vector_search("emb", onehot(0), 10, nprobe=8, rerank_mult=32)
-    assert tuned.num_rows >= 1
+    # Serving is engine-decided; the call carries no tuning kwargs.
+    projected = t.vector_search("emb", onehot(0), 10, projection=["_id", "score"])
+    assert projected.num_rows >= 1
 
 
 def test_filtered_vector_search():
@@ -551,10 +551,6 @@ def test_hybrid_search_fuses_text_and_vector():
     assert hits.num_rows >= 1
     assert "_id" in hits.column_names and "score" in hits.column_names
 
-    # nprobe/rerank_mult tune the vector leg without breaking the search.
-    assert t.hybrid_search(
-        "title", "rust", "emb", onehot(0), 10, nprobe=8, rerank_mult=32
-    ).num_rows >= 1
     # RRF score is higher-is-better, so rows come back descending.
     scores = hits["score"].to_pylist()
     assert scores == sorted(scores, reverse=True)
@@ -566,7 +562,7 @@ def test_hybrid_search_fuses_text_and_vector():
     assert projected.column_names == ["_id", "title", "score"]
 
     # Direct call and the SQL table function agree on the `_id` set
-    # (the TVF fixes mode="or" and default nprobe, so match it).
+    # (the TVF fixes mode="or"; vector serving is engine-decided, so match it).
     csv = ",".join("1" if d == 0 else "0" for d in range(dim))
     via_sql = db.query_sql(
         f"SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '{csv}', 10)"

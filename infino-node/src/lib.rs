@@ -49,7 +49,6 @@ use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
     InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    VectorSearchOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -742,18 +741,11 @@ impl Table {
         column: String,
         query: Float32Array,
         k: u32,
-        nprobe: Option<u32>,
-        rerank_mult: Option<u32>,
         projection: Option<Vec<String>>,
         filter: Option<VectorFilter>,
     ) -> Result<Buffer> {
-        let mut opts = VectorSearchOptions::new();
-        if let Some(n) = nprobe {
-            opts = opts.with_nprobe(n as usize);
-        }
-        if let Some(m) = rerank_mult {
-            opts = opts.with_rerank_mult(m as usize);
-        }
+        // Probe width and rerank budget are engine-decided (drain-time
+        // calibration); there is no caller tuning surface.
         // Optional text-predicate filter (pushdown), borrowing the JS object.
         let vfilter = match &filter {
             Some(f) => Some(infino::VectorFilter {
@@ -772,7 +764,6 @@ impl Table {
                 &column,
                 query.as_ref(),
                 k as usize,
-                opts,
                 vfilter,
                 proj.as_deref(),
             )
@@ -834,9 +825,10 @@ impl Table {
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column`/`text_query` (under `mode`) drive BM25; `vector_column`/
-    /// `vector_query` (a `Float32Array`, with optional `nprobe`) drive vector
-    /// kNN. Returns Arrow rows like [`Table::bm25_search`], with `score` the
-    /// fused RRF score (higher is better); `projection` selects columns.
+    /// `vector_query` (a `Float32Array`) drive vector kNN — probe width and
+    /// rerank budget are engine-decided. Returns Arrow rows like
+    /// [`Table::bm25_search`], with `score` the fused RRF score (higher is
+    /// better); `projection` selects columns.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn hybrid_search(
@@ -847,14 +839,9 @@ impl Table {
         vector_query: Float32Array,
         k: u32,
         mode: Option<String>,
-        nprobe: Option<u32>,
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mode = parse_mode(mode.as_deref())?;
-        let mut opts = VectorSearchOptions::new();
-        if let Some(n) = nprobe {
-            opts = opts.with_nprobe(n as usize);
-        }
         let proj: Option<Vec<&str>> = projection
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
@@ -866,7 +853,6 @@ impl Table {
                 mode,
                 &vector_column,
                 vector_query.as_ref(),
-                opts,
                 k as usize,
                 proj.as_deref(),
             )

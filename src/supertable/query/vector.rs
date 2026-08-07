@@ -3923,7 +3923,7 @@ impl Supertable {
     /// # use infino::arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
     /// # use infino::arrow_array::types::Float32Type;
     /// # use infino::arrow_schema::{DataType, Field, Schema};
-    /// # use infino::{connect, IndexSpec, Metric, VectorSearchOptions};
+    /// # use infino::{connect, IndexSpec, Metric};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new(
     /// #     "emb",
@@ -3936,7 +3936,7 @@ impl Supertable {
     /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
     /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
     /// // Bare call → `_id` + `score`, no scalar decode:
-    /// let hits = vecs.vector_search("emb", &query, 10, VectorSearchOptions::new(), None, None)?;
+    /// let hits = vecs.vector_search("emb", &query, 10, None, None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
     /// // Explicit projection names the same columns (scalar columns,
     /// // when present, materialize row data):
@@ -3944,7 +3944,6 @@ impl Supertable {
     ///     "emb",
     ///     &query,
     ///     10,
-    ///     VectorSearchOptions::new(),
     ///     None,
     ///     Some(&["_id", "score"]),
     /// )?;

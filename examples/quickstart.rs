@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
 use infino::{
-    Bm25SearchOptions, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, BoolMode, IndexSpec, Metric, VectorFilter,
     arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch},
     arrow_schema::{DataType, Field, Schema},
     connect,
@@ -73,7 +73,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "emb",
         &query,
         SEARCH_TOP_K,
-        VectorSearchOptions::new(),
         None,
         Some(&["_id", "title", "score"]),
     )?;
@@ -89,7 +88,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "emb",
         &query,
         SEARCH_TOP_K,
-        VectorSearchOptions::new(),
         Some(VectorFilter {
             column: "title",
             query: "dog",

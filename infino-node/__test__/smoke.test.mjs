@@ -135,7 +135,7 @@ test("hybridSearch fuses BM25 and vector retrieval", () => {
   const scores = hits.map((r) => r.score);
   assert.deepEqual(scores, [...scores].sort((a, b) => b - a));
 
-  // The SQL TVF fixes mode="or" and default nprobe, so the direct call matches.
+  // The SQL TVF fixes mode="or"; vector serving is engine-decided, so the direct call matches.
   const qvec = onehot(0, dim).join(",");
   const viaSql = db.querySql(`SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '${qvec}', 10)`);
   assert.equal(viaSql.length, hits.length);
@@ -215,9 +215,10 @@ test("vector search end-to-end", () => {
   const rows = docs.vectorSearch("emb", onehot(0, dim), 10);
   assert.ok(rows.length >= 1);
 
-  // nprobe + rerankMult tuning knobs are accepted.
-  const tuned = docs.vectorSearch("emb", onehot(0, dim), 5, { nprobe: 1, rerankMult: 4 });
-  assert.ok(tuned.length >= 1);
+  // Probe width and rerank budget are engine-decided; the options object
+  // carries no tuning knobs, only projection / filter / arrow.
+  const projected = docs.vectorSearch("emb", onehot(0, dim), 5, { projection: ["_id", "score"] });
+  assert.ok(projected.length >= 1);
 });
 
 test("filtered vector search (pushdown text predicate)", () => {

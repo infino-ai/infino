@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use infino::arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use infino::arrow_schema::{DataType, Field, Schema};
-use infino::{connect, Bm25SearchOptions, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions};
+use infino::{connect, Bm25SearchOptions, BoolMode, IndexSpec, Metric, VectorFilter};
 
 // Tiny stand-in for your embedding model so this runs as-is — a 16-dim
 // one-hot by topic. Real embeddings are dense and higher-dimensional.
@@ -80,15 +80,15 @@ docs.append(&RecordBatch::try_new(
 // Retrieve context to ground the agent's next answer:
 let keyword =
     docs.bm25_search("body", "cancel subscription", 5, Bm25SearchOptions::new(), None)?;
-let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None, None)?;
+let semantic = docs.vector_search("embedding", &embed(0), 5, None, None)?;
 // hybrid: BM25 + vector, fused with reciprocal-rank fusion:
 let hybrid = docs.hybrid_search(
     "body", "cancel subscription", BoolMode::Or,
-    "embedding", &embed(0), VectorSearchOptions::new(), 5, None,
+    "embedding", &embed(0), 5, None,
 )?;
 // vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
 let filtered = docs.vector_search(
-    "embedding", &embed(0), 5, VectorSearchOptions::new(),
+    "embedding", &embed(0), 5,
     Some(VectorFilter { column: "body", query: "billing", mode: BoolMode::Or }), None,
 )?;
 let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
@@ -130,7 +130,7 @@ live on the [`Connection`] and [`Supertable`] pages:
     [`gc`](Supertable::gc), and [`schema`](Supertable::schema).
 
 Supporting types: [`IndexSpec`], [`Metric`], [`BoolMode`],
-[`VectorSearchOptions`], [`VectorFilter`], [`ConnectOptions`], [`MutationStats`],
+[`VectorFilter`], [`ConnectOptions`], [`MutationStats`],
 [`GcReport`], and the [`InfinoError`], [`OptimizeError`], and [`GcError`] error
 enums.
 

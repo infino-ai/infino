@@ -33,8 +33,11 @@ use pyo3::types::{PyDict, PyList};
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
     GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
-    VectorSearchOptions,
 };
+// Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
+// the engine's public API and reachable only under `infino/test-helpers`.
+#[cfg(feature = "diagnostics")]
+use infino::VectorSearchOptions;
 
 // Typed exception surface for the bindings. `InfinoError` is the base for every
 // infino error, so a caller can catch the whole family with one `except` or
@@ -515,9 +518,37 @@ impl Table {
     /// matching rows rather than post-filtering the global top-`k`.
     /// `filter_mode` is `"or"` (default) or `"and"`.
     ///
-    /// `rerank_mult` sets how many coarse candidates are re-scored
-    /// exactly (`k * rerank_mult`) — the primary recall/latency lever.
-    /// Omitting it keeps the engine default.
+    /// Probe width and rerank budget are engine-decided (drain-time
+    /// calibration, per table and per `k`); there are no tuning kwargs.
+    #[cfg(not(feature = "diagnostics"))]
+    #[pyo3(signature = (column, query, k, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn vector_search<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        query: Vec<f32>,
+        k: usize,
+        filter_column: Option<String>,
+        filter_query: Option<String>,
+        filter_mode: Option<&str>,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let filter = parse_filter(filter_column.as_deref(), filter_query.as_deref(), filter_mode)?;
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner
+                    .vector_search(column, &query, k, filter, names.as_deref())
+            })
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
+    /// Diagnostic build only: `nprobe` / `rerank_mult` overrides for
+    /// recall sweeps and the exact-scan oracle. Published wheels do not
+    /// carry these kwargs.
+    #[cfg(feature = "diagnostics")]
     #[pyo3(signature = (column, query, k, nprobe=None, rerank_mult=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn vector_search<'py>(
@@ -540,37 +571,12 @@ impl Table {
         if let Some(n) = rerank_mult {
             opts = opts.with_rerank_mult(n);
         }
-        // Optional text-predicate filter (pushdown). `filter_column` and
-        // `filter_query` must be supplied together; `filter_mode` is only
-        // meaningful alongside them (a lone `filter_mode` is rejected rather
-        // than silently ignored, so an invalid value never passes unnoticed).
-        let filter = match (
-            filter_column.as_deref(),
-            filter_query.as_deref(),
-            filter_mode,
-        ) {
-            (Some(col), Some(q), mode) => Some(VectorFilter {
-                column: col,
-                query: q,
-                mode: parse_mode(mode)?,
-            }),
-            (None, None, None) => None,
-            (None, None, Some(_)) => {
-                return Err(PyValueError::new_err(
-                    "filter_mode requires filter_column and filter_query",
-                ));
-            }
-            _ => {
-                return Err(PyValueError::new_err(
-                    "filter_column and filter_query must be provided together",
-                ));
-            }
-        };
+        let filter = parse_filter(filter_column.as_deref(), filter_query.as_deref(), filter_mode)?;
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
                 self.inner
-                    .vector_search(column, &query, k, opts, filter, names.as_deref())
+                    .vector_search_with_options(column, &query, k, opts, filter, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -638,11 +644,46 @@ impl Table {
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
-    /// `vector_column` / `vector_query` (with optional `nprobe` and
-    /// `rerank_mult`) drive vector kNN. `k` bounds each retriever and the
-    /// fused result. Returns a pyarrow `Table` like `bm25_search`, with
-    /// `score` the fused RRF score (higher is better); `projection`
-    /// follows the same rules.
+    /// `vector_column` / `vector_query` drive vector kNN — probe width
+    /// and rerank budget are engine-decided. `k` bounds each retriever
+    /// and the fused result. Returns a pyarrow `Table` like
+    /// `bm25_search`, with `score` the fused RRF score (higher is
+    /// better); `projection` follows the same rules.
+    #[cfg(not(feature = "diagnostics"))]
+    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, projection=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn hybrid_search<'py>(
+        &self,
+        py: Python<'py>,
+        text_column: &str,
+        text_query: &str,
+        vector_column: &str,
+        vector_query: Vec<f32>,
+        k: usize,
+        mode: Option<&str>,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mode = parse_mode(mode)?;
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.hybrid_search(
+                    text_column,
+                    text_query,
+                    mode,
+                    vector_column,
+                    &vector_query,
+                    k,
+                    names.as_deref(),
+                )
+            })
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
+    /// Diagnostic build only: `nprobe` / `rerank_mult` overrides — see
+    /// `vector_search`. Published wheels do not carry these kwargs.
+    #[cfg(feature = "diagnostics")]
     #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, rerank_mult=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn hybrid_search<'py>(
@@ -669,7 +710,7 @@ impl Table {
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.hybrid_search(
+                self.inner.hybrid_search_with_options(
                     text_column,
                     text_query,
                     mode,
@@ -806,6 +847,31 @@ fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
         other => Err(PyValueError::new_err(format!(
             "mode must be 'or' or 'and', got {other:?}"
         ))),
+    }
+}
+
+/// Optional text-predicate filter (pushdown). `filter_column` and
+/// `filter_query` must be supplied together; `filter_mode` is only
+/// meaningful alongside them (a lone `filter_mode` is rejected rather
+/// than silently ignored, so an invalid value never passes unnoticed).
+fn parse_filter<'a>(
+    column: Option<&'a str>,
+    query: Option<&'a str>,
+    mode: Option<&str>,
+) -> PyResult<Option<VectorFilter<'a>>> {
+    match (column, query, mode) {
+        (Some(col), Some(q), mode) => Ok(Some(VectorFilter {
+            column: col,
+            query: q,
+            mode: parse_mode(mode)?,
+        })),
+        (None, None, None) => Ok(None),
+        (None, None, Some(_)) => Err(PyValueError::new_err(
+            "filter_mode requires filter_column and filter_query",
+        )),
+        _ => Err(PyValueError::new_err(
+            "filter_column and filter_query must be provided together",
+        )),
     }
 }
 

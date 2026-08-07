@@ -132,22 +132,16 @@ export interface VectorFilter {
   mode?: BoolMode;
 }
 export interface VectorSearchOptions {
-  /** IVF partitions to probe (higher = better recall, more work). */
-  nprobe?: number;
-  /** Over-fetch multiplier for the exact-rerank stage (higher = better recall). */
-  rerankMult?: number;
   projection?: string[];
   arrow?: boolean;
   /** Restrict the kNN to rows matching a text predicate (pushdown pre-filter). */
   filter?: VectorFilter;
 }
-/** Options for `hybridSearch`. `mode` applies to the BM25 side; `nprobe` to
- * the vector side. */
+/** Options for `hybridSearch`. `mode` applies to the BM25 side; vector
+ * probe width and rerank budget are engine-decided. */
 export interface HybridSearchOptions {
   /** BM25 boolean mode: `"or"` (default) or `"and"`. */
   mode?: BoolMode;
-  /** IVF partitions to probe on the vector side (higher = better recall). */
-  nprobe?: number;
   projection?: string[];
   arrow?: boolean;
 }
@@ -395,7 +389,7 @@ export class Table {
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts?: VectorSearchOptions): RowRecord[];
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = query instanceof Float32Array ? query : Float32Array.from(query);
-    const buf = guard(this.remote, () => this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection, opts.filter));
+    const buf = guard(this.remote, () => this.inner.vectorSearch(column, q, k, opts.projection, opts.filter));
     return decode(buf, opts.arrow);
   }
 
@@ -406,7 +400,7 @@ export class Table {
   hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts?: HybridSearchOptions): RowRecord[];
   hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts: HybridSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = vectorQuery instanceof Float32Array ? vectorQuery : Float32Array.from(vectorQuery);
-    const buf = guard(this.remote, () => this.inner.hybridSearch(textColumn, textQuery, vectorColumn, q, k, opts.mode, opts.nprobe, opts.projection));
+    const buf = guard(this.remote, () => this.inner.hybridSearch(textColumn, textQuery, vectorColumn, q, k, opts.mode, opts.projection));
     return decode(buf, opts.arrow);
   }
 

@@ -155,7 +155,7 @@ def test_hybrid_search(db: infino.Connection) -> None:
     assert hits.num_rows >= 1
     assert "_id" in hits.column_names and "score" in hits.column_names
 
-    # The SQL TVF fixes mode="or" and default nprobe, so the direct call matches.
+    # The SQL TVF fixes mode="or"; vector serving is engine-decided, so the direct call matches.
     csv = ",".join("1" if d == 0 else "0" for d in range(DIM))
     tvf = db.query_sql(f"SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '{csv}', 10)")
     assert tvf.num_rows >= 1

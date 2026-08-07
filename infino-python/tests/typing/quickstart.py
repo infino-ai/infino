@@ -34,7 +34,7 @@ def vectors() -> None:
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 16), nullable=False)])
     spec = infino.IndexSpec().vector("emb", 16, "cosine")
     vecs: infino.Table = db.create_table("vecs", schema, spec)
-    vecs.vector_search("emb", [0.0] * 16, k=5, nprobe=8)
+    vecs.vector_search("emb", [0.0] * 16, k=5)
     vecs.vector_search(
         "emb",
         [0.0] * 16,

@@ -43,7 +43,7 @@ use std::{
 };
 
 use infino::{
-    Bm25SearchOptions, IndexSpec, Metric, VectorSearchOptions,
+    Bm25SearchOptions, IndexSpec, Metric,
     arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch},
     arrow_schema::{DataType, Field, Schema},
     connect,
@@ -272,7 +272,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             "vector",
             &case.query_vector,
             k,
-            VectorSearchOptions::new(),
             None,
             Some(&["id", "score"]),
         )?)?;

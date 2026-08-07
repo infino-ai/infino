@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats,
-    OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions, catalog::table::Table,
+    OptimizeError, OptimizeOptions, VectorFilter, catalog::table::Table,
+    superfile::VectorSearchOptions,
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
@@ -70,6 +71,20 @@ fn predicate_to_sql(predicate: &Expr) -> Result<String, InfinoError> {
                 "cannot express this predicate over the remote transport: {e}"
             ))
         })
+}
+
+/// Refuse test-only vector tuning overrides on the remote transport. The
+/// public search methods always pass the default options, so this can only
+/// fire in a `test-helpers` build using the `_with_options` variants.
+fn reject_remote_overrides(opts: &VectorSearchOptions) -> Result<(), InfinoError> {
+    if opts.nprobe.is_some() || opts.rerank_mult().is_some() {
+        return Err(InfinoError::Query(
+            "vector tuning overrides are not supported over the remote transport; \
+             hosted tables serve engine-decided settings"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Parse an update/delete response (`{matched, n_tombstoned, n_not_found}`)
@@ -207,9 +222,13 @@ impl Table for RemoteTable {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        // The hosted endpoint applies its own nprobe/rerank defaults;
-        // VectorSearchOptions is not carried on the wire yet (tracked follow-up).
-        let _ = opts;
+        // Options never cross the wire: the public path always passes the
+        // default (serving is engine-decided), and the hosted API carries
+        // no tuning fields. A diagnostics-build caller reaching for the
+        // test-only overrides against a hosted table hears "no" loudly —
+        // silently serving defaults would corrupt whatever sweep or oracle
+        // measurement asked for the override.
+        reject_remote_overrides(&opts)?;
         let mut body = json!({
             "table_name": self.table_name,
             "field_name": column,
@@ -240,8 +259,8 @@ impl Table for RemoteTable {
         k: usize,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        // See `vector_search`: VectorSearchOptions is not on the wire yet.
-        let _ = opts;
+        // See `vector_search`: overrides never cross the wire; loud, not silent.
+        reject_remote_overrides(&opts)?;
         let body = json!({
             "table_name": self.table_name,
             "text_field": text_column,

@@ -327,18 +327,37 @@ async fn vector_search_sends_query_filter_and_decodes_arrow() {
             mode: BoolMode::Or,
         };
         table
-            .vector_search(
-                "emb",
-                &[1.0, 0.0],
-                5,
-                VectorSearchOptions::new(),
-                Some(filter),
-                None,
-            )
+            .vector_search("emb", &[1.0, 0.0], 5, Some(filter), None)
             .expect("vector_search")
     })
     .await;
     assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn vector_tuning_overrides_are_rejected_on_the_remote_transport() {
+    // Options never cross the wire; the test-only `_with_options` variants
+    // must fail loudly against a hosted table rather than silently serve
+    // engine defaults (a sweep or oracle run would record wrong numbers).
+    // No search endpoint is mounted: the rejection must precede any wire I/O.
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+
+    let err = with_connection(server.uri(), |db| {
+        let table = db.open_table("posts").expect("open");
+        table
+            .vector_search_with_options(
+                "emb",
+                &[1.0, 0.0],
+                5,
+                VectorSearchOptions::new().with_nprobe(2),
+                None,
+                None,
+            )
+            .expect_err("override must be refused")
+    })
+    .await;
+    assert!(err.to_string().contains("remote transport"), "got: {err}");
 }
 
 #[tokio::test]
@@ -366,16 +385,7 @@ async fn hybrid_search_sends_text_and_vector_fields() {
     let rows = with_connection(server.uri(), |db| {
         db.open_table("posts")
             .expect("open")
-            .hybrid_search(
-                "id",
-                "hi",
-                BoolMode::Or,
-                "emb",
-                &[1.0, 0.0],
-                VectorSearchOptions::new(),
-                5,
-                None,
-            )
+            .hybrid_search("id", "hi", BoolMode::Or, "emb", &[1.0, 0.0], 5, None)
             .expect("hybrid_search")
     })
     .await;
@@ -567,24 +577,8 @@ async fn remote_client_matches_the_published_api_spec() {
             let _ = table.token_match("id", "x", BoolMode::Or, Some(&["_id"]));
             let _ = table.exact_match("id", "x", Some(&["_id"]));
             let _ = table.count("id", "x", BoolMode::Or);
-            let _ = table.vector_search(
-                "id",
-                &[1.0],
-                1,
-                VectorSearchOptions::new(),
-                None,
-                Some(&["_id"]),
-            );
-            let _ = table.hybrid_search(
-                "id",
-                "x",
-                BoolMode::Or,
-                "id",
-                &[1.0],
-                VectorSearchOptions::new(),
-                1,
-                Some(&["_id"]),
-            );
+            let _ = table.vector_search("id", &[1.0], 1, None, Some(&["_id"]));
+            let _ = table.hybrid_search("id", "x", BoolMode::Or, "id", &[1.0], 1, Some(&["_id"]));
             let _ = table.optimize(&OptimizeOptions::default());
             let _ = table.gc(Duration::from_secs(0));
         }
