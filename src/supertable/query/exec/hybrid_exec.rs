@@ -66,6 +66,7 @@ use tracing::debug;
 
 use crate::{
     InfinoError,
+    runtime_metrics::op_stats,
     superfile::{
         fts::reader::{Bm25Stats, BoolMode},
         reader::VectorSearchOptions,
@@ -150,7 +151,12 @@ impl SupertableReader {
             self.vector_search_user_table_async(vec_col, &q_vec, k, options),
         )
         .await;
-        Ok(rrf_fuse(&bm25_res?, &vector_res?, k))
+        let (bm25_hits, vector_hits) = (bm25_res?, vector_res?);
+        // The fusion math is a real (small) kernel section; bracket it so
+        // hybrid's kernel CPU covers all three of its compute legs.
+        Ok(op_stats::timed_kernel(&self.op_stats, || {
+            rrf_fuse(&bm25_hits, &vector_hits, k)
+        }))
     }
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion

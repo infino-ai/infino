@@ -716,6 +716,7 @@ impl SupertableReader {
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
                         stats.add_planned_read_ranges(work.planned_ranges);
+                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                     }
                     Ok::<Vec<u64>, QueryError>(dfs)
                 }
@@ -810,11 +811,13 @@ impl SupertableReader {
 
         // Shared fan-out — see `bm25_search` for the rationale; the
         // kernel differs only in calling the prefix search variants.
+        let op_stats = self.op_stats.clone();
         let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
             let column_arc = Arc::clone(&column_arc);
             let prefix_arc = Arc::clone(&prefix_arc);
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
+            let op_stats = op_stats.clone();
             async move {
                 match range {
                     Some((start, end)) => {
@@ -825,40 +828,69 @@ impl SupertableReader {
                         };
                         let set = cell
                             .get_or_try_init(|| async {
-                                r.bm25_prefix_cursor_set(&column_arc, &prefix_arc)
+                                let set = r
+                                    .bm25_prefix_cursor_set(&column_arc, &prefix_arc)
                                     .await
-                                    .map(Arc::new)
-                                    .map_err(fts_read_error)
+                                    .map_err(fts_read_error)?;
+                                // Flushed inside the OnceCell init so slices
+                                // sharing this superfile's expansion count
+                                // its posting work exactly once — the same
+                                // contract as the exact-term ranged path.
+                                if let Some(stats) = &op_stats {
+                                    stats.add_fts_postings_bytes(set.postings_bytes());
+                                    stats.add_planned_read_ranges(set.planned_ranges());
+                                }
+                                Ok(Arc::new(set))
                             })
                             .await?;
                         if set.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
+                            let kernel_stats = op_stats.clone();
                             run_on_pool(
                                 Some(&reader_pool),
                                 "ranged prefix kernel: reader pool dropped result",
                                 move || {
-                                    kernel_reader.bm25_search_or_range_prebuilt(
-                                        &kernel_set,
-                                        k,
-                                        start,
-                                        end,
-                                        f32::NEG_INFINITY,
-                                    )
+                                    op_stats::timed_kernel(&kernel_stats, || {
+                                        kernel_reader.bm25_search_or_range_prebuilt(
+                                            &kernel_set,
+                                            k,
+                                            start,
+                                            end,
+                                            f32::NEG_INFINITY,
+                                        )
+                                    })
                                 },
                             )
                             .await
                             .map_err(|e| QueryError::Execute(e.to_string()))?
                             .map_err(fts_read_error)
                         } else {
-                            r.bm25_search_or_range_prebuilt(set, k, start, end, f32::NEG_INFINITY)
-                                .map_err(fts_read_error)
+                            op_stats::timed_kernel(&op_stats, || {
+                                r.bm25_search_or_range_prebuilt(
+                                    set,
+                                    k,
+                                    start,
+                                    end,
+                                    f32::NEG_INFINITY,
+                                )
+                            })
+                            .map_err(fts_read_error)
                         }
                     }
-                    None => r
-                        .bm25_search_prefix(&column_arc, &prefix_arc, k)
-                        .await
-                        .map_err(fts_read_error),
+                    None => {
+                        let (hits, work, kernel_ns) = r
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                            .await
+                            .map_err(fts_read_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(work.postings_bytes);
+                            stats.add_planned_read_ranges(work.planned_ranges);
+                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                            stats.add_kernel_cpu_ns(kernel_ns);
+                        }
+                        Ok(hits)
+                    }
                 }
             }
         };
@@ -1055,6 +1087,7 @@ impl SupertableReader {
                 if let Some(stats) = &op_stats {
                     stats.add_fts_postings_bytes(work.postings_bytes);
                     stats.add_planned_read_ranges(work.planned_ranges);
+                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
@@ -1181,6 +1214,7 @@ impl SupertableReader {
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(work.postings_bytes);
                             stats.add_planned_read_ranges(work.planned_ranges);
+                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                         }
                         let n = docs
                             .iter()
@@ -1211,6 +1245,7 @@ impl SupertableReader {
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
                         stats.add_planned_read_ranges(work.planned_ranges);
+                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                     }
                     Ok(n)
                 }
@@ -1277,11 +1312,13 @@ impl SupertableReader {
                         .token_match(&column_arc, &refs, BoolMode::And)
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                    // The prune pass's posting walk; the verify pass's row
-                    // decode is CPU-side (its take path reports no ranges).
+                    // The prune pass's posting walk. The verify pass's
+                    // row reads count through the take path's own
+                    // collector accounting below.
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
                         stats.add_planned_read_ranges(work.planned_ranges);
+                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                     }
                     docs
                 };
@@ -1292,7 +1329,7 @@ impl SupertableReader {
                     r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
                         .map_err(|e| QueryError::Parquet(e.to_string()))?
                 } else {
-                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
+                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()], op_stats.clone())
                         .await
                         .map_err(|e| QueryError::Execute(e.to_string()))?
                 };
@@ -2621,7 +2658,9 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
+        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5))
+            .expect("oracle")
+            .0;
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
 
         let st_reader = st.reader().expect("reader");

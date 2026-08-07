@@ -18,6 +18,21 @@
 //! [`metering_active`] (one relaxed atomic load); counters accumulate
 //! locally in kernels and flush per superfile / work unit, never inside
 //! scoring loops.
+//!
+//! ## Deliberate exclusions
+//!
+//! Reads whose cost amortizes across queries or would break the
+//! warm/cold invariance are NOT counted, by design: superfile open I/O
+//! (footers, subsection headers) and the reader-cached Parquet
+//! metadata / page-index parse (paid once per reader lifetime, not per
+//! query); tombstone sidecar prefetches and manifest freshness probes
+//! (table-state / consistency-policy reads, not plan work); the hidden
+//! index's per-generation fast state; and phase C's bookkeeping
+//! refetches (cluster index + Sq8 meta re-reads on the warm-only rerank
+//! wave — cold runs have no phase C, so pricing them would make the one
+//! priced counter temperature-dependent). Their expected cost is
+//! recovered through a consumer's calibrated rates, never surcharged on
+//! the query that happened to pay them.
 
 use std::cell::RefCell;
 use std::sync::{
@@ -64,18 +79,32 @@ pub struct OpStats {
     pub vector_rows_reranked: u64,
     /// Byte-source ranges the plan requested, before coalescing and before
     /// the cache decides whether a request becomes a local read or a GET —
-    /// the warm-equivalent request-work measure. FTS: one per term posting
-    /// range, two per phrase member. Vector: per scanned cell, its cluster
-    /// index plus one prefix/block range per chosen cluster; plus the
-    /// plan's rerank budget — `min(k × rerank_mult, candidates)` on the
-    /// deferred path, the immediate probes' shortlist rows elsewhere —
-    /// one range per budgeted row, identical warm or cold on both arms.
-    /// SQL: one per Parquet range the scan requests.
+    /// the warm-equivalent request-work measure. FTS: one per PFOR term
+    /// posting range (two when a hint-less slot forces a header probe),
+    /// one per phrase-member posting and position-run range, one per
+    /// dictionary fetch a build performs, and one per df-header probe.
+    /// Vector: per scanned cell, its cluster index plus one prefix/block
+    /// range per chosen cluster (plus the lazy Sq8 meta table when the
+    /// column stores one); plus the plan's rerank budget —
+    /// `min(k × rerank_mult, candidates)` on the deferred path, the
+    /// immediate probes' shortlist rows elsewhere — one range per
+    /// budgeted row, identical warm or cold on both arms; plus one per
+    /// stable-id region / `_id` remap read. SQL: one per Parquet range
+    /// the scan requests. Materialization: one per data range a
+    /// projection take requests.
     pub planned_read_ranges: u64,
-    /// Parquet bytes SQL scans requested through the DataFusion store
-    /// (footer, page index, and data pages), independent of whether they
-    /// were served from resident bytes or fetched.
+    /// Parquet **data-page** bytes SQL scans requested through the
+    /// DataFusion store, independent of whether they were served from
+    /// resident bytes or fetched. Footer and page-index reads never
+    /// transit the store — they are open-time amortized state (see the
+    /// module's exclusions) — so they are deliberately not in here.
     pub sql_page_bytes: u64,
+    /// Rows decoded from stored columns to build results — the scalar
+    /// projection decode (`resolve_columns`), including the `_id` stamping
+    /// fallback it serves. The id-score arithmetic fast path decodes
+    /// nothing and counts nothing; remap/tombstone-internal id reads count
+    /// planned ranges only, never rows.
+    pub rows_materialized: u64,
     /// On-CPU nanoseconds of the query's bracketed synchronous kernel
     /// sections (thread-CPU clock, ns resolution). A refinement of — not a
     /// replacement for — a consumer's own process-level CPU accounting:
@@ -93,6 +122,7 @@ pub struct OpStatsCollector {
     vector_rows_reranked: AtomicU64,
     planned_read_ranges: AtomicU64,
     sql_page_bytes: AtomicU64,
+    rows_materialized: AtomicU64,
     kernel_cpu_ns: AtomicU64,
 }
 
@@ -126,6 +156,11 @@ impl OpStatsCollector {
         self.sql_page_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Flush one resolve wave's decoded row count.
+    pub(crate) fn add_rows_materialized(&self, rows: u64) {
+        self.rows_materialized.fetch_add(rows, Ordering::Relaxed);
+    }
+
     /// Flush one bracketed kernel section's on-CPU nanoseconds.
     pub(crate) fn add_kernel_cpu_ns(&self, ns: u64) {
         self.kernel_cpu_ns.fetch_add(ns, Ordering::Relaxed);
@@ -140,6 +175,7 @@ impl OpStatsCollector {
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
             planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
+            rows_materialized: self.rows_materialized.load(Ordering::Relaxed),
             kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),
         }
     }
@@ -233,6 +269,16 @@ pub(crate) fn timed_kernel<T>(
     let value = f();
     stats.add_kernel_cpu_ns(cpu::thread_cpu_delta_ns(start));
     value
+}
+
+/// Bracket one synchronous section with the thread-CPU clock, gated on
+/// [`metering_active`] so an unmetered process pays one relaxed load and
+/// no procfs reads. For the superfile layers, which have no collector —
+/// the ns travel back to the supertable as data.
+pub(crate) fn timed_section<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    let start = metering_active().then(cpu::thread_cpu_ns).flatten();
+    let out = f();
+    (out, cpu::thread_cpu_delta_ns(start))
 }
 
 /// Run `f` with NO collector installed, restoring the active scope after.

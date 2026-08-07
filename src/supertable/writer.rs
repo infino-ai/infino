@@ -3541,9 +3541,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             )
                         }
                     };
-                    let stable_ids = stable_ids_by_local_for_routing(&manifest, &entry, &reader)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    // Write-path materialization: no per-query collector.
+                    let stable_ids =
+                        stable_ids_by_local_for_routing(&manifest, &entry, &reader, &None)
+                            .await
+                            .map_err(|e| BuildError::Store(e.to_string()))?;
                     Ok::<_, BuildError>((reader, stable_ids))
                 }
             }))
@@ -4300,7 +4302,8 @@ async fn load_materialized_rows_from_ivf_superfile(
     }
 
     let manifest = inner.manifest.load_full();
-    let stable_ids = stable_ids_by_local_for_routing(&manifest, entry, &reader)
+    // Write-path materialization: no per-query collector.
+    let stable_ids = stable_ids_by_local_for_routing(&manifest, entry, &reader, &None)
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
     materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, bitmap.as_deref()).await

@@ -49,6 +49,7 @@ use uuid::Uuid;
 
 use super::SuperfileHit;
 use crate::{
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::StorageProvider,
     superfile::{
         SuperfileReader,
@@ -259,6 +260,7 @@ pub(crate) async fn attach_stable_ids(
     entry: &SuperfileEntry,
     hits: &mut [SuperfileHit],
     fetch_lazy_id_page: bool,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<(), QueryError> {
     if hits.is_empty() {
         return Ok(());
@@ -271,6 +273,12 @@ pub(crate) async fn attach_stable_ids(
     }
     let locals: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
     if let Some(ids) = stable_ids_for_tagged_hits(reader, &locals).await? {
+        // The inline stable-id region is one planned range per file —
+        // whether it resolved from residency, the cold ride-along stash,
+        // or a fetch (the plan requests it identically either way).
+        if let Some(stats) = op_stats {
+            stats.add_planned_read_ranges(1);
+        }
         for (hit, id) in hits.iter_mut().zip(ids) {
             hit.stable_id = Some(id);
         }
@@ -284,11 +292,17 @@ pub(crate) async fn attach_stable_ids(
     // promoted hybrid) — the async stream take pays per-call setup that
     // dominates targeted id reads; only genuinely lazy readers await it.
     let batch = if reader.can_take_by_local_doc_ids() {
-        reader
-            .take_by_local_doc_ids(&locals, &[id_column])
-            .map_err(|error| QueryError::Execute(error.to_string()))?
+        let (batch, decode_ns) = op_stats::timed_section(|| {
+            reader
+                .take_by_local_doc_ids(&locals, &[id_column])
+                .map_err(|error| QueryError::Execute(error.to_string()))
+        });
+        if let Some(stats) = op_stats {
+            stats.add_kernel_cpu_ns(decode_ns);
+        }
+        batch?
     } else {
-        take_rows_byte_source(reader, &locals, &[id_column])
+        take_rows_byte_source(reader, &locals, &[id_column], op_stats.clone())
             .await
             .map_err(|error| QueryError::Execute(error.to_string()))?
     };
@@ -344,6 +358,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
     entry: &SuperfileEntry,
     hits: &mut Vec<SuperfileHit>,
     now: Instant,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<(), QueryError> {
     if entry.vector_layout != VectorLayout::MultiCellIvf {
         return apply_tombstone_filter(cache, entry, hits, now);
@@ -360,9 +375,15 @@ pub(crate) async fn apply_resolved_tombstone_filter(
     let locals: Vec<u32> = bitmap.iter().collect();
     let id_column = reader.id_column();
     let batch = if reader.parquet_bytes().is_some() {
-        reader
-            .take_by_local_doc_ids(&locals, &[id_column])
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+        let (batch, decode_ns) = op_stats::timed_section(|| {
+            reader
+                .take_by_local_doc_ids(&locals, &[id_column])
+                .map_err(|e| QueryError::Execute(e.to_string()))
+        });
+        if let Some(stats) = op_stats {
+            stats.add_kernel_cpu_ns(decode_ns);
+        }
+        batch?
     } else {
         let storage = storage.ok_or_else(|| {
             QueryError::Execute(
@@ -384,6 +405,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
             reader.n_docs(),
             &locals,
             &[id_column],
+            op_stats.clone(),
         )
         .await
         .map_err(|e| QueryError::Execute(e.to_string()))?

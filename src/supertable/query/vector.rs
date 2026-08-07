@@ -96,6 +96,7 @@ pub use crate::superfile::reader::VectorSearchOptions;
 use crate::test_helpers::{admit_trace, served_shortlist_probe};
 use crate::{
     config,
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::io_counters,
     superfile::{
         SuperfileReader,
@@ -848,6 +849,7 @@ pub(crate) struct PreparedGlobalAllow {
 async fn lookup_user_placements_by_id(
     manifest: &ManifestSnapshot,
     user_row_ids: &[i128],
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
     if user_row_ids.is_empty() {
         return Ok(Vec::new());
@@ -892,7 +894,7 @@ async fn lookup_user_placements_by_id(
         // Cell-packed user files carry stable ids inline in Parquet row order.
         // Read each compact cell region once instead of decoding the full
         // Parquet `_id` column to place a top-k scalar projection.
-        let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true).await?;
+        let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true, op_stats).await?;
         Ok::<_, QueryError>((entry, ids))
     }))
     .await?;
@@ -968,6 +970,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     reader: &SuperfileReader,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<i128>, QueryError> {
     if row_id_from_manifest_entry(entry, 0).is_some() {
         return Ok((0..entry.n_docs as u32)
@@ -991,7 +994,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
             .map_err(|e| QueryError::Execute(e.to_string()))?;
         return id_values_from_batch(&batch);
     }
-    read_ids_for_locals(manifest, entry, &locals, id_column, true).await
+    read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await
 }
 
 /// Read the `_id` column values at `local_ids` (in caller order) from one
@@ -1009,6 +1012,7 @@ async fn read_ids_for_locals(
     local_ids: &[u32],
     id_column: &str,
     allow_inline_region: bool,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<i128>, QueryError> {
     // Storage is optional: store-only tables (no object-store backend) serve
     // the superfile bytes from the in-memory reader cache. Cell-ordered
@@ -1025,12 +1029,17 @@ async fn read_ids_for_locals(
     // real Parquet rows, so the counts (and orders) match.
     let inline_is_parquet_ordered = reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
     if allow_inline_region && inline_is_parquet_ordered {
+        // The inline-region read is one planned range per file — the plan
+        // requests it identically whether it resolves resident or cold.
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
         // straight from it (resident; no scalar `_id` column read) when available.
         if let Some(ids) = reader
             .vec()
             .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
         {
+            if let Some(stats) = op_stats {
+                stats.add_planned_read_ranges(1);
+            }
             return Ok(ids);
         }
         // Cold path: fetch the inline region async when present but not resident.
@@ -1040,16 +1049,24 @@ async fn read_ids_for_locals(
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?
         {
+            if let Some(stats) = op_stats {
+                stats.add_planned_read_ranges(1);
+            }
             return Ok(ids);
         }
     }
     if reader.parquet_bytes().is_some() {
-        let batch = reader
-            .take_by_local_doc_ids(local_ids, &[id_column])
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
-        return id_values_from_batch(&batch);
+        let (batch, decode_ns) = op_stats::timed_section(|| {
+            reader
+                .take_by_local_doc_ids(local_ids, &[id_column])
+                .map_err(|e| QueryError::Execute(e.to_string()))
+        });
+        if let Some(stats) = op_stats {
+            stats.add_kernel_cpu_ns(decode_ns);
+        }
+        return id_values_from_batch(&batch?);
     }
-    let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
+    let batch = take_rows_byte_source(&reader, local_ids, &[id_column], op_stats.clone())
         .await
         .map_err(|error| QueryError::Execute(error.to_string()))?;
     id_values_from_batch(&batch)
@@ -1069,6 +1086,7 @@ async fn hidden_hits_user_ids(
     hidden_manifest: &ManifestSnapshot,
     hidden_hits: &[SuperfileHit],
     id_column: &str,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<i128>, QueryError> {
     let mut ids = vec![0i128; hidden_hits.len()];
     let mut by_superfile: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
@@ -1101,7 +1119,8 @@ async fn hidden_hits_user_ids(
         }
         // Gapped span → one resident read of just the rows these hits touch.
         let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
-        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true).await?;
+        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true, op_stats)
+            .await?;
         for (j, &i) in idxs.iter().enumerate() {
             ids[i] = vals[j];
         }
@@ -1185,7 +1204,13 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         let user_row_id = if let Some(id) = hit.stable_id {
             id
         } else if let Some(ref hm) = hidden_manifest {
-            hidden_hits_user_ids(hm, std::slice::from_ref(hit), id_column).await?[0]
+            hidden_hits_user_ids(
+                hm,
+                std::slice::from_ref(hit),
+                id_column,
+                &user_reader.op_stats,
+            )
+            .await?[0]
         } else {
             return Err(QueryError::Execute(format!(
                 "hit superfile {:?} missing from manifests",
@@ -1201,7 +1226,8 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         placement_requests.push((i, user_row_id));
     }
     let requested_ids: Vec<i128> = placement_requests.iter().map(|(_, id)| *id).collect();
-    let placements = lookup_user_placements_by_id(user_manifest, &requested_ids).await?;
+    let placements =
+        lookup_user_placements_by_id(user_manifest, &requested_ids, &user_reader.op_stats).await?;
     for ((index, stable_id), (entry, local_doc_id)) in
         placement_requests.into_iter().zip(placements)
     {
@@ -1488,8 +1514,12 @@ impl SupertableReader {
         // gate. Phase timers (INFINO_TRACE_VECTOR_WARM_PHASES): admit covers
         // that work; fanout_wall is probe+rerank+remap wall.
         let admit_t0 = io_counters::phase_start();
+        // The grid/centroid ranking is the admit stage's kernel section —
+        // pure CPU over manifest summaries on this thread.
         let ranked_cells_scored: Option<Vec<(u32, f32)>> =
-            grid.map(|grid| grid.rank_cells(metric, query));
+            op_stats::timed_kernel(&self.op_stats, || {
+                grid.map(|grid| grid.rank_cells(metric, query))
+            });
         let ranked_cells: Option<Vec<u32>> = ranked_cells_scored
             .as_ref()
             .map(|cells| cells.iter().map(|(cell, _)| *cell).collect());
@@ -2222,6 +2252,7 @@ impl SupertableReader {
                             // PRICED rerank ranges are the canonical plan
                             // budget, flushed once after the fan-out.
                             stats.add_vector_rows_reranked(scan.rows_reranked);
+                            stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
                         }
                         total_candidates
                             .fetch_add(scan.candidates_scanned, atomic::Ordering::Relaxed);
@@ -2257,6 +2288,7 @@ impl SupertableReader {
                                 tally.ranges_requested + tally.rows_reranked,
                             );
                             stats.add_vector_rows_reranked(tally.rows_reranked);
+                            stats.add_kernel_cpu_ns(tally.kernel_cpu_ns);
                         }
                         hits
                     };
@@ -2264,8 +2296,14 @@ impl SupertableReader {
                     // Prefer manifest span arithmetic; only touch `_id` pages /
                     // inline IVF regions when the layout is cell-packed or gapped.
                     io_counters::phase_timed_async("vec.stable_id", async {
-                        dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
-                            .await
+                        dispatch::attach_stable_ids(
+                            &reader_for_ids,
+                            &entry,
+                            &mut tagged,
+                            false,
+                            &op_stats,
+                        )
+                        .await
                     })
                     .await?;
                     if !hidden_vector_index && !deny_pushdown {
@@ -2278,6 +2316,7 @@ impl SupertableReader {
                             &entry,
                             &mut tagged,
                             now,
+                            &op_stats,
                         )
                         .await?;
                     }
@@ -2461,6 +2500,7 @@ impl SupertableReader {
                 let column = Arc::clone(&column_arc2);
                 let query = Arc::clone(&query_arc2);
                 let reader_pool = Arc::clone(&manifest.options.reader_pool);
+                let op_stats_c = self.op_stats.clone();
                 let body_c = move |reader: Arc<SuperfileReader>,
                                    entry: Arc<SuperfileEntry>,
                                    _tombstone_cache: Option<Arc<SidecarCache>>,
@@ -2469,6 +2509,7 @@ impl SupertableReader {
                     let column = Arc::clone(&column);
                     let query = Arc::clone(&query);
                     let reader_pool = Arc::clone(&reader_pool);
+                    let op_stats = op_stats_c.clone();
                     async move {
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
@@ -2479,7 +2520,7 @@ impl SupertableReader {
                             .unwrap_or(0);
                         let k_fetch = k.saturating_add(replica_overhead);
                         let reader_for_ids = Arc::clone(&reader);
-                        let hits = reader
+                        let (hits, rerank_kernel_ns) = reader
                             .vector_rerank_selected(
                                 &column,
                                 &query,
@@ -2489,10 +2530,19 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(vector_read_query_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_kernel_cpu_ns(rerank_kernel_ns);
+                        }
                         let mut tagged = dispatch::tag_hits(&entry, hits);
                         io_counters::phase_timed_async("vec.stable_id", async {
-                            dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
-                                .await
+                            dispatch::attach_stable_ids(
+                                &reader_for_ids,
+                                &entry,
+                                &mut tagged,
+                                false,
+                                &op_stats,
+                            )
+                            .await
                         })
                         .await?;
                         Ok::<Vec<SuperfileHit>, QueryError>(tagged)
@@ -2639,6 +2689,7 @@ impl SupertableReader {
                 if let Some(stats) = &op_stats {
                     stats.add_fts_postings_bytes(work.postings_bytes);
                     stats.add_planned_read_ranges(work.planned_ranges);
+                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
                 Ok(docs.into_iter().collect::<RoaringBitmap>())
             }
@@ -2723,7 +2774,9 @@ impl SupertableReader {
                 continue;
             }
             let locals: Vec<u32> = bm.iter().collect();
-            let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, false).await?;
+            let ids =
+                read_ids_for_locals(manifest, &entry, &locals, id_column, false, &self.op_stats)
+                    .await?;
             out.extend(ids);
         }
         Ok(out.into_iter().collect())
@@ -2845,14 +2898,20 @@ impl SupertableReader {
             if !superfiles.is_empty() {
                 let allow_for_cell = Arc::clone(&allow_global);
                 let manifest_for_ids = Arc::clone(&hidden_manifest);
+                let routing_stats = hidden_reader.op_stats.clone();
                 let allow_by_uri = hidden_reader
                     .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                         let allow_for_cell = Arc::clone(&allow_for_cell);
                         let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                        let routing_stats = routing_stats.clone();
                         async move {
-                            let stable_ids =
-                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
-                                    .await?;
+                            let stable_ids = stable_ids_by_local_for_routing(
+                                &manifest_for_ids,
+                                &entry,
+                                &r,
+                                &routing_stats,
+                            )
+                            .await?;
                             let mut local = RoaringBitmap::new();
                             for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                                 if let Ok(global_id) = u32::try_from(stable_id)
@@ -2968,14 +3027,21 @@ impl SupertableReader {
         let column_owned = column.to_string();
         let map_for_fanout = Arc::clone(&map);
         let manifest_for_ids = Arc::clone(&hidden_manifest);
+        let routing_stats = hidden_reader.op_stats.clone();
         let _ = hidden_reader
             .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                 let map = Arc::clone(&map_for_fanout);
                 let manifest_for_ids = Arc::clone(&manifest_for_ids);
                 let column = column_owned.clone();
+                let routing_stats = routing_stats.clone();
                 async move {
-                    let stable_ids =
-                        stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
+                    let stable_ids = stable_ids_by_local_for_routing(
+                        &manifest_for_ids,
+                        &entry,
+                        &r,
+                        &routing_stats,
+                    )
+                    .await?;
                     if let Some(vs) = entry.vector_summary.get(&column) {
                         let mut idx = 0usize;
                         let mut guard = map.lock().expect("diag cell-map lock");
@@ -3047,14 +3113,20 @@ impl SupertableReader {
             if !superfiles.is_empty() {
                 let allow_for_cell = Arc::clone(&allow_set);
                 let manifest_for_ids = Arc::clone(&hidden_manifest);
+                let routing_stats = hidden_reader.op_stats.clone();
                 let allow_by_uri = hidden_reader
                     .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                         let allow_for_cell = Arc::clone(&allow_for_cell);
                         let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                        let routing_stats = routing_stats.clone();
                         async move {
-                            let stable_ids =
-                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
-                                    .await?;
+                            let stable_ids = stable_ids_by_local_for_routing(
+                                &manifest_for_ids,
+                                &entry,
+                                &r,
+                                &routing_stats,
+                            )
+                            .await?;
                             let mut local = RoaringBitmap::new();
                             for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                                 if allow_for_cell.contains(&stable_id) {
@@ -3096,13 +3168,20 @@ impl SupertableReader {
         }
         let allow_for_user = Arc::clone(&allow_set);
         let manifest_for_ids = Arc::clone(manifest);
+        let routing_stats = self.op_stats.clone();
         let allow_by_uri = self
             .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                 let allow_for_user = Arc::clone(&allow_for_user);
                 let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                let routing_stats = routing_stats.clone();
                 async move {
-                    let stable_ids =
-                        stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
+                    let stable_ids = stable_ids_by_local_for_routing(
+                        &manifest_for_ids,
+                        &entry,
+                        &r,
+                        &routing_stats,
+                    )
+                    .await?;
                     let mut local = RoaringBitmap::new();
                     for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                         if allow_for_user.contains(&stable_id) {
@@ -3237,6 +3316,7 @@ impl SupertableReader {
                 if let Some(stats) = &op_stats {
                     stats.add_fts_postings_bytes(work.postings_bytes);
                     stats.add_planned_read_ranges(work.planned_ranges);
+                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
                 bitmap.ok_or_else(|| {
                     QueryError::Execute(
@@ -4112,12 +4192,14 @@ mod tests {
             stable_id: Some(sid),
         };
         let hits = [mk(42)];
-        let ids = block_on(hidden_hits_user_ids(manifest, &hits, "_id")).expect("resolve one id");
+        let ids =
+            block_on(hidden_hits_user_ids(manifest, &hits, "_id", &None)).expect("resolve one id");
         assert_eq!(ids, vec![42], "single inline stable id returned verbatim");
 
         // Order is preserved across multiple stamped hits.
         let hits = [mk(42), mk(7)];
-        let ids = block_on(hidden_hits_user_ids(manifest, &hits, "_id")).expect("resolve two ids");
+        let ids =
+            block_on(hidden_hits_user_ids(manifest, &hits, "_id", &None)).expect("resolve two ids");
         assert_eq!(ids, vec![42, 7], "inline stable ids returned in hit order");
     }
 

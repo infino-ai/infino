@@ -20,7 +20,10 @@ use infino::{
     Connection, IndexSpec, Metric, connect,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    superfile::{
+        builder::FtsConfig,
+        fts::reader::{Bm25Stats, BoolMode},
+    },
     supertable::{
         Supertable, SupertableOptions,
         query::vector::{VectorFilter, VectorSearchOptions},
@@ -185,9 +188,11 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
             .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
             .expect("bm25")
     });
+    // Per superfile: one dictionary fetch + one PFOR posting range.
     assert_eq!(
-        one_term.planned_read_ranges, n_superfiles,
-        "one PFOR term = one posting range per superfile"
+        one_term.planned_read_ranges,
+        2 * n_superfiles,
+        "single term = dict + posting range per superfile"
     );
     let (_, three_terms) = with_op_stats(|| {
         st.reader()
@@ -195,10 +200,11 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
             .bm25_hits("title", "rust async web", TOP_K, BoolMode::Or)
             .expect("bm25")
     });
+    // Per superfile: one dictionary fetch + three PFOR posting ranges.
     assert_eq!(
         three_terms.planned_read_ranges,
-        3 * n_superfiles,
-        "three PFOR terms = three posting ranges per superfile"
+        4 * n_superfiles,
+        "three PFOR terms = dict + three posting ranges per superfile"
     );
 }
 
@@ -364,6 +370,71 @@ fn a_scoped_exact_match_reports_posting_work() {
     assert!(
         stats.fts_postings_bytes > 0,
         "the prune pass walks posting bytes; got 0"
+    );
+}
+
+#[test]
+fn a_scoped_prefix_search_reports_posting_work() {
+    // Prefix expansion used to flush nothing at all — a prefix widening
+    // to many terms billed as zero FTS work.
+    let st = demo_two_superfiles();
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_search_prefix("title", "ru", TOP_K)
+            .expect("prefix search")
+    });
+    assert!(!hits.is_empty(), "fixture prefix must match");
+    assert!(
+        stats.fts_postings_bytes > 0,
+        "the prefix expansion walks posting bytes; got 0"
+    );
+    assert!(
+        stats.planned_read_ranges > 0,
+        "the prefix expansion plans posting ranges; got 0"
+    );
+}
+
+#[test]
+fn a_scalar_projection_reports_materialized_rows() {
+    // Materializing named columns decodes stored rows — real work the
+    // counters must carry; the id+score default decodes nothing.
+    let st = demo_two_superfiles();
+    let (batches, projected) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_search(
+                "title",
+                "rust",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                Some(&["title"]),
+            )
+            .expect("projected search")
+    });
+    let returned: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    assert!(returned > 0);
+    assert_eq!(
+        projected.rows_materialized, returned,
+        "every returned row was decoded from stored columns"
+    );
+    let (_, bare) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_search(
+                "title",
+                "rust",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("bare search")
+    });
+    assert_eq!(
+        bare.rows_materialized, 0,
+        "the id+score fast path decodes no stored columns"
     );
 }
 
@@ -562,6 +633,34 @@ fn a_filtered_vector_query_meters_its_predicate_leg() {
     assert!(
         stats.vector_candidates_scanned > 0,
         "the vector leg still scans candidates; got 0"
+    );
+}
+
+#[test]
+fn a_scoped_vector_query_reports_kernel_cpu() {
+    // Same schedstat-resolution caveat as the FTS kernel test: batch the
+    // queries so the bracketed scan + rerank sections cross scheduler
+    // ticks.
+    const VECTOR_KERNEL_BATCH: usize = 200;
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let (_, stats) = with_op_stats(|| {
+        for _ in 0..VECTOR_KERNEL_BATCH {
+            st.vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                None,
+            )
+            .expect("vector search");
+        }
+    });
+    assert!(
+        stats.kernel_cpu_ns > 0,
+        "the bracketed vector kernels report on-CPU time over {VECTOR_KERNEL_BATCH} queries; got 0"
     );
 }
 

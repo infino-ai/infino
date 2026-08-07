@@ -1224,22 +1224,25 @@ impl SuperfileReader {
     ///
     /// Returns an empty `Vec` if no indexed term begins with
     /// `prefix` or if `k == 0`.
+    /// Returns the hits plus the expansion's posting work and the
+    /// bracketed kernel on-CPU ns, so a prefix expanding to thousands
+    /// of terms carries its cost like any other query shape.
     pub async fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
         k: usize,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         if k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default(), 0));
         }
         let lowered = prefix.to_ascii_lowercase();
         let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default(), 0));
         }
         // FST keys are valid UTF-8 by construction (AsciiLower
         // tokenizer only emits ASCII bytes); the from_utf8 below
@@ -1248,7 +1251,9 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
             .collect();
-        Ok(fts.search(column, &term_strings, k, BoolMode::Or).await?)
+        Ok(fts
+            .search_with_work(column, &term_strings, k, BoolMode::Or)
+            .await?)
     }
 
     /// Multi-term OR BM25 search restricted to a doc_id sub-range.
@@ -1578,7 +1583,8 @@ impl SuperfileReader {
     }
 
     /// Rerank this superfile's share of the globally selected shortlist —
-    /// phase C of the deferred-rerank width sweep.
+    /// phase C of the deferred-rerank width sweep. Returns the hits plus
+    /// the rerank kernel's bracketed on-CPU ns.
     pub(crate) async fn vector_rerank_selected(
         &self,
         column: &str,
@@ -1586,7 +1592,7 @@ impl SuperfileReader {
         k: usize,
         selected: Vec<ScanCandidate>,
         pool: Option<Arc<ThreadPool>>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
@@ -2344,10 +2350,14 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         // "rust" is a prefix of "rust" (docs 0,2); "ru" expands to it too.
-        let hits = r
+        let (hits, work, _kernel_ns) = r
             .bm25_search_prefix("title", "ru", 5)
             .await
             .expect("prefix search");
+        assert!(
+            work.postings_bytes > 0 && work.planned_ranges > 0,
+            "a matching prefix expansion reports its posting work"
+        );
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&2));
@@ -2356,6 +2366,7 @@ mod tests {
             r.bm25_search_prefix("title", "zz", 5)
                 .await
                 .expect("prefix")
+                .0
                 .is_empty()
         );
         // k == 0 short-circuits.
@@ -2363,6 +2374,7 @@ mod tests {
             r.bm25_search_prefix("title", "ru", 0)
                 .await
                 .expect("zero k")
+                .0
                 .is_empty()
         );
     }

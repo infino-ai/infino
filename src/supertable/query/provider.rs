@@ -851,6 +851,7 @@ impl TableProvider for SupertableProvider {
             if let Some(stats) = self.scan_store.op_stats() {
                 stats.add_fts_postings_bytes(predicate_work.postings_bytes);
                 stats.add_planned_read_ranges(predicate_work.planned_ranges);
+                stats.add_kernel_cpu_ns(predicate_work.kernel_cpu_ns);
             }
 
             // This superfile's tombstoned rows (empty when no overlay).

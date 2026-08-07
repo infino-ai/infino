@@ -33,6 +33,10 @@ pub(crate) use crate::superfile::lazy_source::Source;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{run_on_pool, spawn_on},
+    runtime_metrics::{
+        cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+        op_stats::{metering_active, timed_section},
+    },
     storage::io_counters,
     superfile::{
         BuildError, ReadError,
@@ -3025,7 +3029,8 @@ impl VectorReader {
             // through the async paths); its cold fetch is not budget-gated.
             budget: None,
         };
-        let (candidates, survivor_full_ranges) = match build_shortlist(
+        // Superfile-tier direct API: no collector at this layer, ns dropped.
+        let (outcome, _scan_kernel_ns) = build_shortlist(
             col,
             cb,
             &cluster_meta,
@@ -3033,8 +3038,8 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             &ctx,
         )
-        .await?
-        {
+        .await?;
+        let (candidates, survivor_full_ranges) = match outcome {
             ShortlistOutcome::Done(out) => return Ok(out),
             ShortlistOutcome::Rerank {
                 candidates,
@@ -3058,7 +3063,9 @@ impl VectorReader {
         //    scale/offset into the query (one `dim/8` SIMD pass);
         //    the per-doc inner step is then a plain u8→f32 widen
         //    + SIMD dot. Fp32 takes the flat dispatch.
-        rerank_candidates_from_blocks(
+        // Superfile-tier direct API: no collector reaches this layer, so
+        // the bracketed ns are dropped (the supertable paths carry them).
+        Ok(rerank_candidates_from_blocks(
             &self.source,
             lazy_sq8_meta_bytes.as_ref(),
             &cluster_blocks,
@@ -3069,7 +3076,8 @@ impl VectorReader {
             None,
             k,
         )
-        .await
+        .await?
+        .0)
     }
 
     /// Async sibling of [`Self::search`]. Byte-for-byte the same IVF
@@ -3434,6 +3442,7 @@ impl VectorReader {
             candidates_scanned: 0,
             ranges_requested: 0,
             rows_reranked: 0,
+            kernel_cpu_ns: 0,
         };
         if k == 0 || self.n_docs == 0 {
             return Ok(outcome);
@@ -3535,6 +3544,7 @@ impl VectorReader {
                         .sum(),
                     ranges_requested: 1 + prefix_ranges.len() as u64,
                     rows_reranked: 0,
+                    kernel_cpu_ns: 0,
                 };
                 // Warm fast path: every prefix resident -> defer rerank.
                 let prefix_blocks: Option<Vec<Bytes>> = prefix_ranges
@@ -3553,9 +3563,10 @@ impl VectorReader {
                         budget,
                     };
                     let coarse_limit = k.saturating_mul(rerank_mult);
-                    let shortlist =
+                    let (shortlist, scan_kernel_ns) =
                         scan_shortlist(col, cb, &cluster_meta, &blocks, true, coarse_limit, &ctx)
                             .await?;
+                    tally.kernel_cpu_ns += scan_kernel_ns;
                     let cands = shortlist
                         .into_iter()
                         .map(|(did, estimate, pos, cluster_id)| ScanCandidate {
@@ -3590,6 +3601,7 @@ impl VectorReader {
                 // cluster-index + prefix ranges before the branch, and the
                 // probe's own tallies cover the same clusters.
                 tally.rows_reranked = probe_tally.rows_reranked;
+                tally.kernel_cpu_ns += probe_tally.kernel_cpu_ns;
                 Ok((
                     hits.into_iter()
                         .map(|(local_id, score)| (base.saturating_add(local_id), score))
@@ -3612,6 +3624,7 @@ impl VectorReader {
             outcome.candidates_scanned += tally.candidates_scanned;
             outcome.ranges_requested += tally.ranges_requested;
             outcome.rows_reranked += tally.rows_reranked;
+            outcome.kernel_cpu_ns += tally.kernel_cpu_ns;
         }
         // Cold hits merge to this file's top-k exactly as the immediate
         // path does; candidates stay unbounded here (per-cell heaps
@@ -3637,9 +3650,9 @@ impl VectorReader {
         k: usize,
         selected: Vec<ScanCandidate>,
         pool: Option<Arc<ThreadPool>>,
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
         if selected.is_empty() || k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         if !self.column_id_by_name.contains_key(column) {
             return Err(VectorError::UnknownColumn(column.to_string()));
@@ -3749,14 +3762,15 @@ impl VectorReader {
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell: Vec<Vec<(u32, f32)>> = stream::iter(cell_reranks)
+        let per_cell: Vec<(Vec<(u32, f32)>, u64)> = stream::iter(cell_reranks)
             .buffer_unordered(max_in_flight)
             .try_collect()
             .await?;
-        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flatten().collect();
+        let kernel_ns: u64 = per_cell.iter().map(|(_, ns)| ns).sum();
+        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
         merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         merged.truncate(k);
-        Ok(merged)
+        Ok((merged, kernel_ns))
     }
 
     /// Shared async tail of the IVF probe: given a chosen set of cluster
@@ -3784,13 +3798,18 @@ impl VectorReader {
         // Plan tallies, fixed before the warm/cold fetch branch: both arms
         // scan the same clusters and request one prefix/block range each
         // (the caller counts the cluster-index range it fetched).
+        let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
         let mut tally = ProbeTally {
             cells_scanned: 1,
             candidates_scanned: cluster_meta.iter().map(|&(_, _, cnt)| u64::from(cnt)).sum(),
-            ranges_requested: cluster_meta.len() as u64,
+            // One range per chosen cluster, plus the lazy Sq8 meta table
+            // when the column stores one — the warm arm fetches it and
+            // the cold arm rides it on the coalesce plan, so the planned
+            // count is identical at either temperature.
+            ranges_requested: cluster_meta.len() as u64 + u64::from(lazy_sq8_meta_range.is_some()),
             rows_reranked: 0,
+            kernel_cpu_ns: 0,
         };
-        let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
         // Warm fast path: every prefix already resident → sync zero-copy.
         let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
             .iter()
@@ -3884,7 +3903,7 @@ impl VectorReader {
         // RaBitQ heap; survivor_fetch = warm/cold full-row gather; rerank =
         // Sq8/fp32 refine. Concurrent fan-out units each emit their own spans.
         let shortlist_t0 = io_counters::phase_start();
-        let (candidates, survivor_full_ranges) = match build_shortlist(
+        let (outcome, scan_kernel_ns) = build_shortlist(
             col,
             cb,
             &cluster_meta,
@@ -3892,8 +3911,9 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             ctx,
         )
-        .await?
-        {
+        .await?;
+        tally.kernel_cpu_ns += scan_kernel_ns;
+        let (candidates, survivor_full_ranges) = match outcome {
             ShortlistOutcome::Done(out) => {
                 if let Some(t0) = shortlist_t0 {
                     io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
@@ -3924,7 +3944,7 @@ impl VectorReader {
         }
 
         tally.rows_reranked = candidates.len() as u64;
-        let hits = io_counters::phase_timed_async("vec.rerank", async {
+        let (hits, rerank_ns) = io_counters::phase_timed_async("vec.rerank", async {
             rerank_candidates_from_blocks(
                 &self.source,
                 lazy_sq8_meta_bytes.as_ref(),
@@ -3939,6 +3959,7 @@ impl VectorReader {
             .await
         })
         .await?;
+        tally.kernel_cpu_ns += rerank_ns;
         Ok((hits, tally))
     }
 
@@ -4301,12 +4322,13 @@ fn scan_cluster_transposed(
     });
 }
 
-/// The pure-CPU half of [`build_shortlist`]/// The pure-CPU half of [`build_shortlist`]: score every probed cluster's
+/// The pure-CPU half of [`build_shortlist`]: score every probed cluster's
 /// 1-bit codes into one bounded heap of `coarse_limit` survivors, rayon-
 /// parallel when the candidate pool amortizes the hand-off. Shared by the
 /// immediate-rerank path ([`build_shortlist`]) and the deferred-rerank
 /// scan ([`VectorReader::search_clusters_scan_async`]). Returns unsorted
-/// `(did, estimate, pos, cluster_id)` survivors.
+/// `(did, estimate, pos, cluster_id)` survivors plus the scan's bracketed
+/// on-CPU ns (per-chunk brackets on the parallel arm).
 async fn scan_shortlist(
     col: &ColumnReader,
     cb: usize,
@@ -4315,7 +4337,7 @@ async fn scan_shortlist(
     survivor_only_rerank_fetch: bool,
     coarse_limit: usize,
     ctx: &ProbeCtx<'_>,
-) -> Result<Vec<(u32, f32, u32, u32)>, VectorError> {
+) -> Result<(Vec<(u32, f32, u32, u32)>, u64), VectorError> {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
     // Collect every scored row, then keep the top `coarse_limit` with one
@@ -4380,7 +4402,7 @@ async fn scan_shortlist(
             &mut |cand| acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id)),
         );
     };
-    let mut acc = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+    let acc = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
         // Parallelize the coarse 1-bit scan across the configured rayon
         // pool, bridged back via a oneshot so no tokio worker blocks under
         // the compute. Cluster scoring is order-independent — the partition
@@ -4405,6 +4427,7 @@ async fn scan_shortlist(
                 .par_chunks(chunk)
                 .zip(blocks_owned.par_chunks(chunk))
                 .map(|(meta_chunk, block_chunk)| {
+                    let kernel_start = metering_active().then(thread_cpu_ns).flatten();
                     let chunk_rows: usize =
                         meta_chunk.iter().map(|&(_, _, cnt)| cnt as usize).sum();
                     let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
@@ -4452,31 +4475,37 @@ async fn scan_shortlist(
                             truncate_to_top_estimates(&mut acc, coarse_limit);
                         }
                     }
-                    acc
+                    (acc, thread_cpu_delta_ns(kernel_start))
                 })
-                .reduce(Vec::new, |mut a, mut b| {
-                    a.append(&mut b);
-                    if a.len() >= coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK) {
-                        truncate_to_top_estimates(&mut a, coarse_limit);
-                    }
-                    a
-                });
+                .reduce(
+                    || (Vec::new(), 0u64),
+                    |(mut a, ns_a), (mut b, ns_b)| {
+                        a.append(&mut b);
+                        if a.len() >= coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK) {
+                            truncate_to_top_estimates(&mut a, coarse_limit);
+                        }
+                        (a, ns_a + ns_b)
+                    },
+                );
             let _ = tx.send(acc);
         });
         rx.await.map_err(|_| VectorError::TaskDropped("scan"))?
     } else {
-        let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
-        let mut acc = Vec::with_capacity(total_candidates.min(cap));
-        for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
-            scan_vec(&mut acc, item);
-            if acc.len() >= cap {
-                truncate_to_top_estimates(&mut acc, coarse_limit);
+        timed_section(|| {
+            let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
+            let mut acc = Vec::with_capacity(total_candidates.min(cap));
+            for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
+                scan_vec(&mut acc, item);
+                if acc.len() >= cap {
+                    truncate_to_top_estimates(&mut acc, coarse_limit);
+                }
             }
-        }
-        acc
+            acc
+        })
     };
+    let (mut acc, kernel_ns) = acc;
     truncate_to_top_estimates(&mut acc, coarse_limit);
-    Ok(acc)
+    Ok((acc, kernel_ns))
 }
 
 /// Keep the `limit` highest-estimate survivors of one cell scan via a
@@ -4555,6 +4584,11 @@ pub struct ProbeTally {
     /// Rows this probe actually reranked at full precision (execution
     /// diagnostic — see `OpStats::vector_rows_reranked`).
     pub rows_reranked: u64,
+    /// On-CPU nanoseconds of the probe's bracketed kernel sections (1-bit
+    /// scan + exact rerank; per-chunk brackets on the parallel arms, so
+    /// work-stolen chunks attribute their CPU too). Gated on
+    /// [`metering_active`]: 0 in an unmetered process.
+    pub kernel_cpu_ns: u64,
 }
 
 /// Result of a deferred-rerank scan over one superfile
@@ -4584,6 +4618,8 @@ pub(crate) struct ScanOutcome {
     /// Rows the cold arm reranked immediately (warm survivors defer to the
     /// supertable's global selection and are counted at phase C instead).
     pub(crate) rows_reranked: u64,
+    /// Σ per-cell bracketed kernel on-CPU ns (see `ProbeTally::kernel_cpu_ns`).
+    pub(crate) kernel_cpu_ns: u64,
 }
 
 async fn build_shortlist(
@@ -4593,7 +4629,7 @@ async fn build_shortlist(
     cluster_blocks: &[Bytes],
     survivor_only_rerank_fetch: bool,
     ctx: &ProbeCtx<'_>,
-) -> Result<ShortlistOutcome, VectorError> {
+) -> Result<(ShortlistOutcome, u64), VectorError> {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     // Score each probed cluster's 1-bit codes into the shortlist.
     // The per-cluster slices are zero-copy `Bytes` views; the actual
@@ -4608,9 +4644,9 @@ async fn build_shortlist(
         ctx.k.saturating_mul(ctx.rerank_mult)
     };
     if coarse_limit == 0 {
-        return Ok(ShortlistOutcome::Done(Vec::new()));
+        return Ok((ShortlistOutcome::Done(Vec::new()), 0));
     }
-    let mut shortlist = scan_shortlist(
+    let (mut shortlist, scan_kernel_ns) = scan_shortlist(
         col,
         cb,
         cluster_meta,
@@ -4622,7 +4658,7 @@ async fn build_shortlist(
     .await?;
 
     if shortlist.is_empty() {
-        return Ok(ShortlistOutcome::Done(Vec::new()));
+        return Ok((ShortlistOutcome::Done(Vec::new()), scan_kernel_ns));
     }
 
     // `RabitqOnly` short-circuit: the 1-bit shortlist *is* the final
@@ -4640,11 +4676,14 @@ async fn build_shortlist(
         // merge path — otherwise the two paths diverge on top-k for a
         // corrupt/degenerate score.
         shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        return Ok(ShortlistOutcome::Done(
-            shortlist
-                .into_iter()
-                .map(|(did, est, _pos, _c)| (did, -est))
-                .collect(),
+        return Ok((
+            ShortlistOutcome::Done(
+                shortlist
+                    .into_iter()
+                    .map(|(did, est, _pos, _c)| (did, -est))
+                    .collect(),
+            ),
+            scan_kernel_ns,
         ));
     }
 
@@ -4685,10 +4724,13 @@ async fn build_shortlist(
             full_idx,
         });
     }
-    Ok(ShortlistOutcome::Rerank {
-        candidates,
-        survivor_full_ranges,
-    })
+    Ok((
+        ShortlistOutcome::Rerank {
+            candidates,
+            survivor_full_ranges,
+        },
+        scan_kernel_ns,
+    ))
 }
 
 /// Maximum multiplier applied to filtered-search probe breadth and
@@ -4834,23 +4876,41 @@ fn parallel_chunks(n_items: usize) -> usize {
 /// compute runs on rayon (`par_iter().map().collect()`) bridged back to
 /// the async caller via a oneshot, so no tokio worker blocks under it.
 /// `f` and the items must be `'static` so the work can move onto rayon.
+/// Returns the mapped items plus the map's bracketed on-CPU ns. The
+/// parallel arm runs chunked (`par_chunks` + collect preserves input
+/// order exactly as the previous per-item `par_iter` did) with one
+/// bracket per chunk, so work-stolen chunks attribute their CPU too.
 async fn par_map<T, R, F>(
     items: Vec<T>,
     f: F,
     pool: Option<Arc<ThreadPool>>,
-) -> Result<Vec<R>, VectorError>
+) -> Result<(Vec<R>, u64), VectorError>
 where
     T: Send + Sync + 'static,
     R: Send + 'static,
     F: Fn(&T) -> R + Send + Sync + 'static,
 {
-    if parallel_chunks(items.len()) <= 1 {
-        return Ok(items.iter().map(&f).collect());
+    let n_tasks = parallel_chunks(items.len());
+    if n_tasks <= 1 {
+        return Ok(timed_section(|| items.iter().map(&f).collect()));
     }
     run_on_pool(
         pool.as_deref(),
         "rerank rayon task dropped result",
-        move || items.par_iter().map(f).collect(),
+        move || {
+            let chunk = items.len().div_ceil(n_tasks).max(1);
+            let per_chunk: Vec<(Vec<R>, u64)> = items
+                .par_chunks(chunk)
+                .map(|c| timed_section(|| c.iter().map(&f).collect()))
+                .collect();
+            let mut out = Vec::with_capacity(items.len());
+            let mut kernel_ns = 0u64;
+            for (chunk_out, ns) in per_chunk {
+                out.extend(chunk_out);
+                kernel_ns += ns;
+            }
+            (out, kernel_ns)
+        },
     )
     .await
     .map_err(|_| VectorError::TaskDropped("rerank"))
@@ -4984,9 +5044,11 @@ async fn rerank_candidates_from_blocks(
     query: &[f32],
     pool: Option<Arc<ThreadPool>>,
     k: usize,
-) -> Result<Vec<(u32, f32)>, VectorError> {
+) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
     let map_lazy = |e: LazyByteSourceError| VectorError::LazySource(e.to_string());
+    // Bracketed on-CPU ns of the scoring sections below (fetches excluded).
+    let mut kernel_ns = 0u64;
     let reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 => {
             // Exact fp32 rerank — every survivor is independent, so the
@@ -5001,7 +5063,7 @@ async fn rerank_candidates_from_blocks(
                 let survivors: Option<Arc<Vec<Bytes>>> =
                     survivor_full_rows.map(|s| Arc::new(s.to_vec()));
                 let query: Arc<Vec<f32>> = Arc::new(query.to_vec());
-                par_map(
+                let (scored, ns) = par_map(
                     candidates.to_vec(),
                     move |cand: &RerankCandidate| {
                         let bytes = candidate_full_bytes(
@@ -5014,19 +5076,29 @@ async fn rerank_candidates_from_blocks(
                     },
                     pool.clone(),
                 )
-                .await?
+                .await?;
+                kernel_ns += ns;
+                scored
             } else {
-                candidates
-                    .iter()
-                    .map(|cand| {
-                        let bytes =
-                            candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
-                        (
-                            cand.did,
-                            distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
-                        )
-                    })
-                    .collect()
+                let (scored, ns) = timed_section(|| {
+                    candidates
+                        .iter()
+                        .map(|cand| {
+                            let bytes = candidate_full_bytes(
+                                cluster_blocks,
+                                survivor_full_rows,
+                                cand,
+                                stride,
+                            );
+                            (
+                                cand.did,
+                                distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
+                            )
+                        })
+                        .collect()
+                });
+                kernel_ns += ns;
+                scored
             }
         }
         RerankCodec::Sq16 => {
@@ -5065,7 +5137,7 @@ async fn rerank_candidates_from_blocks(
                 let survivors: Option<Arc<Vec<Bytes>>> =
                     survivor_full_rows.map(|s| Arc::new(s.to_vec()));
                 let norms = norms.clone();
-                par_map(
+                let (scored, ns) = par_map(
                     candidates.to_vec(),
                     move |cand: &RerankCandidate| {
                         let bytes = candidate_full_bytes(
@@ -5079,17 +5151,27 @@ async fn rerank_candidates_from_blocks(
                     },
                     pool.clone(),
                 )
-                .await?
+                .await?;
+                kernel_ns += ns;
+                scored
             } else {
-                candidates
-                    .iter()
-                    .map(|cand| {
-                        let bytes =
-                            candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
-                        let norm = norms.as_ref().map(|n| n[cand.pos as usize]);
-                        (cand.did, kernel.distance_with_norm(bytes, norm))
-                    })
-                    .collect()
+                let (scored, ns) = timed_section(|| {
+                    candidates
+                        .iter()
+                        .map(|cand| {
+                            let bytes = candidate_full_bytes(
+                                cluster_blocks,
+                                survivor_full_rows,
+                                cand,
+                                stride,
+                            );
+                            let norm = norms.as_ref().map(|n| n[cand.pos as usize]);
+                            (cand.did, kernel.distance_with_norm(bytes, norm))
+                        })
+                        .collect()
+                });
+                kernel_ns += ns;
+                scored
             }
         }
         RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
@@ -5111,7 +5193,7 @@ async fn rerank_candidates_from_blocks(
                     offset,
                     per_doc_norms,
                 } => {
-                    score_sq8_residual_candidates(
+                    let (scored, ns) = score_sq8_residual_candidates(
                         candidates,
                         cluster_blocks,
                         survivor_full_rows,
@@ -5125,7 +5207,9 @@ async fn rerank_candidates_from_blocks(
                         pool.clone(),
                         stride,
                     )
-                    .await?
+                    .await?;
+                    kernel_ns += ns;
+                    scored
                 }
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
@@ -5149,24 +5233,22 @@ async fn rerank_candidates_from_blocks(
                                 .get()
                                 .expect("lazy Sq8 meta set just above"),
                         );
-                        return Ok(finalize_reranked(
-                            score_sq8_residual_candidates(
-                                candidates,
-                                cluster_blocks,
-                                survivor_full_rows,
-                                col.metric,
-                                col.dim,
-                                query,
-                                parsed.scale.as_slice(),
-                                parsed.offset.as_slice(),
-                                parsed.per_doc_norms.clone(),
-                                residual_divisor,
-                                pool.clone(),
-                                stride,
-                            )
-                            .await?,
-                            k,
-                        ));
+                        let (scored, ns) = score_sq8_residual_candidates(
+                            candidates,
+                            cluster_blocks,
+                            survivor_full_rows,
+                            col.metric,
+                            col.dim,
+                            query,
+                            parsed.scale.as_slice(),
+                            parsed.offset.as_slice(),
+                            parsed.per_doc_norms.clone(),
+                            residual_divisor,
+                            pool.clone(),
+                            stride,
+                        )
+                        .await?;
+                        return Ok((finalize_reranked(scored, k), kernel_ns + ns));
                     }
                     let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
                     clusters.sort_unstable();
@@ -5251,27 +5333,35 @@ async fn rerank_candidates_from_blocks(
                             )
                         })
                         .collect();
-                    candidates
-                        .iter()
-                        .map(|cand| {
-                            let row = candidate_full_bytes(
-                                cluster_blocks,
-                                survivor_full_rows,
-                                cand,
-                                stride,
-                            );
-                            let kernel = kernels
-                                .get(&cand.cluster_id)
-                                .expect("kernel built for every candidate cluster");
-                            let norm = norm_by_pos
-                                .as_ref()
-                                .and_then(|norms| norms.get(&cand.pos).copied());
-                            (
-                                cand.did,
-                                kernel.distance_with_norm(&row[..dim], &row[dim..dim * 2], norm),
-                            )
-                        })
-                        .collect()
+                    let (scored, ns) = timed_section(|| {
+                        candidates
+                            .iter()
+                            .map(|cand| {
+                                let row = candidate_full_bytes(
+                                    cluster_blocks,
+                                    survivor_full_rows,
+                                    cand,
+                                    stride,
+                                );
+                                let kernel = kernels
+                                    .get(&cand.cluster_id)
+                                    .expect("kernel built for every candidate cluster");
+                                let norm = norm_by_pos
+                                    .as_ref()
+                                    .and_then(|norms| norms.get(&cand.pos).copied());
+                                (
+                                    cand.did,
+                                    kernel.distance_with_norm(
+                                        &row[..dim],
+                                        &row[dim..dim * 2],
+                                        norm,
+                                    ),
+                                )
+                            })
+                            .collect()
+                    });
+                    kernel_ns += ns;
+                    scored
                 }
             }
         }
@@ -5280,7 +5370,7 @@ async fn rerank_candidates_from_blocks(
              have no full[] region and should short-circuit before the rerank step"
         ),
     };
-    Ok(finalize_reranked(reranked, k))
+    Ok((finalize_reranked(reranked, k), kernel_ns))
 }
 
 fn finalize_reranked(mut reranked: Vec<(u32, f32)>, k: usize) -> Vec<(u32, f32)> {
@@ -5311,7 +5401,7 @@ async fn score_sq8_residual_candidates(
     residual_divisor: f32,
     pool: Option<Arc<ThreadPool>>,
     stride: usize,
-) -> Result<Vec<(u32, f32)>, VectorError> {
+) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
     let mut cids: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
     cids.sort_unstable();
     cids.dedup();
@@ -5368,7 +5458,7 @@ async fn score_sq8_residual_candidates(
         )
         .await
     } else {
-        Ok(candidates.iter().map(score_one).collect())
+        Ok(timed_section(|| candidates.iter().map(score_one).collect()))
     }
 }
 
@@ -5838,7 +5928,7 @@ mod tests {
             })
             .collect();
 
-        let mut scored = score_sq8_residual_candidates(
+        let scored = score_sq8_residual_candidates(
             &candidates,
             &[Bytes::from(block)],
             None,
@@ -5856,6 +5946,7 @@ mod tests {
         )
         .await
         .expect("sq8 scorer");
+        let (mut scored, _kernel_ns) = scored;
         assert_eq!(scored.len(), candidates.len());
         scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         assert_eq!(
@@ -9449,7 +9540,8 @@ mod tests {
         let deferred = r
             .rerank_selected_async("v", &all[7], k, scan.candidates, None)
             .await
-            .expect("selected rerank");
+            .expect("selected rerank")
+            .0;
         assert_eq!(
             immediate.0, deferred,
             "deferred scan+select+rerank must equal the immediate probe's top-k"
@@ -9529,7 +9621,8 @@ mod tests {
         // parallel_chunks(items) <= 1 takes the serial map arm.
         let out = par_map(vec![1u32, 2, 3], |x| x * 10, None)
             .await
-            .expect("serial par_map cannot drop");
+            .expect("serial par_map cannot drop")
+            .0;
         assert_eq!(out, vec![10, 20, 30]);
     }
 
