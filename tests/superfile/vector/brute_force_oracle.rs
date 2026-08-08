@@ -273,6 +273,63 @@ async fn oracle_negdot_full_nprobe_recovers_exact_topk() {
 }
 
 #[tokio::test]
+async fn oracle_sq16_adaptive_l2sq_full_nprobe_recovers_exact_topk() {
+    // The new non-cosine default codec must recover exact top-k at full nprobe,
+    // the same guarantee the fp32 and fixed-residual legs above assert.
+    let corpus = generate_corpus(ORACLE_N_DOCS, ORACLE_DIM, L2SQ_CORPUS_SEED, false);
+    let reader = build_reader_with_codec(
+        &corpus,
+        ORACLE_DIM,
+        ORACLE_N_CENT,
+        Metric::L2Sq,
+        L2SQ_ROT_SEED,
+        RerankCodec::Sq16Adaptive,
+    );
+    for q_idx in [0usize, 47, 99, 142, 199] {
+        let query = &corpus[q_idx];
+        let exact = brute_force_top_k(&corpus, query, Metric::L2Sq, ORACLE_TOP_K);
+        let approx = reader
+            .search("v", query, ORACLE_TOP_K, ORACLE_N_CENT, ORACLE_RERANK_MULT)
+            .await
+            .expect("Sq16Adaptive L2Sq search");
+        assert_eq!(approx[0].0 as usize, q_idx, "self-NN must be top-1");
+        let exact_set: HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
+        let approx_set: HashSet<u32> = approx.iter().map(|(d, _)| *d).collect();
+        assert_eq!(
+            exact_set, approx_set,
+            "Sq16Adaptive L2Sq full-nprobe top-5 set diverges; query={q_idx}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn oracle_sq16_adaptive_negdot_full_nprobe_recovers_exact_topk() {
+    let corpus = generate_corpus(ORACLE_N_DOCS, ORACLE_DIM, NEGDOT_CORPUS_SEED, false);
+    let reader = build_reader_with_codec(
+        &corpus,
+        ORACLE_DIM,
+        ORACLE_N_CENT,
+        Metric::NegDot,
+        NEGDOT_ROT_SEED,
+        RerankCodec::Sq16Adaptive,
+    );
+    for q_idx in [0usize, 33, 77, 145, 199] {
+        let query = &corpus[q_idx];
+        let exact = brute_force_top_k(&corpus, query, Metric::NegDot, ORACLE_TOP_K);
+        let approx = reader
+            .search("v", query, ORACLE_TOP_K, ORACLE_N_CENT, ORACLE_RERANK_MULT)
+            .await
+            .expect("Sq16Adaptive NegDot search");
+        let exact_set: HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
+        let approx_set: HashSet<u32> = approx.iter().map(|(d, _)| *d).collect();
+        assert_eq!(
+            exact_set, approx_set,
+            "Sq16Adaptive NegDot full-nprobe top-5 set diverges; query={q_idx}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oracle_partial_nprobe_top1_preserved() {
     // With reduced nprobe we may miss tail of the top-k, but the
     // single most-similar doc (= the query itself for self-query) is

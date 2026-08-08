@@ -92,19 +92,23 @@ pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
 // ─── Scale constants ──────────────────────────────────────────────────
 
 /// Codec benches build vector columns with. Mirrors the engine default
-/// (`VectorConfig::new`): the fixed cosine grid for cosine, locally fitted
-/// residuals for unbounded metrics. Codec choice is engine configuration
+/// (`default_rerank_codec_for`): the fixed cosine grid (`Sq16`) for cosine, and
+/// the per-cluster-fitted 16-bit `Sq16Adaptive` for the unbounded metrics
+/// (L2Sq / NegDot). Codec choice is engine configuration
 /// (`vector.rerank_codec` in YAML), not a bench env knob.
 pub fn bench_rerank_codec(metric: Metric) -> RerankCodec {
-    // Diagnostic (env-gated): force an EXACT fp32 rerank column to isolate Sq8
-    // codec loss from routing/coverage. INFINO_BENCH_RERANK_CODEC=fp32 → if the
-    // recall ceiling jumps to ~1.0, the residual gap was the Sq8 quantization.
+    // Diagnostic (env-gated): force a codec to isolate its recall/latency from
+    // routing/coverage, or to A/B the new default against the prior one.
+    // INFINO_BENCH_RERANK_CODEC=fp32 → if the recall ceiling jumps to ~1.0, the
+    // gap was quantization; =sq8_residual → A/B the pre-Sq16Adaptive default.
     let codec = match std::env::var("INFINO_BENCH_RERANK_CODEC").ok().as_deref() {
         Some("fp32") => RerankCodec::Fp32,
         Some("sq16") => RerankCodec::Sq16,
+        Some("sq16_adaptive") => RerankCodec::Sq16Adaptive,
+        Some("sq8_residual") => RerankCodec::Sq8Residual,
         Some("sq8_fixed_residual") => RerankCodec::Sq8FixedResidual,
         _ if metric == Metric::Cosine => RerankCodec::default(),
-        _ => RerankCodec::Sq8Residual,
+        _ => RerankCodec::Sq16Adaptive,
     };
     assert!(
         codec.supports_metric(metric),

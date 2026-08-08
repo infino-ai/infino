@@ -107,8 +107,17 @@ const ROT_SEED: u64 = 7;
 /// Bytes in one gibibyte, for GiB-denominated memory and report values.
 const GIB_BYTES: u64 = 1u64 << 30;
 
-/// Distance metric for the bench vector index.
-const BENCH_METRIC: Metric = Metric::Cosine;
+/// Distance metric for the bench vector index. Defaults to cosine (the
+/// historical baseline, so existing bench deltas are unchanged);
+/// `INFINO_BENCH_METRIC=l2sq|negdot` selects an unbounded metric so CI can
+/// exercise the `Sq16Adaptive` default rather than only the cosine `Sq16` path.
+fn bench_metric() -> Metric {
+    match std::env::var("INFINO_BENCH_METRIC").ok().as_deref() {
+        Some("l2sq") | Some("l2") => Metric::L2Sq,
+        Some("negdot") | Some("dot") => Metric::NegDot,
+        _ => Metric::Cosine,
+    }
+}
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Table-doc-count boundary for the bench's pinned CELL-GRID shape:
@@ -317,8 +326,8 @@ pub fn options_for(
             column: VEC_COLUMN.into(),
             dim: DIM,
             rot_seed: ROT_SEED,
-            metric: BENCH_METRIC,
-            rerank_codec: corpus::bench_rerank_codec(BENCH_METRIC),
+            metric: bench_metric(),
+            rerank_codec: corpus::bench_rerank_codec(bench_metric()),
         }]
     } else {
         vec![]
@@ -350,8 +359,10 @@ pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
         vec_seed: CORPUS_VEC_SEED,
         text_seed: CORPUS_TEXT_SEED,
         rot_seed: ROT_SEED,
-        metric: format!("{BENCH_METRIC:?}"),
-        rerank_codec: corpus::bench_rerank_codec(BENCH_METRIC).name().to_string(),
+        metric: format!("{:?}", bench_metric()),
+        rerank_codec: corpus::bench_rerank_codec(bench_metric())
+            .name()
+            .to_string(),
         modality: format!("{modality:?}"),
     }
 }

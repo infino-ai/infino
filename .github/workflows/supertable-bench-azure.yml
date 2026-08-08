@@ -98,6 +98,10 @@ on:
     inputs:
       bench:           { type: string, required: false, default: supertable_all }
       docs:            { type: string, required: false, default: "1000000" }
+      # Vector metric: ""/cosine → the cosine Sq16 path; l2sq|negdot → the
+      # unbounded metrics whose default codec is Sq16Adaptive. Passed to the
+      # bench as INFINO_BENCH_METRIC. (Empty on legs that don't set it → cosine.)
+      metric:          { type: string, required: false, default: "" }
       vm_size:         { type: string, required: false, default: "Standard_D8s_v7" }
       location:        { type: string, required: false, default: eastus }
       ref:             { type: string, required: false, default: main }
@@ -411,6 +415,7 @@ jobs:
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_METRIC='${{ inputs.metric }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
@@ -449,6 +454,7 @@ jobs:
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_METRIC='${{ inputs.metric }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              KEEP='${{ inputs.keep_table }}' \

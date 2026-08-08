@@ -50,6 +50,9 @@ jobs:
           - { bench: superfile,         docs: "1000000", suffix: sf }
           - { bench: supertable_fts,    docs: "1000000", suffix: st-fts }
           - { bench: supertable_vector, docs: "1000000", suffix: st-vec }
+          # Non-cosine (L2) leg: exercises the Sq16Adaptive default codec
+          # (the cosine leg above stays on the fixed-grid Sq16).
+          - { bench: supertable_vector, docs: "1000000", suffix: st-vec-l2, metric: l2sq }
           - { bench: supertable_sql,    docs: "1000000", suffix: st-sql }
     # A new push to the PR cancels the in-flight run for that bench.
     concurrency:
@@ -63,6 +66,7 @@ jobs:
     with:
       bench: ${{ matrix.bench }}
       docs: ${{ matrix.docs }}
+      metric: ${{ matrix.metric }}
       ref: ${{ github.event.pull_request.head.sha }}
       name_suffix: -${{ matrix.suffix }}
       pr_number: ${{ github.event.pull_request.number }}
