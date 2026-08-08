@@ -629,10 +629,14 @@ mod codec_verify_tests {
     use bytes::Bytes;
 
     use super::verify_superfile_vector_codecs;
-    use crate::superfile::SuperfileReader;
-    use crate::superfile::builder::{BuilderOptions, SuperfileBuilder, VectorConfig};
-    use crate::superfile::vector::{distance::Metric, rerank_codec::RerankCodec};
-    use crate::test_helpers::{decimal128_id_field, decimal128_ids, default_vector_config};
+    use crate::{
+        superfile::{
+            SuperfileReader,
+            builder::{BuilderOptions, SuperfileBuilder, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        test_helpers::{decimal128_id_field, decimal128_ids, default_vector_config},
+    };
 
     const DIM: usize = 16;
 

@@ -59,7 +59,10 @@ use serde::{Deserialize, Serialize};
 use crate::superfile::{
     BuildError,
     vector::{
-        cell_posting::{EncodedCellRow, residual_family_materialize_into_cluster_quant},
+        cell_posting::{
+            EncodedCellRow, note_transcode_clamped_components,
+            residual_family_materialize_into_cluster_quant,
+        },
         distance::{
             Metric, SQ8_RESIDUAL_DIVISOR, dequantize_sq8_residual_into,
             dequantize_sq16_adaptive_into, dequantize_sq16_into, encode_sq16_adaptive_row,
@@ -970,7 +973,7 @@ impl RerankCodecOps for Sq16AdaptiveOps {
         let mut decoded = vec![0.0f32; dim];
         dequantize_sq16_adaptive_into(&row.codes, &row.scale, &row.offset, &mut decoded);
         let clamped = encode_sq16_adaptive_row(&decoded, dst_scale, dst_offset, out);
-        super::cell_posting::note_transcode_clamped_components(clamped);
+        note_transcode_clamped_components(clamped);
         Ok(store_norm.then(|| sq16_adaptive_norm_sq(out, dim, dst_scale, dst_offset)))
     }
 

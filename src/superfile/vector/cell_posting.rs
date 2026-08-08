@@ -1331,4 +1331,43 @@ mod tests {
             "a covering destination grid never clamps"
         );
     }
+
+    /// Parity with the Sq8 tripwire for the new default codec: a Sq16Adaptive
+    /// merge transcode whose destination ruler is narrower than the source
+    /// saturates the out-of-range components and bumps the same process tally,
+    /// so the compaction `BUG` line fires instead of the clamp being silent.
+    /// (The clamp itself goes away once the merge union-sizes the destination
+    /// ruler; until then it must at least be observable, never silent.)
+    #[test]
+    fn sq16_adaptive_transcode_counts_saturated_components() {
+        let dim = 4;
+        // Source ruler decodes [-2.5, 2.5] across the full u16 range.
+        let src_scale: Arc<[f32]> = vec![5.0 / f32::from(u16::MAX); dim].into();
+        let src_offset: Arc<[f32]> = vec![-2.5; dim].into();
+        // Codes decode to [2.5, -2.5, 2.5, ~0.0]: three outside [-1, 1], one fits.
+        let code_vals: [u16; 4] = [u16::MAX, 0, u16::MAX, u16::MAX / 2];
+        let codes: Vec<u8> = code_vals.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let row = EncodedCellRow {
+            stable_id: 0,
+            rerank_codec: RerankCodec::Sq16Adaptive,
+            scale: src_scale,
+            offset: src_offset,
+            codes,
+            residuals: Vec::new(),
+            norm_sq: None,
+        };
+        // Destination ruler covers only [-1, 1] (single u16 plane, no residual).
+        let dst_scale = vec![2.0 / f32::from(u16::MAX); dim];
+        let dst_offset = vec![-1.0f32; dim];
+        let mut out = vec![0u8; dim * 2];
+        let ops = RerankCodec::Sq16Adaptive.ops().expect("Sq16Adaptive ops");
+        let before = transcode_clamped_components();
+        ops.materialize_row_into_cluster_quant(&row, &dst_scale, &dst_offset, dim, &mut out, false)
+            .expect("transcode");
+        assert_eq!(
+            transcode_clamped_components() - before,
+            3,
+            "the three components outside the destination ruler must be counted, not silently clamped"
+        );
+    }
 }
