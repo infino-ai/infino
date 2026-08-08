@@ -107,11 +107,16 @@ pub(crate) const SQ8_FIXED_SCALE: f32 = 2.0 / 255.0;
 /// Residual divisor for the portable cosine-only Sq8 grid.
 pub(crate) const SQ8_FIXED_RESIDUAL_DIVISOR: f32 = 256.0;
 
+/// Largest code value of a single `u16` rerank plane. The single point of
+/// truth for the 16-bit range, shared by [`SQ16_FIXED_SCALE`], the codec's
+/// [`RerankCodec::code_max`], and the encode/dequant math in `distance.rs`, so
+/// the ruler and the plane width can't silently disagree.
+pub(crate) const SQ16_CODE_MAX: f32 = 65535.0;
 /// Absolute offset for the flat cosine-only Sq16 grid.
 pub(crate) const SQ16_FIXED_OFFSET: f32 = -1.0;
 /// Absolute scale for the flat cosine-only Sq16 grid: the full
-/// `u16` range (`0..=65535`) spans `[-1, 1]` in even steps.
-pub(crate) const SQ16_FIXED_SCALE: f32 = 2.0 / 65535.0;
+/// `u16` range (`0..=SQ16_CODE_MAX`) spans `[-1, 1]` in even steps.
+pub(crate) const SQ16_FIXED_SCALE: f32 = 2.0 / SQ16_CODE_MAX;
 
 /// Per-vector-index rerank codec. Picks the on-disk byte layout of the
 /// per-vector rerank values inside the subsection's `full[]`
@@ -343,7 +348,7 @@ impl RerankCodec {
     #[inline]
     pub const fn code_max(self) -> f32 {
         if self.writes_single_u16_plane() {
-            65535.0
+            SQ16_CODE_MAX
         } else {
             255.0
         }

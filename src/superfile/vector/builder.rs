@@ -2083,7 +2083,8 @@ pub(crate) fn build_cell_subsection_from_source(
                 .any(|row| row.encoded.rerank_codec != cfg.rerank_codec)
             {
                 return Err(BuildError::VectorSchemaMismatch(
-                    "materialized IVF rebuild requires one matching residual-family codec".into(),
+                    "materialized IVF rebuild requires every row to share the table's rerank codec"
+                        .into(),
                 ));
             }
         }

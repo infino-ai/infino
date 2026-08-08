@@ -892,15 +892,15 @@ impl VectorReader {
                 VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
                      (known ids: 0=fp32, 1=sq8_residual, 2=rabitq_only, \
-                      3=sq8_fixed_residual)",
+                      3=sq8_fixed_residual, 4=sq16, 5=sq16_adaptive)",
                     cfg.column
                 )))
             })?;
             if !rerank_codec.is_implemented() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' uses rerank codec {} which is not implemented yet \
-                     (`fp32`, `sq8_residual`, `sq8_fixed_residual`, \
-                      `rabitq_only` are the supported codecs)",
+                     (`fp32`, `sq8_residual`, `sq8_fixed_residual`, `sq16`, \
+                      `sq16_adaptive`, `rabitq_only` are the supported codecs)",
                     cfg.column,
                     rerank_codec.name()
                 ))));

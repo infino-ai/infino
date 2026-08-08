@@ -938,9 +938,15 @@ pub fn load_encoded_rows_from_blob(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use super::*;
+
+    /// Serializes the tests that assert an exact delta on the process-wide
+    /// [`TRANSCODE_CLAMPED_COMPONENTS`] counter. cargo runs tests in parallel,
+    /// so without this each would observe the other's increments in its
+    /// before/after window and see the wrong count.
+    static TRANSCODE_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
     use crate::superfile::{
         builder::VectorConfig,
         vector::{
@@ -1268,6 +1274,9 @@ mod tests {
     /// whose destination covers the source adds nothing.
     #[test]
     fn transcode_counts_components_that_saturate_the_destination_grid() {
+        let _serialize = TRANSCODE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let dim = 4;
         // Source: a raw-ingest-class data-derived grid decoding [-2.5, 2.5].
         let raw_scale: Arc<[f32]> = vec![5.0 / f32::from(u8::MAX); dim].into();
@@ -1340,6 +1349,9 @@ mod tests {
     /// ruler; until then it must at least be observable, never silent.)
     #[test]
     fn sq16_adaptive_transcode_counts_saturated_components() {
+        let _serialize = TRANSCODE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let dim = 4;
         // Source ruler decodes [-2.5, 2.5] across the full u16 range.
         let src_scale: Arc<[f32]> = vec![5.0 / f32::from(u16::MAX); dim].into();

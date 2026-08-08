@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use wide::f32x8;
 
-use crate::superfile::vector::rerank_codec::{RerankCodec, SQ16_FIXED_OFFSET, SQ16_FIXED_SCALE};
+use crate::superfile::vector::rerank_codec::{
+    RerankCodec, SQ16_CODE_MAX, SQ16_FIXED_OFFSET, SQ16_FIXED_SCALE,
+};
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
@@ -58,6 +60,10 @@ pub(crate) const COSINE_DISTANCE_BASE: f32 = 1.0;
 /// `‖q − x‖² = ‖q‖² − L2_CROSS_TERM_COEFF·(q·x) + ‖x‖²`, used by the
 /// Sq8 rerank kernels that reconstruct L2 from a fused dot product.
 pub(crate) const L2_CROSS_TERM_COEFF: f32 = 2.0;
+
+/// Half-code slack before an out-of-grid `Sq16Adaptive` component counts as
+/// clamped, mirroring the residual family's tripwire tolerance.
+const SQ16_CLAMP_DETECT_SLACK_CODES: f32 = 0.5;
 
 /// Distance metric for a vector index. Stored per-column in
 /// `inf.vec.columns` JSON, applied at query time.
@@ -1202,7 +1208,7 @@ pub(crate) fn encode_sq16_row(src: &[f32], out: &mut [u8]) {
     debug_assert_eq!(out.len(), src.len() * 2);
     let inv_scale = 1.0 / SQ16_FIXED_SCALE;
     for (d, &v) in src.iter().enumerate() {
-        let code = (((v - SQ16_FIXED_OFFSET) * inv_scale).round()).clamp(0.0, 65535.0) as u16;
+        let code = (((v - SQ16_FIXED_OFFSET) * inv_scale).round()).clamp(0.0, SQ16_CODE_MAX) as u16;
         let b = d * 2;
         out[b..b + 2].copy_from_slice(&code.to_le_bytes());
     }
@@ -1283,16 +1289,19 @@ pub(crate) fn encode_sq16_adaptive_row(
     debug_assert_eq!(offset.len(), src.len());
     let mut clamped = 0u64;
     for (d, &v) in src.iter().enumerate() {
-        // A zero-span dimension (min == max) has scale 0; map every value to
-        // code 0 so decode returns the constant offset exactly.
+        // Guard a zero-span dimension: when the ruler's scale is 0, map every
+        // value to code 0 so decode returns the constant offset exactly. The
+        // build fit assigns scale = 1.0 (not 0) for a constant dim, so on the
+        // real build/merge path this is a defensive floor rather than the
+        // expected shape.
         let code = if scale[d] > 0.0 {
             let q = (v - offset[d]) / scale[d];
-            if !(-SQ16_CLAMP_DETECT_SLACK_CODES..=65535.0 + SQ16_CLAMP_DETECT_SLACK_CODES)
+            if !(-SQ16_CLAMP_DETECT_SLACK_CODES..=SQ16_CODE_MAX + SQ16_CLAMP_DETECT_SLACK_CODES)
                 .contains(&q)
             {
                 clamped += 1;
             }
-            q.round().clamp(0.0, 65535.0) as u16
+            q.round().clamp(0.0, SQ16_CODE_MAX) as u16
         } else {
             0
         };
@@ -1301,10 +1310,6 @@ pub(crate) fn encode_sq16_adaptive_row(
     }
     clamped
 }
-
-/// Half-code slack before an out-of-grid `Sq16Adaptive` component counts as
-/// clamped, mirroring the residual family's tripwire tolerance.
-const SQ16_CLAMP_DETECT_SLACK_CODES: f32 = 0.5;
 
 /// Inverse of [`encode_sq16_adaptive_row`]. `code.len() == out.len() * 2`.
 #[inline]

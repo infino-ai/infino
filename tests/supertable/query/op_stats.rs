@@ -20,8 +20,9 @@ use infino::{
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
-        builder::FtsConfig,
+        builder::{FtsConfig, VectorConfig},
         fts::reader::{Bm25Stats, BoolMode},
+        vector::rerank_codec::RerankCodec,
     },
     supertable::{
         Supertable, SupertableOptions,
@@ -230,6 +231,10 @@ fn work_stats_are_deterministic_across_cache_temperature() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+)]
 fn a_scoped_bm25_query_reports_kernel_cpu() {
     // The thread-CPU clock (schedstat) advances at scheduler events, so a
     // single microsecond kernel can legitimately read zero; a batch of
@@ -592,6 +597,88 @@ fn a_scoped_vector_query_reports_scan_and_rerank_work() {
     );
 }
 
+/// A committed + drained L2Sq vector table whose rerank codec is the
+/// non-cosine default, `Sq16Adaptive`. The other vector fixtures build the
+/// cosine/`Fp32` path, so this is the only op-stats coverage of the new
+/// default codec's rerank kernel.
+fn drained_sq16_adaptive_table(dir: &TempDir) -> Supertable {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            false,
+        ),
+    ]));
+    let vector = VectorConfig {
+        metric: Metric::L2Sq,
+        ..default_vector_config("emb", VECTOR_ROT_SEED).with_rerank_codec(RerankCodec::Sq16Adaptive)
+    };
+    let opts = SupertableOptions::new(
+        schema,
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        vec![vector],
+        Some(default_tokenizer()),
+    )
+    .expect("valid options");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(opts.with_storage(storage)).expect("create");
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&vector_batch(schema)).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    st.drain_vectors_to_cells_sync().expect("drain");
+    st
+}
+
+/// #550 kernel-CPU metering must fire for the new default codec, not only the
+/// residual/cosine paths: a drained `Sq16Adaptive` (L2Sq) table reports a
+/// non-zero rerank kernel CPU time. Regression guard for a rebase or refactor
+/// that drops the metering from the generic scorer's Sq16Adaptive arms.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+)]
+fn a_scoped_sq16_adaptive_vector_query_reports_kernel_cpu() {
+    // Same thread-CPU-clock granularity handling as the BM25 kernel-CPU test: a
+    // single tiny rerank can legitimately read zero, so batch enough queries
+    // that the cumulative bracketed time registers.
+    const KERNEL_CPU_BATCH: usize = 200;
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_sq16_adaptive_table(&dir);
+    let query = row_vec(3);
+    let (_, stats) = with_op_stats(|| {
+        for _ in 0..KERNEL_CPU_BATCH {
+            st.vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                None,
+            )
+            .expect("vector search");
+        }
+    });
+    assert!(
+        stats.vector_rows_reranked > 0,
+        "the Sq16Adaptive shortlist must rerank a non-empty winner set"
+    );
+    assert!(
+        stats.kernel_cpu_ns > 0,
+        "the Sq16Adaptive rerank kernel reports on-CPU time over {KERNEL_CPU_BATCH} queries; got 0"
+    );
+}
+
 #[test]
 fn a_full_width_probe_scans_every_row_exactly_once() {
     // nprobe >= the hidden cell count chooses every cluster, so the scan
@@ -654,6 +741,10 @@ fn a_filtered_vector_query_meters_its_predicate_leg() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+)]
 fn a_scoped_vector_query_reports_kernel_cpu() {
     // Same schedstat-resolution caveat as the FTS kernel test: batch the
     // queries so the bracketed scan + rerank sections cross scheduler
