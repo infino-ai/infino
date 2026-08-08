@@ -51,11 +51,7 @@ use super::SuperfileHit;
 use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::StorageProvider,
-    superfile::{
-        SuperfileReader,
-        builder::VectorConfig,
-        vector::{layout::VectorLayout, rerank_codec::RerankCodec},
-    },
+    superfile::{SuperfileReader, builder::VectorConfig, vector::layout::VectorLayout},
     supertable::{
         error::QueryError,
         handle::SupertableReader,
@@ -97,7 +93,20 @@ pub(crate) async fn open_reader(
     .map_err(|e| QueryError::Store(e.to_string()))
 }
 
-/// Verify that parsed on-disk vector codecs match this table's write options.
+/// Verify that each configured vector column is present in this superfile and
+/// that its stored rerank codec can actually serve the table.
+///
+/// The stored superfile codec is **authoritative**: scoring dispatches on each
+/// superfile's own codec id (per unit), so any codec that was written is scored
+/// correctly regardless of the table's *current* default. The default is not
+/// persisted — reopen re-derives it from the metric — so it can differ from what
+/// a table was created with (e.g. across a release that changes the default for
+/// a metric), and a table may legitimately hold a mix of codecs across
+/// generations. Comparing the stored codec against the re-derived default would
+/// therefore reject valid data. Instead we reject only a stored codec that
+/// genuinely cannot serve this table: one that does not support the table's
+/// metric, or a non-IVF-mergeable codec inside a multi-cell (hidden-index) unit,
+/// which requires mergeable codecs.
 pub(crate) fn verify_superfile_vector_codecs(
     reader: &SuperfileReader,
     expected: &[VectorConfig],
@@ -109,23 +118,26 @@ pub(crate) fn verify_superfile_vector_codecs(
         QueryError::Execute("superfile is missing configured vector index".into())
     })?;
     for config in expected {
-        let expected_codec = if vector.is_multi_cell() && !config.rerank_codec.is_ivf_mergeable() {
-            RerankCodec::Sq8Residual
-        } else {
-            config.rerank_codec
-        };
         let mut matched = false;
         for column in vector
             .vector_columns_config()
             .filter(|column| column.name == config.column)
         {
             matched = true;
-            if column.rerank_codec != expected_codec {
+            let stored = column.rerank_codec;
+            let usable = stored.supports_metric(config.metric)
+                && (!vector.is_multi_cell() || stored.is_ivf_mergeable());
+            if !usable {
                 return Err(QueryError::Execute(format!(
-                    "vector codec mismatch for {:?}: table expects {}, superfile stores {}",
+                    "vector codec {} stored for {:?} cannot serve this table (metric {:?}{})",
+                    stored.name(),
                     config.column,
-                    expected_codec.name(),
-                    column.rerank_codec.name()
+                    config.metric,
+                    if vector.is_multi_cell() {
+                        "; a multi-cell unit requires an IVF-mergeable codec"
+                    } else {
+                        ""
+                    },
                 )));
             }
         }
@@ -606,4 +618,76 @@ where
         }
     });
     try_join_all(handles).await
+}
+
+#[cfg(test)]
+mod codec_verify_tests {
+    use std::sync::Arc;
+
+    use arrow_array::RecordBatch;
+    use arrow_schema::Schema;
+    use bytes::Bytes;
+
+    use super::verify_superfile_vector_codecs;
+    use crate::superfile::SuperfileReader;
+    use crate::superfile::builder::{BuilderOptions, SuperfileBuilder, VectorConfig};
+    use crate::superfile::vector::{distance::Metric, rerank_codec::RerankCodec};
+    use crate::test_helpers::{decimal128_id_field, decimal128_ids, default_vector_config};
+
+    const DIM: usize = 16;
+
+    fn cfg(metric: Metric, codec: RerankCodec) -> VectorConfig {
+        VectorConfig {
+            metric,
+            ..default_vector_config("emb", 7).with_rerank_codec(codec)
+        }
+    }
+
+    /// Build one tiny single superfile whose "emb" column is written with
+    /// `codec` under `metric`, and open it as a reader.
+    fn build_reader(metric: Metric, codec: RerankCodec) -> SuperfileReader {
+        let schema = Arc::new(Schema::new(vec![decimal128_id_field("doc_id")]));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![],
+            vec![cfg(metric, codec)],
+            None,
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new builder");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(decimal128_ids(vec![10u64, 11]))])
+            .expect("batch");
+        let mut v = vec![0.0f32; 2 * DIM]; // two rows, each on a distinct axis
+        v[0] = 1.0;
+        v[DIM + 1] = 1.0;
+        b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open")
+    }
+
+    /// Regression for the backward-compat break: a table written with
+    /// `Sq8Residual` (the pre-flip L2/NegDot default) must still verify — and so
+    /// serve — when reopened under code whose re-derived default is now
+    /// `Sq16Adaptive`. The catalog does not persist the rerank codec, so reopen
+    /// rebuilds the config from the metric with the *current* default; the stored
+    /// superfile codec is authoritative, so the verifier must accept it.
+    #[test]
+    fn reopen_after_default_flip_accepts_stored_codec() {
+        let reader = build_reader(Metric::L2Sq, RerankCodec::Sq8Residual);
+        let expected = [cfg(Metric::L2Sq, RerankCodec::Sq16Adaptive)];
+        verify_superfile_vector_codecs(&reader, &expected)
+            .expect("stored Sq8Residual must be accepted under the Sq16Adaptive default");
+    }
+
+    /// The relaxation trusts *valid* stored codecs, not invalid ones: a stored
+    /// codec that cannot serve the table's metric (a fixed-grid cosine-only
+    /// `Sq16` under an L2Sq config) is still rejected.
+    #[test]
+    fn verifier_rejects_metric_incompatible_stored_codec() {
+        let reader = build_reader(Metric::Cosine, RerankCodec::Sq16);
+        let expected = [cfg(Metric::L2Sq, RerankCodec::Sq16Adaptive)];
+        assert!(
+            verify_superfile_vector_codecs(&reader, &expected).is_err(),
+            "a cosine-only Sq16 codec must not be accepted for an L2Sq table"
+        );
+    }
 }

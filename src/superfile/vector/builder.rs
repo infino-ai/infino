@@ -206,9 +206,13 @@ pub struct VectorConfig {
 /// [`crate::config::VectorSettings::rerank_codec`] (`Sq16` by default);
 /// metrics whose values are not bounded to `[-1, 1]` use the 16-bit,
 /// per-cluster-fitted [`RerankCodec::Sq16Adaptive`] — the same 2 bytes/dim as
-/// the older `Sq8Residual` but a single `u16` plane with no residual leg. A
-/// per-column codec set at table-create time overrides this default; existing
-/// `Sq8Residual` tables keep their stored codec on reopen.
+/// the older `Sq8Residual` but a single `u16` plane with no residual leg. This
+/// default only selects the codec for a **newly created** table: the codec is
+/// not persisted, so reopen re-derives it, but scoring dispatches on each
+/// superfile's own stored codec (the verifier trusts a valid stored codec over
+/// the re-derived default), so tables written before the default changed keep
+/// being served with the codec their data was written with. A per-column codec
+/// set at table-create time overrides this default.
 fn default_rerank_codec_for(metric: Metric) -> RerankCodec {
     if metric == Metric::Cosine {
         RerankCodec::default()
