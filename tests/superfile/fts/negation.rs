@@ -85,6 +85,51 @@ async fn or_single_positive_minus_negative() {
     assert_eq!(got, want, "rust -async (OR)");
 }
 
+/// Count with negation goes through the skip-based exclusion path
+/// (`atoms_match_count` with negated atoms) rather than materializing the
+/// negated union. Pin it against corpus truth for OR and AND positives
+/// with single and multiple negatives.
+#[tokio::test]
+async fn count_with_negation_matches_corpus_truth() {
+    let corp = corpus();
+    let r = build_infino_superfile(&corp);
+    async fn count(r: &SuperfileReader, pos: &[&str], mode: BoolMode, neg: &[&str]) -> u64 {
+        r.atoms_match_count("title", pos, &[], mode, neg, &[])
+            .await
+            .expect("atoms_match_count")
+            .0
+    }
+    // OR positive, one negative.
+    assert_eq!(
+        count(&r, &["rust"], BoolMode::Or, &["async"]).await,
+        exclude(or_match(&corp, &["rust"]), &corp, &["async"]).len() as u64,
+        "rust -async (OR count)"
+    );
+    // OR positive, multiple negatives.
+    assert_eq!(
+        count(&r, &["rust", "python"], BoolMode::Or, &["async", "web"]).await,
+        exclude(
+            or_match(&corp, &["rust", "python"]),
+            &corp,
+            &["async", "web"]
+        )
+        .len() as u64,
+        "rust python -async -web (OR count)"
+    );
+    // AND positive, one negative.
+    assert_eq!(
+        count(&r, &["rust", "web"], BoolMode::And, &["async"]).await,
+        exclude(and_match(&corp, &["rust", "web"]), &corp, &["async"]).len() as u64,
+        "+rust +web -async (AND count)"
+    );
+    // No negatives ⇒ identical to the plain match count (the `None`-filter walk).
+    assert_eq!(
+        count(&r, &["rust"], BoolMode::Or, &[]).await,
+        or_match(&corp, &["rust"]).len() as u64,
+        "rust (OR count, no negation)"
+    );
+}
+
 #[tokio::test]
 async fn or_multi_positive_minus_negative() {
     // "rust python -web": (rust ∪ python) minus web. Multi-term OR
