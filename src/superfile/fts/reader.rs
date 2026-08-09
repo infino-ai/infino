@@ -7521,6 +7521,19 @@ mod tests {
             !or_reroute_by_df(LONG, total, 2, 100),
             "k below the rare term's df keeps pruning alive → MaxScore"
         );
+        // Exact boundary k == rest_df: the heap needs one doc beyond the
+        // rare term's list, so pruning is already dead → reroute (the test
+        // is `>=`, so the boundary counts).
+        assert!(
+            or_reroute_by_df(LONG, total, 2, RARE as usize),
+            "k exactly at rest_df should reroute"
+        );
+        // One below the boundary (k == rest_df - 1): rare term still fills
+        // the heap, stay on MaxScore.
+        assert!(
+            !or_reroute_by_df(LONG, total, 2, RARE as usize - 1),
+            "k just below rest_df keeps pruning alive → MaxScore"
+        );
         // Long list but only one term: not an OR.
         assert!(
             !or_reroute_by_df(LONG, LONG, 1, 1000),
