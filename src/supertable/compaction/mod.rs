@@ -458,9 +458,9 @@ impl Supertable {
         if clamped_components > 0 {
             eprintln!(
                 "[supertable compaction] BUG: {clamped_components} component(s) saturated \
-                 their destination Sq8 quantizer during this pass's merges/splits (#512 \
-                 failure mode) — a destination grid failed to cover its inputs; affected \
-                 rows' recall silently degrades.",
+                 their destination quantizer during this pass's merges/splits — a \
+                 destination grid failed to cover its inputs; affected rows' recall \
+                 degrades.",
             );
         }
         Ok(())
