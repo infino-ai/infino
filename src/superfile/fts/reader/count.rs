@@ -10,7 +10,7 @@ use crate::runtime_metrics::op_stats::timed_section;
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    format::fts::{U32_BYTES, term_meta},
+    format::fts::U32_BYTES,
     fts::{
         builder::TERM_META_SIZE,
         dict::{DictReader, make_key},
@@ -19,7 +19,6 @@ use crate::superfile::{
 };
 
 use super::core::*;
-use super::cursor::TermCursor;
 use super::filter::AtomExcludeFilter;
 use super::options::BoolMode;
 use super::phrase::AnyCursor;
@@ -370,5 +369,215 @@ impl FtsReader {
     pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), FtsError> {
         let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
         Ok((dfs.pop().unwrap_or(0), work))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use crate::superfile::fts::builder::FtsBuilder;
+    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn token_match_or_unions_and_intersects_unranked() {
+        // build_blob: doc0 "rust async runtime", doc1 "tokio is a rust
+        // runtime", doc2 "java spring boot".
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+
+        // Single token → its posting list, ascending.
+        assert_eq!(
+            r.token_match("body", &["rust"], BoolMode::Or)
+                .await
+                .expect("single")
+                .0,
+            vec![0, 1]
+        );
+        // OR = union (rust ∪ java).
+        assert_eq!(
+            r.token_match("body", &["rust", "java"], BoolMode::Or)
+                .await
+                .expect("or")
+                .0,
+            vec![0, 1, 2]
+        );
+        // AND = intersection (rust ∩ runtime).
+        assert_eq!(
+            r.token_match("body", &["rust", "runtime"], BoolMode::And)
+                .await
+                .expect("and")
+                .0,
+            vec![0, 1]
+        );
+        // AND with an absent token → empty.
+        assert!(
+            r.token_match("body", &["rust", "zzz"], BoolMode::And)
+                .await
+                .expect("and absent")
+                .0
+                .is_empty()
+        );
+        // OR ignores an absent token.
+        assert_eq!(
+            r.token_match("body", &["java", "zzz"], BoolMode::Or)
+                .await
+                .expect("or absent")
+                .0,
+            vec![2]
+        );
+        // Empty token list → empty.
+        assert!(
+            r.token_match("body", &[], BoolMode::And)
+                .await
+                .expect("empty")
+                .0
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn token_match_count_matches_token_match_len() {
+        // The counting path (CountSink for AND, or_count_unranked for OR)
+        // must agree with token_match's materialized length on every
+        // shape — single token, OR union, AND intersection, absent
+        // tokens, and the empty list.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let cases: &[(&[&str], BoolMode)] = &[
+            (&["rust"], BoolMode::Or),
+            (&["rust", "java"], BoolMode::Or),
+            (&["rust", "runtime"], BoolMode::And),
+            (&["rust", "zzz"], BoolMode::And),
+            (&["java", "zzz"], BoolMode::Or),
+            (&[], BoolMode::And),
+        ];
+        for (tokens, mode) in cases {
+            let len = r
+                .token_match("body", tokens, *mode)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", tokens, *mode)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(count, len, "count vs len for {tokens:?} {mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn or_count_spans_multiple_windows() {
+        // The windowed disjunction count must equal the union's true
+        // cardinality when the doc-id space spans several OR_WINDOW
+        // windows — exercising cross-window accumulation, the per-window
+        // popcount + clear, and dedup of docs that match multiple terms
+        // within one window. The naive ascending merge (token_match
+        // length) is the reference. Tied to OR_WINDOW so it keeps crossing
+        // the boundary if the window size changes.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha "); // every doc
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let shapes: &[&[&str]] = &[
+            &["alpha"],                           // every doc
+            &["beta", "gamma"],                   // overlap on docs % 6
+            &["alpha", "beta", "gamma", "delta"], // all overlapping
+            &["gamma", "zzz_absent"],             // one absent term
+        ];
+        for terms in shapes {
+            let merge_len = r
+                .token_match("body", terms, BoolMode::Or)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", terms, BoolMode::Or)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(
+                count, merge_len,
+                "windowed count vs merge len for {terms:?}"
+            );
+        }
+        // `alpha` is in every doc, so its union count is exactly N_DOCS —
+        // pins the absolute multi-window cardinality, not just agreement
+        // with the merge.
+        assert_eq!(
+            r.token_match_count("body", &["alpha"], BoolMode::Or)
+                .await
+                .expect("count")
+                .0,
+            N_DOCS as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn term_df_reports_document_frequency() {
+        let (blob, json) = build_mixed_df_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // common → df 3 (PFOR header read), rust → df 2 (PFOR),
+        // uniqzero → df 1 (inline FST value), absent → 0.
+        assert_eq!(r.term_df("body", "common").await.expect("df").0, 3);
+        assert_eq!(r.term_df("body", "rust").await.expect("df").0, 2);
+        assert_eq!(r.term_df("body", "uniqzero").await.expect("df").0, 1);
+        assert_eq!(r.term_df("body", "missing").await.expect("df").0, 0);
+    }
+
+    #[tokio::test]
+    async fn term_df_unknown_column_errors() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let err = r.term_df("nope", "rust").await.expect_err("error");
+        assert!(matches!(err, FtsError::UnknownColumn(_)));
+    }
+
+    #[tokio::test]
+    async fn term_dfs_matches_per_term_term_df() {
+        let (blob, json) = build_mixed_df_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // Interleave the FST value kinds — PFOR (df>1), absent, inline
+        // (df=1), PFOR, absent — so a slot-mapping bug in the batched
+        // path (which fetches only the PFOR headers, then scatters the
+        // results back) would surface as a mismatch here.
+        let tokens = ["rust", "missing", "uniqzero", "common", "absent2"];
+        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs").0;
+        // Element-wise identical to resolving each token on its own.
+        let mut per_term = Vec::with_capacity(tokens.len());
+        for t in tokens {
+            per_term.push(r.term_df("body", t).await.expect("term_df").0);
+        }
+        assert_eq!(
+            batched, per_term,
+            "batched term_dfs must equal per-term term_df"
+        );
+        // …and matches the planted ground truth (common=3, rust=2,
+        // uniqzero=1 inline, absent tokens=0).
+        assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
+        // Empty input short-circuits to empty output (no dict open, no fetch).
+        assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
     }
 }

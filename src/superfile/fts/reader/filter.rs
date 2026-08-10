@@ -11,7 +11,7 @@ use crate::superfile::error::FtsError;
 
 use super::cursor::TermCursor;
 use super::phrase::AnyCursor;
-use super::work::{atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges};
+use super::work::{term_cursor_bytes, term_cursor_ranges};
 
 /// Atom-walk exclusion gate: the heterogeneous sibling of
 /// [`ExcludeFilter`], additionally able to exclude docs containing a
@@ -101,5 +101,73 @@ impl ExcludeFilter {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use crate::superfile::fts::reader::FtsReader;
+
+    // ── ExcludeFilter (negation gate) ─────────────────────────────────
+    // `build_blob` plants: "rust" in docs 0 and 1, "java" in doc 2.
+
+    /// Build an `ExcludeFilter` over `terms` from the planted blob.
+    async fn exclude_filter_for(reader: &FtsReader, terms: &[&str]) -> ExcludeFilter {
+        let column_id = reader.resolve_column_id("body").expect("column exists");
+        let cursors = reader
+            .build_term_cursors(column_id, terms, None)
+            .await
+            .expect("build cursors");
+        ExcludeFilter::new(cursors)
+    }
+
+    #[tokio::test]
+    async fn exclude_filter_rejects_docs_in_negated_list() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let mut f = exclude_filter_for(&r, &["rust"]).await;
+        // "rust" is in docs 0 and 1 → excluded; doc 2 survives.
+        assert!(!f.admits(0));
+        assert!(!f.admits(1));
+        assert!(f.admits(2));
+    }
+
+    #[tokio::test]
+    async fn exclude_filter_missing_term_excludes_nothing() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // A negated term absent from the dictionary yields no cursor, so
+        // the filter admits every doc.
+        let mut f = exclude_filter_for(&r, &["nonexistent"]).await;
+        assert!(f.admits(0));
+        assert!(f.admits(1));
+        assert!(f.admits(2));
+    }
+
+    #[tokio::test]
+    async fn exclude_filter_multiple_negated_terms() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // Negating "rust" (docs 0,1) and "java" (doc 2) excludes all
+        // three — a doc is dropped if it matches ANY negated term.
+        let mut f = exclude_filter_for(&r, &["rust", "java"]).await;
+        assert!(!f.admits(0));
+        assert!(!f.admits(1));
+        assert!(!f.admits(2));
+    }
+
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "non-monotonic")]
+    async fn exclude_filter_panics_on_non_monotonic_feed() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let mut f = exclude_filter_for(&r, &["rust"]).await;
+        // Feed a descending doc-id: `skip_to` can't seek backwards, so
+        // the debug assertion catches the contract violation.
+        let _ = f.admits(1);
+        let _ = f.admits(0);
     }
 }

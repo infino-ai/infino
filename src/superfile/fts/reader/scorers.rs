@@ -7,22 +7,18 @@
 //! reader `core` as its own `impl FtsReader` block.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
-use crate::runtime_metrics::op_stats::timed_section;
 use crate::superfile::error::FtsError;
 use crate::superfile::fts::bm25;
 
 use super::core::*;
 use super::cursor::TermCursor;
-use super::filter::{AtomExcludeFilter, ExcludeFilter};
+use super::filter::ExcludeFilter;
 use super::metadata::NormTable;
-use super::phrase::AnyCursor;
 use super::sink::{
-    AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, and_heap_push,
-    drain_top_k_desc,
+    AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
 };
-use super::work::MatchWork;
 
 impl FtsReader {
     /// Multi-term OR via WAND + BlockMaxWAND.
@@ -1499,5 +1495,571 @@ impl FtsReader {
                 self.run_windowed_union(column_id, cursors, k, None, f32::NEG_INFINITY, 0, u32::MAX)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use crate::superfile::fts::builder::FtsBuilder;
+    use crate::superfile::fts::reader::BoolMode;
+    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn token_match_doc_set_matches_bm25_for_same_terms() {
+        // token_match(Or) must return exactly the doc set bm25 ranks.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let mut bm25: Vec<u32> = r
+            .search("body", &["rust", "java"], 10, BoolMode::Or)
+            .await
+            .expect("search")
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        bm25.sort_unstable();
+        let boolean = r
+            .token_match("body", &["rust", "java"], BoolMode::Or)
+            .await
+            .expect("boolean")
+            .0;
+        assert_eq!(bm25, boolean, "boolean Or doc set == bm25 doc set");
+    }
+
+    #[tokio::test]
+    async fn exhaustive_and_bmm_agree_on_top_k() {
+        // Build a larger blob so multi-term OR queries are
+        // interesting (some docs have multiple terms, some have one).
+        // Both algorithms must return identical top-K (descending
+        // score, ascending doc_id tiebreak).
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        // 20 docs sprinkled with mixed term combinations.
+        let docs = [
+            "alpha",
+            "beta",
+            "gamma",
+            "alpha beta",
+            "alpha gamma",
+            "beta gamma",
+            "alpha beta gamma",
+            "delta",
+            "epsilon",
+            "alpha delta",
+            "beta epsilon",
+            "gamma delta",
+            "alpha beta delta",
+            "alpha epsilon gamma",
+            "delta epsilon",
+            "alpha alpha alpha",
+            "beta beta beta",
+            "gamma gamma",
+            "alpha beta gamma delta epsilon",
+            "epsilon",
+        ];
+        for (i, text) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Three terms with similar UBs — the heuristic should pick
+        // exhaustive for this shape, but we cross-check by calling
+        // both paths directly via the bench harness.
+        let terms: &[&str] = &["alpha", "beta", "gamma"];
+        let bmm = r
+            .search_with_algo_for_bench("body", terms, 5, OrAlgo::Bmm)
+            .await
+            .expect("bmm");
+        let exh = r
+            .search_with_algo_for_bench("body", terms, 5, OrAlgo::Exhaustive)
+            .await
+            .expect("exhaustive");
+        assert_eq!(bmm.len(), exh.len(), "result length mismatch");
+        for ((d_bmm, s_bmm), (d_exh, s_exh)) in bmm.iter().zip(exh.iter()) {
+            assert_eq!(d_bmm, d_exh, "doc_id mismatch");
+            assert!(
+                (s_bmm - s_exh).abs() < 1e-4,
+                "score mismatch: bmm={s_bmm} exhaustive={s_exh}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_with_algo_wand_bmw_agrees_with_bmm() {
+        // The historical WAND+BMW baseline must agree with the production
+        // BMM path on the planted corpus.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        let docs = [
+            "alpha beta",
+            "alpha",
+            "beta gamma",
+            "alpha beta gamma",
+            "gamma",
+            "alpha gamma",
+            "beta",
+            "alpha beta gamma",
+        ];
+        for (i, t) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, t).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let terms: &[&str] = &["alpha", "beta", "gamma"];
+        let bmm = r
+            .search_with_algo_for_bench("body", terms, 5, OrAlgo::Bmm)
+            .await
+            .expect("bmm");
+        let wand = r
+            .search_with_algo_for_bench("body", terms, 5, OrAlgo::WandBmw)
+            .await
+            .expect("wand");
+        assert_eq!(bmm.len(), wand.len());
+        for ((db, sb), (dw, sw)) in bmm.iter().zip(wand.iter()) {
+            assert_eq!(db, dw, "doc_id mismatch");
+            assert!((sb - sw).abs() < 1e-4, "score mismatch {sb} vs {sw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn wand_bmw_exercises_block_skips_on_multi_block_lists() {
+        // A corpus large enough that the common terms span several
+        // 128-doc posting blocks, with five query terms of differing
+        // document frequency and a handful of docs carrying all five.
+        // Running WAND+BMW at a small k forces the pivot to move, the
+        // block-upper-bound skip to fire, lagging cursors to re-align,
+        // and the 4-wide SIMD scoring pack to be used on the
+        // all-terms docs — then cross-checks the result against BMM.
+
+        /// Total planted docs; well over several `BLOCK_LEN` (128) so
+        /// the dense-term posting lists occupy multiple blocks.
+        const N_DOCS: u32 = 400;
+        /// Requested top-K — small, so the heap fills early and the
+        /// score threshold starts pruning blocks.
+        const K: usize = 5;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            // `alpha` in ~every doc, `beta` in ~half, `gamma` every
+            // 5th, `delta` every 13th, `epsilon` every 29th — a
+            // descending-df mix that makes the WAND pivot non-trivial.
+            text.push_str("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 5 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 13 == 0 {
+                text.push_str("delta ");
+            }
+            if i % 29 == 0 {
+                text.push_str("epsilon ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let terms: &[&str] = &["alpha", "beta", "gamma", "delta", "epsilon"];
+        let wand = r
+            .search_with_algo_for_bench("body", terms, K, OrAlgo::WandBmw)
+            .await
+            .expect("wand");
+        let bmm = r
+            .search_with_algo_for_bench("body", terms, K, OrAlgo::Bmm)
+            .await
+            .expect("bmm");
+        assert_eq!(wand.len(), bmm.len(), "result length mismatch");
+        assert_eq!(wand.len(), K, "expected a full top-K");
+        for ((dw, sw), (db, sb)) in wand.iter().zip(bmm.iter()) {
+            assert_eq!(dw, db, "doc_id mismatch wand={dw} bmm={db}");
+            assert!((sw - sb).abs() < 1e-4, "score mismatch {sw} vs {sb}");
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_union_agrees_with_bmm() {
+        // The windowed union scorer must return the identical top-k as
+        // the production MaxScore+BMM path — across term counts, k values,
+        // and the uniform-UB (common-term) shape it targets. N_DOCS spans
+        // multiple windows (and many BLOCK_LEN=128 posting blocks), so the
+        // walk exercises the multi-window path: base advancing to the next
+        // window, empty-window skipping, and cross-window monotonicity —
+        // not just a single window. Tied to OR_WINDOW so it keeps crossing
+        // the boundary if the window size changes.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha zeta eta theta "); // ~every doc
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            if i % 7 == 0 {
+                text.push_str("epsilon ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+        let uniform_terms: &[&str] = &["zeta", "eta", "theta"];
+        let uniform_cursors = r
+            .build_term_cursors(col, uniform_terms, None)
+            .await
+            .expect("uniform cursors");
+        assert!(
+            prefer_windowed_union(&uniform_cursors),
+            "production router should select windowed union for equal upper bounds"
+        );
+
+        let shapes: &[&[&str]] = &[
+            &["alpha", "beta"],
+            &["alpha", "beta", "gamma"],
+            &["beta", "gamma", "delta"], // no single dominator
+            &["alpha", "beta", "gamma", "delta", "epsilon"],
+            uniform_terms,
+        ];
+        for terms in shapes {
+            for k in [1usize, 5, 50, 1000] {
+                let bmm = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Bmm)
+                    .await
+                    .expect("bmm");
+                let win = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Windowed)
+                    .await
+                    .expect("windowed");
+                assert_eq!(bmm.len(), win.len(), "len mismatch {terms:?} k={k}");
+                for ((db, sb), (dw, sw)) in bmm.iter().zip(win.iter()) {
+                    assert_eq!(db, dw, "doc_id mismatch {terms:?} k={k}: bmm={db} win={dw}");
+                    assert!(
+                        (sb - sw).abs() < 1e-4,
+                        "score mismatch {terms:?} k={k}: {sb} vs {sw}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wand_bmw_2term_no_floor_agrees_with_bmm() {
+        // The small-k 2-term production path (`run_wand_bmw`) must return
+        // the identical top-k as MaxScore+BMM on the same inputs, across k.
+        // It is only reached floor-free (the dispatcher routes to MaxScore
+        // when a cross-segment floor is live), so both sides run unfloored
+        // (`NEG_INFINITY`). Multi-window corpus so WAND exercises block
+        // skips; `gamma` rarer than `beta` rarer than `alpha`.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+
+        let shapes: &[&[&str]] = &[&["alpha", "beta"], &["beta", "gamma"], &["alpha", "gamma"]];
+        for terms in shapes {
+            for k in [1usize, 5, 50, 128] {
+                let cw = r
+                    .build_term_cursors(col, terms, None)
+                    .await
+                    .expect("cursors");
+                let cb = r
+                    .build_term_cursors(col, terms, None)
+                    .await
+                    .expect("cursors");
+                let wand = r.run_wand_bmw(col, cw, k).expect("wand");
+                let bmm = r
+                    .run_max_score_bmm(col, cb, k, None, f32::NEG_INFINITY)
+                    .expect("bmm");
+                assert_eq!(wand.len(), bmm.len(), "len mismatch {terms:?} k={k}");
+                for ((dw, sw), (db, sb)) in wand.iter().zip(bmm.iter()) {
+                    assert_eq!(dw, db, "doc mismatch {terms:?} k={k}: {dw} vs {db}");
+                    assert!(
+                        (sw - sb).abs() < 1e-4,
+                        "score mismatch {terms:?} k={k}: {sw} vs {sb}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_term_rare_anchor_gates_on_df_ratio() {
+        // `df` is read onto the cursor, and the 2-term WAND router fires
+        // only when one posting list is >= WAND_BMW_2TERM_DF_RATIO× shorter
+        // than the other (a rare anchor), not when both terms are common.
+        const N_DOCS: u32 = 4000;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("common "); // every doc
+            if i % 2 == 0 {
+                text.push_str("frequent "); // half the docs
+            }
+            if i % 200 == 0 {
+                text.push_str("rare "); // ~1/200 of docs
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+
+        // common (df≈N) + rare (df≈N/200): ratio 200 ≥ 16 → anchor.
+        let anchored = r
+            .build_term_cursors(col, &["common", "rare"], None)
+            .await
+            .expect("cursors");
+        assert!(
+            two_term_has_rare_anchor(&anchored),
+            "rare+common should have a rare anchor"
+        );
+        // common (df≈N) + frequent (df≈N/2): ratio 2 < 16 → no anchor.
+        let uniform = r
+            .build_term_cursors(col, &["common", "frequent"], None)
+            .await
+            .expect("cursors");
+        assert!(
+            !two_term_has_rare_anchor(&uniform),
+            "two common terms should not anchor"
+        );
+    }
+
+    #[test]
+    fn deep_k_dominant_union_reroutes_only_when_list_is_long() {
+        // The deep-k reroute to the windowed scorer fires only when
+        // pruning is dead (k reaches the rarer terms' combined df) AND the
+        // dominant list is long enough to amortize the window setup.
+        const LONG: u64 = 3_000_000; // dominant common term
+        const RARE: u64 = 500; // rare second term
+        let total = LONG + RARE;
+
+        // Deep k (>= rest_df) over a long dominant list: reroute.
+        assert!(
+            or_reroute_by_df(LONG, total, 2, 1000),
+            "deep k over a long dominant list should reroute to windowed"
+        );
+        // Shallow k (< rest_df): the rare term still fills the heap, pruning
+        // is alive, stay on MaxScore.
+        assert!(
+            !or_reroute_by_df(LONG, total, 2, 100),
+            "k below the rare term's df keeps pruning alive → MaxScore"
+        );
+        // Exact boundary k == rest_df: the heap needs one doc beyond the
+        // rare term's list, so pruning is already dead → reroute (the test
+        // is `>=`, so the boundary counts).
+        assert!(
+            or_reroute_by_df(LONG, total, 2, RARE as usize),
+            "k exactly at rest_df should reroute"
+        );
+        // One below the boundary (k == rest_df - 1): rare term still fills
+        // the heap, stay on MaxScore.
+        assert!(
+            !or_reroute_by_df(LONG, total, 2, RARE as usize - 1),
+            "k just below rest_df keeps pruning alive → MaxScore"
+        );
+        // Long list but only one term: not an OR.
+        assert!(
+            !or_reroute_by_df(LONG, LONG, 1, 1000),
+            "single term is not a union"
+        );
+        // Small union (dominant list below the floor): too little work to
+        // amortize the window; stay on MaxScore even at deep k. This is the
+        // case that regressed before the floor was added.
+        let small = OR_WINDOWED_MIN_DOMINANT_DF - 1;
+        assert!(
+            !or_reroute_by_df(small, small + RARE, 2, 1_000_000),
+            "a union below the dominant-df floor must not reroute"
+        );
+        // Exactly at the floor with deep k: reroute.
+        assert!(
+            or_reroute_by_df(
+                OR_WINDOWED_MIN_DOMINANT_DF,
+                OR_WINDOWED_MIN_DOMINANT_DF + RARE,
+                2,
+                1000
+            ),
+            "at the dominant-df floor a deep-k union reroutes"
+        );
+    }
+
+    #[tokio::test]
+    async fn windowed_union_negation_agrees_with_bmm() {
+        // The windowed scorer applies the ExcludeFilter (negation) at
+        // drain. Drive a negated query straight through run_windowed_union
+        // and check it matches MaxScore+BMM with the same exclusion — BMM's
+        // negation is the oracle-validated reference, so equality proves
+        // the windowed filter arm. (Calls the scorers directly so the
+        // windowed arm is exercised regardless of the production dispatch.)
+        const N_DOCS: u32 = OR_WINDOW + 1000; // spans more than one window
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            if i % 7 == 0 {
+                text.push_str("epsilon ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+
+        // (positive terms, negated terms)
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["alpha", "beta", "gamma"], &["delta"]),
+            (&["beta", "gamma", "delta"], &["epsilon"]),
+            (&["alpha", "beta", "gamma", "delta"], &["epsilon", "gamma"]),
+        ];
+        for (pos, neg) in cases {
+            for k in [1usize, 5, 50] {
+                let mut wf = ExcludeFilter::new(
+                    r.build_term_cursors(col, neg, None)
+                        .await
+                        .expect("neg cursors"),
+                );
+                let win = r
+                    .run_windowed_union(
+                        col,
+                        r.build_term_cursors(col, pos, None)
+                            .await
+                            .expect("pos cursors"),
+                        k,
+                        Some(&mut wf),
+                        f32::NEG_INFINITY,
+                        0,
+                        u32::MAX,
+                    )
+                    .expect("windowed");
+                let mut bf = ExcludeFilter::new(
+                    r.build_term_cursors(col, neg, None)
+                        .await
+                        .expect("neg cursors"),
+                );
+                let bmm = r
+                    .run_max_score_bmm(
+                        col,
+                        r.build_term_cursors(col, pos, None)
+                            .await
+                            .expect("pos cursors"),
+                        k,
+                        Some(&mut bf),
+                        f32::NEG_INFINITY,
+                    )
+                    .expect("bmm");
+                assert_eq!(win.len(), bmm.len(), "len {pos:?} -{neg:?} k={k}");
+                for ((dw, sw), (db, sb)) in win.iter().zip(bmm.iter()) {
+                    assert_eq!(
+                        dw, db,
+                        "doc mismatch {pos:?} -{neg:?} k={k}: win={dw} bmm={db}"
+                    );
+                    assert!(
+                        (sw - sb).abs() < 1e-4,
+                        "score mismatch {pos:?} -{neg:?} k={k}: {sw} vs {sb}"
+                    );
+                }
+            }
+        }
+
+        // Sanity: the filter is actually active — at a high k the negated
+        // query must return strictly fewer docs than the positive-only one
+        // (the negated term excludes a non-empty set).
+        let pos: &[&str] = &["alpha", "beta", "gamma"];
+        let neg: &[&str] = &["delta"];
+        let unfiltered = r
+            .run_windowed_union(
+                col,
+                r.build_term_cursors(col, pos, None).await.expect("pos"),
+                N_DOCS as usize,
+                None,
+                f32::NEG_INFINITY,
+                0,
+                u32::MAX,
+            )
+            .expect("unfiltered");
+        let mut f = ExcludeFilter::new(r.build_term_cursors(col, neg, None).await.expect("neg"));
+        let filtered = r
+            .run_windowed_union(
+                col,
+                r.build_term_cursors(col, pos, None).await.expect("pos"),
+                N_DOCS as usize,
+                Some(&mut f),
+                f32::NEG_INFINITY,
+                0,
+                u32::MAX,
+            )
+            .expect("filtered");
+        assert!(
+            filtered.len() < unfiltered.len(),
+            "negation should drop docs: filtered={} unfiltered={}",
+            filtered.len(),
+            unfiltered.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_with_algo_empty_and_zero_k_short_circuit() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        assert!(
+            r.search_with_algo_for_bench("body", &[], 5, OrAlgo::Bmm)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert!(
+            r.search_with_algo_for_bench("body", &["rust"], 0, OrAlgo::Exhaustive)
+                .await
+                .expect("zero k")
+                .is_empty()
+        );
     }
 }

@@ -15,6 +15,8 @@ mod phrase;
 mod scorers;
 mod search;
 mod sink;
+#[cfg(test)]
+mod test_util;
 mod work;
 
 pub use core::*;

@@ -472,3 +472,132 @@ impl AnyCursor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use crate::superfile::fts::reader::FtsReader;
+    use crate::superfile::fts::reader::core::ClauseLists;
+
+    fn phrase(terms: &[&str]) -> Vec<Vec<String>> {
+        vec![terms.iter().map(|t| t.to_string()).collect()]
+    }
+
+    #[tokio::test]
+    async fn phrase_matches_adjacent_in_order_only() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let phrases = phrase(&["new", "york"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 2, 4], "adjacency in order only");
+        // Doc 4 has the phrase twice — highest tf, and with uniform
+        // doc lengths in play its score must strictly exceed doc 0's
+        // (same length, tf 1... doc 0 len 3, doc 4 len 4; tf=2 wins).
+        assert_eq!(hits[0].0, 4, "double occurrence ranks first");
+    }
+
+    #[tokio::test]
+    async fn phrase_composes_with_clauses() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let ny = phrase(&["new", "york"]);
+
+        // Must-phrase + must-term: "the" only in doc 2.
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    musts: &["the"],
+                    must_phrases: &ny,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("must phrase + term");
+        assert_eq!(
+            hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            vec![2],
+            "+\"new york\" +the"
+        );
+
+        // Negated phrase: haven-docs minus the phrase docs.
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    shoulds: &["haven"],
+                    negative_phrases: &ny,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("negated phrase");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3], "haven docs don't contain the phrase");
+    }
+
+    #[tokio::test]
+    async fn phrase_with_absent_member_matches_nothing() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let ghost = phrase(&["new", "zealand"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    must_phrases: &ghost,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("ghost phrase");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn phrase_on_positionless_column_is_typed_error() {
+        use crate::superfile::fts::builder::FtsBuilder;
+        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        b.register_column("title".into(), false).expect("register");
+        b.add_doc(0, 0, "new york").expect("add doc");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let r =
+            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
+        let phrases = phrase(&["new", "york"]);
+        let err = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect_err("must be a typed error");
+        assert!(matches!(err, FtsError::PositionsUnavailable { .. }));
+    }
+}

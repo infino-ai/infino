@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::superfile::fts::bm25;
 
-use crate::superfile::fts::tokenize::{Tokenizer, tokenizer_for_name};
+use crate::superfile::fts::tokenize::Tokenizer;
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
 ///
@@ -161,5 +161,116 @@ impl Default for OpenOptions {
 impl OpenOptions {
     pub fn for_object_store() -> Self {
         Self { verify_crc: false }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use crate::superfile::fts::builder::FtsBuilder;
+    use crate::superfile::fts::reader::FtsReader;
+    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+    use bytes::Bytes;
+
+    // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn open_with_verify_crc_off_succeeds() {
+        // The trusted-storage fast path skips the four CRC scans but must
+        // still produce a fully usable reader.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open_with(blob, &json, OpenOptions { verify_crc: false })
+            .expect("open with crc off");
+        assert_eq!(r.n_docs(), 3);
+        assert_eq!(r.fts_columns().collect::<Vec<_>>(), vec!["body"]);
+    }
+
+    #[test]
+    fn open_with_object_store_options_matches_crc_off() {
+        // `for_object_store` is the named constructor for the crc-off
+        // OpenOptions the lazy/object-store path uses.
+        let opts = OpenOptions::for_object_store();
+        assert!(!opts.verify_crc);
+        let (blob, json) = build_blob();
+        FtsReader::open_with(blob, &json, opts).expect("open object-store options");
+    }
+
+    #[test]
+    fn default_open_options_verifies_crc() {
+        assert!(OpenOptions::default().verify_crc);
+    }
+
+    #[test]
+    fn default_tokenizer_helper_is_ascii_lower() {
+        assert_eq!(default_tokenizer(), "ascii_lower");
+    }
+
+    #[test]
+    fn fts_column_config_missing_tokenizer_defaults() {
+        // A column JSON without the optional `tokenizer` field decodes to
+        // the ascii_lower default (round-trips an old file written before
+        // the field existed).
+        let (blob, _) = build_blob();
+        let json = r#"[{"name":"body"}]"#;
+        let r = FtsReader::open(blob, json).expect("open with terse json");
+        let cfg = r.fts_columns_config().next().expect("one column");
+        assert_eq!(cfg.name, "body");
+    }
+
+    #[test]
+    fn fts_columns_config_exposes_per_column_metadata() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let cols: Vec<&ColumnMeta> = r.fts_columns_config().collect();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "body");
+        // Three non-empty docs ⇒ a positive average doc length and a
+        // populated per-doc normalization table.
+        assert!(cols[0].avgdl > 0.0);
+        assert_eq!(cols[0].dl_norm_k1.len(), 3);
+    }
+
+    #[test]
+    fn norm_table_footprint_is_one_byte_per_doc() {
+        // Memory guard: the resident length-norm table must stay at one
+        // byte per doc (plus the fixed 256-entry decode LUT), not the
+        // 4-byte-per-doc `f32` table it replaced. Build enough
+        // varied-length docs that the per-doc term dominates the LUT.
+        const N: u32 = 5_000;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        for d in 0..N {
+            // Lengths cycle 1..=40 tokens so norms span many buckets and
+            // the table isn't a degenerate single value.
+            let words = (d % 40) + 1;
+            let text: String = (0..words).map(|w| format!("t{}x{w} ", d % 97)).collect();
+            b.add_doc(0, d, text.trim()).expect("add doc");
+        }
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+        let nt = &r.columns[0].dl_norm_k1;
+
+        let per_doc = nt.bytes.capacity(); // 1 byte/doc
+        let lut = std::mem::size_of_val(&*nt.lut); // 256 * 4 = 1 KiB
+        let m2_bytes = per_doc + lut;
+        let f32_baseline = N as usize * std::mem::size_of::<f32>();
+
+        assert_eq!(nt.bytes.len(), N as usize, "one bucket byte per doc");
+        assert_eq!(nt.lut.len(), 256, "fixed 256-entry decode table");
+        // The whole point: strictly smaller than the old f32 table, and
+        // asymptotically 4× smaller (per-doc term is 1 byte vs 4).
+        assert!(
+            m2_bytes < f32_baseline,
+            "norm table {m2_bytes} B not smaller than f32 baseline {f32_baseline} B"
+        );
+        assert_eq!(
+            per_doc * 4,
+            f32_baseline,
+            "per-doc term is exactly 4× smaller"
+        );
     }
 }

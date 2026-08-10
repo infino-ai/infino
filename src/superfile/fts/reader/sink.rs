@@ -263,3 +263,18 @@ pub(super) fn and_heap_push(
         heap.push(TopKEntry(score, doc_id));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_top_k_desc_orders_descending_with_tiebreak() {
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        heap.push(TopKEntry(1.0, 4));
+        heap.push(TopKEntry(2.0, 1));
+        heap.push(TopKEntry(2.0, 0)); // tie with doc 1
+        let out = drain_top_k_desc(heap);
+        assert_eq!(out, vec![(0, 2.0), (1, 2.0), (4, 1.0)]);
+    }
+}
