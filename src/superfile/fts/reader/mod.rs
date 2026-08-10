@@ -7,6 +7,7 @@
 
 mod core;
 mod cursor;
+mod filter;
 mod phrase;
 mod work;
 

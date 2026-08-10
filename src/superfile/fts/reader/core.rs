@@ -25,6 +25,7 @@ use std::{
 use bytes::Bytes;
 
 use super::cursor::{BlockMeta, TermCursor, TermMeta};
+use super::filter::{AtomExcludeFilter, ExcludeFilter};
 use super::phrase::{AnyCursor, PhraseCursor};
 use super::work::{
     MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
@@ -4503,97 +4504,6 @@ fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
             .then(a.0.cmp(&b.0))
     });
     out
-}
-
-/// Atom-walk exclusion gate: the heterogeneous sibling of
-/// [`ExcludeFilter`], additionally able to exclude docs containing a
-/// negated *phrase*. Same monotonic-doc contract.
-struct AtomExcludeFilter {
-    atoms: Vec<AnyCursor>,
-    last_doc: u32,
-}
-
-impl AtomExcludeFilter {
-    fn new(atoms: Vec<AnyCursor>) -> Self {
-        Self { atoms, last_doc: 0 }
-    }
-
-    /// `false` iff `doc` matches any negated atom.
-    fn admits(&mut self, doc: u32) -> Result<bool, FtsError> {
-        debug_assert!(
-            doc >= self.last_doc,
-            "AtomExcludeFilter fed non-monotonic doc: {doc} < {}",
-            self.last_doc
-        );
-        self.last_doc = doc;
-        for a in &mut self.atoms {
-            a.skip_to(doc)?;
-            if !a.is_exhausted() && a.current_doc_id() == doc {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-}
-
-/// Exclusion gate for negated (`-term`) clauses: holds one
-/// [`TermCursor`] per negated term, streamed with `skip_to` (a common
-/// negated list is never fully decoded). A doc is rejected if it appears
-/// in any negated term's list.
-///
-/// Kernels take `Option<&mut ExcludeFilter>` (`None` = no negation)
-/// rather than a generic filter parameter: monomorphizing the OR kernel
-/// measured 25-30% slower even with a no-op filter, while the `None`
-/// branch is constant per query, perfectly predicted, and free.
-pub(crate) struct ExcludeFilter {
-    cursors: Vec<TermCursor>,
-    /// Last doc-id passed to `admits`; guards the monotonic call order.
-    last_doc: u32,
-}
-
-impl ExcludeFilter {
-    fn new(cursors: Vec<TermCursor>) -> Self {
-        Self {
-            cursors,
-            last_doc: 0,
-        }
-    }
-
-    /// Posting-list bytes the negation cursors index into — see
-    /// [`PreparedClauses::postings_bytes`].
-    fn postings_bytes(&self) -> u64 {
-        term_cursor_bytes(&self.cursors)
-    }
-
-    /// Byte-source ranges the negation cursors' builds requested (one per
-    /// PFOR term) — see [`PreparedClauses::planned_ranges`].
-    fn planned_ranges(&self) -> u64 {
-        term_cursor_ranges(&self.cursors)
-    }
-}
-
-impl ExcludeFilter {
-    /// `false` iff `doc` is in any negated list.
-    ///
-    /// `doc` must be non-decreasing across a search: `skip_to` only
-    /// moves forward. Every kernel walks candidates ascending, so this
-    /// holds; the debug-assert guards a future caller that breaks it.
-    #[inline]
-    fn admits(&mut self, doc: u32) -> bool {
-        debug_assert!(
-            doc >= self.last_doc,
-            "ExcludeFilter fed non-monotonic doc: {doc} < {}",
-            self.last_doc
-        );
-        self.last_doc = doc;
-        for c in &mut self.cursors {
-            c.skip_to(doc);
-            if !c.is_exhausted() && c.current_doc_id() == doc {
-                return false;
-            }
-        }
-        true
-    }
 }
 
 /// Per-hit action for the multi-term AND flat-merge intersection.
