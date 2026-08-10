@@ -8,9 +8,11 @@
 mod core;
 mod cursor;
 mod filter;
+mod options;
 mod phrase;
 mod sink;
 mod work;
 
 pub use core::*;
+pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub use work::MatchWork;
