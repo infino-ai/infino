@@ -6,6 +6,7 @@
 //! re-exports the surface callers reach as `fts::reader::*`.
 
 mod core;
+mod count;
 mod cursor;
 mod filter;
 mod options;
