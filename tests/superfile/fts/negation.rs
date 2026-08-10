@@ -15,7 +15,8 @@ use std::collections::HashSet;
 use infino::superfile::{SuperfileReader, fts::reader::BoolMode};
 
 use crate::fts::brute_force_oracle::{
-    build_infino_superfile, build_multi_block_corpus, build_multi_block_reader, corpus,
+    build_infino_superfile, build_infino_superfile_positional, build_multi_block_corpus,
+    build_multi_block_reader, corpus,
 };
 
 // ── corpus-truth helpers ──────────────────────────────────────────────
@@ -50,6 +51,22 @@ fn and_match(corp: &[(u64, &str)], terms: &[&str]) -> HashSet<u64> {
 fn exclude(base: HashSet<u64>, corp: &[(u64, &str)], negatives: &[&str]) -> HashSet<u64> {
     let drop: HashSet<u64> = or_match(corp, negatives);
     base.difference(&drop).copied().collect()
+}
+
+/// Doc-ids whose text contains `phrase` as a contiguous, in-order token run.
+fn docs_with_phrase(corp: &[(u64, &str)], phrase: &[&str]) -> HashSet<u64> {
+    corp.iter()
+        .filter(|(_, t)| {
+            let toks: Vec<&str> = t.split_whitespace().collect();
+            toks.windows(phrase.len()).any(|w| w == phrase)
+        })
+        .map(|(i, _)| *i)
+        .collect()
+}
+
+/// A phrase as the `&[Vec<String>]` the count/search API expects.
+fn phrase(tokens: &[&str]) -> Vec<Vec<String>> {
+    vec![tokens.iter().map(|t| t.to_string()).collect()]
 }
 
 /// Run a query and collect the result doc-ids as a set.
@@ -92,7 +109,9 @@ async fn or_single_positive_minus_negative() {
 #[tokio::test]
 async fn count_with_negation_matches_corpus_truth() {
     let corp = corpus();
-    let r = build_infino_superfile(&corp);
+    // Positional index so the phrase cases below can run; term-only counts
+    // are identical on a positional index.
+    let r = build_infino_superfile_positional(&corp);
     async fn count(r: &SuperfileReader, pos: &[&str], mode: BoolMode, neg: &[&str]) -> u64 {
         r.atoms_match_count("title", pos, &[], mode, neg, &[])
             .await
@@ -128,6 +147,50 @@ async fn count_with_negation_matches_corpus_truth() {
         or_match(&corp, &["rust"]).len() as u64,
         "rust (OR count, no negation)"
     );
+
+    // Positive phrase + negated term: +"web framework" -go. Docs with the
+    // adjacent phrase, minus docs containing "go" (drops doc 7, keeps 8).
+    let got = r
+        .atoms_match_count(
+            "title",
+            &[],
+            &phrase(&["web", "framework"]),
+            BoolMode::And,
+            &["go"],
+            &[],
+        )
+        .await
+        .expect("atoms_match_count")
+        .0;
+    let want = exclude(
+        docs_with_phrase(&corp, &["web", "framework"]),
+        &corp,
+        &["go"],
+    );
+    assert_eq!(
+        got,
+        want.len() as u64,
+        "+\"web framework\" -go (phrase + neg term)"
+    );
+
+    // Negated phrase: web -"web framework". Docs with "web", minus docs where
+    // it is the adjacent phrase — keeps doc 4 ("web" but not "web framework").
+    let got = r
+        .atoms_match_count(
+            "title",
+            &["web"],
+            &[],
+            BoolMode::Or,
+            &[],
+            &phrase(&["web", "framework"]),
+        )
+        .await
+        .expect("atoms_match_count")
+        .0;
+    let base = docs_with(&corp, "web");
+    let drop = docs_with_phrase(&corp, &["web", "framework"]);
+    let want = base.difference(&drop).count() as u64;
+    assert_eq!(got, want, "web -\"web framework\" (term + neg phrase)");
 }
 
 #[tokio::test]
