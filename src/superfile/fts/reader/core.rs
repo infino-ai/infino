@@ -3,7 +3,7 @@
 
 //! FTS blob reader. Multi-column BM25 search.
 //!
-//! Opens the byte layout produced by [`super::builder::FtsBuilder::finish`]
+//! Opens the byte layout produced by [`crate::superfile::fts::builder::FtsBuilder::finish`]
 //! and exposes BM25 search per-column or weighted across columns.
 //!
 //! See `docs/architecture/superfile.md` for the on-disk layout.
