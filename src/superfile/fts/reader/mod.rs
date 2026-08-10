@@ -6,5 +6,6 @@
 //! re-exports the surface callers reach as `fts::reader::*`.
 
 mod core;
+mod cursor;
 
 pub use core::*;
