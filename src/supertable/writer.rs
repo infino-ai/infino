@@ -4262,10 +4262,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     if clamped_components > 0 {
         eprintln!(
             "[supertable drain] BUG: {clamped_components} component(s) saturated their \
-             destination Sq8 quantizer during this drain's re-encodes (#512 failure \
-             mode). Cosine: an ingest path bypassed normalization; L2/NegDot: a \
-             destination grid failed to cover its inputs. Affected rows' recall \
-             silently degrades — find the source and rebuild the table.",
+             destination quantizer during this drain's re-encodes. Cosine: an ingest \
+             path bypassed normalization; L2/NegDot: a destination grid failed to \
+             cover its inputs. Affected rows' recall degrades — find the source and \
+             rebuild the table.",
         );
     }
     // Membership has settled: publish the slow-CAS entry blob and stamp its
