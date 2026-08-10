@@ -8,5 +8,7 @@
 mod core;
 mod cursor;
 mod phrase;
+mod work;
 
 pub use core::*;
+pub use work::MatchWork;
