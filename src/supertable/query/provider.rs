@@ -126,6 +126,12 @@ use crate::{
 /// resolving filter columns to a physical pruning predicate.
 pub(crate) const TABLE_NAME: &str = "supertable";
 
+/// Distance between the endpoints of a min/max range that covers a
+/// 64-bit column type's entire domain (`0 ..= u64::MAX` for `UInt64`,
+/// `i64::MIN ..= i64::MAX` for `Int64`, and the same span for `Date64`
+/// / `Timestamp`). See [`spans_full_domain`].
+const FULL_DOMAIN_ENDPOINT_DISTANCE: u64 = u64::MAX;
+
 /// Object-store URL *prefix* the surviving superfiles are registered under
 /// for a scan. The authority is arbitrary — only a key into the session's
 /// object-store registry — but it must be **unique per provider**: a
@@ -599,7 +605,11 @@ impl SupertableProvider {
                     return stats;
                 }
                 let mut stats = ColumnStatistics::new_unknown();
-                if let Some((min, max)) = scalar_min_max(entries, name) {
+                // A range covering the column type's whole domain is
+                // withheld rather than reported — see `spans_full_domain`.
+                if let Some((min, max)) = scalar_min_max(entries, name)
+                    && !spans_full_domain(&min, &max)
+                {
                     stats.min_value = wrap(min);
                     stats.max_value = wrap(max);
                 }
@@ -709,6 +719,68 @@ fn scalar_min_max(
         };
     }
     acc
+}
+
+/// Whether `[min, max]` covers the column type's entire domain — the one
+/// range shape whose bounds are withheld from the statistics reported to
+/// the query planner.
+///
+/// # Why the bounds are withheld
+///
+/// The planner turns reported bounds into an interval and counts the
+/// values that interval holds as `max - min + 1`. A whole-domain range
+/// needs `u64::MAX + 1`, which does not fit the `u64` the count comes
+/// back in. The addition wraps to zero, the planner then divides by that
+/// count while estimating how many rows a filter keeps, and the resulting
+/// non-finite estimate trips an internal assertion — so every `<`, `>`,
+/// and `BETWEEN` on the column fails before it runs. `=` and a boundary
+/// `>=` escape only because they collapse the interval to a single point
+/// and take a distinct-count path that never divides, which is what makes
+/// the failure look arbitrary from the outside. Reporting no bounds
+/// instead routes the estimate through the planner's existing
+/// "range unknown" fallback.
+///
+/// # What withholding costs
+///
+/// Nothing for filtering: a range spanning every representable value
+/// excludes no row, so it could never have skipped a superfile, a row
+/// group, or a page. The planner also loses the ability to fold an
+/// unfiltered `MIN(col)` / `MAX(col)` out of these statistics — but the
+/// covered-aggregate rewrite folds those from the manifest directly and
+/// still answers them without a scan.
+///
+/// # Scope
+///
+/// The test is on the span, not on the type: any 64-bit-wide integer or
+/// temporal column reaches it once both endpoints appear in the data
+/// (`UInt64`, `Int64`, `Date64`, `Timestamp`). Narrower types cannot span
+/// far enough. Decimals are unaffected because the planner declines to
+/// count their intervals at all. Bounds are folded across every surviving
+/// superfile before this runs, so two superfiles that each contribute one
+/// endpoint trip it exactly as one superfile holding both does.
+///
+/// Floating-point columns are excluded, and the exclusion is load-bearing
+/// rather than cosmetic. The planner counts a float interval by the
+/// distance between the endpoints' *bit patterns*, and already returns no
+/// count when that saturates — floats were never exposed to the overflow.
+/// The endpoint distance used here is a difference in *value*, which for a
+/// wide float range is astronomically larger than any integer domain and
+/// saturates on the cast to an integer. Without this exclusion, an
+/// ordinary wide `Float64` column would match and lose its bounds for no
+/// reason.
+///
+/// # Removing this guard
+///
+/// TODO: delete this once the engine moves to DataFusion 55. The overflow
+/// is fixed upstream by DataFusion PR #22309, "Return None for cardinality
+/// overflow", which makes the count a checked add and returns no count on
+/// overflow — the same fallback this guard forces by hand. That fix landed
+/// after the 54 release branch was cut and was not backported, so 54.x
+/// still needs this.
+fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
+    !min.data_type().is_floating()
+        && max.distance(min).and_then(|d| u64::try_from(d).ok())
+            == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
@@ -2485,6 +2557,58 @@ mod tests {
         assert_eq!(cs.max_value, Precision::Exact(ScalarValue::Int64(Some(20))));
         // One null planted in superfile 1.
         assert_eq!(cs.null_count, Precision::Exact(1));
+    }
+
+    /// A whole-domain min/max range is withheld from the reported
+    /// statistics; anything narrower is reported as usual. See
+    /// [`spans_full_domain`] for why the widest range is the harmful one.
+    #[test]
+    fn whole_domain_bounds_are_withheld_from_reported_statistics() {
+        let full = [
+            (
+                ScalarValue::UInt64(Some(0)),
+                ScalarValue::UInt64(Some(u64::MAX)),
+            ),
+            (
+                ScalarValue::Int64(Some(i64::MIN)),
+                ScalarValue::Int64(Some(i64::MAX)),
+            ),
+        ];
+        for (min, max) in &full {
+            assert!(spans_full_domain(min, max), "{min} .. {max}");
+        }
+
+        let narrower = [
+            (
+                ScalarValue::UInt64(Some(0)),
+                ScalarValue::UInt64(Some(u64::MAX - 1)),
+            ),
+            (
+                ScalarValue::UInt64(Some(1)),
+                ScalarValue::UInt64(Some(u64::MAX)),
+            ),
+            (
+                ScalarValue::Int64(Some(i64::MIN + 1)),
+                ScalarValue::Int64(Some(i64::MAX)),
+            ),
+            (ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(20))),
+            // A float range wider than any integer domain: the planner
+            // counts float intervals by bit pattern, not by value, and
+            // already guards that path.
+            (
+                ScalarValue::Float64(Some(f64::MIN)),
+                ScalarValue::Float64(Some(f64::MAX)),
+            ),
+            // A singleton, and a type the planner never counts anyway.
+            (ScalarValue::UInt64(Some(7)), ScalarValue::UInt64(Some(7))),
+            (
+                ScalarValue::LargeUtf8(Some("alpha".into())),
+                ScalarValue::LargeUtf8(Some("omega".into())),
+            ),
+        ];
+        for (min, max) in &narrower {
+            assert!(!spans_full_domain(min, max), "{min} .. {max}");
+        }
     }
 
     /// A superfile entry carrying only min/max for `col` (no null count,
