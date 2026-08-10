@@ -362,7 +362,7 @@ async fn unranked_ids_and_count_agree_with_oracle() {
             );
 
             let count = r
-                .atoms_match_count("title", &terms, &phrases, mode)
+                .atoms_match_count("title", &terms, &phrases, mode, &[], &[])
                 .await
                 .expect("atoms_match_count")
                 .0;

@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
+// Absent values on the way back out.
+//
 // Null handling on the row-object append path: a nullable field that is
 // omitted from a row must store SQL NULL, exactly like passing `null`
 // explicitly — never a type's zero value. Also covers the Boolean column
 // edge where every value in a batch is null.
+//
+// Also the whole result: a query that matches nothing must decode to `[]`.
+// A zero-row result still ships a schema over Arrow IPC, and a plain (non-FTS)
+// string column is scanned as `Utf8View`, which `apache-arrow` cannot decode.
+// A view leaking there fails the call with
+// `Unrecognized type: "undefined" (24)`.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -26,6 +34,18 @@ const makeTable = (db, name, colName, type) =>
 // Read back the row for `id` and the table-wide IS NULL count for `col`.
 const nullCount = (db, table, col) =>
   Number(db.querySql(`SELECT count(*) AS c FROM ${table} WHERE ${col} IS NULL`)[0].c);
+
+// `id` is FTS-indexed, so it keeps its stored type. `body` is the plain
+// string column that gets viewed for the scan.
+const makeDocs = () => {
+  const db = connect("memory://");
+  const docs = makeTable(db, "docs", "body", new LargeUtf8());
+  docs.append([
+    { id: "present", body: "hello world" },
+    { id: "other", body: "goodbye" },
+  ]);
+  return { db, docs };
+};
 
 test("omitted nullable Int32 stores null, not 0", () => {
   const db = connect("memory://");
@@ -127,4 +147,68 @@ test("update accepts an all-null Bool replacement batch", () => {
 
   t.update("id = 'a'", [{ id: "a", flag: null }]);
   assert.deepEqual(db.querySql("SELECT flag FROM t WHERE id = 'a'"), [{ flag: null }]);
+});
+
+test("zero-match SELECT of a scalar string column returns []", () => {
+  const { db } = makeDocs();
+
+  // Control: the same query against a value that exists.
+  assert.deepEqual(db.querySql("SELECT body FROM docs WHERE id = 'present'"), [
+    { body: "hello world" },
+  ]);
+
+  assert.deepEqual(db.querySql("SELECT body FROM docs WHERE id = 'missing'"), []);
+});
+
+test("zero-match SELECT of the indexed column returns []", () => {
+  const { db } = makeDocs();
+
+  assert.deepEqual(db.querySql("SELECT id FROM docs WHERE id = 'missing'"), []);
+});
+
+test("zero-match SELECT * returns []", () => {
+  const { db } = makeDocs();
+
+  assert.deepEqual(db.querySql("SELECT * FROM docs WHERE id = 'missing'"), []);
+});
+
+// A table queried before its first append hits the same path, and is the way
+// most users meet it.
+test("SELECT from a table with no rows returns []", () => {
+  const db = connect("memory://");
+  makeTable(db, "docs", "body", new LargeUtf8());
+
+  assert.deepEqual(db.querySql("SELECT body FROM docs"), []);
+  assert.deepEqual(db.querySql("SELECT * FROM docs"), []);
+});
+
+// An aggregate always emits a batch, so it never synthesized a schema.
+test("zero-match COUNT(*) still returns one zero row", () => {
+  const { db } = makeDocs();
+
+  assert.deepEqual(db.querySql("SELECT COUNT(*) AS n FROM docs WHERE id = 'missing'"), [
+    { n: 0n },
+  ]);
+});
+
+test("zero-match SELECT with arrow:true yields an empty table with a readable schema", () => {
+  const { db } = makeDocs();
+
+  const table = db.querySql("SELECT body FROM docs WHERE id = 'missing'", { arrow: true });
+  assert.equal(table.numRows, 0);
+  assert.deepEqual(
+    table.schema.fields.map((f) => f.name),
+    ["body"],
+  );
+  // Same string type as a query that matches.
+  const matched = db.querySql("SELECT body FROM docs WHERE id = 'present'", { arrow: true });
+  assert.equal(String(table.schema.fields[0].type), String(matched.schema.fields[0].type));
+});
+
+test("zero-hit searches return []", () => {
+  const { docs } = makeDocs();
+
+  assert.deepEqual(docs.bm25Search("id", "missing", 10), []);
+  assert.deepEqual(docs.tokenMatch("id", "missing"), []);
+  assert.deepEqual(docs.exactMatch("id", "missing"), []);
 });

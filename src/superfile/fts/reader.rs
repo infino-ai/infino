@@ -1772,6 +1772,8 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Vec<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
@@ -1785,9 +1787,32 @@ impl FtsReader {
         if missing_and_atom || atoms.is_empty() {
             return Ok((0, work));
         }
+        // Negated clauses become a skip-based exclusion gate, never a
+        // materialized set: each surviving positive doc is `skip_to`-probed
+        // against the negated cursors, so a common negated term's long list
+        // is only partially decoded. Empty ⇒ `None`, the same walk as an
+        // unnegated count.
+        let mut filter = None;
+        if !neg_terms.is_empty() || !neg_phrases.is_empty() {
+            let (neg_built, neg_dict_ranges) = self
+                .build_atom_cursors(column_id, neg_terms, neg_phrases, None)
+                .await?;
+            let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
+            // Count the negated clause's posting work the same way the
+            // positive atoms above (and the scored path's `ExcludeFilter`)
+            // are counted — planned posting bytes + ranges from cursor
+            // metadata — so op_stats prices a negated count consistently.
+            // (Like every skip/leapfrog path, this is a planned figure, not
+            // the partial bytes the skip probe actually decodes.)
+            work.postings_bytes += atom_cursor_bytes(&neg_atoms);
+            work.planned_ranges += atom_planned_ranges(&neg_atoms) + neg_dict_ranges;
+            if !neg_atoms.is_empty() {
+                filter = Some(AtomExcludeFilter::new(neg_atoms));
+            }
+        }
         let (walk, walk_ns) = timed_section(|| {
             let mut n = 0u64;
-            self.walk_atoms_match(atoms, mode, None, |_| n += 1)
+            self.walk_atoms_match(atoms, mode, filter, |_| n += 1)
                 .map(|()| n)
         });
         work.kernel_cpu_ns = walk_ns;
@@ -4669,6 +4694,15 @@ impl PhraseMember {
 /// the BM25 tf-factor is monotone in tf.
 struct PhraseCursor {
     members: Vec<PhraseMember>,
+    /// Member indices in ascending posting-list length (rarest first).
+    /// The doc-alignment in [`Self::seek_match`] is a set intersection —
+    /// order-independent — so it probes members rarest-first: the short
+    /// lists drive the candidate doc and the long lists (a common word
+    /// like "the") are only skip-confirmed last, once per candidate,
+    /// instead of being re-skipped on every advance of a rare member.
+    /// Positional verification still runs in query order (`members`
+    /// order), which the phrase adjacency check requires.
+    align_order: Vec<usize>,
     /// Σ member idf × (K1 + 1) — the phrase's scoring constant.
     idf_x_k1p1: f32,
     /// Phrase-scaled term-level upper bound (see type docs).
@@ -4677,6 +4711,10 @@ struct PhraseCursor {
     current_doc: u32,
     /// Number of verified anchors at `current_doc`.
     current_tf: u32,
+    /// Reused across `verify_at_aligned` calls to hold the candidate
+    /// phrase-start positions as they are filtered member by member —
+    /// avoids a per-doc allocation on the hot verify path.
+    verify_scratch: Vec<u32>,
 }
 
 impl PhraseCursor {
@@ -4714,12 +4752,18 @@ impl PhraseCursor {
                 }
             })
             .collect();
+        // Rarest-first probe order for alignment: fewest posting blocks
+        // (shortest list) first. Query order is preserved in `members`.
+        let mut align_order: Vec<usize> = (0..members.len()).collect();
+        align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
             idf_x_k1p1: idf_sum * (bm25::K1 + 1.0),
             term_max_bm25: idf_sum * min_scaled_bound,
             members,
+            align_order,
             current_doc: 0,
             current_tf: 0,
+            verify_scratch: Vec::new(),
         };
         cursor.seek_match(0, f32::NEG_INFINITY, &NormTable::empty())?;
         Ok(cursor)
@@ -4779,11 +4823,14 @@ impl PhraseCursor {
         dl_norm_k1: &NormTable,
     ) -> Result<(), FtsError> {
         'docs: loop {
-            // Align every member to the same doc ≥ `from`.
+            // Align every member to the same doc ≥ `from`, probing
+            // rarest-first so a common member is skip-confirmed last
+            // rather than re-skipped on every rare-member advance.
             let mut aligned = from;
-            let mut i = 0usize;
-            while i < self.members.len() {
-                let c = &mut self.members[i].cursor;
+            let mut oi = 0usize;
+            while oi < self.align_order.len() {
+                let mi = self.align_order[oi];
+                let c = &mut self.members[mi].cursor;
                 c.skip_to(aligned);
                 if c.is_exhausted() {
                     self.current_doc = u32::MAX;
@@ -4794,10 +4841,10 @@ impl PhraseCursor {
                 if here > aligned {
                     // Restart alignment at the higher doc.
                     aligned = here;
-                    i = 0;
+                    oi = 0;
                     continue;
                 }
-                i += 1;
+                oi += 1;
             }
 
             if bar > f32::NEG_INFINITY {
@@ -4846,24 +4893,54 @@ impl PhraseCursor {
     /// for every `i`. Member position lists are ascending, so each
     /// probe is a binary search over a per-doc-tf-sized slice.
     fn verify_at_aligned(&mut self) -> Result<u32, FtsError> {
-        for m in self.members.iter_mut() {
-            m.decode_current_positions()?;
+        // Staged, rarest-first, lazy-decode verification. A phrase match
+        // starting at position `s` has member `j` at `s + j`, so any
+        // member can seed the candidate starts: the rarest member (by
+        // posting length — `align_order[0]`) seeds them, then each
+        // remaining member filters the survivors *in rarest-first order*.
+        //
+        // Two wins over decode-all-then-probe-from-the-first-member:
+        //   * The seed loop is as short as the rarest member's per-doc tf,
+        //     not the (often common) query-first member's.
+        //   * Decoding is lazy: a common member's positions — whose
+        //     per-block run-offset walk is the real cost — are only
+        //     decoded once some candidate survives every rarer member.
+        //     On the huge co-occurrence sets a phrase with a common word
+        //     produces, almost every doc is rejected by a rare member
+        //     first, so the common members are never decoded there.
+        let anchor = self.align_order[0];
+        let anchor_off = anchor as u32;
+        self.members[anchor].decode_current_positions()?;
+        self.verify_scratch.clear();
+        for &pa in &self.members[anchor].pos_scratch {
+            if let Some(start) = pa.checked_sub(anchor_off) {
+                self.verify_scratch.push(start);
+            }
         }
-        let (anchor, rest) = self.members.split_first_mut().expect("members >= 2");
-        let mut tf = 0u32;
-        'anchors: for &p in &anchor.pos_scratch {
-            for (i, m) in rest.iter().enumerate() {
-                let want = match p.checked_add(i as u32 + 1) {
-                    Some(w) => w,
-                    None => continue 'anchors,
-                };
-                if m.pos_scratch.binary_search(&want).is_err() {
-                    continue 'anchors;
+        for oi in 1..self.align_order.len() {
+            if self.verify_scratch.is_empty() {
+                break;
+            }
+            let j = self.align_order[oi];
+            self.members[j].decode_current_positions()?;
+            let plist = &self.members[j].pos_scratch;
+            let off = j as u32;
+            // Compact the survivors in place: keep a start iff member `j`
+            // holds `start + j`.
+            let mut w = 0usize;
+            for r in 0..self.verify_scratch.len() {
+                let start = self.verify_scratch[r];
+                let keep = start
+                    .checked_add(off)
+                    .is_some_and(|want| plist.binary_search(&want).is_ok());
+                if keep {
+                    self.verify_scratch[w] = start;
+                    w += 1;
                 }
             }
-            tf += 1;
+            self.verify_scratch.truncate(w);
         }
-        Ok(tf)
+        Ok(self.verify_scratch.len() as u32)
     }
 
     /// Score the phrase at its current doc with the caller-supplied

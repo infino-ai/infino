@@ -55,8 +55,11 @@ jobs:
           - { bench: supertable_vector, docs: "1000000", suffix: st-vec-l2, metric: l2sq }
           - { bench: supertable_sql,    docs: "1000000", suffix: st-sql }
     # A new push to the PR cancels the in-flight run for that bench.
+    # Keyed on the SUFFIX, not the bench name: the two vector cells
+    # (cosine st-vec and l2sq st-vec-l2) share `matrix.bench`, and a
+    # bench-keyed group made them cancel each other on every run.
     concurrency:
-      group: bench-${{ github.event.pull_request.number }}-${{ matrix.bench }}
+      group: bench-${{ github.event.pull_request.number }}-${{ matrix.suffix }}
       cancel-in-progress: true
     permissions:
       id-token: write

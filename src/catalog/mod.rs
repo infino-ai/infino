@@ -828,14 +828,6 @@ impl Connection {
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
-            // A RecordBatch carries the schema; an empty Vec does not. Capture
-            // the output schema before collect() consumes the DataFrame so a
-            // zero-row result returns one empty batch with the projected schema,
-            // rather than a schema-less Vec, which the Python binding's
-            // Table.from_batches([]) can't build from. The scan's `Utf8View`
-            // columns are already coerced back to `LargeUtf8` here by
-            // `expand_views_at_output`, so the schema needs no further fixup.
-            let output_schema: SchemaRef = df.schema().inner().clone();
             // Execute through the physical plan (what `DataFrame::collect`
             // does internally) so the plan handle survives execution and
             // DataFusion's own operator metrics — elapsed compute, scan
@@ -850,6 +842,12 @@ impl Connection {
                 .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
             harvest_datafusion_metrics(&plan, &op_stats);
             if batches.is_empty() {
+                // An empty Vec carries no schema, so hand back one empty batch
+                // instead. Its schema comes from the physical plan, not the
+                // DataFrame: the scan types scalar strings as `Utf8View`, and
+                // `expand_views_at_output` undoes that during optimization,
+                // which the DataFrame's logical plan predates.
+                let output_schema: SchemaRef = plan.schema();
                 Ok(vec![RecordBatch::new_empty(output_schema)])
             } else {
                 Ok(batches)
@@ -2658,6 +2656,71 @@ mod tests {
             batches[0].schema(),
             expected_schema,
             "zero-group schema must match the with-groups schema"
+        );
+    }
+
+    /// A zero-row result must expose the caller-facing `LargeUtf8`, never the
+    /// scan's `Utf8View`.
+    ///
+    /// The two zero-row tests above miss this. One uses an FTS column (never
+    /// viewed), the other a `GROUP BY` (still emits an empty batch to take the
+    /// schema from). A view only escapes when the plan emits no batch at all
+    /// and the schema has to come from somewhere else, so this covers the
+    /// shapes that emit nothing: an unmatched filter, an empty table, `LIMIT
+    /// 0`, and an unmatched join.
+    #[test]
+    fn query_sql_zero_row_string_schema_is_large_utf8_not_view() {
+        let conn = connect("memory://").expect("connect");
+        // No FTS on `title`, so it is a plain scalar string and gets viewed.
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new())
+            .expect("create docs");
+        docs.append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        conn.create_table("blank", schema_id_title(), IndexSpec::new())
+            .expect("create blank");
+
+        // Ground truth: the same projection over rows that exist.
+        let matched = conn
+            .query_sql("SELECT title FROM docs WHERE title = 'alpha'")
+            .expect("matching query");
+        assert_eq!(n_rows(&matched), 1, "exactly one row matches");
+
+        // Collected rather than asserted per shape, so a regression names every
+        // shape it broke instead of stopping at the first.
+        let mut leaked: Vec<(&str, DataType)> = Vec::new();
+        for sql in [
+            "SELECT title FROM docs WHERE title = 'no_such_title'",
+            "SELECT title FROM docs LIMIT 0",
+            "SELECT title FROM blank",
+            "SELECT a.title FROM docs a JOIN docs b ON a.title = b.title \
+             WHERE a.title = 'no_such_title'",
+        ] {
+            let empty = conn.query_sql(sql).expect("zero-row query must not error");
+            assert!(
+                !empty.is_empty(),
+                "{sql}: needs one empty batch to carry the schema"
+            );
+            assert_eq!(n_rows(&empty), 0, "{sql}: must return no rows");
+            let ty = empty[0].schema().field(0).data_type().clone();
+            if ty != DataType::LargeUtf8 {
+                leaked.push((sql, ty));
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "zero-row shapes not LargeUtf8: {leaked:?}"
+        );
+
+        // The plain filter shape also matches the with-rows schema exactly,
+        // names and nullability included.
+        let empty = conn
+            .query_sql("SELECT title FROM docs WHERE title = 'no_such_title'")
+            .expect("zero-row query");
+        assert_eq!(
+            empty[0].schema(),
+            matched[0].schema(),
+            "zero-row and matching results must carry the same schema"
         );
     }
 
