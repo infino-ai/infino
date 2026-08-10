@@ -12,6 +12,7 @@ mod filter;
 mod options;
 mod phrase;
 mod scorers;
+mod search;
 mod sink;
 mod work;
 
