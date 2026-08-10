@@ -10,6 +10,7 @@ mod cursor;
 mod filter;
 mod options;
 mod phrase;
+mod scorers;
 mod sink;
 mod work;
 
