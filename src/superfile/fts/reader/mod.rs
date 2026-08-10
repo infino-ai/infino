@@ -9,6 +9,7 @@ mod core;
 mod cursor;
 mod filter;
 mod phrase;
+mod sink;
 mod work;
 
 pub use core::*;
