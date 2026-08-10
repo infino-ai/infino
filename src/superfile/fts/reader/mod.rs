@@ -7,5 +7,6 @@
 
 mod core;
 mod cursor;
+mod phrase;
 
 pub use core::*;
