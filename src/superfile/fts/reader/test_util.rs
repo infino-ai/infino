@@ -8,8 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::superfile::fts::builder::FtsBuilder;
-use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
 
 pub(super) fn build_blob() -> (Bytes, String) {
     // 3 docs, 1 column.

@@ -9,29 +9,32 @@
 
 use std::collections::{BinaryHeap, HashMap};
 
-use crate::runtime_metrics::{
-    cpu::{thread_cpu_delta_ns, thread_cpu_ns},
-    op_stats::{metering_active, timed_section},
-};
-use crate::superfile::{
-    ReadError,
-    error::FtsError,
-    fts::{
-        bm25,
-        dict::{DictReader, make_key},
-        fst_value::FstValue,
-        posting::{BLOCK_LEN, decode_block},
+use super::{
+    core::*,
+    cursor::{TermCursor, TermMeta},
+    filter::{AtomExcludeFilter, ExcludeFilter},
+    options::BoolMode,
+    phrase::AnyCursor,
+    sink::{TopKEntry, and_heap_push, drain_top_k_desc},
+    work::{
+        MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
     },
 };
-
-use super::core::*;
-use super::cursor::{TermCursor, TermMeta};
-use super::filter::{AtomExcludeFilter, ExcludeFilter};
-use super::options::BoolMode;
-use super::phrase::AnyCursor;
-use super::sink::{TopKEntry, and_heap_push, drain_top_k_desc};
-use super::work::{
-    MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
+use crate::{
+    runtime_metrics::{
+        cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+        op_stats::{metering_active, timed_section},
+    },
+    superfile::{
+        ReadError,
+        error::FtsError,
+        fts::{
+            bm25,
+            dict::{DictReader, make_key},
+            fst_value::FstValue,
+            posting::{BLOCK_LEN, decode_block},
+        },
+    },
 };
 
 impl FtsReader {
@@ -1022,13 +1025,12 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::*;
-    use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+    use std::{collections::HashSet, sync::Arc};
+
     use bytes::Bytes;
-    use std::collections::HashSet;
-    use std::sync::Arc;
+
+    use super::{super::test_util::*, *};
+    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
 
     #[tokio::test]
     async fn search_returns_exact_doc_ids_for_known_term() {

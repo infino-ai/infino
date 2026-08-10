@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use super::core::{read_u32_le, read_u64_le};
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -23,8 +24,6 @@ use crate::superfile::{
         posting::{BLOCK_LEN, decode_block},
     },
 };
-
-use super::core::{read_u32_le, read_u64_le};
 
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —

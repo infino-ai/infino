@@ -6,14 +6,10 @@
 //! AND flat-merge over score-into-heap vs collect/count, and the shared
 //! `and_heap_push`. `pub(super)` within `reader/`.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::{cmp::Ordering, collections::BinaryHeap};
 
+use super::{cursor::TermCursor, filter::ExcludeFilter, metadata::NormTable};
 use crate::superfile::fts::bm25;
-
-use super::cursor::TermCursor;
-use super::filter::ExcludeFilter;
-use super::metadata::NormTable;
 
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
 /// path (single-term BMW, WAND+BMW, MaxScore+BMM, exhaustive union,

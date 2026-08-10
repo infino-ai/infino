@@ -6,8 +6,7 @@
 //! cursor-metadata sums behind it. `MatchWork` is part of the
 //! `fts::reader::*` surface; the summing helpers are `pub(super)`.
 
-use super::cursor::TermCursor;
-use super::phrase::AnyCursor;
+use super::{cursor::TermCursor, phrase::AnyCursor};
 
 /// Sum of the posting-byte ranges a cursor set indexes into (each cursor's
 /// term metadata + skip table + posting blocks). Feeds the per-query work

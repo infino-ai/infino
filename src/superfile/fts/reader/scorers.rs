@@ -6,19 +6,18 @@
 //! dispatch, and the AND flat-merge intersection family. Split from the
 //! reader `core` as its own `impl FtsReader` block.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::{cmp::Ordering, collections::BinaryHeap};
 
-use crate::superfile::error::FtsError;
-use crate::superfile::fts::bm25;
-
-use super::core::*;
-use super::cursor::TermCursor;
-use super::filter::ExcludeFilter;
-use super::metadata::NormTable;
-use super::sink::{
-    AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
+use super::{
+    core::*,
+    cursor::TermCursor,
+    filter::ExcludeFilter,
+    metadata::NormTable,
+    sink::{
+        AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
+    },
 };
+use crate::superfile::{error::FtsError, fts::bm25};
 
 impl FtsReader {
     /// Multi-term OR via WAND + BlockMaxWAND.
@@ -1500,13 +1499,14 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::*;
-    use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
-    use crate::superfile::fts::reader::BoolMode;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-    use bytes::Bytes;
     use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use super::{super::test_util::*, *};
+    use crate::superfile::fts::{
+        builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer,
+    };
 
     #[tokio::test]
     async fn token_match_doc_set_matches_bm25_for_same_terms() {

@@ -6,23 +6,26 @@
 //! entry points (no BM25 scoring, no top-k). Its own `impl FtsReader`
 //! block, split from the reader `core`.
 
-use crate::runtime_metrics::op_stats::timed_section;
-use crate::superfile::{
-    ReadError,
-    error::FtsError,
-    format::fts::U32_BYTES,
-    fts::{
-        builder::TERM_META_SIZE,
-        dict::{DictReader, make_key},
-        fst_value::FstValue,
+use super::{
+    core::*,
+    filter::AtomExcludeFilter,
+    options::BoolMode,
+    phrase::AnyCursor,
+    work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
+};
+use crate::{
+    runtime_metrics::op_stats::timed_section,
+    superfile::{
+        ReadError,
+        error::FtsError,
+        format::fts::U32_BYTES,
+        fts::{
+            builder::TERM_META_SIZE,
+            dict::{DictReader, make_key},
+            fst_value::FstValue,
+        },
     },
 };
-
-use super::core::*;
-use super::filter::AtomExcludeFilter;
-use super::options::BoolMode;
-use super::phrase::AnyCursor;
-use super::work::{MatchWork, atom_cursor_bytes, atom_planned_ranges};
 
 impl FtsReader {
     /// Unranked doc-at-a-time walk over heterogeneous atoms, calling
@@ -374,12 +377,12 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::*;
-    use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-    use bytes::Bytes;
     use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use super::{super::test_util::*, *};
+    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
 
     #[tokio::test]
     async fn token_match_or_unions_and_intersects_unranked() {

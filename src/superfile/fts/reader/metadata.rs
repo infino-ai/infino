@@ -5,14 +5,11 @@
 //! table ([`NormTable`]), per-column metadata ([`ColumnMeta`]) and its
 //! JSON config ([`FtsColumnConfig`]), and the reader [`OpenOptions`].
 
-use std::ops::Range;
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use serde::Deserialize;
 
-use crate::superfile::fts::bm25;
-
-use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::fts::{bm25, tokenize::Tokenizer};
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
 ///
@@ -166,12 +163,12 @@ impl OpenOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::*;
-    use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
-    use crate::superfile::fts::reader::FtsReader;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
     use bytes::Bytes;
+
+    use super::{super::test_util::*, *};
+    use crate::superfile::fts::{
+        builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+    };
 
     // ── Additional coverage ───────────────────────────────────────────
 

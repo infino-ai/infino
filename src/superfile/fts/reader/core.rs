@@ -23,13 +23,14 @@ use std::{
 
 use bytes::Bytes;
 
-use super::cursor::{TermCursor, TermMeta};
-use super::filter::ExcludeFilter;
-use super::metadata::{ColumnMeta, FtsColumnConfig, NormTable, OpenOptions};
-use super::phrase::{AnyCursor, PhraseCursor};
-use super::sink::{TopKEntry, drain_top_k_desc};
-use super::work::{term_cursor_bytes, term_cursor_ranges};
-
+use super::{
+    cursor::{TermCursor, TermMeta},
+    filter::ExcludeFilter,
+    metadata::{ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
+    phrase::{AnyCursor, PhraseCursor},
+    sink::{TopKEntry, drain_top_k_desc},
+    work::{term_cursor_bytes, term_cursor_ranges},
+};
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -1558,15 +1559,14 @@ fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
-    use super::super::test_util::*;
-    use super::*;
-    use crate::superfile::BytesLazyByteSource;
-    use crate::superfile::fts::builder::FtsBuilder;
-    use crate::superfile::fts::reader::BoolMode;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
     use std::collections::HashSet;
+
+    use super::{super::test_util::*, *};
+    use crate::superfile::{
+        BytesLazyByteSource,
+        fts::{builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer},
+    };
 
     #[test]
     fn open_accepts_valid_blob() {

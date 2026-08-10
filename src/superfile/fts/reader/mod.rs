@@ -20,6 +20,7 @@ mod test_util;
 mod work;
 
 pub use core::*;
+
 pub use metadata::OpenOptions;
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub use work::MatchWork;

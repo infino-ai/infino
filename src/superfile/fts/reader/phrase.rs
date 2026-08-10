@@ -9,6 +9,10 @@
 
 use bytes::Bytes;
 
+use super::{
+    cursor::{TermCursor, TermMeta},
+    metadata::NormTable,
+};
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -17,9 +21,6 @@ use crate::superfile::{
         positions::{decode_run, skip_run},
     },
 };
-
-use super::cursor::{TermCursor, TermMeta};
-use super::metadata::NormTable;
 
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
 /// fetched position runs, and a lazily-built per-block cache of each
@@ -475,10 +476,8 @@ impl AnyCursor {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::*;
-    use super::*;
-    use crate::superfile::fts::reader::FtsReader;
-    use crate::superfile::fts::reader::core::ClauseLists;
+    use super::{super::test_util::*, *};
+    use crate::superfile::fts::reader::{FtsReader, core::ClauseLists};
 
     fn phrase(terms: &[&str]) -> Vec<Vec<String>> {
         vec![terms.iter().map(|t| t.to_string()).collect()]

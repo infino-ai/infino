@@ -7,11 +7,12 @@
 //! a common negated list is never fully decoded. `pub(super)` within
 //! `reader/` (ExcludeFilter stays pub(crate) — PreparedClauses carries it).
 
+use super::{
+    cursor::TermCursor,
+    phrase::AnyCursor,
+    work::{term_cursor_bytes, term_cursor_ranges},
+};
 use crate::superfile::error::FtsError;
-
-use super::cursor::TermCursor;
-use super::phrase::AnyCursor;
-use super::work::{term_cursor_bytes, term_cursor_ranges};
 
 /// Atom-walk exclusion gate: the heterogeneous sibling of
 /// [`ExcludeFilter`], additionally able to exclude docs containing a
@@ -106,8 +107,7 @@ impl ExcludeFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::*;
-    use super::*;
+    use super::{super::test_util::*, *};
     use crate::superfile::fts::reader::FtsReader;
 
     // ── ExcludeFilter (negation gate) ─────────────────────────────────
