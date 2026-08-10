@@ -16,6 +16,7 @@ use crate::superfile::fts::bm25;
 use super::core::*;
 use super::cursor::TermCursor;
 use super::filter::{AtomExcludeFilter, ExcludeFilter};
+use super::metadata::NormTable;
 use super::phrase::AnyCursor;
 use super::sink::{
     AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, and_heap_push,

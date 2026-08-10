@@ -11,9 +11,9 @@ use std::collections::BinaryHeap;
 
 use crate::superfile::fts::bm25;
 
-use super::core::NormTable;
 use super::cursor::TermCursor;
 use super::filter::ExcludeFilter;
+use super::metadata::NormTable;
 
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
 /// path (single-term BMW, WAND+BMW, MaxScore+BMM, exhaustive union,

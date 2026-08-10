@@ -9,6 +9,7 @@ mod core;
 mod count;
 mod cursor;
 mod filter;
+mod metadata;
 mod options;
 mod phrase;
 mod scorers;
@@ -17,5 +18,6 @@ mod sink;
 mod work;
 
 pub use core::*;
+pub use metadata::OpenOptions;
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub use work::MatchWork;

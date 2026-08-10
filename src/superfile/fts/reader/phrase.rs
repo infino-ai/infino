@@ -18,8 +18,8 @@ use crate::superfile::{
     },
 };
 
-use super::core::NormTable;
 use super::cursor::{TermCursor, TermMeta};
+use super::metadata::NormTable;
 
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
 /// fetched position runs, and a lazily-built per-block cache of each
