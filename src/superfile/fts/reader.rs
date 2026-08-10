@@ -1798,7 +1798,14 @@ impl FtsReader {
                 .build_atom_cursors(column_id, neg_terms, neg_phrases, None)
                 .await?;
             let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
-            work.planned_ranges += neg_dict_ranges;
+            // Count the negated clause's posting work the same way the
+            // positive atoms above (and the scored path's `ExcludeFilter`)
+            // are counted — planned posting bytes + ranges from cursor
+            // metadata — so op_stats prices a negated count consistently.
+            // (Like every skip/leapfrog path, this is a planned figure, not
+            // the partial bytes the skip probe actually decodes.)
+            work.postings_bytes += atom_cursor_bytes(&neg_atoms);
+            work.planned_ranges += atom_planned_ranges(&neg_atoms) + neg_dict_ranges;
             if !neg_atoms.is_empty() {
                 filter = Some(AtomExcludeFilter::new(neg_atoms));
             }
