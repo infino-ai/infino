@@ -3428,8 +3428,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let clean_uncheckpointed_drain = local_checkpoint.batches_done == 0
         && completed_shards.is_empty()
         && local_checkpoint.spills.is_empty();
-    let mut width_law = clean_uncheckpointed_drain
-        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
+    let mut width_law = clean_uncheckpointed_drain.then(|| {
+        opann::WidthLawCalibration::new(
+            running_clusters.dim as usize,
+            metric,
+            user_inner.options.target_recall,
+        )
+    });
     // #512 invariant tripwire: no re-encode in this drain may saturate its
     // destination quantizer — cosine rows are unit (ingest-normalized) so
     // the fixed grid covers them, and data-derived grids are built to cover
@@ -7139,7 +7144,8 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // this scan measures. A drain that commits between the scan and the
     // stamp adds rows this evidence never saw.
     let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
-    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
+    let mut cal =
+        opann::WidthLawCalibration::new(clusters.dim as usize, metric, inner.options.target_recall);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
     // evenly spaced ordinals over the cell-ordered live-row enumeration —
     // the law's noise floor is set by evidence size, and any fixed stride

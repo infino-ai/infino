@@ -470,6 +470,13 @@ pub struct SupertableOptions {
     /// [`SupertableOptions::apply_config`] copies `vector.drain_batch_superfiles`
     /// into this field; [`Self::with_drain_batch_superfiles`] overrides per table.
     pub drain_batch_superfiles: i64,
+    /// Recall the drain calibration targets when it stamps this table's
+    /// probe laws — the recall/latency lever. Width crosses at this
+    /// value and the depth stages at a padded form of it, so lowering
+    /// it narrows width, fine depth and the rerank budget together.
+    /// [`SupertableOptions::apply_config`] copies `vector.target_recall`
+    /// into this field; [`Self::with_target_recall`] overrides per table.
+    pub target_recall: f64,
     /// Per-cell consolidation op for the hidden-index drain. Default
     /// [`DrainConsolidate::Kmeans`]. [`SupertableOptions::apply_config`] copies
     /// `vector.drain_consolidate`; [`Self::with_drain_consolidate`] overrides
@@ -722,6 +729,7 @@ impl SupertableOptions {
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
             drain_batch_superfiles: DEFAULT_DRAIN_BATCH_SUPERFILES,
+            target_recall: crate::config::global().vector.target_recall,
             drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
@@ -938,6 +946,14 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the calibration's recall target for this table. Takes
+    /// effect on the NEXT drain or recalibration: the laws already
+    /// stamped in the manifest keep serving until then.
+    pub fn with_target_recall(mut self, target: f64) -> Self {
+        self.target_recall = target;
+        self
+    }
+
     /// Override the hidden-index drain consolidation op. See
     /// [`Self::drain_consolidate`].
     pub fn with_drain_consolidate(mut self, mode: DrainConsolidate) -> Self {
@@ -1079,6 +1095,7 @@ impl SupertableOptions {
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        self.target_recall = cfg.vector.target_recall;
         self.drain_consolidate = cfg.vector.drain_consolidate;
         // The `config.yaml` source for the connection budget; the connect path
         // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.

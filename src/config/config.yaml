@@ -138,6 +138,12 @@ vector:
   # each selected cell. The user-table routing default takes this; the
   # hidden index's per-table stamp in the manifest overrides it. Pairs with
   # fine_nprobe_pct as max(floor, floor(pct × cell fine-cluster count)).
+  # Recall the drain calibration targets when stamping this table's
+  # probe laws (width / fine depth / rerank budget). Lower trades recall
+  # for latency: on Cohere-10M, 0.99 serves recall@10 0.997 at 19.4 ms
+  # and 0.93 serves 0.969 at 8.4 ms. Serving recall lands above the
+  # target because the crossings are discrete.
+  target_recall: 0.99
   fine_nprobe_floor: 4
 
   # Proportional fine-probe fraction for UNFILTERED vector search: probe

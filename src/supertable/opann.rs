@@ -716,31 +716,6 @@ pub(crate) fn plan_sq8_split_kway(
 /// same top-k cell spread.
 pub(crate) const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
 
-/// Coverage target for EVERY law stage (width, fine depth, rerank).
-/// Stage coverages compound multiplicatively toward the end-to-end
-/// recall bar (width x fine x rerank): stamping any stage at the 0.99
-/// bar itself leaves zero margin, and a crossing that lands exactly at
-/// target compounds the product to ~0.98 (measured, both ways: fine law
-/// 5 at a 0.99 target → post-drain 0.983; width at a 0.99 target over
-/// the post-split 3.5K-cell grid → post-compact 0.986-0.994 straddling
-/// the bar run-to-run, while stages that overshoot their crossing —
-/// width at 256 cells — deliver 0.996). 0.997 per stage keeps the
-/// three-stage product ≥ 0.991 even when every crossing is tight.
-const LAW_STAGE_TARGET_COVERAGE: f64 = 0.997;
-
-/// Width-walk coverage target: the 0.99 bar itself, NOT the padded
-/// stage target below. Width is the dominant cost term — every probed
-/// cell is a fetch — and the 0.997 pad measured a 2x width tax on
-/// real embeddings (Cohere-1M: width 97 vs 53 at k=100; -7 ms @ k=100
-/// and -2.3 ms @ k=10 at equal recall class when dropped to 0.99).
-/// The padded target exists for PER-STAGE COMPOUNDING, and width is
-/// where compounding is cheapest to absorb: the 10M gate at this
-/// split (2026-08-02, vec10m-width99.log) holds every lifecycle state
-/// at 0.991-0.997 — the historical "width at 0.99 straddles the bar"
-/// measurement predates the recalibration repair and the rerank law
-/// actually serving, both of which carry the margin now.
-const WIDTH_LAW_TARGET_COVERAGE: f64 = 0.99;
-
 /// One-sided 95% normal bound (z ≈ 1.645) for the width crossing's
 /// lower confidence bound — a statistical convention, not a tuned
 /// value. The width walk samples [`WIDTH_LAW_QUERY_SAMPLE`] queries;
@@ -857,6 +832,21 @@ pub(crate) struct WidthLawCalibration {
     /// Distractor-pool size (cells) chosen at [`Self::freeze`]; the
     /// legacy floor until then.
     pool_cells: usize,
+    /// Recall this drain calibrates its laws to hold — the per-table
+    /// `vector.target_recall`. EVERY stage (width, fine depth, rerank
+    /// budget) crosses at this value; there is deliberately no padded
+    /// per-stage variant. The stages compound, but on the SAME queries
+    /// — a query whose neighbors land in the probed cells is also the
+    /// query whose neighbors sit shallow in them — so the product runs
+    /// far above the independent-stages worst case. Measured on
+    /// Cohere-10M with every stage at the target: 0.993 served 0.9959,
+    /// 0.93 served 0.9693, 0.90 served 0.9577. Padding would only
+    /// widen probes for a loss that does not occur.
+    /// per-table
+    /// `vector.target_recall`. Width crosses at the target itself and
+    /// every law stage, so one knob
+    /// moves the whole recall/latency operating point.
+    target_recall: f64,
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
@@ -995,7 +985,7 @@ fn floor_monotone(law: &mut [u32; WIDTH_LAW_KS.len()]) {
 }
 
 impl WidthLawCalibration {
-    pub(crate) fn new(dim: usize, metric: Metric) -> Self {
+    pub(crate) fn new(dim: usize, metric: Metric, target_recall: f64) -> Self {
         Self {
             dim,
             metric,
@@ -1007,6 +997,7 @@ impl WidthLawCalibration {
             fine_ranks: Mutex::new(HashMap::new()),
             max_fine: AtomicU32::new(0),
             pool_cells: RERANK_LAW_POOL_CELLS,
+            target_recall,
             rerank: None,
         }
     }
@@ -1350,7 +1341,7 @@ impl WidthLawCalibration {
     }
 
     /// Extract the width law: cells (in the grid's routing order) needed
-    /// for mean [`LAW_STAGE_TARGET_COVERAGE`] coverage of the exact top-k
+    /// for mean target-recall coverage of the exact top-k
     /// at each [`WIDTH_LAW_KS`] point. Each point is measured over the
     /// queries whose candidate count reaches its `k` — one boundary-starved
     /// query excludes itself, not the whole sample. Points NO query can
@@ -1504,7 +1495,7 @@ impl WidthLawCalibration {
             // all synthetic post-drain shapes) has SE = 0 and stamps
             // exactly as before; only genuinely marginal crossings widen.
             let n = support[ki] as f64;
-            let target = WIDTH_LAW_TARGET_COVERAGE * n;
+            let target = self.target_recall * n;
             if let Some(rank) = sums.iter().enumerate().position(|(rank, &s)| {
                 let mean = s / n;
                 let var = (coverage_sq_sums[ki][rank] / n - mean * mean).max(0.0);
@@ -1513,7 +1504,7 @@ impl WidthLawCalibration {
             }) {
                 law[ki] = (rank + 1) as u32;
             }
-            let stage_target = LAW_STAGE_TARGET_COVERAGE * support[ki] as f64;
+            let stage_target = self.target_recall * support[ki] as f64;
             if let Some(rank) = fine_sums[ki].iter().position(|&s| s >= stage_target) {
                 fine_law[ki] = (rank + 1) as u32;
             }
@@ -1531,7 +1522,7 @@ impl WidthLawCalibration {
             // crossing means the evidence cannot certify the target —
             // the point stays uncalibrated (constant fallback).
             ranks.sort_unstable();
-            let needed = (LAW_STAGE_TARGET_COVERAGE * ranks.len() as f64).ceil() as usize;
+            let needed = (self.target_recall * ranks.len() as f64).ceil() as usize;
             if let Some(&crossing) = ranks.get(needed.saturating_sub(1).min(ranks.len() - 1))
                 && crossing != u64::MAX
             {
@@ -1741,6 +1732,31 @@ mod tests {
 
     use super::*;
 
+    /// Every stage crosses at the target itself — no padded per-stage
+    /// variant, no derived second constant. Pins that the shipped
+    /// default still crosses width at 0.99 (the historical
+    /// `WIDTH_LAW_TARGET_COVERAGE`), which is what the acceptance
+    /// gates measure against.
+    #[test]
+    fn every_stage_crosses_at_the_configured_target() {
+        /// The historical width crossing this knob's default preserves.
+        const SHIPPED_WIDTH: f64 = 0.99;
+        assert_eq!(shipped_target_recall(), SHIPPED_WIDTH);
+        for target in [0.80, 0.90, 0.95, 0.99] {
+            let cal = WidthLawCalibration::new(8, Metric::Cosine, target);
+            assert_eq!(
+                cal.target_recall, target,
+                "the calibration carries the target unmodified"
+            );
+        }
+    }
+
+    /// The shipped `vector.target_recall`, read from the live config so
+    /// the pin below tracks the YAML default instead of a copy of it.
+    fn shipped_target_recall() -> f64 {
+        crate::config::global().vector.target_recall
+    }
+
     /// Raw fp32-le centroid-region bytes for planted calibration views.
     fn fp32_le_bytes(vals: &[f32]) -> Bytes {
         Bytes::from(
@@ -1772,7 +1788,7 @@ mod tests {
             ],
             vec![1; 4],
         );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -1822,7 +1838,7 @@ mod tests {
     fn depth_law_walks_fine_ranks() {
         const DIM: usize = 4;
         let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -1902,7 +1918,7 @@ mod tests {
     fn rerank_law_reads_survivor_budget_from_histograms() {
         const DIM: usize = 4;
         let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -1958,7 +1974,7 @@ mod tests {
     fn depth_law_missing_rank_is_conservative() {
         const DIM: usize = 4;
         let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -2018,7 +2034,7 @@ mod tests {
             ],
             vec![1; 4],
         );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
         let mut queries = vec![0.0f32; 2 * DIM];
         queries[0] = 1.0;
         queries[DIM] = 1.0;
@@ -2081,7 +2097,7 @@ mod tests {
             ],
             vec![1; 2],
         );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
