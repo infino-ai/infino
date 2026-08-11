@@ -155,23 +155,31 @@ vector:
   serve_near_tie_slack: 0.30
 
   # K-means training points per centroid for the drain's per-cell
-  # sub-builds.
-  kmeans_pts_per_centroid: 1024
+  # sub-builds. (Sizes the k-means training sample, not the fine-cluster
+  # count — cluster size is set by the drain's byte-target n_cent.)
+  kmeans_pts_per_centroid: 64
 
   # Query routing for the hidden vector index on the UNFILTERED path.
   # (Filtered queries and pre-drain user tables always use `stamped`.)
   #   global_fine_centroid — score every fine centroid globally across all
-  #                          cells and read the top `global_fine_fanout`
-  #                          clusters, bypassing the grid. Concentrates the
-  #                          cold footprint as the corpus grows.
+  #                          cells and read the top fanout clusters,
+  #                          bypassing the grid. Concentrates the cold
+  #                          footprint as the corpus grows.
   #   stamped              — grid routing to cells, then the manifest's
   #                          stamped per-cell width.
   routing: global_fine_centroid
 
-  # For routing = global_fine_centroid: how many fine clusters the query
-  # fans out to (globally scored). Higher reads more clusters — more cold
-  # bytes, higher recall. Ignored under routing = stamped.
-  global_fine_fanout: 1024
+  # For routing = global_fine_centroid: the FRACTION of all fine clusters
+  # the query fans out to (globally scored): fanout = ceil(pct × total).
+  # A fraction (not a count) so it tracks the corpus — exhaustive at 1M,
+  # a sliver at 100M. Higher reads more clusters — more cold bytes, higher
+  # recall. ~0.99 at 10M may want ~0.15. Ignored under routing = stamped.
+  global_fine_fanout_pct: 0.10
+
+  # For routing = global_fine_centroid: exact-rerank over-fetch multiplier
+  # for this path only (a caller-set rerank_mult still wins). Scoped here so
+  # tuning it never touches the stamped / filtered / user-table defaults.
+  global_fine_rerank_mult: 128
 
   # For routing = global_fine_centroid: coalesce the selected clusters
   # within each cell into contiguous reads. Ignored under routing = stamped.

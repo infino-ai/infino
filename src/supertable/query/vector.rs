@@ -1528,11 +1528,11 @@ impl SupertableReader {
     }
 
     /// Global-fine fanout (`vector.routing = global_fine_centroid`, fanning
-    /// out to `fc = vector.global_fine_fanout` clusters). Phase 1: score
-    /// `query` against every cell's fp32 fine centroids from the resident
-    /// centroid section (a RAM scan — no superfile opens for the scoring) and
-    /// keep the global top-`fc` `(superfile, flat cluster)` by ascending
-    /// distance. Phase 2: scan only those clusters per superfile, pool the
+    /// out to `fc = ceil(fanout_pct × total_fine_clusters)` clusters, where
+    /// `fanout_pct = vector.global_fine_fanout_pct`). Phase 1: score `query`
+    /// against every cell's fp32 fine centroids from the resident centroid
+    /// section (a RAM scan — no superfile opens for the scoring) and keep the
+    /// global top-`fc` `(superfile, flat cluster)` by ascending distance. Phase 2: scan only those clusters per superfile, pool the
     /// warm survivors across all cells, take one global shortlist cut, and
     /// exact-rerank where the winners live. The router overrides only cluster
     /// SELECTION; the byte fetch, 1-bit shortlist, rerank, and id remap are
@@ -1546,7 +1546,7 @@ impl SupertableReader {
         query: &[f32],
         k: usize,
         options: &VectorSearchOptions,
-        fc: usize,
+        fanout_pct: f64,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
         let section = self.centroid_section().await.ok_or_else(|| {
@@ -1555,7 +1555,12 @@ impl SupertableReader {
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.clone();
         let storage = manifest.options.storage.clone();
-        let (_, rerank_mult) = options.resolve(false);
+        // Path-scoped rerank: a caller-set `rerank_mult` wins, else this
+        // path's own configured default — never the shared 256 that serves
+        // the stamped / filtered / user-table paths.
+        let rerank_mult = options
+            .rerank_mult()
+            .unwrap_or(config::global().vector.global_fine_rerank_mult);
 
         // Phase 1: build the global candidate pool. Scores are comparable
         // across cells/superfiles (one metric + one query), so a single
@@ -1580,7 +1585,10 @@ impl SupertableReader {
         if cands.is_empty() {
             return Ok(Vec::new());
         }
+        // `cands` now holds EVERY fine cluster across all cells/superfiles,
+        // so its length is the total cluster count the fraction applies to.
         // Global top-`fc` by ascending distance (smaller = nearer).
+        let fc = ((fanout_pct * cands.len() as f64).ceil() as usize).clamp(1, cands.len());
         if cands.len() > fc {
             cands.select_nth_unstable_by(fc - 1, |a, b| a.2.total_cmp(&b.2));
             cands.truncate(fc);
@@ -1687,11 +1695,11 @@ impl SupertableReader {
         if !filtered
             && hidden_vector_index
             && vcfg.routing == config::VectorRouting::GlobalFineCentroid
-            && vcfg.global_fine_fanout > 0
+            && vcfg.global_fine_fanout_pct > 0.0
         {
-            let fc = vcfg.global_fine_fanout;
+            let pct = vcfg.global_fine_fanout_pct;
             return self
-                .global_fine_fanout(&superfiles, column, query, k, &options, fc)
+                .global_fine_fanout(&superfiles, column, query, k, &options, pct)
                 .await;
         }
         // Borrow routing — do not clone the VectorCell centroid grid just to
