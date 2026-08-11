@@ -1589,9 +1589,17 @@ impl SupertableReader {
             by_sf.entry(si).or_default().push(flat);
         }
 
-        // Phase 2: probe only the selected clusters per superfile via the
-        // existing multi-cell cluster search, then the shared remap.
-        let mut all: Vec<SuperfileHit> = Vec::new();
+        // Phase 2: DEFERRED per-cell scan on the selected clusters, pooling
+        // warm survivors across every cell/superfile, then ONE global exact
+        // rerank — the stamped whole-cell path's discipline
+        // (`search_clusters_scan_async` -> `select_global_shortlist` ->
+        // `vector_rerank_selected`). The immediate `search_clusters_async`
+        // path reranks per cell and merges per-cell top-k, which mis-orders
+        // ~4% of the true top-k at 10M (all neighbors are read — recall@100
+        // is 1.0 — but a single cross-cell exact rerank is needed to seat
+        // them in the top-k).
+        let mut per_superfile: Vec<Vec<SuperfileHit>> = Vec::new();
+        let mut pooled: Vec<(usize, ScanCandidate)> = Vec::new();
         for (si, flats) in by_sf {
             let entry = &superfiles[si];
             let reader = readers[si].as_ref();
@@ -1604,12 +1612,13 @@ impl SupertableReader {
             } else {
                 flats
             };
-            let (hits, _tally) = vr
-                .search_clusters_async(
+            let scan = vr
+                .search_clusters_scan_async(
                     column,
                     query,
                     k,
                     &flats,
+                    rerank_mult,
                     rerank_mult,
                     None,
                     None,
@@ -1618,14 +1627,40 @@ impl SupertableReader {
                 )
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
-            let mut tagged = dispatch::tag_hits(entry, hits);
-            dispatch::attach_stable_ids(reader, entry, &mut tagged, false, &self.op_stats).await?;
-            all.extend(tagged);
+            // Cold cells rerank in-scan; take their exact hits directly.
+            if !scan.hits.is_empty() {
+                let mut tagged = dispatch::tag_hits(entry, scan.hits);
+                dispatch::attach_stable_ids(reader, entry, &mut tagged, false, &self.op_stats)
+                    .await?;
+                per_superfile.push(tagged);
+            }
+            for c in scan.candidates {
+                pooled.push((si, c));
+            }
         }
-        // Global top-k across superfiles (smaller distance = better).
-        all.sort_by(|a, b| a.score.total_cmp(&b.score));
-        all.truncate(k);
-        Ok(all)
+        // Phase C: single global exact rerank of the pooled warm survivors —
+        // one cross-cell shortlist cut, reranked where the winners live.
+        if !pooled.is_empty() {
+            let shortlist_limit = k.saturating_mul(rerank_mult);
+            let winners = select_global_shortlist(pooled, shortlist_limit, 0);
+            let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+            for (si, c) in winners {
+                by_seg.entry(si).or_default().push(c);
+            }
+            for (si, selected) in by_seg {
+                let entry = &superfiles[si];
+                let reader = readers[si].as_ref();
+                let (hits, _ns) = reader
+                    .vector_rerank_selected(column, query, k, selected, None)
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                let mut tagged = dispatch::tag_hits(entry, hits);
+                dispatch::attach_stable_ids(reader, entry, &mut tagged, false, &self.op_stats)
+                    .await?;
+                per_superfile.push(tagged);
+            }
+        }
+        Ok(top_k_ascending(per_superfile, k))
     }
 
     async fn vector_fanout_over_superfiles(

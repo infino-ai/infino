@@ -156,7 +156,7 @@ vector:
 
   # K-means training points per centroid for the drain's per-cell
   # sub-builds.
-  kmeans_pts_per_centroid: 64
+  kmeans_pts_per_centroid: 1024
 
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
