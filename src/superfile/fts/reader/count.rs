@@ -539,6 +539,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn or_count_anchored_matches_merge_on_dominant_term() {
+        // When one term's df dwarfs the rest, the OR count takes the
+        // df-anchored path (`df(dominant) + |others \ dominant|`) instead
+        // of walking the dominant list. It must return the identical
+        // cardinality as the independent naive ascending merge
+        // (`token_match` length). The corpus spans several OR_WINDOW
+        // windows and — crucially — leaves gaps where the dominant term
+        // is *absent* but a rare term is present, so the "doc not in the
+        // anchor" branch is exercised, not just `df(dominant)`.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 137;
+        const RARE_STRIDE: u32 = 250; // rare term hits ~1/250 docs
+        const RAREB_STRIDE: u32 = 400;
+        const HOLE_STRIDE: u32 = 300; // docs missing the dominant term
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            // `common` is in almost every doc (the dominant term) — but
+            // not the holes, so the anchor genuinely lacks some docs the
+            // rare terms supply.
+            if !i.is_multiple_of(HOLE_STRIDE) {
+                text.push_str("common ");
+            }
+            if i.is_multiple_of(RARE_STRIDE) {
+                text.push_str("rare ");
+            }
+            if i.is_multiple_of(RAREB_STRIDE) {
+                text.push_str("rareb ");
+            }
+            // Guarantee no empty doc (a hole that hits neither rare term).
+            if text.is_empty() {
+                text.push_str("filler ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // `common` alone is far more than 4× `rare` + `rareb` combined, so
+        // these shapes drive the anchored path; `filler` never dominates.
+        let shapes: &[&[&str]] = &[
+            &["common", "rare"],
+            &["common", "rare", "rareb"],
+            &["common", "rareb", "zzz_absent"],
+            &["common", "filler"],
+        ];
+        for terms in shapes {
+            let merge_len = r
+                .token_match("body", terms, BoolMode::Or)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", terms, BoolMode::Or)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(
+                count, merge_len,
+                "anchored count vs merge len for {terms:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn term_df_reports_document_frequency() {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open");
