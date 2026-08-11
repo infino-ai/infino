@@ -1876,8 +1876,8 @@ impl VectorReader {
         Some((lo, flat - bases[lo]))
     }
 
-    /// Global-fine router scoring (diagnostic `INFINO_GLOBAL_FINE_FC`): score
-    /// `query` against EVERY fine centroid of every cell in this superfile,
+    /// Global-fine router scoring (`vector.routing = global_fine_centroid`):
+    /// score `query` against EVERY fine centroid of every cell in this superfile,
     /// sourced from the resident centroid `section` (zero superfile opens —
     /// the routing scan is a pure RAM op over the page-cache-backed spill).
     /// Returns `(flat_cluster_id, score)` for all clusters, where the flat id
@@ -1921,7 +1921,7 @@ impl VectorReader {
         Ok(out)
     }
 
-    /// Per-cell coalesced read plan for global-fine (`INFINO_GLOBAL_FINE_COALESCE`):
+    /// Per-cell coalesced read plan for global-fine (`vector.global_fine_coalesce`):
     /// given selected flat cluster ids, return every cluster in each touched
     /// cell's `[min..max]` selected span. Clusters are stored in id order, so
     /// a span is one CONTIGUOUS byte range that coalesces to a single GET

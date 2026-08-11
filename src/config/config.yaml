@@ -158,6 +158,25 @@ vector:
   # sub-builds.
   kmeans_pts_per_centroid: 1024
 
+  # Query routing for the hidden vector index on the UNFILTERED path.
+  # (Filtered queries and pre-drain user tables always use `stamped`.)
+  #   global_fine_centroid — score every fine centroid globally across all
+  #                          cells and read the top `global_fine_fanout`
+  #                          clusters, bypassing the grid. Concentrates the
+  #                          cold footprint as the corpus grows.
+  #   stamped              — grid routing to cells, then the manifest's
+  #                          stamped per-cell width.
+  routing: global_fine_centroid
+
+  # For routing = global_fine_centroid: how many fine clusters the query
+  # fans out to (globally scored). Higher reads more clusters — more cold
+  # bytes, higher recall. Ignored under routing = stamped.
+  global_fine_fanout: 1024
+
+  # For routing = global_fine_centroid: coalesce the selected clusters
+  # within each cell into contiguous reads. Ignored under routing = stamped.
+  global_fine_coalesce: false
+
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
   #

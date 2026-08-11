@@ -265,6 +265,9 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
+/// Default fine-cluster fan-out for `routing = global_fine_centroid` —
+/// the top-N fine clusters (globally scored) a query reads per probe.
+const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
 /// inside each selected cell. Small cells stay at this known-good minimum.
 const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
@@ -342,6 +345,22 @@ pub enum DrainConsolidate {
     Splice,
 }
 
+/// Query routing for the hidden vector index on the UNFILTERED path.
+/// Selected by `vector.routing`. Filtered queries and pre-drain user
+/// tables always take the stamped grid path regardless of this setting.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorRouting {
+    /// Score every fine centroid globally across all cells and read the
+    /// top `vector.global_fine_fanout` clusters, bypassing the grid.
+    /// Reads only where the query's nearest clusters actually live, which
+    /// concentrates the cold footprint as the corpus grows (default).
+    #[default]
+    GlobalFineCentroid,
+    /// Grid routing to cells, then the manifest's stamped per-cell width.
+    Stamped,
+}
+
 /// Vector-index build / search / drain tuning knobs. Grouped so the
 /// vector-specific levers don't crowd the top-level namespace. All
 /// have defaults equal to the engine's built-in behavior; a fresh
@@ -381,6 +400,17 @@ pub struct VectorSettings {
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
     pub kmeans_pts_per_centroid: usize,
+    /// Query routing for the hidden vector index (unfiltered path).
+    pub routing: VectorRouting,
+    /// For `routing = global_fine_centroid`: how many fine clusters the
+    /// query fans out to, chosen globally across all cells by centroid
+    /// score. Higher reads more clusters — more cold bytes, higher
+    /// recall. Ignored under `routing = stamped`.
+    pub global_fine_fanout: usize,
+    /// For `routing = global_fine_centroid`: coalesce the selected
+    /// clusters within each cell into contiguous reads. Ignored under
+    /// `routing = stamped`.
+    pub global_fine_coalesce: bool,
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
@@ -448,6 +478,9 @@ impl Default for VectorSettings {
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
+            routing: VectorRouting::GlobalFineCentroid,
+            global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
+            global_fine_coalesce: false,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,

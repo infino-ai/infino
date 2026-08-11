@@ -1527,17 +1527,18 @@ impl SupertableReader {
             .await
     }
 
-    /// Diagnostic global-fine fanout (`INFINO_GLOBAL_FINE_FC`). Phase 1:
-    /// score `query` against every cell's fp32 fine centroids from the
-    /// resident centroid section (a RAM scan — no superfile opens for the
-    /// scoring) and keep the global top-`fc` `(superfile, flat cluster)` by
-    /// ascending distance. Phase 2: probe only those clusters per superfile
-    /// via the existing [`SuperfileReader::search_clusters_async`], then the
-    /// shared `tag_hits` + `attach_stable_ids` remap, and merge to the global
-    /// top-k. The router overrides only cluster SELECTION; the byte fetch,
-    /// 1-bit shortlist, rerank, and id remap are the stamped-law path's own
-    /// code. Experimental — a tree/HNSW centroid router replaces the
-    /// brute-force scan later; see [`SuperfileReader::global_fine_cluster_scores`].
+    /// Global-fine fanout (`vector.routing = global_fine_centroid`, fanning
+    /// out to `fc = vector.global_fine_fanout` clusters). Phase 1: score
+    /// `query` against every cell's fp32 fine centroids from the resident
+    /// centroid section (a RAM scan — no superfile opens for the scoring) and
+    /// keep the global top-`fc` `(superfile, flat cluster)` by ascending
+    /// distance. Phase 2: scan only those clusters per superfile, pool the
+    /// warm survivors across all cells, take one global shortlist cut, and
+    /// exact-rerank where the winners live. The router overrides only cluster
+    /// SELECTION; the byte fetch, 1-bit shortlist, rerank, and id remap are
+    /// the stamped path's own code. A tree/HNSW centroid router replaces the
+    /// brute-force scan later; see
+    /// [`SuperfileReader::global_fine_cluster_scores`].
     async fn global_fine_fanout(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -1604,10 +1605,10 @@ impl SupertableReader {
             let entry = &superfiles[si];
             let reader = readers[si].as_ref();
             let Some(vr) = reader.vec() else { continue };
-            // Per-cell coalesced read (`INFINO_GLOBAL_FINE_COALESCE`): expand
+            // Per-cell coalesced read (`vector.global_fine_coalesce`): expand
             // each touched cell's selection to its [min..max] contiguous span
             // so the cell reads as one GET instead of scattered clusters.
-            let flats = if std::env::var("INFINO_GLOBAL_FINE_COALESCE").is_ok() {
+            let flats = if config::global().vector.global_fine_coalesce {
                 vr.coalesce_flats_to_cell_spans(&flats)
             } else {
                 flats
@@ -1676,18 +1677,19 @@ impl SupertableReader {
         let (resolved_nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
         let hidden_vector_index = is_hidden_vector_manifest(manifest);
-        // Diagnostic global-fine routing (`INFINO_GLOBAL_FINE_FC`): select the
-        // top-FC fine centroids GLOBALLY across every cell/superfile from the
-        // resident centroid section, bypassing the grid + stamped-law
-        // selection, and read only those clusters. Unfiltered hidden path
-        // only; unset leaves the stamped-law path below untouched.
+        // Global-fine routing (`vector.routing = global_fine_centroid`):
+        // select the top-`global_fine_fanout` fine centroids GLOBALLY across
+        // every cell/superfile from the resident centroid section, bypassing
+        // the grid + stamped-law selection, and read only those clusters.
+        // Unfiltered hidden path only; `stamped` (or a filtered/user-table
+        // query) leaves the stamped-law path below untouched.
+        let vcfg = &config::global().vector;
         if !filtered
             && hidden_vector_index
-            && let Some(fc) = std::env::var("INFINO_GLOBAL_FINE_FC")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n > 0)
+            && vcfg.routing == config::VectorRouting::GlobalFineCentroid
+            && vcfg.global_fine_fanout > 0
         {
+            let fc = vcfg.global_fine_fanout;
             return self
                 .global_fine_fanout(&superfiles, column, query, k, &options, fc)
                 .await;
