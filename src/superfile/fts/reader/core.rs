@@ -294,10 +294,18 @@ pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 /// `df(dominant) + |others \ dominant|` — the dominant term's df is read
 /// from its header (no decode) and its skip table is traversed once to
 /// membership-test the rarer docs — than by walking every posting of
-/// every term. Conservative (≥ this ratio) so only a clear dominant term
-/// takes the anchored path; balanced unions keep the windowed bitset,
-/// which is already faster when no term dominates.
-pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 4;
+/// every term.
+///
+/// The anchored path does one skip-probe per doc in the *others* union,
+/// and a skip-probe costs several times what the windowed walk's linear
+/// `next()` does. So it only pays when the dominant list — the postings
+/// the anchor avoids decoding — is larger than the others' combined df by
+/// more than that per-probe penalty. Measurement puts the crossover
+/// between ~6× (where the probe cost still loses) and ~130× (a clear
+/// win); this threshold sits above the loss region so only a decisively
+/// dominant term takes the anchored path. Balanced unions keep the
+/// windowed bitset, which is already faster when no term dominates.
+pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 8;
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
