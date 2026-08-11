@@ -265,11 +265,8 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
-/// Default fine-cluster fan-out FRACTION for `routing = global_fine_centroid`
-/// — the query reads `ceil(pct × total_fine_clusters)` globally-scored
-/// clusters. 10% is the measured 1M/10M starting point (≈0.99 at 10M may
-/// want ~15%).
-const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT_PCT: f64 = 0.10;
+/// Default fine-cluster fanout for `routing = global_fine_centroid`.
+const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
 /// Default exact-rerank over-fetch for `routing = global_fine_centroid` —
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
@@ -357,14 +354,14 @@ pub enum DrainConsolidate {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorRouting {
-    /// Score every fine centroid globally across all cells and read the
-    /// top `vector.global_fine_fanout` clusters, bypassing the grid.
-    /// Reads only where the query's nearest clusters actually live, which
-    /// concentrates the cold footprint as the corpus grows (default).
+    /// Grid routing to cells, then the manifest's stamped per-cell width
+    /// (default). The established path.
     #[default]
-    GlobalFineCentroid,
-    /// Grid routing to cells, then the manifest's stamped per-cell width.
     Stamped,
+    /// EXPERIMENTAL (opt-in): score every fine centroid globally and read the
+    /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
+    /// cold-read win at scale, not at small scale — see `config.yaml`.
+    GlobalFineCentroid,
 }
 
 /// Vector-index build / search / drain tuning knobs. Grouped so the
@@ -406,16 +403,13 @@ pub struct VectorSettings {
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
     pub kmeans_pts_per_centroid: usize,
-    /// Query routing for the hidden vector index (unfiltered path).
+    /// Query routing for the hidden vector index (unfiltered path). Default
+    /// `stamped`; `global_fine_centroid` is experimental (see [`VectorRouting`]).
     pub routing: VectorRouting,
-    /// For `routing = global_fine_centroid`: the fraction of all fine
-    /// clusters the query fans out to, chosen globally across cells by
-    /// centroid score (`fanout = ceil(pct × total_fine_clusters)`).
-    /// Expressed as a fraction so it tracks the corpus as it grows —
-    /// a fixed count would be exhaustive at 1M and a sliver at 100M.
-    /// Higher reads more clusters — more cold bytes, higher recall.
-    /// Ignored under `routing = stamped`.
-    pub global_fine_fanout_pct: f64,
+    /// For `routing = global_fine_centroid`: number of fine clusters the
+    /// query reads (globally scored, clamped to the table's total). See
+    /// `config.yaml` for sizing guidance. Ignored under `routing = stamped`.
+    pub global_fine_fanout: usize,
     /// For `routing = global_fine_centroid`: the exact-rerank over-fetch
     /// multiplier for this path specifically (a caller-set `rerank_mult`
     /// still wins). Scoped here rather than the shared default so tuning
@@ -492,8 +486,8 @@ impl Default for VectorSettings {
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
-            routing: VectorRouting::GlobalFineCentroid,
-            global_fine_fanout_pct: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT_PCT,
+            routing: VectorRouting::Stamped,
+            global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,

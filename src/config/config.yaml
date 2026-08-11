@@ -161,20 +161,24 @@ vector:
 
   # Query routing for the hidden vector index on the UNFILTERED path.
   # (Filtered queries and pre-drain user tables always use `stamped`.)
-  #   global_fine_centroid — score every fine centroid globally across all
-  #                          cells and read the top fanout clusters,
-  #                          bypassing the grid. Concentrates the cold
-  #                          footprint as the corpus grows.
   #   stamped              — grid routing to cells, then the manifest's
-  #                          stamped per-cell width.
-  routing: global_fine_centroid
+  #                          stamped per-cell width. The default, established path.
+  #   global_fine_centroid — EXPERIMENTAL: score every fine centroid globally
+  #                          across all cells and read the top fanout clusters,
+  #                          bypassing the grid. Concentrates the cold footprint
+  #                          as the corpus grows — a cold-read win at scale
+  #                          (10M+); at small scale it can cost recall/latency
+  #                          for no cold benefit. Opt-in while the per-table
+  #                          fanout stamp is built.
+  routing: stamped
 
-  # For routing = global_fine_centroid: the FRACTION of all fine clusters
-  # the query fans out to (globally scored): fanout = ceil(pct × total).
-  # A fraction (not a count) so it tracks the corpus — exhaustive at 1M,
-  # a sliver at 100M. Higher reads more clusters — more cold bytes, higher
-  # recall. ~0.99 at 10M may want ~0.15. Ignored under routing = stamped.
-  global_fine_fanout_pct: 0.10
+  # For routing = global_fine_centroid: the NUMBER of fine clusters the
+  # query fans out to (globally scored), clamped to the table's cluster
+  # total. Higher reads more clusters — more cold bytes, higher recall.
+  # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
+  # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
+  # pending a per-table calibrated stamp. Ignored under routing = stamped.
+  global_fine_fanout: 1024
 
   # For routing = global_fine_centroid: exact-rerank over-fetch multiplier
   # for this path only (a caller-set rerank_mult still wins). Scoped here so

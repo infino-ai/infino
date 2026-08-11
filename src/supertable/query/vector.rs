@@ -1527,12 +1527,12 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-fine fanout (`vector.routing = global_fine_centroid`, fanning
-    /// out to `fc = ceil(fanout_pct × total_fine_clusters)` clusters, where
-    /// `fanout_pct = vector.global_fine_fanout_pct`). Phase 1: score `query`
-    /// against every cell's fp32 fine centroids from the resident centroid
-    /// section (a RAM scan — no superfile opens for the scoring) and keep the
-    /// global top-`fc` `(superfile, flat cluster)` by ascending distance. Phase 2: scan only those clusters per superfile, pool the
+    /// Global-fine fanout (`vector.routing = global_fine_centroid`, reading
+    /// `fanout = vector.global_fine_fanout` clusters, clamped to the table's
+    /// cluster total). Phase 1: score `query` against every cell's fp32 fine
+    /// centroids from the resident centroid section (a RAM scan — no superfile
+    /// opens for the scoring) and keep the global top-`fanout`
+    /// `(superfile, flat cluster)` by ascending distance. Phase 2: scan only those clusters per superfile, pool the
     /// warm survivors across all cells, take one global shortlist cut, and
     /// exact-rerank where the winners live. The router overrides only cluster
     /// SELECTION; the byte fetch, 1-bit shortlist, rerank, and id remap are
@@ -1546,7 +1546,7 @@ impl SupertableReader {
         query: &[f32],
         k: usize,
         options: &VectorSearchOptions,
-        fanout_pct: f64,
+        fanout: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
         let section = self.centroid_section().await.ok_or_else(|| {
@@ -1585,10 +1585,10 @@ impl SupertableReader {
         if cands.is_empty() {
             return Ok(Vec::new());
         }
-        // `cands` now holds EVERY fine cluster across all cells/superfiles,
-        // so its length is the total cluster count the fraction applies to.
-        // Global top-`fc` by ascending distance (smaller = nearer).
-        let fc = ((fanout_pct * cands.len() as f64).ceil() as usize).clamp(1, cands.len());
+        // `cands` now holds EVERY fine cluster across all cells/superfiles;
+        // clamp the requested fanout to that total. Global top-`fc` by
+        // ascending distance (smaller = nearer).
+        let fc = fanout.clamp(1, cands.len());
         if cands.len() > fc {
             cands.select_nth_unstable_by(fc - 1, |a, b| a.2.total_cmp(&b.2));
             cands.truncate(fc);
@@ -1695,11 +1695,11 @@ impl SupertableReader {
         if !filtered
             && hidden_vector_index
             && vcfg.routing == config::VectorRouting::GlobalFineCentroid
-            && vcfg.global_fine_fanout_pct > 0.0
+            && vcfg.global_fine_fanout > 0
         {
-            let pct = vcfg.global_fine_fanout_pct;
+            let fanout = vcfg.global_fine_fanout;
             return self
-                .global_fine_fanout(&superfiles, column, query, k, &options, pct)
+                .global_fine_fanout(&superfiles, column, query, k, &options, fanout)
                 .await;
         }
         // Borrow routing — do not clone the VectorCell centroid grid just to
