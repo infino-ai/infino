@@ -121,6 +121,11 @@ fn demo_two_superfiles() -> Supertable {
 fn deterministic(mut stats: OpStats) -> OpStats {
     stats.kernel_cpu_ns = 0;
     stats.vector_rows_reranked = 0;
+    // Memoized per superfile uri, so it is paid by whichever query arrives
+    // first and by no other — cache state, not plan work. Stripped here for
+    // the same reason as the two above; `a_gapped_placement_index_is_built_
+    // once_then_memoized` is what pins its behaviour.
+    stats.placement_rows_scanned = 0;
     stats
 }
 
@@ -594,6 +599,73 @@ fn a_scoped_vector_query_reports_scan_and_rerank_work() {
          folded into it (ranges {}, rows {})",
         stats.planned_read_ranges,
         stats.vector_rows_reranked
+    );
+}
+
+#[test]
+fn a_gapped_placement_index_is_built_once_then_memoized() {
+    // Resolving a scalar projection needs `stable_id -> local` for every hit.
+    // Cell-packed (`MultiCellIvf`) user superfiles store rows in cell order,
+    // so that map cannot come from span arithmetic — it is BUILT by reading
+    // the superfile's whole id column: O(rows in the file) to place k rows.
+    // The build is memoized per superfile uri, so only the first query to
+    // touch a file pays. This counter keeps the asymmetry visible — if a
+    // steady-state workload ever stops reporting zero, the memo has stopped
+    // working and every query is scanning the corpus to return k rows.
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+
+    // The id+score path resolves no placements at all, even cold.
+    let (_, bare) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+        .expect("bare vector search")
+    });
+    assert_eq!(
+        bare.placement_rows_scanned, 0,
+        "the id+score fast path never places rows"
+    );
+
+    let (hits, cold) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            Some(&["title"]),
+        )
+        .expect("projected vector search")
+    });
+    assert!(!hits.is_empty(), "fixture vector query must match");
+    assert!(
+        cold.placement_rows_scanned >= VECTOR_ROWS as u64,
+        "the first projected query builds the index over every row of the \
+         holding superfile ({VECTOR_ROWS} rows); got {}",
+        cold.placement_rows_scanned
+    );
+
+    let (_, warm) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            Some(&["title"]),
+        )
+        .expect("projected vector search")
+    });
+    assert_eq!(
+        warm.placement_rows_scanned, 0,
+        "the index is memoized per superfile uri — a repeat query builds nothing"
     );
 }
 

@@ -67,7 +67,7 @@
 use std::{
     borrow::Cow,
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, hash_map::Entry},
     future::Future,
     mem,
     sync::{
@@ -996,6 +996,12 @@ async fn build_gapped_placement_index(
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
     let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
     let ids = read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await?;
+    // The build is O(rows in this superfile) while the query wants k rows, so
+    // make that asymmetry visible in the cost profile. Memoized per uri, so a
+    // steady-state workload reports 0 and only a churning one keeps paying.
+    if let Some(stats) = op_stats {
+        stats.add_placement_rows_scanned(ids.len() as u64);
+    }
     // ~20 B resident per row (i128 id + u32 local). Reserve up front; on refusal
     // build anyway, just unaccounted (correctness is unchanged, only the memo's
     // budget bookkeeping) — same graceful fallback the transposed-code cache uses.
@@ -1276,11 +1282,24 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     });
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
     let mut placement_requests: Vec<(usize, i128)> = Vec::new();
+    // One manifest lookup per DISTINCT hit superfile, not per hit. Hits arrive
+    // top-k-many but from far fewer superfiles, and a hidden-index hit carries a
+    // hidden-table uri that is never in the user manifest — so every one of those
+    // is a miss, and a miss walks every manifest part. Deduping bounds that walk
+    // by the superfile count instead of by k.
+    let mut entry_by_uri: HashMap<SuperfileUri, Option<Arc<SuperfileEntry>>> = HashMap::new();
     for (i, hit) in hits.iter().enumerate() {
-        if let Some(user_entry) = user_manifest
-            .lookup_superfile_entry(hit.superfile)
-            .await
-            .map_err(QueryError::ManifestLoad)?
+        let user_entry = match entry_by_uri.entry(hit.superfile) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(slot) => {
+                let looked_up = user_manifest
+                    .lookup_superfile_entry(hit.superfile)
+                    .await
+                    .map_err(QueryError::ManifestLoad)?;
+                slot.insert(looked_up).clone()
+            }
+        };
+        if let Some(user_entry) = user_entry
             && !(user_entry.vector_layout == VectorLayout::MultiCellIvf && hit.stable_id.is_some())
         {
             out[i] = Some(*hit);

@@ -50,12 +50,14 @@ use serde::{Deserialize, Serialize};
 use super::cpu;
 
 /// Physical work one query performed. Every field except
-/// [`Self::kernel_cpu_ns`] (measured time, varies run to run) and
+/// [`Self::kernel_cpu_ns`] (measured time, varies run to run),
 /// [`Self::vector_rows_reranked`] (actual execution rows — the deferred
 /// path reranks cold cells in place, so the count can shift with cache
-/// temperature) is a deterministic plan count: same query, same table
-/// state → same value, warm or cold. The struct is `#[non_exhaustive]`
-/// because counters land modality by modality.
+/// temperature) and [`Self::placement_rows_scanned`] (a memoized index
+/// build, so only the first query to touch a superfile pays) is a
+/// deterministic plan count: same query, same table state → same value,
+/// warm or cold. The struct is `#[non_exhaustive]` because counters land
+/// modality by modality.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct OpStats {
@@ -116,6 +118,20 @@ pub struct OpStats {
     /// decodes nothing and counts nothing; remap/tombstone-internal id
     /// reads count planned ranges only, never rows.
     pub rows_materialized: u64,
+    /// Rows whose stable `_id` was read to build a gapped superfile's
+    /// `stable_id -> local` placement index (the scalar-projection resolve
+    /// path). Like [`Self::vector_rows_reranked`] this is an EXECUTION
+    /// diagnostic, not a plan count: the index is memoized per superfile
+    /// uri, so a warm process reports 0 and only the first query to touch a
+    /// superfile pays — the count therefore depends on cache state, not on
+    /// the query. It exists because the build is O(rows in the superfile)
+    /// while the query wants k rows: on a static table that cost amortizes
+    /// to nothing, but a write-heavy table that keeps minting superfiles
+    /// pays it again per new file, and a manifest churning fast enough to
+    /// evict entries can pay it repeatedly. Zero here across a steady-state
+    /// workload is the signal that the memo is doing its job; a number that
+    /// keeps growing is the signal that it is not.
+    pub placement_rows_scanned: u64,
     /// Nanoseconds of the query's bracketed synchronous kernel sections.
     /// Engine kernels use the thread-CPU clock; SQL operator sections use
     /// DataFusion's own `elapsed_compute` instrumentation (an `Instant`
@@ -137,6 +153,7 @@ pub(crate) struct OpStatsCollector {
     planned_read_ranges: AtomicU64,
     sql_page_bytes: AtomicU64,
     rows_materialized: AtomicU64,
+    placement_rows_scanned: AtomicU64,
     kernel_cpu_ns: AtomicU64,
 }
 
@@ -175,6 +192,12 @@ impl OpStatsCollector {
         self.rows_materialized.fetch_add(rows, Ordering::Relaxed);
     }
 
+    /// Flush one gapped placement-index build's scanned row count.
+    pub(crate) fn add_placement_rows_scanned(&self, rows: u64) {
+        self.placement_rows_scanned
+            .fetch_add(rows, Ordering::Relaxed);
+    }
+
     /// Flush one bracketed kernel section's on-CPU nanoseconds.
     pub(crate) fn add_kernel_cpu_ns(&self, ns: u64) {
         self.kernel_cpu_ns.fetch_add(ns, Ordering::Relaxed);
@@ -190,6 +213,7 @@ impl OpStatsCollector {
             planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
             rows_materialized: self.rows_materialized.load(Ordering::Relaxed),
+            placement_rows_scanned: self.placement_rows_scanned.load(Ordering::Relaxed),
             kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),
         }
     }
