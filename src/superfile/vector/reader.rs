@@ -1876,6 +1876,75 @@ impl VectorReader {
         Some((lo, flat - bases[lo]))
     }
 
+    /// Global-fine router scoring (diagnostic `INFINO_GLOBAL_FINE_FC`): score
+    /// `query` against EVERY fine centroid of every cell in this superfile,
+    /// sourced from the resident centroid `section` (zero superfile opens —
+    /// the routing scan is a pure RAM op over the page-cache-backed spill).
+    /// Returns `(flat_cluster_id, score)` for all clusters, where the flat id
+    /// is the cumulative-`n_cent` numbering [`Self::resolve_flat_cluster`]
+    /// inverts — so the selected ids feed straight into
+    /// [`Self::search_clusters_async`]. Score is the same SIMD centroid
+    /// distance query-time fine ranking uses (smaller = nearer). Multi-cell
+    /// hidden readers only; others return empty (caller falls back to the
+    /// stamped-law path).
+    pub(crate) fn global_fine_cluster_scores(
+        &self,
+        column: &str,
+        query: &[f32],
+        section: &crate::supertable::slow_vector_state::CentroidSection,
+        superfile_id: uuid::Uuid,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (ci, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 {
+                continue;
+            }
+            // Section is keyed by the grid cell id; multi-cell readers carry
+            // one per column entry (parallel to `columns`).
+            let cell_id = self.cell_ids.get(ci).copied();
+            let Some(bytes) = section
+                .read_cell_bytes(superfile_id, column, cell_id)
+                .map_err(|e| VectorError::LazySource(e.to_string()))?
+            else {
+                continue;
+            };
+            let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
+            // `score_centroids` is the SIMD (`f32x8`) owner query-time fine
+            // ranking uses; `nprobe = n_cent` scores every cluster.
+            for (local, score) in score_centroids(&bytes, col, query, col.n_cent as usize) {
+                out.push((base + local as u32, score));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per-cell coalesced read plan for global-fine (`INFINO_GLOBAL_FINE_COALESCE`):
+    /// given selected flat cluster ids, return every cluster in each touched
+    /// cell's `[min..max]` selected span. Clusters are stored in id order, so
+    /// a span is one CONTIGUOUS byte range that coalesces to a single GET
+    /// per cell — trading a bounded gap over-read (the unselected clusters
+    /// between the first and last selected) for far fewer, larger reads
+    /// instead of scattered per-cluster GETs. Multi-cell readers only.
+    pub(crate) fn coalesce_flats_to_cell_spans(&self, flats: &[u32]) -> Vec<u32> {
+        let mut span: HashMap<usize, (u32, u32)> = HashMap::new();
+        for &f in flats {
+            if let Some((cell, local)) = self.resolve_flat_cluster(f) {
+                let e = span.entry(cell).or_insert((local, local));
+                e.0 = e.0.min(local);
+                e.1 = e.1.max(local);
+            }
+        }
+        let mut out = Vec::new();
+        for (cell, (lo, hi)) in span {
+            let base = self.flat_cluster_base.get(cell).copied().unwrap_or(0);
+            out.extend((lo..=hi).map(|local| base + local));
+        }
+        out
+    }
+
     pub fn n_docs(&self) -> u64 {
         self.n_docs
     }

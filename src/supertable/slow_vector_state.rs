@@ -364,6 +364,51 @@ impl CentroidSection {
         &self.uri
     }
 
+    /// Enumerate every `(superfile, column, cell)` the section carries, with
+    /// that cell's fine-cluster count and dim. The global-fine router walks
+    /// this to score the query against every cell's fp32 fine centroids
+    /// ([`Self::read_cell`]) without opening any superfile — the routing scan
+    /// is entirely served from this resident, page-cache-backed section.
+    pub(crate) fn cell_directory(&self) -> Vec<(Uuid, String, Option<u32>, u32, u32)> {
+        let mut out = Vec::new();
+        for ((superfile_id, column), cells) in &self.cells {
+            for cell in cells {
+                out.push((
+                    *superfile_id,
+                    column.clone(),
+                    cell.cell_id,
+                    cell.n_cent,
+                    cell.dim,
+                ));
+            }
+        }
+        out
+    }
+
+    /// Raw fp32-le fine-centroid bytes for one cell (cluster-major,
+    /// `n_cent × dim × 4`), exactly as they sit in the section. `Ok(None)`
+    /// when the `(superfile, column, cell)` triple is absent; a spill-read
+    /// fault is an error, never "absent". The global-fine router scores
+    /// against these bytes directly through the SIMD `score_centroids`
+    /// owner (which takes `&[u8]`), so no `Vec<f32>` round-trip.
+    pub(crate) fn read_cell_bytes(
+        &self,
+        superfile_id: Uuid,
+        column: &str,
+        cell_id: Option<u32>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let Some(cells) = self.cells.get(&(superfile_id, column.to_owned())) else {
+            return Ok(None);
+        };
+        let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else {
+            return Ok(None);
+        };
+        let len = cell.n_cent as usize * cell.dim as usize * 4;
+        let mut buf = vec![0u8; len];
+        self.spill.as_file().read_exact_at(&mut buf, cell.offset)?;
+        Ok(Some(buf))
+    }
+
     /// Read one cell's fp32 fine centroids (cluster-major, `n_cent × dim`).
     /// `Ok(None)` when the `(superfile, column, cell)` triple is not in the
     /// section; a spill-read fault is an error, never "absent" — mapping it
@@ -374,20 +419,13 @@ impl CentroidSection {
         column: &str,
         cell_id: Option<u32>,
     ) -> io::Result<Option<Vec<f32>>> {
-        let Some(cells) = self.cells.get(&(superfile_id, column.to_owned())) else {
-            return Ok(None);
-        };
-        let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else {
-            return Ok(None);
-        };
-        let len = cell.n_cent as usize * cell.dim as usize * 4;
-        let mut buf = vec![0u8; len];
-        self.spill.as_file().read_exact_at(&mut buf, cell.offset)?;
-        Ok(Some(
-            buf.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
-                .collect(),
-        ))
+        Ok(self
+            .read_cell_bytes(superfile_id, column, cell_id)?
+            .map(|buf| {
+                buf.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
+                    .collect()
+            }))
     }
 }
 

@@ -1527,6 +1527,107 @@ impl SupertableReader {
             .await
     }
 
+    /// Diagnostic global-fine fanout (`INFINO_GLOBAL_FINE_FC`). Phase 1:
+    /// score `query` against every cell's fp32 fine centroids from the
+    /// resident centroid section (a RAM scan — no superfile opens for the
+    /// scoring) and keep the global top-`fc` `(superfile, flat cluster)` by
+    /// ascending distance. Phase 2: probe only those clusters per superfile
+    /// via the existing [`SuperfileReader::search_clusters_async`], then the
+    /// shared `tag_hits` + `attach_stable_ids` remap, and merge to the global
+    /// top-k. The router overrides only cluster SELECTION; the byte fetch,
+    /// 1-bit shortlist, rerank, and id remap are the stamped-law path's own
+    /// code. Experimental — a tree/HNSW centroid router replaces the
+    /// brute-force scan later; see [`SuperfileReader::global_fine_cluster_scores`].
+    async fn global_fine_fanout(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: &VectorSearchOptions,
+        fc: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        let section = self.centroid_section().await.ok_or_else(|| {
+            QueryError::Execute("global-fine: centroid section unavailable".into())
+        })?;
+        let store = Arc::clone(&manifest.options.store);
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+        let (_, rerank_mult) = options.resolve(false);
+
+        // Phase 1: build the global candidate pool. Scores are comparable
+        // across cells/superfiles (one metric + one query), so a single
+        // top-`fc` cut over the pool is a valid global selection.
+        let mut readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(superfiles.len());
+        let mut cands: Vec<(usize, u32, f32)> = Vec::new();
+        for entry in superfiles.iter() {
+            let reader =
+                dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                    .await?;
+            let si = readers.len();
+            if let Some(vr) = reader.vec() {
+                let scores = vr
+                    .global_fine_cluster_scores(column, query, section.as_ref(), entry.superfile_id)
+                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                for (flat, score) in scores {
+                    cands.push((si, flat, score));
+                }
+            }
+            readers.push(reader);
+        }
+        if cands.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Global top-`fc` by ascending distance (smaller = nearer).
+        if cands.len() > fc {
+            cands.select_nth_unstable_by(fc - 1, |a, b| a.2.total_cmp(&b.2));
+            cands.truncate(fc);
+        }
+        let mut by_sf: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (si, flat, _) in cands {
+            by_sf.entry(si).or_default().push(flat);
+        }
+
+        // Phase 2: probe only the selected clusters per superfile via the
+        // existing multi-cell cluster search, then the shared remap.
+        let mut all: Vec<SuperfileHit> = Vec::new();
+        for (si, flats) in by_sf {
+            let entry = &superfiles[si];
+            let reader = readers[si].as_ref();
+            let Some(vr) = reader.vec() else { continue };
+            // Per-cell coalesced read (`INFINO_GLOBAL_FINE_COALESCE`): expand
+            // each touched cell's selection to its [min..max] contiguous span
+            // so the cell reads as one GET instead of scattered clusters.
+            let flats = if std::env::var("INFINO_GLOBAL_FINE_COALESCE").is_ok() {
+                vr.coalesce_flats_to_cell_spans(&flats)
+            } else {
+                flats
+            };
+            let (hits, _tally) = vr
+                .search_clusters_async(
+                    column,
+                    query,
+                    k,
+                    &flats,
+                    rerank_mult,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let mut tagged = dispatch::tag_hits(entry, hits);
+            dispatch::attach_stable_ids(reader, entry, &mut tagged, false, &self.op_stats).await?;
+            all.extend(tagged);
+        }
+        // Global top-k across superfiles (smaller distance = better).
+        all.sort_by(|a, b| a.score.total_cmp(&b.score));
+        all.truncate(k);
+        Ok(all)
+    }
+
     async fn vector_fanout_over_superfiles(
         &self,
         superfiles: Vec<Arc<SuperfileEntry>>,
@@ -1540,6 +1641,22 @@ impl SupertableReader {
         let (resolved_nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
         let hidden_vector_index = is_hidden_vector_manifest(manifest);
+        // Diagnostic global-fine routing (`INFINO_GLOBAL_FINE_FC`): select the
+        // top-FC fine centroids GLOBALLY across every cell/superfile from the
+        // resident centroid section, bypassing the grid + stamped-law
+        // selection, and read only those clusters. Unfiltered hidden path
+        // only; unset leaves the stamped-law path below untouched.
+        if !filtered
+            && hidden_vector_index
+            && let Some(fc) = std::env::var("INFINO_GLOBAL_FINE_FC")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+        {
+            return self
+                .global_fine_fanout(&superfiles, column, query, k, &options, fc)
+                .await;
+        }
         // Borrow routing — do not clone the VectorCell centroid grid just to
         // read Copy `CellRoutingParams` (that clone used to drop the transposed
         // SIMD cache and force a per-query scalar transpose rebuild).
@@ -1755,6 +1872,23 @@ impl SupertableReader {
                 filtered,
                 populated_cells,
             );
+            if std::env::var("INFINO_LOG_WIDTH").is_ok() {
+                eprintln!(
+                    "[WIDTH] k={} law_width={:?} nprobe_min={} nprobe_max={} fine_nprobe={} prepin_fine_depth={}",
+                    k,
+                    law_width,
+                    cell_routing.nprobe_min,
+                    cell_routing.nprobe_max,
+                    cell_routing.fine_nprobe,
+                    prepin_fine_depth
+                );
+            }
+            if let Some(cap) = std::env::var("INFINO_FINE_CAP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                cell_routing.fine_nprobe = cell_routing.fine_nprobe.min(cap);
+            }
             // Per-cell fine probe = max(floor, floor(pct × cell fine-cluster
             // count)), so depth scales with cell size. Filtered queries keep
             // their own fixed fine floor (pct = 0); the proportional depth
