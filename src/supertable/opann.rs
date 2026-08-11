@@ -752,6 +752,24 @@ const WIDTH_LAW_TARGET_COVERAGE: f64 = 0.99;
 /// wider one.
 const WIDTH_LAW_CONFIDENCE_Z: f64 = 1.645;
 
+/// Minimum per-knot evidence (`support × k` coverage observations) for
+/// the confidence-bound crossing to be meaningful. Derived, not tuned:
+/// the bound can pass with at least one candidate still uncovered only
+/// when `n·k ≥ (1+z)/(1−t)` (most favorable partial state — one query
+/// at coverage `1−1/k`, the rest full — gives `LB ≈ 1 − (1+z)/(n·k)`).
+/// Below that, the bound degenerates into a max-statistic: no partial
+/// coverage can certify the target, so the crossing lands wherever the
+/// single WORST sampled query completes — an unbounded, tail-lottery
+/// width (measured on Cohere-10M post-split: raw-mean crossing 662 of
+/// 10,846 cells at k = 1, degenerate LB crossing 2,395 — and the
+/// monotone floor then spread that one noisy knot across the whole
+/// law). Knots under this evidence stamp the raw-mean crossing —
+/// the unbiased estimate — and leave the proof margin to the
+/// higher-k knots, which the monotone floor and the interpolator's
+/// clamp already propagate downward at query time.
+const WIDTH_LAW_LB_MIN_EVIDENCE: f64 =
+    (1.0 + WIDTH_LAW_CONFIDENCE_Z) / (1.0 - WIDTH_LAW_TARGET_COVERAGE);
+
 /// Rerank-law distractor pool: each calibration query counts 1-bit-estimate
 /// distractors only within its `RERANK_LAW_POOL_CELLS` grid-nearest cells —
 /// the pool a width-law sweep would actually scan. A `k` point whose
@@ -1505,7 +1523,15 @@ impl WidthLawCalibration {
             // exactly as before; only genuinely marginal crossings widen.
             let n = support[ki] as f64;
             let target = WIDTH_LAW_TARGET_COVERAGE * n;
+            // Confidence-bound crossing only where the knot carries enough
+            // evidence for the bound to be a measurement rather than a
+            // max-statistic (see [`WIDTH_LAW_LB_MIN_EVIDENCE`]); thin knots
+            // (k = 1 at the standard sample) stamp the raw-mean crossing.
+            let lb_certifiable = n * WIDTH_LAW_KS[ki] as f64 >= WIDTH_LAW_LB_MIN_EVIDENCE;
             if let Some(rank) = sums.iter().enumerate().position(|(rank, &s)| {
+                if !lb_certifiable {
+                    return s >= target;
+                }
                 let mean = s / n;
                 let var = (coverage_sq_sums[ki][rank] / n - mean * mean).max(0.0);
                 let se = (var / n).sqrt();
@@ -2064,6 +2090,75 @@ mod tests {
              to the k=10 width instead of stamping a recall inversion"
         );
         assert_eq!(law[3], 0, "k=1000 has no supporting query and stays 0");
+    }
+
+    /// A thin-evidence knot (k = 1: `support × k` below
+    /// [`WIDTH_LAW_LB_MIN_EVIDENCE`]) stamps the RAW-mean crossing — the
+    /// confidence bound cannot pass there with any query uncovered, so its
+    /// crossing would be the single worst query's completion rank (the
+    /// max-statistic that stamped width 2,395 of 10,846 cells flat across
+    /// every knot on Cohere-10M, via the monotone floor). Knots with
+    /// enough evidence (k = 10 here) keep the bound: one fully-uncovered
+    /// query still forces their crossing out to full coverage.
+    #[test]
+    fn width_law_thin_knot_uses_raw_mean_not_the_worst_query() {
+        const DIM: usize = 8;
+        const N_CELLS: usize = 8;
+        const N_QUERIES: usize = 100;
+        /// Cell holding the outlier query's candidates: ranked LAST for
+        /// the shared query vector (all queries are `e0`; ties above it
+        /// break toward lower cell ids).
+        const DEEP_CELL: u32 = 7;
+        let mut cents = vec![0f32; N_CELLS * DIM];
+        for c in 0..N_CELLS {
+            cents[c * DIM + c] = 1.0;
+        }
+        let grid =
+            ClusterCentroids::from_fp32(N_CELLS as u32, DIM as u32, &cents, vec![1; N_CELLS]);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut queries = vec![0.0f32; N_QUERIES * DIM];
+        for qi in 0..N_QUERIES {
+            queries[qi * DIM] = 1.0;
+        }
+        cal.frozen = Some(WidthLawQueries {
+            queries,
+            ids: (10_000..10_000 + N_QUERIES as i128).collect(),
+        });
+        // 99 queries: 10 candidates each, all in the top-ranked cell 0.
+        // 1 outlier query: 10 candidates, all in the LAST-ranked cell.
+        let tops: Vec<Vec<(f32, u32, i128, f32)>> = (0..N_QUERIES)
+            .map(|qi| {
+                let cell = if qi == 0 { DEEP_CELL } else { 0 };
+                let mut acc = Vec::new();
+                let cand: Vec<(f32, u32, i128, f32)> = (0..10)
+                    .map(|j| {
+                        let id = (qi * 100 + j) as i128;
+                        (0.01 + j as f32 * 0.01, cell, id, f32::NEG_INFINITY)
+                    })
+                    .collect();
+                merge_candidates(&mut acc, cand, WIDTH_LAW_MAX_K);
+                acc
+            })
+            .collect();
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = tops;
+
+        let law = cal
+            .finish(&grid)
+            .expect("law from planted candidates")
+            .width_for_k;
+        assert_eq!(
+            law[0], 1,
+            "k=1 carries 100 observations — below the bound's evidence \
+             floor — so the raw-mean crossing (0.99 at width 1) stamps, \
+             not the outlier's completion rank"
+        );
+        assert_eq!(
+            law[1], N_CELLS as u32,
+            "k=10 carries 1,000 observations — the confidence bound \
+             applies and one fully-uncovered query forces full coverage"
+        );
+        assert_eq!(law[2], 0, "k=100 has no supporting query");
+        assert_eq!(law[3], 0, "k=1000 has no supporting query");
     }
 
     /// An out-of-range cell id in the candidates (impossible in the current
