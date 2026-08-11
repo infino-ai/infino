@@ -721,66 +721,34 @@ fn scalar_min_max(
     acc
 }
 
-/// Whether `[min, max]` covers the column type's entire domain — the one
-/// range shape whose bounds are withheld from the statistics reported to
-/// the query planner.
+/// Whether `[min, max]` covers the column type's entire domain, the one
+/// range shape whose bounds are withheld from the reported statistics.
 ///
-/// # Why the bounds are withheld
+/// The planner counts the values an interval holds as `max - min + 1`. A
+/// whole-domain range needs `u64::MAX + 1`, which wraps to zero, and the
+/// row estimate then divides by that count: every `<`, `>`, and `BETWEEN`
+/// on the column fails an assertion before it runs. Withholding the bounds
+/// routes the estimate through the planner's "range unknown" fallback and
+/// costs nothing for filtering, since a range holding every representable
+/// value skips no superfile, row group, or page.
 ///
-/// The planner turns reported bounds into an interval and counts the
-/// values that interval holds as `max - min + 1`. A whole-domain range
-/// needs `u64::MAX + 1`, which does not fit the `u64` the count comes
-/// back in. The addition wraps to zero, the planner then divides by that
-/// count while estimating how many rows a filter keeps, and the resulting
-/// non-finite estimate trips an internal assertion — so every `<`, `>`,
-/// and `BETWEEN` on the column fails before it runs. `=` and a boundary
-/// `>=` escape only because they collapse the interval to a single point
-/// and take a distinct-count path that never divides, which is what makes
-/// the failure look arbitrary from the outside. Reporting no bounds
-/// instead routes the estimate through the planner's existing
-/// "range unknown" fallback.
+/// Any 64-bit integer or temporal type qualifies once both endpoints
+/// appear, hence a span test rather than a type test. Floats are excluded
+/// deliberately: the planner counts them by bit pattern and already guards
+/// that path, while the value distance used here saturates on a wide
+/// range, so without the exclusion an ordinary `Float64` column would
+/// match and lose its bounds for nothing.
 ///
-/// # What withholding costs
-///
-/// Nothing for filtering: a range spanning every representable value
-/// excludes no row, so it could never have skipped a superfile, a row
-/// group, or a page. The planner also loses the ability to fold an
-/// unfiltered `MIN(col)` / `MAX(col)` out of these statistics — but the
-/// covered-aggregate rewrite folds those from the manifest directly and
-/// still answers them without a scan.
-///
-/// # Scope
-///
-/// The test is on the span, not on the type: any 64-bit-wide integer or
-/// temporal column reaches it once both endpoints appear in the data
-/// (`UInt64`, `Int64`, `Date64`, `Timestamp`). Narrower types cannot span
-/// far enough. Decimals are unaffected because the planner declines to
-/// count their intervals at all. Bounds are folded across every surviving
-/// superfile before this runs, so two superfiles that each contribute one
-/// endpoint trip it exactly as one superfile holding both does.
-///
-/// Floating-point columns are excluded, and the exclusion is load-bearing
-/// rather than cosmetic. The planner counts a float interval by the
-/// distance between the endpoints' *bit patterns*, and already returns no
-/// count when that saturates — floats were never exposed to the overflow.
-/// The endpoint distance used here is a difference in *value*, which for a
-/// wide float range is astronomically larger than any integer domain and
-/// saturates on the cast to an integer. Without this exclusion, an
-/// ordinary wide `Float64` column would match and lose its bounds for no
-/// reason.
-///
-/// # Removing this guard
-///
-/// TODO: delete this once the engine moves to DataFusion 55. The overflow
-/// is fixed upstream by DataFusion PR #22309, "Return None for cardinality
-/// overflow", which makes the count a checked add and returns no count on
-/// overflow — the same fallback this guard forces by hand. That fix landed
-/// after the 54 release branch was cut and was not backported, so 54.x
-/// still needs this.
+/// TODO: delete on the move to DataFusion 55, which carries the upstream
+/// fix (checked add, no count on overflow):
+/// <https://github.com/apache/datafusion/pull/22309>
 fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
+    // Never returns `None` for a reason a caller must handle: a missing or
+    // uncountable distance simply means "not whole-domain", and the bounds
+    // are reported as before. `usize` widens to `u64` losslessly on every
+    // supported target, so the comparison cannot fail either.
     !min.data_type().is_floating()
-        && max.distance(min).and_then(|d| u64::try_from(d).ok())
-            == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
+        && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
