@@ -716,16 +716,30 @@ pub(crate) fn plan_sq8_split_kway(
 /// same top-k cell spread.
 pub(crate) const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
 
-/// One-sided 95% normal bound (z ≈ 1.645) for the width crossing's
-/// lower confidence bound — a statistical convention, not a tuned
-/// value. The width walk samples [`WIDTH_LAW_QUERY_SAMPLE`] queries;
-/// its mean-coverage estimate at a marginal crossing carries sampling
-/// error, and stamping on the raw mean turned that error into a
-/// run-to-run serving lottery (measured at 10M post-compact: width-1
-/// draws served 0.980–0.991, width-2 draws 0.994, identical corpus).
-/// The bound makes the sample prove the narrower width or stamp the
-/// wider one.
-const WIDTH_LAW_CONFIDENCE_Z: f64 = 1.645;
+/// Z-multiplier on the width crossing's sampling error: the crossing
+/// tests `mean − Z·SE` against the target, so `0` crosses on the
+/// measured mean and a positive Z makes the sample PROVE the narrower
+/// width before stamping it.
+///
+/// `0` (crossing on the mean) is what the width walk uses. It was
+/// 1.645 — a one-sided 95% bound — because on a 0.99 target the raw
+/// mean turned sampling error into a serving lottery (measured at 10M
+/// post-compact: width-1 draws served 0.980–0.991, width-2 draws
+/// 0.994, identical corpus), and straddling a hard acceptance bar is a
+/// violation. That argument is specific to targets AT the bar. With
+/// `vector.target_recall` configurable, a table set below the bar has
+/// deliberately traded recall for latency and is not protecting
+/// anything by over-provisioning: measured at 10M, target 0.90 stamped
+/// width [7,7,9,10] under the bound versus [5,5,6,8] on the mean, and
+/// served 0.9523 versus 0.9406 — a quarter more cells bought recall
+/// nobody asked for. The mean also tracks the configured target more
+/// closely, which is the point of exposing it.
+///
+/// The variance the bound guarded against is NOT re-measured here (one
+/// run per setting says nothing about run-to-run spread); if a table
+/// at a bar-level target shows stamp instability, this is the knob
+/// that addresses it.
+const WIDTH_LAW_CONFIDENCE_Z: f64 = 0.0;
 
 /// Rerank-law distractor pool: each calibration query counts 1-bit-estimate
 /// distractors only within its `RERANK_LAW_POOL_CELLS` grid-nearest cells —
