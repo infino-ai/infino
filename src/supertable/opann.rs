@@ -856,10 +856,6 @@ pub(crate) struct WidthLawCalibration {
     /// Cohere-10M with every stage at the target: 0.993 served 0.9959,
     /// 0.93 served 0.9693, 0.90 served 0.9577. Padding would only
     /// widen probes for a loss that does not occur.
-    /// per-table
-    /// `vector.target_recall`. Width crosses at the target itself and
-    /// every law stage, so one knob
-    /// moves the whole recall/latency operating point.
     target_recall: f64,
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
