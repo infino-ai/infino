@@ -485,6 +485,12 @@ pub struct FtsReader {
     /// iff the blob is v2. Phrase queries fetch per-term run ranges
     /// out of it via [`Self::fetch_term_positions`].
     pub(super) positions_range: Option<Range<usize>>,
+    /// True iff the blob is `VERSION_V3` — its positional terms carry a
+    /// position run-offset sub-index between skip table and blocks, which
+    /// the phrase decode uses to reach a pair's runs by skipping
+    /// `< POSITION_SUBINDEX_STRIDE` runs. `V1`/`V2` blobs lack it and take
+    /// the block-start skip-walk fallback.
+    pub(super) has_position_subindex: bool,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -537,17 +543,23 @@ impl FtsReader {
             }));
         }
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION_V1_LEGACY && version != format::fts::VERSION_V2 {
+        if version != format::fts::VERSION_V1_LEGACY
+            && version != format::fts::VERSION_V2
+            && version != format::fts::VERSION_V3
+        {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
         }
         // The FST directory starts right after whichever header
-        // applies; a v2 header's extension bytes are already in the
+        // applies; a v2/v3 header's extension bytes are already in the
         // fetched span (and in the overlay below), so
-        // `open_with_source` re-reads them without another GET.
+        // `open_with_source` re-reads them without another GET. (v3 shares
+        // v2's header size.)
         let header_size = match version {
-            v if v == format::fts::VERSION_V2 => format::fts::HEADER_SIZE_V2,
+            v if v == format::fts::VERSION_V2 || v == format::fts::VERSION_V3 => {
+                format::fts::HEADER_SIZE_V2
+            }
             _ => FTS_HEADER_SIZE,
         };
         if header.len() < header_size {
@@ -625,15 +637,19 @@ impl FtsReader {
         // the positions-region offset at [48..56] and a positions
         // region between the postings and the doc-lengths directory.
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
+        // v3 shares v2's header and region layout; it additionally carries
+        // a per-term position sub-index (handled in the phrase decode).
         let positional_blob = match version {
             v if v == format::fts::VERSION_V1_LEGACY => false,
             v if v == format::fts::VERSION_V2 => true,
+            v if v == format::fts::VERSION_V3 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
                 ))));
             }
         };
+        let has_position_subindex = version == format::fts::VERSION_V3;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -892,6 +908,7 @@ impl FtsReader {
             fst_range,
             postings_range,
             positions_range,
+            has_position_subindex,
             columns,
             column_id_by_name,
         })
@@ -1138,7 +1155,15 @@ impl FtsReader {
             for (cursor, term) in cursors.iter().zip(&member_refs) {
                 match cursor.bytes.is_empty() {
                     false => {
-                        let term_meta = TermMeta::parse(cursor.bytes.as_ref(), 0, true)?;
+                        // This is the phrase member's own term_meta —
+                        // the one `decode_current_positions` uses — so it
+                        // carries the sub-index when the blob has one.
+                        let term_meta = TermMeta::parse(
+                            cursor.bytes.as_ref(),
+                            0,
+                            true,
+                            self.has_position_subindex,
+                        )?;
                         positional.push((Some(term_meta), None));
                     }
                     true => {
@@ -1275,7 +1300,7 @@ impl FtsReader {
                     // one `decode_run` per doc in posting order. Read the slice
                     // once and walk it in lockstep with the doc cursor.
                     let position_bytes = if positional {
-                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true)?;
+                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true, false)?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
                                 "positional column missing a positions region".into(),

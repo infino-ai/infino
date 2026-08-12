@@ -67,15 +67,52 @@ impl PhraseMember {
             return Ok(());
         }
         let block = self.cursor.current_block;
+        let pair = self.cursor.pos;
+
+        // Fast path (VERSION_V3): the run-offset sub-index gives the
+        // nearest checkpoint at or before `pair`, so we skip only the
+        // `< POSITION_SUBINDEX_STRIDE` runs between it and `pair` — never
+        // the whole block from its start. Returns an owned tuple, so no
+        // `term_meta` borrow is held across the decode below.
+        let subindex = self
+            .term_meta
+            .as_ref()
+            .expect("PFOR member has term meta")
+            .positions_subindex_offset(self.cursor.bytes.as_ref(), block, pair);
+        if let Some((checkpoint, runs_to_skip)) = subindex {
+            let mut at = checkpoint as usize;
+            for p in (pair - runs_to_skip)..pair {
+                skip_run(&self.positions, &mut at, self.cursor.block_tfs[p]).ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "position runs truncated within block".into(),
+                    ))
+                })?;
+            }
+            decode_run(
+                &self.positions,
+                &mut at,
+                self.cursor.block_tfs[pair],
+                &mut self.pos_scratch,
+            )
+            .ok_or_else(|| {
+                FtsError::Read(ReadError::MalformedVersion(
+                    "position run truncated or overflowing".into(),
+                ))
+            })?;
+            return Ok(());
+        }
+
+        // Fallback (V1/V2, no sub-index): build the block's run offsets by
+        // walking every run from the block's recorded first-run offset.
         if self.run_offsets_block != block {
-            // One forward walk locates every pair's run in this
-            // block: start at the block's recorded first-run offset
-            // (the skip entry's fourth field), then skip each pair's
-            // `tf` varints.
             self.run_offsets.clear();
-            let term_meta = self.term_meta.as_ref().expect("PFOR member has term meta");
-            let mut at =
-                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            let block_first = self
+                .term_meta
+                .as_ref()
+                .expect("PFOR member has term meta")
+                .positions_block_offset(self.cursor.bytes.as_ref(), block)
+                as usize;
+            let mut at = block_first;
             for i in 0..self.cursor.block_n {
                 self.run_offsets.push(at as u32);
                 skip_run(&self.positions, &mut at, self.cursor.block_tfs[i]).ok_or_else(|| {
@@ -86,7 +123,6 @@ impl PhraseMember {
             }
             self.run_offsets_block = block;
         }
-        let pair = self.cursor.pos;
         let mut at = self.run_offsets[pair] as usize;
         decode_run(
             &self.positions,

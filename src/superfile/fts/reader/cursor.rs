@@ -54,6 +54,12 @@ pub(super) struct TermMeta {
     /// Byte length of this term's position runs (positional columns;
     /// zero otherwise).
     pub(super) positions_length: u32,
+    /// Absolute offset (within the postings region) of this term's
+    /// position run-offset sub-index — the block of
+    /// `num_blocks × ENTRIES_PER_BLOCK` `u32`s sitting right after the
+    /// skip table on a `VERSION_V3` positional term. `None` on
+    /// `V1`/`V2` (no sub-index) and on positionless terms.
+    pub(super) subindex_start: Option<usize>,
 }
 
 impl TermMeta {
@@ -65,6 +71,7 @@ impl TermMeta {
         postings: &[u8],
         metadata_offset: usize,
         positional: bool,
+        has_subindex: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -122,6 +129,23 @@ impl TermMeta {
                 "skip table runs past postings region".into(),
             )));
         }
+        // v3 positional terms store a run-offset sub-index right after the
+        // skip table: `num_blocks × ENTRIES_PER_BLOCK` u32s. Bound it now;
+        // the blocks follow it (their offsets are read from the skip
+        // table, which the writer already shifted past the sub-index).
+        let subindex_start = match has_subindex {
+            true => {
+                const ENTRIES_PER_BLOCK: usize = BLOCK_LEN / format::fts::POSITION_SUBINDEX_STRIDE;
+                let subindex_end = skip_end + num_blocks * ENTRIES_PER_BLOCK * U32_BYTES;
+                if subindex_end > postings.len() {
+                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                        "position sub-index runs past postings region".into(),
+                    )));
+                }
+                Some(skip_end)
+            }
+            false => None,
+        };
         Ok(Self {
             df,
             postings_length,
@@ -129,7 +153,32 @@ impl TermMeta {
             skip_start,
             positions_offset,
             positions_length,
+            subindex_start,
         })
+    }
+
+    /// For a `VERSION_V3` positional term, the run offset of the nearest
+    /// sub-index checkpoint at or before pair `pair_in_block` of block
+    /// `block`, and the number of runs to skip from it to reach the pair.
+    /// The offset is relative to the term's positions (like
+    /// [`Self::positions_block_offset`]). `None` when there is no
+    /// sub-index (`V1`/`V2`) — the caller falls back to the block-start
+    /// walk. The skip is always `< POSITION_SUBINDEX_STRIDE`.
+    #[inline]
+    pub(super) fn positions_subindex_offset(
+        &self,
+        postings: &[u8],
+        block: usize,
+        pair_in_block: usize,
+    ) -> Option<(u32, usize)> {
+        const ENTRIES_PER_BLOCK: usize = BLOCK_LEN / format::fts::POSITION_SUBINDEX_STRIDE;
+        let start = self.subindex_start?;
+        let slot = pair_in_block / format::fts::POSITION_SUBINDEX_STRIDE;
+        let idx = block * ENTRIES_PER_BLOCK + slot;
+        let at = start + idx * U32_BYTES;
+        let checkpoint = read_u32_le(&postings[at..at + U32_BYTES]);
+        let runs_to_skip = pair_in_block % format::fts::POSITION_SUBINDEX_STRIDE;
+        Some((checkpoint, runs_to_skip))
     }
 
     /// Decode skip-table entry `i` into `(last_doc_id,
@@ -309,7 +358,9 @@ impl TermCursor {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional)?;
+        // The plain-term cursor never decodes positions, so it needs no
+        // sub-index (it reads block offsets straight from the skip table).
+        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false)?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         let idf = global_idf.unwrap_or(local_idf);
         // Stored per-block BMW upper bounds bake in the LOCAL idf. Only a

@@ -43,6 +43,27 @@ pub mod fts {
     /// both versions.
     pub const VERSION_V2: u32 = 2;
 
+    /// The version new code writes when a column stores positions: same
+    /// header and region layout as [`VERSION_V2`], but each positional
+    /// term's region gains a **position run-offset sub-index** between its
+    /// skip table and its posting blocks. The sub-index stores, every
+    /// [`POSITION_SUBINDEX_STRIDE`] pairs within a block, the byte offset
+    /// of that pair's position run (relative to the term's positions), so
+    /// the reader reaches a pair's positions by skipping `< STRIDE` runs
+    /// instead of walking every run from the block start. Readers accept
+    /// `V1`/`V2`/`V3`; `V1`/`V2` files (no sub-index) stay readable
+    /// unchanged, so existing indices need no reindex. A column *without*
+    /// positions is written as [`VERSION_V2`] — the sub-index only exists
+    /// where positions do.
+    pub const VERSION_V3: u32 = 3;
+
+    /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
+    /// stored offset per this many pairs within a posting block. A decode
+    /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
+    /// Divides evenly into the posting-block length so every block's
+    /// sub-index has `ceil(pairs_in_block / STRIDE)` entries.
+    pub const POSITION_SUBINDEX_STRIDE: usize = 16;
+
     /// Fixed-point scale for the per-column average document length.
     /// The builder stores `round(avgdl × 1000)` in the doc-lengths
     /// directory as a `u32` (`avgdl_x1000`); the reader recovers the

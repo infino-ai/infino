@@ -3259,7 +3259,17 @@ fn assemble_and_write_blob<W: Write>(
     let blob_copy_start = finish_profile.enabled.then(Instant::now);
     let mut header = Vec::with_capacity(header_size as usize);
     header.extend_from_slice(format::fts::MAGIC); // 8
-    header.extend_from_slice(&format::fts::VERSION_V2.to_le_bytes()); // 4
+    // V3 when the positions region has a real body (beyond its 4-byte
+    // CRC): a non-empty body means at least one non-inline positional term
+    // wrote position runs and therefore a run-offset sub-index. A
+    // positionless blob — or a positional one whose terms all inlined —
+    // leaves a CRC-only region and stays V2, byte-identical to before.
+    // Readers accept both.
+    let fts_version = match positions_region.1 > format::CRC_BYTES as u64 {
+        true => format::fts::VERSION_V3,
+        false => format::fts::VERSION_V2,
+    };
+    header.extend_from_slice(&fts_version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4
     header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
@@ -3359,6 +3369,13 @@ struct TermScratch {
     /// offset of the block's first run within the term's positions
     /// bytes) for positional columns. Reused like the other buffers.
     pos_block_offsets: Vec<u32>,
+    /// Per-term position run-offset sub-index (VERSION_V3, positional
+    /// columns): `ENTRIES_PER_BLOCK` byte offsets per block — one every
+    /// `POSITION_SUBINDEX_STRIDE` pairs — each relative to the term's
+    /// positions bytes. Padded to a whole `ENTRIES_PER_BLOCK` per block
+    /// so entry `(block, slot)` sits at a flat `block * ENTRIES_PER_BLOCK
+    /// + slot`. Reused like the other buffers.
+    pos_subindex_offsets: Vec<u32>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -3646,14 +3663,28 @@ fn encode_and_emit_term<W: Write>(
             Some(_) => TERM_META_POSITIONAL_SIZE,
             None => TERM_META_SIZE,
         };
-        let postings_length = (term_meta_size + skip_table_size + blocks_total_size) as u64;
+        // VERSION_V3 position sub-index (positional terms only): one run
+        // offset every `POSITION_SUBINDEX_STRIDE` pairs, padded to a whole
+        // `ENTRIES_PER_BLOCK` per block, written between the skip table and
+        // the posting blocks. Zero-sized on positionless terms, which keep
+        // the V2 layout byte-for-byte.
+        const ENTRIES_PER_BLOCK: usize = BLOCK_LEN / format::fts::POSITION_SUBINDEX_STRIDE;
+        let subindex_size = match term_positions {
+            Some(_) => num_blocks as usize * ENTRIES_PER_BLOCK * format::fts::U32_BYTES,
+            None => 0,
+        };
+        let postings_length =
+            (term_meta_size + skip_table_size + subindex_size + blocks_total_size) as u64;
 
-        // Per-block byte offsets into this term's position runs: walk
-        // the runs once, recording where each 128-doc block's first
-        // run starts, so the reader can fetch/decode one block's
-        // positions without touching its predecessors.
+        // Walk the runs once, recording where each 128-doc block's first
+        // run starts (the skip table's per-block offset) and, every
+        // `POSITION_SUBINDEX_STRIDE` pairs, a finer sub-index offset — so
+        // the reader reaches a pair's positions by skipping `< STRIDE`
+        // runs rather than every run from the block start.
         let pos_block_offsets = &mut scratch.pos_block_offsets;
+        let pos_subindex_offsets = &mut scratch.pos_subindex_offsets;
         pos_block_offsets.clear();
+        pos_subindex_offsets.clear();
         if let Some((_, runs)) = &term_positions {
             debug_assert!(
                 runs.len() <= u32::MAX as usize,
@@ -3661,12 +3692,28 @@ fn encode_and_emit_term<W: Write>(
             );
             let mut at: usize = 0;
             for (i, &(_, tf)) in pairs.iter().enumerate() {
-                if i % BLOCK_LEN == 0 {
+                let in_block = i % BLOCK_LEN;
+                if in_block == 0 {
                     pos_block_offsets.push(at as u32);
+                }
+                if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
+                    pos_subindex_offsets.push(at as u32);
                 }
                 skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
             }
             debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+            // Pad the final (partial) block's sub-index up to a whole
+            // `ENTRIES_PER_BLOCK`, so entry `(block, slot)` is a flat
+            // `block * ENTRIES_PER_BLOCK + slot`. The pad offsets point at
+            // the run end and are never read (no pair maps to them).
+            while !pos_subindex_offsets.len().is_multiple_of(ENTRIES_PER_BLOCK) {
+                pos_subindex_offsets.push(at as u32);
+            }
+            debug_assert_eq!(
+                pos_subindex_offsets.len() * format::fts::U32_BYTES,
+                subindex_size,
+                "sub-index must hold ENTRIES_PER_BLOCK offsets per block"
+            );
         }
 
         debug_assert!(df <= u32::MAX as u64, "df overflows u32");
@@ -3705,7 +3752,9 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_meta_write += start.elapsed();
         }
 
-        let mut block_offset: u32 = (term_meta_size + skip_table_size) as u32;
+        // Blocks follow the meta, the skip table, and the (V3-only)
+        // position sub-index, so their offsets start past all three.
+        let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
             let max_bm25 = block_ub_per_block[i];
@@ -3730,6 +3779,12 @@ fn encode_and_emit_term<W: Write>(
         }
         if let Some(start) = skip_write_start {
             profile.encode_skip_write += start.elapsed();
+        }
+
+        // Position sub-index (VERSION_V3, positional terms): sits between
+        // the skip table and the blocks. Empty on positionless terms.
+        for &off in pos_subindex_offsets.iter() {
+            term_buf.extend_from_slice(&off.to_le_bytes());
         }
 
         let block_write_start = profile.enabled.then(Instant::now);
@@ -4697,9 +4752,10 @@ mod tests {
         let docs = positional_corpus();
         let k = docs.len();
         let spilled_pos = build_title_blob_spilled(&docs, true, None);
+        // A positional build carries position runs ⇒ a sub-index ⇒ v3.
         assert_eq!(
             u32::from_le_bytes(spilled_pos[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V2
+            format::fts::VERSION_V3
         );
         let inram_pos = build_title_blob(&docs, true);
         let inram_plain = build_title_blob(&docs, false);
@@ -4809,7 +4865,7 @@ mod tests {
     }
 
     #[test]
-    fn every_build_writes_v2_and_positionless_region_is_empty() {
+    fn positionless_is_v2_positional_is_v3_and_positionless_region_is_empty() {
         let docs = positional_corpus();
         let plain = build_title_blob(&docs, false);
         let positional = build_title_blob(&docs, true);
@@ -4817,9 +4873,10 @@ mod tests {
         let version_of = |blob: &bytes::Bytes| {
             u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
         };
-        // New code always writes v2; v1 is a read-only legacy format.
+        // A positionless build is v2; a positional build carries a run-
+        // offset sub-index and is v3. v1 is a read-only legacy format.
         assert_eq!(version_of(&plain), format::fts::VERSION_V2);
-        assert_eq!(version_of(&positional), format::fts::VERSION_V2);
+        assert_eq!(version_of(&positional), format::fts::VERSION_V3);
 
         // A positionless build's region is just the CRC-of-empty.
         let read_u64_plain =
@@ -4916,7 +4973,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V2
+            format::fts::VERSION_V3
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

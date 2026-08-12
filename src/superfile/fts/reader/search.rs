@@ -830,7 +830,7 @@ impl FtsReader {
         // Gated: an unmetered process must not pay the procfs reads on
         // the most common query shape.
         let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
+        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions, false)?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);

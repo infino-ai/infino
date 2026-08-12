@@ -318,7 +318,10 @@ fn corrupt_fts_positions_region_rejected() {
             .try_into()
             .expect("version bytes"),
     );
-    assert_eq!(version, 2, "positional superfile must embed a v2 FTS blob");
+    assert_eq!(
+        version, 3,
+        "positional superfile must embed a v3 FTS blob (positions sub-index)"
+    );
     let positions_off_rel = u64::from_le_bytes(
         bytes[fts_off + 48..fts_off + 56]
             .try_into()
