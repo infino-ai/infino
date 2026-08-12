@@ -48,6 +48,11 @@ supertable:
   # superfiles.
   commit_threshold_size_mb: 1024
 
+  # Target buffered bytes per commit shard, in mebibytes. Each shard becomes one
+  # superfile, so this decides how many files a commit produces from data volume
+  # rather than core count. Set 0 to fall back to one shard per writer-pool thread.
+  shard_target_size_mb: 64
+
   # Verify the trailing whole-blob CRC and per-subsection CRCs
   # on every SuperfileReader::open. Defaults to true. Set to
   # false only when the underlying storage already validates
