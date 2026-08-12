@@ -3668,9 +3668,9 @@ fn encode_and_emit_term<W: Write>(
         // `ENTRIES_PER_BLOCK` per block, written between the skip table and
         // the posting blocks. Zero-sized on positionless terms, which keep
         // the V2 layout byte-for-byte.
-        const ENTRIES_PER_BLOCK: usize = BLOCK_LEN / format::fts::POSITION_SUBINDEX_STRIDE;
+        let entries_per_block = format::fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK;
         let subindex_size = match term_positions {
-            Some(_) => num_blocks as usize * ENTRIES_PER_BLOCK * format::fts::U32_BYTES,
+            Some(_) => num_blocks as usize * entries_per_block * format::fts::U32_BYTES,
             None => 0,
         };
         let postings_length =
@@ -3703,16 +3703,16 @@ fn encode_and_emit_term<W: Write>(
             }
             debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
             // Pad the final (partial) block's sub-index up to a whole
-            // `ENTRIES_PER_BLOCK`, so entry `(block, slot)` is a flat
-            // `block * ENTRIES_PER_BLOCK + slot`. The pad offsets point at
+            // `entries_per_block`, so entry `(block, slot)` is a flat
+            // `block * entries_per_block + slot`. The pad offsets point at
             // the run end and are never read (no pair maps to them).
-            while !pos_subindex_offsets.len().is_multiple_of(ENTRIES_PER_BLOCK) {
+            while !pos_subindex_offsets.len().is_multiple_of(entries_per_block) {
                 pos_subindex_offsets.push(at as u32);
             }
             debug_assert_eq!(
                 pos_subindex_offsets.len() * format::fts::U32_BYTES,
                 subindex_size,
-                "sub-index must hold ENTRIES_PER_BLOCK offsets per block"
+                "sub-index must hold entries_per_block offsets per block"
             );
         }
 

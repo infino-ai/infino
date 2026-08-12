@@ -16,7 +16,10 @@ use crate::superfile::{
     error::FtsError,
     format::{
         self,
-        fts::{POSITION_SUBINDEX_STRIDE, U32_BYTES, U64_BYTES, skip_entry, term_meta},
+        fts::{
+            POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, U32_BYTES, U64_BYTES,
+            skip_entry, term_meta,
+        },
     },
     fts::{
         bm25,
@@ -135,8 +138,8 @@ impl TermMeta {
         // table, which the writer already shifted past the sub-index).
         let subindex_start = match has_subindex {
             true => {
-                const ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
-                let subindex_end = skip_end + num_blocks * ENTRIES_PER_BLOCK * U32_BYTES;
+                let subindex_end =
+                    skip_end + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * U32_BYTES;
                 if subindex_end > postings.len() {
                     return Err(FtsError::Read(ReadError::MalformedVersion(
                         "position sub-index runs past postings region".into(),
@@ -171,10 +174,9 @@ impl TermMeta {
         block: usize,
         pair_in_block: usize,
     ) -> Option<(u32, usize)> {
-        const ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
         let start = self.subindex_start?;
         let slot = pair_in_block / POSITION_SUBINDEX_STRIDE;
-        let idx = block * ENTRIES_PER_BLOCK + slot;
+        let idx = block * POSITION_SUBINDEX_ENTRIES_PER_BLOCK + slot;
         let at = start + idx * U32_BYTES;
         let checkpoint = read_u32_le(&postings[at..at + U32_BYTES]);
         let runs_to_skip = pair_in_block % POSITION_SUBINDEX_STRIDE;

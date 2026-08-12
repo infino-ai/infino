@@ -22,6 +22,8 @@ pub const CRC_BYTES: usize = 4;
 
 /// FTS section magic bytes and constants.
 pub mod fts {
+    use crate::superfile::fts::posting::BLOCK_LEN;
+
     /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` +
     /// `01`. The trailing `01` is a fixed part of the section
     /// identity, **not** a version — it never changes across blob
@@ -63,6 +65,14 @@ pub mod fts {
     /// Divides evenly into the posting-block length so every block's
     /// sub-index has `ceil(pairs_in_block / STRIDE)` entries.
     pub const POSITION_SUBINDEX_STRIDE: usize = 16;
+
+    /// Sub-index run-offset checkpoints stored per posting block
+    /// ([`VERSION_V3`]): the whole-block entry count, one every
+    /// [`POSITION_SUBINDEX_STRIDE`] pairs across a full posting block.
+    /// Both the writer's per-term sub-index sizing and the reader's flat
+    /// `block * ENTRIES + slot` indexing derive from this single value, so
+    /// they stay in lockstep.
+    pub const POSITION_SUBINDEX_ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
 
     /// Fixed-point scale for the per-column average document length.
     /// The builder stores `round(avgdl × 1000)` in the doc-lengths
