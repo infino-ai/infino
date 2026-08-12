@@ -348,6 +348,43 @@ fn uncorrupted_positional_superfile_opens() {
     SuperfileReader::open(Bytes::from(bytes)).expect("clean v3 superfile opens");
 }
 
+#[test]
+fn corrupt_fts_position_subindex_rejected() {
+    // The v3 position run-offset sub-index is not a new CRC region — it
+    // rides inside each term's postings region, which is already
+    // CRC-protected. This pins that the new bytes are covered: land a flip
+    // squarely inside the first term's sub-index and confirm the reader
+    // rejects it at open.
+    //
+    // A v3 positional term's region is `[meta][skip table][sub-index]
+    // [blocks]`. The postings region holds only non-inline terms (inline
+    // df=1 terms live in the FST value), and the fixture's FTS column is
+    // positional, so its first postings term is a positional term whose
+    // sub-index begins right after its skip table.
+    let bytes = build_corruptable_positional_superfile();
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
+    let postings_offset_rel = u64::from_le_bytes(
+        bytes[fts_off + 32..fts_off + 40]
+            .try_into()
+            .expect("postings offset"),
+    ) as usize;
+    let term0 = fts_off + postings_offset_rel;
+    // Positional term header is 32 bytes; `num_blocks` is the u32 at its
+    // offset 16; each skip entry is 16 bytes. The sub-index starts right
+    // after the skip table.
+    const POSITIONAL_META: usize = 32;
+    const SKIP_ENTRY: usize = 16;
+    let num_blocks = u32::from_le_bytes(
+        bytes[term0 + 16..term0 + 20]
+            .try_into()
+            .expect("num_blocks"),
+    ) as usize;
+    assert!(num_blocks >= 1, "first postings term must have ≥1 block");
+    let subindex_start = term0 + POSITIONAL_META + num_blocks * SKIP_ENTRY;
+    assert_corruption_rejected(bytes, subindex_start + 1, "fts/position sub-index");
+}
+
 /// FTS blob range only (the positional fixture has no vector blob, so
 /// `locate_blobs` — which insists on both — doesn't apply).
 fn locate_fts_blob_only(bytes: &[u8]) -> (usize, usize) {
