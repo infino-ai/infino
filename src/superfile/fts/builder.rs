@@ -4821,6 +4821,61 @@ mod tests {
         );
     }
 
+    /// Backwards compatibility: the new reader must read a **v2 positional**
+    /// blob — every already-written positional index — through the
+    /// block-start walk fallback, giving results identical to the v3
+    /// sub-index fast path on the same corpus. A positional build is v3;
+    /// downgrade its version byte to v2 so the reader ignores the sub-index
+    /// and takes the fallback (the sub-index bytes become dead space the
+    /// walk never reads, since blocks are located from the skip table).
+    #[tokio::test]
+    async fn new_code_reads_v2_positional_via_fallback() {
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
+
+        let docs = positional_corpus();
+        let v3_blob = build_title_blob(&docs, true);
+        assert_eq!(
+            u32::from_le_bytes(v3_blob[8..12].try_into().expect("version bytes")),
+            format::fts::VERSION_V3,
+            "a positional build is v3"
+        );
+        // Downgrade the version field only; the header is not itself
+        // CRC-covered, and the positions region + skip offsets are
+        // byte-identical to v2, so the fallback path reads it correctly.
+        let mut v2_bytes = v3_blob.to_vec();
+        v2_bytes[8..12].copy_from_slice(&format::fts::VERSION_V2.to_le_bytes());
+        let v2_blob = bytes::Bytes::from(v2_bytes);
+
+        let v3 = FtsReader::open(v3_blob, title_json(true)).expect("v3 opens");
+        let v2 = FtsReader::open(v2_blob, title_json(true)).expect("v2 opens");
+        // Phrases exercise the position decode. `common filler` matches in
+        // every one of the 391 docs (spanning 4 posting blocks), so
+        // `common`'s decode runs at pairs across many blocks and non-
+        // checkpoint offsets — exactly the sub-index path. The fast path
+        // (v3) and the block-start walk (v2 fallback) must agree exactly,
+        // and match a nonzero count so the decode really ran.
+        let phrases: &[(&[&str], u64)] = &[
+            (&["common", "filler"], 391),
+            (&["medium", "medium"], 79),
+            (&["filler", "medium"], 79),
+        ];
+        for (terms, want) in phrases {
+            let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
+            let a = v3
+                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .await
+                .expect("v3 phrase count")
+                .0;
+            let b = v2
+                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .await
+                .expect("v2 phrase count")
+                .0;
+            assert_eq!(a, b, "v3 fast path vs v2 fallback diverged for {terms:?}");
+            assert_eq!(a, *want, "unexpected phrase count for {terms:?}");
+        }
+    }
+
     /// Column-json for the single "title" column, with or without the
     /// positions flag — matching what `fts_columns_json` emits.
     fn title_json(positional: bool) -> &'static str {
