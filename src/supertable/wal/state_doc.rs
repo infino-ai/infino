@@ -178,7 +178,9 @@ pub enum WalState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     /// Handle id of the process currently driving this WAL.
-    /// Set on take; cleared on COMPLETE or preemption.
+    /// Set on take — or stamped straight into the created doc by
+    /// the writer that is about to drive it; cleared on COMPLETE
+    /// or preemption.
     pub owner: SupertableHandleId,
     pub acquired_at: DateTime<Utc>,
     /// Heartbeat-extended; recovery treats expiry as the cue to
@@ -283,10 +285,12 @@ pub struct WalStateDoc {
     pub state: WalState,
     pub created_at: DateTime<Utc>,
 
-    /// `None` if no process currently owns this WAL (e.g. fresh
-    /// WAL between create and the first heartbeat, or after
-    /// preemption clears the field). Recovery treats absent +
-    /// expired equivalently.
+    /// `None` if no process currently owns this WAL — after
+    /// preemption or a release clears the field, or on a doc
+    /// created by something that isn't going to drive it itself.
+    /// A writer driving its own op stamps the lease into the doc
+    /// it creates, so a freshly created WAL is normally already
+    /// owned. Recovery treats absent + expired equivalently.
     #[serde(default)]
     pub lease: Option<Lease>,
 
