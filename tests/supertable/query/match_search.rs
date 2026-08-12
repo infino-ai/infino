@@ -219,6 +219,50 @@ fn count_dedups_repeated_query_tokens() {
     }
 }
 
+/// Dedup on the count path, negative-clause cases: a term required and
+/// excluded matches nothing, a repeated negative dedups to a single one,
+/// and a repeated negation-only query is rejected exactly like the
+/// single-term form.
+#[test]
+fn count_dedups_repeated_negatives_and_required_excluded() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+
+    // A term both required and excluded is a contradiction — count 0.
+    // (`rust` appears in the corpus, so this is 0 by exclusion, not by
+    // the term being absent.)
+    let contradiction = reader
+        .count("title", "+rust -rust", BoolMode::And)
+        .expect("count +rust -rust");
+    assert_eq!(contradiction, 0, "+rust -rust must match nothing");
+
+    // A repeated negative dedups to the single-negative form, and
+    // excluding `go` (which co-occurs with `rust` in "go rust") drops at
+    // least that doc from the `+rust` set.
+    let rust = reader
+        .count("title", "+rust", BoolMode::And)
+        .expect("count +rust");
+    let one_neg = reader
+        .count("title", "+rust -go", BoolMode::And)
+        .expect("count +rust -go");
+    let dup_neg = reader
+        .count("title", "+rust -go -go", BoolMode::And)
+        .expect("count +rust -go -go");
+    assert_eq!(dup_neg, one_neg, "+rust -go -go must count as +rust -go");
+    assert!(one_neg < rust, "excluding `go` must drop the `go rust` doc");
+
+    // A negation-only query is rejected; repeating the negated term
+    // dedups to the same single-term query, so `-rust -rust` is rejected
+    // identically to `-rust` (never a spurious count).
+    let repeated = reader.count("title", "-rust -rust", BoolMode::And);
+    let single = reader.count("title", "-rust", BoolMode::And);
+    assert!(single.is_err(), "negation-only `-rust` is rejected");
+    assert!(
+        repeated.is_err(),
+        "negation-only `-rust -rust` is rejected like `-rust`"
+    );
+}
+
 /// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
 /// across every superfile before scoring. Statistics change SCORES,
 /// never MEMBERSHIP: with `k` covering every match, the global-stats
