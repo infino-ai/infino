@@ -943,9 +943,32 @@ impl SupertableReader {
             .fts_tokenizer_for(column)
             .parse(query)
             .into_clauses(mode);
-        let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
-        let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
-        let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
+        // Drop repeated tokens within each clause role. Unranked
+        // matching is set-valued — an AND/OR/exclude over a term repeated
+        // in the query (e.g. `+to +be +or +not +to +be`) is idempotent —
+        // so a duplicate only adds a redundant cursor that intersects (or
+        // unions) a list with itself. Order-preserving so the rarest-first
+        // cursor ordering downstream is unaffected. Phrase members are
+        // *not* deduped: position matters there. (Count path only; the
+        // scored path must keep repeats, which can affect BM25.)
+        // Linear dedup, not a HashSet: clause token lists are tiny (a
+        // handful of terms), so an O(n²) scan over the already-kept
+        // tokens is cheaper than allocating a set + hashing, and — unlike
+        // the set — it adds no per-query allocation on the overwhelmingly
+        // common no-duplicate query. Order-preserving; only the first
+        // occurrence's `String` is materialized.
+        let dedup = |tokens: Vec<Cow<'_, str>>| -> Vec<String> {
+            let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                if !out.iter().any(|k| k.as_str() == t.as_ref()) {
+                    out.push(t.into_owned());
+                }
+            }
+            out
+        };
+        let musts: Vec<String> = dedup(clauses.musts);
+        let shoulds: Vec<String> = dedup(clauses.shoulds);
+        let negatives: Vec<String> = dedup(clauses.negatives);
         let own_phrases = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
             phrases
                 .into_iter()

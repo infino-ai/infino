@@ -195,6 +195,30 @@ fn count_agrees_with_token_match_cardinality() {
     }
 }
 
+/// A token repeated in the query is idempotent for an unranked count —
+/// AND/OR/exclude over the same term twice is the same set — so the
+/// count path drops duplicate tokens, and the count must match the
+/// query with the repeat removed. (Phrase members are exempt: position
+/// matters there.)
+#[test]
+fn count_dedups_repeated_query_tokens() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+    // (mode, query-with-duplicate, equivalent-deduped-query)
+    let cases = [
+        // AND: doc 7 ("rust systems") is the only match either way.
+        (BoolMode::And, "+rust +systems +rust", "+rust +systems"),
+        // OR: the union of {rust, go} is unchanged by repeating `rust`.
+        (BoolMode::Or, "rust rust go", "rust go"),
+    ];
+    for (mode, dup, uniq) in cases {
+        let n_dup = reader.count("title", dup, mode).expect("count dup");
+        let n_uniq = reader.count("title", uniq, mode).expect("count uniq");
+        assert_eq!(n_dup, n_uniq, "dup {dup:?} must count as {uniq:?}");
+        assert!(n_dup > 0, "sanity: {dup:?} should match something");
+    }
+}
+
 /// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
 /// across every superfile before scoring. Statistics change SCORES,
 /// never MEMBERSHIP: with `k` covering every match, the global-stats
