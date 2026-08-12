@@ -48,8 +48,8 @@ const CRC_TEST_SECONDARY_AXIS_OFFSET: usize = 3;
 const CORRUPTION_FLIP_MASK: u8 = 0xFF;
 
 /// Positional variant of the corruptable superfile: same corpus, the
-/// FTS column records token positions, so the blob is v2 and carries a
-/// CRC-protected positions region.
+/// FTS column records token positions, so the blob is v3 and carries a
+/// CRC-protected positions region (plus the position sub-index).
 fn build_corruptable_positional_superfile() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -308,7 +308,7 @@ fn corruption_at_random_interior_positions_rejected() {
 
 #[test]
 fn corrupt_fts_positions_region_rejected() {
-    // v2 blob: the positions-region offset lives at header bytes
+    // v3 blob: the positions-region offset lives at header bytes
     // [48..56] (relative to the blob). Flip a byte inside the region
     // body — the multi-doc terms guarantee it is non-empty.
     let bytes = build_corruptable_positional_superfile();
@@ -342,10 +342,10 @@ fn corrupt_fts_positions_region_rejected() {
 
 #[test]
 fn uncorrupted_positional_superfile_opens() {
-    // Sanity twin of the corruption test: the same v2 bytes open
+    // Sanity twin of the corruption test: the same v3 bytes open
     // cleanly when untouched.
     let bytes = build_corruptable_positional_superfile();
-    SuperfileReader::open(Bytes::from(bytes)).expect("clean v2 superfile opens");
+    SuperfileReader::open(Bytes::from(bytes)).expect("clean v3 superfile opens");
 }
 
 /// FTS blob range only (the positional fixture has no vector blob, so
