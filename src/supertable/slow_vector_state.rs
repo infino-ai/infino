@@ -364,27 +364,6 @@ impl CentroidSection {
         &self.uri
     }
 
-    /// Enumerate every `(superfile, column, cell)` the section carries, with
-    /// that cell's fine-cluster count and dim. The global-fine router walks
-    /// this to score the query against every cell's fp32 fine centroids
-    /// ([`Self::read_cell`]) without opening any superfile — the routing scan
-    /// is entirely served from this resident, page-cache-backed section.
-    pub(crate) fn cell_directory(&self) -> Vec<(Uuid, String, Option<u32>, u32, u32)> {
-        let mut out = Vec::new();
-        for ((superfile_id, column), cells) in &self.cells {
-            for cell in cells {
-                out.push((
-                    *superfile_id,
-                    column.clone(),
-                    cell.cell_id,
-                    cell.n_cent,
-                    cell.dim,
-                ));
-            }
-        }
-        out
-    }
-
     /// Raw fp32-le fine-centroid bytes for one cell (cluster-major,
     /// `n_cent × dim × 4`), exactly as they sit in the section. `Ok(None)`
     /// when the `(superfile, column, cell)` triple is absent; a spill-read
