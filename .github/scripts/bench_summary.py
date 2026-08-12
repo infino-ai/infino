@@ -40,6 +40,22 @@ COST_TOKENS = ("$", "cost", "measured", "per-unit")
 SECONDARY_HEADERS = ("cold search", "peak rss")
 SECONDARY_THRESHOLD_PCT = 30.0
 
+# Memory-footprint columns are byte sizes (MiB/GiB), not nanosecond latencies:
+# peak/median RSS, peak anon/file mappings, and total bytes stored. They are
+# run-order biased, so they are never treated as latencies and never gate.
+# is_latency() and human() both key off this set - a token here keeps a
+# footprint column from being mistaken for a nanosecond latency (which would
+# both misformat it as "ms" and sweep it into the merge gate).
+FOOTPRINT_TOKENS = ("rss", "stored", "peak", "anon")
+
+# Cold-cache latencies - object-store first-touch ("cold ...") and the
+# fetch-augmented variants ("+fetch ...") - swing widely run-to-run with
+# network and VM page-cache state, so they are advisory-only and never block a
+# merge. Only warm, CPU-bound latencies and the ingest/optimize/drain walls
+# gate. Identical code routinely moves a cold metric by hundreds of percent;
+# gating on that fails PRs that changed no engine code at all.
+GATE_EXCLUDE_TOKENS = ("cold", "+fetch")
+
 # Map a report basename to (subsystem label, source area).
 SUBSYSTEM = {
     "supertable": ("Ingest", "src/supertable/writer.rs"),
@@ -61,13 +77,15 @@ DEFAULT_OUT = "/tmp/ai-summary.md"
 DEFAULT_THRESHOLD = 5.0
 DEFAULT_GATE_FILE = "/tmp/bench-gate.status"
 
-# Merge-blocking gate: a time-valued metric (warm/cold latency, ingest /
-# drain / optimize wall) must be worse than the main baseline by BOTH of
-# these to block the merge. The AND is the noise guard: a big percent of a
-# sub-millisecond metric never blocks, and neither does a small-percent
-# wiggle on a long wall. The 5% advisory tiers above stay as REPORTING
-# thresholds only; this pair is the sole blocking criterion (enforced by
-# the workflow's "Enforce benchmark merge gate" step reading GATE_FILE).
+# Merge-blocking gate: a gateable time metric (warm latency, count(), ingest
+# Time, or a drain / optimize wall - see gates()) must be worse than the main
+# baseline by BOTH of these to block the merge. The AND is the noise guard: a
+# big percent of a sub-millisecond metric never blocks, and neither does a
+# small-percent wiggle on a long wall. Cold object-store timings and memory
+# footprints are out of scope entirely (too variable to gate on). The 5%
+# advisory tiers above stay as REPORTING thresholds only; this pair is the
+# sole blocking criterion (enforced by the workflow's "Enforce benchmark
+# merge gate" step reading GATE_FILE).
 GATE_REL_PCT = 50.0
 GATE_ABS_NS = 5_000_000.0
 
@@ -110,9 +128,23 @@ def primary_latency_header_from_gate_metric(metric):
 
 
 def is_latency(header):
-    """Lower-is-better and measured in nanoseconds (Time, p50, cold, count())."""
+    """Lower-is-better and measured in nanoseconds (Time, p50, cold, count()).
+
+    Footprint columns (peak/median RSS, peak anon/file, bytes stored) are byte
+    sizes, not latencies, so they are excluded here - otherwise a memory move
+    would be misformatted as "ms" and, worse, treated as a gateable latency.
+    """
     h = header.lower()
-    return not higher_is_better(header) and "rss" not in h and "stored" not in h
+    return not higher_is_better(header) and not any(t in h for t in FOOTPRINT_TOKENS)
+
+
+def gates(header):
+    """Eligible for the merge-blocking gate: a controllable, low-variance time
+    metric - warm latency, count(), ingest Time, or a drain/optimize wall.
+    Cold object-store timings and memory footprints are excluded (see
+    GATE_EXCLUDE_TOKENS and FOOTPRINT_TOKENS)."""
+    h = header.lower()
+    return is_latency(header) and not any(t in h for t in GATE_EXCLUDE_TOKENS)
 
 
 def human(header, value):
@@ -122,7 +154,7 @@ def human(header, value):
         return f"{value:,.0f} docs/s"
     if "bandwidth" in h:
         return f"{value / 1048576:,.1f} MiB/s"
-    if "rss" in h or "stored" in h:
+    if any(t in h for t in FOOTPRINT_TOKENS):
         if value >= 1073741824:
             return f"{value / 1073741824:.2f} GiB"
         return f"{value / 1048576:.1f} MiB"
@@ -173,10 +205,11 @@ def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
             if old is None or old == 0.0:
                 continue
             had_baseline = True
-            # Merge-blocking gate: every time-valued lower-is-better metric
-            # is eligible regardless of advisory tier, so optimize/drain
-            # walls and every latency row are covered.
-            if is_latency(header):
+            # Merge-blocking gate: warm latency, count(), ingest Time, and the
+            # optimize/drain walls are eligible regardless of advisory tier.
+            # Cold object-store timings and memory footprints are excluded -
+            # they vary too much run-to-run to gate on (see gates()).
+            if gates(header):
                 delta_ns = new - old
                 gate_pct = delta_ns / old * 100.0
                 if delta_ns > GATE_ABS_NS and gate_pct > GATE_REL_PCT:
