@@ -45,10 +45,20 @@ pub(super) struct PhraseMember {
     pub(super) idf: f32,
     /// Byte offset of each decoded-block pair's run within
     /// `positions`, valid for `run_offsets_block`. Rebuilt on block
-    /// crossings by one `skip_run` walk over the block's runs.
+    /// crossings by one `skip_run` walk over the block's runs. Used by
+    /// the `V1`/`V2` fallback decode (no sub-index).
     pub(super) run_offsets: Vec<u32>,
-    /// Which block index `run_offsets` covers (`usize::MAX` = none).
+    /// Which block index `run_offsets` / the sub-index cache covers
+    /// (`usize::MAX` = none).
     pub(super) run_offsets_block: usize,
+    /// Sub-index decode (`V3`) cache: the last pair whose run offset was
+    /// resolved in `run_offsets_block`, and that run's byte offset. Pairs
+    /// are visited in ascending order within a block, so the next decode
+    /// skips from `max(this cached pair, the sub-index checkpoint)` —
+    /// dense reuse costs ~one `skip_run`, sparse access at most
+    /// `POSITION_SUBINDEX_STRIDE - 1`. `usize::MAX` = nothing cached.
+    pub(super) cached_pair: usize,
+    pub(super) cached_run_offset: u32,
     /// Scratch for the member's decoded positions at the aligned doc.
     pub(super) pos_scratch: Vec<u32>,
 }
@@ -70,24 +80,38 @@ impl PhraseMember {
         let pair = self.cursor.pos;
 
         // Fast path (VERSION_V3): the run-offset sub-index gives the
-        // nearest checkpoint at or before `pair`, so we skip only the
-        // `< POSITION_SUBINDEX_STRIDE` runs between it and `pair` — never
-        // the whole block from its start. Returns an owned tuple, so no
-        // `term_meta` borrow is held across the decode below.
+        // nearest checkpoint at or before `pair`. Start the skip from
+        // whichever is closer to `pair` — that checkpoint, or the pair we
+        // resolved last in this same block (pairs are visited ascending,
+        // so the last one is `<= pair`). Dense reuse then costs ~one
+        // `skip_run`; sparse access at most `STRIDE - 1`. Returns an owned
+        // tuple, so no `term_meta` borrow is held across the decode below.
         let subindex = self
             .term_meta
             .as_ref()
             .expect("PFOR member has term meta")
             .positions_subindex_offset(self.cursor.bytes.as_ref(), block, pair);
         if let Some((checkpoint, runs_to_skip)) = subindex {
-            let mut at = checkpoint as usize;
-            for p in (pair - runs_to_skip)..pair {
+            let checkpoint_pair = pair - runs_to_skip;
+            let (mut from_pair, mut at) = (checkpoint_pair, checkpoint as usize);
+            if self.run_offsets_block == block
+                && self.cached_pair >= checkpoint_pair
+                && self.cached_pair <= pair
+            {
+                from_pair = self.cached_pair;
+                at = self.cached_run_offset as usize;
+            }
+            for p in from_pair..pair {
                 skip_run(&self.positions, &mut at, self.cursor.block_tfs[p]).ok_or_else(|| {
                     FtsError::Read(ReadError::MalformedVersion(
                         "position runs truncated within block".into(),
                     ))
                 })?;
             }
+            // Cache this pair's run start for the next (higher) pair.
+            self.run_offsets_block = block;
+            self.cached_pair = pair;
+            self.cached_run_offset = at as u32;
             decode_run(
                 &self.positions,
                 &mut at,
@@ -205,6 +229,8 @@ impl PhraseCursor {
                     idf,
                     run_offsets: Vec::new(),
                     run_offsets_block: NO_BLOCK_CACHED,
+                    cached_pair: NO_BLOCK_CACHED,
+                    cached_run_offset: 0,
                     pos_scratch: Vec::new(),
                 }
             })
