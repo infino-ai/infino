@@ -1,17 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Per-query execution work stats — deterministic counters of the physical
-//! work one query performs, independent of cache temperature.
+//! Per-op execution work stats — deterministic counters of the physical
+//! work one query **or one write** performs, independent of cache
+//! temperature (reads) and of pool width / commit contention (writes).
 //!
 //! Parallel to [`super::io`] (connection-scoped I/O ledger) and [`super::cpu`]
-//! (process CPU): this module scopes to a **single query**. A caller wraps a
-//! search in [`with_op_stats`]; the reader minted for that query picks the
-//! collector up ([`current`]) and threads it through the fan-out, and each
-//! kernel flushes its work counters into it. The same query against the same
-//! table state reports the same numbers whether the cache was warm or cold —
-//! these count what the plan *did*, not what the storage layer happened to
-//! fetch (the [`super::io::UsageMeter`] ledger keeps counting actuals).
+//! (process CPU): this module scopes to a **single op**. A caller wraps a
+//! search or a write in [`with_op_stats`]; the reader or writer minted for
+//! that op picks the collector up ([`current`]) and threads it through the
+//! fan-out, and each kernel flushes its work counters into it. The same query
+//! against the same table state reports the same numbers whether the cache
+//! was warm or cold — these count what the plan *did*, not what the storage
+//! layer happened to fetch (the [`super::io::UsageMeter`] ledger keeps
+//! counting actuals).
+//!
+//! One struct serves both directions deliberately: `update` and `delete`
+//! resolve their predicate through a real reader, so a mutation's scan leg
+//! reports read counters and its commit leg reports write counters — one
+//! scope, one snapshot, both halves of the op's physical work. That scan
+//! is the same work a `SELECT` would do and should be priced as read work
+//! (exempting it would let `SELECT`-then-delete-by-id dodge the meter).
+//!
+//! ## Write-side determinism
+//!
+//! Two things vary on the write path through no fault of the caller: the
+//! shard split follows the writer pool's width, and a contended commit
+//! retries its publish. The write counters split accordingly:
+//! [`OpStats::rows_written`], the three ingested-byte counters, and
+//! [`OpStats::rows_tombstoned`] are functions of the batch, the predicate,
+//! and the table state alone — one thread or sixteen, first-attempt commit
+//! or third. [`OpStats::superfiles_written`],
+//! [`OpStats::superfile_bytes_written`], and [`OpStats::fts_terms_indexed`]
+//! are width-dependent execution observations, recorded for reconciliation
+//! and never to be priced.
 //!
 //! With no collector installed the per-flush cost is one `Option` check,
 //! and the superfile-level kernel-CPU brackets gate their procfs reads on
@@ -36,6 +58,17 @@
 //! invariantly). Their expected cost is recovered through a consumer's
 //! calibrated rates, never surcharged on the query that happened to pay
 //! them.
+//!
+//! Write-side exclusions, same reasoning: object-store PUT count/bytes
+//! (OCC retries, multipart fan-out, and manifest-part rewrites are our
+//! contention and our config, not the caller's — the
+//! [`super::io::UsageMeter`] ledger keeps the actuals); the deferred
+//! storage-reclaim sweep and ingest-triggered hidden-index maintenance
+//! (detached tasks never pick up a collector, so they are excluded by
+//! the mint discipline); and per-shard build CPU (the caller's thread
+//! blocks in `pool.install` while the writer pool burns the CPU, so a
+//! calling-thread bracket cannot see it — a consumer's process-level
+//! CPU accounting carries the compute leg).
 
 use std::{
     cell::RefCell,
@@ -49,13 +82,16 @@ use serde::{Deserialize, Serialize};
 
 use super::cpu;
 
-/// Physical work one query performed. Every field except
-/// [`Self::kernel_cpu_ns`] (measured time, varies run to run) and
+/// Physical work one op performed — read counters for its query legs,
+/// write counters for its commit legs (a pure query leaves the write
+/// block zero and vice versa; a mutation fills both). Every read field
+/// except [`Self::kernel_cpu_ns`] (measured time, varies run to run) and
 /// [`Self::vector_rows_reranked`] (actual execution rows — the deferred
 /// path reranks cold cells in place, so the count can shift with cache
 /// temperature) is a deterministic plan count: same query, same table
-/// state → same value, warm or cold. The struct is `#[non_exhaustive]`
-/// because counters land modality by modality.
+/// state → same value, warm or cold. The write block splits the same way
+/// (see the module's write-side determinism note). The struct is
+/// `#[non_exhaustive]` because counters land modality by modality.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct OpStats {
@@ -124,9 +160,45 @@ pub struct OpStats {
     /// of — not a replacement for — a consumer's own process-level CPU
     /// accounting: fan-out glue and async awaits are outside the brackets.
     pub kernel_cpu_ns: u64,
+
+    // ---- Write-side work (see the module's write-side determinism
+    // note; every counter below is a value the commit path already
+    // computes, harvested rather than instrumented) ----
+    /// Rows the op durably indexed: appended rows plus an update's
+    /// replacement rows. Counted from the caller's batch at buffering
+    /// time, before any fan-out — invariant to shard count and OCC
+    /// retries.
+    pub rows_written: u64,
+    /// Arrow footprint of the op's scalar/text columns — the payload the
+    /// commit encodes to Parquet. Deterministic (input-shaped).
+    pub scalar_bytes_written: u64,
+    /// f32 payload bytes of the op's vector columns (`rows × dim × 4`) —
+    /// the input to rotation, k-means, and quantized encode.
+    /// Deterministic (input-shaped).
+    pub vector_bytes_written: u64,
+    /// Arrow footprint of the FTS-indexed text columns, a subset of
+    /// [`Self::scalar_bytes_written`], not additional payload: the
+    /// tokenize → dictionary → postings build scales with it.
+    /// Deterministic (input-shaped).
+    pub fts_text_bytes_written: u64,
+    /// Rows an update or delete tombstoned (sidecar bits set; excludes
+    /// not-found ids). A function of the predicate and table state.
+    pub rows_tombstoned: u64,
+    /// New superfile objects this op published. Host-width dependent —
+    /// the shard split follows the writer pool — so recorded for
+    /// reconciliation, never to be priced.
+    pub superfiles_written: u64,
+    /// On-storage bytes of those superfiles (sealed bodies, excluding
+    /// manifest parts and the pointer). Per-superfile fixed overhead
+    /// scales with shard count, so width-dependent; recorded only.
+    pub superfile_bytes_written: u64,
+    /// Distinct FTS terms built, summed per column across this op's new
+    /// superfiles. A term present in k shards counts k times, so
+    /// width-dependent; recorded only.
+    pub fts_terms_indexed: u64,
 }
 
-/// Accumulates one query's work counters across its fan-out (tokio unit
+/// Accumulates one op's work counters across its fan-out (tokio unit
 /// tasks and rayon kernel waves both add through the same `Arc`).
 #[derive(Debug, Default)]
 pub(crate) struct OpStatsCollector {
@@ -138,6 +210,14 @@ pub(crate) struct OpStatsCollector {
     sql_page_bytes: AtomicU64,
     rows_materialized: AtomicU64,
     kernel_cpu_ns: AtomicU64,
+    rows_written: AtomicU64,
+    scalar_bytes_written: AtomicU64,
+    vector_bytes_written: AtomicU64,
+    fts_text_bytes_written: AtomicU64,
+    rows_tombstoned: AtomicU64,
+    superfiles_written: AtomicU64,
+    superfile_bytes_written: AtomicU64,
+    fts_terms_indexed: AtomicU64,
 }
 
 impl OpStatsCollector {
@@ -180,6 +260,34 @@ impl OpStatsCollector {
         self.kernel_cpu_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    /// Flush one buffered append's input shape — rows plus the three
+    /// ingested-byte legs, computed together at the buffering site.
+    pub(crate) fn add_ingested_write(&self, rows: u64, scalar: u64, vector: u64, fts_text: u64) {
+        self.rows_written.fetch_add(rows, Ordering::Relaxed);
+        self.scalar_bytes_written
+            .fetch_add(scalar, Ordering::Relaxed);
+        self.vector_bytes_written
+            .fetch_add(vector, Ordering::Relaxed);
+        self.fts_text_bytes_written
+            .fetch_add(fts_text, Ordering::Relaxed);
+    }
+
+    /// Flush a mutation's tombstoned-row count.
+    pub(crate) fn add_rows_tombstoned(&self, rows: u64) {
+        self.rows_tombstoned.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Flush one committed publish batch's output shape (after the
+    /// commit returns Ok, so a failed or retried publish never counts).
+    pub(crate) fn add_commit_outputs(&self, superfiles: u64, bytes: u64, fts_terms: u64) {
+        self.superfiles_written
+            .fetch_add(superfiles, Ordering::Relaxed);
+        self.superfile_bytes_written
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.fts_terms_indexed
+            .fetch_add(fts_terms, Ordering::Relaxed);
+    }
+
     /// The counters accumulated so far.
     pub(crate) fn snapshot(&self) -> OpStats {
         OpStats {
@@ -191,6 +299,14 @@ impl OpStatsCollector {
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
             rows_materialized: self.rows_materialized.load(Ordering::Relaxed),
             kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),
+            rows_written: self.rows_written.load(Ordering::Relaxed),
+            scalar_bytes_written: self.scalar_bytes_written.load(Ordering::Relaxed),
+            vector_bytes_written: self.vector_bytes_written.load(Ordering::Relaxed),
+            fts_text_bytes_written: self.fts_text_bytes_written.load(Ordering::Relaxed),
+            rows_tombstoned: self.rows_tombstoned.load(Ordering::Relaxed),
+            superfiles_written: self.superfiles_written.load(Ordering::Relaxed),
+            superfile_bytes_written: self.superfile_bytes_written.load(Ordering::Relaxed),
+            fts_terms_indexed: self.fts_terms_indexed.load(Ordering::Relaxed),
         }
     }
 }
