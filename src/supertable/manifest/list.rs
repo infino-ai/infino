@@ -2658,6 +2658,25 @@ mod tests {
         assert_lists_equal(&decoded, &list);
     }
 
+    /// Version compat: a manifest serialized before the hnsw graph feature has
+    /// no `slow_vector_state_graphs_*` fields. The ref is `None`, so the wire
+    /// form omits them (skip_serializing_if) — byte-identical to a pre-feature
+    /// manifest — and it must decode back to `None`, never a missing-field
+    /// error. Older tables then fall back to ivf and rebuild on first drain.
+    #[test]
+    fn manifest_without_graph_ref_decodes_to_none() {
+        let list = empty_list();
+        assert!(list.slow_vector_state_graphs.is_none());
+        let bytes = encode(&list).expect("encode");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(
+            json.get("slow_vector_state_graphs_uri").is_none(),
+            "absent graph ref must be omitted from the wire form (pre-feature shape)"
+        );
+        let decoded = decode(&bytes).expect("pre-feature manifest must decode");
+        assert!(decoded.slow_vector_state_graphs.is_none());
+    }
+
     #[test]
     fn rich_list_roundtrip_multiple_parts() {
         let list = rich_list(5);

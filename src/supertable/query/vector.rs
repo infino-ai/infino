@@ -1653,7 +1653,7 @@ impl SupertableReader {
             Err(error) => {
                 tracing::warn!(
                     "hnsw graph sections {} unavailable ({error}); falling back to \
-                     lazy build / scan",
+                     the ivf scan",
                     reference.uri
                 );
                 None
@@ -7769,5 +7769,40 @@ mod tests {
             .expect("global union search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].superfile, undrained[0].uri);
+    }
+
+    /// Regression for the pre-drain hnsw collapse (recall 0.240): with
+    /// `search_mode` defaulting to hnsw, a PRE-DRAIN table has no hidden index
+    /// and no persisted graph, so the query must serve via ivf and return the
+    /// exact match — not take the graph path and collapse onto `_id = 0`.
+    /// Guards both the `hidden_vector_index` gate and the removed lazy build.
+    #[test]
+    fn pre_drain_hnsw_default_serves_correct_rows_via_ivf() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, dim, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        // No drain: pre-drain query for the one-hot row at dim 3.
+        let mut q = vec![0.0f32; dim];
+        q[3] = 1.0;
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, 1, VectorSearchOptions::new(), None)
+            .expect("pre-drain search");
+        assert_eq!(hits.len(), 1, "pre-drain hnsw default must serve via ivf");
+        assert!(
+            hits[0].score < 1e-3,
+            "top hit must be the exact one-hot match (distance ~0), not a collapse: {}",
+            hits[0].score
+        );
     }
 }

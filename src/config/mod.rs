@@ -277,26 +277,26 @@ const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
 /// width and the exact `ef` at the `k = 10` anchor (`128 ≈ 0.97 recall@10`
 /// on Cohere-1M). The full law is
 /// `ef = max(k, clamp(ceil(k × ef_mult), ef_floor, ef_ceil))`.
-const DEFAULT_VECTOR_DIRECT_DATA_EF_FLOOR: usize = 128;
+const DEFAULT_VECTOR_HNSW_EF_FLOOR: usize = 128;
 /// Default per-`k` beam multiplier for the `hnsw` ef law (integer).
 /// At the `k = 10` anchor `10 × 10 = 100` clamps up to the 128 floor.
-const DEFAULT_VECTOR_DIRECT_DATA_EF_MULT: usize = 10;
+const DEFAULT_VECTOR_HNSW_EF_MULT: usize = 10;
 /// Default upper clamp on the scaled `hnsw` search `ef`.
-const DEFAULT_VECTOR_DIRECT_DATA_EF_CEIL: usize = 512;
+const DEFAULT_VECTOR_HNSW_EF_CEIL: usize = 512;
 /// Default `ef_construction` for the `hnsw` HNSW build — the beam
 /// width used while inserting nodes. Higher builds a better-connected graph
 /// (same recall at a smaller search `ef`, so lower query latency) at a
 /// linearly higher one-time build cost and NO extra resident memory (degree
 /// is set by `m`, not this). 200 is the sweet spot for recall ~0.93–0.95;
 /// raising it mainly helps the >0.97 end.
-const DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION: usize = 200;
+const DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION: usize = 200;
 /// Default scale ceiling for the `hnsw` **data** graph: the resident
 /// per-row HNSW is built (at drain) and persisted only when the table's doc
 /// count is at or below this. Above it, the whole-corpus graph would not fit
 /// in RAM, so only the (far smaller) centroid graph is built and the query
 /// falls back to the scan path. 10M rows of Sq16 codes at 768d is ~15 GiB
 /// resident — the practical single-host ceiling.
-const DEFAULT_VECTOR_DIRECT_DATA_MAX_DOCS: u64 = 10_000_000;
+const DEFAULT_VECTOR_HNSW_MAX_DOCS: u64 = 10_000_000;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
 /// inside each selected cell. Small cells stay at this known-good minimum.
 const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
@@ -380,20 +380,21 @@ pub enum DrainConsolidate {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorSearchMode {
-    /// Grid routing to cells, then the manifest's stamped per-cell width
-    /// (default). The established IVF cell-scan path.
-    #[default]
+    /// Grid routing to cells, then the manifest's stamped per-cell width.
+    /// The established IVF cell-scan path — the automatic fallback for any
+    /// corpus above `hnsw_max_docs` (where the resident graph won't fit RAM)
+    /// and for filtered / pre-drain / undrained-user queries.
     Ivf,
     /// EXPERIMENTAL (opt-in): score every fine centroid globally and read the
     /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
     /// cold-read win at scale, not at small scale — see `config.yaml`.
     GlobalFineCentroid,
-    /// EXPERIMENTAL (opt-in): walk a resident in-memory HNSW graph built over
-    /// every row's Sq16 rerank codes, bypassing the grid, cell selection, and
-    /// disk reads entirely. The graph and its `node -> doc_id` map are built
-    /// once on the first `hnsw` query and held resident on the table
-    /// handle; search walks it at the `k`-scaled `ef` law. Small/mid-scale
-    /// experimental path — the whole index must fit in RAM.
+    /// DEFAULT: walk a resident in-memory HNSW graph built over every row's
+    /// Sq16 codes, bypassing the grid, cell selection, and disk reads. Built
+    /// at drain and held resident for corpora `<= hnsw_max_docs`; above that
+    /// ceiling the graph is not built and queries fall back to `ivf`
+    /// automatically. Search walks it at the `k`-scaled `ef` law.
+    #[default]
     Hnsw,
 }
 
@@ -545,15 +546,15 @@ impl Default for VectorSettings {
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
-            search_mode: VectorSearchMode::Ivf,
+            search_mode: VectorSearchMode::Hnsw,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
-            hnsw_ef_floor: DEFAULT_VECTOR_DIRECT_DATA_EF_FLOOR,
-            hnsw_ef_mult: DEFAULT_VECTOR_DIRECT_DATA_EF_MULT,
-            hnsw_ef_ceil: DEFAULT_VECTOR_DIRECT_DATA_EF_CEIL,
-            hnsw_ef_construction: DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION,
-            hnsw_max_docs: DEFAULT_VECTOR_DIRECT_DATA_MAX_DOCS,
+            hnsw_ef_floor: DEFAULT_VECTOR_HNSW_EF_FLOOR,
+            hnsw_ef_mult: DEFAULT_VECTOR_HNSW_EF_MULT,
+            hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
+            hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
+            hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,

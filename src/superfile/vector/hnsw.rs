@@ -418,11 +418,18 @@ impl Hnsw {
             |visited, node| builder.insert(scorer, node, visited),
         );
 
-        let entry = builder.entry.into_inner().unwrap().node;
+        let entry = builder
+            .entry
+            .into_inner()
+            .expect("invariant: hnsw entry lock never poisoned")
+            .node;
         let neighbors: Vec<Vec<Vec<u32>>> = builder
             .adj
             .into_iter()
-            .map(|m| m.into_inner().unwrap())
+            .map(|m| {
+                m.into_inner()
+                    .expect("invariant: hnsw adjacency lock never poisoned")
+            })
             .collect();
         Hnsw {
             neighbors,
@@ -492,11 +499,18 @@ impl Hnsw {
             |visited, node| builder.insert(scorer, node, visited),
         );
 
-        let entry = builder.entry.into_inner().unwrap().node;
+        let entry = builder
+            .entry
+            .into_inner()
+            .expect("invariant: hnsw entry lock never poisoned")
+            .node;
         let neighbors: Vec<Vec<Vec<u32>>> = builder
             .adj
             .into_iter()
-            .map(|m| m.into_inner().unwrap())
+            .map(|m| {
+                m.into_inner()
+                    .expect("invariant: hnsw adjacency lock never poisoned")
+            })
             .collect();
         Hnsw {
             neighbors,
@@ -744,7 +758,7 @@ impl Hnsw {
             .map(|&lvl| vec![Vec::new(); lvl as usize + 1])
             .collect();
         // Layer 0, fixed stride m0.
-        for node in 0..n {
+        for slot in neighbors.iter_mut() {
             let mut l0 = Vec::with_capacity(m0);
             for _ in 0..m0 {
                 let id = c.u32()?;
@@ -755,7 +769,7 @@ impl Hnsw {
                     l0.push(id);
                 }
             }
-            neighbors[node][0] = l0;
+            slot[0] = l0;
         }
         // Upper layers.
         let records = c.u64()?;
@@ -791,7 +805,7 @@ impl Hnsw {
 /// On-disk magic for a persisted `hnsw` bundle (graph + node→doc-id
 /// map + node-ordered Sq16 plane), the self-contained payload a resident
 /// data index is rebuilt from at open.
-const DIRECT_DATA_MAGIC: &[u8; 8] = b"INFDDG01";
+const HNSW_DATA_MAGIC: &[u8; 8] = b"INFDDG01";
 
 /// A `hnsw` resident index rebuilt from a persisted bundle: the Sq16
 /// scorer over the node-ordered code plane, the walkable graph, and the
@@ -817,7 +831,7 @@ pub(crate) fn encode_hnsw(
     debug_assert_eq!(sq16_codes.len(), n * dim * 2);
     let graph_bytes = graph.to_bytes();
     let mut out = Vec::with_capacity(32 + n * 16 + sq16_codes.len() + graph_bytes.len());
-    out.extend_from_slice(DIRECT_DATA_MAGIC);
+    out.extend_from_slice(HNSW_DATA_MAGIC);
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.extend_from_slice(&[0u8; 4]); // reserved / alignment
@@ -835,7 +849,7 @@ pub(crate) fn encode_hnsw(
 /// build or scan path rather than failing the query.
 pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
     let mut c = Cursor::new(bytes);
-    if c.take(DIRECT_DATA_MAGIC.len())? != DIRECT_DATA_MAGIC {
+    if c.take(HNSW_DATA_MAGIC.len())? != HNSW_DATA_MAGIC {
         return None;
     }
     let n = c.u64()? as usize;
@@ -1015,7 +1029,9 @@ impl ParBuild {
     /// the (expensive) scoring of those neighbors happens lock-free.
     #[inline]
     fn snapshot(&self, node: u32, level: u32) -> Vec<u32> {
-        let guard = self.adj[node as usize].lock().unwrap();
+        let guard = self.adj[node as usize]
+            .lock()
+            .expect("invariant: hnsw adjacency lock never poisoned");
         let l = level as usize;
         if l < guard.len() {
             guard[l].clone()
@@ -1146,7 +1162,9 @@ impl ParBuild {
         li: usize,
         cap: usize,
     ) {
-        let mut g = self.adj[target as usize].lock().unwrap();
+        let mut g = self.adj[target as usize]
+            .lock()
+            .expect("invariant: hnsw adjacency lock never poisoned");
         for &a in additions {
             if a != target && !g[li].contains(&a) {
                 g[li].push(a);
@@ -1177,7 +1195,10 @@ impl ParBuild {
         let EntryState {
             node: mut ep,
             top_level: entry_level,
-        } = *self.entry.read().unwrap();
+        } = *self
+            .entry
+            .read()
+            .expect("invariant: hnsw entry lock never poisoned");
 
         let mut l = entry_level;
         while l > level {
@@ -1206,7 +1227,10 @@ impl ParBuild {
         }
 
         if level > entry_level {
-            let mut e = self.entry.write().unwrap();
+            let mut e = self
+                .entry
+                .write()
+                .expect("invariant: hnsw entry lock never poisoned");
             // Re-check under the write lock: another worker may have promoted
             // a still-taller node between the snapshot and here.
             if level > e.top_level {

@@ -594,16 +594,13 @@ pub(crate) async fn fetch_graph_header(
 ///
 /// `data` is the self-contained per-row `hnsw` index (graph + Sq16
 /// plane + node→doc-id map), present only when the table was within the
-/// data-graph scale ceiling at drain. `centroid_graph` is the HNSW over the
-/// fp32 fine centroids (present at any scale); its node-ordered centroid
-/// vectors are read from the sibling [`CentroidSection`].
+/// data-graph scale ceiling at drain.
 pub(crate) struct ResidentGraphSections {
     pub uri: String,
     /// Largest stable doc id the graph covers (the append-delta boundary an
     /// incremental drain inserts past).
     pub high_water_id: i128,
     pub data: Option<hnsw::HnswIndex>,
-    pub centroid_graph: Option<hnsw::Hnsw>,
 }
 
 /// Fetch + decode the combined graph bundle for one generation. A decode
@@ -622,7 +619,6 @@ pub(crate) async fn fetch_graph_sections(
         uri: reference.uri.clone(),
         high_water_id: bundle.high_water_id,
         data,
-        centroid_graph: hnsw::Hnsw::from_bytes(&bundle.centroid_graph),
     })
 }
 

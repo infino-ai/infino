@@ -160,23 +160,24 @@ vector:
   kmeans_pts_per_centroid: 64
 
   # Query search mode for the hidden vector index on the UNFILTERED path.
-  # (Filtered queries and pre-drain user tables always use `ivf`.)
-  #   ivf                  — grid routing to cells, then the manifest's
-  #                          stamped per-cell width. The default, established path.
+  # (Filtered queries, pre-drain, and the undrained user arm always use `ivf`.)
+  #   hnsw                 — DEFAULT: walk a resident in-memory HNSW graph built
+  #                          over every row's Sq16 codes, bypassing the grid,
+  #                          cell selection, and disk reads. Built at drain and
+  #                          held resident for corpora <= hnsw_max_docs; above
+  #                          that ceiling the graph is not built and queries fall
+  #                          back to `ivf` AUTOMATICALLY (the drain drops the
+  #                          graph ref when the drained count crosses the
+  #                          ceiling, and the query's valid-graph guard then
+  #                          serves ivf). Self-driving: fast where it fits.
+  #   ivf                  — grid routing to cells, then the manifest's stamped
+  #                          per-cell width. The established scan path, and the
+  #                          automatic fallback for any corpus above hnsw_max_docs.
   #   global_fine_centroid — EXPERIMENTAL: score every fine centroid globally
   #                          across all cells and read the top fanout clusters,
-  #                          bypassing the grid. Concentrates the cold footprint
-  #                          as the corpus grows — a cold-read win at scale
-  #                          (10M+); at small scale it can cost recall/latency
-  #                          for no cold benefit. Opt-in while the per-table
-  #                          fanout stamp is built.
-  #   hnsw                 — EXPERIMENTAL: walk a resident in-memory HNSW graph
-  #                          built over every row's Sq16 rerank codes, bypassing
-  #                          the grid, cell selection, and disk reads. Built at
-  #                          drain and held resident; the user/pre-drain arm and
-  #                          any corpus over hnsw_max_docs fall back to ivf.
-  #                          The whole index must fit in RAM.
-  search_mode: ivf
+  #                          bypassing the grid. A cold-read win at scale (10M+);
+  #                          opt-in while the per-table fanout stamp is built.
+  search_mode: hnsw
 
   # For search_mode = global_fine_centroid: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
