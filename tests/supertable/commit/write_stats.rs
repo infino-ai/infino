@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Per-op work stats over the write surface: a write wrapped in
+//! [`with_op_stats`] reports the rows and bytes it indexed,
+//! deterministically — the same batch into the same table state reports
+//! the same priced counters whether the writer pool is one thread or
+//! eight, and a writer minted outside a scope records nothing. The
+//! width-dependent output-shape counters (superfile count/bytes,
+//! distinct terms) are recorded-only and exempted from the invariance
+//! contract, exactly as the module documents.
+
+#![deny(clippy::unwrap_used)]
+
+use std::{mem, sync::Arc};
+
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{col, lit};
+use infino::{
+    config::{CompactionSettings, OptimizeOptions},
+    runtime_metrics::op_stats::{OpStats, with_op_stats},
+    storage::{LocalFsStorageProvider, StorageProvider},
+    superfile::builder::FtsConfig,
+    supertable::{Supertable, SupertableOptions},
+    test_helpers::{
+        build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
+        schema_id_title,
+    },
+};
+use rayon::ThreadPoolBuilder;
+use tempfile::TempDir;
+
+/// Rows in the width-invariance fixture — comfortably above the widest
+/// pool below, so `n_shards = min(width, rows)` is genuinely
+/// width-bound and the shard split really differs between widths.
+const WIDTH_TEST_ROWS: usize = 40;
+/// Writer-pool widths the invariance test compares.
+const POOL_WIDTHS: [usize; 3] = [1, 2, 8];
+/// Vector fixture dimensionality (engine minimum is 16).
+const DIM: usize = 16;
+/// Rows in the vector-bytes pin fixture.
+const VECTOR_ROWS: usize = 24;
+/// Random-rotation seed for the vector fixture.
+const VECTOR_ROT_SEED: u64 = 13;
+
+/// Zero the counters the write contract exempts: superfile count and
+/// the per-superfile overhead ride the writer pool's width, distinct
+/// terms double-count across shards, and kernel CPU is measured time.
+/// Serves the cross-width comparisons; everything left must be equal.
+fn deterministic_write(mut stats: OpStats) -> OpStats {
+    stats.superfiles_written = 0;
+    stats.superfile_bytes_written = 0;
+    stats.fts_terms_indexed = 0;
+    stats.kernel_cpu_ns = 0;
+    stats
+}
+
+/// The `title`-only options with an explicit writer-pool width.
+fn options_with_pool_width(n_threads: usize) -> SupertableOptions {
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(n_threads)
+            .build()
+            .expect("writer pool"),
+    );
+    SupertableOptions::new(
+        schema_id_title(),
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        Vec::new(),
+        Some(default_tokenizer()),
+    )
+    .expect("valid options")
+    .with_writer_pool(pool)
+}
+
+/// The width-test corpus: same titles every call, so every width builds
+/// from an identical batch.
+fn width_test_batch() -> RecordBatch {
+    let titles: Vec<String> = (0..WIDTH_TEST_ROWS)
+        .map(|i| format!("row{i:03} common tokens"))
+        .collect();
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    build_title_batch(&refs)
+}
+
+/// One scoped append+commit of `batch` into a fresh table built from
+/// `options`, returning the write's work stats.
+fn scoped_append(options: SupertableOptions, batch: &RecordBatch) -> OpStats {
+    let st = Supertable::create(options).expect("create");
+    let ((), stats) = with_op_stats(|| {
+        st.append(batch).expect("append");
+    });
+    stats
+}
+
+#[test]
+fn write_stats_are_invariant_to_writer_pool_width() {
+    // The load-bearing determinism test: the priced counters must not
+    // depend on how many rayon threads happened to shard the build.
+    let batch = width_test_batch();
+    let snapshots: Vec<OpStats> = POOL_WIDTHS
+        .iter()
+        .map(|&width| scoped_append(options_with_pool_width(width), &batch))
+        .collect();
+
+    let baseline = deterministic_write(snapshots[0]);
+    for (width, stats) in POOL_WIDTHS.iter().zip(&snapshots).skip(1) {
+        assert_eq!(
+            deterministic_write(*stats),
+            baseline,
+            "priced write counters must match width 1 at width {width}"
+        );
+    }
+    // The mask is load-bearing, not vacuous: the widest pool really did
+    // shard more than the single thread.
+    assert!(
+        snapshots[2].superfiles_written > snapshots[0].superfiles_written,
+        "width {} must produce more superfiles than width 1 ({} vs {})",
+        POOL_WIDTHS[2],
+        snapshots[2].superfiles_written,
+        snapshots[0].superfiles_written
+    );
+}
+
+#[test]
+fn repeated_identical_appends_report_identical_counters() {
+    // Same batch, same (fresh) table state, same pool width: the whole
+    // masked snapshot matches, and the recorded superfile count does
+    // too (it is width-dependent, not run-dependent).
+    let batch = width_test_batch();
+    let a = scoped_append(options_with_pool_width(2), &batch);
+    let b = scoped_append(options_with_pool_width(2), &batch);
+    assert_eq!(
+        deterministic_write(a),
+        deterministic_write(b),
+        "same batch, same table state, same work"
+    );
+    assert_eq!(
+        a.superfiles_written, b.superfiles_written,
+        "the shard split is a function of width and rows, not of the run"
+    );
+}
+
+#[test]
+fn an_append_pins_exact_rows_and_subset_fts_bytes() {
+    // Exact equality, not >0: a double flush would report 2x and pass a
+    // positivity check.
+    let batch = width_test_batch();
+    let stats = scoped_append(options_with_pool_width(1), &batch);
+    assert_eq!(
+        stats.rows_written, WIDTH_TEST_ROWS as u64,
+        "one committed row per input row"
+    );
+    assert_eq!(stats.rows_tombstoned, 0, "appends tombstone nothing");
+    assert!(
+        stats.scalar_bytes_written > 0,
+        "the scalar leg counts the buffered Arrow payload"
+    );
+    // The FTS leg is a subset of the scalar leg, not additional payload.
+    assert!(
+        stats.fts_text_bytes_written > 0
+            && stats.fts_text_bytes_written <= stats.scalar_bytes_written,
+        "fts bytes ({}) are a subset of scalar bytes ({})",
+        stats.fts_text_bytes_written,
+        stats.scalar_bytes_written
+    );
+    assert_eq!(
+        stats.vector_bytes_written, 0,
+        "no vector column in this fixture"
+    );
+    assert!(
+        stats.superfiles_written > 0 && stats.superfile_bytes_written > 0,
+        "a committed append published at least one superfile"
+    );
+}
+
+#[test]
+fn a_vector_append_pins_exact_payload_bytes() {
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::clone(&item), DIM as i32),
+            false,
+        ),
+    ]));
+    let options = SupertableOptions::new(
+        Arc::clone(&schema),
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+        Some(default_tokenizer()),
+    )
+    .expect("valid options");
+
+    let flat: Vec<f32> = (0..VECTOR_ROWS * DIM).map(|i| i as f32 * 0.25).collect();
+    let titles: Vec<String> = (0..VECTOR_ROWS).map(|i| format!("vec row{i:03}")).collect();
+    let fsl = FixedSizeListArray::try_new(
+        item,
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(LargeStringArray::from(titles)) as ArrayRef,
+            Arc::new(fsl),
+        ],
+    )
+    .expect("batch");
+
+    let st = Supertable::create(options).expect("create");
+    let ((), stats) = with_op_stats(|| {
+        st.append(&batch).expect("append");
+    });
+    assert_eq!(stats.rows_written, VECTOR_ROWS as u64);
+    assert_eq!(
+        stats.vector_bytes_written,
+        (VECTOR_ROWS * DIM * mem::size_of::<f32>()) as u64,
+        "the vector leg is exactly rows x dim x 4"
+    );
+}
+
+#[test]
+fn a_writer_minted_outside_the_scope_records_nothing() {
+    // Pickup happens at writer mint, not at commit time — the same
+    // contract the reader has.
+    let st = Supertable::create(options_with_pool_width(1)).expect("create");
+    let mut w = st.writer().expect("writer");
+    let batch = width_test_batch();
+    let ((), stats) = with_op_stats(|| {
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    });
+    assert_eq!(
+        stats.rows_written, 0,
+        "pickup happens at writer mint, not inside the scope"
+    );
+    assert_eq!(stats.superfiles_written, 0);
+}
+
+/// A storage-backed table (mutations require storage for the WAL
+/// pipeline) with three committed rows.
+fn seeded_storage_table(dir: &TempDir) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st =
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+    st.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+        .expect("seed append");
+    st
+}
+
+#[test]
+fn a_delete_reports_its_tombstoned_rows_and_its_scan() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = seeded_storage_table(&dir);
+    let (outcome, stats) =
+        with_op_stats(|| st.delete(col("title").eq(lit("bravo"))).expect("delete"));
+    assert_eq!(outcome.n_tombstoned(), 1);
+    assert_eq!(
+        stats.rows_tombstoned, 1,
+        "the delete's write leg reports its retired rows"
+    );
+    assert_eq!(stats.rows_written, 0, "deletes index no new rows");
+    // The predicate resolve runs on the reader's cached, collector-
+    // detached SessionContext (the same deliberate suppression that
+    // keeps a cached context from billing later queries into an old
+    // scope), so the scan leg reports no read work today. Pinned here
+    // so a change to that exclusion is a visible decision, not drift:
+    // metering the mutation scan as read work closes a SELECT-then-
+    // delete-by-id arbitrage, but reopening the suppression design is
+    // its own discussion.
+    assert_eq!(
+        stats.planned_read_ranges, 0,
+        "the mutation's predicate scan is unmetered by design (cached \
+         detached context); if this starts reporting, the exclusion \
+         decision changed and the docs must follow"
+    );
+}
+
+#[test]
+fn an_update_reports_replacement_rows_and_tombstones() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = seeded_storage_table(&dir);
+    let (outcome, stats) = with_op_stats(|| {
+        st.update(
+            col("title").eq(lit("bravo")),
+            &build_title_batch(&["bravo-replacement"]),
+        )
+        .expect("update")
+    });
+    assert_eq!(outcome.matched(), 1);
+    assert_eq!(
+        stats.rows_written, 1,
+        "the update's replacement rows count as written"
+    );
+    assert_eq!(
+        stats.rows_tombstoned, 1,
+        "the update's retired rows count as tombstoned"
+    );
+}
+
+#[test]
+fn optimize_does_not_re_bill_ingested_rows() {
+    // Compaction rewrites rows the caller already paid to ingest; if
+    // optimize() ever lands in rows_written, every optimize re-counts
+    // the whole table. Recorded output-shape counters may move; the
+    // priced input-shape counters must stay zero.
+    let dir = TempDir::new().expect("tempdir");
+    let st = seeded_storage_table(&dir);
+    // A second commit gives compaction something to merge.
+    st.append(&build_title_batch(&["delta", "echo"]))
+        .expect("second append");
+    let ((), stats) = with_op_stats(|| {
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+    });
+    assert_eq!(
+        stats.rows_written, 0,
+        "optimize must never re-count ingested rows"
+    );
+    assert_eq!(stats.scalar_bytes_written, 0);
+    assert_eq!(stats.vector_bytes_written, 0);
+    assert_eq!(stats.fts_text_bytes_written, 0);
+}
