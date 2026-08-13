@@ -308,7 +308,7 @@ fn corruption_at_random_interior_positions_rejected() {
 
 #[test]
 fn corrupt_fts_positions_region_rejected() {
-    // v3 blob: the positions-region offset lives at header bytes
+    // v4 blob: the positions-region offset lives at header bytes
     // [48..56] (relative to the blob). Flip a byte inside the region
     // body — the multi-doc terms guarantee it is non-empty.
     let bytes = build_corruptable_positional_superfile();
@@ -319,8 +319,8 @@ fn corrupt_fts_positions_region_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 3,
-        "positional superfile must embed a v3 FTS blob (positions sub-index)"
+        version, 4,
+        "positional superfile must embed a v4 FTS blob (dense corpus ⇒ bitset blocks)"
     );
     let positions_off_rel = u64::from_le_bytes(
         bytes[fts_off + 48..fts_off + 56]
@@ -342,10 +342,10 @@ fn corrupt_fts_positions_region_rejected() {
 
 #[test]
 fn uncorrupted_positional_superfile_opens() {
-    // Sanity twin of the corruption test: the same v3 bytes open
+    // Sanity twin of the corruption test: the same v4 bytes open
     // cleanly when untouched.
     let bytes = build_corruptable_positional_superfile();
-    SuperfileReader::open(Bytes::from(bytes)).expect("clean v3 superfile opens");
+    SuperfileReader::open(Bytes::from(bytes)).expect("clean v4 superfile opens");
 }
 
 #[test]

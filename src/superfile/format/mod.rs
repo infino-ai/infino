@@ -59,6 +59,18 @@ pub mod fts {
     /// where positions do.
     pub const VERSION_V3: u32 = 3;
 
+    /// The version written when any posting block is stored in the **bitset
+    /// encoding**: a dense block's doc ids are a presence bitset (header
+    /// byte 3 = [`crate::superfile::fts::posting::ENCODING_BITSET`]) rather
+    /// than PFOR deltas, so the union count OR's it in without decoding.
+    /// Same header + region layout as [`VERSION_V2`]/[`VERSION_V3`]
+    /// (positions region present iff positional; sub-index for positional
+    /// terms as in `V3`) — `V4` adds only the per-block encoding choice,
+    /// which is self-describing via the header byte. Readers accept
+    /// `V1`–`V4`; `V1`–`V3` blobs carry only PACKED blocks and read
+    /// unchanged, so existing indices need no reindex.
+    pub const VERSION_V4: u32 = 4;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.

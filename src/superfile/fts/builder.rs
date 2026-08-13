@@ -100,7 +100,7 @@ use crate::superfile::{
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
-        posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
+        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
 };
@@ -163,6 +163,11 @@ const CHAIN_END: u32 = u32::MAX;
 #[derive(Default)]
 struct FinishProfile {
     enabled: bool,
+    /// Set once any posting block is emitted in the bitset encoding, so
+    /// the blob header is written as `VERSION_V4`. Not a profiling counter
+    /// — reused here because this struct already threads from term emit to
+    /// the final header write.
+    saw_bitset_block: bool,
     encode_calls: u64,
     encode_df1: u64,
     encode_pfor: u64,
@@ -3259,15 +3264,18 @@ fn assemble_and_write_blob<W: Write>(
     let blob_copy_start = finish_profile.enabled.then(Instant::now);
     let mut header = Vec::with_capacity(header_size as usize);
     header.extend_from_slice(format::fts::MAGIC); // 8
-    // V3 when the positions region has a real body (beyond its 4-byte
-    // CRC): a non-empty body means at least one non-inline positional term
-    // wrote position runs and therefore a run-offset sub-index. A
-    // positionless blob — or a positional one whose terms all inlined —
-    // leaves a CRC-only region and stays V2, byte-identical to before.
-    // Readers accept both.
-    let fts_version = match positions_region.1 > format::CRC_BYTES as u64 {
-        true => format::fts::VERSION_V3,
-        false => format::fts::VERSION_V2,
+    // V4 when any block took the bitset encoding. Otherwise V3 when the
+    // positions region has a real body (beyond its 4-byte CRC) — a
+    // non-empty body means a non-inline positional term wrote position runs
+    // and therefore a run-offset sub-index — else V2 (positionless, or a
+    // positional blob whose terms all inlined), byte-identical to before.
+    // Readers accept all of these.
+    let fts_version = if finish_profile.saw_bitset_block {
+        format::fts::VERSION_V4
+    } else if positions_region.1 > format::CRC_BYTES as u64 {
+        format::fts::VERSION_V3
+    } else {
+        format::fts::VERSION_V2
     };
     header.extend_from_slice(&fts_version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
@@ -3654,6 +3662,10 @@ fn encode_and_emit_term<W: Write>(
         scratch.tfs = block_tfs;
         if let Some(start) = block_build_start {
             profile.encode_block_build += start.elapsed();
+        }
+        // A block emitted in the bitset encoding bumps the blob to v4.
+        if encoded_blocks.iter().any(|b| b.bytes[3] == ENCODING_BITSET) {
+            profile.saw_bitset_block = true;
         }
         let num_blocks = encoded_blocks.len() as u32;
         let metadata_offset = *postings_len;
@@ -4641,7 +4653,15 @@ mod tests {
 
         let read_u64 = |at: usize| u64::from_le_bytes(v2[at..at + 8].try_into().expect("8 bytes"));
         let read_u32 = |at: usize| u32::from_le_bytes(v2[at..at + 4].try_into().expect("4 bytes"));
-        assert_eq!(read_u32(8), format::fts::VERSION_V2);
+        // Accept any 56-byte-header version (v2/v3/v4) as the downgrade
+        // source — they share the header layout this synthesizer edits.
+        let src_version = read_u32(8);
+        assert!(
+            src_version == format::fts::VERSION_V2
+                || src_version == format::fts::VERSION_V3
+                || src_version == format::fts::VERSION_V4,
+            "unexpected source version {src_version}"
+        );
         let fst_off = read_u64(24);
         let postings_off = read_u64(32);
         let doc_lengths_off = read_u64(40);
@@ -4755,7 +4775,7 @@ mod tests {
         // A positional build carries position runs ⇒ a sub-index ⇒ v3.
         assert_eq!(
             u32::from_le_bytes(spilled_pos[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V3
+            format::fts::VERSION_V4
         );
         let inram_pos = build_title_blob(&docs, true);
         let inram_plain = build_title_blob(&docs, false);
@@ -4836,8 +4856,8 @@ mod tests {
         let v3_blob = build_title_blob(&docs, true);
         assert_eq!(
             u32::from_le_bytes(v3_blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V3,
-            "a positional build is v3"
+            format::fts::VERSION_V4,
+            "this positional corpus is dense ⇒ v4"
         );
         // Downgrade the version field only; the header is not itself
         // CRC-covered, and the positions region + skip offsets are
@@ -4928,10 +4948,11 @@ mod tests {
         let version_of = |blob: &bytes::Bytes| {
             u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
         };
-        // A positionless build is v2; a positional build carries a run-
-        // offset sub-index and is v3. v1 is a read-only legacy format.
-        assert_eq!(version_of(&plain), format::fts::VERSION_V2);
-        assert_eq!(version_of(&positional), format::fts::VERSION_V3);
+        // This corpus is dense enough that some block takes the bitset
+        // encoding, so both builds are v4 (v4 subsumes the v3 positions
+        // sub-index). v1 is a read-only legacy format.
+        assert_eq!(version_of(&plain), format::fts::VERSION_V4);
+        assert_eq!(version_of(&positional), format::fts::VERSION_V4);
 
         // A positionless build's region is just the CRC-of-empty.
         let read_u64_plain =
@@ -5028,7 +5049,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V3
+            format::fts::VERSION_V4
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

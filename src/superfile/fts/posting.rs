@@ -60,9 +60,30 @@ use bitpacking::{BitPacker, BitPacker4x};
 /// match `BitPacker4x::BLOCK_LEN`.
 pub const BLOCK_LEN: usize = BitPacker4x::BLOCK_LEN;
 
-/// Header size in bytes (doc_count + delta_bits + tf_bits + reserved +
+/// Header size in bytes (doc_count + delta_bits + tf_bits + encoding +
 /// base_doc_id).
 pub const HEADER_SIZE: usize = 8;
+
+/// Header byte offset of the block `encoding` field (formerly reserved).
+pub const ENCODING_OFF: usize = 3;
+
+/// Block `encoding` (header byte 3): doc ids stored as PFOR-delta packing
+/// (today's layout). Every `V1`–`V3` block is this.
+pub const ENCODING_PACKED: u8 = 0;
+/// Block `encoding`: doc ids stored as a **presence bitset** over
+/// `[base_doc_id, last_doc_id]`, `base_doc_id` aligned down to a 64-bit
+/// word so the union count can OR it in word-aligned. Chosen only when it
+/// does not grow the block (dense blocks). Tfs follow, packed identically
+/// to PACKED. Only `VERSION_V4` blobs contain these.
+pub const ENCODING_BITSET: u8 = 1;
+
+/// Align a doc id down to the 64-bit word that contains it — the origin of
+/// a [`ENCODING_BITSET`] block's presence bitset, so its words line up
+/// with the union bitset and the OR needs no per-word bit shift.
+#[inline]
+pub fn bitset_block_base(doc_id: u32) -> u32 {
+    doc_id & !63
+}
 
 /// One block of postings — sorted-ascending `doc_ids` plus per-doc
 /// `tfs`. Both vectors must have the same length, ≤ [`BLOCK_LEN`].
@@ -133,26 +154,60 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
 
     let deltas_size = BLOCK_LEN * delta_bits as usize / 8;
     let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
-    let mut bytes = Vec::with_capacity(HEADER_SIZE + deltas_size + tfs_size);
+
+    // Store the doc ids as a presence bitset instead of PFOR deltas when
+    // that does not grow the block (a dense block — a common term's ~128
+    // near-consecutive docs). The bitset origin is word-aligned so the
+    // union count can OR it in without a per-word shift.
+    let aligned_base = bitset_block_base(b.doc_ids[0]);
+    let bitset_words = (last_doc_id - aligned_base) as usize / 64 + 1;
+    let bitset_size = bitset_words * 8;
+    let use_bitset = bitset_size <= deltas_size;
+
+    let doc_ids_size = if use_bitset { bitset_size } else { deltas_size };
+    let mut bytes = Vec::with_capacity(HEADER_SIZE + doc_ids_size + tfs_size);
 
     // Header.
     bytes.push(count as u8);
-    bytes.push(delta_bits);
+    bytes.push(if use_bitset { 0 } else { delta_bits });
     bytes.push(tf_bits);
-    bytes.push(0); // reserved
-    bytes.extend_from_slice(&base_doc_id.to_le_bytes());
-
-    // Packed deltas.
-    let deltas_start = bytes.len();
-    bytes.resize(deltas_start + deltas_size, 0);
-    bp.compress_sorted(
-        base_doc_id,
-        &padded_doc_ids,
-        &mut bytes[deltas_start..deltas_start + deltas_size],
-        delta_bits,
+    bytes.push(if use_bitset {
+        ENCODING_BITSET
+    } else {
+        ENCODING_PACKED
+    });
+    bytes.extend_from_slice(
+        &if use_bitset {
+            aligned_base
+        } else {
+            base_doc_id
+        }
+        .to_le_bytes(),
     );
 
-    // Packed tfs.
+    // Doc ids.
+    let doc_ids_start = bytes.len();
+    bytes.resize(doc_ids_start + doc_ids_size, 0);
+    if use_bitset {
+        let words = &mut bytes[doc_ids_start..doc_ids_start + bitset_size];
+        for &d in &b.doc_ids {
+            let bit = (d - aligned_base) as usize;
+            let w = (bit / 64) * 8;
+            let lane = bit % 64;
+            let mut word = u64::from_le_bytes(words[w..w + 8].try_into().expect("8 bytes"));
+            word |= 1u64 << lane;
+            words[w..w + 8].copy_from_slice(&word.to_le_bytes());
+        }
+    } else {
+        bp.compress_sorted(
+            base_doc_id,
+            &padded_doc_ids,
+            &mut bytes[doc_ids_start..doc_ids_start + deltas_size],
+            delta_bits,
+        );
+    }
+
+    // Packed tfs — identical in both encodings, in doc order.
     let tfs_start = bytes.len();
     bytes.resize(tfs_start + tfs_size, 0);
     bp.compress(
@@ -183,24 +238,24 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
 pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]) -> usize {
     let count = decode_block_doc_ids(bytes, dest_doc_ids);
 
-    // Term frequencies follow the packed deltas. The count paths skip
-    // this half (see `decode_block_doc_ids`); only scoring needs it.
+    // Term frequencies are always the trailing `tfs_size` bytes of the
+    // block, regardless of how the doc ids ahead of them are encoded
+    // (PACKED deltas or a BITSET). The count paths skip this half (see
+    // `decode_block_doc_ids`); only scoring needs it.
     assert!(
         dest_tfs.len() >= BLOCK_LEN,
         "decode_block: dest_tfs must have at least {BLOCK_LEN} slots"
     );
-    let delta_bits = bytes[1];
     let tf_bits = bytes[2];
     assert!(tf_bits <= 32, "decode_block: tf_bits {tf_bits} > 32");
-    let deltas_size = BLOCK_LEN * delta_bits as usize / 8;
     let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
     assert!(
-        bytes.len() >= HEADER_SIZE + deltas_size + tfs_size,
-        "decode_block: bytes ({}) shorter than header+deltas+tfs ({})",
+        bytes.len() >= HEADER_SIZE + tfs_size,
+        "decode_block: bytes ({}) shorter than header+tfs ({})",
         bytes.len(),
-        HEADER_SIZE + deltas_size + tfs_size
+        HEADER_SIZE + tfs_size
     );
-    let tfs_start = HEADER_SIZE + deltas_size;
+    let tfs_start = bytes.len() - tfs_size;
     BitPacker4x::new().decompress(
         &bytes[tfs_start..tfs_start + tfs_size],
         &mut dest_tfs[..BLOCK_LEN],
@@ -228,7 +283,8 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest_doc_ids: &mut [u32]) -> usize {
 
     let count = bytes[0] as usize;
     let delta_bits = bytes[1];
-    // bytes[2] = tf_bits (unused here), bytes[3] = reserved.
+    let tf_bits = bytes[2];
+    let encoding = bytes[3];
     assert!(
         delta_bits <= 32,
         "decode_block_doc_ids: delta_bits {delta_bits} > 32"
@@ -238,6 +294,31 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest_doc_ids: &mut [u32]) -> usize {
         "decode_block_doc_ids: doc_count {count} > BLOCK_LEN"
     );
     let base_doc_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+
+    if encoding == ENCODING_BITSET {
+        // Doc ids are a presence bitset over `[base_doc_id, ...]`; the tfs
+        // are the trailing `tf_bits`-packed bytes, so the bitset is
+        // everything between the header and them. Emit the set bits in
+        // ascending order (= ascending doc id) — the sorted order every
+        // consumer expects.
+        let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
+        assert!(
+            bytes.len() >= HEADER_SIZE + tfs_size,
+            "decode_block_doc_ids: bytes shorter than header+tfs"
+        );
+        let words = &bytes[HEADER_SIZE..bytes.len() - tfs_size];
+        let mut j = 0usize;
+        for (wi, chunk) in words.chunks_exact(8).enumerate() {
+            let mut word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+            while word != 0 {
+                dest_doc_ids[j] = base_doc_id + (wi as u32 * 64 + word.trailing_zeros());
+                j += 1;
+                word &= word - 1;
+            }
+        }
+        debug_assert_eq!(j, count, "bitset set-bit count must equal doc_count");
+        return count;
+    }
 
     let deltas_size = BLOCK_LEN * delta_bits as usize / 8;
     assert!(
@@ -298,6 +379,48 @@ mod tests {
         assert_eq!(enc.max_tf, 1);
         // Sanity on byte layout: header + 16*1 + 16*1 = 40 bytes.
         assert_eq!(enc.bytes.len(), HEADER_SIZE + 16 + 16);
+        // 1-bit deltas beat a bitset here, so it stays PACKED.
+        assert_eq!(enc.bytes[3], ENCODING_PACKED);
+    }
+
+    #[test]
+    fn roundtrip_dense_block_uses_bitset_encoding() {
+        // 128 docs at stride 2 (span 254): 2-bit deltas, so the bitset
+        // (≤ the packed deltas) is chosen. Round-trips through the bitset
+        // decode path and its set-bit ordering.
+        let doc_ids: Vec<u32> = (0..128).map(|i| i * 2).collect();
+        let tfs: Vec<u32> = (0..128).map(|i| (i % 5) + 1).collect();
+        let enc = roundtrip(&block(&doc_ids, &tfs));
+        assert_eq!(enc.bytes[3], ENCODING_BITSET, "dense block must be bitset");
+        assert_eq!(enc.last_doc_id, 254);
+        // base aligned down to a 64-bit boundary (0 here).
+        assert_eq!(u32::from_le_bytes(enc.bytes[4..8].try_into().expect("4 bytes")), 0);
+    }
+
+    #[test]
+    fn roundtrip_bitset_block_nonzero_aligned_base() {
+        // Dense block far from the origin: base aligns down to a word.
+        let doc_ids: Vec<u32> = (0..100).map(|i| 10_000 + i * 2).collect();
+        let tfs = vec![1u32; 100];
+        let enc = roundtrip(&block(&doc_ids, &tfs));
+        assert_eq!(enc.bytes[3], ENCODING_BITSET);
+        assert_eq!(
+            u32::from_le_bytes(enc.bytes[4..8].try_into().expect("4 bytes")),
+            10_000 & !63,
+            "base is word-aligned"
+        );
+    }
+
+    #[test]
+    fn roundtrip_sparse_block_stays_packed() {
+        // Widely-scattered docs: a bitset would be huge, so PACKED wins.
+        let doc_ids: Vec<u32> = (0..64).map(|i| i * 100_000).collect();
+        let tfs = vec![1u32; 64];
+        let enc = roundtrip(&block(&doc_ids, &tfs));
+        assert_eq!(
+            enc.bytes[3], ENCODING_PACKED,
+            "sparse block must stay packed"
+        );
     }
 
     #[test]
@@ -450,14 +573,19 @@ mod tests {
     }
 
     #[test]
-    fn header_reserved_byte_is_zero() {
-        let enc = encode_block(&block(&[1, 2, 3], &[1, 1, 1]));
-        assert_eq!(enc.bytes[3], 0, "reserved byte must be 0");
+    fn header_encoding_byte_marks_the_layout() {
+        // Byte 3 (formerly reserved) is the encoding: 0 = PACKED, 1 = BITSET.
+        let packed = encode_block(&block(&[1, 100_000], &[1, 1]));
+        assert_eq!(packed.bytes[3], ENCODING_PACKED, "sparse ⇒ PACKED");
+        let bitset = encode_block(&block(&[1, 2, 3], &[1, 1, 1]));
+        assert_eq!(bitset.bytes[3], ENCODING_BITSET, "dense ⇒ BITSET");
     }
 
     #[test]
     fn header_base_doc_id_is_first_minus_one() {
-        let enc = encode_block(&block(&[100, 102, 105], &[1, 1, 1]));
+        // A PACKED (sparse) block stores base = first doc - 1.
+        let enc = encode_block(&block(&[100, 100_000, 200_000], &[1, 1, 1]));
+        assert_eq!(enc.bytes[3], ENCODING_PACKED);
         let base_le = u32::from_le_bytes([enc.bytes[4], enc.bytes[5], enc.bytes[6], enc.bytes[7]]);
         assert_eq!(base_le, 99);
     }
@@ -660,12 +788,17 @@ mod tests {
                 .collect();
 
             let enc = encode_block(&Block { doc_ids, tfs });
-            let delta_bits = enc.bytes[1] as usize;
             let tf_bits = enc.bytes[2] as usize;
-            let expected_len = 8 /* header */
-                + (BLOCK_LEN * delta_bits) / 8
-                + (BLOCK_LEN * tf_bits) / 8;
-            prop_assert_eq!(enc.bytes.len(), expected_len);
+            let tfs_size = (BLOCK_LEN * tf_bits) / 8;
+            if enc.bytes[3] == ENCODING_BITSET {
+                // Doc ids are a whole number of 64-bit words; tfs trail.
+                prop_assert_eq!(enc.bytes[1], 0, "bitset block has delta_bits 0");
+                let bitset_bytes = enc.bytes.len() - 8 - tfs_size;
+                prop_assert!(bitset_bytes >= 8 && bitset_bytes.is_multiple_of(8));
+            } else {
+                let delta_bits = enc.bytes[1] as usize;
+                prop_assert_eq!(enc.bytes.len(), 8 + (BLOCK_LEN * delta_bits) / 8 + tfs_size);
+            }
         }
     }
 }
