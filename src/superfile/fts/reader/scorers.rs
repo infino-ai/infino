@@ -17,7 +17,10 @@ use super::{
         AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
     },
 };
-use crate::superfile::{error::FtsError, fts::bm25};
+use crate::superfile::{
+    error::FtsError,
+    fts::{bm25, posting::BLOCK_LEN},
+};
 
 /// Intersection cardinality by a rarest-driven membership walk: iterate the
 /// term with the fewest blocks and count docs the others all contain. Each
@@ -45,6 +48,35 @@ fn count_and_intersect_membership(mut cursors: Vec<TermCursor>) -> u64 {
         driver.next();
     }
     n
+}
+
+/// Intersection cardinality via bitset AND: build each term's doc presence into
+/// a doc-space bitset (byte-level — a dense term's bitset blocks are word-copied,
+/// never expanded to doc ids), AND them together, and popcount. Word-parallel, so
+/// its cost is `n_terms × max_doc/64` regardless of how many docs the rarest term
+/// holds — the opposite of the rarest-driven membership walk, which iterates the
+/// rarest term doc by doc. Wins when *every* term is common (dense), where the
+/// membership driver is itself a long list. `max_doc` is the largest doc id
+/// across the terms, so `acc`/`scratch` span every term's presence.
+fn count_and_intersect_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
+    let words = max_doc as usize / 64 + 1;
+    let mut acc = vec![0u64; words];
+    let mut scratch = vec![0u64; words];
+    let mut decode = [0u32; BLOCK_LEN];
+    let mut cursors = cursors.iter();
+    // The first term seeds the accumulator; the rest AND their presence in.
+    let Some(first) = cursors.next() else {
+        return 0;
+    };
+    or_cursor_into_bitset(&mut acc, first, &mut decode);
+    for c in cursors {
+        scratch.iter_mut().for_each(|w| *w = 0);
+        or_cursor_into_bitset(&mut scratch, c, &mut decode);
+        for (a, s) in acc.iter_mut().zip(scratch.iter()) {
+            *a &= *s;
+        }
+    }
+    acc.iter().map(|w| w.count_ones() as u64).sum()
 }
 
 impl FtsReader {
@@ -434,10 +466,29 @@ impl FtsReader {
         }
         // On a v4 blob a common term's blocks may be bitset-encoded, where
         // decoding (set-bit expansion) is slower than the PFOR path the
-        // flat-merge assumes. Drive the intersection by the rarest term and
-        // probe the rest by membership instead: a bitset block answers with
-        // an O(1) bit-test — no decode. See `count_and_intersect_membership`.
+        // flat-merge assumes.
         if self.has_bitset_blocks {
+            // When even the *rarest* term is dense (covers ≥ 1/DIVISOR of the
+            // corpus), the rarest-driven membership walk still iterates a long
+            // list. AND the terms' presence bitsets word-at-a-time instead —
+            // cost is independent of the terms' lengths. The two full-width
+            // bitsets it allocates only pay off at this density, so a sparser
+            // intersection keeps the membership probe.
+            if cursors.len() >= 2 {
+                let max_doc = cursors
+                    .iter()
+                    .filter_map(|c| c.blocks.last())
+                    .map(|b| b.last_doc_id)
+                    .max()
+                    .unwrap_or(0);
+                let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
+                if min_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
+                    return count_and_intersect_bitset(cursors, max_doc);
+                }
+            }
+            // Rarest term is sparse: drive by it and probe the rest by
+            // membership — a bitset block answers with an O(1) bit-test, no
+            // decode. See `count_and_intersect_membership`.
             return count_and_intersect_membership(cursors);
         }
         let col_meta = &self.columns[column_id as usize];

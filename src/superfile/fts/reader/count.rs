@@ -562,6 +562,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn and_count_matches_merge_on_dense_bitset_corpus() {
+        // A dense corpus stores common terms as bitset blocks (v4). The
+        // intersection count must agree with `token_match`'s flat-merge AND
+        // length across both v4 intersection kernels: the bitset-AND
+        // (word-parallel presence AND, when every term is dense enough to
+        // trip the density gate) and the rarest-driven membership walk (when
+        // a sparse term keeps the intersection below the gate). `token_match`
+        // AND collects via the decode-based flat-merge, an independent
+        // reference from either count kernel.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        const RARE_STRIDE: u32 = 371; // sparse ⇒ below the density gate
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha "); // every doc → dense
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            if i.is_multiple_of(RARE_STRIDE) {
+                text.push_str("rare ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let shapes: &[&[&str]] = &[
+            &["alpha", "beta"],                   // dense ∩ dense → bitset-AND
+            &["alpha", "beta", "gamma"],          // 3 dense → bitset-AND
+            &["alpha", "beta", "gamma", "delta"], // 4 dense → bitset-AND
+            &["beta", "gamma"],                   // dense ∩ dense, neither anchor
+            &["alpha", "rare"],                   // dense ∩ sparse → membership
+            &["gamma", "zzz_absent"],             // absent term ⇒ empty
+        ];
+        for terms in shapes {
+            let merge_len = r
+                .token_match("body", terms, BoolMode::And)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", terms, BoolMode::And)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(count, merge_len, "AND count vs merge len for {terms:?}");
+        }
+        // Absolute pin: `alpha` is in every doc, so `alpha ∩ beta` is exactly
+        // the docs where `beta` is present (i % 2 == 0) = ⌈N_DOCS / 2⌉.
+        assert_eq!(
+            r.token_match_count("body", &["alpha", "beta"], BoolMode::And)
+                .await
+                .expect("count")
+                .0,
+            u64::from(N_DOCS.div_ceil(2))
+        );
+    }
+
+    #[tokio::test]
     async fn or_count_anchored_matches_merge_on_dominant_term() {
         // When one term's df dwarfs the rest, the OR count takes the
         // df-anchored path (`df(dominant) + |others \ dominant|`) instead

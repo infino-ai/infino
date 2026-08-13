@@ -1650,36 +1650,52 @@ fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
     let mut union = vec![0u64; words];
     let mut scratch = [0u32; BLOCK_LEN];
     for c in &cursors {
-        // Inline (df=1) cursors carry their single doc pre-decoded and have
-        // no postings bytes to slice.
-        if c.bytes.is_empty() {
-            for &d in &c.block_doc_ids[..c.block_n] {
-                union[(d >> 6) as usize] |= 1u64 << (d & 63);
-            }
-            continue;
+        or_cursor_into_bitset(&mut union, c, &mut scratch);
+    }
+    union.iter().map(|w| w.count_ones() as u64).sum()
+}
+
+/// OR one cursor's doc presence into `dest` (a doc-space bitset spanning at
+/// least the cursor's largest doc id), reading blocks at the byte level: a
+/// **BITSET** block is word-copied at its aligned base word — no expansion to
+/// doc ids; a **PACKED** block is decoded doc-ids-only (no tf) and scattered; an
+/// inline (df=1) cursor scatters its single pre-decoded doc. `scratch` is a
+/// reused `BLOCK_LEN` decode buffer. Shared by the union count
+/// ([`or_count_bitset`]) and the intersection count (`count_and_intersect_bitset`)
+/// so a common term's dense blocks are merged at memory bandwidth either way.
+pub(super) fn or_cursor_into_bitset(
+    dest: &mut [u64],
+    c: &TermCursor,
+    scratch: &mut [u32; BLOCK_LEN],
+) {
+    // Inline (df=1) cursors carry their single doc pre-decoded and have no
+    // postings bytes to slice.
+    if c.bytes.is_empty() {
+        for &d in &c.block_doc_ids[..c.block_n] {
+            dest[(d >> 6) as usize] |= 1u64 << (d & 63);
         }
-        for block in c.blocks.iter() {
-            let bytes = c.bytes.slice(block.block_byte_offset..block.block_byte_end);
-            let bytes = bytes.as_ref();
-            if bytes[posting::ENCODING_OFF] == ENCODING_BITSET {
-                // Word-OR the presence bitset in at its aligned base word.
-                // Tfs trail; the bitset is everything between them.
-                let base_word = read_u32_le(&bytes[4..8]) as usize / 64;
-                let tf_bits = bytes[2] as usize;
-                let tfs_size = BLOCK_LEN * tf_bits / 8;
-                let presence = &bytes[posting::HEADER_SIZE..bytes.len() - tfs_size];
-                for (i, chunk) in presence.chunks_exact(8).enumerate() {
-                    union[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
-                }
-            } else {
-                let n = decode_block_doc_ids(bytes, &mut scratch);
-                for &d in &scratch[..n] {
-                    union[(d >> 6) as usize] |= 1u64 << (d & 63);
-                }
+        return;
+    }
+    for block in c.blocks.iter() {
+        let bytes = c.bytes.slice(block.block_byte_offset..block.block_byte_end);
+        let bytes = bytes.as_ref();
+        if bytes[posting::ENCODING_OFF] == ENCODING_BITSET {
+            // Word-OR the presence bitset in at its aligned base word.
+            // Tfs trail; the bitset is everything between them.
+            let base_word = read_u32_le(&bytes[4..8]) as usize / 64;
+            let tf_bits = bytes[2] as usize;
+            let tfs_size = BLOCK_LEN * tf_bits / 8;
+            let presence = &bytes[posting::HEADER_SIZE..bytes.len() - tfs_size];
+            for (i, chunk) in presence.chunks_exact(8).enumerate() {
+                dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+            }
+        } else {
+            let n = decode_block_doc_ids(bytes, scratch);
+            for &d in &scratch[..n] {
+                dest[(d >> 6) as usize] |= 1u64 << (d & 63);
             }
         }
     }
-    union.iter().map(|w| w.count_ones() as u64).sum()
 }
 
 /// Pick the cursor whose df dominates the union, or `None` if no term is
