@@ -223,7 +223,9 @@ impl FtsReader {
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let cursors = self.build_term_cursors(column_id, tokens, None).await?;
+        let cursors = self
+            .build_term_cursors(column_id, tokens, None, true)
+            .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
         // +1: the build's dictionary fetch.
@@ -261,7 +263,9 @@ impl FtsReader {
         if tokens.is_empty() {
             return Ok((0, MatchWork::default()));
         }
-        let cursors = self.build_term_cursors(column_id, tokens, None).await?;
+        let cursors = self
+            .build_term_cursors(column_id, tokens, None, true)
+            .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += 1;
         let (n, walk_ns) = timed_section(|| match mode {

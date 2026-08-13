@@ -412,7 +412,7 @@ impl FtsReader {
             // Negatives are a hard exclusion filter, not scored, so their
             // idf is irrelevant — always build them with local stats.
             _ => Some(ExcludeFilter::new(
-                self.build_term_cursors(column_id, lists.negatives, None)
+                self.build_term_cursors(column_id, lists.negatives, None, false)
                     .await?,
             )),
         };
@@ -453,7 +453,7 @@ impl FtsReader {
 
         if lists.musts.is_empty() {
             let cursors = self
-                .build_term_cursors(column_id, lists.shoulds, lists.global_idf)
+                .build_term_cursors(column_id, lists.shoulds, lists.global_idf, false)
                 .await?;
             dict_ranges += 1;
             if cursors.is_empty() {
@@ -479,7 +479,7 @@ impl FtsReader {
         // Build must cursors; if any must is missing, the
         // intersection is empty.
         let must_cursors = self
-            .build_term_cursors(column_id, lists.musts, lists.global_idf)
+            .build_term_cursors(column_id, lists.musts, lists.global_idf, false)
             .await?;
         dict_ranges += 1;
         if must_cursors.len() != lists.musts.len() {
@@ -508,7 +508,7 @@ impl FtsReader {
         // Shoulds absent from this superfile contribute nothing;
         // when none survive, the walk is a plain must intersection.
         let should_cursors = self
-            .build_term_cursors(column_id, lists.shoulds, lists.global_idf)
+            .build_term_cursors(column_id, lists.shoulds, lists.global_idf, false)
             .await?;
         dict_ranges += 1;
         if should_cursors.is_empty() {
@@ -651,7 +651,7 @@ impl FtsReader {
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(column_id, terms, global_idf)
+            self.build_term_cursors(column_id, terms, global_idf, false)
                 .await?
         };
         Ok(OrCursorSet { column_id, cursors })
@@ -919,6 +919,7 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         global_idf: Option<&GlobalTermIdf>,
+        count_only: bool,
     ) -> Result<Vec<TermCursor>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
@@ -1015,6 +1016,7 @@ impl FtsReader {
                         col_meta.positions,
                         gidf,
                         header_probed,
+                        count_only,
                     )?);
                 }
             }
@@ -1369,7 +1371,7 @@ mod tests {
         ];
         let column_id = r.resolve_column_id("body").expect("column");
         let uniform_cursors = r
-            .build_term_cursors(column_id, shapes[0], None)
+            .build_term_cursors(column_id, shapes[0], None, false)
             .await
             .expect("cursors");
         assert!(
@@ -1377,7 +1379,7 @@ mod tests {
             "uniform shape must route to the windowed ranged branch"
         );
         let dominant_cursors = r
-            .build_term_cursors(column_id, shapes[1], None)
+            .build_term_cursors(column_id, shapes[1], None, false)
             .await
             .expect("cursors");
         assert!(

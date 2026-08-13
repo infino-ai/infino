@@ -181,34 +181,17 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
 /// - `dest_doc_ids.len() < BLOCK_LEN` or `dest_tfs.len() < BLOCK_LEN`.
 /// - Header reports `delta_bits > 32` or `tf_bits > 32`.
 pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]) -> usize {
-    assert!(
-        dest_doc_ids.len() >= BLOCK_LEN,
-        "decode_block: dest_doc_ids must have at least {BLOCK_LEN} slots"
-    );
+    let count = decode_block_doc_ids(bytes, dest_doc_ids);
+
+    // Term frequencies follow the packed deltas. The count paths skip
+    // this half (see `decode_block_doc_ids`); only scoring needs it.
     assert!(
         dest_tfs.len() >= BLOCK_LEN,
         "decode_block: dest_tfs must have at least {BLOCK_LEN} slots"
     );
-    assert!(
-        bytes.len() >= HEADER_SIZE,
-        "decode_block: bytes too short for header"
-    );
-
-    let count = bytes[0] as usize;
     let delta_bits = bytes[1];
     let tf_bits = bytes[2];
-    // bytes[3] = reserved, ignored.
-    assert!(
-        delta_bits <= 32,
-        "decode_block: delta_bits {delta_bits} > 32"
-    );
     assert!(tf_bits <= 32, "decode_block: tf_bits {tf_bits} > 32");
-    assert!(
-        count <= BLOCK_LEN,
-        "decode_block: doc_count {count} > BLOCK_LEN"
-    );
-    let base_doc_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-
     let deltas_size = BLOCK_LEN * delta_bits as usize / 8;
     let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
     assert!(
@@ -217,21 +200,58 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
         bytes.len(),
         HEADER_SIZE + deltas_size + tfs_size
     );
-
-    let bp = BitPacker4x::new();
-    let deltas_start = HEADER_SIZE;
-    bp.decompress_sorted(
-        base_doc_id,
-        &bytes[deltas_start..deltas_start + deltas_size],
-        &mut dest_doc_ids[..BLOCK_LEN],
-        delta_bits,
-    );
-
-    let tfs_start = deltas_start + deltas_size;
-    bp.decompress(
+    let tfs_start = HEADER_SIZE + deltas_size;
+    BitPacker4x::new().decompress(
         &bytes[tfs_start..tfs_start + tfs_size],
         &mut dest_tfs[..BLOCK_LEN],
         tf_bits,
+    );
+
+    count
+}
+
+/// Decode only the doc ids of a posting block, skipping the term-frequency
+/// half entirely. Unranked counts (union, intersection) never look at
+/// `tf` — they tally doc ids — so decoding + reading the packed tfs is
+/// pure waste there; this halves the per-block decode work on the count
+/// path. Returns the doc count. Shared by [`decode_block`], which appends
+/// the tf decode for the scoring path.
+pub fn decode_block_doc_ids(bytes: &[u8], dest_doc_ids: &mut [u32]) -> usize {
+    assert!(
+        dest_doc_ids.len() >= BLOCK_LEN,
+        "decode_block_doc_ids: dest_doc_ids must have at least {BLOCK_LEN} slots"
+    );
+    assert!(
+        bytes.len() >= HEADER_SIZE,
+        "decode_block_doc_ids: bytes too short for header"
+    );
+
+    let count = bytes[0] as usize;
+    let delta_bits = bytes[1];
+    // bytes[2] = tf_bits (unused here), bytes[3] = reserved.
+    assert!(
+        delta_bits <= 32,
+        "decode_block_doc_ids: delta_bits {delta_bits} > 32"
+    );
+    assert!(
+        count <= BLOCK_LEN,
+        "decode_block_doc_ids: doc_count {count} > BLOCK_LEN"
+    );
+    let base_doc_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+
+    let deltas_size = BLOCK_LEN * delta_bits as usize / 8;
+    assert!(
+        bytes.len() >= HEADER_SIZE + deltas_size,
+        "decode_block_doc_ids: bytes ({}) shorter than header+deltas ({})",
+        bytes.len(),
+        HEADER_SIZE + deltas_size
+    );
+
+    BitPacker4x::new().decompress_sorted(
+        base_doc_id,
+        &bytes[HEADER_SIZE..HEADER_SIZE + deltas_size],
+        &mut dest_doc_ids[..BLOCK_LEN],
+        delta_bits,
     );
 
     count

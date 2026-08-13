@@ -1481,7 +1481,9 @@ impl FtsReader {
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let cursors = self.build_term_cursors(column_id, terms, None).await?;
+        let cursors = self
+            .build_term_cursors(column_id, terms, None, false)
+            .await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
@@ -1727,7 +1729,7 @@ mod tests {
         let col = r.resolve_column_id("body").expect("col");
         let uniform_terms: &[&str] = &["zeta", "eta", "theta"];
         let uniform_cursors = r
-            .build_term_cursors(col, uniform_terms, None)
+            .build_term_cursors(col, uniform_terms, None, false)
             .await
             .expect("uniform cursors");
         assert!(
@@ -1795,11 +1797,11 @@ mod tests {
         for terms in shapes {
             for k in [1usize, 5, 50, 128] {
                 let cw = r
-                    .build_term_cursors(col, terms, None)
+                    .build_term_cursors(col, terms, None, false)
                     .await
                     .expect("cursors");
                 let cb = r
-                    .build_term_cursors(col, terms, None)
+                    .build_term_cursors(col, terms, None, false)
                     .await
                     .expect("cursors");
                 let wand = r.run_wand_bmw(col, cw, k).expect("wand");
@@ -1844,7 +1846,7 @@ mod tests {
 
         // common (df≈N) + rare (df≈N/200): ratio 200 ≥ 16 → anchor.
         let anchored = r
-            .build_term_cursors(col, &["common", "rare"], None)
+            .build_term_cursors(col, &["common", "rare"], None, false)
             .await
             .expect("cursors");
         assert!(
@@ -1853,7 +1855,7 @@ mod tests {
         );
         // common (df≈N) + frequent (df≈N/2): ratio 2 < 16 → no anchor.
         let uniform = r
-            .build_term_cursors(col, &["common", "frequent"], None)
+            .build_term_cursors(col, &["common", "frequent"], None, false)
             .await
             .expect("cursors");
         assert!(
@@ -1962,14 +1964,14 @@ mod tests {
         for (pos, neg) in cases {
             for k in [1usize, 5, 50] {
                 let mut wf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None)
+                    r.build_term_cursors(col, neg, None, false)
                         .await
                         .expect("neg cursors"),
                 );
                 let win = r
                     .run_windowed_union(
                         col,
-                        r.build_term_cursors(col, pos, None)
+                        r.build_term_cursors(col, pos, None, false)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -1980,14 +1982,14 @@ mod tests {
                     )
                     .expect("windowed");
                 let mut bf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None)
+                    r.build_term_cursors(col, neg, None, false)
                         .await
                         .expect("neg cursors"),
                 );
                 let bmm = r
                     .run_max_score_bmm(
                         col,
-                        r.build_term_cursors(col, pos, None)
+                        r.build_term_cursors(col, pos, None, false)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -2017,7 +2019,9 @@ mod tests {
         let unfiltered = r
             .run_windowed_union(
                 col,
-                r.build_term_cursors(col, pos, None).await.expect("pos"),
+                r.build_term_cursors(col, pos, None, false)
+                    .await
+                    .expect("pos"),
                 N_DOCS as usize,
                 None,
                 f32::NEG_INFINITY,
@@ -2025,11 +2029,17 @@ mod tests {
                 u32::MAX,
             )
             .expect("unfiltered");
-        let mut f = ExcludeFilter::new(r.build_term_cursors(col, neg, None).await.expect("neg"));
+        let mut f = ExcludeFilter::new(
+            r.build_term_cursors(col, neg, None, false)
+                .await
+                .expect("neg"),
+        );
         let filtered = r
             .run_windowed_union(
                 col,
-                r.build_term_cursors(col, pos, None).await.expect("pos"),
+                r.build_term_cursors(col, pos, None, false)
+                    .await
+                    .expect("pos"),
                 N_DOCS as usize,
                 Some(&mut f),
                 f32::NEG_INFINITY,

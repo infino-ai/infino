@@ -24,7 +24,7 @@ use crate::superfile::{
     fts::{
         bm25,
         builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
-        posting::{BLOCK_LEN, decode_block},
+        posting::{BLOCK_LEN, decode_block, decode_block_doc_ids},
     },
 };
 
@@ -342,6 +342,12 @@ pub(crate) struct TermCursor {
     /// so the build probed the 20-byte header before fetching the body
     /// — two planned byte-source ranges instead of one.
     pub(super) header_probed: bool,
+    /// Count-only cursor: `decode_current_block` skips the tf half of each
+    /// block (see [`decode_block_doc_ids`]). Set by the unranked count
+    /// kernels (union / intersection), which never read `block_tfs`;
+    /// leaves `block_tfs` stale, so a `count_only` cursor must not be used
+    /// for scoring.
+    pub(super) count_only: bool,
 }
 
 impl TermCursor {
@@ -356,6 +362,7 @@ impl TermCursor {
         positional: bool,
         global_idf: Option<f32>,
         header_probed: bool,
+        count_only: bool,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -418,6 +425,7 @@ impl TermCursor {
             inspect_block: 0,
             bytes: term_bytes,
             header_probed,
+            count_only,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -471,6 +479,9 @@ impl TermCursor {
             inspect_block: 0,
             bytes: Bytes::new(),
             header_probed: false,
+            // Inline cursors carry their single posting pre-decoded and
+            // never call `decode_current_block`, so the flag is inert.
+            count_only: false,
         }
     }
 
@@ -479,7 +490,12 @@ impl TermCursor {
         let bytes = self
             .bytes
             .slice(block.block_byte_offset..block.block_byte_end);
-        self.block_n = decode_block(&bytes, &mut self.block_doc_ids, &mut self.block_tfs);
+        // Count-only cursors skip the tf half of the block; the count
+        // kernels never read `block_tfs`, so it is left stale.
+        self.block_n = match self.count_only {
+            true => decode_block_doc_ids(&bytes, &mut self.block_doc_ids),
+            false => decode_block(&bytes, &mut self.block_doc_ids, &mut self.block_tfs),
+        };
         self.pos = 0;
     }
 

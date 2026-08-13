@@ -307,6 +307,17 @@ pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 /// windowed bitset, which is already faster when no term dominates.
 pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 8;
 
+/// Density gate for the full-bitset union count. When the terms' combined
+/// postings reach `1/N` of the doc-id space, OR them all into one
+/// doc-space bitset and popcount, instead of the per-window walk — a dense
+/// union (several common terms, e.g. a 3-4 word title) touches most of the
+/// corpus, so the bitset streams the doc ids into memory with no per-doc
+/// window bookkeeping. Below the gate the union is sparse and the windowed
+/// bitset — whose state stays L1-resident and needs no full-corpus alloc +
+/// popcount — is cheaper. Expressed as the divisor `N`: bitset when
+/// `total_df >= max_doc / N`.
+pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
+
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
 /// below this many terms. `pub(crate)`: the supertable fan-out reuses
@@ -1124,7 +1135,7 @@ impl FtsReader {
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
         for term in terms {
             let mut cursors = self
-                .build_term_cursors(column_id, &[term], global_idf)
+                .build_term_cursors(column_id, &[term], global_idf, false)
                 .await?;
             dict_ranges += 1;
             out.push(cursors.pop().map(AnyCursor::Term));
@@ -1136,7 +1147,7 @@ impl FtsReader {
             // per-member rescale ratio cancels out of the phrase's tf/length
             // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, global_idf)
+                .build_term_cursors(column_id, &member_refs, global_idf, false)
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1318,7 +1329,8 @@ impl FtsReader {
                     };
                     let mut pos_at = 0usize;
 
-                    let mut cursor = TermCursor::new(term_bytes, n_docs, positional, None, false)?;
+                    let mut cursor =
+                        TermCursor::new(term_bytes, n_docs, positional, None, false, false)?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
@@ -1555,6 +1567,20 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     if let Some(anchor) = dominant_anchor_index(&cursors) {
         return or_count_anchored(cursors, anchor);
     }
+    // Dense union (no dominant term, but the terms together cover a large
+    // fraction of the corpus — e.g. a 3-4 common-word title): OR all doc
+    // ids into one doc-space bitset and popcount. Avoids the per-window
+    // bookkeeping the walk below pays per doc.
+    let total_df: u64 = cursors.iter().map(|c| c.df).sum();
+    let max_doc = cursors
+        .iter()
+        .filter_map(|c| c.blocks.last())
+        .map(|b| b.last_doc_id)
+        .max()
+        .unwrap_or(0);
+    if total_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
+        return or_count_bitset(cursors, max_doc);
+    }
     let mut present = [0u64; OR_WINDOW_WORDS];
     let mut n = 0u64;
     loop {
@@ -1594,6 +1620,30 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         }
     }
     n
+}
+
+/// Disjunction cardinality via a full doc-space bitset: OR every cursor's
+/// doc ids into one bitset, then popcount. Block-bulk — a whole decoded
+/// block's ids are scattered in one tight loop — and the `count_only`
+/// cursors decode doc ids without their term frequencies, so this streams
+/// the postings into memory with no per-doc/per-window bookkeeping.
+/// Overlap between terms is deduplicated for free by the bitset OR. Called
+/// only for dense unions (see the gate in [`or_count_unranked`]); the
+/// full-corpus alloc + popcount would dominate on a sparse one.
+fn or_count_bitset(mut cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
+    let words = max_doc as usize / 64 + 1;
+    let mut bitset = vec![0u64; words];
+    for c in &mut cursors {
+        while !c.is_exhausted() {
+            // The current block is decoded (block 0 on build, later blocks
+            // on `advance_block`); `pos` is 0 at each block start.
+            for &d in &c.block_doc_ids[c.pos..c.block_n] {
+                bitset[(d >> 6) as usize] |= 1u64 << (d & 63);
+            }
+            c.advance_block();
+        }
+    }
+    bitset.iter().map(|w| w.count_ones() as u64).sum()
 }
 
 /// Pick the cursor whose df dominates the union, or `None` if no term is
