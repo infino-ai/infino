@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
+    superfile::vector::hnsw,
     supertable::manifest::{
         SuperfileEntry, VectorSummary,
         encoding::SummaryWireMode,
@@ -537,6 +538,97 @@ async fn write_blob_and_section(
     })
 }
 
+/// Content-address and PUT one `direct_data` graph section (the opaque
+/// bytes produced by `hnsw::encode_direct_data` for the data graph, or
+/// `Hnsw::to_bytes` for the centroid graph), returning its
+/// [`RoutingRef`]. A separate content-addressed object per section,
+/// exactly like the centroid section — the manifest carries the ref, GC
+/// retains it while referenced, and an identical rebuild is a no-op PUT.
+pub(crate) async fn write_graph_section(
+    storage: &dyn StorageProvider,
+    bytes: Vec<u8>,
+) -> Result<RoutingRef, SlowVectorStateError> {
+    let (uri, content_hash) = write_bytes(storage, bytes).await?;
+    Ok(RoutingRef { uri, content_hash })
+}
+
+/// Fetch a graph section written by [`write_graph_section`], verifying its
+/// bytes hash to `reference.content_hash`. Returns the raw section bytes
+/// (the caller decodes them with `hnsw::decode_direct_data` /
+/// `Hnsw::from_bytes`). Striped like every other slow-state fetch. Callers
+/// fall back to the lazy build / scan path on any error — a bad or missing
+/// graph blob must never fail an open or a query.
+pub(crate) async fn fetch_graph_section(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+) -> Result<Vec<u8>, SlowVectorStateError> {
+    let bytes = fetch_blob_striped(storage, &reference.uri, STRIPED_FETCH_CHUNK_BYTES).await?;
+    if ContentHash::of(bytes.as_ref()) != reference.content_hash {
+        return Err(SlowVectorStateError::HashMismatch);
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Read the `(population_key, high_water_id)` header from a graph section
+/// via a small range GET — no whole-object fetch, no hash verify (the
+/// header is self-identifying by magic). `None` when the ref is
+/// absent-shaped, the object is missing, or the header is bad. The settle
+/// path compares the key to the current population's to decide reuse vs
+/// (re)build, and uses the high-water id as the append-delta boundary for
+/// an incremental insert.
+pub(crate) async fn fetch_graph_header(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+) -> Option<(u64, i128)> {
+    let header = storage
+        .get_range(&reference.uri, 0..hnsw::GRAPH_BUNDLE_HEADER_BYTES as u64)
+        .await
+        .ok()?;
+    hnsw::graph_bundle_header(&header)
+}
+
+/// The graph sections of one published generation, decoded resident. Held
+/// on the table handle behind a single-slot cache keyed by `uri` (a new
+/// drain generation publishes a new URI and replaces it), mirroring
+/// [`CentroidSection`].
+///
+/// `data` is the self-contained per-row `direct_data` index (graph + Sq16
+/// plane + node→doc-id map), present only when the table was within the
+/// data-graph scale ceiling at drain. `centroid_graph` is the HNSW over the
+/// fp32 fine centroids (present at any scale); its node-ordered centroid
+/// vectors are read from the sibling [`CentroidSection`].
+pub(crate) struct ResidentGraphSections {
+    pub uri: String,
+    /// Largest stable doc id the graph covers (the append-delta boundary an
+    /// incremental drain inserts past).
+    pub high_water_id: i128,
+    pub data: Option<hnsw::DirectDataIndex>,
+    pub centroid_graph: Option<hnsw::Hnsw>,
+}
+
+/// Fetch + decode the combined graph bundle for one generation. A decode
+/// failure on a sub-section leaves that section `None` (the caller falls
+/// back) rather than failing the whole fetch — only a bad bundle frame or a
+/// hash mismatch is an error.
+pub(crate) async fn fetch_graph_sections(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+) -> Result<ResidentGraphSections, SlowVectorStateError> {
+    let raw = fetch_graph_section(storage, reference).await?;
+    let bundle = hnsw::decode_graph_bundle(&raw)
+        .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
+    let data = bundle
+        .data_bundle
+        .as_deref()
+        .and_then(hnsw::decode_direct_data);
+    Ok(ResidentGraphSections {
+        uri: reference.uri.clone(),
+        high_water_id: bundle.high_water_id,
+        data,
+        centroid_graph: hnsw::Hnsw::from_bytes(&bundle.centroid_graph),
+    })
+}
+
 /// Fetch the blob at `uri`, verify its bytes hash to `expected`, and decode.
 /// Callers fall back to manifest-part loading on any error — a bad blob must
 /// never fail a table open or a query.
@@ -803,6 +895,41 @@ mod tests {
             .await
             .expect("striped fetch");
         assert_eq!(striped, whole, "striped reassembly must be byte-exact");
+    }
+
+    /// A graph section round-trips through publish + fetch byte-exact, is a
+    /// no-op PUT on republish (hash-derived URI), and a tampered ref hash is
+    /// rejected so the caller falls back rather than trusting bad bytes.
+    #[tokio::test]
+    async fn graph_section_roundtrips_and_verifies_hash() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
+        // Opaque section bytes stand in for an encoded graph; this layer is
+        // format-agnostic (the encode/decode is tested in the hnsw module).
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 31) as u8).collect();
+
+        let reference = write_graph_section(&storage, bytes.clone())
+            .await
+            .expect("write graph section");
+        // Republish of identical bytes addresses the same object.
+        let again = write_graph_section(&storage, bytes.clone())
+            .await
+            .expect("republish");
+        assert_eq!(reference, again);
+
+        let fetched = fetch_graph_section(&storage, &reference)
+            .await
+            .expect("fetch graph section");
+        assert_eq!(fetched, bytes, "graph section must round-trip byte-exact");
+
+        let tampered = RoutingRef {
+            uri: reference.uri.clone(),
+            content_hash: ContentHash::of(b"different"),
+        };
+        let err = fetch_graph_section(&storage, &tampered)
+            .await
+            .expect_err("hash mismatch");
+        assert!(matches!(err, SlowVectorStateError::HashMismatch), "{err:?}");
     }
 
     #[tokio::test]

@@ -175,7 +175,7 @@ vector:
   #                          the grid, cell selection, and disk reads. The graph
   #                          and its node->doc_id map are built once on the first
   #                          direct_data query and held resident; search walks it
-  #                          at direct_data_ef. The whole index must fit in RAM.
+  #                          at a k-scaled ef. The whole index must fit in RAM.
   routing: stamped
 
   # For routing = global_fine_centroid: the NUMBER of fine clusters the
@@ -195,11 +195,15 @@ vector:
   # within each cell into contiguous reads. Ignored under routing = stamped.
   global_fine_coalesce: false
 
-  # For routing = direct_data: the ef beam width the resident HNSW graph is
-  # searched at — the recall/latency dial. Higher widens the beam: more
-  # recall, more per-query work. 128 ~ 0.97 recall@10 on Cohere-1M; drop to
-  # 64 for ~0.95 at lower latency. Ignored under any other routing.
-  direct_data_ef: 128
+  # For routing = direct_data: the search ef is scaled from k as
+  #   ef = max(k, clamp(k * ef_mult, ef_floor, ef_ceil))    # all integer
+  # ef_floor is the minimum beam width and the effective ef at the k=10
+  # anchor (10*10=100 clamps up to 128 ~ 0.97 recall@10 on Cohere-1M).
+  # ef_mult (integer >= 1) scales the beam with k; ef_ceil caps it at large
+  # k. Ignored under any other routing.
+  direct_data_ef_floor: 128
+  direct_data_ef_mult: 10
+  direct_data_ef_ceil: 512
 
   # For routing = direct_data: the ef_construction beam used to BUILD the
   # resident HNSW (build-time only, not per query). Higher = better-connected
@@ -207,6 +211,13 @@ vector:
   # linearly higher one-time build cost and NO extra resident memory. 200 is
   # the sweet spot for recall ~0.93-0.95; raise it only to push the >0.97 end.
   direct_data_ef_construction: 200
+
+  # For routing = direct_data: scale ceiling for the per-row DATA graph. The
+  # resident data HNSW is built at drain and persisted only when the table's
+  # doc count is at or below this; above it, only the (much smaller) centroid
+  # graph is built and direct_data queries fall back to the scan path. ~10M
+  # rows of Sq16 codes is the practical single-host resident ceiling.
+  direct_data_max_docs: 10000000
 
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.

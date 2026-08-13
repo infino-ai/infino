@@ -7567,6 +7567,196 @@ async fn previous_centroid_section(
     }
 }
 
+/// One-`u64` population key for the persisted `direct_data` graph — a
+/// digest of *which rows exist*, independent of how they are packed into
+/// superfiles. Built from repack-invariant aggregates (row count, min and
+/// max stable id) plus the consolidated delete generation (the manifest's
+/// deleted-id bytes), so:
+///   - a compaction that only repacks the same rows keeps the key stable →
+///     the settle reuses the existing graph (no rebuild);
+///   - any add or delete moves the key → rebuild.
+/// It stays one value (not per-node) and does not assume monotonic ids:
+/// min, max, and count together move under non-monotonic inserts and
+/// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
+/// correctness — the copy-flip and query-time doc-id dedup are the
+/// correctness guards.
+fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
+    let entries = manifest.get_all_superfiles();
+    let count: u64 = entries.iter().map(|e| e.n_docs).sum();
+    let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
+    let max_id = entries.iter().map(|e| e.id_max).max().unwrap_or(0);
+    // FNV-1a: deterministic across processes (unlike the std hasher), so a
+    // key recomputed at open matches one persisted at drain.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(&count.to_le_bytes());
+    mix(&min_id.to_le_bytes());
+    mix(&max_id.to_le_bytes());
+    if let Some(deleted) = manifest.deleted_user_ids_inline() {
+        mix(deleted);
+    }
+    h
+}
+
+/// Encode + PUT a data bundle as a graph section, logging the outcome.
+async fn publish_direct_data_blob(
+    storage: &dyn StorageProvider,
+    population_key: u64,
+    high_water: i128,
+    data_bundle: &[u8],
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let blob = crate::superfile::vector::hnsw::encode_graph_bundle(
+        population_key,
+        high_water,
+        &[],
+        Some(data_bundle),
+    );
+    let blob_mib = blob.len() / (1024 * 1024);
+    match slow_vector_state::write_graph_section(storage, blob).await {
+        Ok(reference) => {
+            eprintln!(
+                "[supertable direct_data] published graph section: {} ({blob_mib} MiB)",
+                reference.uri
+            );
+            Some(reference)
+        }
+        Err(error) => {
+            eprintln!("[supertable direct_data] publish failed: {error}");
+            None
+        }
+    }
+}
+
+/// Build and publish the persisted `direct_data` graph blob for a settled
+/// generation, returning its manifest ref (`None` when nothing is
+/// persisted). Best-effort: any read/build/publish problem logs and
+/// returns `None` so the drain stamp is never blocked and the query falls
+/// back to the lazy build or scan path.
+///
+/// When the prior generation already persisted a graph and this settle only
+/// **appended** rows, the delta is inserted into a copy of that graph
+/// ([`assemble_direct_data_incremental`]) — work ∝ new rows, not the whole
+/// corpus. Otherwise (no prior graph, or a non-append change) it does a full
+/// rebuild. PUT-before-CAS: the blob is durable before the caller stamps the
+/// manifest ref, so a crash before the manifest CAS just orphans the blob
+/// (GC-reclaimed) and keeps serving the prior generation.
+///
+/// Scope: the per-row **data** graph for the first vector column, gated by
+/// `vector.direct_data_max_docs`. The scale-free **centroid** graph is not
+/// yet built here — the bundle carries an empty centroid section.
+async fn build_direct_data_graph_ref(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let Some(column) = manifest
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())
+    else {
+        eprintln!("[supertable direct_data] build skipped: no vector columns on this manifest");
+        return None;
+    };
+    let total_docs: u64 = manifest.get_all_superfiles().iter().map(|e| e.n_docs).sum();
+    let max_docs = crate::config::global().vector.direct_data_max_docs;
+    eprintln!(
+        "[supertable direct_data] build hook: column={column} total_docs={total_docs} \
+         max_docs={max_docs} superfiles={}",
+        manifest.get_all_superfiles().len(),
+    );
+    if total_docs > max_docs {
+        eprintln!(
+            "[supertable direct_data] build skipped: {total_docs} docs > direct_data_max_docs \
+             {max_docs} (data graph would exceed RAM)"
+        );
+        return None;
+    }
+    let population_key = graph_population_key(manifest);
+    let high_water_now = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.id_max)
+        .max()
+        .unwrap_or(0);
+    let t0 = std::time::Instant::now();
+
+    // Incremental append: extend the prior persisted graph with only the new
+    // rows, cloning it (fetch + decode) rather than mutating a serving graph.
+    if let Some(prior_ref) = manifest.slow_vector_state_graphs_blob()
+        && let Ok(sections) = slow_vector_state::fetch_graph_sections(storage, prior_ref).await
+        && let Some(prior_data) = sections.data
+    {
+        let prior_count = prior_data.doc_ids.len();
+        match crate::supertable::query::vector::assemble_direct_data_incremental(
+            manifest,
+            &column,
+            &None,
+            prior_data,
+            sections.high_water_id,
+        )
+        .await
+        {
+            Ok(Some((data_bundle, new_high_water, inserted))) => {
+                eprintln!(
+                    "[supertable direct_data] incremental: inserted {inserted} nodes into prior \
+                     graph ({prior_count} -> {} nodes), data_bundle={} MiB, wall {:.1}s",
+                    prior_count + inserted,
+                    data_bundle.len() / (1024 * 1024),
+                    t0.elapsed().as_secs_f64(),
+                );
+                return publish_direct_data_blob(
+                    storage,
+                    population_key,
+                    new_high_water,
+                    &data_bundle,
+                )
+                .await;
+            }
+            Ok(None) => {
+                eprintln!(
+                    "[supertable direct_data] incremental not applicable (not a pure append); \
+                     full rebuild"
+                );
+            }
+            Err(error) => {
+                eprintln!("[supertable direct_data] incremental error ({error}); full rebuild");
+            }
+        }
+    }
+
+    // Full rebuild.
+    let data_bundle = match crate::supertable::query::vector::assemble_direct_data_sections(
+        manifest, &column, &None,
+    )
+    .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => {
+            eprintln!(
+                "[supertable direct_data] build skipped: no Sq16 rows assembled for column \
+                 `{column}` (column absent, not sq16, or empty)"
+            );
+            return None;
+        }
+        Err(error) => {
+            eprintln!("[supertable direct_data] build skipped: assemble error: {error}");
+            return None;
+        }
+    };
+    eprintln!(
+        "[supertable direct_data] built graph (full): ~{total_docs} rows, data_bundle={} MiB, \
+         wall {:.1}s",
+        data_bundle.len() / (1024 * 1024),
+        t0.elapsed().as_secs_f64(),
+    );
+    publish_direct_data_blob(storage, population_key, high_water_now, &data_bundle).await
+}
+
 pub(in crate::supertable) async fn stamp_slow_vector_state(
     inner: &SupertableInner,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
@@ -7587,8 +7777,9 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         };
         let entries = old.get_all_superfiles();
         if entries.is_empty() && pending_drain.is_none() {
-            // Nothing to describe (pre-drain / empty table); the ref is
-            // already absent because `update` never carries it forward.
+            // Nothing to describe (pre-drain / empty table): no routing blob
+            // or centroid section to stamp, and a never-drained table has no
+            // graph ref either.
             return Ok(());
         }
         // Carried-forward entries are stripped (routing-shaped hydration);
@@ -7615,16 +7806,62 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             }
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
+        // A settled generation still needs its `direct_data` graphs built
+        // whenever the graph ref is absent — even if the routing blob and
+        // centroid section are byte-identical to what is already stamped
+        // (the membership commit publishes those first, so the post-drain
+        // refresh finds them unchanged). Without this the no-op below would
+        // return before the graph is ever built.
+        // Resolve the `direct_data` graph ref for this stamp.
+        //
+        //  - Mid-drain checkpoint (`pending_drain.is_some()`): carry the
+        //    prior ref forward untouched; the rebuild happens at the final
+        //    settle when membership stops moving.
+        //  - Settled: reuse the prior graph iff it already covers this exact
+        //    doc-id population (a packing-only change — e.g. a compaction
+        //    that repacked the same rows), keyed on `(high-water id, count)`;
+        //    otherwise (re)build. Reuse is what makes a repack settle a no-op
+        //    instead of a second full rebuild.
+        let prior_graph = old.slow_vector_state_graphs_blob().cloned();
+        let graphs_ref = if pending_drain.is_some() {
+            prior_graph.clone()
+        } else {
+            let current_key = graph_population_key(&old);
+            let prior_key = match prior_graph.as_ref() {
+                Some(reference) => {
+                    slow_vector_state::fetch_graph_header(storage.as_ref(), reference)
+                        .await
+                        .map(|(key, _)| key)
+                }
+                None => None,
+            };
+            if prior_key == Some(current_key) {
+                eprintln!(
+                    "[supertable direct_data] reuse: population key {current_key:#x} unchanged; \
+                     keeping {}",
+                    prior_graph.as_ref().map(|r| r.uri.as_str()).unwrap_or(""),
+                );
+                prior_graph.clone()
+            } else {
+                build_direct_data_graph_ref(storage.as_ref(), &old).await
+            }
+        };
+        // No-op only when NOTHING changed — routing blob, centroid section,
+        // and the resolved graph ref all already stamped.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
+            && old.slow_vector_state_graphs_blob() == graphs_ref.as_ref()
         {
-            // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest =
-            old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
+        let new_manifest = old.with_slow_vector_state(
+            published.uri,
+            published.content_hash,
+            published.centroids,
+            graphs_ref,
+        );
         let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
@@ -8166,6 +8403,10 @@ pub(crate) async fn try_commit_attempt(
                     ManifestLoadError::SlowStateHydration(e.to_string()),
                 ))
             })?;
+            // Membership-commit path: the graph ref is left as `update`
+            // carried it forward (the settle's `stamp_slow_vector_state` pass
+            // keys on the doc-id population to reuse or rebuild it); the
+            // membership commit itself never touches it.
             new_manifest = new_manifest.with_slow_vector_state_ref(
                 published.uri,
                 published.content_hash,

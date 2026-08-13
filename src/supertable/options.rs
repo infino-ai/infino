@@ -73,7 +73,7 @@ use crate::{
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
-        slow_vector_state::CentroidSection,
+        slow_vector_state::{CentroidSection, ResidentGraphSections},
     },
 };
 
@@ -409,6 +409,12 @@ pub struct SupertableOptions {
     /// it). Serves the stripped-summary admit rescore from a local
     /// temp-file spill instead of per-cell object-store reads.
     pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
+    /// Single-slot cache for the slow-CAS graph sections (the persisted
+    /// `direct_data` data + centroid HNSW graphs), shared by every manifest
+    /// snapshot of this handle and keyed by the section's content-addressed
+    /// URI. Serves the resident graph walk without rebuilding at query time;
+    /// a new drain generation publishes a new URI and replaces it.
+    pub(crate) graph_sections_cache: Arc<TokioMutex<Option<Arc<ResidentGraphSections>>>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar
     /// projection over gapped user superfiles, so a hit resolves in O(k) after
     /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
@@ -714,6 +720,7 @@ impl SupertableOptions {
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
+            graph_sections_cache: Arc::new(TokioMutex::new(None)),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,

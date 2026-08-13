@@ -122,6 +122,13 @@ impl Sq16Scorer {
         Self { codes, dim, len }
     }
 
+    /// The raw node-ordered Sq16 code plane — so an incremental build can
+    /// concatenate the prior codes with a freshly-drained delta into one
+    /// combined scorer.
+    pub(crate) fn codes(&self) -> &[u8] {
+        &self.codes
+    }
+
     #[inline]
     fn row(&self, node: u32) -> &[u8] {
         let stride = self.dim * 2;
@@ -428,6 +435,80 @@ impl Hnsw {
         }
     }
 
+    /// Extend an existing graph with newly-appended nodes WITHOUT rebuilding
+    /// it: seed a mutable [`ParBuild`] from this graph's adjacency + entry
+    /// point, assign the new nodes their (seeded, deterministic) levels, and
+    /// insert ONLY nodes `[self.len(), scorer.len())` concurrently. `scorer`
+    /// must cover all `scorer.len()` nodes — the prior code plane followed by
+    /// the appended delta. Work is ∝ the number of new nodes, not the whole
+    /// corpus, so an append updates the graph in seconds where a rebuild
+    /// takes minutes.
+    ///
+    /// Node levels use the same seeded [`assign_level`] as [`build`], so node
+    /// `k` lands on the same layer whether it arrives in a fresh build or an
+    /// incremental one. The prior nodes' adjacency is preserved as-is and
+    /// grows only where a new node links back into it (bounded by the reverse
+    /// -link cap + heuristic shrink).
+    pub(crate) fn extend<S: NodeScorer + Sync>(self, scorer: &S, params: HnswParams) -> Hnsw {
+        let prior = self.len;
+        let total = scorer.len();
+        if total <= prior {
+            return self;
+        }
+        let prior_entry = self.entry;
+        let ml = 1.0 / (params.m.max(2) as f64).ln();
+
+        // Prior levels kept; new nodes get their seeded levels.
+        let mut node_level = self.node_level;
+        node_level.reserve(total - prior);
+        for node in prior..total {
+            node_level.push(assign_level(params.seed, node as u32, ml));
+        }
+
+        // Seed adjacency: move the prior lists in, give new nodes empty ones.
+        let mut adj: Vec<Mutex<Vec<Vec<u32>>>> = Vec::with_capacity(total);
+        for lists in self.neighbors {
+            adj.push(Mutex::new(lists));
+        }
+        for &lvl in &node_level[prior..] {
+            adj.push(Mutex::new(vec![Vec::new(); lvl as usize + 1]));
+        }
+
+        let entry_top = node_level[prior_entry as usize];
+        let builder = ParBuild {
+            adj,
+            node_level,
+            entry: RwLock::new(EntryState {
+                node: prior_entry,
+                top_level: entry_top,
+            }),
+            m: params.m,
+            m0: params.m0,
+            ef_construction: params.ef_construction,
+        };
+
+        (prior as u32..total as u32).into_par_iter().for_each_init(
+            || VisitedSet::new(total),
+            |visited, node| builder.insert(scorer, node, visited),
+        );
+
+        let entry = builder.entry.into_inner().unwrap().node;
+        let neighbors: Vec<Vec<Vec<u32>>> = builder
+            .adj
+            .into_iter()
+            .map(|m| m.into_inner().unwrap())
+            .collect();
+        Hnsw {
+            neighbors,
+            node_level: builder.node_level,
+            entry,
+            m: params.m,
+            m0: params.m0,
+            ef_construction: params.ef_construction,
+            len: total,
+        }
+    }
+
     /// Walk greedily downhill at `level` from `entry`, hopping to the
     /// nearest improving neighbor until none is closer.
     fn greedy_nearest<S: NodeScorer>(
@@ -547,6 +628,362 @@ impl Hnsw {
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
+
+/// Sentinel filling unused fixed-stride layer-0 adjacency slots. Node ids
+/// are `< n <= u32::MAX`, so this never collides with a real id.
+const ADJ_SENTINEL: u32 = u32::MAX;
+
+/// On-disk magic for a serialized [`Hnsw`] graph section.
+const HNSW_GRAPH_MAGIC: &[u8; 8] = b"INFHNSW1";
+
+// ---------------- graph serialization ----------------
+//
+// A little cursor over a byte slice: every read is bounds-checked and
+// returns `None` on underrun, so a truncated or corrupt section decodes to
+// `None` and the caller falls back rather than panicking.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn i128(&mut self) -> Option<i128> {
+        Some(i128::from_le_bytes(self.take(16)?.try_into().ok()?))
+    }
+}
+
+impl Hnsw {
+    /// Serialize the graph to a self-describing byte section: a small
+    /// header, the per-node top level, the layer-0 adjacency at a **fixed
+    /// `M0` stride** (unused slots filled with [`ADJ_SENTINEL`] — the bulk
+    /// of the bytes, laid out for `base + node*M0*4` addressing), then the
+    /// sparse upper-layer lists (few nodes reach level ≥ 1). Paired with
+    /// [`from_bytes`](Self::from_bytes).
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let n = self.len;
+        let m0 = self.m0.max(1);
+        let mut out = Vec::with_capacity(48 + n * (4 + m0 * 4));
+        out.extend_from_slice(HNSW_GRAPH_MAGIC);
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+        out.extend_from_slice(&(self.m as u32).to_le_bytes());
+        out.extend_from_slice(&(self.m0 as u32).to_le_bytes());
+        out.extend_from_slice(&(self.ef_construction as u32).to_le_bytes());
+        out.extend_from_slice(&self.entry.to_le_bytes());
+
+        for &lvl in &self.node_level {
+            out.extend_from_slice(&lvl.to_le_bytes());
+        }
+        // Layer 0, fixed stride m0.
+        for node in 0..n {
+            let l0 = &self.neighbors[node][0];
+            for slot in 0..m0 {
+                let id = l0.get(slot).copied().unwrap_or(ADJ_SENTINEL);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+        // Upper layers: [count u64] then (node u32, level u32, len u32, ids…).
+        let mut upper: Vec<u8> = Vec::new();
+        let mut upper_records: u64 = 0;
+        for node in 0..n {
+            let levels = self.neighbors[node].len();
+            for level in 1..levels {
+                let list = &self.neighbors[node][level];
+                upper.extend_from_slice(&(node as u32).to_le_bytes());
+                upper.extend_from_slice(&(level as u32).to_le_bytes());
+                upper.extend_from_slice(&(list.len() as u32).to_le_bytes());
+                for &id in list {
+                    upper.extend_from_slice(&id.to_le_bytes());
+                }
+                upper_records += 1;
+            }
+        }
+        out.extend_from_slice(&upper_records.to_le_bytes());
+        out.extend_from_slice(&upper);
+        out
+    }
+
+    /// Reconstruct a graph from [`to_bytes`](Self::to_bytes). Returns `None`
+    /// on a bad magic, truncation, or an out-of-range node id, so a corrupt
+    /// section degrades to a fallback rather than a panic.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Hnsw> {
+        let mut c = Cursor::new(bytes);
+        if c.take(HNSW_GRAPH_MAGIC.len())? != HNSW_GRAPH_MAGIC {
+            return None;
+        }
+        let n = c.u64()? as usize;
+        let m = c.u32()? as usize;
+        let m0 = c.u32()? as usize;
+        let ef_construction = c.u32()? as usize;
+        let entry = c.u32()?;
+        if n == 0 || entry as usize >= n || m0 == 0 {
+            return None;
+        }
+        let mut node_level = Vec::with_capacity(n);
+        for _ in 0..n {
+            node_level.push(c.u32()?);
+        }
+        // Allocate per-node adjacency sized by its top level.
+        let mut neighbors: Vec<Vec<Vec<u32>>> = node_level
+            .iter()
+            .map(|&lvl| vec![Vec::new(); lvl as usize + 1])
+            .collect();
+        // Layer 0, fixed stride m0.
+        for node in 0..n {
+            let mut l0 = Vec::with_capacity(m0);
+            for _ in 0..m0 {
+                let id = c.u32()?;
+                if id != ADJ_SENTINEL {
+                    if id as usize >= n {
+                        return None;
+                    }
+                    l0.push(id);
+                }
+            }
+            neighbors[node][0] = l0;
+        }
+        // Upper layers.
+        let records = c.u64()?;
+        for _ in 0..records {
+            let node = c.u32()? as usize;
+            let level = c.u32()? as usize;
+            let len = c.u32()? as usize;
+            if node >= n || level >= neighbors[node].len() {
+                return None;
+            }
+            let mut list = Vec::with_capacity(len);
+            for _ in 0..len {
+                let id = c.u32()?;
+                if id as usize >= n {
+                    return None;
+                }
+                list.push(id);
+            }
+            neighbors[node][level] = list;
+        }
+        Some(Hnsw {
+            neighbors,
+            node_level,
+            entry,
+            m,
+            m0,
+            ef_construction,
+            len: n,
+        })
+    }
+}
+
+/// On-disk magic for a persisted `direct_data` bundle (graph + node→doc-id
+/// map + node-ordered Sq16 plane), the self-contained payload a resident
+/// data index is rebuilt from at open.
+const DIRECT_DATA_MAGIC: &[u8; 8] = b"INFDDG01";
+
+/// A `direct_data` resident index rebuilt from a persisted bundle: the Sq16
+/// scorer over the node-ordered code plane, the walkable graph, and the
+/// `node_index -> stable doc id` map.
+pub(crate) struct DirectDataIndex {
+    pub scorer: Sq16Scorer,
+    pub graph: Hnsw,
+    pub doc_ids: Vec<i128>,
+    pub dim: usize,
+}
+
+/// Serialize a `direct_data` index to a persistable byte bundle: header,
+/// the `node -> stable doc id` map, the node-ordered Sq16 code plane, and
+/// the graph section. The Sq16 plane is carried inline so the bundle is
+/// self-contained — reopening needs nothing but these bytes.
+pub(crate) fn encode_direct_data(
+    sq16_codes: &[u8],
+    doc_ids: &[i128],
+    graph: &Hnsw,
+    dim: usize,
+) -> Vec<u8> {
+    let n = doc_ids.len();
+    debug_assert_eq!(sq16_codes.len(), n * dim * 2);
+    let graph_bytes = graph.to_bytes();
+    let mut out = Vec::with_capacity(32 + n * 16 + sq16_codes.len() + graph_bytes.len());
+    out.extend_from_slice(DIRECT_DATA_MAGIC);
+    out.extend_from_slice(&(n as u64).to_le_bytes());
+    out.extend_from_slice(&(dim as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]); // reserved / alignment
+    for &id in doc_ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out.extend_from_slice(sq16_codes);
+    out.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(&graph_bytes);
+    out
+}
+
+/// Rebuild a resident [`DirectDataIndex`] from [`encode_direct_data`].
+/// Returns `None` on any malformation so the caller falls back to the lazy
+/// build or scan path rather than failing the query.
+pub(crate) fn decode_direct_data(bytes: &[u8]) -> Option<DirectDataIndex> {
+    let mut c = Cursor::new(bytes);
+    if c.take(DIRECT_DATA_MAGIC.len())? != DIRECT_DATA_MAGIC {
+        return None;
+    }
+    let n = c.u64()? as usize;
+    let dim = c.u32()? as usize;
+    c.take(4)?; // reserved
+    if dim == 0 {
+        return None;
+    }
+    let mut doc_ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        doc_ids.push(c.i128()?);
+    }
+    let plane = c.take(n.checked_mul(dim)?.checked_mul(2)?)?.to_vec();
+    let graph_len = c.u64()? as usize;
+    let graph_bytes = c.take(graph_len)?;
+    let graph = Hnsw::from_bytes(graph_bytes)?;
+    if graph.len() != n {
+        return None;
+    }
+    let scorer = Sq16Scorer::from_codes(plane, dim, n);
+    Some(DirectDataIndex {
+        scorer,
+        graph,
+        doc_ids,
+        dim,
+    })
+}
+
+/// On-disk magic for the combined graph bundle (one slow-state section
+/// object holding the centroid graph and, at ≤ N scale, the data bundle).
+const GRAPH_BUNDLE_MAGIC: &[u8; 8] = b"INFVGB01";
+
+/// Fixed byte offset of the population key inside a graph bundle: right
+/// after the 8-byte magic. One `u64` digest of the live doc-id population
+/// the graph covers (repack-invariant, delete-sensitive — computed by the
+/// supertable layer).
+const GRAPH_BUNDLE_KEY_OFF: usize = GRAPH_BUNDLE_MAGIC.len();
+/// Fixed byte offset of the high-water stable id: right after the key. The
+/// largest doc id the graph covers, so the next drain knows where the
+/// append delta starts (`stable_id > high_water`) for an incremental
+/// insert instead of a full rebuild.
+const GRAPH_BUNDLE_HIGH_WATER_OFF: usize = GRAPH_BUNDLE_KEY_OFF + 8;
+/// Byte length of the header a settle read needs: magic + key(u64) +
+/// high-water(i128). A single small range GET recovers both without
+/// fetching the multi-GiB body.
+pub(crate) const GRAPH_BUNDLE_HEADER_BYTES: usize = GRAPH_BUNDLE_MAGIC.len() + 8 + 16;
+
+/// The graph sections carried in one slow-state blob, as raw bytes, plus
+/// the population key and high-water id they cover. `centroid_graph` is a
+/// bare [`Hnsw::to_bytes`] over the fp32 fine centroids (present at any
+/// scale). `data_bundle` is an [`encode_direct_data`] payload (graph +
+/// Sq16 plane + node→stable-doc-id map), present only when the table's doc
+/// count is within the data-graph scale ceiling. Full-projection queries
+/// resolve each hit's stable id to its live `(superfile, local)` through
+/// the engine's existing id→placement resolver, so no per-node physical
+/// provenance is baked in (which would go stale on a compaction repack).
+pub(crate) struct GraphBundle {
+    /// One `u64` digest of the covered doc-id population (opaque here; the
+    /// supertable layer defines it).
+    pub population_key: u64,
+    /// Largest stable doc id the graph covers (the append-delta boundary).
+    pub high_water_id: i128,
+    pub centroid_graph: Vec<u8>,
+    pub data_bundle: Option<Vec<u8>>,
+}
+
+/// Read the `(population_key, high_water_id)` header from a bundle's first
+/// [`GRAPH_BUNDLE_HEADER_BYTES`] bytes. `None` on a bad magic or a short
+/// read. Lets the settle path key on the covered population — and find the
+/// append boundary — via a tiny range GET instead of the whole object.
+pub(crate) fn graph_bundle_header(header: &[u8]) -> Option<(u64, i128)> {
+    if header.len() < GRAPH_BUNDLE_HEADER_BYTES
+        || &header[..GRAPH_BUNDLE_MAGIC.len()] != GRAPH_BUNDLE_MAGIC
+    {
+        return None;
+    }
+    let key = u64::from_le_bytes(
+        header[GRAPH_BUNDLE_KEY_OFF..GRAPH_BUNDLE_KEY_OFF + 8]
+            .try_into()
+            .ok()?,
+    );
+    let high_water = i128::from_le_bytes(
+        header[GRAPH_BUNDLE_HIGH_WATER_OFF..GRAPH_BUNDLE_HIGH_WATER_OFF + 16]
+            .try_into()
+            .ok()?,
+    );
+    Some((key, high_water))
+}
+
+/// Length-prefixed opaque section (`0` len flag when absent).
+fn put_opt_section(out: &mut Vec<u8>, section: Option<&[u8]>) {
+    match section {
+        Some(bytes) => {
+            out.push(1);
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        None => out.push(0),
+    }
+}
+
+fn take_opt_section(c: &mut Cursor<'_>) -> Option<Option<Vec<u8>>> {
+    if c.take(1)?[0] == 0 {
+        return Some(None);
+    }
+    let len = c.u64()? as usize;
+    Some(Some(c.take(len)?.to_vec()))
+}
+
+/// Frame the graph sections into one slow-state blob, stamping the
+/// `(high_water_id, count)` watermark into the fixed-offset header. The
+/// data bundle and its provenance are omitted (a `0` flag) above the
+/// data-graph scale ceiling.
+pub(crate) fn encode_graph_bundle(
+    population_key: u64,
+    high_water_id: i128,
+    centroid_graph: &[u8],
+    data_bundle: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(GRAPH_BUNDLE_HEADER_BYTES + 16 + centroid_graph.len());
+    out.extend_from_slice(GRAPH_BUNDLE_MAGIC);
+    out.extend_from_slice(&population_key.to_le_bytes());
+    out.extend_from_slice(&high_water_id.to_le_bytes());
+    out.extend_from_slice(&(centroid_graph.len() as u64).to_le_bytes());
+    out.extend_from_slice(centroid_graph);
+    put_opt_section(&mut out, data_bundle);
+    out
+}
+
+/// Parse an [`encode_graph_bundle`] blob into its raw sections + header.
+/// `None` on a bad magic or truncation, so a corrupt bundle degrades to a
+/// fallback.
+pub(crate) fn decode_graph_bundle(bytes: &[u8]) -> Option<GraphBundle> {
+    let mut c = Cursor::new(bytes);
+    if c.take(GRAPH_BUNDLE_MAGIC.len())? != GRAPH_BUNDLE_MAGIC {
+        return None;
+    }
+    let population_key = c.u64()?;
+    let high_water_id = c.i128()?;
+    let centroid_len = c.u64()? as usize;
+    let centroid_graph = c.take(centroid_len)?.to_vec();
+    let data_bundle = take_opt_section(&mut c)?;
+    Some(GraphBundle {
+        population_key,
+        high_water_id,
+        centroid_graph,
+        data_bundle,
+    })
 }
 
 /// The mutable graph entry point during a concurrent build: the current
@@ -1080,6 +1517,155 @@ mod tests {
             let rb = brute_force(&b, q, 10);
             assert_eq!(ra, rb, "from_codes scorer diverged from from_unit_vectors");
         }
+    }
+
+    /// A graph survives `to_bytes` → `from_bytes` byte-for-byte in
+    /// behavior: the restored graph gives identical search results (the
+    /// adjacency, entry, and levels are reconstructed exactly).
+    #[test]
+    fn graph_bytes_roundtrip() {
+        let dim = 32;
+        let n = 1500;
+        let vectors = random_unit_vectors(n, dim, 0x6A47);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+
+        let bytes = graph.to_bytes();
+        let restored = Hnsw::from_bytes(&bytes).expect("decode graph");
+        assert_eq!(restored.len(), graph.len());
+
+        let queries = random_unit_vectors(25, dim, 0x9B2E);
+        for q in &queries {
+            assert_eq!(
+                graph.search(&scorer, q, 10, 64),
+                restored.search(&scorer, q, 10, 64),
+                "restored graph search diverged"
+            );
+        }
+        // A corrupt/short section decodes to None (caller falls back).
+        assert!(Hnsw::from_bytes(&bytes[..bytes.len() / 2]).is_none());
+        assert!(Hnsw::from_bytes(b"not a graph").is_none());
+    }
+
+    /// `Hnsw::extend` (incremental batch-insert) grows a prior graph with a
+    /// delta and keeps recall in the same ballpark as a from-scratch build at
+    /// the same final scale — the property that makes drain-time incremental
+    /// insert viable. Also checks the new nodes are actually findable.
+    #[test]
+    fn extend_matches_full_build_recall() {
+        let dim = 32;
+        let (n0, delta) = (1500usize, 500usize);
+        let total = n0 + delta;
+        let vectors = random_unit_vectors(total, dim, 0xE47E7D);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
+
+        // Prior graph over the first n0, then extend by the delta.
+        let prior_vecs: Vec<Vec<f32>> = vectors[..n0].to_vec();
+        let prior_scorer = Sq16Scorer::from_unit_vectors(&prior_vecs, dim);
+        let prior = Hnsw::build(&prior_scorer, HnswParams::default());
+        let incremental = prior.extend(&scorer, HnswParams::default());
+        assert_eq!(incremental.len(), total);
+
+        // Full build over all `total` for the recall baseline.
+        let full = Hnsw::build(&scorer, HnswParams::default());
+
+        let queries = random_unit_vectors(60, dim, 0xC0FFEE2);
+        let k = 10;
+        let recall = |g: &Hnsw| -> f64 {
+            let mut hit = 0usize;
+            for q in &queries {
+                let truth: std::collections::HashSet<u32> =
+                    brute_force(&scorer, q, k).into_iter().collect();
+                for (node, _) in g.search(&scorer, q, k, 64) {
+                    if truth.contains(&node) {
+                        hit += 1;
+                    }
+                }
+            }
+            hit as f64 / (queries.len() * k) as f64
+        };
+        let inc_recall = recall(&incremental);
+        let full_recall = recall(&full);
+        // Incremental must stay close to the full-build baseline (small graphs
+        // are noisy; the drain-scale gate is measured end-to-end separately).
+        assert!(
+            inc_recall >= full_recall - 0.05,
+            "incremental recall {inc_recall:.3} lags full {full_recall:.3}"
+        );
+        // A query for a brand-new node's own vector finds it — proof the
+        // delta is wired into the graph, not orphaned.
+        let new_node = (n0 + delta / 2) as u32;
+        let found = incremental.search(&scorer, &vectors[new_node as usize], 1, 64);
+        assert_eq!(found[0].0, new_node, "appended node must be reachable");
+    }
+
+    /// A full `direct_data` bundle (graph + node→doc-id map + Sq16 plane)
+    /// round-trips: the rebuilt index searches identically and maps nodes
+    /// back to the same stable doc ids.
+    #[test]
+    fn direct_data_bundle_roundtrip() {
+        use crate::superfile::vector::distance::encode_sq16_row;
+        let dim = 24;
+        let n = 1200;
+        let vectors = random_unit_vectors(n, dim, 0xD00D);
+        let stride = dim * 2;
+        let mut codes = vec![0u8; n * stride];
+        for (i, v) in vectors.iter().enumerate() {
+            encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
+        }
+        // Distinct, non-trivial stable ids so a node→id mixup would show.
+        let doc_ids: Vec<i128> = (0..n as i128).map(|i| 1_000_000 + i * 7).collect();
+        let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+
+        let bytes = encode_direct_data(&codes, &doc_ids, &graph, dim);
+        let idx = decode_direct_data(&bytes).expect("decode bundle");
+        assert_eq!(idx.dim, dim);
+        assert_eq!(idx.doc_ids, doc_ids);
+        assert_eq!(idx.graph.len(), n);
+
+        let queries = random_unit_vectors(20, dim, 0xFEED);
+        for q in &queries {
+            let orig = graph.search(&scorer, q, 10, 64);
+            let restored = idx.graph.search(&idx.scorer, q, 10, 64);
+            assert_eq!(orig, restored, "bundle search diverged");
+            // Node → doc id maps through the persisted map.
+            for (node, _) in &restored {
+                assert_eq!(idx.doc_ids[*node as usize], doc_ids[*node as usize]);
+            }
+        }
+        assert!(decode_direct_data(b"short").is_none());
+    }
+
+    /// The combined graph bundle frames its sections losslessly, including
+    /// the absent-section flags (data/provenance omitted above the scale
+    /// ceiling) and an empty centroid section.
+    #[test]
+    fn graph_bundle_frames_sections() {
+        // Full bundle: centroid graph + data bundle + population key + high water.
+        let centroid = vec![1u8, 2, 3, 4, 5];
+        let data = vec![9u8; 300];
+        let blob = encode_graph_bundle(0xDEAD_BEEF_1234, 987_654_321, &centroid, Some(&data));
+        let got = decode_graph_bundle(&blob).expect("decode full");
+        assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
+        assert_eq!(got.high_water_id, 987_654_321);
+        assert_eq!(got.centroid_graph, centroid);
+        assert_eq!(got.data_bundle.as_deref(), Some(&data[..]));
+        // The header reads from the fixed-offset prefix alone (a tiny range
+        // GET at settle time — no need for the multi-GiB body).
+        assert_eq!(
+            graph_bundle_header(&blob[..GRAPH_BUNDLE_HEADER_BYTES]),
+            Some((0xDEAD_BEEF_1234, 987_654_321))
+        );
+
+        // Data-less bundle (above the scale ceiling): empty centroid, no data.
+        let blob = encode_graph_bundle(0, 0, &[], None);
+        let got = decode_graph_bundle(&blob).expect("decode empty");
+        assert!(got.centroid_graph.is_empty());
+        assert!(got.data_bundle.is_none());
+
+        assert!(decode_graph_bundle(b"bad").is_none());
+        assert!(graph_bundle_header(b"short").is_none());
     }
 
     /// Empty and singleton graphs don't panic and answer sanely.

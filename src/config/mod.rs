@@ -72,6 +72,8 @@ pub(crate) const DEFAULT_CONNECTION_BUDGET_BYTES: u64 = 0;
 pub enum ConfigError {
     #[error("config load failed: {0}")]
     Figment(Box<figment::Error>),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 impl From<figment::Error> for ConfigError {
@@ -271,11 +273,16 @@ const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
 const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
-/// Default beam width for `routing = direct_data`: the `ef` the resident
-/// HNSW graph is searched at — the recall/latency dial. Higher widens the
-/// beam: more recall, more per-query work. 128 ≈ 0.97 recall@10 on
-/// Cohere-1M; drop to 64 for ~0.95 at lower latency.
-const DEFAULT_VECTOR_DIRECT_DATA_EF: usize = 128;
+/// Default floor for the `direct_data` search-`ef` law — the minimum beam
+/// width and the exact `ef` at the `k = 10` anchor (`128 ≈ 0.97 recall@10`
+/// on Cohere-1M). The full law is
+/// `ef = max(k, clamp(ceil(k × ef_mult), ef_floor, ef_ceil))`.
+const DEFAULT_VECTOR_DIRECT_DATA_EF_FLOOR: usize = 128;
+/// Default per-`k` beam multiplier for the `direct_data` ef law (integer).
+/// At the `k = 10` anchor `10 × 10 = 100` clamps up to the 128 floor.
+const DEFAULT_VECTOR_DIRECT_DATA_EF_MULT: usize = 10;
+/// Default upper clamp on the scaled `direct_data` search `ef`.
+const DEFAULT_VECTOR_DIRECT_DATA_EF_CEIL: usize = 512;
 /// Default `ef_construction` for the `direct_data` HNSW build — the beam
 /// width used while inserting nodes. Higher builds a better-connected graph
 /// (same recall at a smaller search `ef`, so lower query latency) at a
@@ -283,6 +290,13 @@ const DEFAULT_VECTOR_DIRECT_DATA_EF: usize = 128;
 /// is set by `m`, not this). 200 is the sweet spot for recall ~0.93–0.95;
 /// raising it mainly helps the >0.97 end.
 const DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION: usize = 200;
+/// Default scale ceiling for the `direct_data` **data** graph: the resident
+/// per-row HNSW is built (at drain) and persisted only when the table's doc
+/// count is at or below this. Above it, the whole-corpus graph would not fit
+/// in RAM, so only the (far smaller) centroid graph is built and the query
+/// falls back to the scan path. 10M rows of Sq16 codes at 768d is ~15 GiB
+/// resident — the practical single-host ceiling.
+const DEFAULT_VECTOR_DIRECT_DATA_MAX_DOCS: u64 = 10_000_000;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
 /// inside each selected cell. Small cells stay at this known-good minimum.
 const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
@@ -378,7 +392,7 @@ pub enum VectorRouting {
     /// every row's Sq16 rerank codes, bypassing the grid, cell selection, and
     /// disk reads entirely. The graph and its `node -> doc_id` map are built
     /// once on the first `direct_data` query and held resident on the table
-    /// handle; search walks it at `vector.direct_data_ef`. Small/mid-scale
+    /// handle; search walks it at the `k`-scaled `ef` law. Small/mid-scale
     /// experimental path — the whole index must fit in RAM.
     DirectData,
 }
@@ -438,15 +452,31 @@ pub struct VectorSettings {
     /// clusters within each cell into contiguous reads. Ignored under
     /// `routing = stamped`.
     pub global_fine_coalesce: bool,
-    /// For `routing = direct_data`: the `ef` beam width the resident HNSW
-    /// graph is searched at. Ignored under any other routing.
-    pub direct_data_ef: usize,
+    /// For `routing = direct_data`: the search `ef` is scaled from `k` as
+    /// `ef = max(k, clamp(k × ef_mult, ef_floor, ef_ceil))` — all integer.
+    /// This is the floor: the minimum beam width, and the effective `ef` at
+    /// the `k = 10` anchor (`10 × 10 = 100`, clamped up to the 128 floor).
+    /// Ignored under any other routing.
+    pub direct_data_ef_floor: usize,
+    /// For `routing = direct_data`: the per-`k` beam multiplier in the ef law
+    /// above. Integer (≥ 1); the floor pins the small-`k` anchor, so no
+    /// fractional multiplier is needed. Ignored under any other routing.
+    pub direct_data_ef_mult: usize,
+    /// For `routing = direct_data`: the upper clamp on the scaled `ef`.
+    /// Ignored under any other routing.
+    pub direct_data_ef_ceil: usize,
     /// For `routing = direct_data`: the `ef_construction` beam used when
     /// building the resident HNSW (build-time only). Higher = better-
     /// connected graph => lower query latency at fixed recall, at a linear
     /// build cost and no extra resident memory. Ignored under any other
     /// routing.
     pub direct_data_ef_construction: usize,
+    /// For `routing = direct_data`: scale ceiling for the per-row **data**
+    /// graph. The resident data HNSW is built at drain and persisted only
+    /// when the table's doc count ≤ this; above it, only the centroid graph
+    /// is built and `direct_data` queries fall back to the scan path. The
+    /// centroid graph itself is built at any scale.
+    pub direct_data_max_docs: u64,
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
@@ -518,8 +548,11 @@ impl Default for VectorSettings {
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
-            direct_data_ef: DEFAULT_VECTOR_DIRECT_DATA_EF,
+            direct_data_ef_floor: DEFAULT_VECTOR_DIRECT_DATA_EF_FLOOR,
+            direct_data_ef_mult: DEFAULT_VECTOR_DIRECT_DATA_EF_MULT,
+            direct_data_ef_ceil: DEFAULT_VECTOR_DIRECT_DATA_EF_CEIL,
             direct_data_ef_construction: DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION,
+            direct_data_max_docs: DEFAULT_VECTOR_DIRECT_DATA_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,
@@ -832,9 +865,11 @@ impl Config {
     /// overrides. Useful for tests and for documenting what the
     /// shipped default is independent of any host environment.
     pub fn defaults() -> Result<Self, ConfigError> {
-        Ok(Figment::new()
+        let cfg: Config = Figment::new()
             .merge(Yaml::string(EMBEDDED_DEFAULT))
-            .extract()?)
+            .extract()?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// Extract from a caller-provided figment. Used by tests so they
@@ -843,7 +878,31 @@ impl Config {
     /// CLI that adds a `--config-file` source) without duplicating
     /// the embedded-default + extraction machinery.
     pub fn from_figment(fig: Figment) -> Result<Self, ConfigError> {
-        Ok(fig.extract()?)
+        let cfg: Config = fig.extract()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Semantic checks that deserialization alone cannot express, run at
+    /// load time so a bad config fails fast with a clear message instead of
+    /// panicking or misbehaving at query time.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let v = &self.vector;
+        // `.clamp(ef_floor, ef_ceil)` in the direct_data ef law PANICS if
+        // `ef_floor > ef_ceil`; reject an inverted range here.
+        if v.direct_data_ef_floor > v.direct_data_ef_ceil {
+            return Err(ConfigError::Invalid(format!(
+                "vector.direct_data_ef_floor ({}) must be <= vector.direct_data_ef_ceil ({})",
+                v.direct_data_ef_floor, v.direct_data_ef_ceil
+            )));
+        }
+        if v.direct_data_ef_mult < 1 {
+            return Err(ConfigError::Invalid(format!(
+                "vector.direct_data_ef_mult must be >= 1, got {}",
+                v.direct_data_ef_mult
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -900,6 +959,35 @@ mod tests {
     fn embedded_default_loads_with_expected_value() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    /// The `direct_data` ef-law knobs default to the measured anchor, and
+    /// validation rejects an inverted floor/ceil (which would panic
+    /// `.clamp` at query time) or a non-positive multiplier.
+    #[test]
+    fn direct_data_ef_law_config_validates() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert_eq!(cfg.vector.direct_data_ef_floor, 128);
+        assert_eq!(cfg.vector.direct_data_ef_ceil, 512);
+        assert_eq!(cfg.vector.direct_data_ef_mult, 10);
+
+        let inverted =
+            Figment::new()
+                .merge(Yaml::string(EMBEDDED_DEFAULT))
+                .merge(Serialized::defaults(json!({
+                    "vector": { "direct_data_ef_floor": 600, "direct_data_ef_ceil": 512 }
+                })));
+        let err = Config::from_figment(inverted).expect_err("inverted range must fail");
+        assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+
+        let bad_mult =
+            Figment::new()
+                .merge(Yaml::string(EMBEDDED_DEFAULT))
+                .merge(Serialized::defaults(json!({
+                    "vector": { "direct_data_ef_mult": 0 }
+                })));
+        let err = Config::from_figment(bad_mult).expect_err("zero mult must fail");
+        assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
     }
 
     #[test]

@@ -105,7 +105,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
-            hnsw::{Hnsw, HnswParams, Sq16Scorer},
+            hnsw::{Hnsw, HnswParams, Sq16Scorer, encode_direct_data},
             layout::VectorLayout,
             reader::ScanCandidate,
         },
@@ -121,7 +121,9 @@ use crate::{
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
-        slow_vector_state::{CentroidSection, fetch_centroid_section},
+        slow_vector_state::{
+            CentroidSection, ResidentGraphSections, fetch_centroid_section, fetch_graph_sections,
+        },
         tombstones::SidecarCache,
     },
 };
@@ -1364,14 +1366,28 @@ fn score_cell_fp32(
     true
 }
 
-/// One resident-graph node's provenance: the physical row it was built
-/// from (`superfile` + `local_doc_id`, load-bearing for column
-/// projection) and its stable user `_id` (used for the projected `_id`
-/// and cross-replica dedup).
-pub(crate) struct DirectDataNode {
-    superfile: SuperfileUri,
-    local_doc_id: u32,
-    stable_id: i128,
+/// The `direct_data` search beam width for a request of `k`:
+/// `ef = max(k, clamp(k × ef_mult, ef_floor, ef_ceil))` — all integer.
+///
+/// - `.clamp(floor, ceil)`: the recall/latency policy band (config
+///   validation guarantees `floor <= ceil`, so this cannot panic).
+/// - `.max(k)`: the hard `ef ≥ k` invariant, immune to a misconfigured
+///   `ef_mult` — kept OUT of the clamp so it fixes the lower side too.
+fn direct_data_ef(k: usize) -> usize {
+    let v = &config::global().vector;
+    ef_law(
+        k,
+        v.direct_data_ef_mult,
+        v.direct_data_ef_floor,
+        v.direct_data_ef_ceil,
+    )
+}
+
+/// Pure arithmetic of the `direct_data` ef law (config-free, for testing).
+/// `floor <= ceil` is guaranteed by config validation, so `.clamp` here is
+/// panic-free.
+fn ef_law(k: usize, mult: usize, floor: usize, ceil: usize) -> usize {
+    (k * mult).clamp(floor, ceil).max(k)
 }
 
 /// Resident HNSW-over-Sq16 index for `vector.routing = direct_data`.
@@ -1390,8 +1406,188 @@ pub(crate) struct DirectDataIndex {
     scorer: Sq16Scorer,
     /// The proximity graph over `scorer`'s nodes.
     graph: Hnsw,
-    /// `node_index -> provenance`, parallel to the scorer's rows.
-    nodes: Vec<DirectDataNode>,
+    /// `node_index -> stable doc id`, parallel to the scorer's rows. The
+    /// only per-node metadata: a hit's live `(superfile, local)` is
+    /// resolved from this id through the engine's id→placement resolver,
+    /// never baked in (which would go stale on a compaction repack).
+    doc_ids: Vec<i128>,
+}
+
+/// Assemble the persisted `direct_data` data bundle at drain time: walk
+/// every superfile's materialized Sq16 rows for `column`, pool the
+/// node-ordered code plane and the stable-doc-id map, build the HNSW over
+/// the codes, and return the encoded bundle bytes. `Ok(None)` when the
+/// column is absent, not Sq16, or empty; `Err` only on a genuine read
+/// fault (the drain treats that as "skip the graph", never fatal).
+pub(crate) async fn assemble_direct_data_sections(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Option<Vec<u8>>, QueryError> {
+    let Some(vc) = manifest
+        .options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+    else {
+        return Ok(None);
+    };
+    if !vc.rerank_codec.is_sq16() {
+        return Ok(None);
+    }
+    let dim = vc.dim;
+    let stride = dim * 2;
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+
+    let mut codes: Vec<u8> = Vec::new();
+    let mut doc_ids: Vec<i128> = Vec::new();
+    for entry in manifest.get_all_superfiles() {
+        let reader =
+            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                .await?;
+        let Some(vr) = reader.vec() else { continue };
+        let Some(rows) = vr.materialized_index_rows_async(column).await else {
+            continue;
+        };
+        let ids =
+            stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
+        for row in rows {
+            if row.encoded.codes.len() != stride {
+                return Err(QueryError::Execute(format!(
+                    "direct_data: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
+                    row.encoded.codes.len()
+                )));
+            }
+            let local = row.local_doc_id as usize;
+            let stable_id = *ids.get(local).ok_or_else(|| {
+                QueryError::Execute(format!(
+                    "direct_data: local_doc_id {local} out of range ({} ids) on `{column}`",
+                    ids.len()
+                ))
+            })?;
+            codes.extend_from_slice(&row.encoded.codes);
+            doc_ids.push(stable_id);
+        }
+    }
+    if doc_ids.is_empty() {
+        return Ok(None);
+    }
+    let n = doc_ids.len();
+    let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+    let params = HnswParams {
+        ef_construction: config::global().vector.direct_data_ef_construction,
+        ..HnswParams::default()
+    };
+    let graph = Hnsw::build(&scorer, params);
+    Ok(Some(encode_direct_data(&codes, &doc_ids, &graph, dim)))
+}
+
+/// Incrementally extend a prior persisted `direct_data` graph with a
+/// freshly-drained append delta — no full rebuild. Reads only rows whose
+/// `stable_id > prior_high_water` (the append boundary from the prior
+/// bundle header; ids are assigned monotonically at drain), concatenates
+/// their code plane + stable ids onto the prior graph's, and inserts only
+/// the new nodes via [`Hnsw::extend`]. Returns
+/// `(data_bundle_bytes, new_high_water, inserted_node_count)`.
+///
+/// `Ok(None)` means "cannot incrementally extend — do a full rebuild
+/// instead": no new rows, a dim/codec mismatch, or a non-append change
+/// (the prior count plus the delta does not equal the current row count,
+/// so rows were removed or ids are not a clean monotonic extension). This
+/// guard keeps the incremental path strictly for pure appends.
+pub(crate) async fn assemble_direct_data_incremental(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    prior: crate::superfile::vector::hnsw::DirectDataIndex,
+    prior_high_water: i128,
+) -> Result<Option<(Vec<u8>, i128, usize)>, QueryError> {
+    let Some(vc) = manifest
+        .options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+    else {
+        return Ok(None);
+    };
+    let dim = prior.dim;
+    if !vc.rerank_codec.is_sq16() || vc.dim != dim {
+        return Ok(None);
+    }
+    let stride = dim * 2;
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+
+    // Re-read ONLY the appended rows (stable_id past the prior high water).
+    let mut new_codes: Vec<u8> = Vec::new();
+    let mut new_doc_ids: Vec<i128> = Vec::new();
+    for entry in manifest.get_all_superfiles() {
+        let reader =
+            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                .await?;
+        let Some(vr) = reader.vec() else { continue };
+        let Some(rows) = vr.materialized_index_rows_async(column).await else {
+            continue;
+        };
+        let ids =
+            stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
+        for row in rows {
+            if row.encoded.codes.len() != stride {
+                return Err(QueryError::Execute(format!(
+                    "direct_data: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
+                    row.encoded.codes.len()
+                )));
+            }
+            let local = row.local_doc_id as usize;
+            let stable_id = *ids.get(local).ok_or_else(|| {
+                QueryError::Execute(format!(
+                    "direct_data: local_doc_id {local} out of range ({} ids) on `{column}`",
+                    ids.len()
+                ))
+            })?;
+            if stable_id > prior_high_water {
+                new_codes.extend_from_slice(&row.encoded.codes);
+                new_doc_ids.push(stable_id);
+            }
+        }
+    }
+    if new_doc_ids.is_empty() {
+        return Ok(None);
+    }
+    // Pure-append guard: prior population + delta must equal the current row
+    // count. Otherwise rows were removed (or ids are not a clean monotonic
+    // extension) and an incremental insert would be wrong — full rebuild.
+    let current_total: usize = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.n_docs as usize)
+        .sum();
+    if prior.doc_ids.len() + new_doc_ids.len() != current_total {
+        return Ok(None);
+    }
+
+    let inserted = new_doc_ids.len();
+    let mut codes = prior.scorer.codes().to_vec();
+    codes.extend_from_slice(&new_codes);
+    let mut doc_ids = prior.doc_ids;
+    doc_ids.extend_from_slice(&new_doc_ids);
+    let total = doc_ids.len();
+    let scorer = Sq16Scorer::from_codes(codes.clone(), dim, total);
+    let params = HnswParams {
+        ef_construction: config::global().vector.direct_data_ef_construction,
+        ..HnswParams::default()
+    };
+    // Insert ONLY the new node range into a copy of the prior graph.
+    let graph = prior.graph.extend(&scorer, params);
+    let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
+    Ok(Some((
+        encode_direct_data(&codes, &doc_ids, &graph, dim),
+        new_high_water,
+        inserted,
+    )))
 }
 
 impl SupertableReader {
@@ -1419,8 +1615,8 @@ impl SupertableReader {
 
     /// Assemble the resident graph: walk every superfile's materialized
     /// Sq16 rows (`materialized_index_rows_async`), collect each row's code
-    /// bytes plus its `(superfile, local_doc_id, stable_id)` provenance,
-    /// then build one HNSW over the pooled codes.
+    /// bytes plus its stable doc id, then build one HNSW over the pooled
+    /// codes.
     async fn build_direct_data_index(&self, column: &str) -> Result<DirectDataIndex, QueryError> {
         let manifest = self.manifest();
         let vc = manifest
@@ -1445,7 +1641,7 @@ impl SupertableReader {
         let storage = manifest.options.storage.clone();
 
         let mut codes: Vec<u8> = Vec::new();
-        let mut nodes: Vec<DirectDataNode> = Vec::new();
+        let mut doc_ids: Vec<i128> = Vec::new();
         for entry in manifest.get_all_superfiles() {
             let reader =
                 dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
@@ -1478,15 +1674,11 @@ impl SupertableReader {
                     ))
                 })?;
                 codes.extend_from_slice(&row.encoded.codes);
-                nodes.push(DirectDataNode {
-                    superfile: entry.uri,
-                    local_doc_id: row.local_doc_id,
-                    stable_id,
-                });
+                doc_ids.push(stable_id);
             }
         }
 
-        let len = nodes.len();
+        let len = doc_ids.len();
         let scorer = Sq16Scorer::from_codes(codes, dim, len);
         let mut hp = HnswParams::default();
         hp.ef_construction = config::global().vector.direct_data_ef_construction;
@@ -1510,21 +1702,55 @@ impl SupertableReader {
             dim,
             scorer,
             graph,
-            nodes,
+            doc_ids,
         })
     }
 
-    /// Walk the resident `direct_data` graph at `vector.direct_data_ef` and
-    /// return top-k hits carrying the true `(superfile, local_doc_id)` and
-    /// stable id, in the shared ascending-by-distance shape. The graph
-    /// distance is `−dot` on the Sq16 grid; smaller is nearer, matching the
-    /// `SuperfileHit.score` convention.
+    /// Walk the resident `direct_data` graph at the `k`-scaled `ef` law and
+    /// return top-k hits carrying the stable id (+ score), in the shared
+    /// ascending-by-distance shape. Each hit's `superfile`/`local_doc_id`
+    /// are left `nil`/`0`: the `_id`+score projection answers straight from
+    /// `stable_id`, and any wider projection resolves the live
+    /// `(superfile, local)` from that id through
+    /// [`user_placement_for_scalar_resolve`] on the shared `vector_search`
+    /// path — compaction-correct without baking physical rows into the
+    /// graph. The graph distance is `−dot` on the Sq16 grid; smaller is
+    /// nearer, matching the `SuperfileHit.score` convention.
     async fn direct_data_search(
         &self,
         column: &str,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        // Build a hit from a `(node, distance)` and the node→stable-id map.
+        let hit_from = |doc_ids: &[i128], node: u32, dist: f32| -> Option<SuperfileHit> {
+            Some(SuperfileHit {
+                superfile: SuperfileUri(Uuid::nil()),
+                local_doc_id: 0,
+                score: dist,
+                stable_id: Some(*doc_ids.get(node as usize)?),
+            })
+        };
+
+        // Prefer the resident graph persisted at drain. Fall back to the
+        // lazy in-process build when it is absent (older generation, above
+        // the scale ceiling, or the column has no persisted data graph) or
+        // shape-mismatched — never a hard error.
+        if k > 0
+            && let Some(sections) = self.persisted_graph_sections().await
+            && let Some(data) = sections.data.as_ref()
+            && data.dim == query.len()
+            && !data.doc_ids.is_empty()
+        {
+            let hits: Vec<SuperfileHit> = data
+                .graph
+                .search(&data.scorer, query, k, direct_data_ef(k))
+                .into_iter()
+                .filter_map(|(node, dist)| hit_from(&data.doc_ids, node, dist))
+                .collect();
+            return Ok(top_k_ascending(vec![hits], k));
+        }
+
         let idx = self.direct_data_index(column).await?;
         if idx.dim != query.len() {
             return Err(QueryError::Execute(format!(
@@ -1533,28 +1759,50 @@ impl SupertableReader {
                 idx.dim
             )));
         }
-        if idx.nodes.is_empty() || k == 0 {
+        if idx.doc_ids.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let ef = std::env::var("INFINO_DD_EF")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(config::global().vector.direct_data_ef)
-            .max(k);
-        let found = idx.graph.search(&idx.scorer, query, k, ef);
-        let hits: Vec<SuperfileHit> = found
+        let hits: Vec<SuperfileHit> = idx
+            .graph
+            .search(&idx.scorer, query, k, direct_data_ef(k))
             .into_iter()
-            .map(|(node, dist)| {
-                let meta = &idx.nodes[node as usize];
-                SuperfileHit {
-                    superfile: meta.superfile,
-                    local_doc_id: meta.local_doc_id,
-                    score: dist,
-                    stable_id: Some(meta.stable_id),
-                }
-            })
+            .filter_map(|(node, dist)| hit_from(&idx.doc_ids, node, dist))
             .collect();
         Ok(top_k_ascending(vec![hits], k))
+    }
+
+    /// Hydrate (or reuse) the persisted `direct_data` graph sections for
+    /// this table, mirroring [`Self::centroid_section`]: one fetch of the
+    /// content-addressed graph blob on first use, cached resident on the
+    /// handle and keyed by URI. `None` when the manifest carries no graph
+    /// ref (older generation / above the scale ceiling) or the fetch failed
+    /// — callers fall back to the lazy build or the scan path.
+    async fn persisted_graph_sections(&self) -> Option<Arc<ResidentGraphSections>> {
+        let manifest = self.manifest();
+        let reference = manifest.slow_vector_state_graphs_blob()?.clone();
+        let storage = manifest.options.storage.as_ref()?;
+        let slot = Arc::clone(&manifest.options.graph_sections_cache);
+        let mut guard = slot.lock().await;
+        if let Some(sections) = guard.as_ref()
+            && sections.uri == reference.uri
+        {
+            return Some(Arc::clone(sections));
+        }
+        match fetch_graph_sections(storage.as_ref(), &reference).await {
+            Ok(sections) => {
+                let sections = Arc::new(sections);
+                *guard = Some(Arc::clone(&sections));
+                Some(sections)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "direct_data graph sections {} unavailable ({error}); falling back to \
+                     lazy build / scan",
+                    reference.uri
+                );
+                None
+            }
+        }
     }
 
     /// Hydrate (or reuse) the slow-CAS centroid-section spill for this
@@ -4464,7 +4712,7 @@ mod tests {
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
         VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        calibrated_query_for, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
+        calibrated_query_for, cells_ranked_by_fine_score, ef_law, gate_fine_candidates_by_fragment,
         hidden_hits_user_ids, is_hidden_vector_manifest, law_floor_serve_selection,
         postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
         score_fine_candidates, select_global_shortlist, union_cell_selection,
@@ -4507,6 +4755,27 @@ mod tests {
     /// sorts ascending with lower-id tie-break, and ignores untagged
     /// (legacy, `None`-cell) candidates.
     /// Exactly the id + score columns (either order) or a bare `SELECT *`
+    /// The all-integer `direct_data` ef law `max(k, clamp(k×mult, floor, ceil))`.
+    #[test]
+    fn direct_data_ef_law() {
+        let (mult, floor, ceil) = (10usize, 128usize, 512usize);
+        // k=10 anchor: 10×10=100 clamps up to the 128 floor.
+        assert_eq!(ef_law(10, mult, floor, ceil), 128);
+        // Small k stays on the floor.
+        assert_eq!(ef_law(1, mult, floor, ceil), 128);
+        assert_eq!(ef_law(12, mult, floor, ceil), 128); // 120 < floor
+        // Mid k scales linearly between floor and ceil.
+        assert_eq!(ef_law(20, mult, floor, ceil), 200);
+        assert_eq!(ef_law(50, mult, floor, ceil), 500);
+        // Large k clamps at the ceiling, then the `max(k)` invariant wins.
+        assert_eq!(ef_law(60, mult, floor, ceil), 512); // 600 → ceil
+        assert_eq!(ef_law(600, mult, floor, ceil), 600); // ceil<k → max(k)
+        // `.max(k)` is immune to a pathological mult=0: 0 → clamp floor,
+        // but k wins whenever k > floor.
+        assert_eq!(ef_law(600, 0, floor, ceil), 600);
+        assert_eq!(ef_law(5, 0, floor, ceil), 128);
+    }
+
     /// (None) takes the id/score fast path; anything else does not.
     #[test]
     fn projection_is_id_score_only_matches_id_score_combinations() {

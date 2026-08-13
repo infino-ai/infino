@@ -86,6 +86,9 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
         live.insert(centroids.uri.clone());
     }
+    if let Some(graphs) = manifest.slow_vector_state_graphs_blob() {
+        live.insert(graphs.uri.clone());
+    }
 
     // Each resident superfile's tombstone sidecar. `superfiles/` is swept whatever the flag says,
     // so these have to be named here or a sidecar past the gap is deleted and its deleted rows
@@ -392,6 +395,7 @@ mod tests {
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
+                slow_vector_state_graphs: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -465,6 +469,7 @@ mod tests {
                     uri: section_uri.clone(),
                     content_hash: section_hash,
                 }),
+                slow_vector_state_graphs: None,
                 parts: Vec::new(),
             }),
         );
