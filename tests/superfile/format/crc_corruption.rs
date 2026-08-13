@@ -385,6 +385,61 @@ fn corrupt_fts_position_subindex_rejected() {
     assert_corruption_rejected(bytes, subindex_start + 1, "fts/position sub-index");
 }
 
+#[test]
+fn corrupt_fts_bitset_block_rejected() {
+    // The dense fixture (every doc shares the same terms) stores those common
+    // terms' postings as BITSET blocks — a new on-disk shape. Those bytes ride
+    // inside the already-CRC-protected postings region; this pins that a flip
+    // inside a bitset block's presence bitmap is caught at open, the bitset-block
+    // twin of `corrupt_fts_position_subindex_rejected`.
+    let bytes = build_corruptable_superfile();
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    // Dense corpus ⇒ a v4 blob with at least one bitset block.
+    let version = u32::from_le_bytes(
+        bytes[fts_off + 8..fts_off + 12]
+            .try_into()
+            .expect("version bytes"),
+    );
+    assert_eq!(
+        version, 4,
+        "dense corpus must embed a v4 FTS blob (bitset blocks)"
+    );
+    // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
+    let postings_offset_rel = u64::from_le_bytes(
+        bytes[fts_off + 32..fts_off + 40]
+            .try_into()
+            .expect("postings offset"),
+    ) as usize;
+    let term0 = fts_off + postings_offset_rel;
+    // A term is `[meta][skip table][blocks]`; the first block's offset *within
+    // the term* is recorded in skip entry 0's block-offset field, so read it
+    // directly instead of re-deriving the skip-table size. Non-positional term
+    // meta is 20 B (`TERM_META_SIZE`); a skip entry's block-offset u32 sits at
+    // its offset 4 (`BLOCK_OFFSET_OFF`).
+    const TERM_META: usize = 20;
+    const SKIP_BLOCK_OFFSET_FIELD: usize = 4;
+    let block0_off_in_term = u32::from_le_bytes(
+        bytes[term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD
+            ..term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD + 4]
+            .try_into()
+            .expect("block offset"),
+    ) as usize;
+    let block0 = term0 + block0_off_in_term;
+    // Block header byte 3 is the encoding (`ENCODING_BITSET == 1`). Assert the
+    // first postings term's block really is a bitset — both a fixture sanity
+    // check and proof the flip below lands in a presence bitmap, not a PFOR block.
+    const ENCODING_OFF: usize = 3;
+    const ENCODING_BITSET: u8 = 1;
+    const BLOCK_HEADER: usize = 8;
+    assert_eq!(
+        bytes[block0 + ENCODING_OFF],
+        ENCODING_BITSET,
+        "first postings term's block must be bitset-encoded on this dense corpus"
+    );
+    // Flip a byte in the presence bitmap, just past the 8-byte block header.
+    assert_corruption_rejected(bytes, block0 + BLOCK_HEADER, "fts/bitset block presence");
+}
+
 /// FTS blob range only (the positional fixture has no vector blob, so
 /// `locate_blobs` — which insists on both — doesn't apply).
 fn locate_fts_blob_only(bytes: &[u8]) -> (usize, usize) {
