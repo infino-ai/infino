@@ -24,7 +24,7 @@ use crate::superfile::{
     fts::{
         bm25,
         builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
-        posting::{BLOCK_LEN, decode_block, decode_block_doc_ids},
+        posting::{self, BLOCK_LEN, decode_block, decode_block_doc_ids},
     },
 };
 
@@ -348,6 +348,11 @@ pub(crate) struct TermCursor {
     /// leaves `block_tfs` stale, so a `count_only` cursor must not be used
     /// for scoring.
     pub(super) count_only: bool,
+    /// Which block index is currently decoded into `block_doc_ids`
+    /// (`usize::MAX` = none). Lets [`Self::contains`] skip re-decoding a
+    /// PACKED block it already holds while probing membership across a
+    /// run of ascending target docs.
+    pub(super) decoded_block: usize,
 }
 
 impl TermCursor {
@@ -426,6 +431,7 @@ impl TermCursor {
             bytes: term_bytes,
             header_probed,
             count_only,
+            decoded_block: usize::MAX,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -482,6 +488,7 @@ impl TermCursor {
             // Inline cursors carry their single posting pre-decoded and
             // never call `decode_current_block`, so the flag is inert.
             count_only: false,
+            decoded_block: 0,
         }
     }
 
@@ -497,6 +504,74 @@ impl TermCursor {
             false => decode_block(&bytes, &mut self.block_doc_ids, &mut self.block_tfs),
         };
         self.pos = 0;
+        self.decoded_block = self.current_block;
+    }
+
+    /// Membership probe: does this term contain `doc`? Advances the block
+    /// cursor forward to the block that could hold `doc` (targets arrive
+    /// ascending on the AND-count leapfrog) and, on a **bitset block**,
+    /// answers with a single bit-test — no decode. A PACKED block is
+    /// decoded once (cached via `decoded_block`) and binary-searched. Used
+    /// only by the count leapfrog; it moves `current_block`, so a cursor
+    /// probed with `contains` must not also be iterated.
+    pub(super) fn contains(&mut self, doc: u32) -> bool {
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < doc
+        {
+            self.current_block += 1;
+        }
+        if self.current_block >= self.blocks.len() {
+            return false;
+        }
+        // Inline (df=1) cursor: single pre-decoded doc, no postings bytes.
+        if self.bytes.is_empty() {
+            return self.block_n > 0 && self.block_doc_ids[0] == doc;
+        }
+        let block = self.blocks[self.current_block];
+        let raw = self
+            .bytes
+            .slice(block.block_byte_offset..block.block_byte_end);
+        let raw = raw.as_ref();
+        if raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET {
+            let base = read_u32_le(&raw[4..8]);
+            if doc < base {
+                return false;
+            }
+            let bit = (doc - base) as usize;
+            let tfs_size = BLOCK_LEN * raw[2] as usize / 8;
+            let bitset_end = raw.len() - tfs_size;
+            let word_at = posting::HEADER_SIZE + (bit / 64) * 8;
+            if word_at + 8 > bitset_end {
+                return false; // past this block's presence bits ⇒ absent
+            }
+            let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+            (word >> (bit % 64)) & 1 == 1
+        } else {
+            if self.decoded_block != self.current_block {
+                self.decode_current_block();
+            }
+            self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .is_ok()
+        }
+    }
+
+    /// Materialize a `contains`-probed cursor at `doc`: ensure the current
+    /// block is decoded and `pos` points at `doc`. A membership probe
+    /// (`contains`) advances `current_block` but, on a **bitset block**,
+    /// answers by bit-test without decoding — leaving `block_doc_ids`,
+    /// `block_tfs`, and `pos` stale. The phrase position-verification path
+    /// needs the fully decoded block; this decodes it (only when the current
+    /// block isn't already decoded) and scans `pos` up to `doc`. Callers
+    /// pass a `doc` a preceding `contains(doc)` confirmed is present, arriving
+    /// in ascending order, so the forward `pos` scan always lands on it.
+    pub(super) fn materialize_at(&mut self, doc: u32) {
+        if self.decoded_block != self.current_block {
+            self.decode_current_block();
+        }
+        while self.pos < self.block_n && self.block_doc_ids[self.pos] < doc {
+            self.pos += 1;
+        }
     }
 
     pub(super) fn is_exhausted(&self) -> bool {

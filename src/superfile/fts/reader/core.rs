@@ -503,6 +503,10 @@ pub struct FtsReader {
     /// `< POSITION_SUBINDEX_STRIDE` runs. `V1`/`V2` blobs lack it and take
     /// the block-start skip-walk fallback.
     pub(super) has_position_subindex: bool,
+    /// True iff the blob is `VERSION_V4` — some posting blocks may be
+    /// bitset-encoded, so the unranked count kernels prefer membership
+    /// bit-tests (no decode) over decoding a common term's blocks.
+    pub(super) has_bitset_blocks: bool,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -670,6 +674,7 @@ impl FtsReader {
         };
         let has_position_subindex =
             version == format::fts::VERSION_V3 || version == format::fts::VERSION_V4;
+        let has_bitset_blocks = version == format::fts::VERSION_V4;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -929,6 +934,7 @@ impl FtsReader {
             postings_range,
             positions_range,
             has_position_subindex,
+            has_bitset_blocks,
             columns,
             column_id_by_name,
         })

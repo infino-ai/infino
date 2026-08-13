@@ -394,7 +394,10 @@ mod tests {
         assert_eq!(enc.bytes[3], ENCODING_BITSET, "dense block must be bitset");
         assert_eq!(enc.last_doc_id, 254);
         // base aligned down to a 64-bit boundary (0 here).
-        assert_eq!(u32::from_le_bytes(enc.bytes[4..8].try_into().expect("4 bytes")), 0);
+        assert_eq!(
+            u32::from_le_bytes(enc.bytes[4..8].try_into().expect("4 bytes")),
+            0
+        );
     }
 
     #[test]

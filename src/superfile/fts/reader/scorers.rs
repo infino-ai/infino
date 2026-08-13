@@ -19,6 +19,34 @@ use super::{
 };
 use crate::superfile::{error::FtsError, fts::bm25};
 
+/// Intersection cardinality by a rarest-driven membership walk: iterate the
+/// term with the fewest blocks and count docs the others all contain. Each
+/// membership probe is `TermCursor::contains`, which bit-tests a bitset
+/// block with no decode — so a common (bitset) term's blocks are never
+/// expanded. Used for `v4` blobs; the flat-merge stays for `v1`–`v3`, where
+/// every block is PFOR and the sorted merge over decoded blocks is faster.
+fn count_and_intersect_membership(mut cursors: Vec<TermCursor>) -> u64 {
+    // Drive by the rarest term (fewest blocks) to minimise membership
+    // probes. Ties don't matter; any driver yields the same count.
+    let driver_idx = cursors
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, c)| c.block_count())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let mut driver = cursors.swap_remove(driver_idx);
+    let mut others = cursors;
+    let mut n = 0u64;
+    while !driver.is_exhausted() {
+        let doc = driver.current_doc_id();
+        if others.iter_mut().all(|o| o.contains(doc)) {
+            n += 1;
+        }
+        driver.next();
+    }
+    n
+}
+
 impl FtsReader {
     /// Multi-term OR via WAND + BlockMaxWAND.
     ///
@@ -403,6 +431,14 @@ impl FtsReader {
     pub(super) fn count_and_intersect(&self, column_id: u32, mut cursors: Vec<TermCursor>) -> u64 {
         if cursors.is_empty() {
             return 0;
+        }
+        // On a v4 blob a common term's blocks may be bitset-encoded, where
+        // decoding (set-bit expansion) is slower than the PFOR path the
+        // flat-merge assumes. Drive the intersection by the rarest term and
+        // probe the rest by membership instead: a bitset block answers with
+        // an O(1) bit-test — no decode. See `count_and_intersect_membership`.
+        if self.has_bitset_blocks {
+            return count_and_intersect_membership(cursors);
         }
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;

@@ -248,7 +248,7 @@ impl PhraseCursor {
             current_tf: 0,
             verify_scratch: Vec::new(),
         };
-        cursor.seek_match(0, f32::NEG_INFINITY, &NormTable::empty())?;
+        cursor.seek_match_unranked(0)?;
         Ok(cursor)
     }
 
@@ -267,7 +267,7 @@ impl PhraseCursor {
         if self.is_exhausted() || self.current_doc >= target {
             return Ok(());
         }
-        self.seek_match(target, f32::NEG_INFINITY, &NormTable::empty())
+        self.seek_match_unranked(target)
     }
 
     /// [`Self::skip_to`] for ranked walks: additionally skips docs
@@ -288,6 +288,65 @@ impl PhraseCursor {
             return Ok(());
         }
         self.seek_match(target, bar, dl_norm_k1)
+    }
+
+    /// Unranked (match/count) doc alignment: drive off the rarest member
+    /// and confirm the rest by **membership bit-test**, never decoding a
+    /// common member's block during alignment. The rarest member
+    /// (`align_order[0]`) is the only one iterated — it seeds both the
+    /// candidate doc and, later, the phrase-start positions. Every other
+    /// member answers `contains(aligned)` by a single bit-test on a dense
+    /// (bitset) block, so a common word like "the" is never PFOR/bitset-
+    /// decoded just to align a doc; its block is materialized lazily in
+    /// [`Self::verify_at_aligned`] only for the far fewer docs that survive
+    /// every rarer member. This is the count-path twin of the ranked
+    /// [`Self::seek_match`], which must keep decoding tfs for its score bar.
+    pub(super) fn seek_match_unranked(&mut self, mut from: u32) -> Result<(), FtsError> {
+        let driver = self.align_order[0];
+        'docs: loop {
+            // Advance the rarest member; it alone drives the candidate doc.
+            {
+                let d = &mut self.members[driver].cursor;
+                d.skip_to(from);
+                if d.is_exhausted() {
+                    self.current_doc = u32::MAX;
+                    self.current_tf = 0;
+                    return Ok(());
+                }
+            }
+            let aligned = self.members[driver].cursor.current_doc_id();
+            // Every other member must contain `aligned` — a bit-test on a
+            // dense block, no decode. A miss advances the driver past it.
+            for oi in 1..self.align_order.len() {
+                let mi = self.align_order[oi];
+                if !self.members[mi].cursor.contains(aligned) {
+                    from = match aligned.checked_add(1) {
+                        Some(next) => next,
+                        None => {
+                            self.current_doc = u32::MAX;
+                            self.current_tf = 0;
+                            return Ok(());
+                        }
+                    };
+                    continue 'docs;
+                }
+            }
+            // Verify adjacency; the probed members are decoded here, lazily.
+            let tf = self.verify_at_aligned(aligned)?;
+            if tf > 0 {
+                self.current_doc = aligned;
+                self.current_tf = tf;
+                return Ok(());
+            }
+            from = match aligned.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    self.current_doc = u32::MAX;
+                    self.current_tf = 0;
+                    return Ok(());
+                }
+            };
+        }
     }
 
     /// Leapfrog the members to their next common doc ≥ `from`, verify
@@ -353,7 +412,7 @@ impl PhraseCursor {
             }
 
             // Verify adjacency at the aligned doc.
-            let tf = self.verify_at_aligned()?;
+            let tf = self.verify_at_aligned(aligned)?;
             if tf > 0 {
                 self.current_doc = aligned;
                 self.current_tf = tf;
@@ -375,7 +434,7 @@ impl PhraseCursor {
     /// first member's positions `p` where member `i` also has `p + i`
     /// for every `i`. Member position lists are ascending, so each
     /// probe is a binary search over a per-doc-tf-sized slice.
-    pub(super) fn verify_at_aligned(&mut self) -> Result<u32, FtsError> {
+    pub(super) fn verify_at_aligned(&mut self, aligned: u32) -> Result<u32, FtsError> {
         // Staged, rarest-first, lazy-decode verification. A phrase match
         // starting at position `s` has member `j` at `s + j`, so any
         // member can seed the candidate starts: the rarest member (by
@@ -391,8 +450,14 @@ impl PhraseCursor {
         //     On the huge co-occurrence sets a phrase with a common word
         //     produces, almost every doc is rejected by a rare member
         //     first, so the common members are never decoded there.
+        //
+        // `materialize_at` decodes each member's block only now: on the
+        // unranked path a common member reached `aligned` by a `contains`
+        // bit-test and its block is not yet decoded; on the ranked path it
+        // was already decoded by `skip_to`, so this is a no-op there.
         let anchor = self.align_order[0];
         let anchor_off = anchor as u32;
+        self.members[anchor].cursor.materialize_at(aligned);
         self.members[anchor].decode_current_positions()?;
         self.verify_scratch.clear();
         for &pa in &self.members[anchor].pos_scratch {
@@ -405,6 +470,7 @@ impl PhraseCursor {
                 break;
             }
             let j = self.align_order[oi];
+            self.members[j].cursor.materialize_at(aligned);
             self.members[j].decode_current_positions()?;
             let plist = &self.members[j].pos_scratch;
             let off = j as u32;
