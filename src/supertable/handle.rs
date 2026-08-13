@@ -128,6 +128,18 @@ pub(super) struct SupertableInner {
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
     pub(super) sql_session_cache: Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>>,
+    /// Resident HNSW-over-Sq16 index for `vector.routing = direct_data`,
+    /// keyed on the `Arc<ManifestSnapshot>` it was built against — the same
+    /// invalidate-on-commit contract as `sql_session_cache` (a new commit
+    /// publishes a fresh snapshot, the `Arc::ptr_eq` check misses, and the
+    /// graph rebuilds). Built lazily on the first `direct_data` query;
+    /// `None` until then, and never populated under any other routing.
+    pub(super) direct_data_index: Mutex<
+        Option<(
+            Arc<ManifestSnapshot>,
+            Arc<crate::supertable::query::vector::DirectDataIndex>,
+        )>,
+    >,
     /// Deterministic scalar SQL logical plans keyed by statement text and
     /// manifest identity. Physical plans are intentionally rebuilt so fresh
     /// tombstone overlays and query-stable functions retain their semantics.
@@ -1595,6 +1607,7 @@ async fn build_handle(
         compaction_outstanding: AtomicBool::new(false),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
+        direct_data_index: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         tombstone_cache,
@@ -1932,9 +1945,10 @@ impl SupertableReader {
     /// The shared `Arc<SupertableInner>` backing this reader. Used to
     /// build a [`WeakReader`] that retains the snapshot without an
     /// owning cycle through a cached `SessionContext`. Module-private:
-    /// `SupertableInner` is module-private, and the only caller is
-    /// [`WeakReader::from_reader`] in this file.
-    fn inner_arc(&self) -> &Arc<SupertableInner> {
+    /// `SupertableInner` is module-private; callers are
+    /// [`WeakReader::from_reader`] in this file and the query module's
+    /// resident-index cache lookup.
+    pub(super) fn inner_arc(&self) -> &Arc<SupertableInner> {
         &self.inner
     }
 

@@ -170,6 +170,12 @@ vector:
   #                          (10M+); at small scale it can cost recall/latency
   #                          for no cold benefit. Opt-in while the per-table
   #                          fanout stamp is built.
+  #   direct_data          — EXPERIMENTAL: walk a resident in-memory HNSW graph
+  #                          built over every row's Sq16 rerank codes, bypassing
+  #                          the grid, cell selection, and disk reads. The graph
+  #                          and its node->doc_id map are built once on the first
+  #                          direct_data query and held resident; search walks it
+  #                          at direct_data_ef. The whole index must fit in RAM.
   routing: stamped
 
   # For routing = global_fine_centroid: the NUMBER of fine clusters the
@@ -188,6 +194,19 @@ vector:
   # For routing = global_fine_centroid: coalesce the selected clusters
   # within each cell into contiguous reads. Ignored under routing = stamped.
   global_fine_coalesce: false
+
+  # For routing = direct_data: the ef beam width the resident HNSW graph is
+  # searched at — the recall/latency dial. Higher widens the beam: more
+  # recall, more per-query work. 128 ~ 0.97 recall@10 on Cohere-1M; drop to
+  # 64 for ~0.95 at lower latency. Ignored under any other routing.
+  direct_data_ef: 128
+
+  # For routing = direct_data: the ef_construction beam used to BUILD the
+  # resident HNSW (build-time only, not per query). Higher = better-connected
+  # graph => same recall at a smaller search beam => lower query latency, at a
+  # linearly higher one-time build cost and NO extra resident memory. 200 is
+  # the sweet spot for recall ~0.93-0.95; raise it only to push the >0.97 end.
+  direct_data_ef_construction: 200
 
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.

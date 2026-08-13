@@ -105,6 +105,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
+            hnsw::{Hnsw, HnswParams, Sq16Scorer},
             layout::VectorLayout,
             reader::ScanCandidate,
         },
@@ -1363,7 +1364,199 @@ fn score_cell_fp32(
     true
 }
 
+/// One resident-graph node's provenance: the physical row it was built
+/// from (`superfile` + `local_doc_id`, load-bearing for column
+/// projection) and its stable user `_id` (used for the projected `_id`
+/// and cross-replica dedup).
+pub(crate) struct DirectDataNode {
+    superfile: SuperfileUri,
+    local_doc_id: u32,
+    stable_id: i128,
+}
+
+/// Resident HNSW-over-Sq16 index for `vector.routing = direct_data`.
+/// Built once over every row of one vector column across all superfiles
+/// and held on the table handle (see
+/// [`SupertableInner::direct_data_index`](crate::supertable::handle)).
+/// Search walks the graph in RAM — no cell selection, no disk reads.
+pub(crate) struct DirectDataIndex {
+    /// The vector column this graph indexes (cache key alongside the
+    /// manifest identity).
+    column: String,
+    /// Vector dimensionality; guards the query length.
+    dim: usize,
+    /// Sq16 codes for every node, adopted verbatim from the on-disk
+    /// `full[]` plane.
+    scorer: Sq16Scorer,
+    /// The proximity graph over `scorer`'s nodes.
+    graph: Hnsw,
+    /// `node_index -> provenance`, parallel to the scorer's rows.
+    nodes: Vec<DirectDataNode>,
+}
+
 impl SupertableReader {
+    /// Resident `direct_data` graph for `column`, built and cached on the
+    /// table handle against the current manifest snapshot (rebuilt after a
+    /// commit publishes a fresh snapshot). No lock is held across the async
+    /// build, so concurrent first-queries may each build once — last store
+    /// wins, which is correct and at worst redundant.
+    async fn direct_data_index(&self, column: &str) -> Result<Arc<DirectDataIndex>, QueryError> {
+        let manifest = self.manifest();
+        {
+            let guard = self.inner_arc().direct_data_index.lock().unwrap();
+            if let Some((cached_manifest, idx)) = guard.as_ref()
+                && Arc::ptr_eq(cached_manifest, manifest)
+                && idx.column == column
+            {
+                return Ok(Arc::clone(idx));
+            }
+        }
+        let idx = Arc::new(self.build_direct_data_index(column).await?);
+        let mut guard = self.inner_arc().direct_data_index.lock().unwrap();
+        *guard = Some((Arc::clone(manifest), Arc::clone(&idx)));
+        Ok(idx)
+    }
+
+    /// Assemble the resident graph: walk every superfile's materialized
+    /// Sq16 rows (`materialized_index_rows_async`), collect each row's code
+    /// bytes plus its `(superfile, local_doc_id, stable_id)` provenance,
+    /// then build one HNSW over the pooled codes.
+    async fn build_direct_data_index(&self, column: &str) -> Result<DirectDataIndex, QueryError> {
+        let manifest = self.manifest();
+        let vc = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
+        let dim = vc.dim;
+        // The resident graph scores straight off the single-plane Sq16 `u16`
+        // codes; other rerank codecs have a different on-disk row shape.
+        if !vc.rerank_codec.is_sq16() {
+            return Err(QueryError::Execute(format!(
+                "direct_data routing requires the sq16 rerank codec on column `{column}`, \
+                 found `{}`",
+                vc.rerank_codec.name()
+            )));
+        }
+        let stride = dim * 2;
+        let store = Arc::clone(&manifest.options.store);
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+
+        let mut codes: Vec<u8> = Vec::new();
+        let mut nodes: Vec<DirectDataNode> = Vec::new();
+        for entry in manifest.get_all_superfiles() {
+            let reader =
+                dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                    .await?;
+            let Some(vr) = reader.vec() else { continue };
+            let Some(rows) = vr.materialized_index_rows_async(column).await else {
+                continue;
+            };
+            // Resolve stable ids the way the routing paths do: span arithmetic
+            // (`id_min + local`) for contiguous user superfiles, the inline
+            // `_id` region for hidden cells, else the scalar `_id` column. A
+            // materialized row's own `stable_id` is populated only for hidden
+            // (inline) superfiles — ordinary user commits leave it zero, so
+            // trusting it would collapse every hit onto one `_id` in dedup.
+            let ids =
+                stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), &self.op_stats)
+                    .await?;
+            for row in rows {
+                if row.encoded.codes.len() != stride {
+                    return Err(QueryError::Execute(format!(
+                        "direct_data: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
+                        row.encoded.codes.len()
+                    )));
+                }
+                let local = row.local_doc_id as usize;
+                let stable_id = *ids.get(local).ok_or_else(|| {
+                    QueryError::Execute(format!(
+                        "direct_data: local_doc_id {local} out of range ({} ids) on `{column}`",
+                        ids.len()
+                    ))
+                })?;
+                codes.extend_from_slice(&row.encoded.codes);
+                nodes.push(DirectDataNode {
+                    superfile: entry.uri,
+                    local_doc_id: row.local_doc_id,
+                    stable_id,
+                });
+            }
+        }
+
+        let len = nodes.len();
+        let scorer = Sq16Scorer::from_codes(codes, dim, len);
+        let mut hp = HnswParams::default();
+        hp.ef_construction = config::global().vector.direct_data_ef_construction;
+        // Diagnostic build-param overrides for sweeps; config is the default.
+        if let Some(v) = std::env::var("INFINO_DD_EFC")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            hp.ef_construction = v;
+        }
+        if let Some(v) = std::env::var("INFINO_DD_M")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            hp.m = v;
+            hp.m0 = v * 2;
+        }
+        let graph = Hnsw::build(&scorer, hp);
+        Ok(DirectDataIndex {
+            column: column.to_string(),
+            dim,
+            scorer,
+            graph,
+            nodes,
+        })
+    }
+
+    /// Walk the resident `direct_data` graph at `vector.direct_data_ef` and
+    /// return top-k hits carrying the true `(superfile, local_doc_id)` and
+    /// stable id, in the shared ascending-by-distance shape. The graph
+    /// distance is `−dot` on the Sq16 grid; smaller is nearer, matching the
+    /// `SuperfileHit.score` convention.
+    async fn direct_data_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let idx = self.direct_data_index(column).await?;
+        if idx.dim != query.len() {
+            return Err(QueryError::Execute(format!(
+                "direct_data: query dim {} != column `{column}` dim {}",
+                query.len(),
+                idx.dim
+            )));
+        }
+        if idx.nodes.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let ef = std::env::var("INFINO_DD_EF")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(config::global().vector.direct_data_ef)
+            .max(k);
+        let found = idx.graph.search(&idx.scorer, query, k, ef);
+        let hits: Vec<SuperfileHit> = found
+            .into_iter()
+            .map(|(node, dist)| {
+                let meta = &idx.nodes[node as usize];
+                SuperfileHit {
+                    superfile: meta.superfile,
+                    local_doc_id: meta.local_doc_id,
+                    score: dist,
+                    stable_id: Some(meta.stable_id),
+                }
+            })
+            .collect();
+        Ok(top_k_ascending(vec![hits], k))
+    }
+
     /// Hydrate (or reuse) the slow-CAS centroid-section spill for this
     /// table: one streamed fetch of a single content-addressed object on
     /// the first cold rescore, then local `pread`s forever — instead of
@@ -1692,6 +1885,13 @@ impl SupertableReader {
         // Unfiltered hidden path only; `stamped` (or a filtered/user-table
         // query) leaves the stamped-law path below untouched.
         let vcfg = &config::global().vector;
+        // Direct-data routing (`vector.routing = direct_data`): walk a
+        // resident in-memory HNSW graph built over every row's Sq16 codes,
+        // bypassing the grid, cell selection, and disk reads. Unfiltered
+        // path only; a filtered query falls through to the stamped path.
+        if !filtered && vcfg.routing == config::VectorRouting::DirectData {
+            return self.direct_data_search(column, query, k).await;
+        }
         if !filtered
             && hidden_vector_index
             && vcfg.routing == config::VectorRouting::GlobalFineCentroid

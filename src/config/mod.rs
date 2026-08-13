@@ -271,6 +271,18 @@ const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
 const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
+/// Default beam width for `routing = direct_data`: the `ef` the resident
+/// HNSW graph is searched at — the recall/latency dial. Higher widens the
+/// beam: more recall, more per-query work. 128 ≈ 0.97 recall@10 on
+/// Cohere-1M; drop to 64 for ~0.95 at lower latency.
+const DEFAULT_VECTOR_DIRECT_DATA_EF: usize = 128;
+/// Default `ef_construction` for the `direct_data` HNSW build — the beam
+/// width used while inserting nodes. Higher builds a better-connected graph
+/// (same recall at a smaller search `ef`, so lower query latency) at a
+/// linearly higher one-time build cost and NO extra resident memory (degree
+/// is set by `m`, not this). 200 is the sweet spot for recall ~0.93–0.95;
+/// raising it mainly helps the >0.97 end.
+const DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION: usize = 200;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
 /// inside each selected cell. Small cells stay at this known-good minimum.
 const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
@@ -362,6 +374,13 @@ pub enum VectorRouting {
     /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
     /// cold-read win at scale, not at small scale — see `config.yaml`.
     GlobalFineCentroid,
+    /// EXPERIMENTAL (opt-in): walk a resident in-memory HNSW graph built over
+    /// every row's Sq16 rerank codes, bypassing the grid, cell selection, and
+    /// disk reads entirely. The graph and its `node -> doc_id` map are built
+    /// once on the first `direct_data` query and held resident on the table
+    /// handle; search walks it at `vector.direct_data_ef`. Small/mid-scale
+    /// experimental path — the whole index must fit in RAM.
+    DirectData,
 }
 
 /// Vector-index build / search / drain tuning knobs. Grouped so the
@@ -419,6 +438,15 @@ pub struct VectorSettings {
     /// clusters within each cell into contiguous reads. Ignored under
     /// `routing = stamped`.
     pub global_fine_coalesce: bool,
+    /// For `routing = direct_data`: the `ef` beam width the resident HNSW
+    /// graph is searched at. Ignored under any other routing.
+    pub direct_data_ef: usize,
+    /// For `routing = direct_data`: the `ef_construction` beam used when
+    /// building the resident HNSW (build-time only). Higher = better-
+    /// connected graph => lower query latency at fixed recall, at a linear
+    /// build cost and no extra resident memory. Ignored under any other
+    /// routing.
+    pub direct_data_ef_construction: usize,
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
@@ -490,6 +518,8 @@ impl Default for VectorSettings {
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
+            direct_data_ef: DEFAULT_VECTOR_DIRECT_DATA_EF,
+            direct_data_ef_construction: DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,
