@@ -1199,7 +1199,7 @@ impl ManifestSnapshot {
         self.list.as_ref()?.slow_vector_state_centroids.as_ref()
     }
 
-    /// The graph-sections sibling ref (persisted `direct_data` HNSW graphs),
+    /// The graph-sections sibling ref (persisted `hnsw` HNSW graphs),
     /// or `None` on manifests written before it existed or above the
     /// data-graph scale ceiling. Consumers fall back to the lazy build /
     /// scan path when absent.
@@ -1899,7 +1899,7 @@ impl ManifestSnapshot {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
-            // The `direct_data` graph ref, by contrast, IS carried forward:
+            // The `hnsw` graph ref, by contrast, IS carried forward:
             // the graph is a function of which stable doc ids exist, not how
             // they are packed, so it survives a repack. The post-drain /
             // post-compaction settle keys on the doc-id watermark to decide

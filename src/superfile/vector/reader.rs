@@ -1876,7 +1876,7 @@ impl VectorReader {
         Some((lo, flat - bases[lo]))
     }
 
-    /// Global-fine router scoring (`vector.routing = global_fine_centroid`):
+    /// Global-fine router scoring (`vector.search_mode = global_fine_centroid`):
     /// score `query` against EVERY fine centroid of every cell in this superfile,
     /// sourced from the resident centroid `section` (zero superfile opens —
     /// the routing scan is a pure RAM op over the page-cache-backed spill).

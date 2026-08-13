@@ -7567,7 +7567,7 @@ async fn previous_centroid_section(
     }
 }
 
-/// One-`u64` population key for the persisted `direct_data` graph — a
+/// One-`u64` population key for the persisted `hnsw` graph — a
 /// digest of *which rows exist*, independent of how they are packed into
 /// superfiles. Built from repack-invariant aggregates (row count, min and
 /// max stable id) plus the consolidated delete generation (the manifest's
@@ -7604,7 +7604,7 @@ fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
 }
 
 /// Encode + PUT a data bundle as a graph section, logging the outcome.
-async fn publish_direct_data_blob(
+async fn publish_hnsw_blob(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
@@ -7620,19 +7620,19 @@ async fn publish_direct_data_blob(
     match slow_vector_state::write_graph_section(storage, blob).await {
         Ok(reference) => {
             eprintln!(
-                "[supertable direct_data] published graph section: {} ({blob_mib} MiB)",
+                "[supertable hnsw] published graph section: {} ({blob_mib} MiB)",
                 reference.uri
             );
             Some(reference)
         }
         Err(error) => {
-            eprintln!("[supertable direct_data] publish failed: {error}");
+            eprintln!("[supertable hnsw] publish failed: {error}");
             None
         }
     }
 }
 
-/// Build and publish the persisted `direct_data` graph blob for a settled
+/// Build and publish the persisted `hnsw` graph blob for a settled
 /// generation, returning its manifest ref (`None` when nothing is
 /// persisted). Best-effort: any read/build/publish problem logs and
 /// returns `None` so the drain stamp is never blocked and the query falls
@@ -7640,16 +7640,16 @@ async fn publish_direct_data_blob(
 ///
 /// When the prior generation already persisted a graph and this settle only
 /// **appended** rows, the delta is inserted into a copy of that graph
-/// ([`assemble_direct_data_incremental`]) — work ∝ new rows, not the whole
+/// ([`assemble_hnsw_incremental`]) — work ∝ new rows, not the whole
 /// corpus. Otherwise (no prior graph, or a non-append change) it does a full
 /// rebuild. PUT-before-CAS: the blob is durable before the caller stamps the
 /// manifest ref, so a crash before the manifest CAS just orphans the blob
 /// (GC-reclaimed) and keeps serving the prior generation.
 ///
 /// Scope: the per-row **data** graph for the first vector column, gated by
-/// `vector.direct_data_max_docs`. The scale-free **centroid** graph is not
+/// `vector.hnsw_max_docs`. The scale-free **centroid** graph is not
 /// yet built here — the bundle carries an empty centroid section.
-async fn build_direct_data_graph_ref(
+async fn build_hnsw_graph_ref(
     storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
@@ -7659,19 +7659,19 @@ async fn build_direct_data_graph_ref(
         .first()
         .map(|vc| vc.column.clone())
     else {
-        eprintln!("[supertable direct_data] build skipped: no vector columns on this manifest");
+        eprintln!("[supertable hnsw] build skipped: no vector columns on this manifest");
         return None;
     };
     let total_docs: u64 = manifest.get_all_superfiles().iter().map(|e| e.n_docs).sum();
-    let max_docs = crate::config::global().vector.direct_data_max_docs;
+    let max_docs = crate::config::global().vector.hnsw_max_docs;
     eprintln!(
-        "[supertable direct_data] build hook: column={column} total_docs={total_docs} \
+        "[supertable hnsw] build hook: column={column} total_docs={total_docs} \
          max_docs={max_docs} superfiles={}",
         manifest.get_all_superfiles().len(),
     );
     if total_docs > max_docs {
         eprintln!(
-            "[supertable direct_data] build skipped: {total_docs} docs > direct_data_max_docs \
+            "[supertable hnsw] build skipped: {total_docs} docs > hnsw_max_docs \
              {max_docs} (data graph would exceed RAM)"
         );
         return None;
@@ -7692,7 +7692,7 @@ async fn build_direct_data_graph_ref(
         && let Some(prior_data) = sections.data
     {
         let prior_count = prior_data.doc_ids.len();
-        match crate::supertable::query::vector::assemble_direct_data_incremental(
+        match crate::supertable::query::vector::assemble_hnsw_incremental(
             manifest,
             &column,
             &None,
@@ -7703,58 +7703,52 @@ async fn build_direct_data_graph_ref(
         {
             Ok(Some((data_bundle, new_high_water, inserted))) => {
                 eprintln!(
-                    "[supertable direct_data] incremental: inserted {inserted} nodes into prior \
+                    "[supertable hnsw] incremental: inserted {inserted} nodes into prior \
                      graph ({prior_count} -> {} nodes), data_bundle={} MiB, wall {:.1}s",
                     prior_count + inserted,
                     data_bundle.len() / (1024 * 1024),
                     t0.elapsed().as_secs_f64(),
                 );
-                return publish_direct_data_blob(
-                    storage,
-                    population_key,
-                    new_high_water,
-                    &data_bundle,
-                )
-                .await;
+                return publish_hnsw_blob(storage, population_key, new_high_water, &data_bundle)
+                    .await;
             }
             Ok(None) => {
                 eprintln!(
-                    "[supertable direct_data] incremental not applicable (not a pure append); \
+                    "[supertable hnsw] incremental not applicable (not a pure append); \
                      full rebuild"
                 );
             }
             Err(error) => {
-                eprintln!("[supertable direct_data] incremental error ({error}); full rebuild");
+                eprintln!("[supertable hnsw] incremental error ({error}); full rebuild");
             }
         }
     }
 
     // Full rebuild.
-    let data_bundle = match crate::supertable::query::vector::assemble_direct_data_sections(
-        manifest, &column, &None,
-    )
-    .await
-    {
-        Ok(Some(bundle)) => bundle,
-        Ok(None) => {
-            eprintln!(
-                "[supertable direct_data] build skipped: no Sq16 rows assembled for column \
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_hnsw_sections(manifest, &column, &None)
+            .await
+        {
+            Ok(Some(bundle)) => bundle,
+            Ok(None) => {
+                eprintln!(
+                    "[supertable hnsw] build skipped: no Sq16 rows assembled for column \
                  `{column}` (column absent, not sq16, or empty)"
-            );
-            return None;
-        }
-        Err(error) => {
-            eprintln!("[supertable direct_data] build skipped: assemble error: {error}");
-            return None;
-        }
-    };
+                );
+                return None;
+            }
+            Err(error) => {
+                eprintln!("[supertable hnsw] build skipped: assemble error: {error}");
+                return None;
+            }
+        };
     eprintln!(
-        "[supertable direct_data] built graph (full): ~{total_docs} rows, data_bundle={} MiB, \
+        "[supertable hnsw] built graph (full): ~{total_docs} rows, data_bundle={} MiB, \
          wall {:.1}s",
         data_bundle.len() / (1024 * 1024),
         t0.elapsed().as_secs_f64(),
     );
-    publish_direct_data_blob(storage, population_key, high_water_now, &data_bundle).await
+    publish_hnsw_blob(storage, population_key, high_water_now, &data_bundle).await
 }
 
 pub(in crate::supertable) async fn stamp_slow_vector_state(
@@ -7806,13 +7800,13 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             }
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
-        // A settled generation still needs its `direct_data` graphs built
+        // A settled generation still needs its `hnsw` graphs built
         // whenever the graph ref is absent — even if the routing blob and
         // centroid section are byte-identical to what is already stamped
         // (the membership commit publishes those first, so the post-drain
         // refresh finds them unchanged). Without this the no-op below would
         // return before the graph is ever built.
-        // Resolve the `direct_data` graph ref for this stamp.
+        // Resolve the `hnsw` graph ref for this stamp.
         //
         //  - Mid-drain checkpoint (`pending_drain.is_some()`): carry the
         //    prior ref forward untouched; the rebuild happens at the final
@@ -7837,13 +7831,13 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             };
             if prior_key == Some(current_key) {
                 eprintln!(
-                    "[supertable direct_data] reuse: population key {current_key:#x} unchanged; \
+                    "[supertable hnsw] reuse: population key {current_key:#x} unchanged; \
                      keeping {}",
                     prior_graph.as_ref().map(|r| r.uri.as_str()).unwrap_or(""),
                 );
                 prior_graph.clone()
             } else {
-                build_direct_data_graph_ref(storage.as_ref(), &old).await
+                build_hnsw_graph_ref(storage.as_ref(), &old).await
             }
         };
         // No-op only when NOTHING changed — routing blob, centroid section,

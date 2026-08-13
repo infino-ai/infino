@@ -155,7 +155,7 @@ pub struct Manifest {
     /// manifests (consumers fall back to per-superfile centroid reads).
     pub slow_vector_state_centroids: Option<RoutingRef>,
     /// Graph-sections sibling of the slow-CAS state: one content-addressed
-    /// blob holding the persisted `direct_data` HNSW graphs — the per-row
+    /// blob holding the persisted `hnsw` HNSW graphs — the per-row
     /// data graph (present only when the table was within the data-graph
     /// scale ceiling at drain) and the fp32 centroid graph (any scale).
     /// Stamped and cleared together with the centroid ref; absent on older

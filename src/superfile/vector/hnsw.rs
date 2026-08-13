@@ -788,26 +788,26 @@ impl Hnsw {
     }
 }
 
-/// On-disk magic for a persisted `direct_data` bundle (graph + node→doc-id
+/// On-disk magic for a persisted `hnsw` bundle (graph + node→doc-id
 /// map + node-ordered Sq16 plane), the self-contained payload a resident
 /// data index is rebuilt from at open.
 const DIRECT_DATA_MAGIC: &[u8; 8] = b"INFDDG01";
 
-/// A `direct_data` resident index rebuilt from a persisted bundle: the Sq16
+/// A `hnsw` resident index rebuilt from a persisted bundle: the Sq16
 /// scorer over the node-ordered code plane, the walkable graph, and the
 /// `node_index -> stable doc id` map.
-pub(crate) struct DirectDataIndex {
+pub(crate) struct HnswIndex {
     pub scorer: Sq16Scorer,
     pub graph: Hnsw,
     pub doc_ids: Vec<i128>,
     pub dim: usize,
 }
 
-/// Serialize a `direct_data` index to a persistable byte bundle: header,
+/// Serialize a `hnsw` index to a persistable byte bundle: header,
 /// the `node -> stable doc id` map, the node-ordered Sq16 code plane, and
 /// the graph section. The Sq16 plane is carried inline so the bundle is
 /// self-contained — reopening needs nothing but these bytes.
-pub(crate) fn encode_direct_data(
+pub(crate) fn encode_hnsw(
     sq16_codes: &[u8],
     doc_ids: &[i128],
     graph: &Hnsw,
@@ -830,10 +830,10 @@ pub(crate) fn encode_direct_data(
     out
 }
 
-/// Rebuild a resident [`DirectDataIndex`] from [`encode_direct_data`].
+/// Rebuild a resident [`HnswIndex`] from [`encode_hnsw`].
 /// Returns `None` on any malformation so the caller falls back to the lazy
 /// build or scan path rather than failing the query.
-pub(crate) fn decode_direct_data(bytes: &[u8]) -> Option<DirectDataIndex> {
+pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
     let mut c = Cursor::new(bytes);
     if c.take(DIRECT_DATA_MAGIC.len())? != DIRECT_DATA_MAGIC {
         return None;
@@ -856,7 +856,7 @@ pub(crate) fn decode_direct_data(bytes: &[u8]) -> Option<DirectDataIndex> {
         return None;
     }
     let scorer = Sq16Scorer::from_codes(plane, dim, n);
-    Some(DirectDataIndex {
+    Some(HnswIndex {
         scorer,
         graph,
         doc_ids,
@@ -886,7 +886,7 @@ pub(crate) const GRAPH_BUNDLE_HEADER_BYTES: usize = GRAPH_BUNDLE_MAGIC.len() + 8
 /// The graph sections carried in one slow-state blob, as raw bytes, plus
 /// the population key and high-water id they cover. `centroid_graph` is a
 /// bare [`Hnsw::to_bytes`] over the fp32 fine centroids (present at any
-/// scale). `data_bundle` is an [`encode_direct_data`] payload (graph +
+/// scale). `data_bundle` is an [`encode_hnsw`] payload (graph +
 /// Sq16 plane + node→stable-doc-id map), present only when the table's doc
 /// count is within the data-graph scale ceiling. Full-projection queries
 /// resolve each hit's stable id to its live `(superfile, local)` through
@@ -1483,7 +1483,7 @@ mod tests {
     }
 
     /// The `from_codes` path — adopting an already-encoded flat Sq16 code
-    /// buffer (exactly what `build_direct_data_index` feeds from the on-disk
+    /// buffer (exactly what `build_hnsw_index` feeds from the on-disk
     /// `full[]` plane) — must produce a graph identical to encoding the same
     /// vectors through `from_unit_vectors`. This pins the resident-index
     /// build's code path: raw Sq16 bytes in, same search out.
@@ -1599,11 +1599,11 @@ mod tests {
         assert_eq!(found[0].0, new_node, "appended node must be reachable");
     }
 
-    /// A full `direct_data` bundle (graph + node→doc-id map + Sq16 plane)
+    /// A full `hnsw` bundle (graph + node→doc-id map + Sq16 plane)
     /// round-trips: the rebuilt index searches identically and maps nodes
     /// back to the same stable doc ids.
     #[test]
-    fn direct_data_bundle_roundtrip() {
+    fn hnsw_bundle_roundtrip() {
         use crate::superfile::vector::distance::encode_sq16_row;
         let dim = 24;
         let n = 1200;
@@ -1618,8 +1618,8 @@ mod tests {
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
-        let bytes = encode_direct_data(&codes, &doc_ids, &graph, dim);
-        let idx = decode_direct_data(&bytes).expect("decode bundle");
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim);
+        let idx = decode_hnsw(&bytes).expect("decode bundle");
         assert_eq!(idx.dim, dim);
         assert_eq!(idx.doc_ids, doc_ids);
         assert_eq!(idx.graph.len(), n);
@@ -1634,7 +1634,7 @@ mod tests {
                 assert_eq!(idx.doc_ids[*node as usize], doc_ids[*node as usize]);
             }
         }
-        assert!(decode_direct_data(b"short").is_none());
+        assert!(decode_hnsw(b"short").is_none());
     }
 
     /// The combined graph bundle frames its sections losslessly, including

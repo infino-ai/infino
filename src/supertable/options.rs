@@ -410,7 +410,7 @@ pub struct SupertableOptions {
     /// temp-file spill instead of per-cell object-store reads.
     pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
     /// Single-slot cache for the slow-CAS graph sections (the persisted
-    /// `direct_data` data + centroid HNSW graphs), shared by every manifest
+    /// `hnsw` data + centroid HNSW graphs), shared by every manifest
     /// snapshot of this handle and keyed by the section's content-addressed
     /// URI. Serves the resident graph walk without rebuilding at query time;
     /// a new drain generation publishes a new URI and replaces it.

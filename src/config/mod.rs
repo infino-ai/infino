@@ -267,30 +267,30 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
-/// Default fine-cluster fanout for `routing = global_fine_centroid`.
+/// Default fine-cluster fanout for `search_mode = global_fine_centroid`.
 const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
-/// Default exact-rerank over-fetch for `routing = global_fine_centroid` —
+/// Default exact-rerank over-fetch for `search_mode = global_fine_centroid` —
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
 const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
-/// Default floor for the `direct_data` search-`ef` law — the minimum beam
+/// Default floor for the `hnsw` search-`ef` law — the minimum beam
 /// width and the exact `ef` at the `k = 10` anchor (`128 ≈ 0.97 recall@10`
 /// on Cohere-1M). The full law is
 /// `ef = max(k, clamp(ceil(k × ef_mult), ef_floor, ef_ceil))`.
 const DEFAULT_VECTOR_DIRECT_DATA_EF_FLOOR: usize = 128;
-/// Default per-`k` beam multiplier for the `direct_data` ef law (integer).
+/// Default per-`k` beam multiplier for the `hnsw` ef law (integer).
 /// At the `k = 10` anchor `10 × 10 = 100` clamps up to the 128 floor.
 const DEFAULT_VECTOR_DIRECT_DATA_EF_MULT: usize = 10;
-/// Default upper clamp on the scaled `direct_data` search `ef`.
+/// Default upper clamp on the scaled `hnsw` search `ef`.
 const DEFAULT_VECTOR_DIRECT_DATA_EF_CEIL: usize = 512;
-/// Default `ef_construction` for the `direct_data` HNSW build — the beam
+/// Default `ef_construction` for the `hnsw` HNSW build — the beam
 /// width used while inserting nodes. Higher builds a better-connected graph
 /// (same recall at a smaller search `ef`, so lower query latency) at a
 /// linearly higher one-time build cost and NO extra resident memory (degree
 /// is set by `m`, not this). 200 is the sweet spot for recall ~0.93–0.95;
 /// raising it mainly helps the >0.97 end.
 const DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION: usize = 200;
-/// Default scale ceiling for the `direct_data` **data** graph: the resident
+/// Default scale ceiling for the `hnsw` **data** graph: the resident
 /// per-row HNSW is built (at drain) and persisted only when the table's doc
 /// count is at or below this. Above it, the whole-corpus graph would not fit
 /// in RAM, so only the (far smaller) centroid graph is built and the query
@@ -374,16 +374,16 @@ pub enum DrainConsolidate {
     Splice,
 }
 
-/// Query routing for the hidden vector index on the UNFILTERED path.
-/// Selected by `vector.routing`. Filtered queries and pre-drain user
+/// Query search mode for the hidden vector index on the UNFILTERED path.
+/// Selected by `vector.search_mode`. Filtered queries and pre-drain user
 /// tables always take the stamped grid path regardless of this setting.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum VectorRouting {
+pub enum VectorSearchMode {
     /// Grid routing to cells, then the manifest's stamped per-cell width
-    /// (default). The established path.
+    /// (default). The established IVF cell-scan path.
     #[default]
-    Stamped,
+    Ivf,
     /// EXPERIMENTAL (opt-in): score every fine centroid globally and read the
     /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
     /// cold-read win at scale, not at small scale — see `config.yaml`.
@@ -391,10 +391,10 @@ pub enum VectorRouting {
     /// EXPERIMENTAL (opt-in): walk a resident in-memory HNSW graph built over
     /// every row's Sq16 rerank codes, bypassing the grid, cell selection, and
     /// disk reads entirely. The graph and its `node -> doc_id` map are built
-    /// once on the first `direct_data` query and held resident on the table
+    /// once on the first `hnsw` query and held resident on the table
     /// handle; search walks it at the `k`-scaled `ef` law. Small/mid-scale
     /// experimental path — the whole index must fit in RAM.
-    DirectData,
+    Hnsw,
 }
 
 /// Vector-index build / search / drain tuning knobs. Grouped so the
@@ -436,47 +436,48 @@ pub struct VectorSettings {
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
     pub kmeans_pts_per_centroid: usize,
-    /// Query routing for the hidden vector index (unfiltered path). Default
-    /// `stamped`; `global_fine_centroid` is experimental (see [`VectorRouting`]).
-    pub routing: VectorRouting,
-    /// For `routing = global_fine_centroid`: number of fine clusters the
+    /// Query search mode for the hidden vector index (unfiltered path).
+    /// Default `ivf`; `global_fine_centroid` is experimental (see
+    /// [`VectorSearchMode`]).
+    pub search_mode: VectorSearchMode,
+    /// For `search_mode = global_fine_centroid`: number of fine clusters the
     /// query reads (globally scored, clamped to the table's total). See
-    /// `config.yaml` for sizing guidance. Ignored under `routing = stamped`.
+    /// `config.yaml` for sizing guidance. Ignored under `search_mode = ivf`.
     pub global_fine_fanout: usize,
-    /// For `routing = global_fine_centroid`: the exact-rerank over-fetch
+    /// For `search_mode = global_fine_centroid`: the exact-rerank over-fetch
     /// multiplier for this path specifically (a caller-set `rerank_mult`
     /// still wins). Scoped here rather than the shared default so tuning
-    /// it never touches the stamped / filtered / user-table paths.
+    /// it never touches the ivf / filtered / user-table paths.
     pub global_fine_rerank_mult: usize,
-    /// For `routing = global_fine_centroid`: coalesce the selected
+    /// For `search_mode = global_fine_centroid`: coalesce the selected
     /// clusters within each cell into contiguous reads. Ignored under
-    /// `routing = stamped`.
+    /// `search_mode = ivf`.
     pub global_fine_coalesce: bool,
-    /// For `routing = direct_data`: the search `ef` is scaled from `k` as
+    /// For `search_mode = hnsw`: the search `ef` is scaled from `k` as
     /// `ef = max(k, clamp(k × ef_mult, ef_floor, ef_ceil))` — all integer.
     /// This is the floor: the minimum beam width, and the effective `ef` at
     /// the `k = 10` anchor (`10 × 10 = 100`, clamped up to the 128 floor).
-    /// Ignored under any other routing.
-    pub direct_data_ef_floor: usize,
-    /// For `routing = direct_data`: the per-`k` beam multiplier in the ef law
+    /// Ignored under any other search mode.
+    pub hnsw_ef_floor: usize,
+    /// For `search_mode = hnsw`: the per-`k` beam multiplier in the ef law
     /// above. Integer (≥ 1); the floor pins the small-`k` anchor, so no
-    /// fractional multiplier is needed. Ignored under any other routing.
-    pub direct_data_ef_mult: usize,
-    /// For `routing = direct_data`: the upper clamp on the scaled `ef`.
-    /// Ignored under any other routing.
-    pub direct_data_ef_ceil: usize,
-    /// For `routing = direct_data`: the `ef_construction` beam used when
+    /// fractional multiplier is needed. Ignored under any other search mode.
+    pub hnsw_ef_mult: usize,
+    /// For `search_mode = hnsw`: the upper clamp on the scaled `ef`.
+    /// Ignored under any other search mode.
+    pub hnsw_ef_ceil: usize,
+    /// For `search_mode = hnsw`: the `ef_construction` beam used when
     /// building the resident HNSW (build-time only). Higher = better-
     /// connected graph => lower query latency at fixed recall, at a linear
     /// build cost and no extra resident memory. Ignored under any other
-    /// routing.
-    pub direct_data_ef_construction: usize,
-    /// For `routing = direct_data`: scale ceiling for the per-row **data**
+    /// search mode.
+    pub hnsw_ef_construction: usize,
+    /// For `search_mode = hnsw`: scale ceiling for the per-row **data**
     /// graph. The resident data HNSW is built at drain and persisted only
     /// when the table's doc count ≤ this; above it, only the centroid graph
-    /// is built and `direct_data` queries fall back to the scan path. The
+    /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
-    pub direct_data_max_docs: u64,
+    pub hnsw_max_docs: u64,
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
@@ -544,15 +545,15 @@ impl Default for VectorSettings {
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
-            routing: VectorRouting::Stamped,
+            search_mode: VectorSearchMode::Ivf,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
-            direct_data_ef_floor: DEFAULT_VECTOR_DIRECT_DATA_EF_FLOOR,
-            direct_data_ef_mult: DEFAULT_VECTOR_DIRECT_DATA_EF_MULT,
-            direct_data_ef_ceil: DEFAULT_VECTOR_DIRECT_DATA_EF_CEIL,
-            direct_data_ef_construction: DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION,
-            direct_data_max_docs: DEFAULT_VECTOR_DIRECT_DATA_MAX_DOCS,
+            hnsw_ef_floor: DEFAULT_VECTOR_DIRECT_DATA_EF_FLOOR,
+            hnsw_ef_mult: DEFAULT_VECTOR_DIRECT_DATA_EF_MULT,
+            hnsw_ef_ceil: DEFAULT_VECTOR_DIRECT_DATA_EF_CEIL,
+            hnsw_ef_construction: DEFAULT_VECTOR_DIRECT_DATA_EF_CONSTRUCTION,
+            hnsw_max_docs: DEFAULT_VECTOR_DIRECT_DATA_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,
@@ -888,18 +889,18 @@ impl Config {
     /// panicking or misbehaving at query time.
     fn validate(&self) -> Result<(), ConfigError> {
         let v = &self.vector;
-        // `.clamp(ef_floor, ef_ceil)` in the direct_data ef law PANICS if
+        // `.clamp(ef_floor, ef_ceil)` in the hnsw ef law PANICS if
         // `ef_floor > ef_ceil`; reject an inverted range here.
-        if v.direct_data_ef_floor > v.direct_data_ef_ceil {
+        if v.hnsw_ef_floor > v.hnsw_ef_ceil {
             return Err(ConfigError::Invalid(format!(
-                "vector.direct_data_ef_floor ({}) must be <= vector.direct_data_ef_ceil ({})",
-                v.direct_data_ef_floor, v.direct_data_ef_ceil
+                "vector.hnsw_ef_floor ({}) must be <= vector.hnsw_ef_ceil ({})",
+                v.hnsw_ef_floor, v.hnsw_ef_ceil
             )));
         }
-        if v.direct_data_ef_mult < 1 {
+        if v.hnsw_ef_mult < 1 {
             return Err(ConfigError::Invalid(format!(
-                "vector.direct_data_ef_mult must be >= 1, got {}",
-                v.direct_data_ef_mult
+                "vector.hnsw_ef_mult must be >= 1, got {}",
+                v.hnsw_ef_mult
             )));
         }
         Ok(())
@@ -961,21 +962,21 @@ mod tests {
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
     }
 
-    /// The `direct_data` ef-law knobs default to the measured anchor, and
+    /// The `hnsw` ef-law knobs default to the measured anchor, and
     /// validation rejects an inverted floor/ceil (which would panic
     /// `.clamp` at query time) or a non-positive multiplier.
     #[test]
-    fn direct_data_ef_law_config_validates() {
+    fn hnsw_ef_law_config_validates() {
         let cfg = Config::defaults().expect("defaults parse");
-        assert_eq!(cfg.vector.direct_data_ef_floor, 128);
-        assert_eq!(cfg.vector.direct_data_ef_ceil, 512);
-        assert_eq!(cfg.vector.direct_data_ef_mult, 10);
+        assert_eq!(cfg.vector.hnsw_ef_floor, 128);
+        assert_eq!(cfg.vector.hnsw_ef_ceil, 512);
+        assert_eq!(cfg.vector.hnsw_ef_mult, 10);
 
         let inverted =
             Figment::new()
                 .merge(Yaml::string(EMBEDDED_DEFAULT))
                 .merge(Serialized::defaults(json!({
-                    "vector": { "direct_data_ef_floor": 600, "direct_data_ef_ceil": 512 }
+                    "vector": { "hnsw_ef_floor": 600, "hnsw_ef_ceil": 512 }
                 })));
         let err = Config::from_figment(inverted).expect_err("inverted range must fail");
         assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
@@ -984,7 +985,7 @@ mod tests {
             Figment::new()
                 .merge(Yaml::string(EMBEDDED_DEFAULT))
                 .merge(Serialized::defaults(json!({
-                    "vector": { "direct_data_ef_mult": 0 }
+                    "vector": { "hnsw_ef_mult": 0 }
                 })));
         let err = Config::from_figment(bad_mult).expect_err("zero mult must fail");
         assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");

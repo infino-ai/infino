@@ -538,8 +538,8 @@ async fn write_blob_and_section(
     })
 }
 
-/// Content-address and PUT one `direct_data` graph section (the opaque
-/// bytes produced by `hnsw::encode_direct_data` for the data graph, or
+/// Content-address and PUT one `hnsw` graph section (the opaque
+/// bytes produced by `hnsw::encode_hnsw` for the data graph, or
 /// `Hnsw::to_bytes` for the centroid graph), returning its
 /// [`RoutingRef`]. A separate content-addressed object per section,
 /// exactly like the centroid section — the manifest carries the ref, GC
@@ -554,7 +554,7 @@ pub(crate) async fn write_graph_section(
 
 /// Fetch a graph section written by [`write_graph_section`], verifying its
 /// bytes hash to `reference.content_hash`. Returns the raw section bytes
-/// (the caller decodes them with `hnsw::decode_direct_data` /
+/// (the caller decodes them with `hnsw::decode_hnsw` /
 /// `Hnsw::from_bytes`). Striped like every other slow-state fetch. Callers
 /// fall back to the lazy build / scan path on any error — a bad or missing
 /// graph blob must never fail an open or a query.
@@ -592,7 +592,7 @@ pub(crate) async fn fetch_graph_header(
 /// drain generation publishes a new URI and replaces it), mirroring
 /// [`CentroidSection`].
 ///
-/// `data` is the self-contained per-row `direct_data` index (graph + Sq16
+/// `data` is the self-contained per-row `hnsw` index (graph + Sq16
 /// plane + node→doc-id map), present only when the table was within the
 /// data-graph scale ceiling at drain. `centroid_graph` is the HNSW over the
 /// fp32 fine centroids (present at any scale); its node-ordered centroid
@@ -602,7 +602,7 @@ pub(crate) struct ResidentGraphSections {
     /// Largest stable doc id the graph covers (the append-delta boundary an
     /// incremental drain inserts past).
     pub high_water_id: i128,
-    pub data: Option<hnsw::DirectDataIndex>,
+    pub data: Option<hnsw::HnswIndex>,
     pub centroid_graph: Option<hnsw::Hnsw>,
 }
 
@@ -617,10 +617,7 @@ pub(crate) async fn fetch_graph_sections(
     let raw = fetch_graph_section(storage, reference).await?;
     let bundle = hnsw::decode_graph_bundle(&raw)
         .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
-    let data = bundle
-        .data_bundle
-        .as_deref()
-        .and_then(hnsw::decode_direct_data);
+    let data = bundle.data_bundle.as_deref().and_then(hnsw::decode_hnsw);
     Ok(ResidentGraphSections {
         uri: reference.uri.clone(),
         high_water_id: bundle.high_water_id,

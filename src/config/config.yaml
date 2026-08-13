@@ -159,9 +159,9 @@ vector:
   # count — cluster size is set by the drain's byte-target n_cent.)
   kmeans_pts_per_centroid: 64
 
-  # Query routing for the hidden vector index on the UNFILTERED path.
-  # (Filtered queries and pre-drain user tables always use `stamped`.)
-  #   stamped              — grid routing to cells, then the manifest's
+  # Query search mode for the hidden vector index on the UNFILTERED path.
+  # (Filtered queries and pre-drain user tables always use `ivf`.)
+  #   ivf                  — grid routing to cells, then the manifest's
   #                          stamped per-cell width. The default, established path.
   #   global_fine_centroid — EXPERIMENTAL: score every fine centroid globally
   #                          across all cells and read the top fanout clusters,
@@ -170,54 +170,54 @@ vector:
   #                          (10M+); at small scale it can cost recall/latency
   #                          for no cold benefit. Opt-in while the per-table
   #                          fanout stamp is built.
-  #   direct_data          — EXPERIMENTAL: walk a resident in-memory HNSW graph
+  #   hnsw                 — EXPERIMENTAL: walk a resident in-memory HNSW graph
   #                          built over every row's Sq16 rerank codes, bypassing
-  #                          the grid, cell selection, and disk reads. The graph
-  #                          and its node->doc_id map are built once on the first
-  #                          direct_data query and held resident; search walks it
-  #                          at a k-scaled ef. The whole index must fit in RAM.
-  routing: stamped
+  #                          the grid, cell selection, and disk reads. Built at
+  #                          drain and held resident; the user/pre-drain arm and
+  #                          any corpus over hnsw_max_docs fall back to ivf.
+  #                          The whole index must fit in RAM.
+  search_mode: ivf
 
-  # For routing = global_fine_centroid: the NUMBER of fine clusters the
+  # For search_mode = global_fine_centroid: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
   # total. Higher reads more clusters — more cold bytes, higher recall.
   # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
   # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
-  # pending a per-table calibrated stamp. Ignored under routing = stamped.
+  # pending a per-table calibrated stamp. Ignored under search_mode = ivf.
   global_fine_fanout: 1024
 
-  # For routing = global_fine_centroid: exact-rerank over-fetch multiplier
+  # For search_mode = global_fine_centroid: exact-rerank over-fetch multiplier
   # for this path only (a caller-set rerank_mult still wins). Scoped here so
-  # tuning it never touches the stamped / filtered / user-table defaults.
+  # tuning it never touches the ivf / filtered / user-table defaults.
   global_fine_rerank_mult: 128
 
-  # For routing = global_fine_centroid: coalesce the selected clusters
-  # within each cell into contiguous reads. Ignored under routing = stamped.
+  # For search_mode = global_fine_centroid: coalesce the selected clusters
+  # within each cell into contiguous reads. Ignored under search_mode = ivf.
   global_fine_coalesce: false
 
-  # For routing = direct_data: the search ef is scaled from k as
+  # For search_mode = hnsw: the search ef is scaled from k as
   #   ef = max(k, clamp(k * ef_mult, ef_floor, ef_ceil))    # all integer
   # ef_floor is the minimum beam width and the effective ef at the k=10
   # anchor (10*10=100 clamps up to 128 ~ 0.97 recall@10 on Cohere-1M).
   # ef_mult (integer >= 1) scales the beam with k; ef_ceil caps it at large
-  # k. Ignored under any other routing.
-  direct_data_ef_floor: 128
-  direct_data_ef_mult: 10
-  direct_data_ef_ceil: 512
+  # k. Ignored under any other search mode.
+  hnsw_ef_floor: 128
+  hnsw_ef_mult: 10
+  hnsw_ef_ceil: 512
 
-  # For routing = direct_data: the ef_construction beam used to BUILD the
+  # For search_mode = hnsw: the ef_construction beam used to BUILD the
   # resident HNSW (build-time only, not per query). Higher = better-connected
   # graph => same recall at a smaller search beam => lower query latency, at a
   # linearly higher one-time build cost and NO extra resident memory. 200 is
   # the sweet spot for recall ~0.93-0.95; raise it only to push the >0.97 end.
-  direct_data_ef_construction: 200
+  hnsw_ef_construction: 200
 
-  # For routing = direct_data: scale ceiling for the per-row DATA graph. The
+  # For search_mode = hnsw: scale ceiling for the per-row DATA graph. The
   # resident data HNSW is built at drain and persisted only when the table's
   # doc count is at or below this; above it, only the (much smaller) centroid
-  # graph is built and direct_data queries fall back to the scan path. ~10M
+  # graph is built and hnsw queries fall back to the scan path. ~10M
   # rows of Sq16 codes is the practical single-host resident ceiling.
-  direct_data_max_docs: 10000000
+  hnsw_max_docs: 10000000
 
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
