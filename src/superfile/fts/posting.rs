@@ -307,6 +307,21 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest_doc_ids: &mut [u32]) -> usize {
             "decode_block_doc_ids: bytes shorter than header+tfs"
         );
         let words = &bytes[HEADER_SIZE..bytes.len() - tfs_size];
+        // Bounds safety: `j` advances once per set bit, so it is bounded by
+        // `popcount(words)`, and the `dest_doc_ids[j]` writes carry no per-bit
+        // bounds check on this hot decode loop because two invariants keep that
+        // popcount ≤ `BLOCK_LEN`:
+        //   1. The builder sets exactly `doc_count` bits (≤ `BLOCK_LEN`, the
+        //      per-block cap) when it encodes a bitset block, so a well-formed
+        //      block has `popcount == count ≤ BLOCK_LEN`.
+        //   2. Decode only ever runs on CRC-validated bytes: the postings
+        //      region's checksum is verified in `SuperfileReader::open` before
+        //      any block is decoded, so a corrupted bitmap — which could carry
+        //      extra set bits — is rejected at open and never reaches here.
+        // The `debug_assert_eq!(j, count)` below is the test/debug tripwire that
+        // fires if a future builder change ever breaks invariant 1. This bound
+        // depends on invariant 2: if a path is ever added that decodes blocks
+        // before validating their CRC, a `j < BLOCK_LEN` bound becomes mandatory.
         let mut j = 0usize;
         for (wi, chunk) in words.chunks_exact(8).enumerate() {
             let mut word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
