@@ -767,8 +767,12 @@ const WIDTH_LAW_CONFIDENCE_Z: f64 = 1.645;
 /// the unbiased estimate — and leave the proof margin to the
 /// higher-k knots, which the monotone floor and the interpolator's
 /// clamp already propagate downward at query time.
-const WIDTH_LAW_LB_MIN_EVIDENCE: f64 =
-    (1.0 + WIDTH_LAW_CONFIDENCE_Z) / (1.0 - WIDTH_LAW_TARGET_COVERAGE);
+/// Integer because the quantity it gates — `support × k` — is a count of
+/// observations. Comparing counts against a count keeps the discrete
+/// boundary legible (265 here) instead of leaving a `.5` threshold in a
+/// float compare.
+const WIDTH_LAW_LB_MIN_EVIDENCE: usize =
+    ((1.0 + WIDTH_LAW_CONFIDENCE_Z) / (1.0 - WIDTH_LAW_TARGET_COVERAGE)).ceil() as usize;
 
 /// Rerank-law distractor pool: each calibration query counts 1-bit-estimate
 /// distractors only within its `RERANK_LAW_POOL_CELLS` grid-nearest cells —
@@ -1527,7 +1531,8 @@ impl WidthLawCalibration {
             // evidence for the bound to be a measurement rather than a
             // max-statistic (see [`WIDTH_LAW_LB_MIN_EVIDENCE`]); thin knots
             // (k = 1 at the standard sample) stamp the raw-mean crossing.
-            let lb_certifiable = n * WIDTH_LAW_KS[ki] as f64 >= WIDTH_LAW_LB_MIN_EVIDENCE;
+            let evidence = support[ki].saturating_mul(WIDTH_LAW_KS[ki]);
+            let lb_certifiable = evidence >= WIDTH_LAW_LB_MIN_EVIDENCE;
             if let Some(rank) = sums.iter().enumerate().position(|(rank, &s)| {
                 if !lb_certifiable {
                     return s >= target;
