@@ -432,3 +432,70 @@ async fn phrase_and_rare_term_two_phase_agrees() {
         "two-phase AND count for phrase + rare term"
     );
 }
+
+/// The two-phase phrase AND at scale, where the phrase members are **dense**
+/// and therefore BITSET-encoded (the shape the optimization exists for). The
+/// small corpus above keeps members in single PACKED/inline blocks; here `the`
+/// and `who` appear in every one of a few thousand docs, so their posting lists
+/// are stored as bitset blocks. That exercises the path the small test can't:
+/// `approx_seek` confirming a member by `contains` bit-test on a bitset block
+/// (no decode), then `verify_at_aligned` → `materialize_at` decoding that same
+/// bitset block only for the aligned survivors. Cross-checked against the
+/// brute-force oracle for ids and count.
+#[tokio::test]
+async fn two_phase_phrase_with_dense_bitset_members_agrees() {
+    // Every doc holds `who` and `the` (dense ⇒ bitset members) but not adjacent
+    // as "the who"; the phrase is planted only on every 13th doc, and the rare
+    // co-term `uk` on every 40th. A doc matches `+"the who" +uk` iff both land,
+    // i.e. every lcm(13,40)=520th doc.
+    const N_DOCS: u64 = 2600;
+    const PHRASE_STRIDE: u64 = 13;
+    const UK_STRIDE: u64 = 40;
+    let owned: Vec<(u64, String)> = (0..N_DOCS)
+        .map(|d| {
+            // Base: `who` and `the` present but separated ⇒ no "the who".
+            let mut s = format!("who a{d} the b{d}");
+            if d.is_multiple_of(PHRASE_STRIDE) {
+                // Plant an adjacent "the who" at the front.
+                s = format!("the who {s}");
+            }
+            if d.is_multiple_of(UK_STRIDE) {
+                s.push_str(" uk");
+            }
+            (d, s)
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+
+    let terms = vec!["uk"];
+    let phrases = vec![vec!["the".to_string(), "who".to_string()]];
+    let owned_terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+
+    let want: HashSet<u64> = oracle
+        .top_k_atoms(&owned_terms, &phrases, &[], &[], &[], &[], refs.len())
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    // Independent structural expectation: multiples of lcm(13, 40) = 520.
+    let expected: HashSet<u64> = (0..N_DOCS).filter(|d| d.is_multiple_of(520)).collect();
+    assert_eq!(want, expected, "oracle sanity for dense +\"the who\" +uk");
+    assert!(!want.is_empty(), "corpus must plant some matches");
+
+    let ids = r
+        .atoms_match_ids("title", &terms, &phrases, BoolMode::And)
+        .await
+        .expect("atoms_match_ids")
+        .0;
+    let got: HashSet<u64> = ids.into_iter().map(u64::from).collect();
+    assert_eq!(got, want, "dense two-phase AND ids");
+
+    let count = r
+        .atoms_match_count("title", &terms, &phrases, BoolMode::And, &[], &[])
+        .await
+        .expect("atoms_match_count")
+        .0;
+    assert_eq!(count as usize, want.len(), "dense two-phase AND count");
+}

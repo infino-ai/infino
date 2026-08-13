@@ -405,7 +405,11 @@ mod tests {
     use bytes::Bytes;
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+    use crate::superfile::fts::{
+        builder::FtsBuilder,
+        posting::{self, ENCODING_BITSET, ENCODING_PACKED},
+        tokenize::AsciiLowerTokenizer,
+    };
 
     #[tokio::test]
     async fn token_match_or_unions_and_intersects_unranked() {
@@ -511,7 +515,7 @@ mod tests {
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc
-            if i % 2 == 0 {
+            if i.is_multiple_of(2) {
                 text.push_str("beta ");
             }
             if i % 3 == 0 {
@@ -627,6 +631,95 @@ mod tests {
                 .0,
             u64::from(N_DOCS.div_ceil(2))
         );
+    }
+
+    #[tokio::test]
+    async fn count_kernels_handle_a_mixed_encoding_term() {
+        // A term that is dense early (near-consecutive doc ids ⇒ BITSET blocks)
+        // and sparse later (strided ⇒ PACKED blocks) has *both* block encodings
+        // in one posting list. The per-block encoding dispatch in the union
+        // (`or_cursor_into_bitset`), the membership probe (`TermCursor::contains`
+        // advancing across a bitset→packed boundary), and the doc-id decode must
+        // each pick the right branch block by block. Uniform-stride corpora
+        // never produce this, so drive it explicitly and cross-check every count
+        // kernel against `token_match`'s independent flat-merge length.
+        const DENSE_END: u32 = 256; // docs 0..256 hold `mix` every doc → BITSET
+        const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
+        const N_DOCS: u32 = 4200;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("common "); // every doc → dense partner
+            if i % 2 == 0 {
+                text.push_str("even "); // every other doc → dense, non-dominant
+            }
+            let mix = i < DENSE_END || (i - DENSE_END).is_multiple_of(SPARSE_STRIDE);
+            if mix {
+                text.push_str("mix ");
+            }
+            if i.is_multiple_of(37) {
+                text.push_str("rareb "); // sparse ⇒ AND stays below the density gate
+            }
+            text.push_str(&format!("f{}", i % 50));
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Prove `mix` really has both encodings — else the test silently checks
+        // nothing about the transition.
+        let cursors = r
+            .build_term_cursors(0, &["mix"], None, true)
+            .await
+            .expect("build cursors");
+        let mix = &cursors[0];
+        let (mut saw_bitset, mut saw_packed) = (false, false);
+        for blk in mix.blocks.iter() {
+            match mix.bytes.as_ref()[blk.block_byte_offset + posting::ENCODING_OFF] {
+                ENCODING_BITSET => saw_bitset = true,
+                ENCODING_PACKED => saw_packed = true,
+                other => panic!("unexpected encoding byte {other}"),
+            }
+        }
+        assert!(
+            saw_bitset && saw_packed,
+            "`mix` must carry both BITSET and PACKED blocks (bitset={saw_bitset}, packed={saw_packed})"
+        );
+
+        // Every count kernel over the mixed term must agree with the flat-merge.
+        // - `mix` alone: doc-id decode across mixed blocks.
+        // - `mix ∪ even`: dense union, neither dominant ⇒ `or_count_bitset` →
+        //   `or_cursor_into_bitset` takes both the word-copy and scatter branches.
+        // - `mix ∩ common`: `common` dominates → membership walk probes `mix`
+        //   (`contains`) across the bitset→packed boundary.
+        // - `mix ∩ rareb`: rarest is sparse ⇒ membership drives by `rareb` and
+        //   probes `mix`, again crossing the encoding boundary.
+        let cases: &[(&[&str], BoolMode)] = &[
+            (&["mix"], BoolMode::Or),
+            (&["mix", "even"], BoolMode::Or),
+            (&["mix", "common"], BoolMode::And),
+            (&["mix", "rareb"], BoolMode::And),
+            (&["mix", "even", "common"], BoolMode::And),
+        ];
+        for (tokens, mode) in cases {
+            let merge_len = r
+                .token_match("body", tokens, *mode)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", tokens, *mode)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(
+                count, merge_len,
+                "mixed-encoding count for {tokens:?} {mode:?}"
+            );
+        }
     }
 
     #[tokio::test]
