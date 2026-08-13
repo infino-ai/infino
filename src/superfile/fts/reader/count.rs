@@ -723,6 +723,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intersection_count_edges_across_the_density_gate() {
+        // Dispatch edges in `count_and_intersect`: the density-gate boundary
+        // (bitset-AND just above, membership just below `min_df*DIVISOR >=
+        // max_doc`), a single-cursor AND, and inline (df=1) cursors in both an
+        // intersection (`contains` inline branch, true and false) and a dense
+        // union (`or_cursor_into_bitset` inline branch). All cross-checked
+        // against `token_match`'s independent flat-merge length.
+        const N_DOCS: u32 = 4096; // max doc id 4095
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("common"); // every doc
+            text.push_str(if i.is_multiple_of(2) { " even" } else { " odd" });
+            // `gatehi` in 256 docs (df*16 = 4096 ≥ 4095 ⇒ bitset-AND);
+            // `gatelo` in 255 docs (df*16 = 4080 < 4095 ⇒ membership).
+            if i.is_multiple_of(16) {
+                text.push_str(" gatehi");
+            }
+            if i.is_multiple_of(16) && i != 0 {
+                text.push_str(" gatelo");
+            }
+            if i == 100 {
+                text.push_str(" inlinea inlineb"); // two df=1 terms on one doc
+            }
+            if i == 200 {
+                text.push_str(" inlinec"); // a df=1 term on a different doc
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Pin the gate arithmetic: `gatehi` lands on/above the switch, `gatelo`
+        // just below, so the two intersections below take different kernels.
+        let max_doc = u64::from(N_DOCS - 1);
+        let hi = r.term_df("body", "gatehi").await.expect("df").0;
+        let lo = r.term_df("body", "gatelo").await.expect("df").0;
+        assert!(
+            hi.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= max_doc,
+            "gatehi df={hi} must sit on/above the density gate"
+        );
+        assert!(
+            lo.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) < max_doc,
+            "gatelo df={lo} must sit below the density gate"
+        );
+        for token in ["inlinea", "inlineb", "inlinec"] {
+            assert_eq!(
+                r.term_df("body", token).await.expect("df").0,
+                1,
+                "{token} df"
+            );
+        }
+
+        let and_cases: &[&[&str]] = &[
+            &["common", "gatehi"],   // bitset-AND — just above the gate
+            &["common", "gatelo"],   // membership — just below the gate
+            &["common"],             // single-cursor AND
+            &["inlinea", "inlineb"], // two df=1 on the same doc ⇒ contains inline true
+            &["inlinea", "inlinec"], // df=1 on different docs ⇒ contains inline false
+            &["inlinea", "common"],  // inline drives, bitset term probed
+        ];
+        for tokens in and_cases {
+            let merge_len = r
+                .token_match("body", tokens, BoolMode::And)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", tokens, BoolMode::And)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(count, merge_len, "AND edge count for {tokens:?}");
+        }
+
+        // Dense union containing an inline term ⇒ `or_count_bitset` →
+        // the inline branch of `or_cursor_into_bitset`.
+        let or_tokens: &[&str] = &["inlinea", "even", "odd"];
+        let merge_len = r
+            .token_match("body", or_tokens, BoolMode::Or)
+            .await
+            .expect("token_match")
+            .0
+            .len() as u64;
+        let count = r
+            .token_match_count("body", or_tokens, BoolMode::Or)
+            .await
+            .expect("token_match_count")
+            .0;
+        assert_eq!(count, merge_len, "OR-with-inline count");
+
+        // Absolute pins on the inline intersections: same doc ⇒ 1, disjoint ⇒ 0.
+        assert_eq!(
+            r.token_match_count("body", &["inlinea", "inlineb"], BoolMode::And)
+                .await
+                .expect("count")
+                .0,
+            1
+        );
+        assert_eq!(
+            r.token_match_count("body", &["inlinea", "inlinec"], BoolMode::And)
+                .await
+                .expect("count")
+                .0,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn or_count_anchored_matches_merge_on_dominant_term() {
         // When one term's df dwarfs the rest, the OR count takes the
         // df-anchored path (`df(dominant) + |others \ dominant|`) instead
