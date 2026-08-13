@@ -400,3 +400,147 @@ async fn negation_with_multi_block_negated_list() {
         .collect();
     assert_eq!(got, want, "alpha minus beta over multi-block postings");
 }
+
+// ── negation over a dense (bitset-encoded) corpus ─────────────────────
+
+/// A few-thousand-doc corpus where the common terms and the phrase members are
+/// stored as BITSET blocks and the phrase AND is two-phase. `the`/`who` are in
+/// every doc (not adjacent); `"the who"` is planted on every 13th doc, `uk` on
+/// every 40th, `even` on every 2nd (a dense negation target), `tri` on every
+/// 3rd. Truth comes from the whitespace-token helpers, independent of the reader.
+fn dense_negation_corpus() -> Vec<(u64, String)> {
+    const N: u64 = 2600;
+    (0..N)
+        .map(|d| {
+            let mut s = format!("who a{d} the b{d}");
+            if d.is_multiple_of(13) {
+                s = format!("the who {s}");
+            }
+            if d.is_multiple_of(40) {
+                s.push_str(" uk");
+            }
+            if d.is_multiple_of(2) {
+                s.push_str(" even");
+            }
+            if d.is_multiple_of(3) {
+                s.push_str(" tri");
+            }
+            (d, s)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn count_negation_over_dense_bitset_corpus() {
+    // Negation composes with the bitset count kernels and the two-phase phrase
+    // AND through the skip-probe exclude filter. Pin that a -term and a
+    // -"phrase" still exclude exactly, at a scale where the positives, the
+    // negatives, and the phrase members are all bitset-encoded.
+    let owned = dense_negation_corpus();
+    let corp: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&corp);
+
+    async fn cnt(
+        r: &SuperfileReader,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Vec<String>],
+    ) -> u64 {
+        r.atoms_match_count("title", terms, phrases, mode, neg_terms, neg_phrases)
+            .await
+            .expect("atoms_match_count")
+            .0
+    }
+
+    let who_phrase = docs_with_phrase(&corp, &["the", "who"]);
+    let uk = docs_with(&corp, "uk");
+
+    // -term over a bitset negated list: +the -even ⇒ the odd docs.
+    let exp = exclude(docs_with(&corp, "the"), &corp, &["even"]);
+    assert_eq!(
+        cnt(&r, &["the"], &[], BoolMode::And, &["even"], &[]).await,
+        exp.len() as u64,
+        "the -even"
+    );
+
+    // Multiple negatives (bitset + packed): +the -even -tri.
+    let exp = exclude(docs_with(&corp, "the"), &corp, &["even", "tri"]);
+    assert_eq!(
+        cnt(&r, &["the"], &[], BoolMode::And, &["even", "tri"], &[]).await,
+        exp.len() as u64,
+        "the -even -tri"
+    );
+
+    // -"phrase" with bitset members: +uk -"the who".
+    let exp: HashSet<u64> = uk.difference(&who_phrase).copied().collect();
+    assert_eq!(
+        cnt(
+            &r,
+            &["uk"],
+            &[],
+            BoolMode::And,
+            &[],
+            &phrase(&["the", "who"])
+        )
+        .await,
+        exp.len() as u64,
+        "uk -\"the who\""
+    );
+
+    // Two-phase phrase AND minus a bitset term: +"the who" +uk -even.
+    let phrase_and_uk: HashSet<u64> = who_phrase.intersection(&uk).copied().collect();
+    let exp = exclude(phrase_and_uk, &corp, &["even"]);
+    assert_eq!(
+        cnt(
+            &r,
+            &["uk"],
+            &phrase(&["the", "who"]),
+            BoolMode::And,
+            &["even"],
+            &[]
+        )
+        .await,
+        exp.len() as u64,
+        "+\"the who\" +uk -even"
+    );
+
+    // OR positives minus the phrase: the who -"the who".
+    let exp: HashSet<u64> = or_match(&corp, &["the", "who"])
+        .difference(&who_phrase)
+        .copied()
+        .collect();
+    assert_eq!(
+        cnt(
+            &r,
+            &["the", "who"],
+            &[],
+            BoolMode::Or,
+            &[],
+            &phrase(&["the", "who"])
+        )
+        .await,
+        exp.len() as u64,
+        "the who -\"the who\""
+    );
+}
+
+#[tokio::test]
+async fn search_negation_with_phrase_over_dense_bitset_corpus() {
+    // The scored path with a negated clause over bitset-encoded phrase members.
+    // A narrow positive (`+"the who" +uk`, a handful of docs) keeps the result
+    // set below `k`, so top-k truncation can't hide a disagreement.
+    let owned = dense_negation_corpus();
+    let corp: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&corp);
+
+    let got = search_set(&r, r#"+"the who" +uk -tri"#, K_ALL, BoolMode::And).await;
+    let phrase_and_uk: HashSet<u64> = docs_with_phrase(&corp, &["the", "who"])
+        .intersection(&docs_with(&corp, "uk"))
+        .copied()
+        .collect();
+    let want = exclude(phrase_and_uk, &corp, &["tri"]);
+    assert!(!want.is_empty(), "corpus must plant some matches");
+    assert_eq!(got, want, "+\"the who\" +uk -tri (scored, dense/bitset)");
+}
