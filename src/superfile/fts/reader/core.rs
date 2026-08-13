@@ -1742,8 +1742,11 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         if min_doc == u32::MAX {
             break;
         }
-        anchor.skip_to(min_doc);
-        if anchor.is_exhausted() || anchor.current_doc_id() != min_doc {
+        // Membership by bit-test, not `skip_to`: the anchor is the dominant
+        // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
+        // in one word-load; `skip_to` would decode each block — expanding its
+        // ~128 doc ids — as the frontier drags the anchor across its whole list.
+        if !anchor.contains(min_doc) {
             n += 1;
         }
         for c in cursors.iter_mut() {
