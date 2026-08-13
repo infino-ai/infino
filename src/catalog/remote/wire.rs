@@ -17,7 +17,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use serde_json::{Value, json};
 
-use crate::{IndexSpec, InfinoError, Metric};
+use crate::{IndexSpec, InfinoError, Metric, superfile::fts::tokenize::ASCII_LOWER_TOKENIZER};
 
 /// Content type for an Arrow IPC streaming body — the encoding for `append`
 /// bodies and read responses.
@@ -83,13 +83,24 @@ pub(crate) fn metric_str(metric: Metric) -> &'static str {
 }
 
 /// An [`IndexSpec`] as the `indexes` object of a create-table request:
-/// `{fts: [col, …], vector: [{column, dim, metric}, …]}`. Absent index kinds
-/// are omitted (the server treats a missing key as "none").
+/// `{fts: [col | {column, analyzer}, …], vector: [{column, dim, metric}, …]}`.
+/// Absent index kinds are omitted (the server treats a missing key as "none").
+///
+/// An FTS column keeps the bare-name spelling when it uses the default
+/// analyzer, so requests stay byte-identical to those a server predating
+/// per-column analyzers accepts; only a column that declares a different
+/// analyzer takes the object form.
 pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
     let mut indexes = serde_json::Map::new();
-    let fts = spec.fts_columns();
+    let fts: Vec<Value> = spec
+        .fts_indexes()
+        .map(|(column, analyzer)| match analyzer {
+            ASCII_LOWER_TOKENIZER => json!(column),
+            other => json!({"column": column, "analyzer": other}),
+        })
+        .collect();
     if !fts.is_empty() {
-        indexes.insert("fts".to_string(), json!(fts));
+        indexes.insert("fts".to_string(), Value::Array(fts));
     }
     let vectors: Vec<Value> = spec
         .vector_indexes()
@@ -229,6 +240,8 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 
+    use crate::superfile::fts::tokenize::STANDARD_TOKENIZER;
+
     use super::*;
 
     #[test]
@@ -282,6 +295,38 @@ mod tests {
         assert_eq!(
             json["vector"][0],
             json!({"column": "embedding", "dim": 384, "metric": "cosine"})
+        );
+    }
+
+    #[test]
+    fn index_spec_json_carries_a_declared_analyzer() {
+        // A non-default analyzer must reach the server. Dropping it here
+        // indexed the column with `ascii_lower` regardless of what the caller
+        // asked for, so a remote table silently lost non-ASCII text.
+        let spec = IndexSpec::new().fts_with_analyzer("body", STANDARD_TOKENIZER);
+        let json = index_spec_to_json(&spec);
+        assert_eq!(
+            json["fts"],
+            json!([{"column": "body", "analyzer": "standard"}])
+        );
+    }
+
+    #[test]
+    fn index_spec_json_keeps_the_bare_form_for_the_default_analyzer() {
+        // The default stays the compact `["body"]` spelling so a server
+        // predating per-column analyzers keeps accepting the request.
+        let spec = IndexSpec::new().fts_with_analyzer("body", ASCII_LOWER_TOKENIZER);
+        assert_eq!(index_spec_to_json(&spec)["fts"], json!(["body"]));
+    }
+
+    #[test]
+    fn index_spec_json_mixes_analyzer_spellings_per_column() {
+        let spec = IndexSpec::new()
+            .fts("code")
+            .fts_with_analyzer("prose", STANDARD_TOKENIZER);
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!(["code", {"column": "prose", "analyzer": "standard"}])
         );
     }
 

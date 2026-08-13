@@ -68,9 +68,9 @@ impl IndexSpec {
 
     /// Mark `column` as full-text (BM25) indexed with a named analyzer
     /// (`"ascii_lower"` or `"standard"` — the Unicode-aware UAX #29
-    /// tokenizer that keeps non-ASCII text). All FTS columns in a table
-    /// must use the same analyzer; a table mixing analyzers is rejected
-    /// at [`create_table`](crate::Connection::create_table).
+    /// tokenizer that keeps non-ASCII text). Analysis is per column, so a
+    /// table may mix analyzers. An unrecognized name is rejected at
+    /// [`create_table`](crate::Connection::create_table).
     pub fn fts_with_analyzer(
         mut self,
         column: impl Into<String>,
@@ -105,6 +105,16 @@ impl IndexSpec {
     /// [`fts_columns`](Self::fts_columns)).
     pub(crate) fn fts_analyzers(&self) -> Vec<String> {
         self.fts.iter().map(|f| f.analyzer.clone()).collect()
+    }
+
+    /// FTS index declarations as `(column, analyzer)`, in declaration order.
+    /// Used by the remote transport, which needs the pair together rather
+    /// than re-zipping the two parallel name lists.
+    #[cfg(feature = "remote")]
+    pub(crate) fn fts_indexes(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.fts
+            .iter()
+            .map(|f| (f.column.as_str(), f.analyzer.as_str()))
     }
 
     /// Vector index declarations as `(column, dim, metric)`, in declaration
