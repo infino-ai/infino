@@ -69,15 +69,21 @@ impl FtsReader {
             BoolMode::And => {
                 let mut target = 0u32;
                 'docs: loop {
+                    // Phase 1 — align every atom by its cheap *approximation*: a
+                    // term atom is exact; a phrase atom advances only to a doc
+                    // holding all its members, without decoding positions. So a
+                    // rare co-clause (e.g. a term AND'd with a common-word
+                    // phrase) prunes the candidate set here, before any phrase
+                    // pays for adjacency.
                     let mut aligned = target;
                     let mut i = 0usize;
                     while i < atoms.len() {
                         let a = &mut atoms[i];
-                        a.skip_to(aligned)?;
+                        a.approx_skip_to(aligned);
                         if a.is_exhausted() {
                             break 'docs;
                         }
-                        let here = a.current_doc_id();
+                        let here = a.approx_current_doc();
                         if here > aligned {
                             aligned = here;
                             i = 0;
@@ -85,12 +91,25 @@ impl FtsReader {
                         }
                         i += 1;
                     }
-                    let admitted = match filter.as_mut() {
-                        Some(f) => f.admits(aligned)?,
-                        None => true,
-                    };
-                    if admitted {
-                        on_doc(aligned);
+                    // Phase 2 — every approximation agrees on `aligned`. Verify
+                    // the phrase atoms' positions here only: the intersection is
+                    // already down to the co-occurring docs, so position decode
+                    // runs on that handful, not on a phrase's whole match set.
+                    let mut matched = true;
+                    for a in atoms.iter_mut() {
+                        if !a.verify_at(aligned)? {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        let admitted = match filter.as_mut() {
+                            Some(f) => f.admits(aligned)?,
+                            None => true,
+                        };
+                        if admitted {
+                            on_doc(aligned);
+                        }
                     }
                     let Some(next) = aligned.checked_add(1) else {
                         break;

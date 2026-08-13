@@ -290,18 +290,22 @@ impl PhraseCursor {
         self.seek_match(target, bar, dl_norm_k1)
     }
 
-    /// Unranked (match/count) doc alignment: drive off the rarest member
-    /// and confirm the rest by **membership bit-test**, never decoding a
-    /// common member's block during alignment. The rarest member
-    /// (`align_order[0]`) is the only one iterated — it seeds both the
-    /// candidate doc and, later, the phrase-start positions. Every other
-    /// member answers `contains(aligned)` by a single bit-test on a dense
-    /// (bitset) block, so a common word like "the" is never PFOR/bitset-
-    /// decoded just to align a doc; its block is materialized lazily in
-    /// [`Self::verify_at_aligned`] only for the far fewer docs that survive
-    /// every rarer member. This is the count-path twin of the ranked
-    /// [`Self::seek_match`], which must keep decoding tfs for its score bar.
-    pub(super) fn seek_match_unranked(&mut self, mut from: u32) -> Result<(), FtsError> {
+    /// Approximate seek (the cheap half of a two-phase phrase): advance to the
+    /// next doc ≥ `from` that contains **every member** — the members'
+    /// doc-intersection — **without** verifying adjacency or decoding any
+    /// positions. Drives off the rarest member (`align_order[0]`, the only one
+    /// iterated) and confirms the rest by `contains` bit-test on their dense
+    /// blocks, so a common word like "the" is never decoded just to align a
+    /// doc. Sets `current_doc` to that doc (`u32::MAX` when exhausted) and
+    /// leaves `current_tf` at 0 — the doc is a *candidate*, not yet a verified
+    /// phrase match.
+    ///
+    /// An AND atom walk aligns on this approximation across all atoms (so a
+    /// rare co-clause prunes the candidate set first) and only then asks
+    /// [`Self::verify_at_aligned`] to decode positions on the survivors. On its
+    /// own, `approx_seek` + a `verify_at_aligned` retry loop is exactly
+    /// [`Self::seek_match_unranked`].
+    pub(super) fn approx_seek(&mut self, mut from: u32) {
         let driver = self.align_order[0];
         'docs: loop {
             // Advance the rarest member; it alone drives the candidate doc.
@@ -311,7 +315,7 @@ impl PhraseCursor {
                 if d.is_exhausted() {
                     self.current_doc = u32::MAX;
                     self.current_tf = 0;
-                    return Ok(());
+                    return;
                 }
             }
             let aligned = self.members[driver].cursor.current_doc_id();
@@ -320,32 +324,49 @@ impl PhraseCursor {
             for oi in 1..self.align_order.len() {
                 let mi = self.align_order[oi];
                 if !self.members[mi].cursor.contains(aligned) {
-                    from = match aligned.checked_add(1) {
-                        Some(next) => next,
+                    match aligned.checked_add(1) {
+                        Some(next) => from = next,
                         None => {
                             self.current_doc = u32::MAX;
                             self.current_tf = 0;
-                            return Ok(());
+                            return;
                         }
-                    };
+                    }
                     continue 'docs;
                 }
             }
+            self.current_doc = aligned;
+            self.current_tf = 0;
+            return;
+        }
+    }
+
+    /// Unranked (match/count) doc alignment to the next *verified* phrase match
+    /// ≥ `from`: the approximate member-intersection ([`Self::approx_seek`])
+    /// followed by adjacency verification, retrying at the next candidate until
+    /// one verifies or the members exhaust. The count-path twin of the ranked
+    /// [`Self::seek_match`], which must keep decoding tfs for its score bar.
+    pub(super) fn seek_match_unranked(&mut self, mut from: u32) -> Result<(), FtsError> {
+        loop {
+            self.approx_seek(from);
+            if self.current_doc == u32::MAX {
+                return Ok(());
+            }
+            let aligned = self.current_doc;
             // Verify adjacency; the probed members are decoded here, lazily.
             let tf = self.verify_at_aligned(aligned)?;
             if tf > 0 {
-                self.current_doc = aligned;
                 self.current_tf = tf;
                 return Ok(());
             }
-            from = match aligned.checked_add(1) {
-                Some(next) => next,
+            match aligned.checked_add(1) {
+                Some(next) => from = next,
                 None => {
                     self.current_doc = u32::MAX;
                     self.current_tf = 0;
                     return Ok(());
                 }
-            };
+            }
         }
     }
 
@@ -549,6 +570,41 @@ impl AnyCursor {
                 Ok(())
             }
             AnyCursor::Phrase(c) => c.skip_to(target),
+        }
+    }
+
+    /// Two-phase alignment for the AND walk: advance to the atom's next
+    /// *candidate* doc ≥ `target` without paying for a phrase's positions. A
+    /// term atom is exact (its doc *is* a match); a phrase atom advances to the
+    /// next doc holding all its members ([`PhraseCursor::approx_seek`]), leaving
+    /// adjacency for [`Self::verify_at`]. Pairs with [`Self::approx_current_doc`].
+    pub(super) fn approx_skip_to(&mut self, target: u32) {
+        match self {
+            AnyCursor::Term(c) => c.skip_to(target),
+            AnyCursor::Phrase(c) => c.approx_seek(target),
+        }
+    }
+
+    /// The atom's current *candidate* doc (see [`Self::approx_skip_to`]): a term
+    /// atom's decoded doc, or a phrase atom's member-aligned doc (`u32::MAX`
+    /// when exhausted).
+    pub(super) fn approx_current_doc(&self) -> u32 {
+        match self {
+            AnyCursor::Term(c) => c.current_doc_id(),
+            AnyCursor::Phrase(c) => c.current_doc,
+        }
+    }
+
+    /// Confirm the atom actually matches at `doc` — the doc its approximation
+    /// has already reached. A term atom trivially matches; a phrase atom decodes
+    /// positions and checks adjacency ([`PhraseCursor::verify_at_aligned`]). The
+    /// expensive half of the two-phase split, run by the AND walk only on docs
+    /// where every atom's approximation agrees, so a rare co-clause prunes the
+    /// position work.
+    pub(super) fn verify_at(&mut self, doc: u32) -> Result<bool, FtsError> {
+        match self {
+            AnyCursor::Term(_) => Ok(true),
+            AnyCursor::Phrase(c) => Ok(c.verify_at_aligned(doc)? > 0),
         }
     }
 

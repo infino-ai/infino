@@ -374,3 +374,61 @@ async fn unranked_ids_and_count_agree_with_oracle() {
         }
     }
 }
+
+/// A phrase of common words AND'd with a rare term: the AND walk aligns on the
+/// phrase's cheap member-approximation and verifies adjacency only where the
+/// rare term also lands. This pins that the two-phase split stays exact — a doc
+/// matches iff it holds the rare term AND the contiguous phrase — across every
+/// tricky case: phrase-adjacent-but-no-rare-term (pruned), rare-term-with-
+/// members-present-but-not-adjacent (rejected at verify), and rare-term-only.
+#[tokio::test]
+async fn phrase_and_rare_term_two_phase_agrees() {
+    // "the"/"who" are in most docs; "uk" in a few. Only docs with BOTH the
+    // contiguous phrase "the who" and "uk" may match.
+    let refs: Vec<(u64, &str)> = vec![
+        (0, "the who played in the uk last year"), // "the who" adjacent + uk  -> MATCH
+        (1, "the who reunion tour"),               // "the who" adjacent, no uk -> prune
+        (2, "who owns the uk media"),              // members + uk, not adjacent -> reject
+        (3, "the band who toured the uk"),         // members + uk, not adjacent -> reject
+        (4, "uk weather today"),                   // uk only, no phrase       -> no match
+        (5, "the who the who in the uk"),          // two "the who" starts + uk -> MATCH
+        (6, "nothing relevant here at all"),       // neither                  -> no match
+    ];
+    let r = build_infino_superfile_positional(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+
+    let terms = vec!["uk"];
+    let phrases = vec![vec!["the".to_string(), "who".to_string()]];
+    let owned_terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+
+    let want: HashSet<u64> = oracle
+        .top_k_atoms(&owned_terms, &phrases, &[], &[], &[], &[], refs.len())
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    assert_eq!(
+        want,
+        HashSet::from([0, 5]),
+        "oracle sanity for +\"the who\" +uk"
+    );
+
+    let ids = r
+        .atoms_match_ids("title", &terms, &phrases, BoolMode::And)
+        .await
+        .expect("atoms_match_ids")
+        .0;
+    let got: HashSet<u64> = ids.into_iter().map(u64::from).collect();
+    assert_eq!(got, want, "two-phase AND ids for phrase + rare term");
+
+    let count = r
+        .atoms_match_count("title", &terms, &phrases, BoolMode::And, &[], &[])
+        .await
+        .expect("atoms_match_count")
+        .0;
+    assert_eq!(
+        count as usize,
+        want.len(),
+        "two-phase AND count for phrase + rare term"
+    );
+}
