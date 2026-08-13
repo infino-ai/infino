@@ -116,6 +116,7 @@ use crate::{
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{StorageError, StorageProvider},
     superfile::{
         BuildError as SuperfileBuildError, ReadError, SuperfileReader,
@@ -379,6 +380,15 @@ pub struct SupertableWriter {
     /// `wal_id`; `commit()` builds the WAL state doc and drives
     /// the tombstone phase.
     pending_deletes: Vec<PendingDeleteEntry>,
+    /// Per-op work collector, captured at construction — the writer is
+    /// minted on the caller's thread inside its [`with_op_stats`]
+    /// scope (the same pickup contract as the reader), and the write
+    /// counters flush through this `Arc` from wherever the commit
+    /// runs. `None` outside a scope: every flush is one `Option`
+    /// check.
+    ///
+    /// [`with_op_stats`]: crate::runtime_metrics::op_stats::with_op_stats
+    op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 /// One buffered update. Resources here are all reserved at the
@@ -915,6 +925,7 @@ impl Supertable {
                 buffer_fts_bytes: 0,
                 pending_updates: Vec::new(),
                 pending_deletes: Vec::new(),
+                op_stats: op_stats::current(),
             }),
             Err(_) => Err(BuildError::SupertableInUse),
         }
@@ -1078,6 +1089,19 @@ impl SupertableWriter {
         self.buffer_scalar_bytes += scalar_bytes;
         self.buffer_vector_bytes += vector_bytes;
         self.buffer_fts_bytes += fts_bytes;
+
+        // Per-op work stats: the write's input shape, counted here from
+        // the caller's batch — before any shard split or commit retry —
+        // so the counters are deterministic by construction (see the
+        // op_stats module's write-side determinism note).
+        if let Some(stats) = &self.op_stats {
+            stats.add_ingested_write(
+                n_rows as u64,
+                scalar_bytes as u64,
+                vector_bytes as u64,
+                fts_bytes as u64,
+            );
+        }
 
         // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
         // reserve-time concern, not held memory.
@@ -1508,6 +1532,14 @@ impl SupertableWriter {
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        // Per-op work stats: the update's replacement rows are appended
+        // through the WAL pipeline (not the buffered append above), so
+        // they count here — after the drive returns Ok — alongside the
+        // rows its tombstone phase retired.
+        if let Some(stats) = &self.op_stats {
+            stats.add_ingested_write(u64::from(entry.new_row_count), 0, 0, 0);
+            stats.add_rows_tombstoned(n_tombstoned as u64);
+        }
         Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -1631,6 +1663,11 @@ impl SupertableWriter {
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        // Per-op work stats: rows this delete retired, after the drive
+        // returns Ok.
+        if let Some(stats) = &self.op_stats {
+            stats.add_rows_tombstoned(n_tombstoned as u64);
+        }
         Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -1770,11 +1807,23 @@ impl SupertableWriter {
                 .iter()
                 .map(|(_, bytes)| bytes.len())
                 .sum();
+            // Computed before the batch moves into the publish future;
+            // flushed only after Ok below, so a failed or retried commit
+            // never counts.
+            let output_stats = self
+                .op_stats
+                .as_ref()
+                .map(|_| commit_output_stats(&user_batch));
             let publish_t0 = time::Instant::now();
             bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, user_batch, list_metadata),
                 &self.inner.query_runtime(),
             )?;
+            if let (Some(stats), Some((superfiles, bytes, fts_terms))) =
+                (&self.op_stats, output_stats)
+            {
+                stats.add_commit_outputs(superfiles, bytes, fts_terms);
+            }
             if crate::storage::io_counters::timeline_enabled() {
                 eprintln!(
                     "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
@@ -1902,10 +1951,20 @@ impl SupertableWriter {
         })?;
         let superfiles = outputs.len();
         let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+        // Same pre-move / post-Ok discipline as the vector arm above.
+        let output_stats = self
+            .op_stats
+            .as_ref()
+            .map(|_| commit_output_stats(&user_batch));
         bridge_on_runtime(
             persist_superfile_publish_batch_async(&user_inner, user_batch, list_metadata),
             &self.inner.query_runtime(),
         )?;
+        if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
+            (&self.op_stats, output_stats)
+        {
+            stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
+        }
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
@@ -2706,6 +2765,30 @@ fn collect_prepared_superfiles(
         pending_cache_inserts,
         pending_store_inserts,
     })
+}
+
+/// One committed publish batch's output shape for the per-op work stats:
+/// superfile count, sealed on-storage bytes (from each entry's own
+/// `SubsectionOffsets::total_size`, so the figure is identical across
+/// storage backends), and the distinct-FTS-term sum across the new
+/// entries. Callers compute this before the batch moves into the publish
+/// future and flush it only after the commit returns Ok, so a failed or
+/// retried publish never counts.
+fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
+    let superfiles = batch.new_entries.len() as u64;
+    let bytes: u64 = batch
+        .new_entries
+        .iter()
+        .filter_map(|entry| entry.subsection_offsets.as_ref())
+        .map(|offsets| offsets.total_size)
+        .sum();
+    let fts_terms: u64 = batch
+        .new_entries
+        .iter()
+        .flat_map(|entry| entry.fts_summary.values())
+        .map(|agg| agg.n_terms_distinct)
+        .sum();
+    (superfiles, bytes, fts_terms)
 }
 
 fn apply_pending_store_inserts(inner: &SupertableInner, inserts: Vec<(SuperfileUri, Bytes)>) {
