@@ -716,6 +716,12 @@ pub(crate) fn plan_sq8_split_kway(
 /// same top-k cell spread.
 pub(crate) const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
 
+/// Terminal fallback for a `target_recall` that fails validation, used only
+/// when the configured value is also out of range. The acceptance bar the
+/// project gates on, so a table calibrated after a bad knob is still held
+/// to the shipped standard rather than to an arbitrary number.
+const ACCEPTANCE_BAR_RECALL: f64 = 0.99;
+
 /// Z-multiplier on the width crossing's sampling error: the crossing
 /// tests `mean − Z·SE` against the target, so `0` crosses on the
 /// measured mean and a positive Z makes the sample PROVE the narrower
@@ -996,6 +1002,33 @@ fn floor_monotone(law: &mut [u32; WIDTH_LAW_KS.len()]) {
 
 impl WidthLawCalibration {
     pub(crate) fn new(dim: usize, metric: Metric, target_recall: f64) -> Self {
+        // The target arrives from user YAML, so validate it here rather than
+        // let a bad value reach the walk, where it fails silently: NaN makes
+        // every crossing comparison false, so nothing is ever stamped and the
+        // rerank cutoff collapses to zero; zero or negative is satisfied by
+        // the first candidate, stamping a width of 1 that under-provisions
+        // every query; above 1.0 no width can ever satisfy it. The configured
+        // value is the fallback but not a trusted one — it comes off the same
+        // YAML surface — so it is checked too, terminating on the shipped bar.
+        let valid = |v: f64| v.is_finite() && v > 0.0 && v <= 1.0;
+        let fallback_target = {
+            let configured = config::global().vector.target_recall;
+            if valid(configured) {
+                configured
+            } else {
+                ACCEPTANCE_BAR_RECALL
+            }
+        };
+        let target_recall = if valid(target_recall) {
+            target_recall
+        } else {
+            tracing::warn!(
+                target_recall,
+                fallback = fallback_target,
+                "vector.target_recall must be in (0, 1]; falling back to the default"
+            );
+            fallback_target
+        };
         Self {
             dim,
             metric,
@@ -1759,6 +1792,24 @@ mod tests {
                 "the calibration carries the target unmodified"
             );
         }
+    }
+
+    /// A target outside `(0, 1]` never reaches the walk. Each of these
+    /// fails silently if stored: NaN stamps nothing and zeroes the rerank
+    /// cutoff, `<= 0` stamps width 1, `> 1` can never be crossed.
+    #[test]
+    fn an_out_of_range_target_falls_back_to_the_configured_default() {
+        for bad in [f64::NAN, 0.0, -0.5, 1.5, f64::INFINITY, f64::NEG_INFINITY] {
+            let cal = WidthLawCalibration::new(8, Metric::Cosine, bad);
+            assert_eq!(
+                cal.target_recall,
+                shipped_target_recall(),
+                "target {bad} must fall back, not be stored"
+            );
+        }
+        // The boundary itself is a legal target and must survive untouched.
+        let cal = WidthLawCalibration::new(8, Metric::Cosine, 1.0);
+        assert_eq!(cal.target_recall, 1.0);
     }
 
     /// The shipped `vector.target_recall`, read from the live config so
