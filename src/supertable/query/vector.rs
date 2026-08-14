@@ -106,7 +106,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
-            hnsw::{self, Hnsw, HnswParams, Sq16Scorer, encode_hnsw},
+            hnsw::{self, HnswParams, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::ScanCandidate,
         },

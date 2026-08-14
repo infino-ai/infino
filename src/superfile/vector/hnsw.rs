@@ -37,9 +37,11 @@
 //! so the module allows dead code rather than sprinkling per-item guards.
 #![allow(dead_code)]
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::sync::{Mutex, RwLock};
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    sync::{Mutex, RwLock},
+};
 
 use rayon::prelude::*;
 
@@ -648,11 +650,11 @@ impl Hnsw {
     }
 
     /// A copy with the layer-0 (base) adjacency truncated to `m0` neighbors
-    /// per node — a cheap way to *evaluate* a smaller base-layer degree during
-    /// calibration without rebuilding. Upper layers are untouched. This is a
-    /// calibration proxy: the pruned graph's recall approximates a native
-    /// build at `m0` closely enough to rank candidates; the persisted graph is
-    /// always a fresh full build at the chosen `m0`.
+    /// per node — a cheap way to evaluate a smaller base-layer degree without a
+    /// native rebuild. Upper layers are untouched. The pruned graph is BOTH the
+    /// calibration proxy and what gets persisted for the chosen `m0`: truncating
+    /// the max-`m0` build's base layer approximates a native `m0` build closely
+    /// enough to rank candidates, and it serves directly — no second full build.
     pub(crate) fn pruned_base_layer(&self, m0: usize) -> Hnsw {
         let neighbors = self
             .neighbors
@@ -815,20 +817,29 @@ pub(crate) fn calibrate_graph(
             ..HnswParams::default()
         },
     );
-    let pruned: Vec<(usize, Hnsw)> = m0s
+    // Fill a recall[m0][ef] matrix by pruning each m0 ONCE, sweeping every ef
+    // against that single pruned copy, then dropping it before the next m0.
+    // Peak resident stays at `base` + one pruned copy — never all candidates at
+    // once (each pruned copy is ~a full graph, multi-GB at scale).
+    let recall_matrix: Vec<Vec<f64>> = m0s
         .iter()
-        .map(|&m0| (m0, base.pruned_base_layer(m0)))
+        .map(|&m0| {
+            let g = base.pruned_base_layer(m0);
+            efs.iter()
+                .map(|&ef| graph_recall(&g, scorer, &queries, &gt, k, ef))
+                .collect()
+        })
         .collect();
 
+    // Latency-first pick: smallest ef (outer), then smallest m0 (inner), that
+    // clears the target; else the best-recall pair seen.
     let mut best = fallback;
     let mut chosen: Option<CalibChoice> = None;
-    'search: for &ef in &efs {
-        // min latency first
-        for (m0, g) in &pruned {
-            // then min memory
-            let recall = graph_recall(g, scorer, &queries, &gt, k, ef);
+    'search: for (ei, &ef) in efs.iter().enumerate() {
+        for (mi, &m0) in m0s.iter().enumerate() {
+            let recall = recall_matrix[mi][ei];
             let c = CalibChoice {
-                m0: *m0,
+                m0,
                 ef,
                 recall,
                 registered: recall >= register_floor,
@@ -844,8 +855,9 @@ pub(crate) fn calibrate_graph(
         }
     }
     let choice = chosen.unwrap_or(best);
-    // Persist the graph pruned to the chosen m0 — no second full build; the
-    // pruned max-graph IS what serves. `None` when not registered.
+    // Persist the graph pruned to the chosen m0 — one prune of the base, no
+    // second full build; the pruned max-graph IS what serves. `None` when not
+    // registered.
     let graph = choice.registered.then(|| base.pruned_base_layer(choice.m0));
     (choice, graph)
 }

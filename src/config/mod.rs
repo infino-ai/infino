@@ -973,6 +973,21 @@ impl Config {
                 v.hnsw_ef_mult
             )));
         }
+        // A recall target outside (0, 1] is meaningless and, shared with the
+        // ivf stamping law, would silently mis-stamp both engines; an
+        // unreachable one (e.g. > 1) would decline the graph on every table.
+        if !(v.target_recall > 0.0 && v.target_recall <= 1.0) {
+            return Err(ConfigError::Invalid(format!(
+                "vector.target_recall must be in (0.0, 1.0], got {}",
+                v.target_recall
+            )));
+        }
+        if !(0.0..=1.0).contains(&v.hnsw_recall_slack) {
+            return Err(ConfigError::Invalid(format!(
+                "vector.hnsw_recall_slack must be in [0.0, 1.0], got {}",
+                v.hnsw_recall_slack
+            )));
+        }
         Ok(())
     }
 }
