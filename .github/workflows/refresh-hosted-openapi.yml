@@ -17,7 +17,7 @@ on:
     inputs:
       spec_url:
         description: "OpenAPI spec URL to fetch"
-        default: "https://api.platform.infino.ai/openapi.json"
+        default: "https://api.platform.infino.ws/openapi.json"
 
 permissions:
   contents: write
@@ -37,7 +37,7 @@ jobs:
 
       - name: Fetch the published spec
         run: |
-          URL="${{ github.event.inputs.spec_url || 'https://api.platform.infino.ai/openapi.json' }}"
+          URL="${{ github.event.inputs.spec_url || 'https://api.platform.infino.ws/openapi.json' }}"
           echo "fetching $URL"
           curl -fsS "$URL" -o tests/fixtures/hosted-openapi.json
           # Fail loudly if it isn't valid JSON, rather than committing garbage.
