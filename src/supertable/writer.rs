@@ -7725,14 +7725,11 @@ async fn publish_hnsw_blob(
     let blob_mib = blob.len() / (1024 * 1024);
     match slow_vector_state::write_graph_section(storage, blob).await {
         Ok(reference) => {
-            eprintln!(
-                "[supertable hnsw] published graph section: {} ({blob_mib} MiB)",
-                reference.uri
-            );
+            tracing::debug!(uri = %reference.uri, blob_mib, "hnsw: published graph section");
             Some(reference)
         }
         Err(error) => {
-            eprintln!("[supertable hnsw] publish failed: {error}");
+            tracing::warn!("hnsw: publish failed: {error}");
             None
         }
     }
@@ -7746,8 +7743,11 @@ async fn publish_hnsw_blob(
 ///
 /// When the prior generation already persisted a graph and this settle only
 /// **appended** rows, the delta is inserted into a copy of that graph
-/// ([`assemble_hnsw_incremental`]) — work ∝ new rows, not the whole
-/// corpus. Otherwise (no prior graph, or a non-append change) it does a full
+/// ([`assemble_hnsw_incremental`]). The graph insert is ∝ new rows, and the
+/// post-insert recall recheck is bounded to a strided probe subsample once
+/// the grown corpus exceeds `hnsw_probe_max_docs` — so neither scales with
+/// the whole population (only the scan that locates the append delta does).
+/// Otherwise (no prior graph, or a non-append change) it does a full
 /// rebuild. PUT-before-CAS: the blob is durable before the caller stamps the
 /// manifest ref, so a crash before the manifest CAS just orphans the blob
 /// (GC-reclaimed) and keeps serving the prior generation.
@@ -7765,20 +7765,23 @@ async fn build_hnsw_graph_ref(
         .first()
         .map(|vc| vc.column.clone())
     else {
-        eprintln!("[supertable hnsw] build skipped: no vector columns on this manifest");
+        tracing::debug!("hnsw: build skipped — no vector columns on this manifest");
         return None;
     };
     let total_docs: u64 = manifest.get_all_superfiles().iter().map(|e| e.n_docs).sum();
     let max_docs = crate::config::global().vector.hnsw_max_docs;
-    eprintln!(
-        "[supertable hnsw] build hook: column={column} total_docs={total_docs} \
-         max_docs={max_docs} superfiles={}",
-        manifest.get_all_superfiles().len(),
+    tracing::debug!(
+        column,
+        total_docs,
+        max_docs,
+        superfiles = manifest.get_all_superfiles().len(),
+        "hnsw: build hook"
     );
     if total_docs > max_docs {
-        eprintln!(
-            "[supertable hnsw] build skipped: {total_docs} docs > hnsw_max_docs \
-             {max_docs} (data graph would exceed RAM)"
+        tracing::info!(
+            total_docs,
+            max_docs,
+            "hnsw: build skipped — docs exceed hnsw_max_docs (data graph would exceed RAM)"
         );
         return None;
     }
@@ -7808,51 +7811,51 @@ async fn build_hnsw_graph_ref(
         .await
         {
             Ok(Some((data_bundle, new_high_water, inserted))) => {
-                eprintln!(
-                    "[supertable hnsw] incremental: inserted {inserted} nodes into prior \
-                     graph ({prior_count} -> {} nodes), data_bundle={} MiB, wall {:.1}s",
-                    prior_count + inserted,
-                    data_bundle.len() / (1024 * 1024),
-                    t0.elapsed().as_secs_f64(),
+                tracing::debug!(
+                    inserted,
+                    nodes = prior_count + inserted,
+                    data_bundle_mib = data_bundle.len() / (1024 * 1024),
+                    wall_s = t0.elapsed().as_secs_f64(),
+                    "hnsw: incremental insert into prior graph"
                 );
                 return publish_hnsw_blob(storage, population_key, new_high_water, &data_bundle)
                     .await;
             }
             Ok(None) => {
-                eprintln!(
-                    "[supertable hnsw] incremental not applicable (not a pure append); \
-                     full rebuild"
+                tracing::debug!(
+                    "hnsw: incremental not applicable (not a pure append); full rebuild"
                 );
             }
             Err(error) => {
-                eprintln!("[supertable hnsw] incremental error ({error}); full rebuild");
+                tracing::debug!("hnsw: incremental error ({error}); full rebuild");
             }
         }
     }
 
     // Full rebuild.
-    let data_bundle =
-        match crate::supertable::query::vector::assemble_hnsw_sections(manifest, &column, &None)
-            .await
-        {
-            Ok(Some(bundle)) => bundle,
-            Ok(None) => {
-                eprintln!(
-                    "[supertable hnsw] build skipped: no Sq16 rows assembled for column \
-                 `{column}` (column absent, not sq16, or empty)"
-                );
-                return None;
-            }
-            Err(error) => {
-                eprintln!("[supertable hnsw] build skipped: assemble error: {error}");
-                return None;
-            }
-        };
-    eprintln!(
-        "[supertable hnsw] built graph (full): ~{total_docs} rows, data_bundle={} MiB, \
-         wall {:.1}s",
-        data_bundle.len() / (1024 * 1024),
-        t0.elapsed().as_secs_f64(),
+    let data_bundle = match crate::supertable::query::vector::assemble_hnsw_sections(
+        manifest, &column, &None,
+    )
+    .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => {
+            tracing::debug!(
+                column,
+                "hnsw: build skipped — no Sq16 rows assembled (column absent, not sq16, or empty)"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!("hnsw: build skipped — assemble error: {error}");
+            return None;
+        }
+    };
+    tracing::debug!(
+        total_docs,
+        data_bundle_mib = data_bundle.len() / (1024 * 1024),
+        wall_s = t0.elapsed().as_secs_f64(),
+        "hnsw: built graph (full)"
     );
     publish_hnsw_blob(storage, population_key, high_water_now, &data_bundle).await
 }
@@ -7917,46 +7920,20 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             }
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
-        // A settled generation still needs its `hnsw` graphs built
-        // whenever the graph ref is absent — even if the routing blob and
-        // centroid section are byte-identical to what is already stamped
-        // (the membership commit publishes those first, so the post-drain
-        // refresh finds them unchanged). Without this the no-op below would
-        // return before the graph is ever built.
-        // Resolve the `hnsw` graph ref for this stamp.
+        // The `hnsw` graph is built and stamped ONLY in the membership commit
+        // (Commit A), atomically with `drained_ranges`. This settle carries the
+        // prior ref forward untouched and NEVER builds. The graph is
+        // packing-invariant (keyed by `stable_id`), so the prior ref is correct
+        // in every case that reaches here: a drain already rebuilt it in
+        // Commit A; a compaction / merge / split repacks the same id population,
+        // so the same graph still covers it; a legacy generation carries no ref
+        // and stays on ivf until its next drain rebuilds one.
         //
-        //  - Mid-drain checkpoint (`pending_drain.is_some()`): carry the
-        //    prior ref forward untouched; the rebuild happens at the final
-        //    settle when membership stops moving.
-        //  - Settled: reuse the prior graph iff it already covers this exact
-        //    doc-id population (a packing-only change — e.g. a compaction
-        //    that repacked the same rows), keyed on `(high-water id, count)`;
-        //    otherwise (re)build. Reuse is what makes a repack settle a no-op
-        //    instead of a second full rebuild.
-        let prior_graph = old.slow_vector_state_graphs_blob().cloned();
-        let graphs_ref = if pending_drain.is_some() {
-            prior_graph.clone()
-        } else {
-            let current_key = graph_population_key(&old);
-            let prior_key = match prior_graph.as_ref() {
-                Some(reference) => {
-                    slow_vector_state::fetch_graph_header(storage.as_ref(), reference)
-                        .await
-                        .map(|(key, _)| key)
-                }
-                None => None,
-            };
-            if prior_key == Some(current_key) {
-                eprintln!(
-                    "[supertable hnsw] reuse: population key {current_key:#x} unchanged; \
-                     keeping {}",
-                    prior_graph.as_ref().map(|r| r.uri.as_str()).unwrap_or(""),
-                );
-                prior_graph.clone()
-            } else {
-                build_hnsw_graph_ref(storage.as_ref(), &old).await
-            }
-        };
+        // Building here would let the graph be stamped outside the membership
+        // commit — a lag between the watermark and the graph is a window where a
+        // just-drained row is invisible to both arms, the exact visibility gap
+        // the atomic-drain stamp closes.
+        let graphs_ref = old.slow_vector_state_graphs_blob().cloned();
         // No-op only when NOTHING changed — routing blob, centroid section,
         // and the resolved graph ref all already stamped.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()

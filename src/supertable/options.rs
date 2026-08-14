@@ -406,6 +406,13 @@ pub struct SupertableOptions {
     /// URI. Serves the resident graph walk without rebuilding at query time;
     /// a new drain generation publishes a new URI and replaces it.
     pub(crate) graph_sections_cache: Arc<TokioMutex<Option<Arc<ResidentGraphSections>>>>,
+    /// Single-flight gate for [`graph_sections_cache`] hydration. The graph
+    /// bundle is multi-GiB, so a first-touch miss holds THIS gate (never the
+    /// cache mutex) across the download: exactly one query fetches while
+    /// concurrent misses park here and then find the cache already published.
+    /// Warm queries never touch it — they resolve on the cache mutex's fast
+    /// path — so the download never serializes steady-state serving.
+    pub(crate) graph_hydration_lock: Arc<TokioMutex<()>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar
     /// projection over gapped user superfiles, so a hit resolves in O(k) after
     /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
@@ -719,6 +726,7 @@ impl SupertableOptions {
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
             graph_sections_cache: Arc::new(TokioMutex::new(None)),
+            graph_hydration_lock: Arc::new(TokioMutex::new(())),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,

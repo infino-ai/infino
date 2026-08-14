@@ -688,10 +688,14 @@ impl Hnsw {
     /// nodes permanently unreachable and making small-`m0` recall measure worse
     /// than a native build. Re-selecting by the heuristic keeps the closest
     /// diverse neighbors and matches a native `m0` build closely.
-    pub(crate) fn pruned_base_layer<S: NodeScorer>(&self, scorer: &S, m0: usize) -> Hnsw {
+    pub(crate) fn pruned_base_layer<S: NodeScorer + Sync>(&self, scorer: &S, m0: usize) -> Hnsw {
+        // Each node's pruned neighbor list is computed independently, so the
+        // re-selection fans across rayon like the base build's per-node work
+        // (this already runs on the reader pool). `par_iter().enumerate()`
+        // keeps node order, so `collect` reassembles the adjacency in place.
         let neighbors = self
             .neighbors
-            .iter()
+            .par_iter()
             .enumerate()
             .map(|(node, levels)| {
                 levels
@@ -853,8 +857,9 @@ fn graph_recall(
 /// smaller `m0` by pruning the base layer (cheap) and `ef` by re-search (free),
 /// and returns the **fastest** clearing pair (min `ef`, then min `m0` — latency
 /// is the graph's whole point). If none clears within the candidates, returns
-/// the best achieved with `registered` gated by the `0.9×target` graceful
-/// floor. Queries are held-out, perturbed (off-node) so recall is realistic.
+/// the best achieved with `registered` gated by the `target_recall −
+/// recall_slack` graceful floor. Queries are held-out, perturbed (off-node) so
+/// recall is realistic.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn calibrate_graph(
     scorer: &Sq16Scorer,
@@ -1228,6 +1233,13 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
         return None;
     }
     let column = String::from_utf8(c.take(col_len)?.to_vec()).ok()?;
+    // Cross-check the doc-id block length (16 B/id, one i128 per node) against
+    // the bytes present BEFORE reserving, so a corrupt `n` (e.g. ~2^60) cannot
+    // drive a huge `with_capacity` that aborts under `handle_alloc_error` —
+    // mirroring the guard `Hnsw::from_bytes` applies to its own wire lengths.
+    if n.checked_mul(16)? > c.remaining() {
+        return None;
+    }
     let mut doc_ids = Vec::with_capacity(n);
     for _ in 0..n {
         doc_ids.push(c.i128()?);
@@ -2286,6 +2298,17 @@ mod tests {
             }
         }
         assert!(decode_hnsw(b"short").is_none());
+
+        // A corrupt node count must degrade to None, not drive a huge
+        // `with_capacity` alloc-abort. Overwrite the `n` word (right after the
+        // 8-byte magic) with an absurd value and confirm the decode declines.
+        let mut poisoned = bytes.clone();
+        poisoned[HNSW_DATA_MAGIC.len()..HNSW_DATA_MAGIC.len() + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(
+            decode_hnsw(&poisoned).is_none(),
+            "a corrupt node count must decode to None, not attempt a giant alloc"
+        );
     }
 
     /// The combined graph bundle frames its sections losslessly, including

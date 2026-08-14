@@ -1506,20 +1506,40 @@ fn score_cell_fp32(
     true
 }
 
-/// The `hnsw` search beam width for a request of `k`:
-/// Warn once (process-wide) that `search_mode = hnsw` is set but no resident
-/// graph is available, so the query is being served by the ivf scan
-/// instead. Fires only on the hidden arm with the graph absent — i.e. the
-/// corpus exceeds `hnsw_max_docs` (or an older generation predates the
-/// graph). The `_id` results are still correct; only the fast path is off.
-fn warn_hnsw_no_resident_graph_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+/// Warn that `search_mode = hnsw` is set but this query fell through to the
+/// ivf scan, with the diagnosis the situation actually warrants:
+///   - `has_graph_ref = false`: the table carries no resident graph at all —
+///     pre-drain, or the corpus exceeds `hnsw_max_docs`.
+///   - `has_graph_ref = true`: a graph exists but not for THIS column (a
+///     second same-dim vector column carries it, or a dim/emptiness mismatch).
+///
+/// The `_id` results are still correct; only the fast path is off. Deduped
+/// per `(diagnosis, column)` so a miss on one column never suppresses the
+/// warning another column would legitimately raise.
+fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
+    static WARNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
+    > = std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(Default::default);
+    {
+        let mut set = warned.lock().expect("hnsw warn dedup set");
+        if !set.insert((has_graph_ref, column.to_string())) {
+            return;
+        }
+    }
+    if has_graph_ref {
         tracing::warn!(
+            column,
+            "search_mode=hnsw but no resident graph for this column (another column \
+             carries the graph, or a dim/emptiness mismatch); serving via ivf scan"
+        );
+    } else {
+        tracing::warn!(
+            column,
             "search_mode=hnsw but no resident graph (pre-drain or corpus > hnsw_max_docs); \
              serving via ivf scan"
         );
-    });
+    }
 }
 
 /// Assemble the persisted `hnsw` data bundle at drain time: walk
@@ -1550,6 +1570,8 @@ async fn collect_hnsw_codes(
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.clone();
     let storage = manifest.options.storage.clone();
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
     let mut codes: Vec<u8> = Vec::new();
     let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
@@ -1557,7 +1579,10 @@ async fn collect_hnsw_codes(
             dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
                 .await?;
         let Some(vr) = reader.vec() else { continue };
-        let Some(rows) = vr.materialized_index_rows_async(column).await else {
+        let Some(rows) = vr
+            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .await
+        else {
             continue;
         };
         for row in rows {
@@ -1608,13 +1633,18 @@ pub(crate) async fn assemble_hnsw_sections(
     // passes. A graph-hostile corpus therefore never materializes the whole
     // plane just to decline (which, on a large drain, is the difference between
     // fitting in RAM and OOM).
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
     let mut doc_ids: Vec<i128> = Vec::new();
     for entry in manifest.get_all_superfiles() {
         let reader =
             dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
                 .await?;
         let Some(vr) = reader.vec() else { continue };
-        let Some(rows) = vr.materialized_index_rows_async(column).await else {
+        let Some(rows) = vr
+            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .await
+        else {
             continue;
         };
         let ids =
@@ -1836,6 +1866,8 @@ pub(crate) async fn assemble_hnsw_incremental(
     let storage = manifest.options.storage.clone();
 
     // Re-read ONLY the appended rows (stable_id past the prior high water).
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
     let mut new_codes: Vec<u8> = Vec::new();
     let mut new_doc_ids: Vec<i128> = Vec::new();
     for entry in manifest.get_all_superfiles() {
@@ -1843,7 +1875,10 @@ pub(crate) async fn assemble_hnsw_incremental(
             dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
                 .await?;
         let Some(vr) = reader.vec() else { continue };
-        let Some(rows) = vr.materialized_index_rows_async(column).await else {
+        let Some(rows) = vr
+            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .await
+        else {
             continue;
         };
         let ids =
@@ -1898,29 +1933,78 @@ pub(crate) async fn assemble_hnsw_incremental(
     // `scorer.codes()` rather than holding a second owned copy.
     let scorer = Sq16Scorer::from_codes(codes, dim, total);
     let vcfg = &config::global().vector;
-    let params = HnswParams {
-        ef_construction: vcfg.hnsw_ef_construction,
-        m0: inherited_m0,
-        ..HnswParams::default()
-    };
-    // Insert ONLY the new node range into a copy of the prior graph.
-    let graph = prior.graph.extend(&scorer, params);
-    // Re-measure recall on the GROWN graph. The base-layer degree requirement
-    // rises with N, so inherited `(m0, ef)` calibrated at a smaller population
-    // can drift below the bar as an append-only table grows (a graph
-    // calibrated at 200K and served at 5M is exactly this regime). If the
-    // extended graph no longer clears the register floor, drop the incremental
-    // result — the caller then does a full rebuild, which recalibrates `m0`/`ef`
-    // or de-registers to ivf. Cheap relative to the rebuild it may avoid.
-    let floor = (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0);
-    let recall = hnsw::measure_recall(
-        &graph,
-        &scorer,
-        inherited_ef,
-        HNSW_CALIB_RECALL_K,
-        HNSW_CALIB_QUERIES,
-        HNSW_CALIB_SEED,
+    let (target_recall, recall_slack, ef_construction, probe_cap) = (
+        vcfg.target_recall,
+        vcfg.hnsw_recall_slack,
+        vcfg.hnsw_ef_construction,
+        vcfg.hnsw_probe_max_docs as usize,
     );
+    let floor = (target_recall - recall_slack).max(0.0);
+    let prior_graph = prior.graph;
+    // The extend fans the new-node inserts across rayon, and the recall
+    // recheck is pure CPU; both belong on the reader pool, not inline on the
+    // tokio worker or the global rayon pool — matching the full-build path.
+    let (scorer, graph, recall) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "hnsw incremental extend + recheck: reader pool dropped result",
+        move || {
+            let params = HnswParams {
+                ef_construction,
+                m0: inherited_m0,
+                ..HnswParams::default()
+            };
+            // Insert ONLY the new node range into a copy of the prior graph.
+            let graph = prior_graph.extend(&scorer, params);
+            // Re-check recall on the grown graph. The base-layer degree
+            // requirement rises with N, so inherited `(m0, ef)` calibrated at a
+            // smaller population can drift below the bar as an append-only table
+            // grows (a graph calibrated at 200K and served at 5M is exactly this
+            // regime). If it no longer clears the register floor, the caller
+            // does a full rebuild, which recalibrates `m0`/`ef` or de-registers.
+            //
+            // Above `hnsw_probe_max_docs` the exact recheck's ground truth is
+            // O(corpus) per query, so measure a bounded strided subsample
+            // instead — the same probe the full build gates on — keeping the
+            // recheck ~O(probe_cap) regardless of how large the table has grown.
+            let recall = if total > probe_cap {
+                let step = total / probe_cap;
+                let stride_bytes = dim * 2;
+                let mut sample: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
+                for (i, row) in scorer.codes().chunks_exact(stride_bytes).enumerate() {
+                    if i.is_multiple_of(step) {
+                        sample.extend_from_slice(row);
+                    }
+                }
+                let pn = sample.len() / stride_bytes;
+                let psc = Sq16Scorer::from_codes(sample, dim, pn);
+                hnsw::calibrate_graph(
+                    &psc,
+                    &[inherited_m0],
+                    &[inherited_ef],
+                    target_recall,
+                    recall_slack,
+                    ef_construction,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_SEED,
+                )
+                .0
+                .recall
+            } else {
+                hnsw::measure_recall(
+                    &graph,
+                    &scorer,
+                    inherited_ef,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_SEED,
+                )
+            };
+            (scorer, graph, recall)
+        },
+    )
+    .await
+    .map_err(|e| QueryError::Execute(e.to_string()))?;
     if recall < floor {
         return Ok(None);
     }
@@ -1979,6 +2063,12 @@ impl SupertableReader {
         // id; `top_k_ascending` collapses them by id, so a plain top-`k` walk
         // would return fewer than `k` distinct rows on a delete-free table. The
         // ivf arm over-fetches by the same factor (`k_fetch = k + overhead`).
+        //
+        // Caveat: this reads the CURRENT config, but replica duplication is a
+        // build-time property baked into the persisted graph. Lowering
+        // `drain_replica_target_factor` below the value the resident graph was
+        // built at under-counts its replicas and can re-open an under-`k`
+        // window until the next full rebuild restamps the graph.
         let replica_factor = config::global().vector.drain_replica_target_factor.max(1.0);
         let k_fetch = ((k as f32) * replica_factor).ceil() as usize;
         // The calibrated per-table `ef` stamped in the bundle drives the walk,
@@ -2034,10 +2124,20 @@ impl SupertableReader {
     /// the ivf scan.
     async fn persisted_graph_sections(&self) -> Option<Arc<ResidentGraphSections>> {
         let manifest = self.manifest();
-        let reference = manifest.slow_vector_state_graphs_blob()?.clone();
-        let storage = manifest.options.storage.as_ref()?;
         let slot = Arc::clone(&manifest.options.graph_sections_cache);
-        // Fast path: reuse the resident sections when they already match.
+        let Some(reference) = manifest.slow_vector_state_graphs_blob().cloned() else {
+            // No graph ref for this generation (a drain declined the graph, or
+            // the corpus crossed the scale ceiling). Drop any previously
+            // hydrated sections so their multi-GiB plane is not pinned for the
+            // process lifetime; the caller falls through to the ivf scan.
+            let mut guard = slot.lock().await;
+            *guard = None;
+            return None;
+        };
+        let storage = manifest.options.storage.as_ref()?;
+        // Fast path: reuse the resident sections when they already match. Only
+        // the cache mutex is taken here, and never across a fetch, so a warm
+        // query is never blocked behind a first-touch download.
         {
             let guard = slot.lock().await;
             if let Some(sections) = guard.as_ref()
@@ -2046,12 +2146,23 @@ impl SupertableReader {
                 return Some(Arc::clone(sections));
             }
         }
-        // Hydrate OUTSIDE the lock. `fetch_graph_sections` blake3-hashes and
-        // copies a multi-GiB bundle; holding the cache mutex across it would
-        // block every concurrent query behind the first post-drain hydration.
-        // The cost of releasing is that racing queries may each hydrate once
-        // during the brief first-touch window — cheaper than serializing all
-        // queries behind one download.
+        // Single-flight hydration. `fetch_graph_sections` blake3-hashes and
+        // copies a multi-GiB bundle; without a gate every racing first-touch
+        // query would run its own download (N duplicate fetches and a transient
+        // N×-plane RSS spike that can OOM). The first miss takes THIS gate and
+        // hydrates; concurrent misses park on the gate and, once they hold it,
+        // find the cache already published and return without a second fetch.
+        // The gate — not the cache mutex — is what is held across the fetch, so
+        // the warm fast path above is never serialized behind the download.
+        let _hydrating = manifest.options.graph_hydration_lock.lock().await;
+        {
+            let guard = slot.lock().await;
+            if let Some(sections) = guard.as_ref()
+                && sections.uri == reference.uri
+            {
+                return Some(Arc::clone(sections));
+            }
+        }
         let sections = match fetch_graph_sections(storage.as_ref(), &reference).await {
             Ok(sections) => Arc::new(sections),
             Err(error) => {
@@ -2063,15 +2174,12 @@ impl SupertableReader {
                 return None;
             }
         };
-        // Publish under the lock. A concurrent hydration may have installed the
-        // same uri first — keep theirs so all callers share one Arc.
-        let mut guard = slot.lock().await;
-        if let Some(existing) = guard.as_ref()
-            && existing.uri == reference.uri
+        // Publish under the cache lock. The gate makes this the only in-flight
+        // hydration, so it installs the uri it just fetched.
         {
-            return Some(Arc::clone(existing));
+            let mut guard = slot.lock().await;
+            *guard = Some(Arc::clone(&sections));
         }
-        *guard = Some(Arc::clone(&sections));
         Some(sections)
     }
 
@@ -2431,7 +2539,7 @@ impl SupertableReader {
             if let Some(hits) = self.hnsw_search(column, query, k).await? {
                 return Ok(hits);
             }
-            warn_hnsw_no_resident_graph_once();
+            warn_hnsw_no_resident_graph(column, manifest.slow_vector_state_graphs_blob().is_some());
             // fall through to the ivf scan below
         }
         if !filtered
@@ -7492,6 +7600,135 @@ mod tests {
             near, k,
             "recalibrated laws must serve the full {k} planted neighbors \
              at default settings, got {near}"
+        );
+    }
+
+    /// A cell split retires the parent cell's blocks in place; its rows
+    /// survive under the split's successor cells. The graph assemblers must
+    /// skip the superseded parent, exactly as the ivf routing path does — or
+    /// the same `stable_id` enters the graph twice (parent copy + child copy).
+    /// At serve time `top_k_ascending` collapses the duplicates by id, so a
+    /// plain top-`k` walk then returns fewer than `k` distinct rows, silently.
+    /// Build a Sq16 table, split a populated cell so a superseded parent
+    /// exists, then reassemble the graph exactly as the drain does and assert
+    /// the split conserves the live population — one node per id, no
+    /// duplicate stable ids.
+    #[test]
+    fn hnsw_assembly_skips_superseded_split_parent_cells() {
+        use std::collections::BTreeSet;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_col_sq16(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        const COMMITS: u64 = 4;
+        const ROWS_PER_COMMIT: usize = 64;
+        const TOTAL: usize = COMMITS as usize * ROWS_PER_COMMIT;
+        for c in 0..COMMITS {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(
+                c * ROWS_PER_COMMIT as u64,
+                ROWS_PER_COMMIT,
+                dim,
+                schema.clone(),
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // Reassemble the graph the way the drain does (over the CURRENT hidden
+        // manifest) and return its per-node stable ids.
+        let assemble_ids = |hidden: &Arc<Supertable>| -> Vec<i128> {
+            let reader = hidden.reader().expect("hidden reader");
+            let manifest = reader.manifest();
+            let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
+                .expect("assemble ok")
+                .expect("sq16 rows must assemble into a graph");
+            let decoded =
+                crate::superfile::vector::hnsw::decode_hnsw(&bundle).expect("decode data bundle");
+            assert_eq!(
+                decoded.graph.len(),
+                decoded.doc_ids.len(),
+                "the graph has one node per stable id"
+            );
+            decoded.doc_ids
+        };
+
+        // Control: the freshly drained graph covers each live id exactly once.
+        // The replica factor defaults to 1.0, so there are no intentional
+        // duplicate nodes — any duplicate below is the superseded-parent bug.
+        let before = assemble_ids(&hidden);
+        let distinct_before: BTreeSet<i128> = before.iter().copied().collect();
+        assert_eq!(
+            before.len(),
+            TOTAL,
+            "graph covers every live id before split"
+        );
+        assert_eq!(
+            distinct_before.len(),
+            TOTAL,
+            "no duplicate ids before split (replica factor 1.0)"
+        );
+
+        // Split the busiest populated cell so a superseded parent exists.
+        let strategy = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy();
+        let PartitionStrategy::VectorCell { clusters, .. } = strategy else {
+            panic!("hidden index must be VectorCell after drain");
+        };
+        let busiest = (0..clusters.n_cent)
+            .filter(|&c| clusters.counts[c as usize] > 0)
+            .max_by_key(|&c| clusters.counts[c as usize])
+            .expect("a populated cell to split");
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), busiest, 0.0))
+            .expect("split call")
+            .expect("a populated cell must split");
+        assert!(
+            hidden
+                .reader()
+                .expect("hidden reader")
+                .manifest()
+                .get_superseded_cells()
+                .is_some_and(|m| m.values().any(|cells| cells.contains(&busiest))),
+            "the split must mark the parent cell superseded"
+        );
+
+        // After the split the parent cell is superseded and its rows live under
+        // the successor cells. A superseded-aware reassembly still covers each
+        // live id exactly once; the buggy path would re-ingest the parent's
+        // rows and inflate the node count past TOTAL with duplicate ids.
+        let after = assemble_ids(&hidden);
+        let distinct_after: BTreeSet<i128> = after.iter().copied().collect();
+        assert_eq!(
+            after.len(),
+            TOTAL,
+            "the split conserves the live population: still {TOTAL} nodes, not \
+             parent+child duplicates ({} nodes)",
+            after.len()
+        );
+        assert_eq!(
+            distinct_after.len(),
+            TOTAL,
+            "no stable id may appear twice after the split"
+        );
+        assert_eq!(
+            distinct_after, distinct_before,
+            "the split repacks the same live ids, adds/removes none"
         );
     }
 

@@ -569,24 +569,6 @@ pub(crate) async fn fetch_graph_section(
     Ok(bytes.to_vec())
 }
 
-/// Read the `(population_key, high_water_id)` header from a graph section
-/// via a small range GET — no whole-object fetch, no hash verify (the
-/// header is self-identifying by magic). `None` when the ref is
-/// absent-shaped, the object is missing, or the header is bad. The settle
-/// path compares the key to the current population's to decide reuse vs
-/// (re)build, and uses the high-water id as the append-delta boundary for
-/// an incremental insert.
-pub(crate) async fn fetch_graph_header(
-    storage: &dyn StorageProvider,
-    reference: &RoutingRef,
-) -> Option<(u64, i128)> {
-    let header = storage
-        .get_range(&reference.uri, 0..hnsw::GRAPH_BUNDLE_HEADER_BYTES as u64)
-        .await
-        .ok()?;
-    hnsw::graph_bundle_header(&header)
-}
-
 /// The graph sections of one published generation, decoded resident. Held
 /// on the table handle behind a single-slot cache keyed by `uri` (a new
 /// drain generation publishes a new URI and replaces it), mirroring
@@ -618,12 +600,12 @@ pub(crate) async fn fetch_graph_sections(
     if let Some(idx) = &data {
         // Surface the stamped params every time the resident graph hydrates,
         // so serving always shows what a table's graph is actually running.
-        eprintln!(
-            "[supertable hnsw] resident graph: {} nodes, dim={}, m0={}, ef={} (stamped)",
-            idx.graph.len(),
-            idx.dim,
-            idx.graph.base_degree(),
-            idx.ef_search
+        tracing::debug!(
+            nodes = idx.graph.len(),
+            dim = idx.dim,
+            base_degree = idx.graph.base_degree(),
+            ef = idx.ef_search,
+            "hnsw: resident graph hydrated (stamped)"
         );
     }
     Ok(ResidentGraphSections {

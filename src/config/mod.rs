@@ -1013,6 +1013,16 @@ impl Config {
                 v.hnsw_m0, v.hnsw_ef_construction
             )));
         }
+        // The probe subsamples a corpus down to ~`hnsw_probe_max_docs` rows by
+        // striding at `n / probe_cap`. A cap of 0 makes that stride a divide by
+        // zero on any non-empty table, so require at least one row of headroom.
+        if v.hnsw_probe_max_docs == 0 {
+            return Err(ConfigError::Invalid(
+                "vector.hnsw_probe_max_docs must be >= 1 — a 0 cap divides by zero when the \
+                 probe strides the corpus down to the sample"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1094,6 +1104,8 @@ mod tests {
         invalid(json!({ "vector": { "target_recall": 0.9, "hnsw_recall_slack": 0.95 } }));
         // An explicit m0 far above ef_construction is sentinel padding.
         invalid(json!({ "vector": { "hnsw_m0": 1024, "hnsw_ef_construction": 200 } }));
+        // A 0 probe cap divides by zero when the probe strides the corpus.
+        invalid(json!({ "vector": { "hnsw_probe_max_docs": 0 } }));
     }
 
     #[test]

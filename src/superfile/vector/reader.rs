@@ -12,7 +12,7 @@
 //! eagerly at `open()`; per-query work happens on demand.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt,
     ops::Range,
     sync::{
@@ -2807,6 +2807,51 @@ impl VectorReader {
             return Some(out);
         }
         self.materialized_cell_rows_async_at(0).await
+    }
+
+    /// Like [`Self::materialized_index_rows_async`], but drops the rows of any
+    /// cell whose global id is in `superseded` — the cells an in-place split
+    /// retired, whose rows survive under the split's successor cells. Ingesting
+    /// a retired parent alongside its live successor would put the same
+    /// `stable_id` into the graph twice.
+    ///
+    /// `local_doc_id` still counts file-local across EVERY cell (superseded
+    /// ones included), so a returned row indexes the stable-id vector that
+    /// [`crate::supertable::query::vector::stable_ids_by_local_for_routing`]
+    /// builds over the whole superfile. `None` exactly when
+    /// [`Self::materialized_index_rows_async`] returns `None` (column absent).
+    pub(crate) async fn materialized_index_rows_excluding_async(
+        &self,
+        index_name: &str,
+        superseded: Option<&BTreeSet<u32>>,
+    ) -> Option<Vec<MaterializedIvfRow>> {
+        // No exclusions ⇒ the plain path (also covers v1, whose synthetic cell
+        // id 0 does not correspond to a real split-retired cell).
+        if superseded.is_none_or(|s| s.is_empty()) {
+            return self.materialized_index_rows_async(index_name).await;
+        }
+        if !self.column_id_by_name.contains_key(index_name) {
+            return None;
+        }
+        if !self.is_multi_cell() {
+            return self.materialized_cell_rows_async_at(0).await;
+        }
+        let cells = self.materialized_cells_rows_async(None).await?;
+        let mut out = Vec::new();
+        let mut file_doc_base = 0u32;
+        for (cell_id, rows) in cells {
+            let n = rows.len() as u32;
+            if !superseded.is_some_and(|s| s.contains(&cell_id)) {
+                for mut row in rows {
+                    row.local_doc_id += file_doc_base;
+                    out.push(row);
+                }
+            }
+            // Advance across superseded cells too, so a kept row's file-local
+            // id keeps indexing the whole-superfile stable-id vector.
+            file_doc_base = file_doc_base.saturating_add(n);
+        }
+        Some(out)
     }
 
     /// Decode every IVF row from `sub` (the full subsection bytes) using the
