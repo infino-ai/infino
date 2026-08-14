@@ -615,6 +615,17 @@ pub(crate) async fn fetch_graph_sections(
     let bundle = hnsw::decode_graph_bundle(&raw)
         .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
     let data = bundle.data_bundle.as_deref().and_then(hnsw::decode_hnsw);
+    if let Some(idx) = &data {
+        // Surface the stamped params every time the resident graph hydrates,
+        // so serving always shows what a table's graph is actually running.
+        eprintln!(
+            "[supertable hnsw] resident graph: {} nodes, dim={}, m0={}, ef={} (stamped)",
+            idx.graph.len(),
+            idx.dim,
+            idx.graph.base_degree(),
+            idx.ef_search
+        );
+    }
     Ok(ResidentGraphSections {
         uri: reference.uri.clone(),
         high_water_id: bundle.high_water_id,

@@ -642,6 +642,212 @@ impl Hnsw {
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    pub(crate) fn base_degree(&self) -> usize {
+        self.m0
+    }
+
+    /// A copy with the layer-0 (base) adjacency truncated to `m0` neighbors
+    /// per node — a cheap way to *evaluate* a smaller base-layer degree during
+    /// calibration without rebuilding. Upper layers are untouched. This is a
+    /// calibration proxy: the pruned graph's recall approximates a native
+    /// build at `m0` closely enough to rank candidates; the persisted graph is
+    /// always a fresh full build at the chosen `m0`.
+    pub(crate) fn pruned_base_layer(&self, m0: usize) -> Hnsw {
+        let neighbors = self
+            .neighbors
+            .iter()
+            .map(|levels| {
+                levels
+                    .iter()
+                    .enumerate()
+                    .map(|(lvl, lst)| {
+                        if lvl == 0 && lst.len() > m0 {
+                            lst[..m0].to_vec()
+                        } else {
+                            lst.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        Hnsw {
+            neighbors,
+            node_level: self.node_level.clone(),
+            entry: self.entry,
+            m: self.m,
+            m0,
+            ef_construction: self.ef_construction,
+            len: self.len,
+        }
+    }
+}
+
+/// Outcome of graph calibration: the base-layer degree to build at, the
+/// query beam to stamp, the recall it achieves, and whether to register the
+/// graph at all (`registered = false` ⇒ serve ivf).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CalibChoice {
+    /// Base-layer degree to build the full graph at.
+    pub m0: usize,
+    /// Query beam (`ef`) to stamp in the bundle header.
+    pub ef: usize,
+    /// Recall of the winning `(m0, ef)` on the calibration sample.
+    pub recall: f64,
+    /// Register the graph? `false` ⇒ recall below the graceful floor, serve ivf.
+    pub registered: bool,
+    /// Recall cleared the full target (vs the `0.9×target` graceful band only).
+    pub at_target: bool,
+}
+
+/// Exhaustive top-`k` node ids under `scorer` for one query — the calibration
+/// ground truth. Sq16-exhaustive matches served fp32 recall to within the
+/// codec's own exhaustive ceiling, so it needs no fp32 plane.
+fn exhaustive_topk<S: NodeScorer>(scorer: &S, query: &[f32], k: usize) -> Vec<u32> {
+    let prepared = scorer.prepare(query);
+    let mut all: Vec<Scored> = (0..scorer.len() as u32)
+        .map(|node| Scored {
+            node,
+            dist: scorer.score(&prepared, node),
+        })
+        .collect();
+    all.sort_unstable();
+    all.into_iter().take(k).map(|s| s.node).collect()
+}
+
+/// Recall@k of `graph` walked at `ef` against exhaustive `gt`.
+fn graph_recall(
+    graph: &Hnsw,
+    scorer: &Sq16Scorer,
+    queries: &[Vec<f32>],
+    gt: &[Vec<u32>],
+    k: usize,
+    ef: usize,
+) -> f64 {
+    let mut hit = 0usize;
+    let mut total = 0usize;
+    for (q, truth) in queries.iter().zip(gt) {
+        let got: std::collections::HashSet<u32> = graph
+            .search(scorer, q, k, ef)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        hit += truth.iter().filter(|t| got.contains(t)).count();
+        total += truth.len();
+    }
+    if total == 0 {
+        0.0
+    } else {
+        hit as f64 / total as f64
+    }
+}
+
+/// Calibrate `(m0, ef)` to `target_recall` on `scorer` (the drained Sq16 plane,
+/// or a subsample of it). Builds ONE graph at `max(m0_candidates)`, evaluates
+/// smaller `m0` by pruning the base layer (cheap) and `ef` by re-search (free),
+/// and returns the **fastest** clearing pair (min `ef`, then min `m0` — latency
+/// is the graph's whole point). If none clears within the candidates, returns
+/// the best achieved with `registered` gated by the `0.9×target` graceful
+/// floor. Queries are held-out, perturbed (off-node) so recall is realistic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn calibrate_graph(
+    scorer: &Sq16Scorer,
+    m0_candidates: &[usize],
+    ef_candidates: &[usize],
+    target_recall: f64,
+    recall_slack: f64,
+    ef_construction: usize,
+    n_queries: usize,
+    k: usize,
+    seed: u64,
+) -> (CalibChoice, Option<Hnsw>) {
+    let register_floor = (target_recall - recall_slack).max(0.0);
+    let n = scorer.len();
+    let dim = scorer.dim();
+    let fallback = CalibChoice {
+        m0: *m0_candidates.iter().min().unwrap_or(&32),
+        ef: *ef_candidates.iter().min().unwrap_or(&128),
+        recall: 0.0,
+        registered: false,
+        at_target: false,
+    };
+    if n == 0 || m0_candidates.is_empty() || ef_candidates.is_empty() {
+        return (fallback, None);
+    }
+    let stride = dim * 2;
+    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let nq = n_queries.min(n);
+    let queries: Vec<Vec<f32>> = (0..nq)
+        .map(|i| {
+            let node = i.wrapping_mul(2_654_435_761) % n;
+            let mut v = vec![0.0f32; dim];
+            dequantize_sq16_into(&scorer.codes()[node * stride..(node + 1) * stride], &mut v);
+            for x in &mut v {
+                let u = (splitmix64(&mut rng) >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
+                *x += (u * 2.0 - 1.0) * 0.05;
+            }
+            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
+            for x in &mut v {
+                *x /= norm;
+            }
+            v
+        })
+        .collect();
+    let gt: Vec<Vec<u32>> = queries
+        .iter()
+        .map(|q| exhaustive_topk(scorer, q, k))
+        .collect();
+
+    let mut m0s: Vec<usize> = m0_candidates.to_vec();
+    m0s.sort_unstable();
+    m0s.dedup();
+    let mut efs: Vec<usize> = ef_candidates.to_vec();
+    efs.sort_unstable();
+    efs.dedup();
+    let m0_max = *m0s
+        .last()
+        .expect("invariant: m0 candidates non-empty (guarded above)");
+    let base = Hnsw::build(
+        scorer,
+        HnswParams {
+            m0: m0_max,
+            ef_construction,
+            ..HnswParams::default()
+        },
+    );
+    let pruned: Vec<(usize, Hnsw)> = m0s
+        .iter()
+        .map(|&m0| (m0, base.pruned_base_layer(m0)))
+        .collect();
+
+    let mut best = fallback;
+    let mut chosen: Option<CalibChoice> = None;
+    'search: for &ef in &efs {
+        // min latency first
+        for (m0, g) in &pruned {
+            // then min memory
+            let recall = graph_recall(g, scorer, &queries, &gt, k, ef);
+            let c = CalibChoice {
+                m0: *m0,
+                ef,
+                recall,
+                registered: recall >= register_floor,
+                at_target: recall >= target_recall,
+            };
+            if recall > best.recall {
+                best = c;
+            }
+            if recall >= target_recall {
+                chosen = Some(c);
+                break 'search;
+            }
+        }
+    }
+    let choice = chosen.unwrap_or(best);
+    // Persist the graph pruned to the chosen m0 — no second full build; the
+    // pruned max-graph IS what serves. `None` when not registered.
+    let graph = choice.registered.then(|| base.pruned_base_layer(choice.m0));
+    (choice, graph)
 }
 
 /// Sentinel filling unused fixed-stride layer-0 adjacency slots. Node ids
@@ -815,6 +1021,10 @@ pub(crate) struct HnswIndex {
     pub graph: Hnsw,
     pub doc_ids: Vec<i128>,
     pub dim: usize,
+    /// Calibrated query beam stamped at drain — the served `ef` default (a
+    /// query knob, so it rides in the bundle header, not the graph structure).
+    /// 0 ⇒ older bundle with no stamp; caller falls back to the ef law.
+    pub ef_search: usize,
 }
 
 /// Serialize a `hnsw` index to a persistable byte bundle: header,
@@ -826,6 +1036,7 @@ pub(crate) fn encode_hnsw(
     doc_ids: &[i128],
     graph: &Hnsw,
     dim: usize,
+    ef_search: usize,
 ) -> Vec<u8> {
     let n = doc_ids.len();
     debug_assert_eq!(sq16_codes.len(), n * dim * 2);
@@ -834,7 +1045,8 @@ pub(crate) fn encode_hnsw(
     out.extend_from_slice(HNSW_DATA_MAGIC);
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    out.extend_from_slice(&[0u8; 4]); // reserved / alignment
+    // Was reserved / alignment; now the stamped query beam (u32).
+    out.extend_from_slice(&(ef_search as u32).to_le_bytes());
     for &id in doc_ids {
         out.extend_from_slice(&id.to_le_bytes());
     }
@@ -854,7 +1066,7 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
     }
     let n = c.u64()? as usize;
     let dim = c.u32()? as usize;
-    c.take(4)?; // reserved
+    let ef_search = c.u32()? as usize; // 0 on older bundles (was reserved)
     if dim == 0 {
         return None;
     }
@@ -875,6 +1087,7 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
         graph,
         doc_ids,
         dim,
+        ef_search,
     })
 }
 
@@ -1463,6 +1676,99 @@ mod tests {
         assert!(recall >= 0.9, "sq16 recall@10 = {recall:.3} (< 0.9)");
     }
 
+    /// Deterministic clustered corpus: `n_cent` near-orthogonal unit
+    /// centers, each doc = a center plus small per-dim noise, renormalized.
+    /// Mirrors the synthetic vector bench's planted-cluster structure so we
+    /// can study graph quality on well-separated clusters.
+    fn clustered_unit_vectors(
+        n: usize,
+        n_cent: usize,
+        dim: usize,
+        noise: f32,
+        seed: u64,
+    ) -> Vec<Vec<f32>> {
+        let mut state = seed;
+        let renorm = |v: &mut Vec<f32>| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        };
+        let centers: Vec<Vec<f32>> = (0..n_cent)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim)
+                    .map(|_| next_unit(&mut state) * 2.0 - 1.0)
+                    .collect();
+                renorm(&mut v);
+                v
+            })
+            .collect();
+        (0..n)
+            .map(|i| {
+                let c = &centers[i % n_cent];
+                let mut v: Vec<f32> = c
+                    .iter()
+                    .map(|&cv| cv + (next_unit(&mut state) * 2.0 - 1.0) * noise)
+                    .collect();
+                renorm(&mut v);
+                v
+            })
+            .collect()
+    }
+
+    /// The calibrator returns a registering `(m0, ef)` that clears the target
+    /// on a corpus where the graph can, and picks from the candidate sets.
+    #[test]
+    fn calibrate_graph_picks_registering_choice() {
+        let dim = 128;
+        let n = 5000;
+        let vectors = clustered_unit_vectors(n, 32, dim, 0.3, 0x0CA_11B);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
+        let (choice, graph) = calibrate_graph(
+            &scorer,
+            &[32, 64, 128],
+            &[128, 256, 512],
+            0.90,
+            0.01,
+            200,
+            100,
+            10,
+            0x5EED,
+        );
+        eprintln!(
+            "[calib] m0={} ef={} recall={:.3} registered={} at_target={}",
+            choice.m0, choice.ef, choice.recall, choice.registered, choice.at_target
+        );
+        assert!(
+            choice.registered,
+            "should register; got recall {:.3}",
+            choice.recall
+        );
+        let graph = graph.expect("registered ⇒ pruned graph returned");
+        assert_eq!(
+            graph.base_degree(),
+            choice.m0,
+            "persisted graph pruned to chosen m0"
+        );
+        assert_eq!(graph.len(), n, "graph covers all rows");
+        assert!(
+            [32, 64, 128].contains(&choice.m0),
+            "m0 {} not a candidate",
+            choice.m0
+        );
+        assert!(
+            [128, 256, 512].contains(&choice.ef),
+            "ef {} not a candidate",
+            choice.ef
+        );
+        // A dim-128 clustered corpus should be reachable ⇒ at_target.
+        assert!(
+            choice.at_target,
+            "expected to clear 0.90; got {:.3}",
+            choice.recall
+        );
+    }
+
     /// The same generic build/search satisfies the trait for both the
     /// Sq16 and the Fp32 reference scorer, and each finds an exact stored
     /// vector as its own nearest neighbor.
@@ -1642,11 +1948,15 @@ mod tests {
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
-        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim);
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256);
         let idx = decode_hnsw(&bytes).expect("decode bundle");
         assert_eq!(idx.dim, dim);
         assert_eq!(idx.doc_ids, doc_ids);
         assert_eq!(idx.graph.len(), n);
+        assert_eq!(
+            idx.ef_search, 256,
+            "stamped ef round-trips through the bundle"
+        );
 
         let queries = random_unit_vectors(20, dim, 0xFEED);
         for q in &queries {

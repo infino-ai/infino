@@ -105,7 +105,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
-            hnsw::{Hnsw, HnswParams, Sq16Scorer, encode_hnsw},
+            hnsw::{self, Hnsw, HnswParams, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::ScanCandidate,
         },
@@ -1406,6 +1406,28 @@ fn warn_hnsw_no_resident_graph_once() {
 /// the codes, and return the encoded bundle bytes. `Ok(None)` when the
 /// column is absent, not Sq16, or empty; `Err` only on a genuine read
 /// fault (the drain treats that as "skip the graph", never fatal).
+/// Held-out query count for calibration recall measurement.
+const HNSW_CALIB_QUERIES: usize = 200;
+/// Deterministic calibration seed (no wall-clock / system randomness).
+const HNSW_CALIB_SEED: u64 = 0x_C0FF_EE00_CA11_B000;
+
+/// Evenly-strided subsample of the node-ordered Sq16 code plane down to
+/// `target` rows (all rows unchanged when `n <= target`). Used only for the
+/// cheap calibration probe on a large corpus — a coarse, deterministic spread
+/// across the drain-ordered plane, no allocation of the full clone.
+fn subsample_codes(codes: &[u8], dim: usize, n: usize, target: usize) -> (Vec<u8>, usize) {
+    if n <= target {
+        return (codes.to_vec(), n);
+    }
+    let stride = dim * 2;
+    let mut out = Vec::with_capacity(target * stride);
+    for i in 0..target {
+        let src = ((i as u64 * n as u64) / target as u64) as usize;
+        out.extend_from_slice(&codes[src * stride..src * stride + stride]);
+    }
+    (out, target)
+}
+
 pub(crate) async fn assemble_hnsw_sections(
     manifest: &ManifestSnapshot,
     column: &str,
@@ -1462,13 +1484,99 @@ pub(crate) async fn assemble_hnsw_sections(
         return Ok(None);
     }
     let n = doc_ids.len();
-    let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
-    let params = HnswParams {
-        ef_construction: config::global().vector.hnsw_ef_construction,
-        ..HnswParams::default()
+    let vcfg = &config::global().vector;
+    // (m0, ef) candidate grid for the calibrator. An explicit `hnsw_m0`
+    // override collapses the m0 search to that value; the ef grid is capped by
+    // `hnsw_ef_ceil`.
+    let m0_cands: Vec<usize> = if vcfg.hnsw_m0 != 0 {
+        vec![vcfg.hnsw_m0]
+    } else {
+        config::HNSW_M0_CANDIDATES.to_vec()
     };
-    let graph = Hnsw::build(&scorer, params);
-    Ok(Some(encode_hnsw(&codes, &doc_ids, &graph, dim)))
+    let ef_cands: Vec<usize> = config::HNSW_EF_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|&e| e <= vcfg.hnsw_ef_ceil)
+        .collect();
+    // Cheap probe gate. On a corpus larger than `hnsw_probe_max_docs`,
+    // calibrate on a bounded subsample first. Subsample recall is OPTIMISTIC
+    // (the m0 requirement grows with N), so a probe that cannot register is a
+    // hard "graph-hostile distribution" signal — skip the expensive full build
+    // and serve ivf. This gates on distribution, not size: a large but
+    // graph-friendly corpus passes the probe and keeps its graph. A registrable
+    // probe falls through to the authoritative full-corpus calibration below.
+    let probe_cap = vcfg.hnsw_probe_max_docs as usize;
+    if n > probe_cap {
+        let (pcodes, pn) = subsample_codes(&codes, dim, n, probe_cap);
+        let pscorer = Sq16Scorer::from_codes(pcodes, dim, pn);
+        let (pchoice, _) = hnsw::calibrate_graph(
+            &pscorer,
+            &m0_cands,
+            &ef_cands,
+            vcfg.target_recall,
+            vcfg.hnsw_recall_slack,
+            vcfg.hnsw_ef_construction,
+            HNSW_CALIB_QUERIES,
+            10,
+            HNSW_CALIB_SEED,
+        );
+        if !pchoice.registered {
+            eprintln!(
+                "[supertable hnsw] probe col={column} dim={dim} n={n} (sampled {pn}): \
+                 best recall {:.3} < floor (target {:.3}) — graph-hostile, serving ivf \
+                 (full build skipped)",
+                pchoice.recall, vcfg.target_recall
+            );
+            return Ok(None);
+        }
+        eprintln!(
+            "[supertable hnsw] probe col={column} dim={dim} n={n} (sampled {pn}): \
+             registrable (m0={} ef={} recall {:.3}) — proceeding to full-corpus build",
+            pchoice.m0, pchoice.ef, pchoice.recall
+        );
+    }
+    let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+    // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
+    // once at m0_max, prune down, sweep ef by re-search — free). The m0
+    // requirement is scale-dependent, so this full-corpus pass is authoritative
+    // (a subsample under-provisions it: 50K looks 0.99 while the full corpus
+    // serves 0.86). The pruned max-graph IS what we persist: no second build.
+    // If the graph can't clear the graceful floor, return None so queries serve
+    // ivf (the self-driving decision — reuses the existing None→fallback).
+    let (choice, graph) = hnsw::calibrate_graph(
+        &scorer,
+        &m0_cands,
+        &ef_cands,
+        vcfg.target_recall,
+        vcfg.hnsw_recall_slack,
+        vcfg.hnsw_ef_construction,
+        HNSW_CALIB_QUERIES,
+        10, // recall@10
+        HNSW_CALIB_SEED,
+    );
+    if !choice.registered {
+        eprintln!(
+            "[supertable hnsw] calibrate col={column} dim={dim} n={n}: best recall \
+             {:.3} < floor (target {:.3}) — graph NOT registered, serving ivf",
+            choice.recall, vcfg.target_recall
+        );
+        return Ok(None);
+    }
+    eprintln!(
+        "[supertable hnsw] calibrate col={column} dim={dim} n={n}: m0={} ef={} \
+         recall {:.3} (target {:.3}{})",
+        choice.m0,
+        choice.ef,
+        choice.recall,
+        vcfg.target_recall,
+        if choice.at_target {
+            ""
+        } else {
+            " — below-target/graceful"
+        }
+    );
+    let graph = graph.expect("registered choice carries its pruned graph");
+    Ok(Some(encode_hnsw(&codes, &doc_ids, &graph, dim, choice.ef)))
 }
 
 /// Incrementally extend a prior persisted `hnsw` graph with a
@@ -1557,21 +1665,29 @@ pub(crate) async fn assemble_hnsw_incremental(
     }
 
     let inserted = new_doc_ids.len();
+    // Incremental drains INHERIT the prior graph's calibrated `(m0, ef)`: the
+    // new nodes must match the existing base-layer degree (a mixed-degree
+    // graph would be inconsistent), and the stamped query beam carries
+    // forward. No recalibration here — that only happens on a full build.
+    let inherited_m0 = prior.graph.base_degree();
+    let inherited_ef = prior.ef_search;
     let mut codes = prior.scorer.codes().to_vec();
     codes.extend_from_slice(&new_codes);
     let mut doc_ids = prior.doc_ids;
     doc_ids.extend_from_slice(&new_doc_ids);
     let total = doc_ids.len();
     let scorer = Sq16Scorer::from_codes(codes.clone(), dim, total);
+    let vcfg = &config::global().vector;
     let params = HnswParams {
-        ef_construction: config::global().vector.hnsw_ef_construction,
+        ef_construction: vcfg.hnsw_ef_construction,
+        m0: inherited_m0,
         ..HnswParams::default()
     };
     // Insert ONLY the new node range into a copy of the prior graph.
     let graph = prior.graph.extend(&scorer, params);
     let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
     Ok(Some((
-        encode_hnsw(&codes, &doc_ids, &graph, dim),
+        encode_hnsw(&codes, &doc_ids, &graph, dim, inherited_ef),
         new_high_water,
         inserted,
     )))
@@ -1610,9 +1726,16 @@ impl SupertableReader {
         if data.dim != query.len() || data.doc_ids.is_empty() {
             return Ok(None);
         }
+        // The calibrated per-table `ef` stamped in the bundle is the default;
+        // fall back to the ef law only for older bundles with no stamp (0).
+        let ef = if data.ef_search > 0 {
+            data.ef_search.max(k)
+        } else {
+            hnsw_ef(k)
+        };
         let hits: Vec<SuperfileHit> = data
             .graph
-            .search(&data.scorer, query, k, hnsw_ef(k))
+            .search(&data.scorer, query, k, ef)
             .into_iter()
             .filter_map(|(node, dist)| {
                 Some(SuperfileHit {

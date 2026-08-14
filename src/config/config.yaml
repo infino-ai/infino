@@ -204,7 +204,7 @@ vector:
   # k. Ignored under any other search mode.
   hnsw_ef_floor: 128
   hnsw_ef_mult: 10
-  hnsw_ef_ceil: 512
+  hnsw_ef_ceil: 2048
 
   # For search_mode = hnsw: the ef_construction beam used to BUILD the
   # resident HNSW (build-time only, not per query). Higher = better-connected
@@ -213,12 +213,42 @@ vector:
   # the sweet spot for recall ~0.93-0.95; raise it only to push the >0.97 end.
   hnsw_ef_construction: 200
 
+  # For search_mode = hnsw: base-layer (layer-0) graph degree — the recall
+  # lever for high-dimensional vectors (the base layer must densify as
+  # dimension grows or greedy search under-finds). 0 lets the drain calibrator
+  # pick it (sweep to target_recall); a positive value overrides per table.
+  # Memory scales with docs x m0 (base layer only), bounded by hnsw_max_docs.
+  hnsw_m0: 0
+
+  # Recall/latency operating point for vector search — the bar both the ivf
+  # stamping law and the hnsw graph calibrator cross at. One value per table,
+  # engine-agnostic: the graph aims to hit it faster than ivf; if it can't,
+  # ivf serves the same target. Lower it to trade recall for latency.
+  target_recall: 0.99
+
+  # For search_mode = hnsw: how far below target_recall the graph is still
+  # accepted before the drain gives up and serves ivf (floor = target - this).
+  # Widen to keep more hard high-dim tables on the fast graph; tighten to
+  # demand near-target recall from the graph or step aside to ivf.
+  hnsw_recall_slack: 0.01
+
   # For search_mode = hnsw: scale ceiling for the per-row DATA graph. The
   # resident data HNSW is built at drain and persisted only when the table's
   # doc count is at or below this; above it, only the (much smaller) centroid
   # graph is built and hnsw queries fall back to the scan path. ~10M
   # rows of Sq16 codes is the practical single-host resident ceiling.
   hnsw_max_docs: 10000000
+
+  # For search_mode = hnsw: row cap for the cheap calibration probe. On a
+  # larger corpus, calibrate on a subsample of this many rows first. Subsample
+  # recall is optimistic (the m0 requirement grows with N), so a probe that
+  # cannot register is a hard "graph-hostile distribution" signal → skip the
+  # expensive full build and serve ivf; a probe that registers proceeds to the
+  # authoritative full-corpus calibration. Gates on distribution, not size: a
+  # large but graph-friendly corpus (e.g. a low-dim 10M set) passes and keeps
+  # its graph. Re-derived every drain, so no pre-existing table is permanently
+  # locked out — a migrated table is probed and, if friendly, fully built.
+  hnsw_probe_max_docs: 100000
 
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.

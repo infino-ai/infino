@@ -281,8 +281,11 @@ const DEFAULT_VECTOR_HNSW_EF_FLOOR: usize = 128;
 /// Default per-`k` beam multiplier for the `hnsw` ef law (integer).
 /// At the `k = 10` anchor `10 × 10 = 100` clamps up to the 128 floor.
 const DEFAULT_VECTOR_HNSW_EF_MULT: usize = 10;
-/// Default upper clamp on the scaled `hnsw` search `ef`.
-const DEFAULT_VECTOR_HNSW_EF_CEIL: usize = 512;
+/// Default upper clamp on the scaled `hnsw` search `ef`. High-dimensional
+/// cosine tables need a wide beam to reach the recall bar (e.g. glove-100
+/// clears ~0.99 only at ef=1024), so the ceiling allows that; the stamped
+/// per-table `ef` still lands well under it on easy tables.
+const DEFAULT_VECTOR_HNSW_EF_CEIL: usize = 2048;
 /// Default `ef_construction` for the `hnsw` HNSW build — the beam
 /// width used while inserting nodes. Higher builds a better-connected graph
 /// (same recall at a smaller search `ef`, so lower query latency) at a
@@ -290,6 +293,24 @@ const DEFAULT_VECTOR_HNSW_EF_CEIL: usize = 512;
 /// is set by `m`, not this). 200 is the sweet spot for recall ~0.93–0.95;
 /// raising it mainly helps the >0.97 end.
 const DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION: usize = 200;
+/// Default base-layer degree knob: `0` means the drain calibrator picks it
+/// (search over `HNSW_M0_CANDIDATES`). A non-zero config value overrides.
+const DEFAULT_VECTOR_HNSW_M0: usize = 0;
+/// Recall/latency operating point the graph calibrator targets (shared with
+/// the ivf stamping law — one point per table, engine-agnostic). The graph
+/// aims to hit this recall *faster* than ivf; if it can't, ivf serves it.
+const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
+/// How far below `target_recall` the drain calibrator still registers the
+/// graph (accepting the shortfall for the latency win) before giving up and
+/// serving ivf. The register floor is `target_recall - this`. Widen it to keep
+/// more hard high-dim tables on the graph; tighten it to demand near-target
+/// recall from the graph or step aside to ivf.
+const DEFAULT_VECTOR_HNSW_RECALL_SLACK: f64 = 0.01;
+/// Base-layer degree candidates the drain calibrator sweeps (ascending).
+pub const HNSW_M0_CANDIDATES: &[usize] = &[32, 64, 128, 256];
+/// Query-beam (`ef`) candidates the drain calibrator sweeps (ascending),
+/// bounded above by `hnsw_ef_ceil`.
+pub const HNSW_EF_CANDIDATES: &[usize] = &[128, 256, 512, 1024, 2048];
 /// Default scale ceiling for the `hnsw` **data** graph: the resident
 /// per-row HNSW is built (at drain) and persisted only when the table's doc
 /// count is at or below this. Above it, the whole-corpus graph would not fit
@@ -297,6 +318,18 @@ const DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION: usize = 200;
 /// falls back to the scan path. 10M rows of Sq16 codes at 768d is ~15 GiB
 /// resident — the practical single-host ceiling.
 const DEFAULT_VECTOR_HNSW_MAX_DOCS: u64 = 10_000_000;
+/// Row cap for the cheap calibration *probe*. On a corpus larger than this,
+/// the calibrator first builds + calibrates on a bounded subsample of this
+/// many rows before committing to the expensive full-corpus build. Subsample
+/// recall is optimistic (the `m0` requirement grows with N), so a probe that
+/// cannot register is a hard "graph-hostile distribution" signal → skip the
+/// full build and serve ivf. A probe that registers proceeds to the
+/// authoritative full-corpus calibration. This gates on distribution, not
+/// size: a large but graph-friendly corpus (e.g. a low-dim 10M set) passes the
+/// probe and keeps its graph. Because the probe is re-derived every drain, no
+/// pre-existing table is ever permanently locked out — a migrated table gets
+/// probed and, if friendly, fully built on its first drain.
+const DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS: u64 = 100_000;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
 /// inside each selected cell. Small cells stay at this known-good minimum.
 const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
@@ -473,12 +506,35 @@ pub struct VectorSettings {
     /// build cost and no extra resident memory. Ignored under any other
     /// search mode.
     pub hnsw_ef_construction: usize,
+    /// For `search_mode = hnsw`: base-layer (layer-0) graph degree. This is
+    /// the recall lever for high-dimensional vectors — the base layer must be
+    /// denser as dimension grows or greedy search under-finds the true
+    /// neighbors. `0` (the default) lets the drain calibrator pick it (sweep
+    /// over `HNSW_M0_CANDIDATES` to the recall bar); a non-zero value overrides
+    /// that per table. Memory and the persisted graph scale with `docs × m0`,
+    /// bounded by `hnsw_max_docs`. The upper-layer degree stays fixed (cheap) —
+    /// only the base layer moves recall.
+    pub hnsw_m0: usize,
+    /// Recall/latency operating point for vector search — the bar the
+    /// acceptance gates (ivf stamping, and the hnsw graph calibrator) cross
+    /// at. One value per table, engine-agnostic: the graph aims to hit it
+    /// faster than ivf, else ivf serves it.
+    pub target_recall: f64,
+    /// Recall shortfall below `target_recall` the hnsw graph is still accepted
+    /// at before the drain gives up and serves ivf (`floor = target - this`).
+    pub hnsw_recall_slack: f64,
     /// For `search_mode = hnsw`: scale ceiling for the per-row **data**
     /// graph. The resident data HNSW is built at drain and persisted only
     /// when the table's doc count ≤ this; above it, only the centroid graph
     /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
     pub hnsw_max_docs: u64,
+    /// For `search_mode = hnsw`: row cap for the cheap calibration *probe*. On
+    /// a larger corpus, calibrate on a subsample of this many rows first; a
+    /// probe that cannot register (optimistic subsample recall) skips the
+    /// expensive full build → ivf, while a probe that registers proceeds to the
+    /// authoritative full-corpus calibration. Gates on distribution, not size.
+    pub hnsw_probe_max_docs: u64,
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
@@ -554,7 +610,11 @@ impl Default for VectorSettings {
             hnsw_ef_mult: DEFAULT_VECTOR_HNSW_EF_MULT,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
+            hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
+            target_recall: DEFAULT_VECTOR_TARGET_RECALL,
+            hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
+            hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,
@@ -970,7 +1030,7 @@ mod tests {
     fn hnsw_ef_law_config_validates() {
         let cfg = Config::defaults().expect("defaults parse");
         assert_eq!(cfg.vector.hnsw_ef_floor, 128);
-        assert_eq!(cfg.vector.hnsw_ef_ceil, 512);
+        assert_eq!(cfg.vector.hnsw_ef_ceil, 2048);
         assert_eq!(cfg.vector.hnsw_ef_mult, 10);
 
         let inverted =
