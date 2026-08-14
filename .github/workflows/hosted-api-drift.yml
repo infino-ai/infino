@@ -29,7 +29,35 @@ jobs:
     name: Remote transport ⇄ hosted API spec
     runs-on: ubuntu-latest
     steps:
+      # Full history so the base branch's fixture is available to diff against.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Report-only changelog: when the vendored spec itself changed, grade the
+      # delta with oasdiff so the PR summary reads "N breaking / M additive"
+      # instead of raw JSON hunks. Never fails the job — by the time a refresh
+      # PR exists the service has already shipped the change; the conformance
+      # test below is the gate for "does the client still match".
+      - name: Summarize the spec delta (report-only)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          BASE_REF="origin/${{ github.base_ref }}"
+          if git diff --quiet "$BASE_REF"...HEAD -- tests/fixtures/hosted-openapi.json; then
+            echo "fixture unchanged in this PR — no spec delta to summarize"
+            exit 0
+          fi
+          VERSION=1.28.0
+          curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${VERSION}/oasdiff_${VERSION}_linux_amd64.tar.gz"             | tar -xz oasdiff
+          git show "$BASE_REF:tests/fixtures/hosted-openapi.json" > /tmp/base-spec.json
+          {
+            echo "## Hosted API spec delta (base → PR)"
+            echo '```'
+            ./oasdiff changelog /tmp/base-spec.json tests/fixtures/hosted-openapi.json || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `--ignored` runs exactly the ignored drift test (kept out of `make ci`).

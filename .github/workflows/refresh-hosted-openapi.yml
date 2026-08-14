@@ -19,9 +19,11 @@ on:
         description: "OpenAPI spec URL to fetch"
         default: "https://api.platform.infino.ws/openapi.json"
 
+# The push and PR use RELEASE_PAT (same fine-grained token release-prep
+# uses): a PR created with the default GITHUB_TOKEN triggers no workflows,
+# so the drift check this refresh exists to feed would never run on it.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: refresh-hosted-openapi
@@ -34,6 +36,8 @@ jobs:
     if: github.repository == 'infino-ai/infino'
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Fetch the published spec
         run: |
@@ -46,6 +50,7 @@ jobs:
       - name: Open a refresh PR if the spec changed
         uses: peter-evans/create-pull-request@v6
         with:
+          token: ${{ secrets.RELEASE_PAT }}
           add-paths: tests/fixtures/hosted-openapi.json
           branch: bot/refresh-hosted-openapi
           commit-message: "test: refresh the vendored hosted API spec"
