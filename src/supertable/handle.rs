@@ -5833,6 +5833,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         // The hidden table's own scoped provider — its pointer file, not the
@@ -6035,6 +6036,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6110,6 +6112,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let zero_manifest = hidden
             .block_on_query(persist_commit_async(
@@ -6271,6 +6274,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden

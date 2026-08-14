@@ -150,7 +150,21 @@ impl Default for MemorySettings {
 /// never panics on a malformed host config.
 pub fn global() -> &'static Config {
     static GLOBAL: OnceLock<Config> = OnceLock::new();
-    GLOBAL.get_or_init(|| Config::load().unwrap_or_default())
+    GLOBAL.get_or_init(|| match Config::load() {
+        Ok(cfg) => cfg,
+        // A load failure here silently reverts the operator's ENTIRE config
+        // file — storage, commit thresholds, budgets, drain tuning — to the
+        // embedded defaults. Never do that quietly: log loudly, then fall back
+        // (a read site must not panic on a malformed host config).
+        Err(error) => {
+            tracing::error!(
+                "operator config failed to load ({error}); falling back to embedded \
+                 defaults — the host config file (storage, budgets, drain tuning) is NOT \
+                 being applied. Fix the config and restart."
+            );
+            Config::default()
+        }
+    })
 }
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
@@ -273,15 +287,7 @@ const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
 const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
-/// Default floor for the `hnsw` search-`ef` law — the minimum beam
-/// width and the exact `ef` at the `k = 10` anchor (`128 ≈ 0.97 recall@10`
-/// on Cohere-1M). The full law is
-/// `ef = max(k, clamp(ceil(k × ef_mult), ef_floor, ef_ceil))`.
-const DEFAULT_VECTOR_HNSW_EF_FLOOR: usize = 128;
-/// Default per-`k` beam multiplier for the `hnsw` ef law (integer).
-/// At the `k = 10` anchor `10 × 10 = 100` clamps up to the 128 floor.
-const DEFAULT_VECTOR_HNSW_EF_MULT: usize = 10;
-/// Default upper clamp on the scaled `hnsw` search `ef`. High-dimensional
+/// Default upper bound on the `hnsw` calibration ef grid. High-dimensional
 /// cosine tables need a wide beam to reach the recall bar (e.g. glove-100
 /// clears ~0.99 only at ef=1024), so the ceiling allows that; the stamped
 /// per-table `ef` still lands well under it on easy tables.
@@ -501,18 +507,10 @@ pub struct VectorSettings {
     /// clusters within each cell into contiguous reads. Ignored under
     /// `search_mode = ivf`.
     pub global_fine_coalesce: bool,
-    /// For `search_mode = hnsw`: the search `ef` is scaled from `k` as
-    /// `ef = max(k, clamp(k × ef_mult, ef_floor, ef_ceil))` — all integer.
-    /// This is the floor: the minimum beam width, and the effective `ef` at
-    /// the `k = 10` anchor (`10 × 10 = 100`, clamped up to the 128 floor).
-    /// Ignored under any other search mode.
-    pub hnsw_ef_floor: usize,
-    /// For `search_mode = hnsw`: the per-`k` beam multiplier in the ef law
-    /// above. Integer (≥ 1); the floor pins the small-`k` anchor, so no
-    /// fractional multiplier is needed. Ignored under any other search mode.
-    pub hnsw_ef_mult: usize,
-    /// For `search_mode = hnsw`: the upper clamp on the scaled `ef`.
-    /// Ignored under any other search mode.
+    /// For `search_mode = hnsw`: the upper bound on the calibration ef grid —
+    /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
+    /// the winning `ef` per table into the persisted bundle. Must be at least
+    /// the smallest candidate (128). Ignored under any other search mode.
     pub hnsw_ef_ceil: usize,
     /// For `search_mode = hnsw`: the `ef_construction` beam used when
     /// building the resident HNSW (build-time only). Higher = better-
@@ -616,8 +614,6 @@ impl Default for VectorSettings {
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
-            hnsw_ef_floor: DEFAULT_VECTOR_HNSW_EF_FLOOR,
-            hnsw_ef_mult: DEFAULT_VECTOR_HNSW_EF_MULT,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
@@ -959,18 +955,17 @@ impl Config {
     /// panicking or misbehaving at query time.
     fn validate(&self) -> Result<(), ConfigError> {
         let v = &self.vector;
-        // `.clamp(ef_floor, ef_ceil)` in the hnsw ef law PANICS if
-        // `ef_floor > ef_ceil`; reject an inverted range here.
-        if v.hnsw_ef_floor > v.hnsw_ef_ceil {
+        // The calibrator's ef grid starts at the smallest [`HNSW_EF_CANDIDATES`]
+        // entry (128). A ceiling below that filters the grid to empty, so the
+        // drain finds no registrable (m0, ef) and logs "graph-hostile" though
+        // no sweep ever ran. Keep the ceiling at or above the smallest
+        // candidate.
+        const MIN_EF_CEIL: usize = 128;
+        if v.hnsw_ef_ceil < MIN_EF_CEIL {
             return Err(ConfigError::Invalid(format!(
-                "vector.hnsw_ef_floor ({}) must be <= vector.hnsw_ef_ceil ({})",
-                v.hnsw_ef_floor, v.hnsw_ef_ceil
-            )));
-        }
-        if v.hnsw_ef_mult < 1 {
-            return Err(ConfigError::Invalid(format!(
-                "vector.hnsw_ef_mult must be >= 1, got {}",
-                v.hnsw_ef_mult
+                "vector.hnsw_ef_ceil ({}) must be >= {MIN_EF_CEIL} (the smallest \
+                 calibration ef candidate); a lower ceiling empties the sweep grid",
+                v.hnsw_ef_ceil
             )));
         }
         // A recall target outside (0, 1] is meaningless and, shared with the
@@ -986,6 +981,36 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "vector.hnsw_recall_slack must be in [0.0, 1.0], got {}",
                 v.hnsw_recall_slack
+            )));
+        }
+        // The register floor is `target_recall - hnsw_recall_slack`. Slack at
+        // or above the target collapses that floor to <= 0, so ANY graph with
+        // recall > 0 registers and the recall bar stops meaning anything.
+        if v.hnsw_recall_slack >= v.target_recall {
+            return Err(ConfigError::Invalid(format!(
+                "vector.hnsw_recall_slack ({}) must be < vector.target_recall ({}) — \
+                 otherwise the register floor collapses to zero and every graph registers",
+                v.hnsw_recall_slack, v.target_recall
+            )));
+        }
+        // An explicit base degree far above `ef_construction` is pure sentinel
+        // padding: a build discovers at most ~`ef_construction` neighbors per
+        // node, so slots beyond that stay empty (`ADJ_SENTINEL`) — wasted
+        // persisted bytes (m0 = 1024 is ~40GB of sentinels at 10M rows for a
+        // degree-<=200 graph). `hnsw_m0 = 0` means the calibrator picks it, so
+        // only guard an explicit override. Allow modest headroom (the
+        // calibrator's own top candidate slightly exceeds the default
+        // `ef_construction`) but reject gross over-provisioning.
+        const M0_HEADROOM_OVER_EF_CONSTRUCTION: usize = 2;
+        let m0_ceiling = v
+            .hnsw_ef_construction
+            .saturating_mul(M0_HEADROOM_OVER_EF_CONSTRUCTION);
+        if v.hnsw_m0 != 0 && v.hnsw_m0 > m0_ceiling {
+            return Err(ConfigError::Invalid(format!(
+                "vector.hnsw_m0 ({}) must be <= {m0_ceiling} ({M0_HEADROOM_OVER_EF_CONSTRUCTION}× \
+                 vector.hnsw_ef_construction = {}) — a larger base degree is unreachable \
+                 sentinel padding",
+                v.hnsw_m0, v.hnsw_ef_construction
             )));
         }
         Ok(())
@@ -1047,33 +1072,28 @@ mod tests {
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
     }
 
-    /// The `hnsw` ef-law knobs default to the measured anchor, and
-    /// validation rejects an inverted floor/ceil (which would panic
-    /// `.clamp` at query time) or a non-positive multiplier.
+    /// The `hnsw` calibration knobs default to the shipped values, and
+    /// validation rejects the cross-field combinations that would silently
+    /// disable the recall bar or empty the calibration grid.
     #[test]
-    fn hnsw_ef_law_config_validates() {
+    fn hnsw_calibration_config_validates() {
         let cfg = Config::defaults().expect("defaults parse");
-        assert_eq!(cfg.vector.hnsw_ef_floor, 128);
         assert_eq!(cfg.vector.hnsw_ef_ceil, 2048);
-        assert_eq!(cfg.vector.hnsw_ef_mult, 10);
 
-        let inverted =
-            Figment::new()
+        let invalid = |patch: serde_json::Value| {
+            let fig = Figment::new()
                 .merge(Yaml::string(EMBEDDED_DEFAULT))
-                .merge(Serialized::defaults(json!({
-                    "vector": { "hnsw_ef_floor": 600, "hnsw_ef_ceil": 512 }
-                })));
-        let err = Config::from_figment(inverted).expect_err("inverted range must fail");
-        assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+                .merge(Serialized::defaults(patch));
+            let err = Config::from_figment(fig).expect_err("must fail validation");
+            assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+        };
 
-        let bad_mult =
-            Figment::new()
-                .merge(Yaml::string(EMBEDDED_DEFAULT))
-                .merge(Serialized::defaults(json!({
-                    "vector": { "hnsw_ef_mult": 0 }
-                })));
-        let err = Config::from_figment(bad_mult).expect_err("zero mult must fail");
-        assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+        // A ceiling below the smallest ef candidate empties the sweep grid.
+        invalid(json!({ "vector": { "hnsw_ef_ceil": 64 } }));
+        // Slack >= target collapses the register floor to zero.
+        invalid(json!({ "vector": { "target_recall": 0.9, "hnsw_recall_slack": 0.95 } }));
+        // An explicit m0 far above ef_construction is sentinel padding.
+        invalid(json!({ "vector": { "hnsw_m0": 1024, "hnsw_ef_construction": 200 } }));
     }
 
     #[test]

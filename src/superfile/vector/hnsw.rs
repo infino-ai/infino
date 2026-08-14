@@ -39,7 +39,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashSet},
     sync::{Mutex, RwLock},
 };
 
@@ -335,10 +335,14 @@ impl VisitedSet {
     }
 }
 
+/// SplitMix64 increment (the odd golden-ratio constant `⌊2⁶⁴/φ⌋`), also mixed
+/// into calibration/layer seeds to decorrelate their streams.
+const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// SplitMix64 — a tiny, fully deterministic mixer for layer assignment.
 #[inline]
 fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    *state = state.wrapping_add(SPLITMIX64_INCREMENT);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -348,7 +352,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// Deterministic layer for `node`: `floor(−ln(U) · ml)` with `U` a
 /// seeded uniform in `(0, 1]`, the standard exponential HNSW tower.
 fn assign_level(seed: u64, node: u32, ml: f64) -> u32 {
-    let mut st = seed ^ (node as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut st = seed ^ (node as u64).wrapping_mul(SPLITMIX64_INCREMENT);
     let r = splitmix64(&mut st);
     // Top 53 bits → uniform in [0, 1).
     let unif = (r >> 11) as f64 / ((1u64 << 53) as f64);
@@ -412,9 +416,10 @@ impl Hnsw {
             ef_construction: params.ef_construction,
         };
 
-        // Insert nodes 1..n concurrently. `for_each_init` hands each worker a
-        // reusable `VisitedSet` scratch so the O(n) epoch buffer is allocated
-        // once per thread, not once per insert.
+        // Insert nodes 1..n concurrently. `for_each_init` calls `init` once per
+        // job (a contiguous run of items a worker processes), not once per
+        // element, so the O(n) epoch buffer is amortized across many inserts
+        // rather than allocated per insert.
         (1..n as u32).into_par_iter().for_each_init(
             || VisitedSet::new(n),
             |visited, node| builder.insert(scorer, node, visited),
@@ -609,12 +614,30 @@ impl Hnsw {
 
     /// Search the graph for the `k` nearest nodes to `query`, using an
     /// `ef`-width beam on layer 0. Returns `(node, distance)` ascending.
+    /// Allocates a fresh visited set; prefer [`search_scratch`](Self::search_scratch)
+    /// on a hot loop (e.g. calibration) to reuse one across many searches.
     pub(crate) fn search<S: NodeScorer>(
         &self,
         scorer: &S,
         query: &[f32],
         k: usize,
         ef: usize,
+    ) -> Vec<(u32, f32)> {
+        let mut visited = VisitedSet::new(self.len);
+        self.search_scratch(scorer, query, k, ef, &mut visited)
+    }
+
+    /// [`search`](Self::search) reusing a caller-owned visited set. The set is
+    /// reset in O(1) here, so a caller running many searches (calibration runs
+    /// thousands per drain) allocates the O(n) epoch buffer once instead of
+    /// per search. `visited` must be sized for at least `self.len` nodes.
+    fn search_scratch<S: NodeScorer>(
+        &self,
+        scorer: &S,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        visited: &mut VisitedSet,
     ) -> Vec<(u32, f32)> {
         if self.len == 0 || k == 0 {
             return Vec::new();
@@ -627,9 +650,10 @@ impl Hnsw {
             ep = self.greedy_nearest(scorer, &prepared, ep, l);
             l -= 1;
         }
-        let mut visited = VisitedSet::new(self.len);
+        // `search_layer` resets `visited` (O(1) epoch bump) before use, so a
+        // reused scratch set needs no clear here.
         let ef = ef.max(k);
-        let found = self.search_layer(scorer, &prepared, &[ep], ef, 0, &mut visited);
+        let found = self.search_layer(scorer, &prepared, &[ep], ef, 0, visited);
         found
             .into_iter()
             .take(k)
@@ -649,23 +673,41 @@ impl Hnsw {
         self.m0
     }
 
-    /// A copy with the layer-0 (base) adjacency truncated to `m0` neighbors
-    /// per node — a cheap way to evaluate a smaller base-layer degree without a
+    /// A copy with the layer-0 (base) adjacency reduced to `m0` neighbors per
+    /// node — a cheap way to evaluate a smaller base-layer degree without a
     /// native rebuild. Upper layers are untouched. The pruned graph is BOTH the
-    /// calibration proxy and what gets persisted for the chosen `m0`: truncating
-    /// the max-`m0` build's base layer approximates a native `m0` build closely
-    /// enough to rank candidates, and it serves directly — no second full build.
-    pub(crate) fn pruned_base_layer(&self, m0: usize) -> Hnsw {
+    /// calibration proxy and what gets persisted for the chosen `m0`.
+    ///
+    /// The reduction re-runs [`select_neighbors_heuristic`] per node at the
+    /// target `m0` — the SAME distance-aware selection [`link_into`] applies
+    /// when a list overflows its cap during a build. A positional truncation
+    /// (`lst[..m0]`) would be unsound here: an un-overflowed base list is laid
+    /// out `[distance-sorted own selection | reverse links in arrival order]`,
+    /// so slicing preferentially drops the unsorted reverse-link tail
+    /// regardless of distance, leaving a run-varying set of in-degree-zero
+    /// nodes permanently unreachable and making small-`m0` recall measure worse
+    /// than a native build. Re-selecting by the heuristic keeps the closest
+    /// diverse neighbors and matches a native `m0` build closely.
+    pub(crate) fn pruned_base_layer<S: NodeScorer>(&self, scorer: &S, m0: usize) -> Hnsw {
         let neighbors = self
             .neighbors
             .iter()
-            .map(|levels| {
+            .enumerate()
+            .map(|(node, levels)| {
                 levels
                     .iter()
                     .enumerate()
                     .map(|(lvl, lst)| {
                         if lvl == 0 && lst.len() > m0 {
-                            lst[..m0].to_vec()
+                            let prep = scorer.prepare_node(node as u32);
+                            let cands: Vec<Scored> = lst
+                                .iter()
+                                .map(|&x| Scored {
+                                    node: x,
+                                    dist: scorer.score(&prep, x),
+                                })
+                                .collect();
+                            select_neighbors_heuristic(scorer, cands, m0)
                         } else {
                             lst.clone()
                         }
@@ -717,6 +759,65 @@ fn exhaustive_topk<S: NodeScorer>(scorer: &S, query: &[f32], k: usize) -> Vec<u3
     all.into_iter().take(k).map(|s| s.node).collect()
 }
 
+/// Odd Knuth multiplier that spreads calibration query source nodes evenly
+/// across the plane (multiplicative hashing) without clustering.
+const CALIB_QUERY_STRIDE_MULT: usize = 2_654_435_761;
+/// Fraction each calibration query is nudged off its exact source node (then
+/// renormalized) so measured recall reflects true off-node search rather than
+/// a node's trivial self-hit.
+const CALIB_QUERY_JITTER: f32 = 0.05;
+
+/// Held-out, perturbed (off-node) calibration queries drawn from the plane —
+/// evenly spread source nodes, each jittered off its exact position and
+/// renormalized. Shared by the calibrator and the incremental recall re-check.
+fn calibration_queries(scorer: &Sq16Scorer, n_queries: usize, seed: u64) -> Vec<Vec<f32>> {
+    let n = scorer.len();
+    let dim = scorer.dim();
+    let stride = dim * 2;
+    let mut rng = seed ^ SPLITMIX64_INCREMENT;
+    let nq = n_queries.min(n);
+    (0..nq)
+        .map(|i| {
+            let node = i.wrapping_mul(CALIB_QUERY_STRIDE_MULT) % n;
+            let mut v = vec![0.0f32; dim];
+            dequantize_sq16_into(&scorer.codes()[node * stride..(node + 1) * stride], &mut v);
+            for x in &mut v {
+                let u = (splitmix64(&mut rng) >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
+                *x += (u * 2.0 - 1.0) * CALIB_QUERY_JITTER;
+            }
+            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
+            for x in &mut v {
+                *x /= norm;
+            }
+            v
+        })
+        .collect()
+}
+
+/// Measured recall@`k` of an already-built `graph` walked at `ef`, against
+/// exhaustive ground truth on held-out perturbed queries. Lets a drain
+/// re-check that a graph GROWN by incremental insert still clears its recall
+/// bar (the base-layer degree requirement rises with N, so inherited `(m0,
+/// ef)` calibrated at a smaller scale can drift below target).
+pub(crate) fn measure_recall(
+    graph: &Hnsw,
+    scorer: &Sq16Scorer,
+    ef: usize,
+    k: usize,
+    n_queries: usize,
+    seed: u64,
+) -> f64 {
+    if graph.is_empty() {
+        return 0.0;
+    }
+    let queries = calibration_queries(scorer, n_queries, seed);
+    let gt: Vec<Vec<u32>> = queries
+        .iter()
+        .map(|q| exhaustive_topk(scorer, q, k))
+        .collect();
+    graph_recall(graph, scorer, &queries, &gt, k, ef)
+}
+
 /// Recall@k of `graph` walked at `ef` against exhaustive `gt`.
 fn graph_recall(
     graph: &Hnsw,
@@ -728,9 +829,12 @@ fn graph_recall(
 ) -> f64 {
     let mut hit = 0usize;
     let mut total = 0usize;
+    // One visited set reused across every query (calibration runs thousands of
+    // searches per drain — a fresh O(n) buffer each would dominate).
+    let mut visited = VisitedSet::new(graph.len());
     for (q, truth) in queries.iter().zip(gt) {
-        let got: std::collections::HashSet<u32> = graph
-            .search(scorer, q, k, ef)
+        let got: HashSet<u32> = graph
+            .search_scratch(scorer, q, k, ef, &mut visited)
             .into_iter()
             .map(|(n, _)| n)
             .collect();
@@ -765,7 +869,6 @@ pub(crate) fn calibrate_graph(
 ) -> (CalibChoice, Option<Hnsw>) {
     let register_floor = (target_recall - recall_slack).max(0.0);
     let n = scorer.len();
-    let dim = scorer.dim();
     let fallback = CalibChoice {
         m0: *m0_candidates.iter().min().unwrap_or(&32),
         ef: *ef_candidates.iter().min().unwrap_or(&128),
@@ -776,25 +879,7 @@ pub(crate) fn calibrate_graph(
     if n == 0 || m0_candidates.is_empty() || ef_candidates.is_empty() {
         return (fallback, None);
     }
-    let stride = dim * 2;
-    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
-    let nq = n_queries.min(n);
-    let queries: Vec<Vec<f32>> = (0..nq)
-        .map(|i| {
-            let node = i.wrapping_mul(2_654_435_761) % n;
-            let mut v = vec![0.0f32; dim];
-            dequantize_sq16_into(&scorer.codes()[node * stride..(node + 1) * stride], &mut v);
-            for x in &mut v {
-                let u = (splitmix64(&mut rng) >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
-                *x += (u * 2.0 - 1.0) * 0.05;
-            }
-            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
-            for x in &mut v {
-                *x /= norm;
-            }
-            v
-        })
-        .collect();
+    let queries = calibration_queries(scorer, n_queries, seed);
     let gt: Vec<Vec<u32>> = queries
         .iter()
         .map(|q| exhaustive_topk(scorer, q, k))
@@ -824,7 +909,7 @@ pub(crate) fn calibrate_graph(
     let recall_matrix: Vec<Vec<f64>> = m0s
         .iter()
         .map(|&m0| {
-            let g = base.pruned_base_layer(m0);
+            let g = base.pruned_base_layer(scorer, m0);
             efs.iter()
                 .map(|&ef| graph_recall(&g, scorer, &queries, &gt, k, ef))
                 .collect()
@@ -857,8 +942,16 @@ pub(crate) fn calibrate_graph(
     let choice = chosen.unwrap_or(best);
     // Persist the graph pruned to the chosen m0 — one prune of the base, no
     // second full build; the pruned max-graph IS what serves. `None` when not
-    // registered.
-    let graph = choice.registered.then(|| base.pruned_base_layer(choice.m0));
+    // registered. When the chosen m0 IS the max (the common case for hard
+    // high-dim tables), the base graph already has that degree — move it
+    // instead of a byte-for-byte deep copy (a full graph is multi-GB at scale).
+    let graph = if !choice.registered {
+        None
+    } else if choice.m0 == m0_max {
+        Some(base)
+    } else {
+        Some(base.pruned_base_layer(scorer, choice.m0))
+    };
     (choice, graph)
 }
 
@@ -888,6 +981,11 @@ impl<'a> Cursor<'a> {
         let s = self.buf.get(self.pos..end)?;
         self.pos = end;
         Some(s)
+    }
+    /// Bytes left unread — used to bound wire-driven allocations before
+    /// reserving, so a corrupt length word can't request a huge `Vec`.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
@@ -966,9 +1064,25 @@ impl Hnsw {
         if n == 0 || entry as usize >= n || m0 == 0 {
             return None;
         }
+        // Cross-check the wire lengths against the bytes actually present
+        // BEFORE reserving, so a corrupt `n`/`m0` word cannot drive a huge
+        // `with_capacity` (an `n` of u32::MAX would otherwise abort under
+        // `handle_alloc_error`). The node-level block is `n * 4` bytes and the
+        // fixed-stride layer-0 block is `n * m0 * 4`; both must fit.
+        let node_level_bytes = n.checked_mul(4)?;
+        let l0_bytes = n.checked_mul(m0)?.checked_mul(4)?;
+        if node_level_bytes.checked_add(l0_bytes)? > c.remaining() {
+            return None;
+        }
         let mut node_level = Vec::with_capacity(n);
         for _ in 0..n {
-            node_level.push(c.u32()?);
+            let lvl = c.u32()?;
+            // A tower taller than the graph ever builds is corruption; reject
+            // rather than allocate a `MAX_LEVEL`-plus adjacency vec.
+            if lvl > MAX_LEVEL {
+                return None;
+            }
+            node_level.push(lvl);
         }
         // Allocate per-node adjacency sized by its top level.
         let mut neighbors: Vec<Vec<Vec<u32>>> = node_level
@@ -998,13 +1112,26 @@ impl Hnsw {
             if node >= n || level >= neighbors[node].len() {
                 return None;
             }
+            // Bound the per-record allocation by the bytes left (each id is 4).
+            if len.checked_mul(4)? > c.remaining() {
+                return None;
+            }
             let mut list = Vec::with_capacity(len);
             for _ in 0..len {
-                let id = c.u32()?;
-                if id as usize >= n {
+                let id = c.u32()? as usize;
+                if id >= n {
                     return None;
                 }
-                list.push(id);
+                // Tower-coverage guard: an edge at `level` is followed into
+                // `neighbors[id][level]` during the walk, so `id`'s tower must
+                // reach `level`. Without this, a level edge to a shorter tower
+                // is an out-of-bounds panic in `greedy_nearest` at query time —
+                // exactly the corruption we must degrade to a fallback, not
+                // panic inside a query or drain worker.
+                if (node_level[id] as usize) < level {
+                    return None;
+                }
+                list.push(id as u32);
             }
             neighbors[node][level] = list;
         }
@@ -1022,8 +1149,10 @@ impl Hnsw {
 
 /// On-disk magic for a persisted `hnsw` bundle (graph + node→doc-id
 /// map + node-ordered Sq16 plane), the self-contained payload a resident
-/// data index is rebuilt from at open.
-const HNSW_DATA_MAGIC: &[u8; 8] = b"INFDDG01";
+/// data index is rebuilt from at open. `02` carries the stamped column
+/// name; an older `01` bundle (no column) decodes to `None` so the query
+/// falls back to ivf until the next drain rebuilds it.
+const HNSW_DATA_MAGIC: &[u8; 8] = b"INFDDG02";
 
 /// A `hnsw` resident index rebuilt from a persisted bundle: the Sq16
 /// scorer over the node-ordered code plane, the walkable graph, and the
@@ -1033,10 +1162,15 @@ pub(crate) struct HnswIndex {
     pub graph: Hnsw,
     pub doc_ids: Vec<i128>,
     pub dim: usize,
-    /// Calibrated query beam stamped at drain — the served `ef` default (a
-    /// query knob, so it rides in the bundle header, not the graph structure).
-    /// 0 ⇒ older bundle with no stamp; caller falls back to the ef law.
+    /// Calibrated query beam stamped at drain — the served `ef` (a query knob,
+    /// so it rides in the bundle header, not the graph structure). Always
+    /// non-zero from the drain; a 0 (which cannot occur) degrades to `k`.
     pub ef_search: usize,
+    /// Vector column this graph was built for. A table can carry several
+    /// same-dim vector columns; the serving path must reject a query on a
+    /// different column (→ ivf) rather than silently answer it from this
+    /// column's neighbors.
+    pub column: String,
 }
 
 /// Serialize a `hnsw` index to a persistable byte bundle: header,
@@ -1049,16 +1183,22 @@ pub(crate) fn encode_hnsw(
     graph: &Hnsw,
     dim: usize,
     ef_search: usize,
+    column: &str,
 ) -> Vec<u8> {
     let n = doc_ids.len();
     debug_assert_eq!(sq16_codes.len(), n * dim * 2);
     let graph_bytes = graph.to_bytes();
-    let mut out = Vec::with_capacity(32 + n * 16 + sq16_codes.len() + graph_bytes.len());
+    let col = column.as_bytes();
+    let mut out =
+        Vec::with_capacity(32 + col.len() + n * 16 + sq16_codes.len() + graph_bytes.len());
     out.extend_from_slice(HNSW_DATA_MAGIC);
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     // Was reserved / alignment; now the stamped query beam (u32).
     out.extend_from_slice(&(ef_search as u32).to_le_bytes());
+    // Stamped column name: length-prefixed UTF-8.
+    out.extend_from_slice(&(col.len() as u32).to_le_bytes());
+    out.extend_from_slice(col);
     for &id in doc_ids {
         out.extend_from_slice(&id.to_le_bytes());
     }
@@ -1082,6 +1222,12 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
     if dim == 0 {
         return None;
     }
+    let col_len = c.u32()? as usize;
+    // Bound the column-name read against the bytes present before taking it.
+    if col_len > c.remaining() {
+        return None;
+    }
+    let column = String::from_utf8(c.take(col_len)?.to_vec()).ok()?;
     let mut doc_ids = Vec::with_capacity(n);
     for _ in 0..n {
         doc_ids.push(c.i128()?);
@@ -1100,6 +1246,7 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
         doc_ids,
         dim,
         ef_search,
+        column,
     })
 }
 
@@ -1889,6 +2036,163 @@ mod tests {
         assert!(Hnsw::from_bytes(b"not a graph").is_none());
     }
 
+    /// Pruning a max-degree base layer down to a small `m0` must track a
+    /// NATIVE build at that `m0` — the property that makes the pruned graph a
+    /// sound calibration proxy AND a servable persisted graph. A positional
+    /// `lst[..m0]` slice (the prior bug) drops the unsorted reverse-link tail
+    /// regardless of distance, so small-`m0` recall falls well short of a
+    /// native build and leaves nodes unreachable. Serial builds keep this
+    /// deterministic.
+    #[test]
+    fn pruned_base_layer_tracks_native_small_m0() {
+        let dim = 24;
+        let n = 1200;
+        let vectors = random_unit_vectors(n, dim, 0x9F17);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
+        let (m0_small, m0_max, efc) = (8usize, 64usize, 200usize);
+
+        let native = Hnsw::build_serial(
+            &scorer,
+            HnswParams {
+                m0: m0_small,
+                ef_construction: efc,
+                ..HnswParams::default()
+            },
+        );
+        let base = Hnsw::build_serial(
+            &scorer,
+            HnswParams {
+                m0: m0_max,
+                ef_construction: efc,
+                ..HnswParams::default()
+            },
+        );
+        let pruned = base.pruned_base_layer(&scorer, m0_small);
+        assert_eq!(pruned.base_degree(), m0_small);
+
+        let queries = random_unit_vectors(60, dim, 0x2C4);
+        let k = 10;
+        let recall = |g: &Hnsw| -> f64 {
+            let mut hit = 0usize;
+            let mut total = 0usize;
+            for q in &queries {
+                let truth: HashSet<u32> = brute_force(&scorer, q, k).into_iter().collect();
+                let got: HashSet<u32> = g
+                    .search(&scorer, q, k, 64)
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect();
+                hit += truth.iter().filter(|t| got.contains(t)).count();
+                total += k;
+            }
+            hit as f64 / total as f64
+        };
+        let r_native = recall(&native);
+        let r_pruned = recall(&pruned);
+        assert!(
+            r_pruned >= r_native - 0.03,
+            "distance-aware prune should track native small-m0 recall: pruned {r_pruned:.3} vs native {r_native:.3}"
+        );
+    }
+
+    /// `measure_recall` reflects graph quality: an under-provisioned base
+    /// layer measures below a well-provisioned one. This is the primitive the
+    /// incremental drain uses to catch a graph whose inherited `m0` has drifted
+    /// below the recall bar as the table grew, and force a full rebuild.
+    #[test]
+    fn measure_recall_reflects_graph_quality() {
+        let dim = 128;
+        let n = 4000;
+        let vectors = clustered_unit_vectors(n, 32, dim, 0.3, 0xD1F7);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
+        let ef = 256;
+        let strong = Hnsw::build(
+            &scorer,
+            HnswParams {
+                m0: 128,
+                ef_construction: 200,
+                ..HnswParams::default()
+            },
+        );
+        let weak = Hnsw::build(
+            &scorer,
+            HnswParams {
+                m0: 4,
+                ef_construction: 200,
+                ..HnswParams::default()
+            },
+        );
+        let r_strong = measure_recall(&strong, &scorer, ef, 10, 100, 0x5EED);
+        let r_weak = measure_recall(&weak, &scorer, ef, 10, 100, 0x5EED);
+        assert!(
+            r_strong >= 0.9,
+            "a well-provisioned graph should measure high recall, got {r_strong:.3}"
+        );
+        assert!(
+            r_strong > r_weak,
+            "a denser base layer must measure higher recall: strong {r_strong:.3} vs weak {r_weak:.3}"
+        );
+    }
+
+    /// `from_bytes` degrades a corrupt section to `None` (→ ivf fallback)
+    /// rather than decoding a graph that panics at query time. Two hardening
+    /// guards beyond the prior `id < n` check: a tower taller than the graph
+    /// ever builds, and an upper-layer edge into a shorter tower (an
+    /// out-of-bounds index in `greedy_nearest`).
+    #[test]
+    fn from_bytes_rejects_tower_violations() {
+        let dim = 8;
+        let n = 300;
+        let vectors = random_unit_vectors(n, dim, 0x77A1);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+        let good = graph.to_bytes();
+        assert!(Hnsw::from_bytes(&good).is_some(), "baseline decodes");
+
+        let rd_u32 =
+            |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().expect("4 bytes"));
+        let rd_u64 =
+            |b: &[u8], off: usize| u64::from_le_bytes(b[off..off + 8].try_into().expect("8 bytes"));
+
+        // Layout: MAGIC(8) n(8) m(4) m0(4) efc(4) entry(4) = 32-byte header,
+        // then node_level[n]*4, then layer0 n*m0*4, then records u64, then
+        // records of (node u32, level u32, len u32, ids…).
+        let n_hdr = rd_u64(&good, 8) as usize;
+        assert_eq!(n_hdr, n);
+        let m0 = rd_u32(&good, 20) as usize;
+        let node_level_off = 32;
+        let layer0_off = node_level_off + n * 4;
+        let records_off = layer0_off + n * m0 * 4;
+
+        // Guard 1: a node_level word above MAX_LEVEL is rejected.
+        let mut over_tower = good.clone();
+        over_tower[node_level_off..node_level_off + 4]
+            .copy_from_slice(&(MAX_LEVEL + 1).to_le_bytes());
+        assert!(
+            Hnsw::from_bytes(&over_tower).is_none(),
+            "a tower above MAX_LEVEL must be rejected"
+        );
+
+        // Guard 2: point an upper-layer edge at a node whose tower is too
+        // short for that level. Find a node with tower level 0 to aim at.
+        let short = (0..n)
+            .find(|&i| rd_u32(&good, node_level_off + i * 4) == 0)
+            .expect("some node sits at level 0");
+        let records = rd_u64(&good, records_off) as usize;
+        assert!(records > 0, "graph has at least one upper-layer node");
+        // First record: node(4) level(4) len(4) then ids.
+        let rec_body = records_off + 8;
+        let level = rd_u32(&good, rec_body + 4);
+        assert!(level >= 1, "upper record sits at level >= 1");
+        let ids_off = rec_body + 12;
+        let mut bad_edge = good.clone();
+        bad_edge[ids_off..ids_off + 4].copy_from_slice(&(short as u32).to_le_bytes());
+        assert!(
+            Hnsw::from_bytes(&bad_edge).is_none(),
+            "a level-{level} edge into a level-0 tower must be rejected"
+        );
+    }
+
     /// `Hnsw::extend` (incremental batch-insert) grows a prior graph with a
     /// delta and keeps recall in the same ballpark as a from-scratch build at
     /// the same final scale — the property that makes drain-time incremental
@@ -1960,7 +2264,7 @@ mod tests {
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
-        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256);
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256, "emb");
         let idx = decode_hnsw(&bytes).expect("decode bundle");
         assert_eq!(idx.dim, dim);
         assert_eq!(idx.doc_ids, doc_ids);
@@ -1969,6 +2273,7 @@ mod tests {
             idx.ef_search, 256,
             "stamped ef round-trips through the bundle"
         );
+        assert_eq!(idx.column, "emb", "stamped column round-trips");
 
         let queries = random_unit_vectors(20, dim, 0xFEED);
         for q in &queries {

@@ -1285,9 +1285,33 @@ impl ManifestSnapshot {
             list.slow_vector_state_content_hash = Some(hash);
             list.slow_vector_state_centroids = Some(centroids);
             // `slow_vector_state_graphs` is intentionally left as `update`
-            // carried it forward — the membership commit does not touch the
-            // graph ref; the settle path (re)stamps it after keying on the
-            // doc-id watermark.
+            // carried it forward. A drain that (re)builds the graph stamps it
+            // separately via `with_slow_vector_state_graphs` — routed through
+            // `CommitListMetadata` so it lands in the SAME membership commit as
+            // `drained_ranges`, not a later settle.
+            list
+        });
+        Self {
+            superfile_list: self.superfile_list.clone(),
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
+    /// Stamp ONLY the `hnsw` graph ref on an already-built successor, leaving
+    /// the routing blob, centroid section, and every other slow-state field
+    /// exactly as they are — the counterpart to [`with_slow_vector_state_ref`]
+    /// for the one field a drain must land in its membership commit. Does not
+    /// bump `manifest_id` (an overlay, like the other `CommitListMetadata`
+    /// stamps); the successor id is set by the surrounding commit.
+    pub(crate) fn with_slow_vector_state_graphs(&self, graphs: Option<RoutingRef>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.slow_vector_state_graphs = graphs;
             list
         });
         Self {

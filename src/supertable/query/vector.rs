@@ -1507,24 +1507,6 @@ fn score_cell_fp32(
 }
 
 /// The `hnsw` search beam width for a request of `k`:
-/// `ef = max(k, clamp(k × ef_mult, ef_floor, ef_ceil))` — all integer.
-///
-/// - `.clamp(floor, ceil)`: the recall/latency policy band (config
-///   validation guarantees `floor <= ceil`, so this cannot panic).
-/// - `.max(k)`: the hard `ef ≥ k` invariant, immune to a misconfigured
-///   `ef_mult` — kept OUT of the clamp so it fixes the lower side too.
-fn hnsw_ef(k: usize) -> usize {
-    let v = &config::global().vector;
-    ef_law(k, v.hnsw_ef_mult, v.hnsw_ef_floor, v.hnsw_ef_ceil)
-}
-
-/// Pure arithmetic of the `hnsw` ef law (config-free, for testing).
-/// `floor <= ceil` is guaranteed by config validation, so `.clamp` here is
-/// panic-free.
-fn ef_law(k: usize, mult: usize, floor: usize, ceil: usize) -> usize {
-    (k * mult).clamp(floor, ceil).max(k)
-}
-
 /// Warn once (process-wide) that `search_mode = hnsw` is set but no resident
 /// graph is available, so the query is being served by the ivf scan
 /// instead. Fires only on the hidden arm with the graph absent — i.e. the
@@ -1548,6 +1530,9 @@ fn warn_hnsw_no_resident_graph_once() {
 /// fault (the drain treats that as "skip the graph", never fatal).
 /// Held-out query count for calibration recall measurement.
 const HNSW_CALIB_QUERIES: usize = 200;
+/// The `k` calibration and the incremental recall re-check measure at (the
+/// engine's recall@10 acceptance anchor).
+const HNSW_CALIB_RECALL_K: usize = 10;
 /// Deterministic calibration seed (no wall-clock / system randomness).
 const HNSW_CALIB_SEED: u64 = 0x_C0FF_EE00_CA11_B000;
 
@@ -1684,36 +1669,67 @@ pub(crate) async fn assemble_hnsw_sections(
         let pcodes = collect_hnsw_codes(manifest, column, stride, Some(step)).await?;
         let pn = pcodes.len() / stride;
         let pscorer = Sq16Scorer::from_codes(pcodes, dim, pn);
-        let (pchoice, _) = hnsw::calibrate_graph(
-            &pscorer,
-            &m0_cands,
-            &ef_cands,
+        // The calibrate build is pure CPU; run it on the reader pool (not the
+        // global rayon pool, and not inline on the tokio worker) per the
+        // concurrency contract. The candidate grids are tiny, so clone them
+        // into the closure; the full-corpus pass below still owns the originals.
+        let (target_recall, recall_slack, ef_construction) = (
             vcfg.target_recall,
             vcfg.hnsw_recall_slack,
             vcfg.hnsw_ef_construction,
-            HNSW_CALIB_QUERIES,
-            10,
-            HNSW_CALIB_SEED,
         );
+        let (pm0, pef) = (m0_cands.clone(), ef_cands.clone());
+        let pchoice = run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "hnsw probe calibrate: reader pool dropped result",
+            move || {
+                hnsw::calibrate_graph(
+                    &pscorer,
+                    &pm0,
+                    &pef,
+                    target_recall,
+                    recall_slack,
+                    ef_construction,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_SEED,
+                )
+                .0
+            },
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
         if !pchoice.registered {
-            eprintln!(
-                "[supertable hnsw] probe col={column} dim={dim} n={n} (sampled {pn}): \
-                 best recall {:.3} < floor (target {:.3}) — graph-hostile, serving ivf \
-                 (full build skipped)",
-                pchoice.recall, vcfg.target_recall
+            tracing::info!(
+                column,
+                dim,
+                n,
+                sampled = pn,
+                recall = pchoice.recall,
+                target = vcfg.target_recall,
+                "hnsw probe: best recall below floor — graph-hostile, serving ivf \
+                 (full build skipped)"
             );
             return Ok(None);
         }
-        eprintln!(
-            "[supertable hnsw] probe col={column} dim={dim} n={n} (sampled {pn}): \
-             registrable (m0={} ef={} recall {:.3}) — proceeding to full-corpus build",
-            pchoice.m0, pchoice.ef, pchoice.recall
+        tracing::debug!(
+            column,
+            dim,
+            n,
+            sampled = pn,
+            m0 = pchoice.m0,
+            ef = pchoice.ef,
+            recall = pchoice.recall,
+            "hnsw probe: registrable — proceeding to full-corpus build"
         );
     }
     // Full code plane — reached only for a small corpus (n ≤ probe_cap) or a
     // passing probe. This is where the whole plane is finally materialized.
+    // The scorer OWNS the plane; the encoder below borrows it back via
+    // `scorer.codes()` rather than keeping a second owned copy alive through
+    // the build + encode (the plane is multi-GB at the scale ceiling).
     let codes = collect_hnsw_codes(manifest, column, stride, None).await?;
-    let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+    let scorer = Sq16Scorer::from_codes(codes, dim, n);
     // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
     // once at m0_max, prune down, sweep ef by re-search — free). The m0
     // requirement is scale-dependent, so this full-corpus pass is authoritative
@@ -1721,40 +1737,65 @@ pub(crate) async fn assemble_hnsw_sections(
     // serves 0.86). The pruned max-graph IS what we persist: no second build.
     // If the graph can't clear the graceful floor, return None so queries serve
     // ivf (the self-driving decision — reuses the existing None→fallback).
-    let (choice, graph) = hnsw::calibrate_graph(
-        &scorer,
-        &m0_cands,
-        &ef_cands,
+    // Calibrate on the reader pool, not inline on the tokio worker or the
+    // global rayon pool. The scorer owns the (multi-GB) plane, so move it into
+    // the closure and hand it back for the encode below rather than cloning.
+    let (target_recall, recall_slack, ef_construction) = (
         vcfg.target_recall,
         vcfg.hnsw_recall_slack,
         vcfg.hnsw_ef_construction,
-        HNSW_CALIB_QUERIES,
-        10, // recall@10
-        HNSW_CALIB_SEED,
     );
+    let (scorer, choice, graph) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "hnsw calibrate: reader pool dropped result",
+        move || {
+            let (choice, graph) = hnsw::calibrate_graph(
+                &scorer,
+                &m0_cands,
+                &ef_cands,
+                target_recall,
+                recall_slack,
+                ef_construction,
+                HNSW_CALIB_QUERIES,
+                HNSW_CALIB_RECALL_K,
+                HNSW_CALIB_SEED,
+            );
+            (scorer, choice, graph)
+        },
+    )
+    .await
+    .map_err(|e| QueryError::Execute(e.to_string()))?;
     if !choice.registered {
-        eprintln!(
-            "[supertable hnsw] calibrate col={column} dim={dim} n={n}: best recall \
-             {:.3} < floor (target {:.3}) — graph NOT registered, serving ivf",
-            choice.recall, vcfg.target_recall
+        tracing::info!(
+            column,
+            dim,
+            n,
+            recall = choice.recall,
+            target = vcfg.target_recall,
+            "hnsw calibrate: best recall below floor — graph NOT registered, serving ivf"
         );
         return Ok(None);
     }
-    eprintln!(
-        "[supertable hnsw] calibrate col={column} dim={dim} n={n}: m0={} ef={} \
-         recall {:.3} (target {:.3}{})",
-        choice.m0,
-        choice.ef,
-        choice.recall,
-        vcfg.target_recall,
-        if choice.at_target {
-            ""
-        } else {
-            " — below-target/graceful"
-        }
+    tracing::info!(
+        column,
+        dim,
+        n,
+        m0 = choice.m0,
+        ef = choice.ef,
+        recall = choice.recall,
+        target = vcfg.target_recall,
+        at_target = choice.at_target,
+        "hnsw calibrate: graph registered"
     );
     let graph = graph.expect("registered choice carries its pruned graph");
-    Ok(Some(encode_hnsw(&codes, &doc_ids, &graph, dim, choice.ef)))
+    Ok(Some(encode_hnsw(
+        scorer.codes(),
+        &doc_ids,
+        &graph,
+        dim,
+        choice.ef,
+        column,
+    )))
 }
 
 /// Incrementally extend a prior persisted `hnsw` graph with a
@@ -1845,8 +1886,7 @@ pub(crate) async fn assemble_hnsw_incremental(
     let inserted = new_doc_ids.len();
     // Incremental drains INHERIT the prior graph's calibrated `(m0, ef)`: the
     // new nodes must match the existing base-layer degree (a mixed-degree
-    // graph would be inconsistent), and the stamped query beam carries
-    // forward. No recalibration here — that only happens on a full build.
+    // graph would be inconsistent), and the stamped query beam carries forward.
     let inherited_m0 = prior.graph.base_degree();
     let inherited_ef = prior.ef_search;
     let mut codes = prior.scorer.codes().to_vec();
@@ -1854,7 +1894,9 @@ pub(crate) async fn assemble_hnsw_incremental(
     let mut doc_ids = prior.doc_ids;
     doc_ids.extend_from_slice(&new_doc_ids);
     let total = doc_ids.len();
-    let scorer = Sq16Scorer::from_codes(codes.clone(), dim, total);
+    // The scorer owns the extended plane; the encoder borrows it back via
+    // `scorer.codes()` rather than holding a second owned copy.
+    let scorer = Sq16Scorer::from_codes(codes, dim, total);
     let vcfg = &config::global().vector;
     let params = HnswParams {
         ef_construction: vcfg.hnsw_ef_construction,
@@ -1863,9 +1905,28 @@ pub(crate) async fn assemble_hnsw_incremental(
     };
     // Insert ONLY the new node range into a copy of the prior graph.
     let graph = prior.graph.extend(&scorer, params);
+    // Re-measure recall on the GROWN graph. The base-layer degree requirement
+    // rises with N, so inherited `(m0, ef)` calibrated at a smaller population
+    // can drift below the bar as an append-only table grows (a graph
+    // calibrated at 200K and served at 5M is exactly this regime). If the
+    // extended graph no longer clears the register floor, drop the incremental
+    // result — the caller then does a full rebuild, which recalibrates `m0`/`ef`
+    // or de-registers to ivf. Cheap relative to the rebuild it may avoid.
+    let floor = (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0);
+    let recall = hnsw::measure_recall(
+        &graph,
+        &scorer,
+        inherited_ef,
+        HNSW_CALIB_RECALL_K,
+        HNSW_CALIB_QUERIES,
+        HNSW_CALIB_SEED,
+    );
+    if recall < floor {
+        return Ok(None);
+    }
     let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
     Ok(Some((
-        encode_hnsw(&codes, &doc_ids, &graph, dim, inherited_ef),
+        encode_hnsw(scorer.codes(), &doc_ids, &graph, dim, inherited_ef, column),
         new_high_water,
         inserted,
     )))
@@ -1885,10 +1946,14 @@ impl SupertableReader {
     /// wider projection resolves the live `(superfile, local)` from that id
     /// through [`user_placement_for_scalar_resolve`] on the shared
     /// `vector_search` path — compaction-correct without baking physical
-    /// rows into the graph. The graph distance is `−dot` on the Sq16 grid;
-    /// smaller is nearer, matching the `SuperfileHit.score` convention.
+    /// rows into the graph. The graph walks on `−dot` (Sq16 grid, smaller is
+    /// nearer), but the emitted `SuperfileHit.score` is shifted to `1 − dot` to
+    /// match the cosine distance the ivf/scan arm emits — the two arms merge on
+    /// raw score, so they MUST share one scale (an undrained user-arm hit and a
+    /// drained graph hit are compared directly).
     async fn hnsw_search(
         &self,
+        column: &str,
         query: &[f32],
         k: usize,
     ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
@@ -1901,29 +1966,62 @@ impl SupertableReader {
         let Some(data) = sections.data.as_ref() else {
             return Ok(None);
         };
-        if data.dim != query.len() || data.doc_ids.is_empty() {
+        // The persisted graph is built for exactly one column. A table can
+        // carry several same-dim vector columns, so a dim match alone is not
+        // enough — a query on a DIFFERENT column must fall back to ivf rather
+        // than be answered from this column's neighbors.
+        if data.column != column || data.dim != query.len() || data.doc_ids.is_empty() {
             return Ok(None);
         }
-        // The calibrated per-table `ef` stamped in the bundle is the default;
-        // fall back to the ef law only for older bundles with no stamp (0).
-        let ef = if data.ef_search > 0 {
-            data.ef_search.max(k)
-        } else {
-            hnsw_ef(k)
-        };
-        let hits: Vec<SuperfileHit> = data
-            .graph
-            .search(&data.scorer, query, k, ef)
-            .into_iter()
-            .filter_map(|(node, dist)| {
-                Some(SuperfileHit {
-                    superfile: SuperfileUri(Uuid::nil()),
-                    local_doc_id: 0,
-                    score: dist,
-                    stable_id: Some(*data.doc_ids.get(node as usize)?),
-                })
-            })
-            .collect();
+        // Over-fetch to absorb boundary replicas. When
+        // `drain_replica_target_factor > 1`, a user row is replicated across
+        // hidden cells and appears as several graph nodes with the SAME stable
+        // id; `top_k_ascending` collapses them by id, so a plain top-`k` walk
+        // would return fewer than `k` distinct rows on a delete-free table. The
+        // ivf arm over-fetches by the same factor (`k_fetch = k + overhead`).
+        let replica_factor = config::global().vector.drain_replica_target_factor.max(1.0);
+        let k_fetch = ((k as f32) * replica_factor).ceil() as usize;
+        // The calibrated per-table `ef` stamped in the bundle drives the walk,
+        // never below the (over-)fetch width. Every persisted bundle carries a
+        // non-zero calibrated `ef`; a 0 (which cannot occur from the drain)
+        // degrades to `k_fetch`, still a valid beam.
+        let ef = data.ef_search.max(k_fetch);
+        // The Sq16 walk is pure CPU (up to ef × m0 scores); run it on the
+        // reader pool and await a oneshot, per the rayon-for-CPU / tokio-for-I/O
+        // contract — inline it would block a tokio worker for the walk's whole
+        // duration, stalling every other query's I/O on that worker.
+        let manifest = self.manifest();
+        let sections_for_walk = Arc::clone(&sections);
+        let query_owned = query.to_vec();
+        let hits: Vec<SuperfileHit> = run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "hnsw serving walk: reader pool dropped result",
+            move || {
+                let data = sections_for_walk
+                    .data
+                    .as_ref()
+                    .expect("data present: checked before dispatch");
+                data.graph
+                    .search(&data.scorer, &query_owned, k_fetch, ef)
+                    .into_iter()
+                    .filter_map(|(node, dist)| {
+                        // Shift the graph's `−dot` onto the ivf/scan arm's
+                        // `1 − dot` cosine scale so the cross-arm merge
+                        // (top_k_ascending) compares like with like. Monotonic
+                        // in `dist`, so intra-arm order is unchanged; the public
+                        // `score` column stays non-negative.
+                        Some(SuperfileHit {
+                            superfile: SuperfileUri(Uuid::nil()),
+                            local_doc_id: 0,
+                            score: 1.0 + dist,
+                            stable_id: Some(*data.doc_ids.get(node as usize)?),
+                        })
+                    })
+                    .collect()
+            },
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
         Ok(Some(top_k_ascending(vec![hits], k)))
     }
 
@@ -1939,27 +2037,42 @@ impl SupertableReader {
         let reference = manifest.slow_vector_state_graphs_blob()?.clone();
         let storage = manifest.options.storage.as_ref()?;
         let slot = Arc::clone(&manifest.options.graph_sections_cache);
-        let mut guard = slot.lock().await;
-        if let Some(sections) = guard.as_ref()
-            && sections.uri == reference.uri
+        // Fast path: reuse the resident sections when they already match.
         {
-            return Some(Arc::clone(sections));
-        }
-        match fetch_graph_sections(storage.as_ref(), &reference).await {
-            Ok(sections) => {
-                let sections = Arc::new(sections);
-                *guard = Some(Arc::clone(&sections));
-                Some(sections)
+            let guard = slot.lock().await;
+            if let Some(sections) = guard.as_ref()
+                && sections.uri == reference.uri
+            {
+                return Some(Arc::clone(sections));
             }
+        }
+        // Hydrate OUTSIDE the lock. `fetch_graph_sections` blake3-hashes and
+        // copies a multi-GiB bundle; holding the cache mutex across it would
+        // block every concurrent query behind the first post-drain hydration.
+        // The cost of releasing is that racing queries may each hydrate once
+        // during the brief first-touch window — cheaper than serializing all
+        // queries behind one download.
+        let sections = match fetch_graph_sections(storage.as_ref(), &reference).await {
+            Ok(sections) => Arc::new(sections),
             Err(error) => {
                 tracing::warn!(
                     "hnsw graph sections {} unavailable ({error}); falling back to \
                      the ivf scan",
                     reference.uri
                 );
-                None
+                return None;
             }
+        };
+        // Publish under the lock. A concurrent hydration may have installed the
+        // same uri first — keep theirs so all callers share one Arc.
+        let mut guard = slot.lock().await;
+        if let Some(existing) = guard.as_ref()
+            && existing.uri == reference.uri
+        {
+            return Some(Arc::clone(existing));
         }
+        *guard = Some(Arc::clone(&sections));
+        Some(sections)
     }
 
     /// Hydrate (or reuse) the slow-CAS centroid-section spill for this
@@ -1991,10 +2104,10 @@ impl SupertableReader {
                 Some(section)
             }
             Err(error) => {
-                eprintln!(
-                    "[supertable] centroid section {} unavailable ({error}); deferred rescores \
-                     will fail unless the parts cache covers their cells",
-                    reference.uri
+                tracing::warn!(
+                    uri = %reference.uri,
+                    "centroid section unavailable ({error}); deferred rescores will fail \
+                     unless the parts cache covers their cells"
                 );
                 None
             }
@@ -2290,16 +2403,32 @@ impl SupertableReader {
         // Unfiltered hidden path only; `stamped` (or a filtered/user-table
         // query) leaves the stamped-law path below untouched.
         let vcfg = &config::global().vector;
+        // Validate the queried column exists BEFORE any serving branch. An
+        // undeclared column is a caller error and must be rejected uniformly —
+        // otherwise a drained table would answer an unknown-column query from
+        // the graph (which carries its own column check but is reached first),
+        // while an undrained table rejects it later at the grid lookup.
+        if !manifest
+            .options
+            .vector_columns
+            .iter()
+            .any(|vc| vc.column == column)
+        {
+            return Err(QueryError::Execute(format!(
+                "unknown vector column `{column}`"
+            )));
+        }
         // HNSW search mode (`vector.search_mode = hnsw`): walk the resident
         // graph built at drain over every row's Sq16 codes, bypassing the
         // grid, cell selection, and disk reads. Only the hidden (drained)
         // arm serves via the graph — the user/pre-drain arm always uses ivf,
         // exactly like the global-fine branch below (`hidden_vector_index`).
         // And even on the hidden arm, only when a VALID persisted graph
-        // exists (dim-matches, non-empty); if the drain skipped it because
-        // the corpus exceeds `hnsw_max_docs`, fall through to the ivf scan.
+        // exists (dim-matches, right column, non-empty); if the drain skipped
+        // it because the corpus exceeds `hnsw_max_docs`, or the query targets
+        // a different column, fall through to the ivf scan.
         if !filtered && hidden_vector_index && vcfg.search_mode == config::VectorSearchMode::Hnsw {
-            if let Some(hits) = self.hnsw_search(query, k).await? {
+            if let Some(hits) = self.hnsw_search(column, query, k).await? {
                 return Ok(hits);
             }
             warn_hnsw_no_resident_graph_once();
@@ -2530,23 +2659,15 @@ impl SupertableReader {
                 filtered,
                 populated_cells,
             );
-            if std::env::var("INFINO_LOG_WIDTH").is_ok() {
-                eprintln!(
-                    "[WIDTH] k={} law_width={:?} nprobe_min={} nprobe_max={} fine_nprobe={} prepin_fine_depth={}",
-                    k,
-                    law_width,
-                    cell_routing.nprobe_min,
-                    cell_routing.nprobe_max,
-                    cell_routing.fine_nprobe,
-                    prepin_fine_depth
-                );
-            }
-            if let Some(cap) = std::env::var("INFINO_FINE_CAP")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-            {
-                cell_routing.fine_nprobe = cell_routing.fine_nprobe.min(cap);
-            }
+            tracing::debug!(
+                k,
+                ?law_width,
+                nprobe_min = cell_routing.nprobe_min,
+                nprobe_max = cell_routing.nprobe_max,
+                fine_nprobe = cell_routing.fine_nprobe,
+                prepin_fine_depth,
+                "vector width pin resolved"
+            );
             // Per-cell fine probe = max(floor, floor(pct × cell fine-cluster
             // count)), so depth scales with cell size. Filtered queries keep
             // their own fixed fine floor (pct = 0); the proportional depth
@@ -4716,18 +4837,22 @@ fn select_global_shortlist(
 
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     // Total order over hits: distance ascending, then the unique
-    // `(superfile, local_doc_id)` key. The tie-break makes the kept set
-    // deterministic when scores are equal (common when many rows share a
-    // direction) — otherwise the k-boundary among ties would be resolved by
-    // heap feed order (HashMap iteration + fan-out completion), which varies
-    // run to run. Tie order never affects recall: equal-distance rows are
-    // interchangeable.
+    // `(superfile, local_doc_id)` key, then `stable_id`. The tie-break makes
+    // the kept set deterministic when scores are equal (common when many rows
+    // share a direction) — otherwise the k-boundary among ties would be
+    // resolved by heap feed order (HashMap iteration + fan-out completion),
+    // which varies run to run. Tie order never affects recall: equal-distance
+    // rows are interchangeable. The `stable_id` leg is load-bearing for graph
+    // (hnsw) hits: they carry no `(superfile, local_doc_id)` (both nil/0), so
+    // without it every equal-distance graph hit compares Equal and the
+    // k-boundary among them would again be nondeterministic.
     fn hit_order(a: &SuperfileHit, b: &SuperfileHit) -> Ordering {
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.superfile.cmp(&b.superfile))
             .then_with(|| a.local_doc_id.cmp(&b.local_doc_id))
+            .then_with(|| a.stable_id.cmp(&b.stable_id))
     }
 
     #[derive(PartialEq)]
@@ -4888,7 +5013,7 @@ mod tests {
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
         VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        calibrated_query_for, cells_ranked_by_fine_score, ef_law, free_column_slot,
+        calibrated_query_for, cells_ranked_by_fine_score, free_column_slot,
         free_columns_unambiguous, gate_fine_candidates_by_fragment, hidden_hits_user_ids,
         id_score_projection_indices, is_hidden_vector_manifest, law_floor_serve_selection,
         postings_by_cell_from_summaries, rerank_mult_from_law, score_fine_candidates,
@@ -4968,27 +5093,6 @@ mod tests {
         // ambiguous request and stops the paths drifting.
         assert_eq!(free_column_slot(SCORE_COLUMN, SCORE_COLUMN), None);
         assert!(!free_columns_unambiguous(&clean, SCORE_COLUMN));
-    }
-
-    /// The all-integer `hnsw` ef law `max(k, clamp(k×mult, floor, ceil))`.
-    #[test]
-    fn hnsw_ef_law() {
-        let (mult, floor, ceil) = (10usize, 128usize, 512usize);
-        // k=10 anchor: 10×10=100 clamps up to the 128 floor.
-        assert_eq!(ef_law(10, mult, floor, ceil), 128);
-        // Small k stays on the floor.
-        assert_eq!(ef_law(1, mult, floor, ceil), 128);
-        assert_eq!(ef_law(12, mult, floor, ceil), 128); // 120 < floor
-        // Mid k scales linearly between floor and ceil.
-        assert_eq!(ef_law(20, mult, floor, ceil), 200);
-        assert_eq!(ef_law(50, mult, floor, ceil), 500);
-        // Large k clamps at the ceiling, then the `max(k)` invariant wins.
-        assert_eq!(ef_law(60, mult, floor, ceil), 512); // 600 → ceil
-        assert_eq!(ef_law(600, mult, floor, ceil), 600); // ceil<k → max(k)
-        // `.max(k)` is immune to a pathological mult=0: 0 → clamp floor,
-        // but k wins whenever k > floor.
-        assert_eq!(ef_law(600, 0, floor, ceil), 600);
-        assert_eq!(ef_law(5, 0, floor, ceil), 128);
     }
 
     /// The SQL TVF classifies by DataFusion column INDEX and the public
@@ -7623,6 +7727,120 @@ mod tests {
             ids[0],
             *ids.iter().min().expect("ids is non-empty"),
             "the exact-match doc must rank first, got {ids:?}"
+        );
+    }
+
+    /// Single vector column (`emb`), Sq16 rerank codec — so the drain builds
+    /// and persists the resident per-row graph the hnsw serving path walks.
+    fn options_one_col_sq16(dim: usize) -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(
+            schema_with_vector(dim),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq16,
+                provided_centroids: None,
+            }],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    /// The resident-graph (hnsw) arm emits `score` on the SAME cosine-distance
+    /// scale as the ivf arm — `1 - dot`, non-negative, ~0 for a perfect match —
+    /// not the graph's internal `-dot`. The two arms merge on raw score, so a
+    /// mismatched scale ranks drained non-matches above an exact match and
+    /// surfaces a negative distance in the public `score` column. Sq16 codec +
+    /// a well-separated corpus so the drained graph registers and serves.
+    #[test]
+    fn hnsw_graph_arm_emits_cosine_scale_scores() {
+        let dim = 32usize;
+        let n = 256usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_col_sq16(dim);
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, n, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // Exact match for the docs at direction 5 (id % dim == 5).
+        let mut q = vec![0.0f32; dim];
+        q[5] = 1.0;
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, 10, VectorSearchOptions::new(), None)
+            .expect("post-drain graph search");
+        assert!(!hits.is_empty(), "graph must return hits");
+        for h in &hits {
+            assert!(
+                h.score >= 0.0,
+                "cosine distance is non-negative; a negative score means the graph \
+                 arm leaked its internal -dot: {}",
+                h.score
+            );
+        }
+        assert!(
+            hits[0].score < 0.05,
+            "an exact match is distance ~0 on the cosine scale, got {}",
+            hits[0].score
+        );
+    }
+
+    /// An undeclared vector column is a caller error and must be rejected on a
+    /// DRAINED table too. Before the column validation was hoisted above the
+    /// graph branch, a drained table answered an unknown-column query from the
+    /// resident graph (which matched on dimension alone) instead of erroring —
+    /// the same silent mis-answer a wrong same-dim column would get. The
+    /// bundle now also stamps its column so the serving walk can reject a
+    /// mismatch (see `hnsw_bundle_roundtrip`).
+    #[test]
+    fn hnsw_unknown_column_errors_on_drained_table() {
+        let dim = 32usize;
+        let n = 128usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_col_sq16(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, n, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let err = st
+            .reader()
+            .expect("reader")
+            .vector_hits("does_not_exist", &q, 5, VectorSearchOptions::new(), None)
+            .expect_err("an unknown column must error on a drained table, not serve the graph");
+        assert!(
+            format!("{err}").contains("unknown vector column"),
+            "expected an unknown-column error, got {err}"
         );
     }
 

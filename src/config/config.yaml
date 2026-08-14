@@ -202,14 +202,12 @@ vector:
   # within each cell into contiguous reads. Ignored under search_mode = ivf.
   global_fine_coalesce: false
 
-  # For search_mode = hnsw: the search ef is scaled from k as
-  #   ef = max(k, clamp(k * ef_mult, ef_floor, ef_ceil))    # all integer
-  # ef_floor is the minimum beam width and the effective ef at the k=10
-  # anchor (10*10=100 clamps up to 128 ~ 0.97 recall@10 on Cohere-1M).
-  # ef_mult (integer >= 1) scales the beam with k; ef_ceil caps it at large
-  # k. Ignored under any other search mode.
-  hnsw_ef_floor: 128
-  hnsw_ef_mult: 10
+  # For search_mode = hnsw: upper bound on the calibration ef grid. The drain
+  # sweeps the ef candidates up to this ceiling and stamps the winning per-table
+  # ef into the persisted graph bundle; that stamped value drives every query.
+  # Must be at least the smallest candidate (128). High-dim cosine tables need a
+  # wide beam (e.g. glove-100 clears ~0.99 only at ef=1024), so the ceiling
+  # allows that; easy tables stamp well under it. Ignored under other modes.
   hnsw_ef_ceil: 2048
 
   # For search_mode = hnsw: the ef_construction beam used to BUILD the
