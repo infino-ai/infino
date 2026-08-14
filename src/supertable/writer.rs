@@ -9,7 +9,7 @@
 //! [`crate::superfile::SuperfileBuilder`], which is a single-shot
 //! factory consuming `self` to produce one immutable artifact.
 //! Each `commit` here internally spawns many superfile builders,
-//! one per shard.
+//! one per piece of the split buffer.
 //!
 //! Acquired via [`Supertable::writer`](super::Supertable::writer);
 //! at most one writer is outstanding per supertable at a time
@@ -28,9 +28,9 @@
 //!   `vector_split`, pushes a `BufferedBatch` onto the writer's
 //!   buffer, and triggers an internal `commit()` if the running
 //!   buffer-byte estimate crosses the configured threshold.
-//! - `commit()` drains the buffer, partitions across the writer
-//!   pool, runs each shard build in parallel, and publishes all
-//!   shards as new superfiles in one manifest swap. Idempotent on
+//! - `commit()` drains the buffer, splits it by buffered bytes (capped
+//!   by the writer pool), builds each piece in parallel, and publishes
+//!   them all as new superfiles in one manifest swap. Idempotent on
 //!   an empty buffer (no-op return Ok). The writer slot is
 //!   released on `Drop`; callers don't need a separate `finish()`
 //!   call.
@@ -187,7 +187,7 @@ const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
 /// Stable IDs fed to the streamed shard Parquet builder per Arrow batch.
 const DRAIN_ID_BATCH_ROWS: usize = 64 * 1024;
 
-/// One mebibyte; converts `shard_target_size_mb` into bytes.
+/// One mebibyte; converts `superfile_buffer_split_mb` into bytes.
 const MIB: usize = 1 << 20;
 
 pub(in crate::supertable) const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
@@ -467,16 +467,15 @@ impl<'a> VectorColumnView<'a> {
     }
 }
 
-/// Shard count for one taken buffer: `ceil(buffered_bytes / target_bytes)`, capped by the
-/// pool and the row count.
+/// How many superfiles one taken buffer becomes: `ceil(buffered_bytes / split_bytes)`, capped by
+/// the pool and the row count.
 ///
-/// A 1 GiB buffer with the default 64 MiB target builds 16 shards on
-/// a 192-thread pool and 8 on an 8-thread pool; every shard carries between half and one
-/// full target. `target_bytes == 0` (the [`SupertableOptions::shard_target_size_mb`] escape
-/// hatch) caps by the pool alone.
-///
-/// Always at least one shard.
-fn commit_shard_count(
+/// A 1 GiB buffer at the default 64 MiB split builds 16 superfiles on a 192-thread pool and 8 on
+/// an 8-thread pool, each carrying between half and one full split's worth of rows. Rounding up
+/// favours parallelism: every piece gets its own thread, since the count is capped by the pool.
+/// `split_bytes == 0` (the [`SupertableOptions::superfile_buffer_split_mb`] escape hatch) caps by
+/// the pool alone. Always at least one.
+fn superfiles_per_commit(
     total_rows: usize,
     buffered_bytes: usize,
     pool_threads: usize,
@@ -490,38 +489,35 @@ fn commit_shard_count(
     by_bytes.min(pool_threads.max(1)).min(total_rows.max(1))
 }
 
-/// Row-balanced split of the writer's buffered batches into
-/// `n_shards` shard inputs, each shaped as a `Vec<BufferedBatch>`
-/// that [`build_one_shard_with_layout`] can consume directly. The split walks
-/// rows across the original buffer in order and emits zero-copy
-/// Arrow slices (`RecordBatch::slice` + `Float32Array::slice` —
-/// adjust buffer offsets only; underlying memory stays Arc-counted),
-/// so no payload bytes are copied even when a shard boundary falls
-/// in the middle of a `BufferedBatch`.
+/// Row-balanced split of the writer's buffered batches into `n_superfiles` build inputs, each
+/// shaped as a `Vec<BufferedBatch>` that [`build_one_shard_with_layout`] can consume directly.
+/// The split walks rows across the original buffer in order and emits zero-copy Arrow slices
+/// (`RecordBatch::slice` + `Float32Array::slice` — adjust buffer offsets only; underlying memory
+/// stays Arc-counted), so no payload bytes are copied even when a split boundary falls in the
+/// middle of a `BufferedBatch`.
 ///
-/// Row imbalance across shards is ≤ 1: with `total_rows = q·n + r`,
-/// the first `r` shards get `q+1` rows and the rest get `q`.
+/// Row imbalance across pieces is ≤ 1: with `total_rows = q·n + r`, the first `r` pieces get
+/// `q+1` rows and the rest get `q`.
 ///
-/// Trailing empty shards (only possible when `total_rows < n_shards`)
-/// are dropped before return; callers see exactly the shards that
-/// will produce a non-empty superfile.
-fn split_buffer_into_row_shards(
+/// Trailing empty pieces (only possible when `total_rows < n_superfiles`) are dropped before
+/// return; callers see exactly the pieces that will produce a non-empty superfile.
+fn split_buffer_into_superfile_inputs(
     buffer: Vec<BufferedBatch>,
-    n_shards: usize,
+    n_superfiles: usize,
     vector_dims: &[usize],
 ) -> Vec<Vec<BufferedBatch>> {
-    debug_assert!(n_shards > 0);
+    debug_assert!(n_superfiles > 0);
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
     if total_rows == 0 {
         return Vec::new();
     }
-    let base = total_rows / n_shards;
-    let remainder = total_rows % n_shards;
+    let base = total_rows / n_superfiles;
+    let remainder = total_rows % n_superfiles;
     let target = |i: usize| if i < remainder { base + 1 } else { base };
 
-    let mut shards: Vec<Vec<BufferedBatch>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut shard_idx = 0usize;
-    let mut shard_remaining = target(0);
+    let mut pieces: Vec<Vec<BufferedBatch>> = (0..n_superfiles).map(|_| Vec::new()).collect();
+    let mut piece_idx = 0usize;
+    let mut piece_remaining = target(0);
 
     for batch in buffer {
         let n_rows = batch.scalar.num_rows();
@@ -530,14 +526,14 @@ fn split_buffer_into_row_shards(
         }
         let mut row_cursor = 0;
         while row_cursor < n_rows {
-            // Skip ahead over any zero-target shards (only happens
-            // when total_rows < n_shards, leaving trailing shards
+            // Skip ahead over any zero-target pieces (only happens
+            // when total_rows < n_superfiles, leaving trailing pieces
             // with target == 0).
-            while shard_remaining == 0 && shard_idx + 1 < n_shards {
-                shard_idx += 1;
-                shard_remaining = target(shard_idx);
+            while piece_remaining == 0 && piece_idx + 1 < n_superfiles {
+                piece_idx += 1;
+                piece_remaining = target(piece_idx);
             }
-            let take = cmp::min(shard_remaining, n_rows - row_cursor);
+            let take = cmp::min(piece_remaining, n_rows - row_cursor);
             let scalar = batch.scalar.slice(row_cursor, take);
             let vectors: Vec<Arc<Float32Array>> = batch
                 .vectors
@@ -548,13 +544,13 @@ fn split_buffer_into_row_shards(
                     Arc::new(v.slice(row_cursor * dim, take * dim))
                 })
                 .collect();
-            shards[shard_idx].push(BufferedBatch { scalar, vectors });
+            pieces[piece_idx].push(BufferedBatch { scalar, vectors });
             row_cursor += take;
-            shard_remaining -= take;
+            piece_remaining -= take;
         }
     }
-    shards.retain(|s| !s.is_empty());
-    shards
+    pieces.retain(|s| !s.is_empty());
+    pieces
 }
 
 /// After a manifest swap that drops superfile references, schedule a deferred
@@ -1718,8 +1714,10 @@ impl SupertableWriter {
             .iter()
             .map(|b| b.scalar.get_array_memory_size())
             .sum();
-        let target_bytes = (self.inner.options.shard_target_size_mb as usize).saturating_mul(MIB);
-        let n_shards = commit_shard_count(total_rows, buffered_bytes, n_threads, target_bytes);
+        let target_bytes =
+            (self.inner.options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
+        let n_superfiles =
+            superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
 
         let vector_dims: Vec<usize> = self
             .inner
@@ -1774,12 +1772,13 @@ impl SupertableWriter {
                         .collect();
                     (shards, hints)
                 } else {
-                    let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
+                    let shards =
+                        split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
                     let hints = vec![None; shards.len()];
                     (shards, hints)
                 }
             } else {
-                let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
+                let shards = split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
                 let hints = vec![None; shards.len()];
                 (shards, hints)
             };
@@ -3888,11 +3887,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let scratch = drain_scratch.as_path();
         let n_cells_total = added_per_cell.len();
         let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
-        let n_shards = shard_count;
+        let n_superfiles = shard_count;
 
         let mut cell_counts_by_shard: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
         for (&cell, &count) in &added_per_cell {
-            let shard = packed_cell_shard(cell, n_shards) as u32;
+            let shard = packed_cell_shard(cell, n_superfiles) as u32;
             cell_counts_by_shard
                 .entry(shard)
                 .or_default()
@@ -3935,7 +3934,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 "drain has cell counts but no cell build sources".into(),
             ));
         }
-        let mut shard_sources = group_cells_by_packed_shard(sources, n_shards);
+        let mut shard_sources = group_cells_by_packed_shard(sources, n_superfiles);
         shard_sources.retain(|(shard_id, _)| !completed_shards.contains(shard_id));
         let checkpoint = Arc::new(Mutex::new(local_checkpoint));
         let vector_config = hidden_inner
@@ -4057,9 +4056,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map_err(|_| BuildError::Store("drain checkpoint lock poisoned".into()))?
             .clone();
 
-        if prepared_shards.len() + completed_shards.len() > n_shards {
+        if prepared_shards.len() + completed_shards.len() > n_superfiles {
             return Err(BuildError::Store(format!(
-                "drain produced {} packed shards for {n_shards} workers",
+                "drain produced {} packed shards for {n_superfiles} workers",
                 prepared_shards.len() + completed_shards.len()
             )));
         }
@@ -4268,7 +4267,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             total_rows,
             n_cells_total,
             n_shard_files,
-            n_shards,
+            n_superfiles,
             build_t0.elapsed().as_secs_f64() * 1e3,
         );
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
@@ -8662,41 +8661,41 @@ mod tests {
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
 
     /// Default shard target for the fanout unit tests, in bytes — mirrors the shipped
-    /// `shard_target_size_mb` default (64 MiB).
-    const TEST_SHARD_TARGET: usize = 64 * MIB;
+    /// `superfile_buffer_split_mb` default (64 MiB).
+    const TEST_SPLIT_BYTES: usize = 64 * MIB;
 
     /// Shard fanout follows buffered bytes (one shard per target's worth, rounded up), capped
     /// by the pool and the row count — a big pool must not fragment a small buffer.
     #[test]
-    fn commit_shard_count_follows_bytes_capped_by_pool() {
-        const T: usize = TEST_SHARD_TARGET;
+    fn superfiles_per_commit_follows_bytes_capped_by_pool() {
+        const T: usize = TEST_SPLIT_BYTES;
         // 10 MiB buffer on a 192-thread pool: one shard, not 192.
-        assert_eq!(commit_shard_count(1_000_000, 10 << 20, 192, T), 1);
+        assert_eq!(superfiles_per_commit(1_000_000, 10 << 20, 192, T), 1);
         // 1 GiB buffer: 16 shards by bytes, capped by a smaller pool.
-        assert_eq!(commit_shard_count(1_000_000, 1 << 30, 192, T), 16);
-        assert_eq!(commit_shard_count(1_000_000, 1 << 30, 8, T), 8);
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 192, T), 16);
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 8, T), 8);
         // Never more shards than rows, and never zero.
-        assert_eq!(commit_shard_count(3, 1 << 30, 192, T), 3);
-        assert_eq!(commit_shard_count(1, 1, 0, T), 1);
+        assert_eq!(superfiles_per_commit(3, 1 << 30, 192, T), 3);
+        assert_eq!(superfiles_per_commit(1, 1, 0, T), 1);
     }
 
     /// Boundary behavior of the ceiling division: a buffer at the target is one shard, one
     /// byte over splits, and each shard always carries at least half a target.
     #[test]
-    fn commit_shard_count_target_boundaries() {
-        const T: usize = TEST_SHARD_TARGET;
+    fn superfiles_per_commit_split_boundaries() {
+        const T: usize = TEST_SPLIT_BYTES;
         // Exactly one target: one shard. One byte over: two.
-        assert_eq!(commit_shard_count(1_000_000, T, 192, T), 1);
-        assert_eq!(commit_shard_count(1_000_000, T + 1, 192, T), 2);
+        assert_eq!(superfiles_per_commit(1_000_000, T, 192, T), 1);
+        assert_eq!(superfiles_per_commit(1_000_000, T + 1, 192, T), 2);
         // Exactly k targets: k shards. One byte over: k + 1.
-        assert_eq!(commit_shard_count(1_000_000, 4 * T, 192, T), 4);
-        assert_eq!(commit_shard_count(1_000_000, 4 * T + 1, 192, T), 5);
+        assert_eq!(superfiles_per_commit(1_000_000, 4 * T, 192, T), 4);
+        assert_eq!(superfiles_per_commit(1_000_000, 4 * T + 1, 192, T), 5);
         // Zero bytes still yields one shard (rows exist; bytes is a heuristic).
-        assert_eq!(commit_shard_count(10, 0, 192, T), 1);
+        assert_eq!(superfiles_per_commit(10, 0, 192, T), 1);
         // Documented lower bound: bytes-per-shard never drops below half a
         // target while the pool cap is not binding.
         for bytes in [T + 1, 2 * T - 1, 3 * T + T / 2, 10 * T + 1] {
-            let n = commit_shard_count(1_000_000, bytes, 192, T);
+            let n = superfiles_per_commit(1_000_000, bytes, 192, T);
             assert!(bytes.div_ceil(n) >= T / 2, "bytes={bytes} n={n}");
         }
     }
@@ -8704,21 +8703,21 @@ mod tests {
     /// `target_bytes == 0` is the configured escape hatch back to thread-count fanout:
     /// shards = pool width (still capped by rows).
     #[test]
-    fn commit_shard_count_zero_target_restores_thread_fanout() {
-        assert_eq!(commit_shard_count(1_000_000, 10 << 20, 192, 0), 192);
-        assert_eq!(commit_shard_count(1_000_000, 1 << 30, 8, 0), 8);
-        assert_eq!(commit_shard_count(3, 1 << 30, 192, 0), 3);
+    fn superfiles_per_commit_zero_split_restores_thread_fanout() {
+        assert_eq!(superfiles_per_commit(1_000_000, 10 << 20, 192, 0), 192);
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 8, 0), 8);
+        assert_eq!(superfiles_per_commit(3, 1 << 30, 192, 0), 3);
     }
 
-    /// The configured `shard_target_size_mb` reaches the commit fanout: a 1 MiB target splits
+    /// The configured `superfile_buffer_split_mb` reaches the commit fanout: a 1 MiB target splits
     /// a small buffer, `0` restores thread fanout, a large target keeps one file.
     #[test]
-    fn shard_target_config_knob_reaches_commit_fanout() {
+    fn superfile_buffer_split_config_knob_reaches_commit_fanout() {
         let batch = build_simple_batch(0, 50_000); // ~a few MiB in-memory
         for (target_mb, expect) in [(1u64, 2usize), (0, 2)] {
             let opts = options_id_title()
                 .with_writer_pool(writer_pool_with(2))
-                .with_shard_target_size_mb(target_mb);
+                .with_superfile_buffer_split_mb(target_mb);
             let st = Supertable::create(opts).expect("create");
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
@@ -8733,7 +8732,7 @@ mod tests {
         // Large target: the same buffer stays one superfile.
         let opts = options_id_title()
             .with_writer_pool(writer_pool_with(2))
-            .with_shard_target_size_mb(4096);
+            .with_superfile_buffer_split_mb(4096);
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&batch).expect("append");
@@ -8763,9 +8762,9 @@ mod tests {
         assert_eq!(r.n_docs_total(), 15);
     }
 
-    /// A single-shard FTS commit produces a queryable index, not just a counted superfile.
+    /// A one-piece FTS commit produces a queryable index, not just a counted superfile.
     #[test]
-    fn single_shard_fts_commit_is_searchable() {
+    fn single_piece_fts_commit_is_searchable() {
         let opts = options_id_title().with_writer_pool(writer_pool_with(4));
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
@@ -8774,9 +8773,9 @@ mod tests {
         drop(w);
 
         let r = st.reader().expect("reader");
-        assert_eq!(r.n_superfiles(), 1, "small FTS commit stays one shard");
+        assert_eq!(r.n_superfiles(), 1, "small FTS commit stays one piece");
         // Every doc's title contains "alpha" (see build_simple_batch); a match-all term must
-        // surface hits from the single-shard index.
+        // surface hits from the one-piece index.
         let hits = st
             .bm25_search(
                 "title",
@@ -8786,7 +8785,7 @@ mod tests {
                 Bm25Stats::PerSuperfile,
                 None,
             )
-            .expect("bm25 over single-shard commit");
+            .expect("bm25 over one-piece commit");
         let n: usize = hits.iter().map(|b| b.num_rows()).sum();
         assert!(n > 0, "single-shard FTS index must return hits");
     }
@@ -10004,7 +10003,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_shards_wide_buffer_up_to_pool_width() {
+    fn commit_splits_wide_buffer_up_to_pool_width() {
         // A buffer over the shard target splits, capped by the pool. Arrow reports capacity
         // (not logical bytes), so the ~100 MiB buffer wants 2-3 shards; the 2-thread pool pins
         // it to exactly 2.
