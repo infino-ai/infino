@@ -304,7 +304,7 @@ fn common_heavy_corpus(n: u64) -> Vec<(u64, String)> {
     for i in 5..n {
         let mut toks: Vec<&str> = Vec::new();
         for (t, name) in terms.iter().enumerate() {
-            if (i + t as u64) % 2 == 0 {
+            if (i + t as u64).is_multiple_of(2) {
                 toks.push(name);
             }
         }
