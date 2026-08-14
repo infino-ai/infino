@@ -8,6 +8,8 @@
 
 use std::{cmp::Ordering, collections::BinaryHeap};
 
+use std::slice::from_mut;
+
 use super::{
     core::*,
     cursor::TermCursor,
@@ -77,6 +79,42 @@ fn count_and_intersect_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
         }
     }
     acc.iter().map(|w| w.count_ones() as u64).sum()
+}
+
+/// Block-Max-AND upper bound at the leader's current doc, plus the window it
+/// is valid over. `cursors[0]` is the leader (positioned on a real doc in its
+/// current block); the rest are bounded by the block that *contains* that doc
+/// (`shallow_advance_block_to` + `inspect_block_max_bm25`), not by a max over
+/// every block spanning the leader's whole — possibly wide — block range. The
+/// sum is a true upper bound for every doc in `[leader_doc, window_end]`,
+/// where `window_end` is the smallest block boundary across the leader and all
+/// others: past it some cursor enters a new block and its bound may rise.
+///
+/// This is the tight per-block-pair bound. The looser range-max
+/// (`block_max_in_range` over the leader's full block) collapses to a common
+/// term's *global* max on a rare∧common query — where the rare leader's one
+/// block spans thousands of the common term's docs — so the skip almost never
+/// fires. Bounding by the single overlapping block instead lets the skip fire
+/// on a common term's locally-low regions, and skipping only to `window_end`
+/// keeps every skip provably safe.
+///
+/// The leader's block max and block end are passed in (its callers hold it
+/// split off from `others` for the flat-merge), and `others` is bounded and
+/// window-clamped in place via each cursor's `inspect_block` hint pointer.
+fn block_max_and_bound(
+    leader_block_max: f32,
+    leader_block_end: u32,
+    others: &mut [TermCursor],
+    leader_doc: u32,
+) -> (f32, u32) {
+    let mut ub = leader_block_max;
+    let mut window_end = leader_block_end;
+    for c in others.iter_mut() {
+        c.shallow_advance_block_to(leader_doc);
+        ub += c.inspect_block_max_bm25();
+        window_end = window_end.min(c.inspect_block_last_doc_id());
+    }
+    (ub, window_end)
 }
 
 impl FtsReader {
@@ -540,26 +578,30 @@ impl FtsReader {
                 break;
             }
 
-            // Block-max-AND pruning (scoring sinks only; the unranked
+            // Block-Max-AND pruning (scoring sinks only; the unranked
             // sink's `bar()` is NEG_INFINITY, so this whole block is
             // skipped). The bar is the kth-best once the heap fills, or
-            // the caller's seeded floor before that — whichever is
-            // higher. If the leader's current block can't possibly
-            // produce a bar-beating score, skip the whole block — the
-            // safest UB sums leader's block_max with each other cursor's
-            // max block_max across all blocks that overlap the leader's
-            // block doc-id range.
+            // the caller's seeded floor before that — whichever is higher.
+            // Bound the leader's current doc by the single block each other
+            // cursor has covering it (`block_max_and_bound`) — a tight
+            // per-block-pair sum — and, if it can't beat the bar, skip only
+            // to the smallest block boundary across all cursors, past which
+            // some bound may rise. Skipping the leader's *whole* block with
+            // a max over every overlapping block instead let a common term's
+            // global max swamp the bound so it rarely fired.
             let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
-                let range_start = cursors[0].current_doc_id();
-                let range_end = cursors[0].current_block_last_doc_id();
+                let leader_doc = cursors[0].current_doc_id();
                 let leader_block_max = cursors[0].current_block_max_bm25();
-                let mut other_ub = 0.0_f32;
-                for c in cursors[1..].iter_mut() {
-                    other_ub += c.block_max_in_range(range_start, range_end);
-                }
-                if leader_block_max + other_ub <= bar {
-                    cursors[0].skip_to(range_end.saturating_add(1));
+                let leader_block_end = cursors[0].current_block_last_doc_id();
+                let (ub, window_end) = block_max_and_bound(
+                    leader_block_max,
+                    leader_block_end,
+                    &mut cursors[1..],
+                    leader_doc,
+                );
+                if ub <= bar {
+                    cursors[0].skip_to(window_end.saturating_add(1));
                     continue;
                 }
             }
@@ -696,19 +738,23 @@ impl FtsReader {
                 break;
             }
 
-            // Block-max-AND pruning at the leader's current block
-            // (scoring sinks only; the unranked sink's `bar()` is
-            // NEG_INFINITY, so this is skipped). The bar is the kth-best
-            // once the heap fills, or the caller's seeded floor before
-            // that — whichever is higher.
+            // Block-Max-AND pruning at the leader's current doc (scoring
+            // sinks only; the unranked sink's `bar()` is NEG_INFINITY, so
+            // this is skipped). The bar is the kth-best once the heap fills,
+            // or the caller's seeded floor before that — whichever is higher.
+            // Bound `c1` by the single block covering the leader doc and skip
+            // only to the nearer block boundary; see `block_max_and_bound`.
             let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
-                let range_start = c0.current_doc_id();
-                let range_end = c0.current_block_last_doc_id();
-                let ub =
-                    c0.current_block_max_bm25() + c1.block_max_in_range(range_start, range_end);
+                let leader_doc = c0.current_doc_id();
+                let (ub, window_end) = block_max_and_bound(
+                    c0.current_block_max_bm25(),
+                    c0.current_block_last_doc_id(),
+                    from_mut(c1),
+                    leader_doc,
+                );
                 if ub <= bar {
-                    c0.skip_to(range_end.saturating_add(1));
+                    c0.skip_to(window_end.saturating_add(1));
                     continue;
                 }
             }
