@@ -11,6 +11,21 @@
 //! "this is safe because we hold the lease" are wrong — every
 //! state transition has to surface at the CAS layer.
 //!
+//! ## Where leases come from
+//!
+//! Two places, and only the first one lives in this module:
+//!
+//! - [`try_acquire`], used by the recovery sweep to take over a
+//!   WAL some other process left behind.
+//! - The create itself, for a WAL whose creator is about to drive
+//!   it. The delete path stamps a lease straight into the doc it
+//!   creates: creating and acquiring in one write leaves no window
+//!   for a sweep to pick the WAL up before the writer gets going,
+//!   whereas a `try_acquire` issued after the create would.
+//!
+//! So a `None` lease does not imply "nobody has started this
+//! WAL yet" — it means nobody owns it *now*.
+//!
 //! ## What lives here
 //!
 //! - [`try_acquire`] — vacant or expired → CAS-take. Vacant means

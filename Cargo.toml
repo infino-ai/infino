@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -183,6 +183,12 @@ tracing = "0.1"
 # against a per-Supertable cached Runtime. Tokio is single-worker
 # here: it drives DataFusion's I/O state machine, not CPU-bound work
 # (CPU work for skip + fan-out lives on the rayon reader pool).
+#
+# On bumping to 55: drop `spans_full_domain` in
+# `src/supertable/query/provider.rs`. It works around a cardinality
+# overflow that 54.x still carries; 55 has the upstream fix
+# (https://github.com/apache/datafusion/pull/22309), so the guard becomes
+# dead weight that only costs us statistics.
 datafusion = "54"
 # `macros` enables `#[tokio::test]` for the async DataFusion
 # integration tests; runtime weight on a release build is just the

@@ -753,7 +753,7 @@ pub mod fts {
                         .map(|p| p.into_iter().map(|t| t.into_owned()).collect())
                         .collect();
                     return self
-                        .atoms_match_count(column, &refs, &owned, eff_mode)
+                        .atoms_match_count(column, &refs, &owned, eff_mode, &[], &[])
                         .await
                         .expect("superfile atoms_match_count")
                         .0;

@@ -48,8 +48,8 @@ const CRC_TEST_SECONDARY_AXIS_OFFSET: usize = 3;
 const CORRUPTION_FLIP_MASK: u8 = 0xFF;
 
 /// Positional variant of the corruptable superfile: same corpus, the
-/// FTS column records token positions, so the blob is v2 and carries a
-/// CRC-protected positions region.
+/// FTS column records token positions, so the blob is v3 and carries a
+/// CRC-protected positions region (plus the position sub-index).
 fn build_corruptable_positional_superfile() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -308,7 +308,7 @@ fn corruption_at_random_interior_positions_rejected() {
 
 #[test]
 fn corrupt_fts_positions_region_rejected() {
-    // v2 blob: the positions-region offset lives at header bytes
+    // v4 blob: the positions-region offset lives at header bytes
     // [48..56] (relative to the blob). Flip a byte inside the region
     // body — the multi-doc terms guarantee it is non-empty.
     let bytes = build_corruptable_positional_superfile();
@@ -318,7 +318,10 @@ fn corrupt_fts_positions_region_rejected() {
             .try_into()
             .expect("version bytes"),
     );
-    assert_eq!(version, 2, "positional superfile must embed a v2 FTS blob");
+    assert_eq!(
+        version, 4,
+        "positional superfile must embed a v4 FTS blob (dense corpus ⇒ bitset blocks)"
+    );
     let positions_off_rel = u64::from_le_bytes(
         bytes[fts_off + 48..fts_off + 56]
             .try_into()
@@ -339,10 +342,102 @@ fn corrupt_fts_positions_region_rejected() {
 
 #[test]
 fn uncorrupted_positional_superfile_opens() {
-    // Sanity twin of the corruption test: the same v2 bytes open
+    // Sanity twin of the corruption test: the same v4 bytes open
     // cleanly when untouched.
     let bytes = build_corruptable_positional_superfile();
-    SuperfileReader::open(Bytes::from(bytes)).expect("clean v2 superfile opens");
+    SuperfileReader::open(Bytes::from(bytes)).expect("clean v4 superfile opens");
+}
+
+#[test]
+fn corrupt_fts_position_subindex_rejected() {
+    // The v3 position run-offset sub-index is not a new CRC region — it
+    // rides inside each term's postings region, which is already
+    // CRC-protected. This pins that the new bytes are covered: land a flip
+    // squarely inside the first term's sub-index and confirm the reader
+    // rejects it at open.
+    //
+    // A v3 positional term's region is `[meta][skip table][sub-index]
+    // [blocks]`. The postings region holds only non-inline terms (inline
+    // df=1 terms live in the FST value), and the fixture's FTS column is
+    // positional, so its first postings term is a positional term whose
+    // sub-index begins right after its skip table.
+    let bytes = build_corruptable_positional_superfile();
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
+    let postings_offset_rel = u64::from_le_bytes(
+        bytes[fts_off + 32..fts_off + 40]
+            .try_into()
+            .expect("postings offset"),
+    ) as usize;
+    let term0 = fts_off + postings_offset_rel;
+    // Positional term header is 32 bytes; `num_blocks` is the u32 at its
+    // offset 16; each skip entry is 16 bytes. The sub-index starts right
+    // after the skip table.
+    const POSITIONAL_META: usize = 32;
+    const SKIP_ENTRY: usize = 16;
+    let num_blocks = u32::from_le_bytes(
+        bytes[term0 + 16..term0 + 20]
+            .try_into()
+            .expect("num_blocks"),
+    ) as usize;
+    assert!(num_blocks >= 1, "first postings term must have ≥1 block");
+    let subindex_start = term0 + POSITIONAL_META + num_blocks * SKIP_ENTRY;
+    assert_corruption_rejected(bytes, subindex_start + 1, "fts/position sub-index");
+}
+
+#[test]
+fn corrupt_fts_bitset_block_rejected() {
+    // The dense fixture (every doc shares the same terms) stores those common
+    // terms' postings as BITSET blocks — a new on-disk shape. Those bytes ride
+    // inside the already-CRC-protected postings region; this pins that a flip
+    // inside a bitset block's presence bitmap is caught at open, the bitset-block
+    // twin of `corrupt_fts_position_subindex_rejected`.
+    let bytes = build_corruptable_superfile();
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    // Dense corpus ⇒ a v4 blob with at least one bitset block.
+    let version = u32::from_le_bytes(
+        bytes[fts_off + 8..fts_off + 12]
+            .try_into()
+            .expect("version bytes"),
+    );
+    assert_eq!(
+        version, 4,
+        "dense corpus must embed a v4 FTS blob (bitset blocks)"
+    );
+    // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
+    let postings_offset_rel = u64::from_le_bytes(
+        bytes[fts_off + 32..fts_off + 40]
+            .try_into()
+            .expect("postings offset"),
+    ) as usize;
+    let term0 = fts_off + postings_offset_rel;
+    // A term is `[meta][skip table][blocks]`; the first block's offset *within
+    // the term* is recorded in skip entry 0's block-offset field, so read it
+    // directly instead of re-deriving the skip-table size. Non-positional term
+    // meta is 20 B (`TERM_META_SIZE`); a skip entry's block-offset u32 sits at
+    // its offset 4 (`BLOCK_OFFSET_OFF`).
+    const TERM_META: usize = 20;
+    const SKIP_BLOCK_OFFSET_FIELD: usize = 4;
+    let block0_off_in_term = u32::from_le_bytes(
+        bytes[term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD
+            ..term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD + 4]
+            .try_into()
+            .expect("block offset"),
+    ) as usize;
+    let block0 = term0 + block0_off_in_term;
+    // Block header byte 3 is the encoding (`ENCODING_BITSET == 1`). Assert the
+    // first postings term's block really is a bitset — both a fixture sanity
+    // check and proof the flip below lands in a presence bitmap, not a PFOR block.
+    const ENCODING_OFF: usize = 3;
+    const ENCODING_BITSET: u8 = 1;
+    const BLOCK_HEADER: usize = 8;
+    assert_eq!(
+        bytes[block0 + ENCODING_OFF],
+        ENCODING_BITSET,
+        "first postings term's block must be bitset-encoded on this dense corpus"
+    );
+    // Flip a byte in the presence bitmap, just past the 8-byte block header.
+    assert_corruption_rejected(bytes, block0 + BLOCK_HEADER, "fts/bitset block presence");
 }
 
 /// FTS blob range only (the positional fixture has no vector blob, so

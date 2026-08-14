@@ -84,7 +84,10 @@ use crate::{
                 },
                 vector_exec::arg_to_query_vector,
             },
-            vector::{calibrated_query, user_placement_for_scalar_resolve},
+            vector::{
+                calibrated_query, free_columns_unambiguous, hits_id_score_batch,
+                id_score_projection_indices, user_placement_for_scalar_resolve,
+            },
         },
     },
 };
@@ -211,6 +214,25 @@ impl Supertable {
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let batch = self
             .block_on_query(async {
+                // `_id` + `score` come free with the search wave, so a
+                // projection of just those needs no placement and no
+                // Parquet decode — the same fast path `vector_search`
+                // takes. GUARDED on every hit carrying a stable-id
+                // stamp: hybrid fuses FTS-matched rows that never went
+                // through the hidden vector index, and those reach here
+                // unstamped (`stable_id: None`), which
+                // `hits_id_score_batch` treats as an upstream bug. Any
+                // unstamped hit falls through to the general path,
+                // which resolves ids by placement.
+                let id_column = reader.options().id_column.as_str();
+                if free_columns_unambiguous(&reader.options().schema, id_column)
+                    && let Some(indices) = id_score_projection_indices(projection, id_column)
+                    && hits.iter().all(|h| h.stable_id.is_some())
+                {
+                    return hits_id_score_batch(&reader, &hits)?
+                        .project(&indices)
+                        .map_err(|e| QueryError::Execute(e.to_string()));
+                }
                 // Boundary-replica stubs carry an IVF local that does not
                 // address a Parquet row; remap to the owning placement by
                 // stable id before the scalar decode, exactly as the

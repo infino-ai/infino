@@ -260,6 +260,17 @@ impl ConnectionMemoryBudget {
     }
 
     test_visible! {
+        /// Bytes currently reserved. Test-visible companion to
+        /// [`peak`](Self::peak): where peak proves the budget was
+        /// exercised, `used_bytes` proves reservations were RELEASED —
+        /// the property that separates operation-scoped holders from
+        /// caches that pin bytes for their whole lifetime.
+        fn used_bytes(&self) -> usize {
+            self.used()
+        }
+    }
+
+    test_visible! {
         /// The enforced ceiling, or `None` when measured.
         fn limit(&self) -> Option<usize> {
             self.limit

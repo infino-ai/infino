@@ -79,6 +79,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
+use arrow_schema::Schema;
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
@@ -916,7 +917,13 @@ async fn lookup_user_placements_by_id(
         // concurrent prune from dropping the cell out from under the build.
         let cells: Vec<(Arc<SuperfileEntry>, GappedPlacementCell)> = {
             let mut cache = slot.lock().await;
-            if version >= cache.pruned_through {
+            // `>` not `>=`: a generation equal to the last prune has already
+            // been pruned, and re-running `retain` for it walks the whole map
+            // under this lock on EVERY projected query of a steady-state table
+            // (the common case — the generation only moves on commit/compact).
+            // The monotonic guarantee is unchanged: an older snapshot still
+            // never evicts a newer one's freshly built maps.
+            if version > cache.pruned_through {
                 cache.entries.retain(|uri, _| live_uris.contains(uri));
                 cache.pruned_through = version;
             }
@@ -987,33 +994,52 @@ fn id_values_from_batch(batch: &RecordBatch) -> Result<Vec<i128>, QueryError> {
 }
 
 /// Build one gapped superfile's sorted `stable_id -> local` index (#556): read
-/// its `_id` column once, reserve the resident bytes against the connection
-/// budget (degrading to an unreserved build under pressure rather than failing
-/// the query — the vector scan degrades the same way), then sort + dedup on the
-/// reader pool. Memoized per uri by the caller's single-flight cell.
+/// its `_id` column once, then sort + dedup on the reader pool. Memoized per
+/// uri by the caller's single-flight cell.
+///
+/// The index's RESIDENT bytes are deliberately not charged to the connection
+/// memory budget, only its transient build scratch is. The budget gates
+/// MANDATORY work — ingest reserves through `reserve_build_scratch`
+/// (`writer.rs`) and compaction through `merge_superfiles`
+/// (`compaction/mod.rs`), and both HARD-FAIL when refused. A discretionary,
+/// rebuildable read cache that pins budget bytes for as long as its superfile
+/// stays live can push those two over the ceiling and keep them there: the only
+/// thing that evicts an entry is its superfile being superseded, which is
+/// exactly what compaction does, which is now the operation being denied. That
+/// deadlock does not clear without a process restart, so the cache stays out of
+/// the accounted set. Resident cost is bounded by the live gapped corpus
+/// (~20 B/row) — the same proportional-to-corpus class as the transposed-code
+/// cache — and every entry is reconstructible from immutable bytes.
 async fn build_gapped_placement_index(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     id_column: &str,
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
-    let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+    let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
     let ids = read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await?;
-    // ~20 B resident per row (i128 id + u32 local). Reserve up front; on refusal
-    // build anyway, just unaccounted (correctness is unchanged, only the memo's
-    // budget bookkeeping) — same graceful fallback the transposed-code cache uses.
-    let bytes = ids.len() * (std::mem::size_of::<i128>() + std::mem::size_of::<u32>());
-    let reservation = manifest
+    // Build scratch only, released the moment the sorted arrays are extracted.
+    // The transient peak holds all three vectors at once — the decoded `ids`
+    // and `locals` are still alive while the `(i128, u32)` pairs they zip into
+    // are built — so account for the sum rather than the pair vector alone
+    // (which undercounts the real high-water mark by ~2.6x). Refusal degrades
+    // to an unaccounted build rather than failing the query — the vector scan
+    // degrades the same way.
+    let scratch_bytes = ids.len()
+        * (std::mem::size_of::<i128>()
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<(i128, u32)>());
+    let scratch = manifest
         .options
         .connection_memory_budget
-        .try_reserve(bytes)
+        .try_reserve(scratch_bytes)
         .ok();
     let pool = Arc::clone(&manifest.options.reader_pool);
     let index = run_on_pool(
         Some(&pool),
         "gapped id-map: reader pool dropped result",
         move || {
-            let mut pairs: Vec<(i128, u32)> = ids.into_iter().zip(locals).collect();
+            let mut pairs: Vec<(i128, u32)> = ids.into_iter().zip(locals.iter().copied()).collect();
             // Sort by id, ties by local, so dedup keeps the SMALLEST local for a
             // repeated id — first-wins in Parquet row order, matching the old scan.
             pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -1024,7 +1050,9 @@ async fn build_gapped_placement_index(
                 sorted_ids.push(id);
                 sorted_locals.push(local);
             }
-            GappedPlacementIndex::new(sorted_ids, sorted_locals, reservation)
+            // Scratch is dead here; release before the index outlives it.
+            drop(scratch);
+            GappedPlacementIndex::new(sorted_ids, sorted_locals)
         },
     )
     .await
@@ -1065,7 +1093,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
             .map(|local| entry.id_min + i128::from(local))
             .collect());
     }
-    let locals: Vec<u32> = (0..reader.n_docs() as u32).collect();
+    let locals = Arc::new((0..reader.n_docs() as u32).collect::<Vec<u32>>());
     // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
     // straight from it (resident; no scalar `_id` column read) before falling
     // back to the column.
@@ -1097,7 +1125,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 async fn read_ids_for_locals(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
-    local_ids: &[u32],
+    local_ids: &Arc<Vec<u32>>,
     id_column: &str,
     allow_inline_region: bool,
     op_stats: &Option<Arc<OpStatsCollector>>,
@@ -1121,10 +1149,32 @@ async fn read_ids_for_locals(
         // requests it identically whether it resolves resident or cold.
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
         // straight from it (resident; no scalar `_id` column read) when available.
-        if let Some(ids) = reader
-            .vec()
-            .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
-        {
+        // Resident decode is CPU over the whole requested row set — the
+        // placement-index build asks for EVERY row of the superfile — so it
+        // rides the reader pool and this task awaits a oneshot, per the
+        // rayon-for-CPU / tokio-for-I/O contract. Running it inline blocks a
+        // tokio worker for the length of a full-column decode, stalling every
+        // other query's I/O on that worker.
+        let resident = {
+            let reader = Arc::clone(&reader);
+            // Arc clone, not a buffer copy: the placement-index build
+            // passes EVERY row of the superfile here, so copying to
+            // satisfy the 'static bound would double a 10M-row locals
+            // list (~40 MB) per build.
+            let locals = Arc::clone(local_ids);
+            run_on_pool(
+                Some(&manifest.options.reader_pool),
+                "inline stable-id decode: reader pool dropped result",
+                move || {
+                    reader
+                        .vec()
+                        .and_then(|v| v.inline_stable_ids_for_locals(&locals))
+                },
+            )
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+        };
+        if let Some(ids) = resident {
             if let Some(stats) = op_stats {
                 stats.add_planned_read_ranges(1);
             }
@@ -1144,11 +1194,26 @@ async fn read_ids_for_locals(
         }
     }
     if reader.parquet_bytes().is_some() {
-        let (batch, decode_ns) = op_stats::timed_section(|| {
-            reader
-                .take_by_local_doc_ids(local_ids, &[id_column])
-                .map_err(|e| QueryError::Execute(e.to_string()))
-        });
+        // Same bridge as the inline path: a Parquet column take over the
+        // requested rows is CPU, not I/O.
+        let (batch, decode_ns) = {
+            let reader = Arc::clone(&reader);
+            let locals = Arc::clone(local_ids);
+            let id_column = id_column.to_string();
+            run_on_pool(
+                Some(&manifest.options.reader_pool),
+                "scalar id decode: reader pool dropped result",
+                move || {
+                    op_stats::timed_section(|| {
+                        reader
+                            .take_by_local_doc_ids(&locals, &[id_column.as_str()])
+                            .map_err(|e| QueryError::Execute(e.to_string()))
+                    })
+                },
+            )
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+        };
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
         }
@@ -1206,7 +1271,11 @@ async fn hidden_hits_user_ids(
             continue;
         }
         // Gapped span → one resident read of just the rows these hits touch.
-        let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
+        let locals = Arc::new(
+            idxs.iter()
+                .map(|&i| hidden_hits[i].local_doc_id)
+                .collect::<Vec<u32>>(),
+        );
         let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true, op_stats)
             .await?;
         for (j, &i) in idxs.iter().enumerate() {
@@ -1216,11 +1285,82 @@ async fn hidden_hits_user_ids(
     Ok(ids)
 }
 
-fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> bool {
-    match projection {
-        None => true,
-        Some(names) => names == [id_column, SCORE_COLUMN] || names == [SCORE_COLUMN, id_column],
+/// Column positions in the batch [`hits_id_score_batch`] synthesizes.
+const ID_SCORE_ID_COLUMN: usize = 0;
+const ID_SCORE_SCORE_COLUMN: usize = 1;
+
+/// Position of `name` in the batch [`hits_id_score_batch`] synthesizes,
+/// or `None` when it is a user column that needs a data page.
+///
+/// THE rule for which columns come free with the search wave: the ids
+/// are stamped on the hits and the scores are the kernel's output, so
+/// any subset or ordering of the two serves without resolving
+/// placements. Both entry points classify through this one function —
+/// the public API by name directly, the SQL TVF by mapping its
+/// DataFusion column indices back to names — so a third free column
+/// cannot be added to one path and forgotten on the other.
+pub(crate) fn free_column_slot(name: &str, id_column: &str) -> Option<usize> {
+    // An id column literally named `score` makes the two free names one
+    // name: the match below would answer `score` with the id slot. The
+    // general path resolves it the same way (`index_of` takes the first
+    // field, which is the id), so this changes no result today — it
+    // stops the two paths from drifting if either resolution order
+    // changes, and keeps the classifier from silently answering an
+    // ambiguous request.
+    if id_column == SCORE_COLUMN {
+        return None;
     }
+    match name {
+        n if n == id_column => Some(ID_SCORE_ID_COLUMN),
+        n if n == SCORE_COLUMN => Some(ID_SCORE_SCORE_COLUMN),
+        _ => None,
+    }
+}
+
+/// Whether `_id` and `score` unambiguously name the free columns for
+/// this table — i.e. no user column shadows either.
+///
+/// Arrow permits duplicate field names and nothing rejects a user
+/// column called `score` (or one matching the id column) at create
+/// time. When one exists, `output_schema_with_score` carries the name
+/// twice and the general path's `index_of` resolves it to the USER
+/// column, decoding real data. The fast path would answer the same
+/// projection with the synthesized value instead — a different result,
+/// not just a different route — so it must decline. Checked against
+/// the user-declared schema, which is a handful of fields and needs no
+/// allocation (building the scalar schema per query would cost the
+/// fast path the very work it exists to skip).
+pub(crate) fn free_columns_unambiguous(user_schema: &Schema, id_column: &str) -> bool {
+    id_column != SCORE_COLUMN
+        && !user_schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == SCORE_COLUMN || f.name() == id_column)
+}
+
+/// Public-API projection policy: positions into the synthesized batch,
+/// or `None` when the projection needs the general path.
+///
+/// `None` (engine-native) is the `_id` + `score` pair. An EMPTY
+/// projection takes the general path: a zero-column batch carries its
+/// row count differently, and reproducing that here would be a second
+/// contract to maintain for a degenerate input. (The SQL TVF keeps its
+/// own policy for empty — DataFusion emits one for `COUNT(*)`-shaped
+/// plans, where a zero-column batch is exactly what it wants.)
+pub(crate) fn id_score_projection_indices(
+    projection: Option<&[&str]>,
+    id_column: &str,
+) -> Option<Vec<usize>> {
+    let Some(names) = projection else {
+        return Some(vec![ID_SCORE_ID_COLUMN, ID_SCORE_SCORE_COLUMN]);
+    };
+    if names.is_empty() {
+        return None;
+    }
+    names
+        .iter()
+        .map(|name| free_column_slot(name, id_column))
+        .collect()
 }
 
 fn is_hidden_vector_manifest(manifest: &ManifestSnapshot) -> bool {
@@ -3458,7 +3598,7 @@ impl SupertableReader {
                 }
                 continue;
             }
-            let locals: Vec<u32> = bm.iter().collect();
+            let locals = Arc::new(bm.iter().collect::<Vec<u32>>());
             let ids =
                 read_ids_for_locals(manifest, &entry, &locals, id_column, false, &self.op_stats)
                     .await?;
@@ -4285,8 +4425,19 @@ impl SupertableReader {
                 }
             };
             let id_column = self.options().id_column.as_str();
-            if projection_is_id_score_only(projection, id_column) {
-                let batch = hits_id_score_batch(self, &hits)?;
+            // GUARDED on every hit carrying a stamp, exactly as the hybrid
+            // path guards its own fast path (`hybrid_exec.rs`): a superfile
+            // entry with no row-id base stamps `stable_id: None`
+            // (`dispatch.rs`), and `hits_id_score_batch` treats that as an
+            // upstream bug. Falling through resolves the id by placement
+            // instead of failing the query.
+            if free_columns_unambiguous(&self.options().schema, id_column)
+                && let Some(indices) = id_score_projection_indices(projection, id_column)
+                && hits.iter().all(|hit| hit.stable_id.is_some())
+            {
+                let batch = hits_id_score_batch(self, &hits)?
+                    .project(&indices)
+                    .map_err(|e| QueryError::Execute(e.to_string()))?;
                 return Ok(vec![batch]);
             }
             let hits = user_placement_for_scalar_resolve(self, &hits).await?;
@@ -4699,11 +4850,11 @@ mod tests {
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
         VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        calibrated_query_for, cells_ranked_by_fine_score, ef_law, gate_fine_candidates_by_fragment,
-        hidden_hits_user_ids, is_hidden_vector_manifest, law_floor_serve_selection,
-        postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
-        vector_read_query_error,
+        calibrated_query_for, cells_ranked_by_fine_score, ef_law, free_column_slot,
+        free_columns_unambiguous, gate_fine_candidates_by_fragment, hidden_hits_user_ids,
+        id_score_projection_indices, is_hidden_vector_manifest, law_floor_serve_selection,
+        postings_by_cell_from_summaries, rerank_mult_from_law, score_fine_candidates,
+        select_global_shortlist, union_cell_selection, vector_read_query_error,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -4741,7 +4892,46 @@ mod tests {
     /// Fine ranking takes each cell's best (minimum) candidate score,
     /// sorts ascending with lower-id tie-break, and ignores untagged
     /// (legacy, `None`-cell) candidates.
-    /// Exactly the id + score columns (either order) or a bare `SELECT *`
+    /// A user column that shadows a free name must disable the fast
+    /// path entirely. Nothing rejects a column called `score` (or one
+    /// matching the id column) at create time, and when one exists the
+    /// general path's `index_of` resolves the name to the USER column
+    /// and decodes real data — so answering the same projection with
+    /// the synthesized value would be a different RESULT, not just a
+    /// different route.
+    #[test]
+    fn a_user_column_shadowing_a_free_name_declines_the_fast_path() {
+        let id = "doc_id";
+        let clean = Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]);
+        assert!(free_columns_unambiguous(&clean, id));
+
+        let shadows_score = Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(SCORE_COLUMN, DataType::Float32, false),
+        ]);
+        assert!(
+            !free_columns_unambiguous(&shadows_score, id),
+            "a visible `score` column must decline the fast path"
+        );
+
+        let shadows_id = Schema::new(vec![Field::new(id, DataType::Int64, false)]);
+        assert!(
+            !free_columns_unambiguous(&shadows_id, id),
+            "a user column matching the id column must decline the fast path"
+        );
+
+        // An id column named `score` collapses the two free names into
+        // one. The general path answers `score` with the id (index_of
+        // takes the first field, which is the id), so declining here
+        // changes no result — it keeps the classifier from answering an
+        // ambiguous request and stops the paths drifting.
+        assert_eq!(free_column_slot(SCORE_COLUMN, SCORE_COLUMN), None);
+        assert!(!free_columns_unambiguous(&clean, SCORE_COLUMN));
+    }
+
     /// The all-integer `hnsw` ef law `max(k, clamp(k×mult, floor, ceil))`.
     #[test]
     fn hnsw_ef_law() {
@@ -4763,18 +4953,73 @@ mod tests {
         assert_eq!(ef_law(5, 0, floor, ceil), 128);
     }
 
-    /// (None) takes the id/score fast path; anything else does not.
+    /// The SQL TVF classifies by DataFusion column INDEX and the public
+    /// API by NAME, so they cannot share a signature — but they must
+    /// share the RULE. Both resolve through [`free_column_slot`]; this
+    /// pins that the index path (index -> field name -> slot) lands on
+    /// exactly what the name path returns, for every projection shape.
+    /// A third free column added to `free_column_slot` is then picked
+    /// up by both without touching either call site.
     #[test]
-    fn projection_is_id_score_only_matches_id_score_combinations() {
+    fn tvf_index_classification_matches_the_name_path() {
         let id = "doc_id";
-        assert!(projection_is_id_score_only(None, id));
-        assert!(projection_is_id_score_only(Some(&[id, SCORE_COLUMN]), id));
-        assert!(projection_is_id_score_only(Some(&[SCORE_COLUMN, id]), id));
-        assert!(!projection_is_id_score_only(Some(&[id]), id));
-        assert!(!projection_is_id_score_only(
-            Some(&["other", SCORE_COLUMN]),
-            id
-        ));
+        // The TVF's output schema: scalar columns, `score` appended.
+        let names = [id, "title", "body", SCORE_COLUMN];
+        // Index path: what exec::vector_exec derives per requested index.
+        let by_index = |requested: &[usize]| -> Option<Vec<usize>> {
+            requested
+                .iter()
+                .map(|&i| names.get(i).and_then(|n| free_column_slot(n, id)))
+                .collect()
+        };
+        for requested in [
+            vec![0, 3],    // _id + score
+            vec![3, 0],    // reversed
+            vec![0],       // _id alone
+            vec![3],       // score alone
+            vec![0, 1, 3], // includes a user column
+            vec![1],       // user column alone
+        ] {
+            let as_names: Vec<&str> = requested.iter().map(|&i| names[i]).collect();
+            assert_eq!(
+                by_index(&requested),
+                id_score_projection_indices(Some(&as_names), id),
+                "index and name classification disagree for {requested:?}"
+            );
+        }
+    }
+
+    /// ANY subset/order of `_id` + `score` takes the fast path, and the
+    /// returned indices reproduce the requested order — `_id` alone is
+    /// the regression: it used to miss the exact-pair match and pay a
+    /// placement resolve for ids already stamped on the hits. A name
+    /// needing a user data page (or an empty projection) declines.
+    #[test]
+    fn id_score_projection_admits_any_subset_of_id_and_score() {
+        let id = "doc_id";
+        assert_eq!(id_score_projection_indices(None, id), Some(vec![0, 1]));
+        assert_eq!(
+            id_score_projection_indices(Some(&[id, SCORE_COLUMN]), id),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            id_score_projection_indices(Some(&[SCORE_COLUMN, id]), id),
+            Some(vec![1, 0])
+        );
+        assert_eq!(id_score_projection_indices(Some(&[id]), id), Some(vec![0]));
+        assert_eq!(
+            id_score_projection_indices(Some(&[SCORE_COLUMN]), id),
+            Some(vec![1])
+        );
+        assert_eq!(
+            id_score_projection_indices(Some(&[id, SCORE_COLUMN, id]), id),
+            Some(vec![0, 1, 0])
+        );
+        assert_eq!(
+            id_score_projection_indices(Some(&["other", SCORE_COLUMN]), id),
+            None
+        );
+        assert_eq!(id_score_projection_indices(Some(&[]), id), None);
     }
 
     /// The admit window scales with the ranked cell population (the

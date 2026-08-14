@@ -22,6 +22,8 @@ pub const CRC_BYTES: usize = 4;
 
 /// FTS section magic bytes and constants.
 pub mod fts {
+    use crate::superfile::fts::posting::BLOCK_LEN;
+
     /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` +
     /// `01`. The trailing `01` is a fixed part of the section
     /// identity, **not** a version — it never changes across blob
@@ -42,6 +44,47 @@ pub mod fts {
     /// postings region and the doc-lengths directory. Readers accept
     /// both versions.
     pub const VERSION_V2: u32 = 2;
+
+    /// The version new code writes when a column stores positions: same
+    /// header and region layout as [`VERSION_V2`], but each positional
+    /// term's region gains a **position run-offset sub-index** between its
+    /// skip table and its posting blocks. The sub-index stores, every
+    /// [`POSITION_SUBINDEX_STRIDE`] pairs within a block, the byte offset
+    /// of that pair's position run (relative to the term's positions), so
+    /// the reader reaches a pair's positions by skipping `< STRIDE` runs
+    /// instead of walking every run from the block start. Readers accept
+    /// `V1`/`V2`/`V3`; `V1`/`V2` files (no sub-index) stay readable
+    /// unchanged, so existing indices need no reindex. A column *without*
+    /// positions is written as [`VERSION_V2`] — the sub-index only exists
+    /// where positions do.
+    pub const VERSION_V3: u32 = 3;
+
+    /// The version written when any posting block is stored in the **bitset
+    /// encoding**: a dense block's doc ids are a presence bitset (header
+    /// byte 3 = [`crate::superfile::fts::posting::ENCODING_BITSET`]) rather
+    /// than PFOR deltas, so the union count OR's it in without decoding.
+    /// Same header + region layout as [`VERSION_V2`]/[`VERSION_V3`]
+    /// (positions region present iff positional; sub-index for positional
+    /// terms as in `V3`) — `V4` adds only the per-block encoding choice,
+    /// which is self-describing via the header byte. Readers accept
+    /// `V1`–`V4`; `V1`–`V3` blobs carry only PACKED blocks and read
+    /// unchanged, so existing indices need no reindex.
+    pub const VERSION_V4: u32 = 4;
+
+    /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
+    /// stored offset per this many pairs within a posting block. A decode
+    /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
+    /// Divides evenly into the posting-block length so every block's
+    /// sub-index has `ceil(pairs_in_block / STRIDE)` entries.
+    pub const POSITION_SUBINDEX_STRIDE: usize = 16;
+
+    /// Sub-index run-offset checkpoints stored per posting block
+    /// ([`VERSION_V3`]): the whole-block entry count, one every
+    /// [`POSITION_SUBINDEX_STRIDE`] pairs across a full posting block.
+    /// Both the writer's per-term sub-index sizing and the reader's flat
+    /// `block * ENTRIES + slot` indexing derive from this single value, so
+    /// they stay in lockstep.
+    pub const POSITION_SUBINDEX_ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
 
     /// Fixed-point scale for the per-column average document length.
     /// The builder stores `round(avgdl × 1000)` in the doc-lengths

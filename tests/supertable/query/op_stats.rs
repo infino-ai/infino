@@ -12,9 +12,11 @@
 use std::{sync::Arc, thread};
 
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+    Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+    LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{Expr, col, lit};
 use infino::{
     ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
@@ -1019,4 +1021,230 @@ fn a_search_tvf_inside_sql_reports_fts_work() {
         stats.fts_postings_bytes > 0,
         "the BM25 leg inside SQL indexes posting bytes; got 0"
     );
+}
+
+/// Projecting only `_id` must cost no more than the engine-native
+/// (`None`) result: both columns are produced by the search wave — ids
+/// stamped on the hits, scores from the kernel — so neither needs a
+/// placement resolve or a Parquet decode. Regression for the fast path
+/// that matched only the exact `[_id, score]` pair and sent a bare
+/// `["_id"]` down the scalar-projection path, which resolves placements
+/// (a whole-`_id`-column read per gapped superfile on first touch) and
+/// then decodes rows. `rows_materialized` is the invariant signal: the
+/// native path decodes nothing, so anything above 0 here means the
+/// query fell off the fast path.
+#[test]
+fn id_only_projection_costs_no_more_than_the_native_result() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let search = |projection: Option<&[&str]>| {
+        let (hits, stats) = with_op_stats(|| {
+            st.vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                projection,
+            )
+            .expect("vector search")
+        });
+        assert!(!hits.is_empty(), "fixture vector query must match");
+        stats
+    };
+
+    let native = search(None);
+    let id_only = search(Some(&["_id"]));
+    let id_and_score = search(Some(&["_id", "score"]));
+    let score_only = search(Some(&["score"]));
+
+    assert_eq!(
+        native.rows_materialized, 0,
+        "the engine-native result decodes no stored rows"
+    );
+    for (label, stats) in [
+        ("_id", &id_only),
+        ("_id + score", &id_and_score),
+        ("score", &score_only),
+    ] {
+        assert_eq!(
+            stats.rows_materialized, 0,
+            "projection [{label}] must stay on the id/score fast path \
+             (decoded {} rows)",
+            stats.rows_materialized
+        );
+        assert_eq!(
+            stats.planned_read_ranges, native.planned_read_ranges,
+            "projection [{label}] must plan the same reads as the native result"
+        );
+    }
+}
+
+/// The gapped-placement memo must not pin connection-budget bytes. The
+/// budget gates MANDATORY work — ingest and compaction both hard-fail
+/// when refused — so a discretionary, rebuildable read cache that holds
+/// bytes for as long as its superfile stays live can push those over the
+/// ceiling and keep them there: the only thing that evicts an entry is
+/// its superfile being superseded, which is what compaction does, which
+/// would be the operation denied.
+///
+/// Measured as a DELTA against a warmed native query, because the
+/// transposed-code cache legitimately pins bytes for its reader's
+/// lifetime (`TransposedCluster::_reservation`) — this asserts only that
+/// building the placement memo adds nothing permanent on top.
+#[test]
+fn placement_memo_releases_its_budget_bytes() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let budget = st.options().connection_budget();
+    let query = row_vec(3);
+    let search = |projection: Option<&[&str]>| {
+        let hits = st
+            .vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                projection,
+            )
+            .expect("vector search");
+        assert!(!hits.is_empty(), "fixture vector query must match");
+    };
+
+    // Warm every reader-lifetime cache the query path legitimately pins,
+    // so the only new resident state below is the placement memo.
+    search(None);
+    search(None);
+    let warmed = budget.used_bytes();
+    assert!(
+        budget.peak() > 0,
+        "the query must have exercised the budget at all"
+    );
+
+    // A user-column projection forces placement resolution over the
+    // drained (gapped) superfiles — this is what builds the memo.
+    search(Some(&["title"]));
+
+    assert_eq!(
+        budget.used_bytes(),
+        warmed,
+        "building the placement memo must leave no reserved bytes behind; \
+         {} held beyond the warmed baseline",
+        budget.used_bytes().saturating_sub(warmed)
+    );
+
+    // Liveness: mandatory work still reserves after the memo is warm.
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&vector_batch(schema)).expect("append after memo");
+    w.commit().expect("commit after memo");
+}
+
+/// A FILTERED vector query projecting `_id`/`score` must not return
+/// hidden-deleted rows — and this pins WHY it doesn't.
+///
+/// The fast path returns straight from search-wave stamps, skipping
+/// `user_placement_for_scalar_resolve`, which is where the identity-level
+/// delete filter lives. Unlike the global route, the filtered route has no
+/// retain of its own, so the omission looks unsafe. It is not, for a reason
+/// worth pinning: the filtered route derives its hidden allow-set from the
+/// USER-table allow bitmaps (`stable_ids_from_user_allow_async`), and those
+/// have already had `subtract_tombstones` applied in
+/// `fanout_candidate_bitmaps`. A deleted row is therefore dropped at the
+/// predicate leg and never becomes a candidate id, so no deleted row can
+/// reach the fast path in the first place.
+///
+/// That upstream subtraction is load-bearing and invisible from the
+/// projection code. This test fails if it is ever removed or bypassed.
+#[test]
+fn a_filtered_id_score_query_excludes_deleted_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let opts = VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE);
+    let filter = || VectorFilter {
+        column: "title",
+        query: "vec",
+        mode: BoolMode::Or,
+    };
+
+    // Identify the top-k by BOTH id and title in one pass: the title drives
+    // the delete predicate, the id is what the fast path must stop serving.
+    // This arm projects a scalar column, so it goes through placement — the
+    // arm under test is the `["_id", "score"]` one below.
+    let before = st
+        .vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            opts,
+            Some(filter()),
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("filtered search before delete");
+    let (ids_before, titles) = ids_and_titles(&before);
+    assert_eq!(
+        ids_before.len(),
+        VECTOR_K,
+        "fixture must fill k before any delete"
+    );
+
+    let preds: Vec<Expr> = titles.iter().map(|t| lit(t.as_str())).collect();
+    let stats = st
+        .delete(col("title").in_list(preds, false))
+        .expect("delete");
+    assert_eq!(
+        stats.n_tombstoned() as usize,
+        ids_before.len(),
+        "every top-k row must tombstone"
+    );
+
+    // The arm under test: `["_id", "score"]` takes the fast path.
+    let after = st
+        .vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            opts,
+            Some(filter()),
+            Some(&["_id", "score"]),
+        )
+        .expect("filtered search after delete");
+    let (ids_after, _) = ids_and_titles(&after);
+    for id in &ids_after {
+        assert!(
+            !ids_before.contains(id),
+            "filtered id/score fast path returned deleted _id {id}"
+        );
+    }
+    assert_eq!(
+        ids_after.len(),
+        VECTOR_K,
+        "filtered result underflowed instead of backfilling past tombstones"
+    );
+}
+
+/// `_id`s, and titles when the projection carried them.
+fn ids_and_titles(batches: &[RecordBatch]) -> (Vec<i128>, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut titles = Vec::new();
+    for b in batches {
+        let id_col = b
+            .column_by_name("_id")
+            .expect("_id column")
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is decimal128");
+        ids.extend((0..id_col.len()).map(|i| id_col.value(i)));
+        if let Some(col) = b.column_by_name("title") {
+            let t = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title is large utf8");
+            titles.extend((0..t.len()).map(|i| t.value(i).to_owned()));
+        }
+    }
+    (ids, titles)
 }

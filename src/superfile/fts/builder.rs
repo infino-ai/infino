@@ -100,7 +100,7 @@ use crate::superfile::{
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
-        posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
+        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
 };
@@ -163,6 +163,11 @@ const CHAIN_END: u32 = u32::MAX;
 #[derive(Default)]
 struct FinishProfile {
     enabled: bool,
+    /// Set once any posting block is emitted in the bitset encoding, so
+    /// the blob header is written as `VERSION_V4`. Not a profiling counter
+    /// — reused here because this struct already threads from term emit to
+    /// the final header write.
+    saw_bitset_block: bool,
     encode_calls: u64,
     encode_df1: u64,
     encode_pfor: u64,
@@ -3259,7 +3264,20 @@ fn assemble_and_write_blob<W: Write>(
     let blob_copy_start = finish_profile.enabled.then(Instant::now);
     let mut header = Vec::with_capacity(header_size as usize);
     header.extend_from_slice(format::fts::MAGIC); // 8
-    header.extend_from_slice(&format::fts::VERSION_V2.to_le_bytes()); // 4
+    // V4 when any block took the bitset encoding. Otherwise V3 when the
+    // positions region has a real body (beyond its 4-byte CRC) — a
+    // non-empty body means a non-inline positional term wrote position runs
+    // and therefore a run-offset sub-index — else V2 (positionless, or a
+    // positional blob whose terms all inlined), byte-identical to before.
+    // Readers accept all of these.
+    let fts_version = if finish_profile.saw_bitset_block {
+        format::fts::VERSION_V4
+    } else if positions_region.1 > format::CRC_BYTES as u64 {
+        format::fts::VERSION_V3
+    } else {
+        format::fts::VERSION_V2
+    };
+    header.extend_from_slice(&fts_version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4
     header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
@@ -3359,6 +3377,13 @@ struct TermScratch {
     /// offset of the block's first run within the term's positions
     /// bytes) for positional columns. Reused like the other buffers.
     pos_block_offsets: Vec<u32>,
+    /// Per-term position run-offset sub-index (VERSION_V3, positional
+    /// columns): `ENTRIES_PER_BLOCK` byte offsets per block — one every
+    /// `POSITION_SUBINDEX_STRIDE` pairs — each relative to the term's
+    /// positions bytes. Padded to a whole `ENTRIES_PER_BLOCK` per block
+    /// so entry `(block, slot)` sits at a flat `block * ENTRIES_PER_BLOCK
+    /// + slot`. Reused like the other buffers.
+    pos_subindex_offsets: Vec<u32>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -3638,6 +3663,10 @@ fn encode_and_emit_term<W: Write>(
         if let Some(start) = block_build_start {
             profile.encode_block_build += start.elapsed();
         }
+        // A block emitted in the bitset encoding bumps the blob to v4.
+        if encoded_blocks.iter().any(|b| b.bytes[3] == ENCODING_BITSET) {
+            profile.saw_bitset_block = true;
+        }
         let num_blocks = encoded_blocks.len() as u32;
         let metadata_offset = *postings_len;
         let skip_table_size = encoded_blocks.len() * SKIP_ENTRY_SIZE;
@@ -3646,14 +3675,28 @@ fn encode_and_emit_term<W: Write>(
             Some(_) => TERM_META_POSITIONAL_SIZE,
             None => TERM_META_SIZE,
         };
-        let postings_length = (term_meta_size + skip_table_size + blocks_total_size) as u64;
+        // VERSION_V3 position sub-index (positional terms only): one run
+        // offset every `POSITION_SUBINDEX_STRIDE` pairs, padded to a whole
+        // `ENTRIES_PER_BLOCK` per block, written between the skip table and
+        // the posting blocks. Zero-sized on positionless terms, which keep
+        // the V2 layout byte-for-byte.
+        let entries_per_block = format::fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK;
+        let subindex_size = match term_positions {
+            Some(_) => num_blocks as usize * entries_per_block * format::fts::U32_BYTES,
+            None => 0,
+        };
+        let postings_length =
+            (term_meta_size + skip_table_size + subindex_size + blocks_total_size) as u64;
 
-        // Per-block byte offsets into this term's position runs: walk
-        // the runs once, recording where each 128-doc block's first
-        // run starts, so the reader can fetch/decode one block's
-        // positions without touching its predecessors.
+        // Walk the runs once, recording where each 128-doc block's first
+        // run starts (the skip table's per-block offset) and, every
+        // `POSITION_SUBINDEX_STRIDE` pairs, a finer sub-index offset — so
+        // the reader reaches a pair's positions by skipping `< STRIDE`
+        // runs rather than every run from the block start.
         let pos_block_offsets = &mut scratch.pos_block_offsets;
+        let pos_subindex_offsets = &mut scratch.pos_subindex_offsets;
         pos_block_offsets.clear();
+        pos_subindex_offsets.clear();
         if let Some((_, runs)) = &term_positions {
             debug_assert!(
                 runs.len() <= u32::MAX as usize,
@@ -3661,12 +3704,28 @@ fn encode_and_emit_term<W: Write>(
             );
             let mut at: usize = 0;
             for (i, &(_, tf)) in pairs.iter().enumerate() {
-                if i % BLOCK_LEN == 0 {
+                let in_block = i % BLOCK_LEN;
+                if in_block == 0 {
                     pos_block_offsets.push(at as u32);
+                }
+                if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
+                    pos_subindex_offsets.push(at as u32);
                 }
                 skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
             }
             debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+            // Pad the final (partial) block's sub-index up to a whole
+            // `entries_per_block`, so entry `(block, slot)` is a flat
+            // `block * entries_per_block + slot`. The pad offsets point at
+            // the run end and are never read (no pair maps to them).
+            while !pos_subindex_offsets.len().is_multiple_of(entries_per_block) {
+                pos_subindex_offsets.push(at as u32);
+            }
+            debug_assert_eq!(
+                pos_subindex_offsets.len() * format::fts::U32_BYTES,
+                subindex_size,
+                "sub-index must hold entries_per_block offsets per block"
+            );
         }
 
         debug_assert!(df <= u32::MAX as u64, "df overflows u32");
@@ -3705,7 +3764,9 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_meta_write += start.elapsed();
         }
 
-        let mut block_offset: u32 = (term_meta_size + skip_table_size) as u32;
+        // Blocks follow the meta, the skip table, and the (V3-only)
+        // position sub-index, so their offsets start past all three.
+        let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
             let max_bm25 = block_ub_per_block[i];
@@ -3730,6 +3791,12 @@ fn encode_and_emit_term<W: Write>(
         }
         if let Some(start) = skip_write_start {
             profile.encode_skip_write += start.elapsed();
+        }
+
+        // Position sub-index (VERSION_V3, positional terms): sits between
+        // the skip table and the blocks. Empty on positionless terms.
+        for &off in pos_subindex_offsets.iter() {
+            term_buf.extend_from_slice(&off.to_le_bytes());
         }
 
         let block_write_start = profile.enabled.then(Instant::now);
@@ -4586,7 +4653,15 @@ mod tests {
 
         let read_u64 = |at: usize| u64::from_le_bytes(v2[at..at + 8].try_into().expect("8 bytes"));
         let read_u32 = |at: usize| u32::from_le_bytes(v2[at..at + 4].try_into().expect("4 bytes"));
-        assert_eq!(read_u32(8), format::fts::VERSION_V2);
+        // Accept any 56-byte-header version (v2/v3/v4) as the downgrade
+        // source — they share the header layout this synthesizer edits.
+        let src_version = read_u32(8);
+        assert!(
+            src_version == format::fts::VERSION_V2
+                || src_version == format::fts::VERSION_V3
+                || src_version == format::fts::VERSION_V4,
+            "unexpected source version {src_version}"
+        );
         let fst_off = read_u64(24);
         let postings_off = read_u64(32);
         let doc_lengths_off = read_u64(40);
@@ -4697,9 +4772,10 @@ mod tests {
         let docs = positional_corpus();
         let k = docs.len();
         let spilled_pos = build_title_blob_spilled(&docs, true, None);
+        // A positional build carries position runs ⇒ a sub-index ⇒ v3.
         assert_eq!(
             u32::from_le_bytes(spilled_pos[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V2
+            format::fts::VERSION_V4
         );
         let inram_pos = build_title_blob(&docs, true);
         let inram_plain = build_title_blob(&docs, false);
@@ -4765,6 +4841,61 @@ mod tests {
         );
     }
 
+    /// Backwards compatibility: the new reader must read a **v2 positional**
+    /// blob — every already-written positional index — through the
+    /// block-start walk fallback, giving results identical to the v3
+    /// sub-index fast path on the same corpus. A positional build is v3;
+    /// downgrade its version byte to v2 so the reader ignores the sub-index
+    /// and takes the fallback (the sub-index bytes become dead space the
+    /// walk never reads, since blocks are located from the skip table).
+    #[tokio::test]
+    async fn new_code_reads_v2_positional_via_fallback() {
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
+
+        let docs = positional_corpus();
+        let v3_blob = build_title_blob(&docs, true);
+        assert_eq!(
+            u32::from_le_bytes(v3_blob[8..12].try_into().expect("version bytes")),
+            format::fts::VERSION_V4,
+            "this positional corpus is dense ⇒ v4"
+        );
+        // Downgrade the version field only; the header is not itself
+        // CRC-covered, and the positions region + skip offsets are
+        // byte-identical to v2, so the fallback path reads it correctly.
+        let mut v2_bytes = v3_blob.to_vec();
+        v2_bytes[8..12].copy_from_slice(&format::fts::VERSION_V2.to_le_bytes());
+        let v2_blob = bytes::Bytes::from(v2_bytes);
+
+        let v3 = FtsReader::open(v3_blob, title_json(true)).expect("v3 opens");
+        let v2 = FtsReader::open(v2_blob, title_json(true)).expect("v2 opens");
+        // Phrases exercise the position decode. `common filler` matches in
+        // every one of the 391 docs (spanning 4 posting blocks), so
+        // `common`'s decode runs at pairs across many blocks and non-
+        // checkpoint offsets — exactly the sub-index path. The fast path
+        // (v3) and the block-start walk (v2 fallback) must agree exactly,
+        // and match a nonzero count so the decode really ran.
+        let phrases: &[(&[&str], u64)] = &[
+            (&["common", "filler"], 391),
+            (&["medium", "medium"], 79),
+            (&["filler", "medium"], 79),
+        ];
+        for (terms, want) in phrases {
+            let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
+            let a = v3
+                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .await
+                .expect("v3 phrase count")
+                .0;
+            let b = v2
+                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .await
+                .expect("v2 phrase count")
+                .0;
+            assert_eq!(a, b, "v3 fast path vs v2 fallback diverged for {terms:?}");
+            assert_eq!(a, *want, "unexpected phrase count for {terms:?}");
+        }
+    }
+
     /// Column-json for the single "title" column, with or without the
     /// positions flag — matching what `fts_columns_json` emits.
     fn title_json(positional: bool) -> &'static str {
@@ -4809,7 +4940,7 @@ mod tests {
     }
 
     #[test]
-    fn every_build_writes_v2_and_positionless_region_is_empty() {
+    fn positionless_is_v2_positional_is_v3_and_positionless_region_is_empty() {
         let docs = positional_corpus();
         let plain = build_title_blob(&docs, false);
         let positional = build_title_blob(&docs, true);
@@ -4817,9 +4948,11 @@ mod tests {
         let version_of = |blob: &bytes::Bytes| {
             u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
         };
-        // New code always writes v2; v1 is a read-only legacy format.
-        assert_eq!(version_of(&plain), format::fts::VERSION_V2);
-        assert_eq!(version_of(&positional), format::fts::VERSION_V2);
+        // This corpus is dense enough that some block takes the bitset
+        // encoding, so both builds are v4 (v4 subsumes the v3 positions
+        // sub-index). v1 is a read-only legacy format.
+        assert_eq!(version_of(&plain), format::fts::VERSION_V4);
+        assert_eq!(version_of(&positional), format::fts::VERSION_V4);
 
         // A positionless build's region is just the CRC-of-empty.
         let read_u64_plain =
@@ -4916,7 +5049,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V2
+            format::fts::VERSION_V4
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

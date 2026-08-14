@@ -73,7 +73,7 @@ use arrow_array::{
 };
 use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
 use futures::{
     future::try_join_all,
@@ -106,8 +106,8 @@ use super::{
         WalStore,
         pipeline::{self, TombstonePhaseOutcome},
         state_doc::{
-            IdSpan, OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId,
-            WalState, WalStateDoc,
+            IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
+            TombstoneOutcome, WalId, WalState, WalStateDoc,
         },
     },
 };
@@ -171,8 +171,11 @@ use crate::{
             vector::stable_ids_by_local_for_routing,
         },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
-        slow_vector_state,
-        slow_vector_state::{CentroidSection, fetch_centroid_section},
+        slow_vector_state::{self, CentroidSection, fetch_centroid_section},
+        wal::{
+            Lease,
+            lease::{self, DEFAULT_LEASE_DURATION},
+        },
     },
 };
 
@@ -1441,24 +1444,39 @@ impl SupertableWriter {
         })
     }
 
-    /// Drive one pending delete entry through its tombstone
-    /// phase. Returns the per-op outcome on success.
-    fn drive_one_delete(&self, entry: &PendingDeleteEntry) -> Result<MutationStats, MutationError> {
-        let storage = self
-            .inner
-            .options
-            .storage
-            .as_ref()
-            .ok_or(MutationError::NoStorageAttached)?
-            .clone();
-
-        let wal_doc = WalStateDoc {
+    /// Build the `Intent` state doc for one buffered delete.
+    ///
+    /// The doc is born already leased to this handle. `create` is the WAL's
+    /// first appearance on storage, so stamping the lease into the created
+    /// bytes leaves no window in which a peer's recovery sweep could see an
+    /// unowned `Intent` doc and start driving the same tombstone phase
+    /// underneath us — a `try_acquire` issued after `create` would leave
+    /// exactly that window, and losing the race there costs the caller its
+    /// whole delete (the peer's CAS invalidates our etag, so every
+    /// subsequent per-target write fails and `commit` reports a partial
+    /// commit for work that actually landed).
+    ///
+    /// The lease stays advisory: the etag CAS chain in the tombstone phase
+    /// is what keeps concurrent drivers correct. This only keeps a peer
+    /// from duplicating the work and knocking us off our etag.
+    ///
+    /// One `now` stamps `created_at` and both lease timestamps so the
+    /// doc's creation time and its lease window come from a single clock
+    /// reading.
+    fn delete_wal_doc(&self, entry: &PendingDeleteEntry, now: DateTime<Utc>) -> WalStateDoc {
+        let lease_span = ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+            .expect("default lease duration should be a valid chronoduration");
+        WalStateDoc {
             wal_id: entry.wal_id,
             schema_version: SCHEMA_VERSION,
             op_kind: OpKind::Delete,
             state: WalState::Intent,
-            created_at: Utc::now(),
-            lease: None,
+            created_at: now,
+            lease: Some(Lease {
+                owner: self.inner.handle_id,
+                acquired_at: now,
+                expires_at: now + lease_span,
+            }),
             predicate_repr: "writer.delete()".into(),
             target_ids: entry.target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: None,
@@ -1474,7 +1492,21 @@ impl SupertableWriter {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
-        };
+        }
+    }
+
+    /// Drive one pending delete entry through its tombstone
+    /// phase. Returns the per-op outcome on success.
+    fn drive_one_delete(&self, entry: &PendingDeleteEntry) -> Result<MutationStats, MutationError> {
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        let wal_doc = self.delete_wal_doc(entry, Utc::now());
 
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
@@ -1489,13 +1521,21 @@ impl SupertableWriter {
             .as_ref()
             .map(|vit| Arc::clone(vit.inner()));
         let deleted_ids: Vec<i128> = entry.target_ids.clone();
+        let owner = self.inner.handle_id;
         let drive = async move {
             let etag = wal_store
                 .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let (outcome, _post, _post_etag) =
-                pipeline::run_tombstone_phase(&supertable, &wal_store, &wal_doc, &etag).await?;
+            let phase =
+                pipeline::run_tombstone_phase(&supertable, &wal_store, &wal_doc, &etag).await;
+            let (outcome, _post, _post_etag) = match phase {
+                Ok(applied) => applied,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
             let (n_t, n_nf) = match outcome {
                 TombstonePhaseOutcome::Applied {
                     n_tombstoned,
@@ -3428,8 +3468,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let clean_uncheckpointed_drain = local_checkpoint.batches_done == 0
         && completed_shards.is_empty()
         && local_checkpoint.spills.is_empty();
-    let mut width_law = clean_uncheckpointed_drain
-        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
+    let mut width_law = clean_uncheckpointed_drain.then(|| {
+        opann::WidthLawCalibration::new(
+            running_clusters.dim as usize,
+            metric,
+            user_inner.options.target_recall,
+        )
+    });
     // #512 invariant tripwire: no re-encode in this drain may saturate its
     // destination quantizer — cosine rows are unit (ingest-normalized) so
     // the fixed grid covers them, and data-derived grids are built to cover
@@ -7139,7 +7184,8 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // this scan measures. A drain that commits between the scan and the
     // stamp adds rows this evidence never saw.
     let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
-    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
+    let mut cal =
+        opann::WidthLawCalibration::new(clusters.dim as usize, metric, inner.options.target_recall);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
     // evenly spaced ordinals over the cell-ordered live-row enumeration —
     // the law's noise floor is set by evidence size, and any fixed stride
@@ -7883,6 +7929,30 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     Err(BuildError::Store(
         "slow vector-state refresh: write contention exhausted".into(),
     ))
+}
+
+/// Best-effort lease hand-back after a mutation drive failed part-way.
+///
+/// The WAL itself stays on storage: its per-target progress is the recovery
+/// cursor, and a sweep finishes what we started. Clearing our lease first is
+/// what lets that sweep act on its very next pass — a sweep that finds a
+/// still-live lease counts the WAL as held-by-peer and skips it, and sweeps
+/// only run when a handle opens, so "skip this pass" can mean the tombstones
+/// wait a long while for another one.
+///
+/// Every failure here is a no-op we can ignore: a lease already preempted or
+/// cleared surfaces `Preempted` / `LeaseMissing` (a peer owns the WAL now, so
+/// it is exactly as recoverable as we wanted), a lost CAS means somebody else
+/// just wrote the doc, and a storage error leaves the lease to expire on its
+/// own. Logged at debug because none of it is actionable.
+async fn release_mutation_lease(wal_store: &WalStore, wal_id: WalId, owner: SupertableHandleId) {
+    if let Err(e) = lease::try_release(wal_store, wal_id, owner).await {
+        debug!(
+            error = %e,
+            "supertable: could not hand back the WAL lease after a failed mutation; \
+             recovery picks the WAL up once the lease expires"
+        );
+    }
 }
 
 async fn record_hidden_deleted_ids(
@@ -8830,6 +8900,7 @@ mod tests {
         Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
     use figment::{
         Figment,
         providers::{Format, Yaml},
@@ -8845,8 +8916,16 @@ mod tests {
             fts::reader::BoolMode,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{SupertableOptions, handle::Supertable, storage::LocalFsStorageProvider},
-        test_helpers::default_tokenizer as tok,
+        supertable::{
+            SupertableOptions,
+            handle::Supertable,
+            storage::LocalFsStorageProvider,
+            wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
+        },
+        test_helpers::{
+            build_title_batch, default_supertable_options, default_tokenizer as tok,
+            fault_storage::{FaultKind, FaultOp, FaultStorage},
+        },
     };
 
     /// Small fixed vector dimension accepted by the vector builder.
@@ -10550,6 +10629,214 @@ supertable:
         assert_ne!(
             read_second, read_first,
             "object content actually changed between writes"
+        );
+    }
+
+    // ---- delete-WAL lease ownership ----------------------------------
+
+    /// WAL id for the delete-lease tests below. Fixed so the state-doc
+    /// path is predictable; nothing else writes this prefix here.
+    const DELETE_LEASE_WAL_ID: i128 = 0x0DE1_5EA5;
+    /// `_id` the seeded delete targets. No superfile claims it, so a sweep
+    /// that did drive this WAL would resolve it as `NotFound` and still
+    /// march the WAL to `Complete` — which is what the sweep assertions
+    /// below detect.
+    const DELETE_LEASE_TARGET_ID: i128 = 42;
+    /// Owner id of the peer running the recovery sweep. Distinct from the
+    /// writer handle's own id: `try_acquire` treats a same-owner lease as
+    /// a renewal, so only a foreign owner exercises the conflict path.
+    const DELETE_LEASE_PEER_OWNER: i128 = 0x0BAD_0BAD;
+
+    fn delete_lease_test_table(directory: &TempDir) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create")
+    }
+
+    fn delete_lease_test_entry() -> PendingDeleteEntry {
+        PendingDeleteEntry {
+            wal_id: WalId(DELETE_LEASE_WAL_ID),
+            target_ids: vec![DELETE_LEASE_TARGET_ID],
+        }
+    }
+
+    /// A delete's WAL state doc is born holding a live lease owned by the
+    /// handle that is about to drive it, and `created_at` + both lease
+    /// timestamps come from the single clock reading passed in.
+    #[test]
+    fn delete_wal_doc_is_born_leased_by_this_handle() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let writer = table.writer().expect("writer");
+
+        let now = Utc::now();
+        let doc = writer.delete_wal_doc(&delete_lease_test_entry(), now);
+
+        assert_eq!(doc.op_kind, OpKind::Delete);
+        assert_eq!(doc.state, WalState::Intent);
+        assert_eq!(
+            doc.created_at, now,
+            "created_at must come from the passed clock reading, not a second sample"
+        );
+        let lease = doc
+            .lease
+            .expect("a delete WAL must be born leased, not left unowned until a later acquire");
+        assert_eq!(
+            lease.owner,
+            table.handle_id(),
+            "the lease must name the handle that will drive the tombstone phase"
+        );
+        assert_eq!(
+            lease.acquired_at, now,
+            "acquired_at must share created_at's clock reading"
+        );
+        assert_eq!(
+            lease.expires_at,
+            now + ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+                .expect("default lease duration converts"),
+            "the lease must run a full default duration from the same reading"
+        );
+    }
+
+    /// Regression: a peer's recovery sweep must not take a delete WAL away
+    /// from the writer that just created it. The creating handle holds a
+    /// live lease from the moment the doc lands, so the sweep counts it as
+    /// held-by-peer and leaves the bytes alone. Before the lease was
+    /// stamped at create time the sweep drove the WAL to `Complete`, which
+    /// invalidated the writer's etag and turned an in-flight delete into a
+    /// partial-commit failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_sweep_skips_a_freshly_created_delete_wal() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let storage = table
+            .inner()
+            .options
+            .storage
+            .as_ref()
+            .expect("storage attached")
+            .clone();
+        let writer = table.writer().expect("writer");
+
+        // The doc as `drive_one_delete` writes it, at the point where the
+        // create has landed but the tombstone phase hasn't started.
+        let wal_store = WalStore::new(storage);
+        let doc = writer.delete_wal_doc(&delete_lease_test_entry(), Utc::now());
+        let etag_before = wal_store.create(&doc).await.expect("create wal state doc");
+
+        let report = scan_and_recover(
+            &table,
+            SupertableHandleId(DELETE_LEASE_PEER_OWNER),
+            DEFAULT_LEASE_DURATION,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(report.n_scanned, 1, "the sweep must see the seeded WAL");
+        assert_eq!(
+            report.n_held_by_peer, 1,
+            "the writer's live lease must fence the sweep off this WAL"
+        );
+        assert_eq!(
+            report.n_tombstone_only_completed, 0,
+            "the sweep must not drive a delete the writer is still holding"
+        );
+
+        let (after, etag_after) = wal_store
+            .read(WalId(DELETE_LEASE_WAL_ID))
+            .await
+            .expect("read back");
+        assert_eq!(
+            etag_after, etag_before,
+            "etag unchanged → the sweep never wrote the state doc"
+        );
+        assert_eq!(
+            after.state,
+            WalState::Intent,
+            "the WAL must still be waiting for its owner's tombstone phase"
+        );
+        assert_eq!(
+            after.lease.expect("lease survives the sweep").owner,
+            table.handle_id(),
+            "ownership must still sit with the creating handle"
+        );
+    }
+
+    /// Rule budget for the sidecar-CAS fault: comfortably above the
+    /// tombstone loop's own per-sidecar retry budget, so every attempt in
+    /// that loop loses its race and the phase gives up.
+    const DELETE_LEASE_SIDECAR_FAULTS: usize = 64;
+    /// Suffix of the per-superfile tombstone sidecars the delete path
+    /// CAS-writes. Faulting it leaves superfile, manifest, and WAL-state
+    /// writes alone — including the release this test is watching for.
+    const DELETE_LEASE_TOMBSTONES_SUFFIX: &str = ".tombstones";
+
+    /// A delete that fails part-way hands its lease back, so the next
+    /// recovery sweep can finish the WAL on its very first pass instead of
+    /// counting it held-by-peer and skipping until the lease expires. The
+    /// WAL itself must stay put — its per-target progress is the cursor
+    /// recovery resumes from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_delete_hands_back_its_wal_lease() {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+
+        // Resolve the predicate while storage is healthy, then break every
+        // sidecar CAS so the tombstone phase exhausts its retries.
+        writer
+            .delete(col("title").eq(lit("alpha")))
+            .expect("buffer delete");
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            DELETE_LEASE_TOMBSTONES_SUFFIX,
+            DELETE_LEASE_SIDECAR_FAULTS,
+        );
+        let err = writer
+            .commit()
+            .expect_err("a sidecar CAS that never lands must fail the delete");
+        assert!(
+            matches!(err, CommitError::PartialCommit { .. }),
+            "the failed delete must surface as a partial commit, got {err:?}"
+        );
+        assert!(
+            faults.fired() > 1,
+            "the failure must come from the injected sidecar faults, fired {}",
+            faults.fired()
+        );
+
+        // The WAL is still there for recovery, and it is unowned.
+        faults.clear();
+        let wal_store = WalStore::new(storage);
+        let wal_ids = wal_store.list_wal_ids().await.expect("list wal ids");
+        assert_eq!(
+            wal_ids.len(),
+            1,
+            "the failed delete must leave its WAL for recovery, found {wal_ids:?}"
+        );
+        let (doc, _etag) = wal_store.read(wal_ids[0]).await.expect("read wal doc");
+        assert_eq!(
+            doc.state,
+            WalState::Intent,
+            "the WAL must still be waiting for its tombstone phase"
+        );
+        assert!(
+            doc.lease.is_none(),
+            "a failed delete must release its lease so the next sweep can take \
+             the WAL immediately, still held by {:?}",
+            doc.lease
         );
     }
 }

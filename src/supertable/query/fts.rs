@@ -943,9 +943,32 @@ impl SupertableReader {
             .fts_tokenizer_for(column)
             .parse(query)
             .into_clauses(mode);
-        let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
-        let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
-        let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
+        // Drop repeated tokens within each clause role. Unranked
+        // matching is set-valued — an AND/OR/exclude over a term repeated
+        // in the query (e.g. `+to +be +or +not +to +be`) is idempotent —
+        // so a duplicate only adds a redundant cursor that intersects (or
+        // unions) a list with itself. Order-preserving so the rarest-first
+        // cursor ordering downstream is unaffected. Phrase members are
+        // *not* deduped: position matters there. (Count path only; the
+        // scored path must keep repeats, which can affect BM25.)
+        // Linear dedup, not a HashSet: clause token lists are tiny (a
+        // handful of terms), so an O(n²) scan over the already-kept
+        // tokens is cheaper than allocating a set + hashing, and — unlike
+        // the set — it adds no per-query allocation on the overwhelmingly
+        // common no-duplicate query. Order-preserving; only the first
+        // occurrence's `String` is materialized.
+        let dedup = |tokens: Vec<Cow<'_, str>>| -> Vec<String> {
+            let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                if !out.iter().any(|k| k.as_str() == t.as_ref()) {
+                    out.push(t.into_owned());
+                }
+            }
+            out
+        };
+        let musts: Vec<String> = dedup(clauses.musts);
+        let shoulds: Vec<String> = dedup(clauses.shoulds);
+        let negatives: Vec<String> = dedup(clauses.negatives);
         let own_phrases = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
             phrases
                 .into_iter()
@@ -1173,11 +1196,13 @@ impl SupertableReader {
                     };
                     let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                     // Negated terms or deletes both force materialization:
-                    // the df read and the bare match count can't subtract
-                    // excluded or tombstoned docs. Materialize the positive
-                    // matches, then drop any doc carrying a negated term
-                    // (union of the negatives) or a tombstone.
-                    if has_negatives || tomb.is_some() {
+                    // Deletes force materialization: a tombstone bitmap can
+                    // only be subtracted from an explicit id set, so when this
+                    // superfile has deletes we materialize the positive matches
+                    // and drop any doc carrying a negated term (union of the
+                    // negatives) or a tombstone. Negation *without* deletes
+                    // takes the skip-based counting path below instead.
+                    if tomb.is_some() {
                         let (docs, mut work) = match phrase_involved {
                             true => r
                                 .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
@@ -1224,19 +1249,35 @@ impl SupertableReader {
                             .count() as u64;
                         return Ok::<u64, QueryError>(n);
                     }
-                    // No negatives and no deletes (the common case): count
-                    // without materializing ids — a single token resolves
-                    // O(1) from the stored df, multi-token tallies the
-                    // match walk through the counting sink.
-                    let (n, work) = if single_term {
+                    // No deletes (the common case): count without
+                    // materializing ids.
+                    let (n, work) = if has_negatives {
+                        // Negation, delete-free: walk the positive atoms and
+                        // skip-exclude the negated ones — the negated union is
+                        // never materialized. Covers term-only and phrase
+                        // positives alike.
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        r.atoms_match_count(
+                            &column_arc,
+                            &refs,
+                            &phrase_arc,
+                            match_mode,
+                            &neg_refs,
+                            &neg_ph_arc,
+                        )
+                        .await
+                        .map_err(fts_read_error)?
+                    } else if single_term {
+                        // A single token resolves O(1) from the stored df.
                         r.term_df(&column_arc, &term_arc[0])
                             .await
                             .map_err(fts_read_error)?
                     } else if phrase_involved {
-                        r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode)
+                        r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode, &[], &[])
                             .await
                             .map_err(fts_read_error)?
                     } else {
+                        // Multi-token AND/OR tallies through the counting sink.
                         r.token_match_count(&column_arc, &refs, match_mode)
                             .await
                             .map_err(fts_read_error)?

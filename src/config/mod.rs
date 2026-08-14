@@ -449,6 +449,20 @@ pub struct VectorSettings {
     /// the manifest overrides it. Pairs with [`Self::fine_nprobe_pct`]
     /// as `max(floor, floor(pct × clusters))`.
     pub fine_nprobe_floor: usize,
+    /// Recall the drain calibration targets when it stamps this table's
+    /// probe laws — the recall/latency lever. The width crossing takes
+    /// this value directly and the depth stages take a padded form of
+    /// it (see `supertable::opann`), so lowering it narrows width,
+    /// depth and the rerank budget together.
+    ///
+    /// Measured on Cohere-10M (768d cosine, 1K official queries):
+    /// 0.99 → recall@10 0.9972 / p50 19.4 ms; 0.993 → 0.9959 / 16.1 ms;
+    /// 0.93 → 0.9693 / 8.4 ms; 0.90 → 0.9577 / 8.4 ms. Serving recall
+    /// runs ABOVE the target (the crossings are discrete, so the
+    /// smallest width or depth that clears the bar usually overshoots
+    /// it), and below ~0.93 the k=10 latency stops responding — the
+    /// remaining cost is per-cell and per-query overhead, not rows.
+    pub target_recall: f64,
     /// Proportional fine-probe fraction for UNFILTERED vector search:
     /// probe `floor(pct × the cell's fine-cluster count)` so depth scales
     /// with cell size. `0.0` (the default) turns the proportional depth
@@ -515,11 +529,6 @@ pub struct VectorSettings {
     /// bounded by `hnsw_max_docs`. The upper-layer degree stays fixed (cheap) —
     /// only the base layer moves recall.
     pub hnsw_m0: usize,
-    /// Recall/latency operating point for vector search — the bar the
-    /// acceptance gates (ivf stamping, and the hnsw graph calibrator) cross
-    /// at. One value per table, engine-agnostic: the graph aims to hit it
-    /// faster than ivf, else ivf serves it.
-    pub target_recall: f64,
     /// Recall shortfall below `target_recall` the hnsw graph is still accepted
     /// at before the drain gives up and serves ivf (`floor = target - this`).
     pub hnsw_recall_slack: f64,
@@ -599,6 +608,7 @@ impl Default for VectorSettings {
         Self {
             inner_budget: None,
             fine_nprobe_floor: DEFAULT_VECTOR_FINE_NPROBE_FLOOR,
+            target_recall: DEFAULT_VECTOR_TARGET_RECALL,
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
@@ -611,7 +621,6 @@ impl Default for VectorSettings {
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
-            target_recall: DEFAULT_VECTOR_TARGET_RECALL,
             hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,

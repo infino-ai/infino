@@ -15,7 +15,8 @@ use std::collections::HashSet;
 use infino::superfile::{SuperfileReader, fts::reader::BoolMode};
 
 use crate::fts::brute_force_oracle::{
-    build_infino_superfile, build_multi_block_corpus, build_multi_block_reader, corpus,
+    build_infino_superfile, build_infino_superfile_positional, build_multi_block_corpus,
+    build_multi_block_reader, corpus,
 };
 
 // ── corpus-truth helpers ──────────────────────────────────────────────
@@ -52,6 +53,22 @@ fn exclude(base: HashSet<u64>, corp: &[(u64, &str)], negatives: &[&str]) -> Hash
     base.difference(&drop).copied().collect()
 }
 
+/// Doc-ids whose text contains `phrase` as a contiguous, in-order token run.
+fn docs_with_phrase(corp: &[(u64, &str)], phrase: &[&str]) -> HashSet<u64> {
+    corp.iter()
+        .filter(|(_, t)| {
+            let toks: Vec<&str> = t.split_whitespace().collect();
+            toks.windows(phrase.len()).any(|w| w == phrase)
+        })
+        .map(|(i, _)| *i)
+        .collect()
+}
+
+/// A phrase as the `&[Vec<String>]` the count/search API expects.
+fn phrase(tokens: &[&str]) -> Vec<Vec<String>> {
+    vec![tokens.iter().map(|t| t.to_string()).collect()]
+}
+
 /// Run a query and collect the result doc-ids as a set.
 async fn search_set(
     reader: &SuperfileReader,
@@ -83,6 +100,97 @@ async fn or_single_positive_minus_negative() {
     let got = search_set(&r, "rust -async", K_ALL, BoolMode::Or).await;
     let want = exclude(or_match(&corp, &["rust"]), &corp, &["async"]);
     assert_eq!(got, want, "rust -async (OR)");
+}
+
+/// Count with negation goes through the skip-based exclusion path
+/// (`atoms_match_count` with negated atoms) rather than materializing the
+/// negated union. Pin it against corpus truth for OR and AND positives
+/// with single and multiple negatives.
+#[tokio::test]
+async fn count_with_negation_matches_corpus_truth() {
+    let corp = corpus();
+    // Positional index so the phrase cases below can run; term-only counts
+    // are identical on a positional index.
+    let r = build_infino_superfile_positional(&corp);
+    async fn count(r: &SuperfileReader, pos: &[&str], mode: BoolMode, neg: &[&str]) -> u64 {
+        r.atoms_match_count("title", pos, &[], mode, neg, &[])
+            .await
+            .expect("atoms_match_count")
+            .0
+    }
+    // OR positive, one negative.
+    assert_eq!(
+        count(&r, &["rust"], BoolMode::Or, &["async"]).await,
+        exclude(or_match(&corp, &["rust"]), &corp, &["async"]).len() as u64,
+        "rust -async (OR count)"
+    );
+    // OR positive, multiple negatives.
+    assert_eq!(
+        count(&r, &["rust", "python"], BoolMode::Or, &["async", "web"]).await,
+        exclude(
+            or_match(&corp, &["rust", "python"]),
+            &corp,
+            &["async", "web"]
+        )
+        .len() as u64,
+        "rust python -async -web (OR count)"
+    );
+    // AND positive, one negative.
+    assert_eq!(
+        count(&r, &["rust", "web"], BoolMode::And, &["async"]).await,
+        exclude(and_match(&corp, &["rust", "web"]), &corp, &["async"]).len() as u64,
+        "+rust +web -async (AND count)"
+    );
+    // No negatives ⇒ identical to the plain match count (the `None`-filter walk).
+    assert_eq!(
+        count(&r, &["rust"], BoolMode::Or, &[]).await,
+        or_match(&corp, &["rust"]).len() as u64,
+        "rust (OR count, no negation)"
+    );
+
+    // Positive phrase + negated term: +"web framework" -go. Docs with the
+    // adjacent phrase, minus docs containing "go" (drops doc 7, keeps 8).
+    let got = r
+        .atoms_match_count(
+            "title",
+            &[],
+            &phrase(&["web", "framework"]),
+            BoolMode::And,
+            &["go"],
+            &[],
+        )
+        .await
+        .expect("atoms_match_count")
+        .0;
+    let want = exclude(
+        docs_with_phrase(&corp, &["web", "framework"]),
+        &corp,
+        &["go"],
+    );
+    assert_eq!(
+        got,
+        want.len() as u64,
+        "+\"web framework\" -go (phrase + neg term)"
+    );
+
+    // Negated phrase: web -"web framework". Docs with "web", minus docs where
+    // it is the adjacent phrase — keeps doc 4 ("web" but not "web framework").
+    let got = r
+        .atoms_match_count(
+            "title",
+            &["web"],
+            &[],
+            BoolMode::Or,
+            &[],
+            &phrase(&["web", "framework"]),
+        )
+        .await
+        .expect("atoms_match_count")
+        .0;
+    let base = docs_with(&corp, "web");
+    let drop = docs_with_phrase(&corp, &["web", "framework"]);
+    let want = base.difference(&drop).count() as u64;
+    assert_eq!(got, want, "web -\"web framework\" (term + neg phrase)");
 }
 
 #[tokio::test]
@@ -291,4 +399,148 @@ async fn negation_with_multi_block_negated_list() {
         .filter(|d| d % 3 == 0 && d % 4 != 0)
         .collect();
     assert_eq!(got, want, "alpha minus beta over multi-block postings");
+}
+
+// ── negation over a dense (bitset-encoded) corpus ─────────────────────
+
+/// A few-thousand-doc corpus where the common terms and the phrase members are
+/// stored as BITSET blocks and the phrase AND is two-phase. `the`/`who` are in
+/// every doc (not adjacent); `"the who"` is planted on every 13th doc, `uk` on
+/// every 40th, `even` on every 2nd (a dense negation target), `tri` on every
+/// 3rd. Truth comes from the whitespace-token helpers, independent of the reader.
+fn dense_negation_corpus() -> Vec<(u64, String)> {
+    const N: u64 = 2600;
+    (0..N)
+        .map(|d| {
+            let mut s = format!("who a{d} the b{d}");
+            if d.is_multiple_of(13) {
+                s = format!("the who {s}");
+            }
+            if d.is_multiple_of(40) {
+                s.push_str(" uk");
+            }
+            if d.is_multiple_of(2) {
+                s.push_str(" even");
+            }
+            if d.is_multiple_of(3) {
+                s.push_str(" tri");
+            }
+            (d, s)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn count_negation_over_dense_bitset_corpus() {
+    // Negation composes with the bitset count kernels and the two-phase phrase
+    // AND through the skip-probe exclude filter. Pin that a -term and a
+    // -"phrase" still exclude exactly, at a scale where the positives, the
+    // negatives, and the phrase members are all bitset-encoded.
+    let owned = dense_negation_corpus();
+    let corp: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&corp);
+
+    async fn cnt(
+        r: &SuperfileReader,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Vec<String>],
+    ) -> u64 {
+        r.atoms_match_count("title", terms, phrases, mode, neg_terms, neg_phrases)
+            .await
+            .expect("atoms_match_count")
+            .0
+    }
+
+    let who_phrase = docs_with_phrase(&corp, &["the", "who"]);
+    let uk = docs_with(&corp, "uk");
+
+    // -term over a bitset negated list: +the -even ⇒ the odd docs.
+    let exp = exclude(docs_with(&corp, "the"), &corp, &["even"]);
+    assert_eq!(
+        cnt(&r, &["the"], &[], BoolMode::And, &["even"], &[]).await,
+        exp.len() as u64,
+        "the -even"
+    );
+
+    // Multiple negatives (bitset + packed): +the -even -tri.
+    let exp = exclude(docs_with(&corp, "the"), &corp, &["even", "tri"]);
+    assert_eq!(
+        cnt(&r, &["the"], &[], BoolMode::And, &["even", "tri"], &[]).await,
+        exp.len() as u64,
+        "the -even -tri"
+    );
+
+    // -"phrase" with bitset members: +uk -"the who".
+    let exp: HashSet<u64> = uk.difference(&who_phrase).copied().collect();
+    assert_eq!(
+        cnt(
+            &r,
+            &["uk"],
+            &[],
+            BoolMode::And,
+            &[],
+            &phrase(&["the", "who"])
+        )
+        .await,
+        exp.len() as u64,
+        "uk -\"the who\""
+    );
+
+    // Two-phase phrase AND minus a bitset term: +"the who" +uk -even.
+    let phrase_and_uk: HashSet<u64> = who_phrase.intersection(&uk).copied().collect();
+    let exp = exclude(phrase_and_uk, &corp, &["even"]);
+    assert_eq!(
+        cnt(
+            &r,
+            &["uk"],
+            &phrase(&["the", "who"]),
+            BoolMode::And,
+            &["even"],
+            &[]
+        )
+        .await,
+        exp.len() as u64,
+        "+\"the who\" +uk -even"
+    );
+
+    // OR positives minus the phrase: the who -"the who".
+    let exp: HashSet<u64> = or_match(&corp, &["the", "who"])
+        .difference(&who_phrase)
+        .copied()
+        .collect();
+    assert_eq!(
+        cnt(
+            &r,
+            &["the", "who"],
+            &[],
+            BoolMode::Or,
+            &[],
+            &phrase(&["the", "who"])
+        )
+        .await,
+        exp.len() as u64,
+        "the who -\"the who\""
+    );
+}
+
+#[tokio::test]
+async fn search_negation_with_phrase_over_dense_bitset_corpus() {
+    // The scored path with a negated clause over bitset-encoded phrase members.
+    // A narrow positive (`+"the who" +uk`, a handful of docs) keeps the result
+    // set below `k`, so top-k truncation can't hide a disagreement.
+    let owned = dense_negation_corpus();
+    let corp: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&corp);
+
+    let got = search_set(&r, r#"+"the who" +uk -tri"#, K_ALL, BoolMode::And).await;
+    let phrase_and_uk: HashSet<u64> = docs_with_phrase(&corp, &["the", "who"])
+        .intersection(&docs_with(&corp, "uk"))
+        .copied()
+        .collect();
+    let want = exclude(phrase_and_uk, &corp, &["tri"]);
+    assert!(!want.is_empty(), "corpus must plant some matches");
+    assert_eq!(got, want, "+\"the who\" +uk -tri (scored, dense/bitset)");
 }

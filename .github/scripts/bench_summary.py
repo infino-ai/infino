@@ -9,6 +9,7 @@ Inputs (env):
   BASELINE_DIR               dir holding <report>.json from the base-ref baseline
   CURRENT_DIR                dir holding <report>.json from this run
   BENCH_NOISE_THRESHOLD_PCT  threshold in percent (default 5)
+  GATE_FILE                  merge-gate verdict destination (default /tmp/bench-gate.status)
   OUT_FILE                   markdown destination (default /tmp/ai-summary.md)
   BENCH_LABEL                human label for the run (the `bench` input)
   BENCH_VM_SIZE              VM size label for context
@@ -58,6 +59,17 @@ MIN_LATENCY_DELTA_NS = 100_000.0
 
 DEFAULT_OUT = "/tmp/ai-summary.md"
 DEFAULT_THRESHOLD = 5.0
+DEFAULT_GATE_FILE = "/tmp/bench-gate.status"
+
+# Merge-blocking gate: a time-valued metric (warm/cold latency, ingest /
+# drain / optimize wall) must be worse than the main baseline by BOTH of
+# these to block the merge. The AND is the noise guard: a big percent of a
+# sub-millisecond metric never blocks, and neither does a small-percent
+# wiggle on a long wall. The 5% advisory tiers above stay as REPORTING
+# thresholds only; this pair is the sole blocking criterion (enforced by
+# the workflow's "Enforce benchmark merge gate" step reading GATE_FILE).
+GATE_REL_PCT = 50.0
+GATE_ABS_NS = 5_000_000.0
 
 
 def is_text_only(header):
@@ -131,9 +143,13 @@ def load(path):
 def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
     """Classify changes per report.
 
-    Returns (regressions, improvements, had_baseline, cost_present).
+    Returns (regressions, improvements, blocking, had_baseline, cost_present).
+
+    `regressions` / `improvements` are the advisory findings (the 5%/30%
+    tier thresholds — report-only). `blocking` is the merge gate: time
+    metrics worse than baseline by BOTH >GATE_REL_PCT and >GATE_ABS_NS.
     """
-    regressions, improvements = [], []
+    regressions, improvements, blocking = [], [], []
     had_baseline = False
     cost_present = False
     for report in reports:
@@ -153,12 +169,29 @@ def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
                 cost_present = True
                 continue
             t = tier(header, primary_headers)
-            if t is None:
-                continue
             old = base.get(key)
             if old is None or old == 0.0:
                 continue
             had_baseline = True
+            # Merge-blocking gate: every time-valued lower-is-better metric
+            # is eligible regardless of advisory tier, so optimize/drain
+            # walls and every latency row are covered.
+            if is_latency(header):
+                delta_ns = new - old
+                gate_pct = delta_ns / old * 100.0
+                if delta_ns > GATE_ABS_NS and gate_pct > GATE_REL_PCT:
+                    blocking.append(
+                        {
+                            "subsystem": subsystem,
+                            "area": area,
+                            "metric": f"{label} / {header}".strip(" /"),
+                            "change": f"{human(header, old)} -> {human(header, new)}",
+                            "pct": round(gate_pct, 1),
+                            "tier": "blocking",
+                        }
+                    )
+            if t is None:
+                continue
             if is_latency(header):
                 if max(abs(old), abs(new)) < MIN_LATENCY_NS:
                     continue
@@ -180,7 +213,8 @@ def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
             (improvements if improved else regressions).append(entry)
     regressions.sort(key=lambda e: -abs(e["pct"]))
     improvements.sort(key=lambda e: -abs(e["pct"]))
-    return regressions, improvements, had_baseline, cost_present
+    blocking.sort(key=lambda e: -abs(e["pct"]))
+    return regressions, improvements, blocking, had_baseline, cost_present
 
 
 def finding(entry):
@@ -203,14 +237,16 @@ def main():
         primary_latency_header_from_gate_metric(bench_gate_metric),
         "time",
         "stored",
+        "wall",
     )
     try:
         threshold = float(os.environ.get("BENCH_NOISE_THRESHOLD_PCT", DEFAULT_THRESHOLD))
     except ValueError:
         threshold = DEFAULT_THRESHOLD
 
+    gate_file = os.environ.get("GATE_FILE", DEFAULT_GATE_FILE)
     failures = [ln.strip() for ln in os.environ.get("ERRORS", "").splitlines() if ln.strip()]
-    regressions, improvements, had_baseline, cost_present = diff(
+    regressions, improvements, blocking, had_baseline, cost_present = diff(
         reports, baseline_dir, current_dir, threshold, primary_headers
     )
 
@@ -218,7 +254,7 @@ def main():
     prim_impr = [e for e in improvements if e["tier"] == "primary"]
     secondary_present = any(e["tier"] == "secondary" for e in regressions + improvements)
 
-    if failures or prim_regr:
+    if failures or blocking:
         status = "FAIL"
     else:
         status = "PASS"
@@ -226,7 +262,11 @@ def main():
     counts = f"{len(prim_regr)} regressions · {len(prim_impr)} improvements"
     parts = [f"## Benchmark Summary (A/B vs {base_ref})", ""]
     parts.append(f"Status: {status}")
-    parts.append(f"Primary Gate: {counts}, threshold ±{threshold:g}%")
+    parts.append(
+        f"Merge Gate (blocking): {len(blocking)} regressions past "
+        f">{GATE_REL_PCT:g}% AND >{GATE_ABS_NS / 1e6:g} ms vs {base_ref}"
+    )
+    parts.append(f"Advisory findings: {counts}, threshold ±{threshold:g}% (report-only)")
     parts.append(
         f"Run Context: bench={label} vm={vm_size} region={location} cpuset={cpuset or 'auto'}"
     )
@@ -234,6 +274,12 @@ def main():
 
     if failures:
         parts += ["### Failures", "```", "\n".join(failures[:20]), "```", ""]
+
+    if blocking:
+        # Never truncate merge-blocking signals.
+        parts += ["### Blocking Regressions (merge gate)", ""]
+        parts.extend(finding(e) for e in blocking)
+        parts.append("")
 
     if not failures and not had_baseline:
         parts += [f"_No {base_ref} baseline to diff against (first run or new config)._", ""]
@@ -253,18 +299,23 @@ def main():
             parts.append("")
 
     parts.append("### Decision")
-    if failures or prim_regr:
+    if failures or blocking:
         parts.append("- Merge Gate: FAIL")
-        if prim_regr:
-            parts.append("- Reason: Primary regressions above threshold.")
+        if blocking:
+            parts.append(
+                f"- Reason: time metrics worse than {base_ref} by both "
+                f">{GATE_REL_PCT:g}% and >{GATE_ABS_NS / 1e6:g} ms."
+            )
         else:
             parts.append("- Reason: Benchmark run reported failures.")
     else:
         parts.append("- Merge Gate: PASS")
-        if prim_impr:
-            parts.append("- Reason: No primary regressions; primary improvements observed.")
+        if prim_regr:
+            parts.append(
+                "- Reason: advisory regressions only — none past the blocking pair."
+            )
         else:
-            parts.append("- Reason: No primary regressions above threshold.")
+            parts.append("- Reason: No blocking regressions.")
     parts.append("")
 
     parts.append("### Actions")
@@ -297,9 +348,21 @@ def main():
     with open(out_file, "w", encoding="utf-8") as fh:
         fh.write(body)
 
+    # The enforcement step reads this verdict; FAIL lines carry the reasons.
+    with open(gate_file, "w", encoding="utf-8") as fh:
+        if failures or blocking:
+            fh.write("FAIL\n")
+            for ln in failures[:20]:
+                fh.write(f"failure: {ln}\n")
+            for e in blocking:
+                fh.write(f"{e['metric']}: {e['change']} ({e['pct']:+.0f}%)\n")
+        else:
+            fh.write("PASS\n")
+
     print(
-        f"wrote {out_file}: {len(regressions)} regressions, {len(improvements)} improvements, "
-        f"{len(failures)} failure line(s), baseline={'yes' if had_baseline else 'no'}"
+        f"wrote {out_file}: {len(blocking)} blocking, {len(regressions)} advisory regressions, "
+        f"{len(improvements)} improvements, {len(failures)} failure line(s), "
+        f"baseline={'yes' if had_baseline else 'no'}"
     )
 
 

@@ -616,6 +616,28 @@ jobs:
           ERRORS="$(cat /tmp/bench.errors 2>/dev/null || true)" \
             python3 .github/scripts/bench_summary.py
 
+      # Enforce the merge-blocking benchmark gate: a time metric worse than
+      # the same-host main baseline by BOTH >50% and >5 ms fails this job
+      # (bench_summary.py writes the verdict; the 5% findings stay advisory).
+      # A separate step so the summary still posts to the PR on FAIL.
+      - name: Enforce benchmark merge gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          STATUS_FILE=/tmp/bench-gate.status
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo "no gate verdict produced (no baseline or summary skipped) — pass"
+            exit 0
+          fi
+          if head -1 "$STATUS_FILE" | grep -q '^FAIL'; then
+            echo "::error::benchmark merge gate FAILED (>50% AND >5ms vs main):"
+            tail -n +2 "$STATUS_FILE" | while IFS= read -r line; do
+              echo "::error::  $line"
+            done
+            exit 1
+          fi
+          echo "benchmark merge gate: pass"
+
       - name: Publish benchmark summary to run summary
         if: ${{ !cancelled() && inputs.summary_destination == 'step_summary' }}
         run: |

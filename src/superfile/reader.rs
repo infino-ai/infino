@@ -1071,18 +1071,25 @@ impl SuperfileReader {
     }
 
     /// Phrase-aware unranked match **count** — the phrase sibling of
-    /// [`token_match_count`](Self::token_match_count).
+    /// [`token_match_count`](Self::token_match_count). `neg_terms` /
+    /// `neg_phrases` are counted as a skip-based exclusion gate (a doc
+    /// matching any negated clause is not counted); pass empty slices for
+    /// an unnegated count.
     pub async fn atoms_match_count(
         &self,
         column: &str,
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Vec<String>],
     ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.atoms_match_count(column, terms, phrases, mode).await?)
+        Ok(fts
+            .atoms_match_count(column, terms, phrases, mode, neg_terms, neg_phrases)
+            .await?)
     }
 
     /// Document frequency of `token` in `column` (0 if absent) — a cheap

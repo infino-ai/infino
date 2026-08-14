@@ -1311,7 +1311,15 @@ fn emit_transitions_with(
                     let io = transition.io;
                     vec![
                         text(transition.label),
-                        text(fmt_time(transition.wall_ns)),
+                        // Numeric so the CI delta layer can diff and GATE
+                        // transition walls (drain / optimize) against main —
+                        // as text they never reach the report JSON and an
+                        // optimize regression is invisible to the A/B.
+                        metric(
+                            transition.wall_ns,
+                            fmt_time(transition.wall_ns),
+                            Better::Lower,
+                        ),
                         text(
                             io.map(|value| value.put_count.to_string())
                                 .unwrap_or_else(|| "NOT METERED".into()),

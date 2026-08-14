@@ -59,7 +59,7 @@ use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 use arrow::ipc::reader::StreamReader;
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use roaring::RoaringBitmap;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -889,6 +889,51 @@ const SEALED_RETRY_CAP_MS: u64 = 30_000;
 /// rather than overflowing on a high attempt count.
 const SEALED_RETRY_MAX_SHIFT: u32 = 8;
 
+/// The lease span the current driver was granted, or `None` when the WAL
+/// carries no lease. Read once per phase, before any renewal moves
+/// `expires_at`.
+fn granted_lease_span(doc: &WalStateDoc) -> Option<ChronoDuration> {
+    doc.lease
+        .as_ref()
+        .map(|lease| lease.expires_at - lease.acquired_at)
+}
+
+/// Push the WAL's lease expiry out one full span from now, in the caller's
+/// in-memory doc, so the next state-doc write carries a fresh lease.
+///
+/// The tombstone phase can easily outlive a single lease grant: the
+/// per-target loop is sequential and spends three storage round trips per
+/// target, so a delete of a few thousand rows runs well past the default
+/// 60 s. Without renewal the lease lapses mid-phase, a recovery sweep
+/// preempts, and the driver's next CAS fails — losing the phase (and, for a
+/// writer-driven delete, the caller's whole `commit`) after the work had
+/// already landed.
+///
+/// Renewal rides on writes the phase is making anyway: no extra round trip,
+/// and — unlike a background heartbeat task — no second writer racing the
+/// `etag_cur` chain. A heartbeat's own CAS would invalidate the driver's
+/// etag and break the very phase it was meant to protect.
+///
+/// Tying the expiry to writes ties it to observable forward progress: a
+/// wedged driver stops landing writes, its lease lapses, and recovery takes
+/// the WAL over — the same outcome the heartbeat's stuck-worker check exists
+/// to produce. A driver parked in the sealed-sidecar backoff below is
+/// therefore preemptible, which is deliberate: that wait is unbounded from
+/// the lease's point of view and a peer deserves the chance to try.
+///
+/// `span` comes from [`granted_lease_span`], so whoever took the lease keeps
+/// the duration they chose — a writer stamping its default at create time, or
+/// a sweep passing its own `lease_duration`.
+///
+/// `acquired_at` stays put: it records when ownership began, which renewal
+/// doesn't change. That matches `lease::try_heartbeat`, which also moves only
+/// `expires_at`.
+fn renew_lease(doc: &mut WalStateDoc, span: Option<ChronoDuration>, now: DateTime<Utc>) {
+    if let (Some(lease), Some(span)) = (doc.lease.as_mut(), span) {
+        lease.expires_at = now + span;
+    }
+}
+
 /// The non-idempotent fast path for the tombstone loop. For each
 /// `Pending` target in `wal_doc.tombstone_progress`: resolve →
 /// CAS-PUT the bit → CAS-update the WAL state doc. Once every
@@ -913,6 +958,10 @@ async fn do_tombstone_apply(
 
     let mut wal_cur = wal_doc.clone();
     let mut etag_cur = wal_etag.clone();
+    // Sampled before the loop starts moving `expires_at`: deriving the
+    // span per write would compound it, since each renewal would measure
+    // from the original `acquired_at` and hand back elapsed + span.
+    let lease_span = granted_lease_span(&wal_cur);
 
     // Per-target loop. A `Pending` entry walks through resolve
     // + sidecar-CAS + per-target WAL state CAS; anything else
@@ -931,6 +980,7 @@ async fn do_tombstone_apply(
         // Per-target WAL state CAS. We persist after each
         // target so recovery has a fresh cursor and a crash
         // never wastes more than one target's work.
+        renew_lease(&mut wal_cur, lease_span, Utc::now());
         etag_cur = wal_store
             .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
             .await?;
@@ -962,8 +1012,11 @@ async fn do_tombstone_apply(
     // WAL itself to Complete. One CAS — if it loses, the
     // caller's recovery loop picks up at the now-no-op
     // tombstone scan above (everything's already non-Pending)
-    // and re-attempts the final advance.
+    // and re-attempts the final advance. The manifest stamp
+    // above can take a while, so this write gets a fresh lease
+    // too: it is the one whose loss wastes the whole phase.
     wal_cur.state = WalState::Complete;
+    renew_lease(&mut wal_cur, lease_span, Utc::now());
     etag_cur = wal_store
         .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
         .await?;
@@ -1268,8 +1321,8 @@ mod tests {
             manifest::ManifestSnapshot,
             wal::{
                 state_doc::{
-                    OpKind, RowId, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome,
-                    WalId, WalState,
+                    Lease, OpKind, RowId, SCHEMA_VERSION, SealRecord, SupertableHandleId,
+                    TombstoneEntry, TombstoneOutcome, WalId, WalState,
                 },
                 tombstones_codec::TombstonesSidecar,
             },
@@ -2107,6 +2160,170 @@ mod tests {
         let bitmap = read_sidecar_bitmap(&ws, sf_id).await;
         assert_eq!(bitmap.len(), 1);
         assert!(bitmap.contains(1u32));
+    }
+
+    // ---- lease renewal across the tombstone phase --------------------
+
+    /// Lease span the renewal tests grant. Deliberately far shorter than
+    /// the phase itself would need, so an un-renewed lease would be long
+    /// expired by the time the phase finishes.
+    const LEASE_RENEWAL_SPAN_MS: i64 = 50;
+    /// Owner of the seeded lease: stands in for the writer handle that
+    /// created the WAL and is driving it.
+    const LEASE_RENEWAL_OWNER: i128 = 0x0D12_1E55;
+
+    /// Seed a DELETE WAL that is already leased, the way a writer's create
+    /// stamps one before it drives the tombstone phase.
+    async fn create_leased_delete_wal(
+        ws: &WalStore,
+        wal_id_value: i128,
+        target_ids: &[i128],
+        span: ChronoDuration,
+    ) -> (WalStateDoc, Etag) {
+        let (mut wal, etag) = create_delete_wal(ws, wal_id_value, target_ids).await;
+        let now = Utc::now();
+        wal.lease = Some(Lease {
+            owner: SupertableHandleId(LEASE_RENEWAL_OWNER),
+            acquired_at: now,
+            expires_at: now + span,
+        });
+        let etag = ws
+            .update_with_etag(wal.wal_id, &etag, &wal)
+            .await
+            .expect("stamp lease");
+        (wal, etag)
+    }
+
+    /// The phase pushes the driver's lease expiry out on the state-doc
+    /// writes it is already making, so a phase that runs longer than one
+    /// lease grant can't be preempted out from under its driver. Ownership
+    /// is untouched, and the renewal reaches storage — not just the
+    /// in-memory copy the phase returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tombstone_phase_renews_the_drivers_lease_as_it_writes() {
+        let (_dir, st, ws, _sf_id, id_min, _id_max) =
+            published_superfile_fixture(&["aa", "bb", "cc"], 60_000).await;
+        let span = ChronoDuration::milliseconds(LEASE_RENEWAL_SPAN_MS);
+        let (wal, etag) =
+            create_leased_delete_wal(&ws, 260, &[id_min, id_min + 1, id_min + 2], span).await;
+        let granted = wal.lease.clone().expect("seeded lease");
+
+        let (outcome, new_wal, _) = run_tombstone_phase(&st, &ws, &wal, &etag)
+            .await
+            .expect("phase ok");
+        assert_eq!(
+            outcome,
+            TombstonePhaseOutcome::Applied {
+                n_tombstoned: 3,
+                n_not_found: 0,
+            }
+        );
+
+        let renewed = new_wal.lease.expect("the phase must not drop the lease");
+        assert_eq!(
+            renewed.owner, granted.owner,
+            "renewal must not change who owns the WAL"
+        );
+        assert_eq!(
+            renewed.acquired_at, granted.acquired_at,
+            "renewal moves the expiry, not the moment ownership began"
+        );
+        assert!(
+            renewed.expires_at > granted.expires_at,
+            "the phase's own writes must push the expiry out, granted {} still at {}",
+            granted.expires_at,
+            renewed.expires_at
+        );
+
+        let (persisted, _) = ws.read(wal.wal_id).await.expect("read back");
+        assert_eq!(
+            persisted
+                .lease
+                .expect("persisted doc must carry the lease")
+                .expires_at,
+            renewed.expires_at,
+            "the renewal must ride along on the phase's state-doc write"
+        );
+    }
+
+    /// Each renewal is exactly one granted span past the write it rides
+    /// on. The span is sampled once per phase for this reason: re-deriving
+    /// it from the renewed doc (`expires_at - acquired_at`) compounds,
+    /// handing the driver an ever-wider window. This pins both halves —
+    /// the exact renewal arithmetic, and the compounding that sampling
+    /// per-write would produce.
+    #[test]
+    fn lease_renewal_is_one_span_from_the_write_it_rides_on() {
+        let t0 = Utc::now();
+        let span = ChronoDuration::seconds(60);
+        let mut doc = WalStateDoc {
+            wal_id: WalId(261),
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Delete,
+            state: WalState::Intent,
+            created_at: t0,
+            lease: Some(Lease {
+                owner: SupertableHandleId(LEASE_RENEWAL_OWNER),
+                acquired_at: t0,
+                expires_at: t0 + span,
+            }),
+            predicate_repr: "renewal arithmetic".into(),
+            target_ids: vec![RowId(1)],
+            new_row_count: None,
+            new_row_content_hash: None,
+            preallocated_superfile_id: None,
+            minted_id_spans: Vec::new(),
+            tombstone_progress: Vec::new(),
+        };
+
+        let granted = granted_lease_span(&doc).expect("leased doc has a span");
+        assert_eq!(granted, span, "the granted span is the acquirer's window");
+
+        renew_lease(&mut doc, Some(granted), t0 + ChronoDuration::seconds(30));
+        assert_eq!(
+            doc.lease.as_ref().expect("lease").expires_at,
+            t0 + ChronoDuration::seconds(90),
+            "a write at t+30s must own the WAL until t+90s"
+        );
+
+        renew_lease(&mut doc, Some(granted), t0 + ChronoDuration::seconds(70));
+        let lease = doc.lease.as_ref().expect("lease").clone();
+        assert_eq!(
+            lease.expires_at,
+            t0 + ChronoDuration::seconds(130),
+            "the next write must land one span out, not one span plus elapsed"
+        );
+        assert_eq!(lease.acquired_at, t0, "ownership start must not drift");
+
+        assert!(
+            granted_lease_span(&doc).expect("span") > granted,
+            "re-deriving the span mid-phase widens it — which is why the \
+             phase samples it once, before the first renewal"
+        );
+    }
+
+    /// A WAL nobody holds has nothing to renew: the phase must leave the
+    /// `None` alone rather than inventing an owner-less lease.
+    #[test]
+    fn lease_renewal_is_a_no_op_on_an_unleased_wal() {
+        let mut doc = WalStateDoc {
+            wal_id: WalId(262),
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Delete,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "unleased".into(),
+            target_ids: vec![RowId(1)],
+            new_row_count: None,
+            new_row_content_hash: None,
+            preallocated_superfile_id: None,
+            minted_id_spans: Vec::new(),
+            tombstone_progress: Vec::new(),
+        };
+        assert!(granted_lease_span(&doc).is_none());
+        renew_lease(&mut doc, None, Utc::now());
+        assert!(doc.lease.is_none(), "renewal must not mint a lease");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

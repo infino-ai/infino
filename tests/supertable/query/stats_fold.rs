@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Plan-shape and correctness gates for manifest-statistics aggregate
-//! folding.
+//! Plan-shape and correctness gates for manifest statistics.
 //!
 //! On a tombstone-free table, `COUNT(*)` / `MIN` / `MAX` must be
 //! answered from manifest statistics — the physical plan contains no
 //! scan node at all. With tombstones, `COUNT(*)` may still fold (the
 //! bitmap cardinalities are exact) but value-derived stats degrade to
 //! a real scan; results must stay correct either way.
+//!
+//! The same statistics reach the planner a second way, as the column
+//! bounds behind its row estimate for a filter. Bounds covering a type's
+//! entire domain are withheld there (see `spans_full_domain` in
+//! `supertable::query::provider`), so the last group below pins both
+//! halves of that: range filters on such a column return rows, and
+//! withholding the bounds does not cost the aggregate fold.
 
 #![deny(clippy::unwrap_used)]
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_array::{Array, Date32Array, Int64Array, LargeStringArray, RecordBatch};
+use arrow_array::{Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
@@ -25,6 +31,7 @@ use infino::{
     },
     test_helpers::{build_title_batch, default_supertable_options},
 };
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 
 /// Commits in the fold fixture — multiple segments so the statistics
@@ -362,4 +369,230 @@ fn temporal_fold_excludes_deleted_extremum() {
         scalar_date32(&st, "SELECT MAX(day) FROM supertable"),
         second_max_day
     );
+}
+
+/// One writer thread means one superfile per commit, so these fixtures
+/// control exactly which rows share a min/max range. The default pool
+/// shards a small batch across superfiles by row range, which would
+/// scatter the endpoints and make the fold depend on the host's core
+/// count.
+const FULL_DOMAIN_WRITER_THREADS: usize = 1;
+
+/// Row ids for the `UInt64` fixture, one per row, in append order.
+const U64_IDS: [i64; 5] = [1, 2, 3, 4, 5];
+/// The `u` column: both domain endpoints plus small and mid values, so a
+/// single superfile's min/max cover `0 ..= u64::MAX` exactly.
+const US: [u64; 5] = [0, 1, 1000, 1 << 63, u64::MAX];
+/// Mid-range literal for the `u` filters. Nowhere near the type's upper
+/// bound; only the column's committed range is.
+const SMALL_LITERAL: u64 = 1000;
+
+/// Row ids and `n` values for the split-domain `Int64` fixture. The first
+/// commit contributes the lower endpoint, the second the upper one, so
+/// neither superfile spans the domain on its own and only the fold does.
+const SPLIT_IDS_FIRST: [i64; 2] = [1, 2];
+const SPLIT_NS_FIRST: [i64; 2] = [i64::MIN, 5];
+const SPLIT_IDS_SECOND: [i64; 2] = [3, 4];
+const SPLIT_NS_SECOND: [i64; 2] = [10, i64::MAX];
+/// Threshold for the split-domain query, chosen so every superfile
+/// survives pruning: the first still holds `5`, the second only larger
+/// values. A threshold that pruned either would narrow the folded range
+/// and stop exercising the withholding at all.
+const SPLIT_THRESHOLD: i64 = 0;
+
+fn single_superfile_writer_pool() -> Arc<ThreadPool> {
+    Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(FULL_DOMAIN_WRITER_THREADS)
+            .build()
+            .expect("writer pool"),
+    )
+}
+
+/// Schema `(i: Int64, u: UInt64)`; `i` labels the row, `u` carries the
+/// values under test.
+fn options_full_domain_u64() -> SupertableOptions {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i", DataType::Int64, false),
+        Field::new("u", DataType::UInt64, false),
+    ]));
+    SupertableOptions::new(schema, vec![], vec![], None)
+        .expect("valid options")
+        .with_writer_pool(single_superfile_writer_pool())
+}
+
+/// Schema `(i: Int64, n: Int64)`, the signed counterpart of
+/// [`options_full_domain_u64`].
+fn options_split_domain_i64() -> SupertableOptions {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    SupertableOptions::new(schema, vec![], vec![], None)
+        .expect("valid options")
+        .with_writer_pool(single_superfile_writer_pool())
+}
+
+/// Single-superfile table over [`U64_IDS`] / [`US`]: one superfile holds
+/// both `UInt64` endpoints.
+fn full_domain_u64_table() -> Supertable {
+    let st = Supertable::create(options_full_domain_u64()).expect("create");
+    let schema = st.options().schema.clone();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(U64_IDS.to_vec())),
+            Arc::new(UInt64Array::from(US.to_vec())),
+        ],
+    )
+    .expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    st
+}
+
+/// Two-superfile table where each superfile holds one `Int64` endpoint,
+/// so only the fold across survivors spans the domain.
+fn split_domain_i64_table() -> Supertable {
+    let st = Supertable::create(options_split_domain_i64()).expect("create");
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    for (ids, ns) in [
+        (SPLIT_IDS_FIRST, SPLIT_NS_FIRST),
+        (SPLIT_IDS_SECOND, SPLIT_NS_SECOND),
+    ] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(ns.to_vec())),
+            ],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+    st
+}
+
+/// The `i` column of `sql`'s result, sorted, so assertions don't depend
+/// on fan-out order.
+fn select_ids(st: &Supertable, sql: &str) -> Vec<i64> {
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql(sql)
+        .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let idx = batch.schema().index_of("i").expect("i column");
+        let arr = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("i is Int64");
+        for r in 0..arr.len() {
+            if !arr.is_null(r) {
+                ids.push(arr.value(r));
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// Single-cell u64 result of an aggregate query.
+fn scalar_u64(st: &Supertable, sql: &str) -> u64 {
+    let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
+    let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("u64 result")
+        .value(0)
+}
+
+/// Every comparison shape over a whole-domain column returns the right
+/// rows. `=` and the boundary `>=` always worked, because they collapse
+/// the column's range to a single point and take a distinct-count path
+/// that never divides; they are here so a change to the withholding rule
+/// can't quietly break the side that was fine.
+#[test]
+fn full_domain_column_answers_every_comparison_shape() {
+    let st = full_domain_u64_table();
+    let max = u64::MAX;
+
+    for (sql, expected) in [
+        (format!("SELECT i FROM supertable WHERE u = {max}"), vec![5]),
+        (
+            format!("SELECT i FROM supertable WHERE u >= {max}"),
+            vec![5],
+        ),
+        (
+            format!("SELECT i FROM supertable WHERE u = {SMALL_LITERAL}"),
+            vec![3],
+        ),
+        (
+            format!("SELECT i FROM supertable WHERE u > {SMALL_LITERAL}"),
+            vec![4, 5],
+        ),
+        (
+            format!("SELECT i FROM supertable WHERE u < {max}"),
+            vec![1, 2, 3, 4],
+        ),
+        (
+            format!("SELECT i FROM supertable WHERE u BETWEEN 1 AND {max}"),
+            vec![2, 3, 4, 5],
+        ),
+    ] {
+        assert_eq!(select_ids(&st, &sql), expected, "{sql}");
+    }
+}
+
+/// The domain is spanned only after folding two superfiles' bounds
+/// together, and the column is `Int64` rather than `UInt64`: the same
+/// failure reached along the two axes the single-superfile fixture
+/// doesn't cover. The threshold excludes only the `i64::MIN` row.
+#[test]
+fn range_filter_holds_when_domain_is_split_across_superfiles() {
+    let st = split_domain_i64_table();
+    assert_eq!(
+        select_ids(
+            &st,
+            &format!("SELECT i FROM supertable WHERE n > {SPLIT_THRESHOLD}")
+        ),
+        vec![2, 3, 4]
+    );
+}
+
+/// Withholding whole-domain bounds costs the aggregate fold nothing.
+/// Both extremes are still the right answer, and the query is still
+/// answered without a scan: the fold reads the per-superfile stats
+/// directly, so it never saw the withheld bounds.
+#[test]
+fn full_domain_column_still_folds_min_max_without_scanning() {
+    let st = full_domain_u64_table();
+
+    assert_eq!(scalar_u64(&st, "SELECT MIN(u) FROM supertable"), 0);
+    assert_eq!(scalar_u64(&st, "SELECT MAX(u) FROM supertable"), u64::MAX);
+    assert_eq!(
+        scalar_i64(&st, "SELECT COUNT(*) FROM supertable"),
+        U64_IDS.len() as i64
+    );
+
+    for sql in [
+        "SELECT MIN(u) FROM supertable",
+        "SELECT MAX(u) FROM supertable",
+        "SELECT COUNT(*) FROM supertable",
+    ] {
+        let plan = explain(&st, sql);
+        assert!(
+            !plan.contains("DataSourceExec"),
+            "{sql}: expected statistics fold (no scan); plan was:\n{plan}"
+        );
+    }
 }
