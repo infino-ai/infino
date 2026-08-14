@@ -1190,6 +1190,11 @@ impl SupertableWriter {
             )));
         }
 
+        // The vector check `append` runs, at call time rather than in the
+        // commit's append phase — where it would surface as a partial commit
+        // for a mutation that buffered nothing.
+        split_vectors(&new_rows, &self.inner.options).map_err(MutationError::InvalidNewRows)?;
+
         // Resolve the predicate against the latest committed manifest, not a
         // bounded-staleness snapshot: a stale resolve would miss a row
         // committed after the snapshot and leave the old version live beside

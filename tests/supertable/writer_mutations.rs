@@ -10,19 +10,28 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_array::Array;
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    new_null_array,
+};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
     InfinoError,
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::fts::reader::{Bm25Stats, BoolMode},
+    superfile::{
+        builder::FtsConfig,
+        fts::reader::{Bm25Stats, BoolMode},
+    },
     supertable::{
-        Supertable,
+        Supertable, SupertableOptions,
         mutations::MutationError,
         options::Consistency,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{
+        build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
+    },
 };
 use tempfile::TempDir;
 
@@ -38,6 +47,61 @@ const PREFETCH_CONCURRENCY: usize = 8;
 const MMAP_TIMER_DISABLED_SECS: u64 = 0;
 /// BM25 top-k for post-mutation FTS queries.
 const FTS_TOP_K: usize = 10;
+/// Matches `default_vector_config`'s dimension.
+const VECTOR_DIM: usize = 16;
+/// Random-rotation seed for the vector fixture's index.
+const VECTOR_ROT_SEED: u64 = 11;
+
+fn fixed_list_f32(dim: usize) -> DataType {
+    DataType::FixedSizeList(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim as i32,
+    )
+}
+
+/// `title` alongside a vector-indexed, nullable `emb`.
+fn vector_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(VECTOR_DIM), true),
+    ]))
+}
+
+fn vector_options() -> SupertableOptions {
+    SupertableOptions::new(
+        vector_schema(),
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+        Some(default_tokenizer()),
+    )
+    .expect("valid options")
+}
+
+/// One row of [`vector_schema`]. `embedded` false leaves `emb` null — the row
+/// a client sends when it forgets the vector column.
+fn vector_row(title: &str, embedded: bool) -> RecordBatch {
+    let emb: ArrayRef = if embedded {
+        Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                VECTOR_DIM as i32,
+                Arc::new(Float32Array::from(vec![1.0f32; VECTOR_DIM])) as ArrayRef,
+                None,
+            )
+            .expect("FSL"),
+        )
+    } else {
+        new_null_array(&fixed_list_f32(VECTOR_DIM), 1)
+    };
+    RecordBatch::try_new(
+        vector_schema(),
+        vec![Arc::new(LargeStringArray::from(vec![title])), emb],
+    )
+    .expect("batch")
+}
 
 fn make_disk_cache(
     storage: Arc<dyn StorageProvider>,
@@ -475,4 +539,90 @@ async fn update_emitted_superfile_carries_subsection_offsets() {
         .as_ref()
         .expect("update-emitted superfile carries subsection_offsets");
     assert!(offsets.total_size > 0, "total_size is stamped");
+}
+
+/// A replacement row whose vector column is null is refused at call time, so
+/// nothing is buffered and the row it targeted stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_update_with_a_null_vector_is_rejected_before_buffering() {
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        vector_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    )
+    .expect("create");
+
+    let mut w = st.writer().expect("writer");
+    w.append(&vector_row("alpha", true)).expect("append");
+    w.commit().expect("commit");
+
+    let err = w
+        .update(col("title").eq(lit("alpha")), vector_row("prime", false))
+        .expect_err("a null vector must be refused");
+    assert!(
+        matches!(err, MutationError::InvalidNewRows(_)),
+        "got: {err}"
+    );
+
+    let result = w.commit().expect("commit");
+    assert!(result.outcomes.is_empty(), "nothing was buffered");
+    drop(w);
+
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT title FROM supertable")
+        .expect("sql");
+    let titles: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title col");
+            (0..col.len()).map(move |i| col.value(i).to_string())
+        })
+        .collect();
+    assert_eq!(titles, vec!["alpha".to_string()]);
+}
+
+/// The rejection is a schema fault, like the same rows through `append` — not a
+/// backend one, and never a partial commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_with_a_null_vector_is_a_schema_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let disk_cache = make_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        vector_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(disk_cache),
+    )
+    .expect("create");
+    st.append(&vector_row("alpha", true)).expect("append");
+
+    let appended = st
+        .append(&vector_row("bravo", false))
+        .expect_err("append refuses a null vector");
+    let updated = st
+        .update(col("title").eq(lit("alpha")), &vector_row("prime", false))
+        .expect_err("update refuses the same rows");
+
+    assert!(
+        matches!(appended, InfinoError::Schema(_)),
+        "got: {appended}"
+    );
+    assert!(matches!(updated, InfinoError::Schema(_)), "got: {updated}");
+    assert!(
+        !updated.to_string().contains("partial commit"),
+        "got: {updated}"
+    );
 }

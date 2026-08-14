@@ -237,6 +237,8 @@ impl From<MutationError> for InfinoError {
             MutationError::CardinalityMismatch { .. }
             | MutationError::MatchCountExceedsCap { .. } => InfinoError::Cardinality(msg),
             MutationError::SchemaMismatch(_) => InfinoError::Schema(msg),
+            // Classifies exactly as the same rows would through `append`.
+            MutationError::InvalidNewRows(b) => InfinoError::from(b),
             // Matches the read path: a purged table's name resolves to nothing.
             MutationError::TableGone => InfinoError::NotFound(msg),
             _ => InfinoError::Backend(msg),
