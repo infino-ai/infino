@@ -6,9 +6,7 @@
 //! dispatch, and the AND flat-merge intersection family. Split from the
 //! reader `core` as its own `impl FtsReader` block.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
-
-use std::slice::from_mut;
+use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
 
 use super::{
     core::*,
