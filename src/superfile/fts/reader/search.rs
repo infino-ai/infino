@@ -1359,31 +1359,39 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        // Both shapes route to the MaxScore ranged branch at this corpus
-        // scale: Phase 1 reserves the windowed scan for the pruning-dead
-        // case (`or_topk_pruning_ineffective`), which needs a dominant list
-        // of ≥100k docs — unreachable in a fast in-memory test (that df
-        // threshold is unit-tested directly on `or_reroute_by_df`). The
-        // invariant under test here — partition union == un-ranged result —
-        // is kernel-agnostic, and both entries route through the same
-        // `route_or_to_windowed` seam, so a query cannot silently run a
-        // different kernel sliced vs whole. Assert the routing rather than
-        // assume it.
+        // Phase-1 routing is k-gated, so this test exercises *both* ranged
+        // kernels. The uniform 4-term OR stays on MaxScore at the small
+        // top-k but falls to the windowed scan at K_ALL (k past the pruning
+        // cutoff); the dominant-UB shape stays on MaxScore at every k. Both
+        // entries route through the same `route_or_to_windowed` seam, so a
+        // query cannot silently run a different kernel sliced vs whole, and
+        // the invariant under test — partition union == un-ranged result —
+        // holds for either kernel. Assert the routing rather than assume it.
         let shapes: [&[&str]; 2] = [
             &["alpha", "beta", "gamma", "delta"],
             &["rareterm", "alpha", "beta"],
         ];
         let column_id = r.resolve_column_id("body").expect("column");
-        for terms in shapes {
-            let cursors = r
-                .build_term_cursors(column_id, terms, None, false)
-                .await
-                .expect("cursors");
-            assert!(
-                !route_or_to_windowed(&cursors, K_ALL) && !route_or_to_windowed(&cursors, K_TOP),
-                "{terms:?} routes to MaxScore at test scale (windowed needs a ≥100k dominant list)"
-            );
-        }
+        let uniform = r
+            .build_term_cursors(column_id, shapes[0], None, false)
+            .await
+            .expect("cursors");
+        assert!(
+            route_or_to_windowed(&uniform, K_ALL),
+            "uniform OR at K_ALL (deep k) must route to the windowed ranged branch"
+        );
+        assert!(
+            !route_or_to_windowed(&uniform, K_TOP),
+            "uniform OR at small k must route to the MaxScore ranged branch"
+        );
+        let dominant = r
+            .build_term_cursors(column_id, shapes[1], None, false)
+            .await
+            .expect("cursors");
+        assert!(
+            !route_or_to_windowed(&dominant, K_ALL) && !route_or_to_windowed(&dominant, K_TOP),
+            "dominant-UB OR must route to MaxScore at every k (not uniform, no ≥100k list)"
+        );
         // Uneven partitions, including window-boundary-crossing cuts.
         let partitions: [&[(u32, u32)]; 3] = [
             &[(0, N_DOCS)],
