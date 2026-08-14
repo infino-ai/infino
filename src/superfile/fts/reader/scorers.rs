@@ -1822,14 +1822,20 @@ mod tests {
             .build_term_cursors(col, uniform_terms, None, false)
             .await
             .expect("uniform cursors");
-        // Phase 1 routing: the common-heavy (equal-upper-bound) shape is no
-        // longer forced onto the windowed scan — at these k it routes to the
-        // pruning MaxScore path. Windowed is reserved for the pruning-dead
-        // case (a long dominant list at deep k), which this shape isn't.
-        for k in [1usize, 5, 50, 1000] {
+        // Phase 1 routing is k-gated: the common-heavy (equal-upper-bound)
+        // shape stays on the pruning MaxScore path at small/mid k, and only
+        // falls to the windowed scan at deep k (past the pruning cutoff),
+        // where MaxScore can no longer prune it.
+        for k in [1usize, 5, 50, OR_WINDOWED_UNIFORM_MAX_PRUNING_K] {
             assert!(
                 !route_or_to_windowed(&uniform_cursors, k),
-                "common-heavy OR at k={k} should route to MaxScore, not windowed"
+                "common-heavy OR at k={k} (<= cutoff) should route to MaxScore"
+            );
+        }
+        for k in [OR_WINDOWED_UNIFORM_MAX_PRUNING_K + 1, 1000] {
+            assert!(
+                route_or_to_windowed(&uniform_cursors, k),
+                "common-heavy OR at deep k={k} should route to the windowed scan"
             );
         }
 
