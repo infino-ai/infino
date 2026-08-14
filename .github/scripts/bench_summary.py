@@ -10,7 +10,7 @@ Inputs (env):
   CURRENT_DIR                dir holding <report>.json from this run
   BENCH_NOISE_THRESHOLD_PCT  threshold in percent (default 5)
   GATE_FILE                  merge-gate verdict destination (default /tmp/bench-gate.status)
-  INFO_FILE                  non-gating cold findings (default /tmp/bench-gate.info)
+  INFO_FILE                  non-gating findings (default /tmp/bench-gate.info)
   OUT_FILE                   markdown destination (default /tmp/ai-summary.md)
   BENCH_LABEL                human label for the run (the `bench` input)
   BENCH_VM_SIZE              VM size label for context
@@ -22,6 +22,7 @@ Inputs (env):
 
 import json
 import os
+from dataclasses import dataclass, field
 
 # Report keys are "anchor|subtitle|label|header"; split on this into 4 fields.
 KEY_PARTS = 4
@@ -74,9 +75,9 @@ COST_TOKENS = ("$", "cost", "measured", "per-unit")
 SECONDARY_HEADERS = ("cold", "peak rss")
 SECONDARY_THRESHOLD_PCT = 30.0
 
-# Cold latency is a fresh-cache network round trip — it tracks the object store,
-# not the diff — so it is reported and never blocks.
-NON_GATING_HEADERS = ("cold",)
+# Advisory (report-only) primary tier beyond the gate metric: build time,
+# stored size, and transition walls. Flagged at `threshold`; none block.
+PRIMARY_EXTRA_HEADERS = ("time", "stored", "wall")
 
 # Map a report basename to (subsystem label, source area).
 SUBSYSTEM = {
@@ -100,15 +101,46 @@ DEFAULT_THRESHOLD = 5.0
 DEFAULT_GATE_FILE = "/tmp/bench-gate.status"
 DEFAULT_INFO_FILE = "/tmp/bench-gate.info"
 
-# Merge-blocking gate: a gating time-valued metric (warm latency, ingest /
-# drain / optimize wall) must be worse than the main baseline by BOTH of
-# these to block the merge. The AND is the noise guard: a big percent of a
+# Merge-blocking gate: the run's designated gate metric (BENCH_GATE_METRIC,
+# default warm p90) must be worse than the main baseline by BOTH of these to
+# block the merge. The AND is the noise guard: a big percent of a
 # sub-millisecond metric never blocks, and neither does a small-percent
 # wiggle on a long wall. The 5% advisory tiers above stay as REPORTING
 # thresholds only; this pair is the sole blocking criterion (enforced by
 # the workflow's "Enforce benchmark merge gate" step reading GATE_FILE).
+#
+# Exactly one statistic gates. Every other time-valued column is reported as
+# an informational mover, because each of the three families below failed the
+# gate on runs where BOTH A/B arms built the SAME commit — a push to main
+# benchmarks main against main, so those verdicts were measurement noise:
+#   - Tail percentiles. `warm p99` is not a percentile at these sample counts:
+#     the benches take 30 (supertable) or 50 (superfile) warm iterations and
+#     nearest-rank p99 lands on the last one, so it IS the max sample and one
+#     slow iteration on a shared CI VM trips the gate.
+#   - Cold latency. A fresh-cache network round trip tracks the object store,
+#     not the diff.
+#   - Transition walls. `delta commit`, drain, and optimize are each ONE
+#     un-repeated mutation against a real object store, and the A/B always
+#     runs the ref arm second on the same VM and storage account — so they
+#     carry a systematic order bias, not just variance, and no threshold
+#     separates that from a real regression.
 GATE_REL_PCT = 50.0
 GATE_ABS_NS = 5_000_000.0
+
+
+@dataclass
+class Diff:
+    """The classified outcome of one A/B comparison."""
+
+    regressions: list = field(default_factory=list)
+    improvements: list = field(default_factory=list)
+    blocking: list = field(default_factory=list)
+    informational: list = field(default_factory=list)
+    had_baseline: bool = False
+    cost_present: bool = False
+    # False with a baseline present means no report emitted the gate metric,
+    # so nothing could have blocked — a dead gate, not a clean run.
+    gate_metric_seen: bool = False
 
 
 def is_text_only(header):
@@ -124,8 +156,14 @@ def is_cost(header):
     return any(t in h for t in COST_TOKENS)
 
 
-def is_non_gating(header):
-    return any(t in header.lower() for t in NON_GATING_HEADERS)
+def is_gating(header, gate_header):
+    """Whether `header` is the one statistic allowed to block a merge.
+
+    An allowlist, not a denylist: every other time-valued column is reported
+    and never blocks. Exact (case-insensitive) match on the run's designated
+    gate metric — see GATE_REL_PCT for why the others are excluded.
+    """
+    return header.strip().lower() == gate_header
 
 
 def tier(header, primary_headers):
@@ -205,20 +243,20 @@ def load(path):
         return {}
 
 
-def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
-    """Classify changes per report.
-
-    Returns (regressions, improvements, blocking, informational, had_baseline,
-    cost_present).
+def diff(reports, baseline_dir, current_dir, threshold, gate_header):
+    """Classify changes per report into a `Diff`.
 
     `regressions` / `improvements` are the advisory findings (the 5%/30%
-    tier thresholds — report-only). `blocking` is the merge gate: time
-    metrics worse than baseline by BOTH >GATE_REL_PCT and >GATE_ABS_NS.
-    `informational` holds the same-sized moves on non-gating (cold) headers.
+    tier thresholds — report-only). `blocking` is the merge gate: the
+    designated gate metric worse than baseline by BOTH >GATE_REL_PCT and
+    >GATE_ABS_NS. `informational` holds the same-sized moves on every other
+    time-valued header.
     """
+    primary_headers = (gate_header, *PRIMARY_EXTRA_HEADERS)
     regressions, improvements, blocking, informational = [], [], [], []
     had_baseline = False
     cost_present = False
+    gate_metric_seen = False
     for report in reports:
         base = load(os.path.join(baseline_dir, f"{report}.json"))
         cur = load(os.path.join(current_dir, f"{report}.json"))
@@ -240,22 +278,23 @@ def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
             if old is None or old == 0.0:
                 continue
             had_baseline = True
-            # Every time-valued metric is eligible regardless of advisory tier,
-            # so optimize/drain walls and warm latency are covered.
+            # Every time-valued metric is measured against the gate thresholds;
+            # only the designated gate metric may block on the result.
             if is_latency(header):
+                gating = is_gating(header, gate_header)
+                gate_metric_seen = gate_metric_seen or gating
                 delta_ns = new - old
                 gate_pct = delta_ns / old * 100.0
                 if delta_ns > GATE_ABS_NS and gate_pct > GATE_REL_PCT:
-                    non_gating = is_non_gating(header)
                     entry = {
                         "subsystem": subsystem,
                         "area": area,
                         "metric": f"{label} / {header}".strip(" /"),
                         "change": f"{human(header, old)} -> {human(header, new)}",
                         "pct": round(gate_pct, 1),
-                        "tier": "informational" if non_gating else "blocking",
+                        "tier": "blocking" if gating else "informational",
                     }
-                    (informational if non_gating else blocking).append(entry)
+                    (blocking if gating else informational).append(entry)
             if t is None:
                 continue
             if is_latency(header):
@@ -281,7 +320,15 @@ def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
     improvements.sort(key=lambda e: -abs(e["pct"]))
     blocking.sort(key=lambda e: -abs(e["pct"]))
     informational.sort(key=lambda e: -abs(e["pct"]))
-    return regressions, improvements, blocking, informational, had_baseline, cost_present
+    return Diff(
+        regressions=regressions,
+        improvements=improvements,
+        blocking=blocking,
+        informational=informational,
+        had_baseline=had_baseline,
+        cost_present=cost_present,
+        gate_metric_seen=gate_metric_seen,
+    )
 
 
 def finding(entry):
@@ -300,12 +347,7 @@ def main():
     cpuset = os.environ.get("BENCH_CPUSET", "auto")
     bench_gate_metric = os.environ.get("BENCH_GATE_METRIC", "p90")
     run_url = os.environ.get("RUN_URL", "")
-    primary_headers = (
-        primary_latency_header_from_gate_metric(bench_gate_metric),
-        "time",
-        "stored",
-        "wall",
-    )
+    gate_header = primary_latency_header_from_gate_metric(bench_gate_metric)
     try:
         threshold = float(os.environ.get("BENCH_NOISE_THRESHOLD_PCT", DEFAULT_THRESHOLD))
     except ValueError:
@@ -314,13 +356,16 @@ def main():
     gate_file = os.environ.get("GATE_FILE", DEFAULT_GATE_FILE)
     info_file = os.environ.get("INFO_FILE", DEFAULT_INFO_FILE)
     failures = [ln.strip() for ln in os.environ.get("ERRORS", "").splitlines() if ln.strip()]
-    regressions, improvements, blocking, informational, had_baseline, cost_present = diff(
-        reports, baseline_dir, current_dir, threshold, primary_headers
-    )
+    d = diff(reports, baseline_dir, current_dir, threshold, gate_header)
+    blocking, informational = d.blocking, d.informational
 
-    prim_regr = [e for e in regressions if e["tier"] == "primary"]
-    prim_impr = [e for e in improvements if e["tier"] == "primary"]
-    secondary_present = any(e["tier"] == "secondary" for e in regressions + improvements)
+    prim_regr = [e for e in d.regressions if e["tier"] == "primary"]
+    prim_impr = [e for e in d.improvements if e["tier"] == "primary"]
+    secondary_present = any(e["tier"] == "secondary" for e in d.regressions + d.improvements)
+    # A gate that cannot fire reads as a pass; say so rather than stay silent.
+    dead_gate = d.had_baseline and not d.gate_metric_seen
+    if dead_gate:
+        print(f"::warning::no report emitted `{gate_header}` — the merge gate had nothing to check")
 
     if failures or blocking:
         status = "FAIL"
@@ -331,11 +376,13 @@ def main():
     parts = [f"## Benchmark Summary (A/B vs {base_ref})", ""]
     parts.append(f"Status: {status}")
     parts.append(
-        f"Merge Gate (blocking): {len(blocking)} regressions past "
+        f"Merge Gate (blocking): {len(blocking)} `{gate_header}` regressions past "
         f">{GATE_REL_PCT:g}% AND >{GATE_ABS_NS / 1e6:g} ms vs {base_ref}"
     )
     parts.append(f"Advisory findings: {counts}, threshold ±{threshold:g}% (report-only)")
-    parts.append(f"Cold movers (informational): {len(informational)}")
+    parts.append(f"Non-gating movers (informational): {len(informational)}")
+    if dead_gate:
+        parts.append(f"Warning: no report emitted `{gate_header}` — the gate checked nothing")
     parts.append(
         f"Run Context: bench={label} vm={vm_size} region={location} cpuset={cpuset or 'auto'}"
     )
@@ -351,11 +398,17 @@ def main():
         parts.append("")
 
     if informational:
-        parts += ["### Cold Movers (informational — not gating)", ""]
+        parts += [
+            "### Non-Gating Movers (informational)",
+            "",
+            "_Tail percentiles, cold reads, and one-shot transition walls. "
+            "Measured and reported; they never block a merge._",
+            "",
+        ]
         parts.extend(finding(e) for e in informational)
         parts.append("")
 
-    if not failures and not had_baseline:
+    if not failures and not d.had_baseline:
         parts += [f"_No {base_ref} baseline to diff against (first run or new config)._", ""]
     elif not failures:
         parts += ["### Primary Findings", ""]
@@ -377,7 +430,7 @@ def main():
         parts.append("- Merge Gate: FAIL")
         if blocking:
             parts.append(
-                f"- Reason: time metrics worse than {base_ref} by both "
+                f"- Reason: `{gate_header}` worse than {base_ref} by both "
                 f">{GATE_REL_PCT:g}% and >{GATE_ABS_NS / 1e6:g} ms."
             )
         else:
@@ -408,7 +461,7 @@ def main():
     parts.append("")
 
     parts.append("### Notes")
-    if secondary_present or cost_present:
+    if secondary_present or d.cost_present:
         parts.append(
             "- Cold-search and cost metrics measured, non-gating."
         )
@@ -439,9 +492,10 @@ def main():
             fh.write(f"{e['metric']}: {e['change']} ({e['pct']:+.0f}%)\n")
 
     print(
-        f"wrote {out_file}: {len(blocking)} blocking, {len(informational)} informational, "
-        f"{len(regressions)} advisory regressions, {len(improvements)} improvements, "
-        f"{len(failures)} failure line(s), baseline={'yes' if had_baseline else 'no'}"
+        f"wrote {out_file}: gate={gate_header}, {len(blocking)} blocking, "
+        f"{len(informational)} informational, {len(d.regressions)} advisory regressions, "
+        f"{len(d.improvements)} improvements, {len(failures)} failure line(s), "
+        f"baseline={'yes' if d.had_baseline else 'no'}"
     )
 
 

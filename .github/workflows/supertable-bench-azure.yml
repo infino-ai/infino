@@ -635,11 +635,14 @@ jobs:
           ERRORS="$(cat /tmp/bench.errors 2>/dev/null || true)" \
             python3 .github/scripts/bench_summary.py
 
-      # Enforce the merge-blocking benchmark gate: a warm/wall time metric worse
-      # than the same-host main baseline by BOTH >50% and >5 ms fails this job
-      # (bench_summary.py writes the verdict; the 5% findings stay advisory).
-      # Cold movers are reported as warnings — they track object-store network
-      # variance, not the diff. A separate step so the summary still posts on FAIL.
+      # Enforce the merge-blocking benchmark gate: the designated warm gate
+      # metric (`bench_gate_metric`) worse than the same-host main baseline by
+      # BOTH >50% and >5 ms fails this job (bench_summary.py writes the verdict;
+      # the 5% findings stay advisory). Every other time-valued metric — tail
+      # percentiles, cold reads, one-shot transition walls — is reported as a
+      # warning instead: each tracks object-store or run-order variance rather
+      # than the diff, and each was observed failing the gate on main-vs-main
+      # runs. A separate step so the summary still posts on FAIL.
       - name: Enforce benchmark merge gate
         if: ${{ !cancelled() }}
         run: |
@@ -647,7 +650,7 @@ jobs:
           STATUS_FILE=/tmp/bench-gate.status
           INFO_FILE=/tmp/bench-gate.info
           if [ -s "$INFO_FILE" ]; then
-            echo "::warning::cold movers past >50% AND >5ms vs main (informational, not gating):"
+            echo "::warning::non-gating movers past >50% AND >5ms vs main (informational):"
             while IFS= read -r line; do
               echo "::warning::  $line"
             done < "$INFO_FILE"

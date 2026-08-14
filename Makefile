@@ -2,7 +2,7 @@
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update api-parity api-parity-update \
-        version-sync release-prep doc-check \
+        version-sync release-prep doc-check bench-gate \
         python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
@@ -18,6 +18,7 @@ check:
 	cargo clippy --all-targets --features test-helpers,remote -- -D warnings
 	$(MAKE) api-parity
 	$(MAKE) version-sync
+	$(MAKE) bench-gate
 	$(MAKE) doc-check
 
 # Apply formatting, including the import-layout rules above.
@@ -58,6 +59,12 @@ api-parity-update:
 version-sync:
 	python3 -m unittest discover -s scripts -q
 	python3 scripts/check_version_sync.py
+
+# Benchmark merge-gate guard. The CI bench gate decides which metrics can
+# block a merge; that classification is easy to widen by accident and a
+# false positive blocks every PR, so it is unit-tested. Pure Python 3.
+bench-gate:
+	python3 -m unittest discover -s .github/scripts -q
 
 # Stamp every version file for a release and print the follow-up step.
 # PACKAGE selects the scope: crate | node | python (single-package patch,
