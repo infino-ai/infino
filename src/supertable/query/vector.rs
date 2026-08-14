@@ -1551,21 +1551,48 @@ const HNSW_CALIB_QUERIES: usize = 200;
 /// Deterministic calibration seed (no wall-clock / system randomness).
 const HNSW_CALIB_SEED: u64 = 0x_C0FF_EE00_CA11_B000;
 
-/// Evenly-strided subsample of the node-ordered Sq16 code plane down to
-/// `target` rows (all rows unchanged when `n <= target`). Used only for the
-/// cheap calibration probe on a large corpus — a coarse, deterministic spread
-/// across the drain-ordered plane, no allocation of the full clone.
-fn subsample_codes(codes: &[u8], dim: usize, n: usize, target: usize) -> (Vec<u8>, usize) {
-    if n <= target {
-        return (codes.to_vec(), n);
+/// Gather the Sq16 code plane for `column` across all superfiles, in manifest
+/// order (so a full collection aligns positionally with the `doc_ids` gathered
+/// in the same order). `stride_step = Some(k)` keeps only every k-th row — a
+/// coarse, deterministic, evenly-spread sample that lets the probe bound its
+/// memory to ~`n/k` rows instead of the whole plane; `None` collects every row.
+async fn collect_hnsw_codes(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    stride: usize,
+    stride_step: Option<usize>,
+) -> Result<Vec<u8>, QueryError> {
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    let mut codes: Vec<u8> = Vec::new();
+    let mut gi: usize = 0;
+    for entry in manifest.get_all_superfiles() {
+        let reader =
+            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                .await?;
+        let Some(vr) = reader.vec() else { continue };
+        let Some(rows) = vr.materialized_index_rows_async(column).await else {
+            continue;
+        };
+        for row in rows {
+            if row.encoded.codes.len() != stride {
+                return Err(QueryError::Execute(format!(
+                    "hnsw: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
+                    row.encoded.codes.len()
+                )));
+            }
+            let keep = match stride_step {
+                Some(k) => gi.is_multiple_of(k),
+                None => true,
+            };
+            if keep {
+                codes.extend_from_slice(&row.encoded.codes);
+            }
+            gi += 1;
+        }
     }
-    let stride = dim * 2;
-    let mut out = Vec::with_capacity(target * stride);
-    for i in 0..target {
-        let src = ((i as u64 * n as u64) / target as u64) as usize;
-        out.extend_from_slice(&codes[src * stride..src * stride + stride]);
-    }
-    (out, target)
+    Ok(codes)
 }
 
 pub(crate) async fn assemble_hnsw_sections(
@@ -1590,7 +1617,12 @@ pub(crate) async fn assemble_hnsw_sections(
     let disk_cache = manifest.options.disk_cache.clone();
     let storage = manifest.options.storage.clone();
 
-    let mut codes: Vec<u8> = Vec::new();
+    // Gather the stable doc-ids (cheap: 16 B/row) and the row count first. The
+    // Sq16 code plane itself (dim*2 B/row — GBs at scale) is gathered LATER: a
+    // bounded strided sample for the probe, and the full plane only if the probe
+    // passes. A graph-hostile corpus therefore never materializes the whole
+    // plane just to decline (which, on a large drain, is the difference between
+    // fitting in RAM and OOM).
     let mut doc_ids: Vec<i128> = Vec::new();
     for entry in manifest.get_all_superfiles() {
         let reader =
@@ -1616,7 +1648,6 @@ pub(crate) async fn assemble_hnsw_sections(
                     ids.len()
                 ))
             })?;
-            codes.extend_from_slice(&row.encoded.codes);
             doc_ids.push(stable_id);
         }
     }
@@ -1647,7 +1678,11 @@ pub(crate) async fn assemble_hnsw_sections(
     // probe falls through to the authoritative full-corpus calibration below.
     let probe_cap = vcfg.hnsw_probe_max_docs as usize;
     if n > probe_cap {
-        let (pcodes, pn) = subsample_codes(&codes, dim, n, probe_cap);
+        // Gather ONLY a bounded, evenly-spread strided sample for the probe —
+        // never the full plane. `step = n / probe_cap` keeps ~probe_cap rows.
+        let step = (n / probe_cap).max(1);
+        let pcodes = collect_hnsw_codes(manifest, column, stride, Some(step)).await?;
+        let pn = pcodes.len() / stride;
         let pscorer = Sq16Scorer::from_codes(pcodes, dim, pn);
         let (pchoice, _) = hnsw::calibrate_graph(
             &pscorer,
@@ -1675,6 +1710,9 @@ pub(crate) async fn assemble_hnsw_sections(
             pchoice.m0, pchoice.ef, pchoice.recall
         );
     }
+    // Full code plane — reached only for a small corpus (n ≤ probe_cap) or a
+    // passing probe. This is where the whole plane is finally materialized.
+    let codes = collect_hnsw_codes(manifest, column, stride, None).await?;
     let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
     // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
     // once at m0_max, prune down, sweep ef by re-search — free). The m0
