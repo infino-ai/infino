@@ -662,15 +662,14 @@ impl FtsReader {
     /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
     /// The ranged path carries no negation in v1.
     ///
-    /// Kernel choice mirrors `dispatch_or_algo` instead of
-    /// hardcoding MaxScore+BMM: on a broad OR over uniform-upper-bound
-    /// terms BMM cannot prune (every block max ties), so it degrades to
-    /// per-doc min-scan bookkeeping over ~the whole union — the exact
-    /// shape `run_windowed_union` exists for, and it is natively ranged.
-    /// Hardcoding BMM here made the SAME query run a different kernel
-    /// depending on whether the fan-out sliced (few large superfiles,
-    /// i.e. post-compaction) or not (many small ones, pre-compaction) —
-    /// measured at 1M as the 11-24x post-compact broad-OR regression.
+    /// Kernel choice mirrors `dispatch_or_algo` via the shared
+    /// `route_or_to_windowed` seam instead of hardcoding a kernel: MaxScore
+    /// is the default, and the windowed scan is used only when block-max
+    /// pruning is dead at this `k`. Routing through the same predicate as
+    /// the single-shot path is what keeps the SAME query on the SAME kernel
+    /// whether or not the fan-out sliced it (few large superfiles
+    /// post-compaction vs many small ones pre-compaction) — hardcoding BMM
+    /// here once caused an 11-24x post-compact broad-OR regression.
     pub(crate) fn search_or_range_prebuilt(
         &self,
         set: &OrCursorSet,
@@ -683,7 +682,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
-        if prefer_windowed_union(&cursors) {
+        if route_or_to_windowed(&cursors, k) {
             self.run_windowed_union(
                 set.column_id,
                 cursors,
@@ -1360,32 +1359,31 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        // Uniform 4-term OR routes to the windowed union; the
-        // rare+common mix keeps a dominant term UB and stays on BMM.
-        // Assert the routing rather than assume it — a corpus tweak that
-        // silently stopped exercising one branch would otherwise turn
-        // this into a test of the other branch twice.
+        // Both shapes route to the MaxScore ranged branch at this corpus
+        // scale: Phase 1 reserves the windowed scan for the pruning-dead
+        // case (`or_topk_pruning_ineffective`), which needs a dominant list
+        // of ≥100k docs — unreachable in a fast in-memory test (that df
+        // threshold is unit-tested directly on `or_reroute_by_df`). The
+        // invariant under test here — partition union == un-ranged result —
+        // is kernel-agnostic, and both entries route through the same
+        // `route_or_to_windowed` seam, so a query cannot silently run a
+        // different kernel sliced vs whole. Assert the routing rather than
+        // assume it.
         let shapes: [&[&str]; 2] = [
             &["alpha", "beta", "gamma", "delta"],
             &["rareterm", "alpha", "beta"],
         ];
         let column_id = r.resolve_column_id("body").expect("column");
-        let uniform_cursors = r
-            .build_term_cursors(column_id, shapes[0], None, false)
-            .await
-            .expect("cursors");
-        assert!(
-            prefer_windowed_union(&uniform_cursors),
-            "uniform shape must route to the windowed ranged branch"
-        );
-        let dominant_cursors = r
-            .build_term_cursors(column_id, shapes[1], None, false)
-            .await
-            .expect("cursors");
-        assert!(
-            !prefer_windowed_union(&dominant_cursors),
-            "dominant-UB shape must route to the BMM ranged branch"
-        );
+        for terms in shapes {
+            let cursors = r
+                .build_term_cursors(column_id, terms, None, false)
+                .await
+                .expect("cursors");
+            assert!(
+                !route_or_to_windowed(&cursors, K_ALL) && !route_or_to_windowed(&cursors, K_TOP),
+                "{terms:?} routes to MaxScore at test scale (windowed needs a ≥100k dominant list)"
+            );
+        }
         // Uneven partitions, including window-boundary-crossing cuts.
         let partitions: [&[(u32, u32)]; 3] = [
             &[(0, N_DOCS)],

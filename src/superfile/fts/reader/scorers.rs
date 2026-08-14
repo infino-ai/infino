@@ -1521,17 +1521,20 @@ impl FtsReader {
         // cross-segment floor (`floor_eff` unset) — seeding WAND's
         // threshold from a floor mis-prunes, so a live floor stays on
         // MaxScore.
-        // The dominance heuristic (`prefer_windowed_union`) assumes a
-        // dominant term means MaxScore prunes hard — true only at small
-        // `k`. At large `k` relative to the rarer terms' combined df the
-        // top-k threshold collapses to the common term's upper bound,
-        // MaxScore can skip nothing, and it degrades to a *scalar* full
-        // scan. `or_topk_pruning_ineffective` catches exactly that case
-        // (including a 2-term rare+common OR too deep for WAND) and
-        // routes it to the SIMD windowed scorer, which does the same
-        // full scan without the per-doc f-way merge. Small-`k`
-        // dominant-term ORs fail this test and stay on MaxScore, where
-        // pruning still wins.
+        // MaxScore is the default for multi-term OR, *including* the
+        // common-heavy (uniform upper-bound) shape. The old heuristic sent
+        // that shape to the non-pruning windowed scanner on the premise
+        // "no dominant term ⇒ MaxScore can't prune"; that is wrong at
+        // small/mid `k`, where the competitive threshold rises above the
+        // common terms' per-block maxima once the heap fills and MaxScore
+        // skips those blocks — pruning the windowed scan ignores (its cost
+        // is independent of `k`). Route to the windowed scan only when
+        // pruning is genuinely dead at this `k` (`route_or_to_windowed` →
+        // `or_topk_pruning_ineffective`: a long dominant list plus `k`
+        // deep enough that the rarer terms can no longer fill the heap, so
+        // the threshold collapses to the common term's upper bound). There
+        // the SIMD full scan does the same work MaxScore would, without the
+        // per-doc f-way merge.
         let no_floor = floor_eff == f32::NEG_INFINITY;
         if cursors.len() == 2
             && k <= WAND_BMW_2TERM_MAX_K
@@ -1540,7 +1543,7 @@ impl FtsReader {
             && two_term_has_rare_anchor(&cursors)
         {
             self.run_wand_bmw(column_id, cursors, k)
-        } else if prefer_windowed_union(&cursors) || or_topk_pruning_ineffective(&cursors, k) {
+        } else if route_or_to_windowed(&cursors, k) {
             self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         } else {
             self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
@@ -1819,10 +1822,16 @@ mod tests {
             .build_term_cursors(col, uniform_terms, None, false)
             .await
             .expect("uniform cursors");
-        assert!(
-            prefer_windowed_union(&uniform_cursors),
-            "production router should select windowed union for equal upper bounds"
-        );
+        // Phase 1 routing: the common-heavy (equal-upper-bound) shape is no
+        // longer forced onto the windowed scan — at these k it routes to the
+        // pruning MaxScore path. Windowed is reserved for the pruning-dead
+        // case (a long dominant list at deep k), which this shape isn't.
+        for k in [1usize, 5, 50, 1000] {
+            assert!(
+                !route_or_to_windowed(&uniform_cursors, k),
+                "common-heavy OR at k={k} should route to MaxScore, not windowed"
+            );
+        }
 
         let shapes: &[&[&str]] = &[
             &["alpha", "beta"],
