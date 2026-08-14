@@ -494,14 +494,14 @@ impl TermCursor {
 
     pub(super) fn decode_current_block(&mut self) {
         let block = self.blocks[self.current_block];
-        let bytes = self
-            .bytes
-            .slice(block.block_byte_offset..block.block_byte_end);
+        // Borrow in place rather than clone an owned `Bytes` (disjoint from the
+        // `&mut self.block_*` decode targets, which are separate fields).
+        let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
         // Count-only cursors skip the tf half of the block; the count
         // kernels never read `block_tfs`, so it is left stale.
         self.block_n = match self.count_only {
-            true => decode_block_doc_ids(&bytes, &mut self.block_doc_ids),
-            false => decode_block(&bytes, &mut self.block_doc_ids, &mut self.block_tfs),
+            true => decode_block_doc_ids(bytes, &mut self.block_doc_ids),
+            false => decode_block(bytes, &mut self.block_doc_ids, &mut self.block_tfs),
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
@@ -528,10 +528,13 @@ impl TermCursor {
             return self.block_n > 0 && self.block_doc_ids[0] == doc;
         }
         let block = self.blocks[self.current_block];
-        let raw = self
-            .bytes
-            .slice(block.block_byte_offset..block.block_byte_end);
-        let raw = raw.as_ref();
+        // Borrow the block's bytes in place — `self.bytes` is held for the
+        // cursor's life, so a subslice needs no owned `Bytes` clone. A
+        // per-probe `.slice()` here bumps and drops an atomic refcount on
+        // every membership probe; over a long driver it was ~11% of the
+        // intersection-count time (and wasted on the PACKED path, which
+        // only reads the encoding byte before falling to the decode cache).
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         if raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET {
             let base = read_u32_le(&raw[4..8]);
             if doc < base {
@@ -547,6 +550,7 @@ impl TermCursor {
             let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
             (word >> (bit % 64)) & 1 == 1
         } else {
+            // Borrow of `raw` ends above; the decode needs `&mut self`.
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
