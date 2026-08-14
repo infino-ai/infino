@@ -1870,7 +1870,7 @@ mod tests {
         // shape stays on the pruning MaxScore path at small/mid k, and only
         // falls to the windowed scan at deep k (past the pruning cutoff),
         // where MaxScore can no longer prune it.
-        for k in [1usize, 5, 50, OR_WINDOWED_UNIFORM_MAX_PRUNING_K] {
+        for k in [1usize, 5, 16, OR_WINDOWED_UNIFORM_MAX_PRUNING_K] {
             assert!(
                 !route_or_to_windowed(&uniform_cursors, k),
                 "common-heavy OR at k={k} (<= cutoff) should route to MaxScore"

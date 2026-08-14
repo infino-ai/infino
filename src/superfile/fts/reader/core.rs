@@ -361,13 +361,14 @@ pub(super) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 /// common terms' per-block maxima and their blocks skip. As `k` grows the
 /// threshold falls until no block clears it, MaxScore degrades to a scalar
 /// full union scan, and the windowed scorer does that same scan far faster
-/// (SIMD, no per-doc f-way merge). Calibrated on the ranked-union bench:
-/// MaxScore wins by a wide margin at page-sized `k` and holds into the low
-/// hundreds, then loses once `k` reaches the ~thousand-result range where
-/// its pruning is dead — so the crossover sits in between. Shares the value
-/// (and the "pruning stays alive below this k" rationale) with
-/// [`WAND_BMW_2TERM_MAX_K`].
-pub(super) const OR_WINDOWED_UNIFORM_MAX_PRUNING_K: usize = 128;
+/// (SIMD, no per-doc f-way merge). Calibrated on the x86 cross-engine
+/// ranked-union bench: MaxScore wins decisively at page-sized `k` (tens of
+/// results) but already loses to the SIMD windowed scan by the low hundreds,
+/// so the crossover sits just above page size — the value is set below it.
+/// (The crossover is architecture-sensitive: on a wide-SIMD x86 host the
+/// windowed scan is relatively faster than on ARM, so this is tuned to the
+/// x86 target, not a local dev machine.)
+pub(super) const OR_WINDOWED_UNIFORM_MAX_PRUNING_K: usize = 32;
 
 /// True when **no single term dominates** the score upper bound:
 /// `max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`. Uniform terms sit near
