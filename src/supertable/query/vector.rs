@@ -1605,6 +1605,48 @@ async fn collect_hnsw_codes(
     Ok(codes)
 }
 
+/// Cheap metadata-only row count for `column` across all superfiles, excluding
+/// superseded cells — WITHOUT decoding any code plane. Returns the exact same
+/// row total that the decode passes ([`collect_hnsw_codes`] /
+/// `materialized_index_rows_excluding_async`) would produce, by mirroring their
+/// column gate and superseded-cell exclusion against per-cell doc counts from
+/// the blob directory. This lets [`assemble_hnsw_sections`] size the probe's
+/// strided step up front, so it can emit the stable doc-ids and the strided
+/// probe sample in a SINGLE decode of each superfile instead of two.
+async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<usize, QueryError> {
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+    let mut n: usize = 0;
+    for entry in manifest.get_all_superfiles() {
+        let reader =
+            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                .await?;
+        let Some(vr) = reader.vec() else { continue };
+        if !vr.has_index_column(column) {
+            continue;
+        }
+        let sup = superseded.get(&entry.superfile_id);
+        if sup.is_none_or(|s| s.is_empty()) || !vr.is_multi_cell() {
+            // No exclusions (or v1): the whole blob's rows are counted, exactly
+            // as the decode path takes every materialized row.
+            n += vr.n_docs() as usize;
+        } else {
+            // Multi-cell with superseded cells: count only the cells the decode
+            // path keeps (it drops superseded cells' rows).
+            for &cell_id in vr.packed_cell_ids() {
+                if sup.is_some_and(|s| s.contains(&cell_id)) {
+                    continue;
+                }
+                n += vr.packed_cell_n_docs(cell_id).unwrap_or(0) as usize;
+            }
+        }
+    }
+    Ok(n)
+}
+
 pub(crate) async fn assemble_hnsw_sections(
     manifest: &ManifestSnapshot,
     column: &str,
@@ -1635,7 +1677,56 @@ pub(crate) async fn assemble_hnsw_sections(
     // fitting in RAM and OOM).
     let empty_superseded = BTreeMap::new();
     let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
-    let mut doc_ids: Vec<i128> = Vec::new();
+    // Cheap metadata pre-count (NO code decode): the row total lets us size the
+    // probe's strided step before touching any code plane, so the stable
+    // doc-ids and the strided probe sample can both come out of ONE decode pass
+    // below — previously two separate full decodes (a doc-ids-only decode, then
+    // a strided-sample decode).
+    let n = count_hnsw_rows(manifest, column).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let vcfg = &config::global().vector;
+    // (m0, ef) candidate grid for the calibrator. An explicit `hnsw_m0`
+    // override collapses the m0 search to that value; the ef grid is capped by
+    // `hnsw_ef_ceil`.
+    let m0_cands: Vec<usize> = if vcfg.hnsw_m0 != 0 {
+        vec![vcfg.hnsw_m0]
+    } else {
+        config::HNSW_M0_CANDIDATES.to_vec()
+    };
+    let ef_cands: Vec<usize> = config::HNSW_EF_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|&e| e <= vcfg.hnsw_ef_ceil)
+        .collect();
+    // Cheap probe gate. On a corpus larger than `hnsw_probe_max_docs`,
+    // calibrate on a bounded subsample first. Subsample recall is OPTIMISTIC
+    // (the m0 requirement grows with N), so a probe that cannot register is a
+    // hard "graph-hostile distribution" signal — skip the expensive full build
+    // and serve ivf. This gates on distribution, not size: a large but
+    // graph-friendly corpus passes the probe and keeps its graph. A registrable
+    // probe falls through to the authoritative full-corpus calibration below.
+    let probe_cap = vcfg.hnsw_probe_max_docs as usize;
+    // Probe path when the corpus exceeds the cap: keep every `step`-th row so
+    // the sample is ~probe_cap rows. `None` = small corpus, no probe.
+    let probe_step: Option<usize> = (n > probe_cap).then(|| (n / probe_cap).max(1));
+
+    // Single decode pass over every superfile: read/decode each superfile's
+    // rows ONCE and, in that same loop, (a) push the stable doc-id (same
+    // superfile iteration order, same superseded-cell exclusion, so `doc_ids`
+    // is identical to before) and (b) on the probe path, append the row's codes
+    // to the strided sample when its global index is on the step (byte-identical
+    // to the old `collect_hnsw_codes(.., Some(step))`). The full plane is still
+    // read (below) only when the probe registers.
+    let mut doc_ids: Vec<i128> = Vec::with_capacity(n);
+    // On the probe path this carries only the strided probe sample; on the
+    // small-corpus path (no probe) it carries the FULL decoded plane so the
+    // full build below reuses it instead of re-reading + re-decoding every
+    // superfile a second time. The two modes are mutually exclusive, so one
+    // buffer serves both and peak memory is unchanged.
+    let mut carried_codes: Vec<u8> = Vec::new();
+    let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
         let reader =
             dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
@@ -1664,39 +1755,33 @@ pub(crate) async fn assemble_hnsw_sections(
                 ))
             })?;
             doc_ids.push(stable_id);
+            match probe_step {
+                // Probe path: keep only every `step`-th row for the sample.
+                Some(step) if gi.is_multiple_of(step) => {
+                    carried_codes.extend_from_slice(&row.encoded.codes);
+                }
+                Some(_) => {}
+                // Small corpus (no probe): carry the whole plane for the build.
+                None => carried_codes.extend_from_slice(&row.encoded.codes),
+            }
+            gi += 1;
         }
     }
+    // The cheap pre-count must equal the decoded row count, or the strided step
+    // was sized wrong and the probe sample would diverge from the old code.
+    debug_assert_eq!(
+        doc_ids.len(),
+        n,
+        "hnsw pre-count vs decoded row count mismatch"
+    );
     if doc_ids.is_empty() {
         return Ok(None);
     }
-    let n = doc_ids.len();
-    let vcfg = &config::global().vector;
-    // (m0, ef) candidate grid for the calibrator. An explicit `hnsw_m0`
-    // override collapses the m0 search to that value; the ef grid is capped by
-    // `hnsw_ef_ceil`.
-    let m0_cands: Vec<usize> = if vcfg.hnsw_m0 != 0 {
-        vec![vcfg.hnsw_m0]
-    } else {
-        config::HNSW_M0_CANDIDATES.to_vec()
-    };
-    let ef_cands: Vec<usize> = config::HNSW_EF_CANDIDATES
-        .iter()
-        .copied()
-        .filter(|&e| e <= vcfg.hnsw_ef_ceil)
-        .collect();
-    // Cheap probe gate. On a corpus larger than `hnsw_probe_max_docs`,
-    // calibrate on a bounded subsample first. Subsample recall is OPTIMISTIC
-    // (the m0 requirement grows with N), so a probe that cannot register is a
-    // hard "graph-hostile distribution" signal — skip the expensive full build
-    // and serve ivf. This gates on distribution, not size: a large but
-    // graph-friendly corpus passes the probe and keeps its graph. A registrable
-    // probe falls through to the authoritative full-corpus calibration below.
-    let probe_cap = vcfg.hnsw_probe_max_docs as usize;
-    if n > probe_cap {
-        // Gather ONLY a bounded, evenly-spread strided sample for the probe —
-        // never the full plane. `step = n / probe_cap` keeps ~probe_cap rows.
-        let step = (n / probe_cap).max(1);
-        let pcodes = collect_hnsw_codes(manifest, column, stride, Some(step)).await?;
+
+    if probe_step.is_some() {
+        // Reuse the strided sample gathered in the merged pass above — no second
+        // decode. (Byte-identical to the prior `collect_hnsw_codes(Some(step))`.)
+        let pcodes = std::mem::take(&mut carried_codes);
         let pn = pcodes.len() / stride;
         let pscorer = Sq16Scorer::from_codes(pcodes, dim, pn);
         // The calibrate build is pure CPU; run it on the reader pool (not the
@@ -1758,8 +1843,35 @@ pub(crate) async fn assemble_hnsw_sections(
     // The scorer OWNS the plane; the encoder below borrows it back via
     // `scorer.codes()` rather than keeping a second owned copy alive through
     // the build + encode (the plane is multi-GB at the scale ceiling).
-    let codes = collect_hnsw_codes(manifest, column, stride, None).await?;
-    let scorer = Sq16Scorer::from_codes(codes, dim, n);
+    // Small corpus reuses the full plane already decoded in the merged pass
+    // above (no probe was taken from `carried_codes`); the probe path re-reads
+    // the plane here, having kept it out of RAM through the probe to bound peak
+    // memory at scale.
+    let codes = if probe_step.is_none() {
+        std::mem::take(&mut carried_codes)
+    } else {
+        collect_hnsw_codes(manifest, column, stride, None).await?
+    };
+    // Size the scorer from the DECODED plane, not the metadata pre-count `n`
+    // (which only sizes the probe step). The decode can skip a superfile the
+    // footer-only count still includes — `materialized_index_rows_*` returns
+    // `None` on a transient range/parse fault, not just an absent column — so
+    // trusting `n` here could slice the scorer past its buffer. If the decoded
+    // plane and the doc-id pass disagree, a transient fault desynced the two
+    // reads and a graph built now would mismap nodes to ids: skip it and serve
+    // ivf; the next drain rebuilds.
+    let decoded_rows = codes.len() / stride;
+    if decoded_rows != doc_ids.len() {
+        tracing::warn!(
+            column,
+            doc_ids = doc_ids.len(),
+            decoded_rows,
+            "hnsw: decoded plane row count != doc-id count (transient read fault?); \
+             skipping graph build, serving ivf"
+        );
+        return Ok(None);
+    }
+    let scorer = Sq16Scorer::from_codes(codes, dim, decoded_rows);
     // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
     // once at m0_max, prune down, sweep ef by re-search — free). The m0
     // requirement is scale-dependent, so this full-corpus pass is authoritative

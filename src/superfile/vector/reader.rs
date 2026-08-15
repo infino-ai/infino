@@ -1847,6 +1847,15 @@ impl VectorReader {
         !self.cell_ids.is_empty()
     }
 
+    /// Whether this blob carries the named vector index column. Mirrors the
+    /// column gate in [`Self::materialized_index_rows_async`] /
+    /// [`Self::materialized_index_rows_excluding_async`] (both return `None`
+    /// when the column is absent), so a metadata-only row count can skip the
+    /// same superfiles the decode passes skip.
+    pub(crate) fn has_index_column(&self, name: &str) -> bool {
+        self.column_id_by_name.contains_key(name)
+    }
+
     /// Map a flat cluster id (manifest / query fan-out) to
     /// `(cell_column_index, local_cluster)` for multi-cell blobs.
     pub(crate) fn resolve_flat_cluster(&self, flat: u32) -> Option<(usize, u32)> {
