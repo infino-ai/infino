@@ -318,13 +318,10 @@ fn common_heavy_corpus(n: u64) -> Vec<(u64, String)> {
 
 #[tokio::test]
 async fn oracle_common_heavy_or_matches_brute_force_at_depth() {
-    // Phase-1 routing sends a common-heavy (uniform-UB) multi-term OR to
-    // the pruning MaxScore path instead of the non-pruning windowed scan.
-    // MaxScore prunes differently at each k (the competitive threshold
-    // engages later as k grows), so verify the *rerouted default* against
-    // ground-truth BM25 across the k regimes it now owns — not just against
-    // the windowed kernel it agrees with. The tie-free top-5 anchors make
-    // the head comparison deterministic regardless of tail tie-breaking.
+    // A common-heavy OR now defaults to MaxScore, which prunes differently at
+    // each k. Verify the rerouted default against ground-truth BM25 across k,
+    // not just against the windowed kernel it agrees with. The tie-free top-5
+    // anchors keep the head comparison deterministic under tail tie-breaking.
     let corp = common_heavy_corpus(4_000);
     let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
     let infino = build_infino_superfile(&corp_refs);

@@ -662,14 +662,10 @@ impl FtsReader {
     /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
     /// The ranged path carries no negation in v1.
     ///
-    /// Kernel choice mirrors `dispatch_or_algo` via the shared
-    /// `route_or_to_windowed` seam instead of hardcoding a kernel: MaxScore
-    /// is the default, and the windowed scan is used only when block-max
-    /// pruning is dead at this `k`. Routing through the same predicate as
-    /// the single-shot path is what keeps the SAME query on the SAME kernel
-    /// whether or not the fan-out sliced it (few large superfiles
-    /// post-compaction vs many small ones pre-compaction) — hardcoding BMM
-    /// here once caused an 11-24x post-compact broad-OR regression.
+    /// Kernel choice goes through the same `route_or_to_windowed` seam as the
+    /// single-shot path, so a query runs the same kernel whether or not the
+    /// fan-out sliced it — hardcoding BMM here once caused an 11-24x
+    /// post-compact broad-OR regression.
     pub(crate) fn search_or_range_prebuilt(
         &self,
         set: &OrCursorSet,
@@ -1359,14 +1355,10 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        // Phase-1 routing is k-gated, so this test exercises *both* ranged
-        // kernels. The uniform 4-term OR stays on MaxScore at the small
-        // top-k but falls to the windowed scan at K_ALL (k past the pruning
-        // cutoff); the dominant-UB shape stays on MaxScore at every k. Both
-        // entries route through the same `route_or_to_windowed` seam, so a
-        // query cannot silently run a different kernel sliced vs whole, and
-        // the invariant under test — partition union == un-ranged result —
-        // holds for either kernel. Assert the routing rather than assume it.
+        // k-gated routing exercises both ranged kernels: the uniform OR takes
+        // the windowed scan at K_ALL (deep k) but MaxScore at the small top-k;
+        // the dominant-UB OR stays on MaxScore throughout. Assert it rather
+        // than assume it, so a corpus tweak can't silently test one branch twice.
         let shapes: [&[&str]; 2] = [
             &["alpha", "beta", "gamma", "delta"],
             &["rareterm", "alpha", "beta"],

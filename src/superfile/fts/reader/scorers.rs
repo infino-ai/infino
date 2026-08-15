@@ -79,26 +79,13 @@ fn count_and_intersect_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
     acc.iter().map(|w| w.count_ones() as u64).sum()
 }
 
-/// Block-Max-AND upper bound at the leader's current doc, plus the window it
-/// is valid over. `cursors[0]` is the leader (positioned on a real doc in its
-/// current block); the rest are bounded by the block that *contains* that doc
-/// (`shallow_advance_block_to` + `inspect_block_max_bm25`), not by a max over
-/// every block spanning the leader's whole — possibly wide — block range. The
-/// sum is a true upper bound for every doc in `[leader_doc, window_end]`,
-/// where `window_end` is the smallest block boundary across the leader and all
-/// others: past it some cursor enters a new block and its bound may rise.
-///
-/// This is the tight per-block-pair bound. The looser range-max
-/// (`block_max_in_range` over the leader's full block) collapses to a common
-/// term's *global* max on a rare∧common query — where the rare leader's one
-/// block spans thousands of the common term's docs — so the skip almost never
-/// fires. Bounding by the single overlapping block instead lets the skip fire
-/// on a common term's locally-low regions, and skipping only to `window_end`
-/// keeps every skip provably safe.
-///
-/// The leader's block max and block end are passed in (its callers hold it
-/// split off from `others` for the flat-merge), and `others` is bounded and
-/// window-clamped in place via each cursor's `inspect_block` hint pointer.
+/// Block-Max-AND upper bound at the leader's doc, valid over
+/// `[leader_doc, window_end]` where `window_end` is the smallest block boundary
+/// across all cursors. Each non-leader is bounded by the single block that
+/// *contains* `leader_doc`, not a max over every block under the leader's whole
+/// (possibly wide) block — the looser range-max collapsed to a common term's
+/// global max on rare∧common queries, so the skip rarely fired. Leader block
+/// max/end are passed in (callers hold the leader split off for the flat-merge).
 fn block_max_and_bound(
     leader_block_max: f32,
     leader_block_end: u32,
@@ -576,17 +563,11 @@ impl FtsReader {
                 break;
             }
 
-            // Block-Max-AND pruning (scoring sinks only; the unranked
-            // sink's `bar()` is NEG_INFINITY, so this whole block is
-            // skipped). The bar is the kth-best once the heap fills, or
-            // the caller's seeded floor before that — whichever is higher.
-            // Bound the leader's current doc by the single block each other
-            // cursor has covering it (`block_max_and_bound`) — a tight
-            // per-block-pair sum — and, if it can't beat the bar, skip only
-            // to the smallest block boundary across all cursors, past which
-            // some bound may rise. Skipping the leader's *whole* block with
-            // a max over every overlapping block instead let a common term's
-            // global max swamp the bound so it rarely fired.
+            // Block-Max-AND pruning (scoring sinks only; unranked `bar()` is
+            // NEG_INFINITY). If the tight per-block-pair bound at the leader's
+            // doc can't beat the bar, skip to the smallest block boundary
+            // across all cursors (past which a bound may rise). See
+            // `block_max_and_bound`.
             let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
                 let leader_doc = cursors[0].current_doc_id();
@@ -736,12 +717,9 @@ impl FtsReader {
                 break;
             }
 
-            // Block-Max-AND pruning at the leader's current doc (scoring
-            // sinks only; the unranked sink's `bar()` is NEG_INFINITY, so
-            // this is skipped). The bar is the kth-best once the heap fills,
-            // or the caller's seeded floor before that — whichever is higher.
-            // Bound `c1` by the single block covering the leader doc and skip
-            // only to the nearer block boundary; see `block_max_and_bound`.
+            // Block-Max-AND pruning (scoring sinks only). Bound `c1` by the
+            // single block covering the leader doc; if it can't beat the bar,
+            // skip to the nearer block boundary. See `block_max_and_bound`.
             let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
                 let leader_doc = c0.current_doc_id();
@@ -1565,20 +1543,10 @@ impl FtsReader {
         // cross-segment floor (`floor_eff` unset) — seeding WAND's
         // threshold from a floor mis-prunes, so a live floor stays on
         // MaxScore.
-        // MaxScore is the default for multi-term OR, *including* the
-        // common-heavy (uniform upper-bound) shape. The old heuristic sent
-        // that shape to the non-pruning windowed scanner on the premise
-        // "no dominant term ⇒ MaxScore can't prune"; that is wrong at
-        // small/mid `k`, where the competitive threshold rises above the
-        // common terms' per-block maxima once the heap fills and MaxScore
-        // skips those blocks — pruning the windowed scan ignores (its cost
-        // is independent of `k`). Route to the windowed scan only when
-        // pruning is genuinely dead at this `k` (`route_or_to_windowed` →
-        // `or_topk_pruning_ineffective`: a long dominant list plus `k`
-        // deep enough that the rarer terms can no longer fill the heap, so
-        // the threshold collapses to the common term's upper bound). There
-        // the SIMD full scan does the same work MaxScore would, without the
-        // per-doc f-way merge.
+        // A 2-term rare+common OR goes to WAND+BMW (it pivots on the rare
+        // term); otherwise MaxScore by default, and the windowed scan only
+        // where pruning is dead — see `route_or_to_windowed`. WAND takes no
+        // filter or floor, so a negated / floored query skips it.
         let no_floor = floor_eff == f32::NEG_INFINITY;
         if cursors.len() == 2
             && k <= WAND_BMW_2TERM_MAX_K

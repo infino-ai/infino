@@ -352,30 +352,16 @@ pub(super) const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
 /// a dominant (rarer) term sits well above it. See [`no_dominant_term_ub`].
 pub(super) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 
-/// For a common-heavy (no-dominant-term) multi-term OR, the `k` at or below
-/// which MaxScore still out-prunes the non-pruning windowed scan, so the OR
-/// stays on MaxScore; above it the windowed SIMD scan wins.
-///
-/// Even with no dominant term MaxScore prunes at *small* `k`: once the heap
-/// fills, the competitive threshold (the k-th best score) rises above the
-/// common terms' per-block maxima and their blocks skip. As `k` grows the
-/// threshold falls until no block clears it, MaxScore degrades to a scalar
-/// full union scan, and the windowed scorer does that same scan far faster
-/// (SIMD, no per-doc f-way merge). Calibrated on the x86 cross-engine
-/// ranked-union bench: MaxScore wins decisively at page-sized `k` (tens of
-/// results) but already loses to the SIMD windowed scan by the low hundreds,
-/// so the crossover sits just above page size — the value is set below it.
-/// (The crossover is architecture-sensitive: on a wide-SIMD x86 host the
-/// windowed scan is relatively faster than on ARM, so this is tuned to the
-/// x86 target, not a local dev machine.)
+/// `k` cutoff for a common-heavy OR: at or below it MaxScore prunes (its
+/// heap fills and the threshold rises above the common terms' block maxima),
+/// so keep it there; above it pruning is dead and the SIMD windowed scan
+/// wins. Bench-tuned to the x86 target (the crossover is lower on wide-SIMD
+/// x86 than on ARM).
 pub(super) const OR_WINDOWED_UNIFORM_MAX_PRUNING_K: usize = 32;
 
-/// True when **no single term dominates** the score upper bound:
-/// `max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`. Uniform terms sit near
-/// the average — MaxScore can prune them only while the top-k threshold is
-/// high (small `k`); a dominant (typically rare) term sits well above it,
-/// and MaxScore / WAND can skip hard against it at any `k`. Cheap — the
-/// per-term upper bounds are already on the cursors.
+/// True when no single term dominates the score upper bound
+/// (`max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`). Such a "common-heavy" OR
+/// only prunes on MaxScore at small `k`; a dominant term skips hard at any `k`.
 pub(super) fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
     let total: f32 = cursors.iter().map(|c| c.term_max_bm25).sum();
     if total <= 0.0 {
@@ -389,24 +375,12 @@ pub(super) fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
     max <= OR_WINDOW_DOMINANCE_MULT * avg
 }
 
-/// Choose the non-pruning windowed union scorer over MaxScore+BMM for a
-/// multi-term OR — true only when block-max pruning is dead at this `k`, in
-/// either of two ways:
-///
-/// - **Dominant long list, deep `k`** ([`or_topk_pruning_ineffective`]): the
-///   heap can't fill without the common term's tail, so the threshold
-///   collapses to its upper bound and no block skips.
-/// - **Common-heavy (no dominant term), deep `k`**: with `>=
-///   OR_WINDOW_MIN_TERMS` uniform-upper-bound terms and `k >
-///   OR_WINDOWED_UNIFORM_MAX_PRUNING_K`, the threshold sits too low to skip
-///   any term's blocks. At small/mid `k` this shape stays on MaxScore, which
-///   still prunes once its heap fills — the case the old always-windowed
-///   heuristic got wrong.
-///
-/// Everything else defaults to MaxScore. Both the single-shot
-/// (`dispatch_or_algo`) and ranged (`search_or_range_prebuilt`) OR entries
-/// call this, so a query runs the same kernel whether or not the fan-out
-/// sliced it.
+/// Route a multi-term OR to the non-pruning windowed scan instead of MaxScore,
+/// true only where MaxScore's pruning is dead at this `k`: a dominant long list
+/// too deep to fill the heap without its tail ([`or_topk_pruning_ineffective`]),
+/// or a common-heavy shape past [`OR_WINDOWED_UNIFORM_MAX_PRUNING_K`]. Otherwise
+/// MaxScore. Shared by the single-shot and ranged OR entries so a query runs the
+/// same kernel whether or not the fan-out sliced it.
 pub(super) fn route_or_to_windowed(cursors: &[TermCursor], k: usize) -> bool {
     or_topk_pruning_ineffective(cursors, k)
         || (k > OR_WINDOWED_UNIFORM_MAX_PRUNING_K
