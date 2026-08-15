@@ -4288,6 +4288,23 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .update(&new_entries, &no_removals)
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
+        // Warm the DISK CACHE with the just-drained cell bytes — already
+        // resident in `pending_cache_inserts` — BEFORE building the graph, so
+        // the graph's full re-read of these same cells is served from the local
+        // cache instead of a cold GET of data we wrote seconds ago. Without
+        // this the drain re-reads the whole Sq16 plane back from object storage,
+        // the dominant drain-time cost on object-store deployments. The disk
+        // cache is URI-keyed and LRU-bounded, so if the membership CAS below
+        // loses, these entries are unreferenced and evicted under budget
+        // pressure. The in-memory store tier is NOT warmed here: it has no
+        // eviction, so pre-committing to it would pin bytes on a failed drain,
+        // and it is used only on cache-less (local) deployments that have no
+        // cold-read to avoid — its warm-through stays after the commit below.
+        if !pending_cache_inserts.is_empty()
+            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
+        {
+            warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
+        }
         let graph_ref = build_hnsw_graph_ref(storage.as_ref(), &prospective).await;
         list_metadata.graph_ref = Some(graph_ref);
         // Commit A (membership). Visibility-gating state MUST land here,
@@ -4316,12 +4333,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             DrainTestFailurePhase::AfterMembershipCommit,
             0,
         )?;
+        // In-memory store tier (cache-less deployments only): warmed after the
+        // commit succeeds, so a lost CAS never pins bytes in the non-evicting
+        // store. The disk cache was warmed before the graph build above.
         apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
-        if !pending_cache_inserts.is_empty()
-            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
-        {
-            warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
-        }
         if let Err(error) = fs::remove_dir_all(&drain_scratch)
             && error.kind() != io::ErrorKind::NotFound
         {
