@@ -2997,31 +2997,40 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn erase_superfile_local_copy_concurrent_with_a_fill_keeps_accounting_consistent() {
-        // GC can drop a URI while a fill for it is in flight. Either outcome is
-        // fine (the fill lands and leaves a dead entry a later eviction
-        // reclaims, or the drop wins), but accounting must match the outcome:
-        // bytes present exactly when the entry is.
+        // A fill and an erase race on one URI, 200 interleavings. Whichever wins, the
+        // byte count must equal what is actually cached, and a fill that lost its file
+        // to the erase must release what it reserved. Drift either way corrupts the
+        // budget: phantom bytes starve the cache, missing ones let it overrun.
         let (_dir, store) = test_store();
         let size = tiny_superfile_bytes().len() as u64;
 
         for _ in 0..RACE_ITERATIONS {
             let uri = SuperfileUri::new_v4();
             let filler = Arc::clone(&store);
-            let dropper = Arc::clone(&store);
+            let eraser = Arc::clone(&store);
             let fill =
                 tokio::spawn(async move { filler.insert_warm(&uri, tiny_superfile_bytes()).await });
-            let drop_task = tokio::spawn(async move { dropper.erase_superfile_local_copy(&uri) });
-            let (fill_res, drop_res) = tokio::join!(fill, drop_task);
-            fill_res.expect("fill task").expect("insert_warm");
-            drop_res.expect("drop task");
+            let erase = tokio::spawn(async move { eraser.erase_superfile_local_copy(&uri) });
+            let (fill_res, erase_res) = tokio::join!(fill, erase);
+            let filled = fill_res.expect("fill task").is_ok();
+            erase_res.expect("erase task");
 
             let s = store.stats();
             let expected = if s.n_entries == 1 { size } else { 0 };
             assert_eq!(
                 s.current_bytes, expected,
-                "bytes must match entry presence (entries={})",
+                "bytes must match entry presence (entries={}, filled={filled})",
                 s.n_entries
             );
+
+            if !filled {
+                assert_eq!(s.n_entries, 0, "a failed fill leaves no entry behind");
+                assert_eq!(
+                    s.current_bytes, 0,
+                    "a failed fill rolls its reservation back"
+                );
+            }
+
             // Leave a clean slate for the next iteration.
             store.erase_superfile_local_copy(&uri);
             assert_eq!(store.stats().current_bytes, 0);
