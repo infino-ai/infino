@@ -110,16 +110,13 @@ impl FtsReader {
             return Ok(drain_top_k_desc(heap));
         }
 
-        // Must-driven walk, two-phase per candidate: (1) align every must by
-        // its cheap approximation — a phrase advances only to a doc holding all
-        // its members, no position decode — so a selective must prunes the
-        // candidate set before any phrase pays for adjacency; (2) bar-skip on
-        // block-max upper bounds; (3) verify phrase positions and score only on
-        // the survivors. The old single-phase walk verified a phrase during
-        // alignment, decoding positions for every member co-occurrence — so a
-        // phrase of common words cost the same with or without a selective
-        // co-clause. Verifying only on the aligned intersection lets that
-        // co-clause prune the position work.
+        // Must-driven walk, two-phase per candidate: (1) align every must by its
+        // cheap approximation (a phrase advances only to a member co-occurrence,
+        // no positions); (2) bar-skip on block-max UBs; (3) verify phrase
+        // adjacency and score only on the survivors. The old single-phase walk
+        // verified phrases *during* alignment, so a phrase of common words cost
+        // the same with or without a selective co-clause; verifying only on the
+        // aligned intersection lets that clause prune the position work.
         let should_ub: f32 = shoulds.iter().map(AnyCursor::term_max_bm25).sum();
         let should_others_ub: Vec<f32> = {
             let must_ub_total: f32 = musts.iter().map(AnyCursor::term_max_bm25).sum();

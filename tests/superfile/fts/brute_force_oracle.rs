@@ -332,6 +332,60 @@ async fn oracle_common_heavy_or_matches_brute_force_at_depth() {
     }
 }
 
+/// Corpus where a common non-essential ("hot") has a high block-max only in a
+/// *mid-range* block. Five anchors in block 10 (ids 1281..1289) carry `lead` +
+/// `hot`×{10,9,8,7,6} — strictly-decreasing scores far above the bulk (bulk hot
+/// tf=1), so the tie-free top-5 lives entirely in that block. It gates the
+/// per-block bound's failure mode: the filter must advance each non-essential's
+/// `inspect_block` hint *into* block 10 and read its high max there; a stale
+/// hint would under-bound and wrongly drop a top-5 anchor — something the
+/// uniform / block-0-hot corpora can't catch.
+fn mid_hot_block_corpus() -> Vec<(u64, String)> {
+    const N: u64 = 2560; // 20 × 128-doc blocks
+    let anchors: [(u64, usize); 5] = [(1281, 10), (1283, 9), (1285, 8), (1287, 7), (1289, 6)];
+    let mut docs = Vec::with_capacity(N as usize);
+    for i in 0..N {
+        if let Some(&(_, hot_tf)) = anchors.iter().find(|&&(id, _)| id == i) {
+            let mut toks = vec!["lead".to_string()];
+            for _ in 0..hot_tf {
+                toks.push("hot".to_string());
+            }
+            docs.push((i, toks.join(" ")));
+            continue;
+        }
+        let mut toks: Vec<String> = Vec::new();
+        if i.is_multiple_of(80) {
+            toks.push("lead".to_string());
+        }
+        if i.is_multiple_of(2) {
+            toks.push("hot".to_string());
+        }
+        if i.is_multiple_of(3) {
+            toks.push("other".to_string());
+        }
+        if toks.is_empty() {
+            toks.push(format!("f{}", i % 50));
+        }
+        docs.push((i, toks.join(" ")));
+    }
+    docs
+}
+
+#[tokio::test]
+async fn oracle_maxscore_mid_hot_block_nonessential_bound() {
+    // 3-term OR with a dominant "lead" ⇒ routes to MaxScore (not windowed: not
+    // common-heavy; not the 2-term WAND path). The tie-free top-5 lives in the
+    // mid hot block, so a correct per-block non-essential bound is load-bearing.
+    let corp = mid_hot_block_corpus();
+    let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&corp_refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
+    for k in [10usize, 50] {
+        assert_top_k_head_agrees(&infino, &oracle, "lead hot other", 5, k).await;
+    }
+}
+
 #[tokio::test]
 async fn oracle_no_match_query_returns_empty() {
     // "xyzzy" is in none of the docs; both engines must return empty.

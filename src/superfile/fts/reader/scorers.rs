@@ -945,17 +945,13 @@ impl FtsReader {
                         cursors[0].current_tf(),
                         norm,
                     );
-                    // Per-doc UB tightening: bound the non-essentials at
-                    // `candidate` by each one's block-max for the block that
-                    // *contains* it — its local 128-doc max — not its global
-                    // term-max. The `inspect_block` hint advances monotonically
-                    // with `candidate`, so this is amortized O(1) per
-                    // non-essential. If even this tight bound can't beat the
-                    // threshold, skip the expensive non-essential `skip_to` +
-                    // SIMD score + heap entirely — the dominant per-doc cost.
-                    // A common non-essential's local block max is far below its
-                    // global max, so this fires on far more docs than the old
-                    // global-term-max bound did.
+                    // Bound the non-essentials at `candidate` by each one's
+                    // block-max for the block that *contains* it (via the
+                    // monotonic `inspect_block` hint — amortized O(1), no
+                    // decode), not by its global term-max. Far tighter for a
+                    // common term, so the skip below fires on many more docs,
+                    // dropping the non-essential `skip_to` + score + heap — the
+                    // dominant per-doc cost.
                     let mut others_ub = 0.0f32;
                     for c in cursors.iter_mut().skip(1) {
                         c.shallow_advance_block_to(candidate);
