@@ -926,14 +926,6 @@ impl FtsReader {
 
                 let block_end = cursors[0].current_block_last_doc_id();
                 let mut f_changed = false;
-                // Per-doc UB tightening: bound this doc's max possible
-                // score by `essential_score + sum_others_term_max`.
-                // If even this can't beat the heap threshold, skip
-                // the non-essential lookups + heap update entirely
-                // — those are the dominant per-doc cost. Only docs
-                // where the essential alone is "in striking distance"
-                // pay the full lookup price.
-                let others_term_ub = total_term_ub - cursors[0].term_max_bm25;
                 while !cursors[0].is_exhausted()
                     && cursors[0].current_doc_id() <= block_end
                     && cursors[0].current_doc_id() < doc_id_end
@@ -953,10 +945,23 @@ impl FtsReader {
                         cursors[0].current_tf(),
                         norm,
                     );
-                    if essential_score + others_term_ub <= threshold {
-                        // No combination of non-essential
-                        // contributions at `candidate` can push it
-                        // above threshold. Skip lookup + heap.
+                    // Per-doc UB tightening: bound the non-essentials at
+                    // `candidate` by each one's block-max for the block that
+                    // *contains* it — its local 128-doc max — not its global
+                    // term-max. The `inspect_block` hint advances monotonically
+                    // with `candidate`, so this is amortized O(1) per
+                    // non-essential. If even this tight bound can't beat the
+                    // threshold, skip the expensive non-essential `skip_to` +
+                    // SIMD score + heap entirely — the dominant per-doc cost.
+                    // A common non-essential's local block max is far below its
+                    // global max, so this fires on far more docs than the old
+                    // global-term-max bound did.
+                    let mut others_ub = 0.0f32;
+                    for c in cursors.iter_mut().skip(1) {
+                        c.shallow_advance_block_to(candidate);
+                        others_ub += c.inspect_block_max_bm25();
+                    }
+                    if essential_score + others_ub <= threshold {
                         cursors[0].next();
                         continue;
                     }
