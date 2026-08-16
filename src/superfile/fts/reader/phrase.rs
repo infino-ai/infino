@@ -510,7 +510,11 @@ impl PhraseCursor {
             }
             self.verify_scratch.truncate(w);
         }
-        Ok(self.verify_scratch.len() as u32)
+        // The surviving starts are this doc's phrase occurrences — its tf.
+        // Store it so `score_current` scores the phrase after a two-phase
+        // `verify_at` (the single-phase `skip_to_pruned` sets it itself).
+        self.current_tf = self.verify_scratch.len() as u32;
+        Ok(self.current_tf)
     }
 
     /// Score the phrase at its current doc with the caller-supplied

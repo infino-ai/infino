@@ -110,10 +110,17 @@ impl FtsReader {
             return Ok(drain_top_k_desc(heap));
         }
 
-        // Must-driven walk: leapfrog the musts to each common doc,
-        // score musts + landing shoulds there.
+        // Must-driven walk, two-phase per candidate: (1) align every must by
+        // its cheap approximation — a phrase advances only to a doc holding all
+        // its members, no position decode — so a selective must prunes the
+        // candidate set before any phrase pays for adjacency; (2) bar-skip on
+        // block-max upper bounds; (3) verify phrase positions and score only on
+        // the survivors. The old single-phase walk verified a phrase during
+        // alignment, decoding positions for every member co-occurrence — so a
+        // phrase of common words cost the same with or without a selective
+        // co-clause. Verifying only on the aligned intersection lets that
+        // co-clause prune the position work.
         let should_ub: f32 = shoulds.iter().map(AnyCursor::term_max_bm25).sum();
-        let must_others_ub = atom_slack(&musts, should_ub);
         let should_others_ub: Vec<f32> = {
             let must_ub_total: f32 = musts.iter().map(AnyCursor::term_max_bm25).sum();
             atom_slack(&shoulds, must_ub_total)
@@ -124,15 +131,17 @@ impl FtsReader {
                 true => heap.peek().expect("heap len == k").0.max(floor_eff),
                 false => floor_eff,
             };
+            // Phase 1 — approximate alignment (phrase = member co-occurrence,
+            // no positions).
             let mut aligned = target;
             let mut i = 0usize;
             while i < musts.len() {
                 let a = &mut musts[i];
-                a.skip_to_pruned(aligned, bar - must_others_ub[i], dl_norm_k1)?;
+                a.approx_skip_to(aligned);
                 if a.is_exhausted() {
                     break 'docs;
                 }
-                let here = a.current_doc_id();
+                let here = a.approx_current_doc();
                 if here > aligned {
                     aligned = here;
                     i = 0;
@@ -140,13 +149,10 @@ impl FtsReader {
                 }
                 i += 1;
             }
-            // Bar skip: the kth-best (or the seeded floor) minus the
-            // most the shoulds could add bounds what the musts must
-            // reach; a candidate whose must-side block bounds can't
-            // get there is dead without scoring (and, for phrase
-            // shoulds, without any position work). `>=`, not `>`: a
-            // doc exactly at the bar can still displace the incumbent
-            // kth-best on the ascending-doc-id tie-break.
+            // Bar skip on block-max UBs, before any position work: a candidate
+            // whose musts + shoulds can't reach the kth-best is dead without a
+            // verify. `>=`, not `>`: a doc exactly at the bar can still displace
+            // the incumbent kth-best on the ascending-doc-id tie-break.
             let scoring_needed = match bar > f32::NEG_INFINITY {
                 true => {
                     let must_ub: f32 = musts
@@ -157,22 +163,34 @@ impl FtsReader {
                 }
                 false => true,
             };
-            let admitted = scoring_needed
-                && match filter.as_mut() {
-                    Some(f) => f.admits(aligned)?,
-                    None => true,
-                };
-            if admitted {
-                let norm = dl_norm_k1.get(aligned);
-                let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
-                for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
-                    sh.skip_to_pruned(aligned, bar - others, dl_norm_k1)?;
-                    if !sh.is_exhausted() && sh.current_doc_id() == aligned {
-                        score += sh.score_current(norm);
+            if scoring_needed {
+                // Phase 2 — verify phrase adjacency at the aligned candidate;
+                // terms match trivially. Only survivors reach the position
+                // decode and scoring.
+                let mut matched = true;
+                for a in musts.iter_mut() {
+                    if !a.verify_at(aligned)? {
+                        matched = false;
+                        break;
                     }
                 }
-                if score > floor_eff {
-                    and_heap_push(&mut heap, k, None, score, aligned);
+                let admitted = matched
+                    && match filter.as_mut() {
+                        Some(f) => f.admits(aligned)?,
+                        None => true,
+                    };
+                if admitted {
+                    let norm = dl_norm_k1.get(aligned);
+                    let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
+                    for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
+                        sh.skip_to_pruned(aligned, bar - others, dl_norm_k1)?;
+                        if !sh.is_exhausted() && sh.current_doc_id() == aligned {
+                            score += sh.score_current(norm);
+                        }
+                    }
+                    if score > floor_eff {
+                        and_heap_push(&mut heap, k, None, score, aligned);
+                    }
                 }
             }
             let Some(next) = aligned.checked_add(1) else {
