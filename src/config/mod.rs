@@ -419,22 +419,26 @@ pub enum DrainConsolidate {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorSearchMode {
-    /// Grid routing to cells, then the manifest's stamped per-cell width.
-    /// The established IVF cell-scan path — the automatic fallback for any
-    /// corpus above `hnsw_max_docs` (where the resident graph won't fit RAM)
-    /// and for filtered / pre-drain / undrained-user queries.
+    /// DEFAULT. Grid routing to cells, then the manifest's stamped per-cell
+    /// width. The established IVF cell-scan path — also the automatic
+    /// fallback for any corpus above `hnsw_max_docs` (where the resident
+    /// graph won't fit RAM) and for filtered / pre-drain / undrained-user
+    /// queries.
+    #[default]
     Ivf,
     /// EXPERIMENTAL (opt-in): score every fine centroid globally and read the
     /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
     /// cold-read win at scale, not at small scale — see `config.yaml`.
     GlobalFineCentroid,
-    /// DEFAULT: walk a resident in-memory HNSW graph built over every row's
-    /// Sq16 codes, bypassing the grid, cell selection, and disk reads. Built
-    /// at drain and held resident for corpora `<= hnsw_max_docs`; above that
-    /// ceiling the graph is not built and queries fall back to `ivf`
-    /// automatically. Search walks it at the `k`-scaled `ef` law.
-    #[default]
-    Hnsw,
+    /// OPT-IN (`hnsw_ivf`): walk a resident in-memory HNSW graph built over
+    /// every row's Sq16 codes, bypassing the grid, cell selection, and disk
+    /// reads. Built at drain and held resident (RAM-pinned) for corpora
+    /// `<= hnsw_max_docs`; above that ceiling the graph is not built. The
+    /// `_ivf` suffix names the fallback: correctness never depends on the
+    /// graph being present — a missing graph (pre-drain, above the ceiling,
+    /// or a different column) always serves `ivf`. Search walks the graph at
+    /// the `k`-scaled `ef` law.
+    HnswIvf,
 }
 
 /// Vector-index build / search / drain tuning knobs. Grouped so the
@@ -507,18 +511,18 @@ pub struct VectorSettings {
     /// clusters within each cell into contiguous reads. Ignored under
     /// `search_mode = ivf`.
     pub global_fine_coalesce: bool,
-    /// For `search_mode = hnsw`: the upper bound on the calibration ef grid —
+    /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
     /// the winning `ef` per table into the persisted bundle. Must be at least
     /// the smallest candidate (128). Ignored under any other search mode.
     pub hnsw_ef_ceil: usize,
-    /// For `search_mode = hnsw`: the `ef_construction` beam used when
+    /// For `search_mode = hnsw_ivf`: the `ef_construction` beam used when
     /// building the resident HNSW (build-time only). Higher = better-
     /// connected graph => lower query latency at fixed recall, at a linear
     /// build cost and no extra resident memory. Ignored under any other
     /// search mode.
     pub hnsw_ef_construction: usize,
-    /// For `search_mode = hnsw`: base-layer (layer-0) graph degree. This is
+    /// For `search_mode = hnsw_ivf`: base-layer (layer-0) graph degree. This is
     /// the recall lever for high-dimensional vectors — the base layer must be
     /// denser as dimension grows or greedy search under-finds the true
     /// neighbors. `0` (the default) lets the drain calibrator pick it (sweep
@@ -530,13 +534,13 @@ pub struct VectorSettings {
     /// Recall shortfall below `target_recall` the hnsw graph is still accepted
     /// at before the drain gives up and serves ivf (`floor = target - this`).
     pub hnsw_recall_slack: f64,
-    /// For `search_mode = hnsw`: scale ceiling for the per-row **data**
+    /// For `search_mode = hnsw_ivf`: scale ceiling for the per-row **data**
     /// graph. The resident data HNSW is built at drain and persisted only
     /// when the table's doc count ≤ this; above it, only the centroid graph
     /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
     pub hnsw_max_docs: u64,
-    /// For `search_mode = hnsw`: row cap for the cheap calibration *probe*. On
+    /// For `search_mode = hnsw_ivf`: row cap for the cheap calibration *probe*. On
     /// a larger corpus, calibrate on a subsample of this many rows first; a
     /// probe that cannot register (optimistic subsample recall) skips the
     /// expensive full build → ivf, while a probe that registers proceeds to the
@@ -610,7 +614,7 @@ impl Default for VectorSettings {
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
-            search_mode: VectorSearchMode::Hnsw,
+            search_mode: VectorSearchMode::Ivf,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,

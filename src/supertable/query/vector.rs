@@ -1506,7 +1506,7 @@ fn score_cell_fp32(
     true
 }
 
-/// Warn that `search_mode = hnsw` is set but this query fell through to the
+/// Warn that `search_mode = hnsw_ivf` is set but this query fell through to the
 /// ivf scan, with the diagnosis the situation actually warrants:
 ///   - `has_graph_ref = false`: the table carries no resident graph at all —
 ///     pre-drain, or the corpus exceeds `hnsw_max_docs`.
@@ -1530,13 +1530,13 @@ fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
     if has_graph_ref {
         tracing::warn!(
             column,
-            "search_mode=hnsw but no resident graph for this column (another column \
+            "search_mode=hnsw_ivf but no resident graph for this column (another column \
              carries the graph, or a dim/emptiness mismatch); serving via ivf scan"
         );
     } else {
         tracing::warn!(
             column,
-            "search_mode=hnsw but no resident graph (pre-drain or corpus > hnsw_max_docs); \
+            "search_mode=hnsw_ivf but no resident graph (pre-drain or corpus > hnsw_max_docs); \
              serving via ivf scan"
         );
     }
@@ -2638,16 +2638,18 @@ impl SupertableReader {
                 "unknown vector column `{column}`"
             )));
         }
-        // HNSW search mode (`vector.search_mode = hnsw`): walk the resident
-        // graph built at drain over every row's Sq16 codes, bypassing the
-        // grid, cell selection, and disk reads. Only the hidden (drained)
+        // HNSW search mode (`vector.search_mode = hnsw_ivf`): walk the
+        // resident graph built at drain over every row's Sq16 codes, bypassing
+        // the grid, cell selection, and disk reads. Only the hidden (drained)
         // arm serves via the graph — the user/pre-drain arm always uses ivf,
         // exactly like the global-fine branch below (`hidden_vector_index`).
         // And even on the hidden arm, only when a VALID persisted graph
         // exists (dim-matches, right column, non-empty); if the drain skipped
         // it because the corpus exceeds `hnsw_max_docs`, or the query targets
-        // a different column, fall through to the ivf scan.
-        if !filtered && hidden_vector_index && vcfg.search_mode == config::VectorSearchMode::Hnsw {
+        // a different column, fall through to the ivf scan (the `_ivf` in the
+        // mode name).
+        if !filtered && hidden_vector_index && vcfg.search_mode == config::VectorSearchMode::HnswIvf
+        {
             if let Some(hits) = self.hnsw_search(column, query, k).await? {
                 return Ok(hits);
             }
@@ -8771,7 +8773,11 @@ mod tests {
             .expect("reader")
             .vector_hits("emb", &q, 1, VectorSearchOptions::new(), None)
             .expect("pre-drain search");
-        assert_eq!(hits.len(), 1, "pre-drain hnsw default must serve via ivf");
+        assert_eq!(
+            hits.len(),
+            1,
+            "pre-drain query must serve via ivf (no graph pre-drain)"
+        );
         assert!(
             hits[0].score < 1e-3,
             "top hit must be the exact one-hot match (distance ~0), not a collapse: {}",

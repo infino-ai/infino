@@ -167,23 +167,26 @@ vector:
 
   # Query search mode for the hidden vector index on the UNFILTERED path.
   # (Filtered queries, pre-drain, and the undrained user arm always use `ivf`.)
-  #   hnsw                 — DEFAULT: walk a resident in-memory HNSW graph built
+  #   ivf                  — DEFAULT: grid routing to cells, then the manifest's
+  #                          stamped per-cell width. The established scan path,
+  #                          and the automatic fallback for any corpus above
+  #                          hnsw_max_docs. Cache is NVMe-backed and reclaimable
+  #                          (scales down / to zero with activity).
+  #   hnsw_ivf             — OPT-IN: walk a resident in-memory HNSW graph built
   #                          over every row's Sq16 codes, bypassing the grid,
   #                          cell selection, and disk reads. Built at drain and
-  #                          held resident for corpora <= hnsw_max_docs; above
-  #                          that ceiling the graph is not built and queries fall
-  #                          back to `ivf` AUTOMATICALLY (the drain drops the
-  #                          graph ref when the drained count crosses the
-  #                          ceiling, and the query's valid-graph guard then
-  #                          serves ivf). Self-driving: fast where it fits.
-  #   ivf                  — grid routing to cells, then the manifest's stamped
-  #                          per-cell width. The established scan path, and the
-  #                          automatic fallback for any corpus above hnsw_max_docs.
+  #                          held resident (RAM-pinned) for corpora
+  #                          <= hnsw_max_docs; above that ceiling the graph is
+  #                          not built. The `_ivf` suffix names the fallback:
+  #                          a missing graph (pre-drain, above the ceiling, or a
+  #                          different column) serves `ivf` AUTOMATICALLY, so
+  #                          correctness never depends on the graph. Best for
+  #                          single-box, latency-tier, RAM-provisioned tables.
   #   global_fine_centroid — EXPERIMENTAL: score every fine centroid globally
   #                          across all cells and read the top fanout clusters,
   #                          bypassing the grid. A cold-read win at scale (10M+);
   #                          opt-in while the per-table fanout stamp is built.
-  search_mode: hnsw
+  search_mode: ivf
 
   # For search_mode = global_fine_centroid: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
@@ -202,7 +205,7 @@ vector:
   # within each cell into contiguous reads. Ignored under search_mode = ivf.
   global_fine_coalesce: false
 
-  # For search_mode = hnsw: upper bound on the calibration ef grid. The drain
+  # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table
   # ef into the persisted graph bundle; that stamped value drives every query.
   # Must be at least the smallest candidate (128). High-dim cosine tables need a
@@ -210,34 +213,34 @@ vector:
   # allows that; easy tables stamp well under it. Ignored under other modes.
   hnsw_ef_ceil: 2048
 
-  # For search_mode = hnsw: the ef_construction beam used to BUILD the
+  # For search_mode = hnsw_ivf: the ef_construction beam used to BUILD the
   # resident HNSW (build-time only, not per query). Higher = better-connected
   # graph => same recall at a smaller search beam => lower query latency, at a
   # linearly higher one-time build cost and NO extra resident memory. 200 is
   # the sweet spot for recall ~0.93-0.95; raise it only to push the >0.97 end.
   hnsw_ef_construction: 200
 
-  # For search_mode = hnsw: base-layer (layer-0) graph degree — the recall
+  # For search_mode = hnsw_ivf: base-layer (layer-0) graph degree — the recall
   # lever for high-dimensional vectors (the base layer must densify as
   # dimension grows or greedy search under-finds). 0 lets the drain calibrator
   # pick it (sweep to target_recall); a positive value overrides per table.
   # Memory scales with docs x m0 (base layer only), bounded by hnsw_max_docs.
   hnsw_m0: 0
 
-  # For search_mode = hnsw: how far below target_recall the graph is still
+  # For search_mode = hnsw_ivf: how far below target_recall the graph is still
   # accepted before the drain gives up and serves ivf (floor = target - this).
   # Widen to keep more hard high-dim tables on the fast graph; tighten to
   # demand near-target recall from the graph or step aside to ivf.
   hnsw_recall_slack: 0.01
 
-  # For search_mode = hnsw: scale ceiling for the per-row DATA graph. The
+  # For search_mode = hnsw_ivf: scale ceiling for the per-row DATA graph. The
   # resident data HNSW is built at drain and persisted only when the table's
   # doc count is at or below this; above it, only the (much smaller) centroid
   # graph is built and hnsw queries fall back to the scan path. ~10M
   # rows of Sq16 codes is the practical single-host resident ceiling.
   hnsw_max_docs: 10000000
 
-  # For search_mode = hnsw: row cap for the cheap calibration probe. On a
+  # For search_mode = hnsw_ivf: row cap for the cheap calibration probe. On a
   # larger corpus, calibrate on a subsample of this many rows first. Subsample
   # recall is optimistic (the m0 requirement grows with N), so a probe that
   # cannot register is a hard "graph-hostile distribution" signal → skip the

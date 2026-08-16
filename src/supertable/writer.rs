@@ -7768,12 +7768,21 @@ async fn publish_hnsw_blob(
 /// (GC-reclaimed) and keeps serving the prior generation.
 ///
 /// Scope: the per-row **data** graph for the first vector column, gated by
-/// `vector.hnsw_max_docs`. The scale-free **centroid** graph is not
-/// yet built here — the bundle carries an empty centroid section.
+/// `vector.search_mode = hnsw_ivf` and `vector.hnsw_max_docs`. The scale-free
+/// **centroid** graph is not yet built here — the bundle carries an empty
+/// centroid section.
 async fn build_hnsw_graph_ref(
     storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    // Opt-in gate: the resident data graph is built only when queries will
+    // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` (or
+    // `global_fine_centroid`) the drain skips the build entirely — no build
+    // tax, no RAM-pinned graph — and queries serve ivf.
+    if crate::config::global().vector.search_mode != crate::config::VectorSearchMode::HnswIvf {
+        tracing::debug!("hnsw: build skipped — search_mode is not hnsw_ivf");
+        return None;
+    }
     let Some(column) = manifest
         .options
         .vector_columns
