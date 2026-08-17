@@ -860,15 +860,25 @@ impl SupertableOptions {
         self
     }
 
-    /// Tokenizer configured for `column`, for tokenizing query text so
-    /// it matches how the column was indexed. Falls back to the ASCII
-    /// default when `column` is not a registered FTS column (the query
-    /// then fails downstream on the unknown column).
-    pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
+    /// Tokenizer configured for `column`, or `None` when `column` carries
+    /// no full-text index. `fts_tokenizers` is aligned to `fts_columns` (one
+    /// per column), so a hit on the column always yields its tokenizer — a
+    /// `None` return is exactly the "column is not full-text-indexed" signal,
+    /// which lets a search path reject up front instead of failing deep in
+    /// the scan. The lookup is a single pass over `fts_columns`.
+    pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
         self.fts_columns
             .iter()
             .position(|c| c.column == column)
             .and_then(|i| self.fts_tokenizers.get(i).cloned())
+    }
+
+    /// Tokenizer configured for `column`, for tokenizing query text so
+    /// it matches how the column was indexed. Falls back to the ASCII
+    /// default when `column` is not a registered FTS column; a caller that
+    /// must distinguish that case uses [`Self::try_fts_tokenizer_for`].
+    pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
+        self.try_fts_tokenizer_for(column)
             .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer))
     }
 

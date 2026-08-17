@@ -328,24 +328,21 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        // A bm25 query names a column that must carry a full-text index. If it
-        // does not, every candidate superfile lacks the full-text section this
-        // scan reads, and the low-level reader fails deep in the scan with an
-        // opaque missing-metadata error. Reject up front with a message that
-        // names the column and the searchable set.
-        if !manifest
-            .options
-            .fts_columns
-            .iter()
-            .any(|c| c.column == column)
-        {
+        let pool_threads = manifest.options.reader_pool.current_num_threads();
+        let column_owned = column.to_owned();
+
+        // Resolve the query tokenizer, which doubles as the column's
+        // full-text-index check: a `None` here means `column` carries no
+        // full-text index, so every candidate superfile would lack the
+        // full-text section this scan reads and the low-level reader would
+        // fail deep in the scan with an opaque missing-metadata error. Reject
+        // up front instead, naming the column and the searchable set.
+        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(column) else {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
                 &manifest.options.fts_columns,
             )));
-        }
-        let pool_threads = manifest.options.reader_pool.current_num_threads();
-        let column_owned = column.to_owned();
+        };
 
         // Parse the query once here, not per superfile, resolving the
         // bare tokens' polarity from the default operator (`And` ⇒
@@ -353,11 +350,7 @@ impl SupertableReader {
         // ('static) data for tokio::spawn, so this is the one place
         // the tokens are copied — the prune and every per-superfile
         // search reuse them.
-        let clauses = manifest
-            .options
-            .fts_tokenizer_for(column)
-            .parse(query)
-            .into_clauses(mode);
+        let clauses = tokenizer.parse(query).into_clauses(mode);
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
@@ -801,12 +794,10 @@ impl SupertableReader {
         // As in `bm25_search_async`: a prefix query over a column with no
         // full-text index would otherwise fail deep in the scan with an opaque
         // missing-metadata error. Reject up front, naming the searchable set.
-        if !manifest
-            .options
-            .fts_columns
-            .iter()
-            .any(|c| c.column == column)
-        {
+        // Prefix expansion lowercases the prefix bytes directly rather than
+        // tokenizing, so there is no tokenizer lookup to fold this into — but
+        // it is the same single pass over `fts_columns`, once per query.
+        if manifest.options.try_fts_tokenizer_for(column).is_none() {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
                 &manifest.options.fts_columns,
