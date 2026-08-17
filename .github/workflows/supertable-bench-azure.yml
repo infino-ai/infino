@@ -41,10 +41,15 @@ on:
         default: "main"
         type: string
       base_ref:
-        description: "A/B base arm ref (default main; set = ref for same-host noise)."
+        description: "A/B base arm ref (default main). Must differ from `ref` unless allow_same_ref is set."
         required: false
         default: "main"
         type: string
+      allow_same_ref:
+        description: "Permit ref == base_ref. Only for measuring the same-host noise floor (A/B of a ref against itself)."
+        required: false
+        default: false
+        type: boolean
       is_fork_pr:
         description: "Simulate a fork PR (runner checks out base tooling, not the ref; routes to the approval-gated env). For verifying fork-safe checkout."
         required: false
@@ -113,6 +118,9 @@ on:
       location:        { type: string, required: false, default: eastus }
       ref:             { type: string, required: false, default: main }
       base_ref:        { type: string, required: false, default: main }
+      # Opt-in for a ref benchmarked against itself (noise-floor measurement);
+      # otherwise two arms on the same commit fail the run as a config bug.
+      allow_same_ref:  { type: boolean, required: false, default: false }
       keep_table:      { type: boolean, required: false, default: false }
       timeout_minutes: { type: string, required: false, default: "60" }
       # Discriminator appended to resource names so parallel callers
@@ -219,6 +227,55 @@ jobs:
           echo "args=$args"       >> "$GITHUB_OUTPUT"
           echo "reports=$reports" >> "$GITHUB_OUTPUT"
           echo "args=[$args] reports=[$reports]"
+
+      # A/B needs two distinct arms: identical (or empty, hence defaulted) refs
+      # build the same commit twice and report noise as a delta. Runs before the
+      # VM exists so a misconfigured caller costs nothing.
+      - name: Validate A/B arms
+        env:
+          REF: ${{ inputs.ref }}
+          BASE_REF: ${{ inputs.base_ref }}
+          ALLOW_SAME_REF: ${{ inputs.allow_same_ref }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for v in REF BASE_REF; do
+            if [ -z "${!v}" ]; then
+              echo "::error::empty $v — the caller must pass both A/B arms explicitly (an omitted arm falls back to 'main', which would compare main against itself)"
+              exit 1
+            fi
+          done
+
+          same_arms() {
+            if [ "$ALLOW_SAME_REF" = "true" ]; then
+              echo "::warning::same-ref A/B ($1) — this measures the same-host noise floor, not a code change"
+              exit 0
+            fi
+            echo "::error::both A/B arms are the same commit ($1). Benchmarking a ref against itself measures noise, not a change. Pass two different refs, or set allow_same_ref=true for a deliberate noise-floor run."
+            exit 1
+          }
+
+          # Literal match: `main` vs `main`, the shape a caller lands on when it
+          # fails to pass the ref under test.
+          if [ "$REF" = "$BASE_REF" ]; then
+            same_arms "ref = base_ref = $REF"
+          fi
+
+          # SHA match: also catches `main` against main's tip SHA. A fork PR head
+          # isn't always reachable from the base repo, so an unresolvable arm is
+          # only a warning — the literal check above still holds.
+          resolve() { gh api "repos/$REPO/commits/$1" --jq .sha 2>/dev/null || true; }
+          REF_SHA="$(resolve "$REF")"
+          BASE_SHA="$(resolve "$BASE_REF")"
+          if [ -z "$REF_SHA" ] || [ -z "$BASE_SHA" ]; then
+            echo "::warning::could not resolve both arms to SHAs in $REPO (ref='$REF' -> '${REF_SHA:-unresolved}', base_ref='$BASE_REF' -> '${BASE_SHA:-unresolved}') — skipping the SHA-level same-commit check"
+            exit 0
+          fi
+          echo "A/B arms: ref=$REF ($REF_SHA) vs base_ref=$BASE_REF ($BASE_SHA)"
+          if [ "$REF_SHA" = "$BASE_SHA" ]; then
+            same_arms "$REF and $BASE_REF both resolve to $REF_SHA"
+          fi
 
       - name: Validate bench gate metric
         run: |
