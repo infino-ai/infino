@@ -102,6 +102,35 @@ fn block_max_and_bound(
     (ub, window_end)
 }
 
+/// Route a ranked AND to the membership walk ([`FtsReader::and_membership_scored`])
+/// instead of the block flat-merge. True only for v4 blobs — where a common
+/// term's blocks are bitset-encoded, so [`TermCursor::contains`] is an O(1)
+/// bit-test — with **≥3 terms** and a **very sparse rarest term**: driving the
+/// rarest doc-by-doc is then cheap and bit-testing the common others beats
+/// decoding their blocks to align them.
+///
+/// Two guards keep it off the shapes where it regressed the ranked tail:
+/// - **≥3 terms**: a 2-term AND keeps the specialized `and_flat_merge_2term`
+///   (two-pointer merge over the decoded blocks), which the membership walk was
+///   losing to.
+/// - **rarest < 1/`AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR`**: the walk gives up the
+///   flat-merge's heap-bar block skip, so it only pays when the rarest list is
+///   genuinely short. A looser bound regressed p99 where the bar-skip was
+///   working.
+fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> bool {
+    if !has_bitset_blocks || cursors.len() < 3 {
+        return false;
+    }
+    let max_doc = cursors
+        .iter()
+        .filter_map(|c| c.blocks.last())
+        .map(|b| b.last_doc_id)
+        .max()
+        .unwrap_or(0);
+    let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
+    min_df.saturating_mul(AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR) < u64::from(max_doc)
+}
+
 impl FtsReader {
     /// Multi-term OR via WAND + BlockMaxWAND.
     ///
@@ -399,11 +428,6 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
-        // Smallest-df cursor at index 0 = leader. The remaining order
-        // doesn't matter for correctness but ascending-df reduces the
-        // expected number of leapfrog bumps per candidate.
-        cursors.sort_by_key(|c| c.block_count());
-
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut sink = ScoreSink {
@@ -412,8 +436,66 @@ impl FtsReader {
             filter,
             floor_eff,
         };
-        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        if and_prefer_membership(self.has_bitset_blocks, &cursors) {
+            // Rarest-driven membership walk: bit-test the common terms instead
+            // of decoding their blocks to align them (the flat-merge's dominant
+            // cost on rare∧common). See `and_membership_scored`.
+            self.and_membership_scored(cursors, dl_norm_k1, &mut sink);
+        } else {
+            // Smallest-df cursor at index 0 = leader. Ascending-df order reduces
+            // the expected number of leapfrog bumps per candidate.
+            cursors.sort_by_key(|c| c.block_count());
+            self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        }
         Ok(drain_top_k_desc(heap))
+    }
+
+    /// Ranked AND via the same rarest-driven membership walk that the unranked
+    /// count path uses ([`count_and_intersect_membership`]), but scoring the
+    /// matches. Iterate the rarest term; for each of its docs, probe the others
+    /// with [`TermCursor::contains`] — a **bitset bit-test with no block decode**
+    /// — short-circuiting on the first miss. Only a doc present in *every* term
+    /// is materialized (decoded + positioned via [`TermCursor::materialize_at`])
+    /// and scored. This skips the flat-merge's per-leader-doc `skip_to` that
+    /// fully decodes a common term's 128-doc block to read one doc — the profiled
+    /// cost on n≥3-term AND with a common term. Score is `Σ` per-term BM25 at the
+    /// doc, identical to the flat-merge; emitted through the sink, so it serves
+    /// both the pure-AND and must+should sinks. Gated to the v4 bitset case with
+    /// a sparse rarest term (see [`and_prefer_membership`]); the flat-merge stays
+    /// for v1–v3 and the all-dense case.
+    fn and_membership_scored<S: AndSink>(
+        &self,
+        mut cursors: Vec<TermCursor>,
+        dl_norm_k1: &NormTable,
+        sink: &mut S,
+    ) {
+        let driver_idx = cursors
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, c)| c.block_count())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let mut driver = cursors.swap_remove(driver_idx);
+        let mut others = cursors;
+        while !driver.is_exhausted() {
+            let doc = driver.current_doc_id();
+            if others.iter_mut().all(|o| o.contains(doc)) {
+                let score = if sink.needs_score() {
+                    let norm = dl_norm_k1.get(doc);
+                    let mut s =
+                        bm25::score_with_dl_norm_k1(driver.idf_x_k1p1, driver.current_tf(), norm);
+                    for o in others.iter_mut() {
+                        o.materialize_at(doc);
+                        s += bm25::score_with_dl_norm_k1(o.idf_x_k1p1, o.current_tf(), norm);
+                    }
+                    s
+                } else {
+                    0.0
+                };
+                sink.emit(doc, score);
+            }
+            driver.next();
+        }
     }
 
     /// Ranked must+should walk: the match set is the musts'
