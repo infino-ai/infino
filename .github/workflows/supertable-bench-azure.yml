@@ -161,7 +161,9 @@ env:
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
   # Keepalive so a dead-but-unclosed SSH session fails in ~60s instead of
-  # hanging until the job timeout (ServerAliveInterval × CountMax).
+  # hanging until the job timeout (ServerAliveInterval × CountMax). Left
+  # unquoted at every use — it is a flag list meant to word-split, hence the
+  # `shellcheck disable=SC2086` at each ssh/scp call.
   SSH_OPTS: "-o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
   # Set "false" to suppress PR comments (summary-only).
   POST_PR_COMMENT: "true"
@@ -344,6 +346,7 @@ jobs:
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           for i in $(seq 1 30); do
+            # shellcheck disable=SC2086
             if ssh $SSH_OPTS -o ConnectTimeout=5 \
                  "${ADMIN}@${VM_IP}" true 2>/dev/null; then
               echo "SSH up after ${i} tries"; exit 0
@@ -360,6 +363,7 @@ jobs:
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           # Single-quoted heredoc: the body is literal; only the
           # ssh-line assignments reach the VM as env.
+          # shellcheck disable=SC2086
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "GH_TOKEN='${{ github.token }}' \
              REPO='${{ github.repository }}' \
@@ -428,6 +432,7 @@ jobs:
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          # shellcheck disable=SC2086
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
@@ -485,6 +490,7 @@ jobs:
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          # shellcheck disable=SC2086
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
@@ -514,6 +520,7 @@ jobs:
           # diffs them against the PR arm's metrics (collected later).
           mkdir -p baseline
           for j in $REPORTS; do
+            # shellcheck disable=SC2086
             scp $SSH_OPTS \
               "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "baseline/${j}.json" \
               2>/dev/null && echo "baseline staged: $j" \
@@ -524,6 +531,7 @@ jobs:
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          # shellcheck disable=SC2086
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
@@ -661,6 +669,7 @@ jobs:
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           mkdir -p current
           for j in $REPORTS; do
+            # shellcheck disable=SC2086
             scp $SSH_OPTS \
               "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "current/${j}.json" \
               2>/dev/null && echo "collected: $j" \
