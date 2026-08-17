@@ -4175,7 +4175,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .iter()
             .map(|entry| (entry.uri, Arc::clone(entry)))
             .collect();
-        let pending_cache_inserts = publish.pending_cache_inserts;
+        let mut pending_cache_inserts = publish.pending_cache_inserts;
         let pending_store_inserts = publish.pending_store_inserts;
         let multipart_threshold = hidden_inner.options.put_multipart_threshold_bytes;
         let put_futures = publish
@@ -4358,32 +4358,35 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .update(&new_entries, &no_removals)
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
-        // Warm the DISK CACHE with the just-drained cell bytes — already
-        // resident in `pending_cache_inserts` — BEFORE building the graph, so
-        // the graph's full re-read of these same cells is served from the local
-        // cache instead of a cold GET of data we wrote seconds ago. Without
-        // this the drain re-reads the whole Sq16 plane back from object storage,
-        // the dominant drain-time cost on object-store deployments. The disk
-        // cache is URI-keyed and LRU-bounded, so if the membership CAS below
-        // loses, these entries are unreferenced and evicted under budget
-        // pressure. The in-memory store tier is NOT warmed here: it has no
-        // eviction, so pre-committing to it would pin bytes on a failed drain,
-        // and it is used only on cache-less (local) deployments that have no
-        // cold-read to avoid — its warm-through stays after the commit below.
-        if !pending_cache_inserts.is_empty()
-            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
-        {
-            warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
-        }
         // Opt-in gate: only build the resident data graph when queries will
         // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` (or
         // `global_fine_centroid`) the drain skips the build — no build tax, no
         // RAM-pinned graph — and queries serve ivf. Gating here (not inside
         // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
         // build step.
-        let graph_ref = if crate::config::global().vector.search_mode
-            == crate::config::VectorSearchMode::HnswIvf
+        let building_graph =
+            crate::config::global().vector.search_mode == crate::config::VectorSearchMode::HnswIvf;
+        // Warm the DISK CACHE with the just-drained cell bytes — already
+        // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
+        // full re-read of these same cells is served from the local cache
+        // instead of a cold GET of data we wrote seconds ago (the dominant
+        // drain-time cost on object-store deployments). This pre-build warm
+        // exists ONLY to serve that re-read, so it is gated on the graph path:
+        // under `ivf`/`gfc` there is no re-read, and warming here would just
+        // overlap the warmed bytes with the commit's own buffers (higher peak
+        // file memory) for no benefit — those modes warm AFTER the commit
+        // below, matching the non-graph baseline. The disk cache is URI-keyed
+        // and LRU-bounded, so if the membership CAS below loses, these entries
+        // are unreferenced and evicted under budget pressure. The in-memory
+        // store tier is NOT warmed here: it has no eviction, so pre-committing
+        // to it would pin bytes on a failed drain.
+        if building_graph
+            && !pending_cache_inserts.is_empty()
+            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
         {
+            warm_cache_after_commit(&hidden_inner, cache, mem::take(&mut pending_cache_inserts));
+        }
+        let graph_ref = if building_graph {
             build_hnsw_graph_ref(storage.as_ref(), &prospective).await
         } else {
             None
@@ -4417,8 +4420,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         )?;
         // In-memory store tier (cache-less deployments only): warmed after the
         // commit succeeds, so a lost CAS never pins bytes in the non-evicting
-        // store. The disk cache was warmed before the graph build above.
+        // store.
         apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
+        // Disk-cache warm for the non-graph path (`ivf`/`gfc`): after the
+        // commit, matching the baseline ordering (lower peak file memory than
+        // warming before the commit). A no-op when the graph path already
+        // consumed the inserts in the pre-build warm above.
+        if !pending_cache_inserts.is_empty()
+            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
+        {
+            warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
+        }
         if let Err(error) = fs::remove_dir_all(&drain_scratch)
             && error.kind() != io::ErrorKind::NotFound
         {
