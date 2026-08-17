@@ -4305,7 +4305,19 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         {
             warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
         }
-        let graph_ref = build_hnsw_graph_ref(storage.as_ref(), &prospective).await;
+        // Opt-in gate: only build the resident data graph when queries will
+        // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` (or
+        // `global_fine_centroid`) the drain skips the build — no build tax, no
+        // RAM-pinned graph — and queries serve ivf. Gating here (not inside
+        // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
+        // build step.
+        let graph_ref = if crate::config::global().vector.search_mode
+            == crate::config::VectorSearchMode::HnswIvf
+        {
+            build_hnsw_graph_ref(storage.as_ref(), &prospective).await
+        } else {
+            None
+        };
         list_metadata.graph_ref = Some(graph_ref);
         // Commit A (membership). Visibility-gating state MUST land here,
         // atomically with `drained_ranges`: cells, watermark, and the resident
@@ -7767,22 +7779,16 @@ async fn publish_hnsw_blob(
 /// manifest ref, so a crash before the manifest CAS just orphans the blob
 /// (GC-reclaimed) and keeps serving the prior generation.
 ///
-/// Scope: the per-row **data** graph for the first vector column, gated by
-/// `vector.search_mode = hnsw_ivf` and `vector.hnsw_max_docs`. The scale-free
-/// **centroid** graph is not yet built here — the bundle carries an empty
-/// centroid section.
+/// Scope: the per-row **data** graph for the first vector column, gated here
+/// by `vector.hnsw_max_docs` (RAM ceiling). The opt-in `vector.search_mode =
+/// hnsw_ivf` gate lives at the sole caller (the drain), so this stays a pure
+/// build step — directly callable in tests without touching global config. The
+/// scale-free **centroid** graph is not yet built here — the bundle carries an
+/// empty centroid section.
 async fn build_hnsw_graph_ref(
     storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
-    // Opt-in gate: the resident data graph is built only when queries will
-    // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` (or
-    // `global_fine_centroid`) the drain skips the build entirely — no build
-    // tax, no RAM-pinned graph — and queries serve ivf.
-    if crate::config::global().vector.search_mode != crate::config::VectorSearchMode::HnswIvf {
-        tracing::debug!("hnsw: build skipped — search_mode is not hnsw_ivf");
-        return None;
-    }
     let Some(column) = manifest
         .options
         .vector_columns
@@ -9025,6 +9031,73 @@ mod tests {
     const COMMIT_AS_DRAIN_TEST_ROT_SEED: u64 = 7;
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
+
+    /// End-to-end coverage of the opt-in `hnsw_ivf` drain-build path, which the
+    /// default `ivf` mode no longer exercises (the caller now gates the build).
+    /// Drives the caller-gated build step directly on the drained cells
+    /// (`build_hnsw_graph_ref` → the full `assemble_hnsw_sections` build +
+    /// `publish_hnsw_blob` internally), fetches the published graph back, and
+    /// asserts it actually SERVES — a query on the batch's axis finds its exact
+    /// row through the fetched graph. Behavioral coverage, not a
+    /// build-and-forget stub: it would catch a wrong node→id map or a build
+    /// whose rows are unreachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hnsw_drain_full_build_serves_its_rows() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let dim = 32usize;
+        let rows = 256usize;
+        let half = dim / 2;
+        let table = Supertable::create(
+            options_title_emb_sq16(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+
+        let nearest = |data: &crate::superfile::vector::hnsw::HnswIndex, axis: usize| -> f32 {
+            let mut q = vec![0.0f32; dim];
+            q[axis] = 1.0;
+            data.graph
+                .search(&data.scorer, &q, 5, 128)
+                .into_iter()
+                .map(|(_, d)| d)
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        // Batch 1 on axes [0, half): append + drain (cells only — the default
+        // ivf caller-gate skips the graph build).
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch_range(rows, dim, 0, half))
+                .expect("append batch 1");
+            writer.commit().expect("commit batch 1");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("first drain");
+
+        // Full build directly off the drained cells (the now caller-gated step).
+        let reader1 = hidden.reader().expect("hidden reader");
+        let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
+            .await
+            .expect("full build registers a graph");
+        let prior = slow_vector_state::fetch_graph_sections(storage.as_ref(), &ref1)
+            .await
+            .expect("fetch built graph")
+            .data
+            .expect("data graph present after full build");
+        assert!(
+            nearest(&prior, 1) < 0.05,
+            "full-build graph must serve a batch-1 row"
+        );
+    }
 
     /// `SupertableWriter`'s `Debug` impl renders its buffered-batch summary.
     #[test]
