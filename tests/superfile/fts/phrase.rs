@@ -284,6 +284,64 @@ async fn phrase_block_crossing_rejection() {
 }
 
 #[tokio::test]
+async fn must_phrase_skips_cooccurring_nonadjacent() {
+    // The must-driven walk is two-phase: Phase 1 aligns each phrase must by
+    // member *co-occurrence* (no positions), Phase 2 verifies adjacency and
+    // scores only the survivors. This pins that Phase 2 actually rejects the
+    // docs where the members co-occur but are not adjacent — a verify bug would
+    // leak every co-occurrence into the must result.
+    //
+    // In the multi-block corpus alpha (every 3rd doc) and gamma (every 5th)
+    // co-occur at every 15th doc, but beta (every 4th) is planted between them
+    // whenever the doc is also divisible by 4 (i.e. divisible by 60), so
+    // `"alpha gamma"` is adjacent exactly at the docs divisible by 15 but not 4.
+    // Co-occurrence: 67 docs (multiples of 15); adjacent: 50 (those 67 minus the
+    // 17 multiples of 60, where beta splits the pair).
+    let owned = build_multi_block_corpus();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&refs);
+
+    // Guard the guard: the members really do co-occur at 67 docs (term-AND), so
+    // the smaller phrase result below is a Phase-2 rejection, not a thin
+    // intersection.
+    let cooccur = search_hits(&r, "+alpha +gamma", K_ALL_MULTI_BLOCK, BoolMode::Or).await;
+    assert_eq!(
+        cooccur.len(),
+        67,
+        "alpha and gamma co-occur at every 15th doc: {}",
+        cooccur.len()
+    );
+
+    // The must phrase keeps only the adjacent subset: the 17 docs divisible by
+    // 60, where beta sits between alpha and gamma, are aligned in Phase 1 and
+    // rejected in Phase 2.
+    let must_phrase = search_hits(&r, r#"+"alpha gamma""#, K_ALL_MULTI_BLOCK, BoolMode::Or).await;
+    assert_eq!(
+        must_phrase.len(),
+        50,
+        "must phrase matches only the adjacent docs (co-occurring-but-not-adjacent skipped): {}",
+        must_phrase.len()
+    );
+
+    // Pin the ranked walk against the oracle: the phrase must alone, the phrase
+    // must beside a should term (the should drags scoring onto verified docs),
+    // and the phrase as one of two musts (And). Small k keeps the pruning bar
+    // live through the two-phase walk, so a bug that skips or mis-scores a
+    // verified doc diverges from ground truth.
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    for (query, mode) in [
+        (r#"+"alpha gamma""#, BoolMode::Or),
+        (r#"+"alpha gamma" delta"#, BoolMode::Or),
+        (r#""alpha gamma" delta"#, BoolMode::And),
+    ] {
+        for k in [3usize, 10, K_ALL_MULTI_BLOCK] {
+            assert_matches_oracle(&r, &oracle, query, mode, k).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn truncated_top_k_pruning_agrees_with_oracle() {
     // Every query shape whose ranked walk can skip phrase
     // verification once the heap fills — a small k keeps the bar live
