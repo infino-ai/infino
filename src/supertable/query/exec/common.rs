@@ -143,8 +143,7 @@ pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
     projection: Option<&[&str]>,
-    what: &str,
-) -> DfResult<RecordBatch> {
+) -> Result<RecordBatch, QueryError> {
     let scalar_schema = reader.options().scalar_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
@@ -158,24 +157,37 @@ pub(crate) async fn resolve_hits_named(
         Some(names) => names,
         None => &bare,
     };
-    let indices: Option<Vec<usize>> = Some(
-        names
-            .iter()
-            .map(|name| {
-                output_schema.index_of(name).map_err(|_| {
-                    DataFusionError::Execution(format!("{what}: unknown column {name:?}"))
-                })
-            })
-            .collect::<Result<_, _>>()?,
-    );
-    resolve_hits(
-        reader,
-        hits,
-        &scalar_schema,
-        &output_schema,
-        indices.as_deref(),
-    )
-    .await
+    // Resolving a projected name to a column is caller-input validation, not
+    // query execution: the single-table search methods run their own kernels
+    // (no SQL engine involved), so an unknown column must read as a bad request
+    // that names the column and the valid set — never as an internal execution
+    // failure.
+    let indices: Vec<usize> = names
+        .iter()
+        .map(|name| {
+            output_schema
+                .index_of(name)
+                .map_err(|_| QueryError::InvalidQuery(unknown_column_message(name, &output_schema)))
+        })
+        .collect::<Result<_, _>>()?;
+    // Past name resolution, any failure is a store/decode fault reading the
+    // projected columns — not the caller's mistake.
+    resolve_hits(reader, hits, &scalar_schema, &output_schema, Some(&indices))
+        .await
+        .map_err(|e| QueryError::Store(e.to_string()))
+}
+
+/// Message for a projection naming a column the search output does not
+/// carry. Lists the selectable columns (`_id`, the visible scalar columns,
+/// and the trailing `score`) so the caller can correct the request.
+fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
+    let available = output_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("unknown column {name:?} in projection; valid columns: {available}")
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25

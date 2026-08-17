@@ -238,9 +238,7 @@ impl Supertable {
                 // stable id before the scalar decode, exactly as the
                 // hybrid TVF and `vector_search` paths do.
                 let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
-                resolve_hits_named(&reader, &hits, projection, "hybrid_search")
-                    .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))
+                resolve_hits_named(&reader, &hits, projection).await
             })
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
         Ok(vec![batch])

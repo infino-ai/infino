@@ -503,8 +503,8 @@ pub enum GcError {
 /// we don't propagate them as `#[from]`. Callers get the formatted
 /// message; structured introspection isn't a v1 concern. When the
 /// SQL surface gains a manifest-level skip planner, it'll get its
-/// own variant to distinguish "DataFusion failed" from "store
-/// failed mid-scan".
+/// own variant to distinguish "the query engine failed" from
+/// "store failed mid-scan".
 #[derive(Debug, Error)]
 pub enum QueryError {
     #[error("superfile store error during query: {0}")]
@@ -516,10 +516,10 @@ pub enum QueryError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
-    #[error("DataFusion failed to plan the query: {0}")]
+    #[error("failed to plan the query: {0}")]
     Plan(String),
 
-    #[error("DataFusion failed to execute the query: {0}")]
+    #[error("failed to run the query: {0}")]
     Execute(String),
 
     /// A query crossed the connection memory budget. The string is already

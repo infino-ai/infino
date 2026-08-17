@@ -120,6 +120,7 @@ use crate::{
     runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
+        builder::FtsConfig,
         error::{FtsError, ReadError},
         fts::{
             bm25,
@@ -188,6 +189,26 @@ impl UnrankedNegatives {
 /// anchor (e.g. `-foo`). Shared by the scored and unranked FTS paths so
 /// both reject the case identically.
 const NEGATION_ONLY_QUERY_MSG: &str = "only negated terms; at least one positive term is required";
+
+/// Message for a bm25 / token query naming a column that carries no
+/// full-text index. Names the requested column and the searchable set so the
+/// caller can correct the request, rather than failing deep in the scan with
+/// an opaque "missing full-text section" error once a candidate superfile is
+/// opened.
+fn no_fts_index_message(column: &str, fts_columns: &[FtsConfig]) -> String {
+    if fts_columns.is_empty() {
+        return format!(
+            "no full-text index for column {column:?}: this table has no \
+             full-text-indexed columns"
+        );
+    }
+    let available = fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("no full-text index for column {column:?}; full-text-indexed columns: {available}")
+}
 
 /// Cross-segment top-k score sharing for the BM25 fan-out.
 ///
@@ -307,6 +328,22 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
+        // A bm25 query names a column that must carry a full-text index. If it
+        // does not, every candidate superfile lacks the full-text section this
+        // scan reads, and the low-level reader fails deep in the scan with an
+        // opaque missing-metadata error. Reject up front with a message that
+        // names the column and the searchable set.
+        if !manifest
+            .options
+            .fts_columns
+            .iter()
+            .any(|c| c.column == column)
+        {
+            return Err(QueryError::InvalidQuery(no_fts_index_message(
+                column,
+                &manifest.options.fts_columns,
+            )));
+        }
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
@@ -761,6 +798,20 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
+        // As in `bm25_search_async`: a prefix query over a column with no
+        // full-text index would otherwise fail deep in the scan with an opaque
+        // missing-metadata error. Reject up front, naming the searchable set.
+        if !manifest
+            .options
+            .fts_columns
+            .iter()
+            .any(|c| c.column == column)
+        {
+            return Err(QueryError::InvalidQuery(no_fts_index_message(
+                column,
+                &manifest.options.fts_columns,
+            )));
+        }
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
@@ -1433,9 +1484,7 @@ impl SupertableReader {
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
             // only the projected columns.
-            let batch = resolve_hits_named(self, &hits, projection, "bm25_search")
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let batch = resolve_hits_named(self, &hits, projection).await?;
             Ok(vec![batch])
         })
     }
@@ -1807,13 +1856,8 @@ impl Supertable {
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "token_match",
-            ))
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("token_match", None))?;
+            .block_on_query(resolve_hits_named(&reader, &hits, projection))
+            .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         Ok(vec![batch])
     }
 
@@ -1838,13 +1882,8 @@ impl Supertable {
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "exact_match",
-            ))
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("exact_match", None))?;
+            .block_on_query(resolve_hits_named(&reader, &hits, projection))
+            .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         Ok(vec![batch])
     }
 
@@ -2541,6 +2580,50 @@ mod tests {
     }
 
     #[test]
+    fn bm25_search_unknown_projection_column_is_a_clean_error() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["rust async"])).expect("append");
+        w.commit().expect("commit");
+        let r = st.reader().expect("reader");
+
+        let err = r
+            .bm25_search(
+                "title",
+                "rust",
+                5,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                Some(&["title", "does_not_exist"]),
+            )
+            .expect_err("unknown projection column must error");
+
+        // A bad projection is caller input, not an engine failure: it comes
+        // back as InvalidQuery, names the offending column and the valid set,
+        // and never leaks the query engine's internals into the message. (The
+        // single-table search kernels run without the SQL engine at all, so a
+        // "DataFusion"/"Execution error" phrasing would be doubly misleading.)
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "expected InvalidQuery, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does_not_exist"),
+            "names the bad column: {msg}"
+        );
+        assert!(msg.contains("valid columns"), "lists valid columns: {msg}");
+        assert!(
+            msg.contains("title") && msg.contains("score"),
+            "valid set includes the real columns: {msg}"
+        );
+        assert!(
+            !msg.contains("DataFusion") && !msg.contains("Execution error"),
+            "must not leak query-engine internals: {msg}"
+        );
+    }
+
+    #[test]
     fn bm25_search_k_zero_short_circuits() {
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -2758,6 +2841,10 @@ mod tests {
     fn bm25_search_unknown_column_errors() {
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
+        // A committed superfile exists, so the query has real data to scan. The
+        // queried column carries no full-text index, though: the reject must
+        // happen up front, not deep in the scan where the low-level reader
+        // would surface an opaque storage-format error.
         w.append(&build_batch(0, &["rust"])).expect("append");
         w.commit().expect("commit");
 
@@ -2765,7 +2852,17 @@ mod tests {
         let err = r
             .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
-        assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+        assert!(matches!(err, QueryError::InvalidQuery(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no full-text index"),
+            "explains the miss: {msg}"
+        );
+        assert!(msg.contains("missing_column"), "names the column: {msg}");
+        assert!(
+            !msg.contains("inf.fts.offset") && !msg.contains("parquet"),
+            "must not leak the storage-format internals: {msg}"
+        );
     }
 
     #[test]

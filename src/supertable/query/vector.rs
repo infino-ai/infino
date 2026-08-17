@@ -3865,9 +3865,7 @@ impl SupertableReader {
                 return Ok(vec![batch]);
             }
             let hits = user_placement_for_scalar_resolve(self, &hits).await?;
-            let batch = resolve_hits_named(self, &hits, projection, "vector_search")
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let batch = resolve_hits_named(self, &hits, projection).await?;
             Ok(vec![batch])
         })
     }
