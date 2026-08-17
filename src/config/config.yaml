@@ -17,7 +17,7 @@
 # readable from files instead of reconstructed from process env.
 
 # Supertable runtime knobs. Reader fan-out (skip + per-superfile
-# search + top-k merge) and writer commit-time rayon-shard run on
+# search + top-k merge) and the writer's parallel commit builds run on
 # separate pools so a long-running commit can't spike reader p99 or
 # vice versa.
 #
@@ -42,11 +42,17 @@ supertable:
 
   # Threshold above which the supertable's writer triggers an
   # internal commit() to flush the in-memory buffer to disk-
-  # equivalent (one superfile per writer-pool thread). Specified
+  # equivalent. Specified
   # in mebibytes (1 MiB = 1024 × 1024 bytes). Set 0 to disable
   # auto-flush — only caller-driven commit() will produce
   # superfiles.
   commit_threshold_size_mb: 1024
+
+  # Split point for a commit's buffer, in mebibytes: the writer cuts the buffered
+  # rows every this many bytes and builds one superfile per piece, in parallel and
+  # capped by the writer pool. So the file count follows the data volume rather
+  # than the core count. Set 0 to fall back to one piece per writer-pool thread.
+  superfile_buffer_split_mb: 64
 
   # Verify the trailing whole-blob CRC and per-subsection CRCs
   # on every SuperfileReader::open. Defaults to true. Set to

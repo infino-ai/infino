@@ -746,6 +746,31 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
     selected
 }
 
+/// Widen a grid cell cutoff so the probed cells' indexed row counts cover at
+/// least `k`. `grid_cell_cutoff`'s slack window stops at the nearest near-tie
+/// cluster — a single cell for a query blended between two clusters — so a
+/// top-k request that spans cells could otherwise probe one undersized cell and
+/// return fewer than `k` rows. Walks the cell ranking past `cutoff`, adding each
+/// cell's indexed row count (from `postings_by_cell`) until coverage reaches `k`
+/// or the ranking is exhausted. A no-op once the already-probed cells hold `k`
+/// (the common single-cluster case, and every cell large relative to `k` at
+/// scale), so a sufficient query is never widened.
+fn cover_k_cell_cutoff(
+    cutoff: usize,
+    ranked: &[(u32, f32)],
+    postings_by_cell: &HashMap<u32, u64>,
+    k: usize,
+) -> usize {
+    let cell_rows = |cell: u32| postings_by_cell.get(&cell).copied().unwrap_or(0);
+    let mut covered: u64 = ranked[..cutoff].iter().map(|(c, _)| cell_rows(*c)).sum();
+    let mut cut = cutoff;
+    while cut < ranked.len() && covered < k as u64 {
+        covered += cell_rows(ranked[cut].0);
+        cut += 1;
+    }
+    cut
+}
+
 // Serve-time near-tie window on the exact-fine cell ranking (#515),
 // law-pinned default path only. Past the law's width, selection keeps
 // following the ranking while each next cell's best exact fine score
@@ -2921,6 +2946,19 @@ impl SupertableReader {
                 ));
             }
             let cutoff = grid_cell_cutoff(&ranked_for_beam, &cell_routing);
+            // Default routing only: a top-k request with no caller `nprobe`
+            // must probe enough cells to actually hold `k` rows. The slack
+            // window above stops at the nearest near-tie cluster, so a query
+            // blended between two clusters selects one undersized cell and
+            // returns fewer than `k`; widen along the grid ranking until the
+            // probed cells cover `k`. No-op once the nearest cell(s) already
+            // hold `k`. An explicit caller `nprobe` is a deliberate width
+            // constraint and is left untouched even when it under-fills `k`.
+            let cutoff = if options.nprobe.is_none() {
+                cover_k_cell_cutoff(cutoff, &ranked_for_beam, &postings_by_cell, k)
+            } else {
+                cutoff
+            };
             // 1-bit prefilter for the exact fine scan: the grid's cutoff
             // picks are must-include so every cell the beam can select has
             // exact candidate scores (near-tie checks included). Filtered

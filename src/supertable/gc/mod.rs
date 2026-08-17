@@ -17,7 +17,7 @@ use crate::{
         error::GcError,
         handle::SupertableInner,
         manifest::{
-            SUPERFILE_DATA_DIR,
+            SUPERFILE_DATA_DIR, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
@@ -271,6 +271,14 @@ pub(super) async fn gc_storage_sweep_for_inner(
     }
 
     for (key, size) in candidates {
+        // Drop the cache copy first.
+        if let (Some(cache), Some(uri)) = (
+            inner.options.disk_cache.as_ref(),
+            SuperfileUri::from_storage_path(&key),
+        ) {
+            cache.erase_superfile_local_copy(&uri);
+        }
+
         match storage.delete(&key).await {
             Ok(()) => {
                 report.objects_deleted += 1;
@@ -302,7 +310,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::{LocalFsStorageProvider, StorageProvider},
+        storage::{LocalFsStorageProvider, PrefixedStorageProvider, StorageProvider},
         supertable::{
             SupertableOptions,
             manifest::{
@@ -316,6 +324,37 @@ mod tests {
         },
         test_helpers::default_supertable_options,
     };
+
+    /// The hidden vector index sweeps through a `PrefixedStorageProvider`, which
+    /// strips its sub-prefix on list. Its keys therefore reach the cache
+    /// drop-through in the same `data/seg-<uuid>.sf.parquet` shape as the user
+    /// table's, so the sweep drops the right entry from the shared cache.
+    #[tokio::test]
+    async fn keys_listed_through_a_prefixed_provider_parse_as_superfile_uris() {
+        let dir = tempdir().expect("tempdir");
+        let root: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let prefixed: Arc<dyn StorageProvider> = Arc::new(PrefixedStorageProvider::new(
+            Arc::clone(&root),
+            "hidden-index-prefix/",
+        ));
+        let uri = SuperfileUri::new_v4();
+        prefixed
+            .put_atomic(&uri.storage_path(), bytes::Bytes::from_static(b"superfile"))
+            .await
+            .expect("put");
+
+        let listed = prefixed
+            .list_with_prefix_metadata(SUPERFILE_DATA_DIR)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1, "the prefixed listing sees its own object");
+        assert_eq!(
+            SuperfileUri::from_storage_path(&listed[0].0),
+            Some(uri),
+            "prefix-stripped key parses back to the URI GC must drop"
+        );
+    }
 
     /// Bucket count for a minimal hash-partitioned manifest list fixture.
     const TEST_HASH_BUCKETS: u32 = 1;

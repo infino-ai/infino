@@ -616,15 +616,23 @@ jobs:
           ERRORS="$(cat /tmp/bench.errors 2>/dev/null || true)" \
             python3 .github/scripts/bench_summary.py
 
-      # Enforce the merge-blocking benchmark gate: a time metric worse than
-      # the same-host main baseline by BOTH >50% and >5 ms fails this job
+      # Enforce the merge-blocking benchmark gate: a warm/wall time metric worse
+      # than the same-host main baseline by BOTH >50% and >5 ms fails this job
       # (bench_summary.py writes the verdict; the 5% findings stay advisory).
-      # A separate step so the summary still posts to the PR on FAIL.
+      # Cold movers are reported as warnings — they track object-store network
+      # variance, not the diff. A separate step so the summary still posts on FAIL.
       - name: Enforce benchmark merge gate
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           STATUS_FILE=/tmp/bench-gate.status
+          INFO_FILE=/tmp/bench-gate.info
+          if [ -s "$INFO_FILE" ]; then
+            echo "::warning::cold movers past >50% AND >5ms vs main (informational, not gating):"
+            while IFS= read -r line; do
+              echo "::warning::  $line"
+            done < "$INFO_FILE"
+          fi
           if [ ! -f "$STATUS_FILE" ]; then
             echo "no gate verdict produced (no baseline or summary skipped) — pass"
             exit 0

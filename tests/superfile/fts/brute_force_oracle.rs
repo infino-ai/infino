@@ -276,6 +276,62 @@ async fn oracle_three_term_query_top5_set_matches() {
     assert_top_k_head_agrees(&infino, &oracle, "rust web framework", 3, 10).await;
 }
 
+/// A common-heavy 4-term corpus: four terms each in ~half the docs (no
+/// single dominant list — the "uniform upper bound" OR shape), plus five
+/// short high-tf anchor docs whose scores strictly decrease, giving a
+/// tie-free top-5 head. Large enough (`n`) that a k=1000 search exercises
+/// a genuinely deep top-k, not "return everything".
+fn common_heavy_corpus(n: u64) -> Vec<(u64, String)> {
+    let terms = ["alpha", "beta", "gamma", "delta"];
+    let mut docs = Vec::with_capacity(n as usize);
+    // Anchors 0..5: all four terms repeated (6-i) times ⇒ tf 6,5,4,3,2,
+    // each strictly above the bulk's tf=1, and strictly decreasing among
+    // themselves ⇒ a deterministic, tie-free top-5.
+    for i in 0..5u64 {
+        let reps = 6 - i as usize;
+        let mut doc = String::new();
+        for name in terms {
+            for _ in 0..reps {
+                doc.push_str(name);
+                doc.push(' ');
+            }
+        }
+        docs.push((i, doc.trim().to_string()));
+    }
+    // Bulk: each term present (tf=1) in a different ~half of the docs, on
+    // staggered strides so the four dfs are close (no dominant term) but
+    // the memberships differ per doc.
+    for i in 5..n {
+        let mut toks: Vec<&str> = Vec::new();
+        for (t, name) in terms.iter().enumerate() {
+            if (i + t as u64).is_multiple_of(2) {
+                toks.push(name);
+            }
+        }
+        if toks.is_empty() {
+            toks.push("filler");
+        }
+        docs.push((i, toks.join(" ")));
+    }
+    docs
+}
+
+#[tokio::test]
+async fn oracle_common_heavy_or_matches_brute_force_at_depth() {
+    // A common-heavy OR now defaults to MaxScore, which prunes differently at
+    // each k. Verify the rerouted default against ground-truth BM25 across k,
+    // not just against the windowed kernel it agrees with. The tie-free top-5
+    // anchors keep the head comparison deterministic under tail tie-breaking.
+    let corp = common_heavy_corpus(4_000);
+    let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&corp_refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
+    for k in [10usize, 100, 1000] {
+        assert_top_k_head_agrees(&infino, &oracle, "alpha beta gamma delta", 5, k).await;
+    }
+}
+
 #[tokio::test]
 async fn oracle_no_match_query_returns_empty() {
     // "xyzzy" is in none of the docs; both engines must return empty.

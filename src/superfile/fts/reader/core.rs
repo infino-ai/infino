@@ -325,16 +325,6 @@ pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
 /// this same boundary to decide when a ranged kernel is heavy enough to
 /// ship to the reader pool (see `RANGED_KERNEL_POOL_MIN_TERMS`).
 pub(crate) const OR_WINDOW_MIN_TERMS: usize = 3;
-/// Route a multi-term OR to the windowed union scorer only when the top
-/// term's score upper bound is at most this multiple of the *average*
-/// term upper bound — i.e. no single term dominates. Uniform terms sit at
-/// ~1.0× the average (MaxScore can't prune them → windowed wins); a
-/// dominant rare term sits well above it (MaxScore prunes hard → it stays
-/// on MaxScore). Calibrated on the 1M tier; re-measured on every bench
-/// run by the superfile tier's per-algorithm probes
-/// (`benches/utils/superfile.rs`), whose shapes sit on both sides of
-/// this threshold.
-pub(super) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 
 /// Largest `k` for which a 2-term OR routes to WAND+BMW instead of
 /// MaxScore. WAND's pivot pruning needs a high top-k threshold to skip
@@ -356,13 +346,22 @@ pub(super) const WAND_BMW_2TERM_MAX_K: usize = 128;
 /// (long list), which WAND can't skip — only df separates the cases.
 pub(super) const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
 
-/// True when **no single term dominates** the score upper bound:
-/// `max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`. Uniform terms sit near
-/// the average — MaxScore can't prune them (its essential set never
-/// shrinks); a dominant (typically rare) term sits well above it, and
-/// MaxScore / WAND can skip hard against it. Shared by the windowed-union
-/// and 2-term WAND routers, which want opposite sides of this test. Cheap
-/// — the per-term upper bounds are already on the cursors.
+/// Score upper-bound spread below which a multi-term OR counts as
+/// "common-heavy" (no single term dominates): `max_ub <=
+/// OR_WINDOW_DOMINANCE_MULT * avg_ub`. Uniform terms sit near the average;
+/// a dominant (rarer) term sits well above it. See [`no_dominant_term_ub`].
+pub(super) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
+
+/// `k` cutoff for a common-heavy OR: at or below it MaxScore prunes (its
+/// heap fills and the threshold rises above the common terms' block maxima),
+/// so keep it there; above it pruning is dead and the SIMD windowed scan
+/// wins. Bench-tuned to the x86 target (the crossover is lower on wide-SIMD
+/// x86 than on ARM).
+pub(super) const OR_WINDOWED_UNIFORM_MAX_PRUNING_K: usize = 32;
+
+/// True when no single term dominates the score upper bound
+/// (`max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`). Such a "common-heavy" OR
+/// only prunes on MaxScore at small `k`; a dominant term skips hard at any `k`.
 pub(super) fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
     let total: f32 = cursors.iter().map(|c| c.term_max_bm25).sum();
     if total <= 0.0 {
@@ -376,12 +375,17 @@ pub(super) fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
     max <= OR_WINDOW_DOMINANCE_MULT * avg
 }
 
-/// Choose the windowed union scorer over MaxScore+BMM for a multi-term
-/// OR: true when there are enough terms to amortize the window and no
-/// single term dominates (so MaxScore degrades to scoring the whole
-/// union).
-pub(super) fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
-    cursors.len() >= OR_WINDOW_MIN_TERMS && no_dominant_term_ub(cursors)
+/// Route a multi-term OR to the non-pruning windowed scan instead of MaxScore,
+/// true only where MaxScore's pruning is dead at this `k`: a dominant long list
+/// too deep to fill the heap without its tail ([`or_topk_pruning_ineffective`]),
+/// or a common-heavy shape past [`OR_WINDOWED_UNIFORM_MAX_PRUNING_K`]. Otherwise
+/// MaxScore. Shared by the single-shot and ranged OR entries so a query runs the
+/// same kernel whether or not the fan-out sliced it.
+pub(super) fn route_or_to_windowed(cursors: &[TermCursor], k: usize) -> bool {
+    or_topk_pruning_ineffective(cursors, k)
+        || (k > OR_WINDOWED_UNIFORM_MAX_PRUNING_K
+            && cursors.len() >= OR_WINDOW_MIN_TERMS
+            && no_dominant_term_ub(cursors))
 }
 
 /// Minimum dominant-term df for the deep-`k` reroute to the windowed

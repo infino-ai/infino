@@ -228,6 +228,8 @@ pub struct CacheStats {
     /// by the idle-threshold sweep thread. Includes individual
     /// `sweep_once()` invocations.
     pub n_madvise_calls: u64,
+    /// Total count of entries dropped because GC deleted from objectstore.
+    pub n_gc_drops: u64,
 }
 
 /// Pulls superfile bytes through a [`StorageProvider`] and
@@ -262,6 +264,7 @@ pub struct DiskCacheStore {
     budget_warned: AtomicBool,
     n_cold_fetches: AtomicU64,
     n_evictions: AtomicU64,
+    n_gc_drops: AtomicU64,
     n_madvise_calls: AtomicU64,
     /// Number of callers explicitly waiting for lazy background
     /// promotion. A waiter means promotion is now latency-critical,
@@ -334,6 +337,7 @@ impl DiskCacheStore {
             budget_warned: AtomicBool::new(false),
             n_cold_fetches: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
+            n_gc_drops: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
@@ -752,6 +756,7 @@ impl DiskCacheStore {
             n_cold_fetches: self.n_cold_fetches.load(Ordering::Acquire),
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
+            n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
         }
     }
 
@@ -1806,6 +1811,30 @@ impl DiskCacheStore {
         Ok(())
     }
 
+    /// Erase every local trace of a superfile: its in-memory index entry, the promoted file, the
+    /// sparse block sidecar, and the per-URI fetch coordinator.
+    ///
+    /// GC calls this immediately before deleting the superfile from storage, so the local copy never
+    /// outlives its source. Returns whether an index entry was present, which is what `n_gc_drops`
+    /// counts.
+    pub(crate) fn erase_superfile_local_copy(&self, uri: &SuperfileUri) -> bool {
+        let present = if let Some((_, entry)) = self.cached.remove(uri) {
+            self.release_entry_accounting(&entry);
+            true
+        } else {
+            false
+        };
+
+        self.coordinators.remove(uri);
+        let _ = fs::remove_file(self.cache_path(uri));
+        let _ = fs::remove_file(self.blocks_path(uri));
+        if present {
+            self.n_gc_drops.fetch_add(1, Ordering::AcqRel);
+        }
+
+        present
+    }
+
     /// Fetch `size` bytes from `storage_uri` into `dest_path`
     /// via parallel range-GETs. Mutex-serialized writes; the
     /// fetches are the slow path so the per-write mutex
@@ -2840,6 +2869,9 @@ mod tests {
     const TEST_TINY_BUDGET_BYTES: u64 = 4;
     /// A comfortably large budget floor for the raise paths.
     const TEST_RAISED_FLOOR_BYTES: u64 = 1 << 20;
+    /// Attempts per interleaving-sensitive test; enough to surface a torn
+    /// drop-vs-fill without making the suite slow.
+    const RACE_ITERATIONS: usize = 200;
 
     #[tokio::test]
     async fn auto_budget_is_raised_and_admits_previously_oversized_entry() {
@@ -2879,6 +2911,147 @@ mod tests {
         store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
         assert_eq!(store.disk_budget_bytes(), TEST_TINY_BUDGET_BYTES);
         assert_eq!(store.stats().budget_bytes, TEST_TINY_BUDGET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn erase_superfile_local_copy_removes_entry_file_and_accounting() {
+        // GC drop-through: a dropped URI leaves no entry, no promoted file, no
+        // block sidecar, and balanced byte accounting.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("insert_warm");
+        assert!(store.cache_path(&uri).is_file());
+        assert_eq!(store.stats().n_entries, 1);
+
+        assert!(store.erase_superfile_local_copy(&uri), "entry was present");
+        let s = store.stats();
+        assert_eq!(s.n_entries, 0);
+        assert_eq!(s.current_bytes, 0, "accounting released");
+        assert_eq!(s.n_gc_drops, 1);
+        assert!(!store.cache_path(&uri).exists(), "promoted file unlinked");
+        assert!(!store.blocks_path(&uri).exists(), "block sidecar unlinked");
+
+        // A second drop of the same URI is a no-op, and a never-cached URI
+        // reports absent — only real drops count.
+        assert!(!store.erase_superfile_local_copy(&uri));
+        assert!(!store.erase_superfile_local_copy(&SuperfileUri::new_v4()));
+        assert_eq!(store.stats().n_gc_drops, 1);
+    }
+
+    #[tokio::test]
+    async fn erase_superfile_local_copy_keeps_a_held_reader_alive() {
+        // GC can drop a URI a query is reading. The mapping survives: unlink
+        // removes the directory entry, not the inode, so the held `Arc<Mmap>`
+        // keeps faulting valid pages (this is why eviction has always been
+        // safe under live readers).
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("insert_warm");
+        let held = store.reader(&uri).await.expect("reader");
+        let n_docs = held.n_docs();
+
+        assert!(store.erase_superfile_local_copy(&uri));
+        assert!(!store.cache_path(&uri).exists(), "file unlinked");
+
+        // Same reader, after the drop: still serving its own mapping.
+        assert_eq!(held.n_docs(), n_docs, "held reader still reads its mmap");
+
+        // A refetch of the same URI writes a fresh inode via tmp + rename, so
+        // it cannot zero the bytes the held reader is still mapping.
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("refetch after drop");
+        assert_eq!(
+            held.n_docs(),
+            n_docs,
+            "refetch left the held mapping intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn erase_superfile_local_copy_leaves_source_owned_accounting_to_its_owner() {
+        // A block-backed entry's bytes are accounted by the block source, not
+        // the entry (`EntryAccounting::SourceOwned`). Dropping the entry must
+        // not decrement for it — the source's own release does that, and a
+        // second decrement here would underflow `current_bytes`.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let filled = Arc::new(AtomicU64::new(4096));
+        let token = Arc::new(());
+        store.install_block_entry_for_test(uri, Arc::clone(&filled), Arc::clone(&token));
+        assert_eq!(store.stats().current_bytes, 0, "source owns these bytes");
+
+        assert!(store.erase_superfile_local_copy(&uri), "entry was present");
+        let s = store.stats();
+        assert_eq!(s.n_entries, 0);
+        assert_eq!(s.current_bytes, 0, "no decrement, no underflow");
+        assert_eq!(s.n_gc_drops, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn erase_superfile_local_copy_concurrent_with_a_fill_keeps_accounting_consistent() {
+        // A fill and an erase race on one URI, 200 interleavings. Whichever wins, the
+        // byte count must equal what is actually cached, and a fill that lost its file
+        // to the erase must release what it reserved. Drift either way corrupts the
+        // budget: phantom bytes starve the cache, missing ones let it overrun.
+        let (_dir, store) = test_store();
+        let size = tiny_superfile_bytes().len() as u64;
+
+        for _ in 0..RACE_ITERATIONS {
+            let uri = SuperfileUri::new_v4();
+            let filler = Arc::clone(&store);
+            let eraser = Arc::clone(&store);
+            let fill =
+                tokio::spawn(async move { filler.insert_warm(&uri, tiny_superfile_bytes()).await });
+            let erase = tokio::spawn(async move { eraser.erase_superfile_local_copy(&uri) });
+            let (fill_res, erase_res) = tokio::join!(fill, erase);
+            let filled = fill_res.expect("fill task").is_ok();
+            erase_res.expect("erase task");
+
+            let s = store.stats();
+            let expected = if s.n_entries == 1 { size } else { 0 };
+            assert_eq!(
+                s.current_bytes, expected,
+                "bytes must match entry presence (entries={}, filled={filled})",
+                s.n_entries
+            );
+
+            if !filled {
+                assert_eq!(s.n_entries, 0, "a failed fill leaves no entry behind");
+                assert_eq!(
+                    s.current_bytes, 0,
+                    "a failed fill rolls its reservation back"
+                );
+            }
+
+            // Leave a clean slate for the next iteration.
+            store.erase_superfile_local_copy(&uri);
+            assert_eq!(store.stats().current_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn erase_superfile_local_copy_unlinks_file_left_without_an_entry() {
+        // A cache file can exist with no map entry (crash between rename and
+        // insert); erase_superfile_local_copy still unlinks it so the orphan cannot outlive its
+        // storage object.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        fs::write(store.cache_path(&uri), b"stale bytes").expect("write orphan");
+
+        assert!(!store.erase_superfile_local_copy(&uri), "no entry to drop");
+        assert!(
+            !store.cache_path(&uri).exists(),
+            "orphan file still unlinked"
+        );
+        assert_eq!(store.stats().n_gc_drops, 0);
     }
 
     #[tokio::test]

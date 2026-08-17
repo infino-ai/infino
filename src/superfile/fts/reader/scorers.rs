@@ -6,7 +6,7 @@
 //! dispatch, and the AND flat-merge intersection family. Split from the
 //! reader `core` as its own `impl FtsReader` block.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
 
 use super::{
     core::*,
@@ -77,6 +77,29 @@ fn count_and_intersect_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
         }
     }
     acc.iter().map(|w| w.count_ones() as u64).sum()
+}
+
+/// Block-Max-AND upper bound at the leader's doc, valid over
+/// `[leader_doc, window_end]` where `window_end` is the smallest block boundary
+/// across all cursors. Each non-leader is bounded by the single block that
+/// *contains* `leader_doc`, not a max over every block under the leader's whole
+/// (possibly wide) block — the looser range-max collapsed to a common term's
+/// global max on rare∧common queries, so the skip rarely fired. Leader block
+/// max/end are passed in (callers hold the leader split off for the flat-merge).
+fn block_max_and_bound(
+    leader_block_max: f32,
+    leader_block_end: u32,
+    others: &mut [TermCursor],
+    leader_doc: u32,
+) -> (f32, u32) {
+    let mut ub = leader_block_max;
+    let mut window_end = leader_block_end;
+    for c in others.iter_mut() {
+        c.shallow_advance_block_to(leader_doc);
+        ub += c.inspect_block_max_bm25();
+        window_end = window_end.min(c.inspect_block_last_doc_id());
+    }
+    (ub, window_end)
 }
 
 impl FtsReader {
@@ -540,26 +563,24 @@ impl FtsReader {
                 break;
             }
 
-            // Block-max-AND pruning (scoring sinks only; the unranked
-            // sink's `bar()` is NEG_INFINITY, so this whole block is
-            // skipped). The bar is the kth-best once the heap fills, or
-            // the caller's seeded floor before that — whichever is
-            // higher. If the leader's current block can't possibly
-            // produce a bar-beating score, skip the whole block — the
-            // safest UB sums leader's block_max with each other cursor's
-            // max block_max across all blocks that overlap the leader's
-            // block doc-id range.
+            // Block-Max-AND pruning (scoring sinks only; unranked `bar()` is
+            // NEG_INFINITY). If the tight per-block-pair bound at the leader's
+            // doc can't beat the bar, skip to the smallest block boundary
+            // across all cursors (past which a bound may rise). See
+            // `block_max_and_bound`.
             let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
-                let range_start = cursors[0].current_doc_id();
-                let range_end = cursors[0].current_block_last_doc_id();
+                let leader_doc = cursors[0].current_doc_id();
                 let leader_block_max = cursors[0].current_block_max_bm25();
-                let mut other_ub = 0.0_f32;
-                for c in cursors[1..].iter_mut() {
-                    other_ub += c.block_max_in_range(range_start, range_end);
-                }
-                if leader_block_max + other_ub <= bar {
-                    cursors[0].skip_to(range_end.saturating_add(1));
+                let leader_block_end = cursors[0].current_block_last_doc_id();
+                let (ub, window_end) = block_max_and_bound(
+                    leader_block_max,
+                    leader_block_end,
+                    &mut cursors[1..],
+                    leader_doc,
+                );
+                if ub <= bar {
+                    cursors[0].skip_to(window_end.saturating_add(1));
                     continue;
                 }
             }
@@ -696,19 +717,20 @@ impl FtsReader {
                 break;
             }
 
-            // Block-max-AND pruning at the leader's current block
-            // (scoring sinks only; the unranked sink's `bar()` is
-            // NEG_INFINITY, so this is skipped). The bar is the kth-best
-            // once the heap fills, or the caller's seeded floor before
-            // that — whichever is higher.
+            // Block-Max-AND pruning (scoring sinks only). Bound `c1` by the
+            // single block covering the leader doc; if it can't beat the bar,
+            // skip to the nearer block boundary. See `block_max_and_bound`.
             let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
-                let range_start = c0.current_doc_id();
-                let range_end = c0.current_block_last_doc_id();
-                let ub =
-                    c0.current_block_max_bm25() + c1.block_max_in_range(range_start, range_end);
+                let leader_doc = c0.current_doc_id();
+                let (ub, window_end) = block_max_and_bound(
+                    c0.current_block_max_bm25(),
+                    c0.current_block_last_doc_id(),
+                    from_mut(c1),
+                    leader_doc,
+                );
                 if ub <= bar {
-                    c0.skip_to(range_end.saturating_add(1));
+                    c0.skip_to(window_end.saturating_add(1));
                     continue;
                 }
             }
@@ -1521,17 +1543,10 @@ impl FtsReader {
         // cross-segment floor (`floor_eff` unset) — seeding WAND's
         // threshold from a floor mis-prunes, so a live floor stays on
         // MaxScore.
-        // The dominance heuristic (`prefer_windowed_union`) assumes a
-        // dominant term means MaxScore prunes hard — true only at small
-        // `k`. At large `k` relative to the rarer terms' combined df the
-        // top-k threshold collapses to the common term's upper bound,
-        // MaxScore can skip nothing, and it degrades to a *scalar* full
-        // scan. `or_topk_pruning_ineffective` catches exactly that case
-        // (including a 2-term rare+common OR too deep for WAND) and
-        // routes it to the SIMD windowed scorer, which does the same
-        // full scan without the per-doc f-way merge. Small-`k`
-        // dominant-term ORs fail this test and stay on MaxScore, where
-        // pruning still wins.
+        // A 2-term rare+common OR goes to WAND+BMW (it pivots on the rare
+        // term); otherwise MaxScore by default, and the windowed scan only
+        // where pruning is dead — see `route_or_to_windowed`. WAND takes no
+        // filter or floor, so a negated / floored query skips it.
         let no_floor = floor_eff == f32::NEG_INFINITY;
         if cursors.len() == 2
             && k <= WAND_BMW_2TERM_MAX_K
@@ -1540,7 +1555,7 @@ impl FtsReader {
             && two_term_has_rare_anchor(&cursors)
         {
             self.run_wand_bmw(column_id, cursors, k)
-        } else if prefer_windowed_union(&cursors) || or_topk_pruning_ineffective(&cursors, k) {
+        } else if route_or_to_windowed(&cursors, k) {
             self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         } else {
             self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
@@ -1819,10 +1834,22 @@ mod tests {
             .build_term_cursors(col, uniform_terms, None, false)
             .await
             .expect("uniform cursors");
-        assert!(
-            prefer_windowed_union(&uniform_cursors),
-            "production router should select windowed union for equal upper bounds"
-        );
+        // Phase 1 routing is k-gated: the common-heavy (equal-upper-bound)
+        // shape stays on the pruning MaxScore path at small/mid k, and only
+        // falls to the windowed scan at deep k (past the pruning cutoff),
+        // where MaxScore can no longer prune it.
+        for k in [1usize, 5, 16, OR_WINDOWED_UNIFORM_MAX_PRUNING_K] {
+            assert!(
+                !route_or_to_windowed(&uniform_cursors, k),
+                "common-heavy OR at k={k} (<= cutoff) should route to MaxScore"
+            );
+        }
+        for k in [OR_WINDOWED_UNIFORM_MAX_PRUNING_K + 1, 1000] {
+            assert!(
+                route_or_to_windowed(&uniform_cursors, k),
+                "common-heavy OR at deep k={k} should route to the windowed scan"
+            );
+        }
 
         let shapes: &[&[&str]] = &[
             &["alpha", "beta"],

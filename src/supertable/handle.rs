@@ -3218,6 +3218,114 @@ mod tests {
         );
     }
 
+    /// A top-k vector query blended between two axis clusters must return all
+    /// `k` results once the drain has split those axes into separate hidden
+    /// cells. Under default routing (no caller nprobe) the coarse cell cutoff
+    /// widened only by score-slack — probing the single nearest cell and
+    /// returning `k/2`; it must instead probe enough cells to fill `k`.
+    #[test]
+    fn blended_vector_search_fills_topk_across_hidden_cells() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            reader::VectorSearchOptions,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        const DIM: usize = 16;
+        const AXES: usize = 5;
+        const ROWS: usize = 60; // AXES clusters, ROWS / AXES = 12 rows each
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+
+        // Row i is a one-hot vector on axis `i % AXES`, so the drain lands each
+        // axis in its own hidden cell.
+        let titles = LargeStringArray::from((0..ROWS).map(|i| format!("r{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; ROWS * DIM];
+        for i in 0..ROWS {
+            flat[i * DIM + (i % AXES)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+
+        let st = Supertable::create(options).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        // Query blended between axis 0 (weight 1.0) and axis 1 (weight 0.5): the
+        // top `k` spans both axes' rows, which the drain split across two cells.
+        let k = 2 * (ROWS / AXES); // 24
+        let mut q = vec![0.0f32; DIM];
+        q[0] = 1.0;
+        q[1] = 0.5;
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("vector search");
+        assert_eq!(
+            hits.len(),
+            k,
+            "blended top-k must span both hidden cells, got {}",
+            hits.len()
+        );
+    }
+
     /// After a splice drain into the hidden vector index, the reader's derived-
     /// state accessors report a live hidden index: a storage prefix is stamped,
     /// the hidden-superfile stats are non-empty, the user superfiles carry real

@@ -7,8 +7,8 @@
   },
   "servers": [
     {
-      "url": "https://api.platform.infino.ai",
-      "description": "Infino Enterprise"
+      "url": "https://api.platform.infino.ws",
+      "description": "Infino Cloud"
     }
   ],
   "paths": {
@@ -49,6 +49,18 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "403": {
+            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. The response body names which limit was reached. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically."
+          },
+          "404": {
+            "description": "The target table does not exist. Append never creates a table — create it first with create_table."
+          },
+          "409": {
+            "description": "Another write to the same table was in flight, so this one was not applied. A table takes one write at a time. Transient — reissue the identical request after the `Retry-After` interval, or batch more rows per request to need fewer of them."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -96,6 +108,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -143,6 +158,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -190,6 +208,12 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "409": {
+            "description": "Either the table name already exists — terminal, pick another name — or another catalog change was in flight, so this one was not applied. Every table in a database is created through one catalog. The second case carries a `Retry-After`; reissue the identical request after it."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -266,6 +290,16 @@
               }
             }
           },
+          "402": {
+            "description": "The account has not completed onboarding.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Database already exists.",
             "content": {
@@ -309,6 +343,16 @@
           },
           "401": {
             "description": "No valid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The database changed concurrently; retry the request.",
             "content": {
               "application/json": {
                 "schema": {
@@ -366,6 +410,12 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "409": {
+            "description": "Another write to the same table was in flight, so this one was not applied. A table takes one write at a time. Transient — reissue the identical request after the `Retry-After` interval, or batch more rows per request to need fewer of them."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -413,6 +463,12 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "409": {
+            "description": "Another catalog change was in flight, so this one was not applied. Every table in a database is dropped through one catalog. Transient — reissue the identical request after the `Retry-After` interval."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -460,6 +516,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -507,6 +566,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -541,6 +603,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -588,6 +653,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -635,6 +703,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -682,6 +753,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -735,6 +809,15 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "403": {
+            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. The response body names which limit was reached. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically."
+          },
+          "409": {
+            "description": "Another write to the same table was in flight, so this one was not applied. A table takes one write at a time. Transient — reissue the identical request after the `Retry-After` interval, or batch more rows per request to need fewer of them."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -782,6 +865,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "503": {
+            "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
           }
         },
         "security": [
@@ -805,9 +891,6 @@
           "mode"
         ],
         "properties": {
-          "stats": {
-            "$ref": "#/components/schemas/Bm25Stats"
-          },
           "field_name": {
             "type": "string"
           },
@@ -829,6 +912,17 @@
           },
           "query": {
             "type": "string"
+          },
+          "stats": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Stats",
+                "description": "BM25 corpus statistics for idf scoring. Absent ⇒ the engine default\n(per-superfile); the engine SDK's remote transport always sends it."
+              }
+            ]
           },
           "table_name": {
             "type": "string"
@@ -989,7 +1083,7 @@
       },
       "HybridSearchRequest": {
         "type": "object",
-        "description": "`POST /v1/hybrid_search/{database}`. BM25 + vector fused with RRF.\nProjection is optional; `nprobe` / `rerank_mult` tune the vector leg.",
+        "description": "`POST /v1/hybrid_search/{database}`. BM25 + vector fused with RRF.\nProjection is optional; vector-leg serving is engine-decided.",
         "required": [
           "table_name",
           "text_field",
@@ -1007,13 +1101,6 @@
           "mode": {
             "$ref": "#/components/schemas/Mode"
           },
-          "nprobe": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "minimum": 0
-          },
           "projection": {
             "type": [
               "array",
@@ -1022,13 +1109,6 @@
             "items": {
               "type": "string"
             }
-          },
-          "rerank_mult": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "minimum": 0
           },
           "table_name": {
             "type": "string"
@@ -1112,14 +1192,6 @@
           "and"
         ]
       },
-      "Bm25Stats": {
-        "type": "string",
-        "description": "BM25 corpus-statistics scope for scoring: per-superfile (default) or global across superfiles.",
-        "enum": [
-          "per_superfile",
-          "global"
-        ]
-      },
       "SchemaField": {
         "type": "object",
         "description": "One column in a `create_table` schema. A scalar column is `{name, type}` where `type` is a scalar spelling (`\"i32\"`, `\"large_utf8\"`, …); a vector column is `{name, type: \"vector\", dim}`; a list column is `{name, type: \"list\", item}`. `dim` is required for `\"vector\"` and `item` for `\"list\"`.",
@@ -1186,6 +1258,14 @@
           }
         },
         "additionalProperties": false
+      },
+      "Stats": {
+        "type": "string",
+        "description": "Which BM25 corpus statistics to score term rarity (idf) with. Accepted\ncase-insensitively on the wire (`\"per_superfile\"`, `\"global\"`); serialized\ncanonically. Absent on a request ⇒ the engine default (per-superfile).",
+        "enum": [
+          "per_superfile",
+          "global"
+        ]
       },
       "TokenMatchRequest": {
         "type": "object",
@@ -1261,21 +1341,13 @@
           },
           "metric": {
             "$ref": "#/components/schemas/Metric"
-          },
-          "n_centroids": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "description": "IVF centroid count. Optional; the server applies a default when omitted.",
-            "minimum": 0
           }
         },
         "additionalProperties": false
       },
       "VectorSearchRequest": {
         "type": "object",
-        "description": "`POST /v1/vector_search/{database}`. Projection required; `nprobe` /\n`rerank_mult` / `filter` are optional tuning knobs.",
+        "description": "`POST /v1/vector_search/{database}`. Projection required; `filter` is an\noptional pushdown text pre-filter. Probe width and rerank budget are\nengine-decided (drain-time calibration) — there are no tuning knobs.",
         "required": [
           "table_name",
           "field_name",
@@ -1301,13 +1373,6 @@
             "type": "integer",
             "minimum": 0
           },
-          "nprobe": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "minimum": 0
-          },
           "projection": {
             "type": "array",
             "items": {
@@ -1320,13 +1385,6 @@
               "type": "number",
               "format": "float"
             }
-          },
-          "rerank_mult": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "minimum": 0
           },
           "table_name": {
             "type": "string"

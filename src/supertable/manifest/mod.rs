@@ -2522,6 +2522,12 @@ impl SuperfileUri {
         let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
     }
+
+    /// Inverse of [`Self::storage_path`]. Fetches the superfile name from the path.
+    pub fn from_storage_path(key: &str) -> Option<Self> {
+        let name = key.strip_prefix(SUPERFILE_DATA_DIR)?.strip_prefix('/')?;
+        Self::from_cache_filename(name)
+    }
 }
 
 /// Merge min/max arrays by comparing values and keeping the actual min and max.
@@ -3923,6 +3929,37 @@ mod tests {
         assert!(mutated.transposed.get().is_none());
         let _ = mutated.transposed(); // rebuild
         assert!(mutated.transposed.get().is_some());
+    }
+
+    /// `from_storage_path` recovers a URI from a superfile object key and only
+    /// from one: every other key shape a storage listing can yield (manifest
+    /// parts, tombstone sidecars, in-flight tmps, foreign files) falls through,
+    /// so GC can feed it every candidate it deletes.
+    #[test]
+    fn from_storage_path_parses_only_superfile_keys() {
+        let uri = SuperfileUri::new_v4();
+        assert_eq!(
+            SuperfileUri::from_storage_path(&uri.storage_path()),
+            Some(uri),
+            "round-trips its own storage_path"
+        );
+
+        for key in [
+            "manifests/manifest-42.json",
+            "manifest-parts/ab12cd.part",
+            "superfiles/seg-not-a-uuid.tombstones",
+            &format!("superfiles/seg-{}.tombstones", uri.0), // valid uuid, sidecar dir
+            &format!("data/seg-{}.sf.parquet.tmp", uri.0),
+            &format!("seg-{}.sf.parquet", uri.0), // missing data/ prefix
+            "data/seg-not-a-uuid.sf.parquet",
+            "",
+        ] {
+            assert_eq!(
+                SuperfileUri::from_storage_path(key),
+                None,
+                "must not parse: {key}"
+            );
+        }
     }
 
     /// The 1-bit admit estimate must prefer the instance holding the

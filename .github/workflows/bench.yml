@@ -64,7 +64,9 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      pull-requests: write # post the bench-results comment on the PR
+      # Kept so summary_destination=pr_comment stays usable; PR runs default to
+      # step_summary, so this path is exercised only by a manual dispatch.
+      pull-requests: write
     uses: ./.github/workflows/supertable-bench-azure.yml
     with:
       bench: ${{ matrix.bench }}

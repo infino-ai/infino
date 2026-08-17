@@ -229,6 +229,8 @@ const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
 const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+/// Default target buffered bytes per commit shard (in MiB units).
+const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
@@ -527,6 +529,19 @@ pub struct SupertableOptions {
     /// caller-driven `commit()` produces superfiles.
     /// Default: 1024 (1 GiB).
     pub commit_threshold_size_mb: u64,
+    /// Target buffered bytes per commit shard, in MiB. A commit splits its buffer into
+    /// `ceil(buffered / target)` shards, capped by the writer pool; each shard builds in
+    /// parallel and becomes one superfile.
+    ///
+    /// A 1 GiB flush therefore lands as ~16 × 64 MiB superfiles whether the host has 16 cores
+    /// or 192: data volume sets the table's file geometry, the pool only caps build
+    /// parallelism. Small superfiles are pure overhead downstream (each one is a footer
+    /// parse and an object-store GET on cold open, a disk-cache entry, a compaction input),
+    /// which is what the target guards against.
+    ///
+    /// `0` removes the target: one shard per pool thread, tying file count to the machine.
+    /// Default: 64.
+    pub superfile_buffer_split_mb: u64,
     /// Superfile size (in bytes) at or above which the writer
     /// routes the storage write through
     /// [`StorageProvider::put_multipart`] instead of
@@ -740,6 +755,7 @@ impl SupertableOptions {
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
+            superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
@@ -1000,6 +1016,13 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the target buffered bytes per commit shard (MiB); see
+    /// [`Self::superfile_buffer_split_mb`].
+    pub fn with_superfile_buffer_split_mb(mut self, mb: u64) -> Self {
+        self.superfile_buffer_split_mb = mb;
+        self
+    }
+
     /// Override the superfile-size threshold (bytes) at which
     /// the writer routes through `put_multipart` instead of
     /// `put_atomic`. See [`Self::put_multipart_threshold_bytes`].
@@ -1099,6 +1122,7 @@ impl SupertableOptions {
             ),
         };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
+        self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
         self.target_recall = cfg.vector.target_recall;

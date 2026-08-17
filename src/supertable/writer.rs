@@ -9,7 +9,7 @@
 //! [`crate::superfile::SuperfileBuilder`], which is a single-shot
 //! factory consuming `self` to produce one immutable artifact.
 //! Each `commit` here internally spawns many superfile builders,
-//! one per shard.
+//! one per piece of the split buffer.
 //!
 //! Acquired via [`Supertable::writer`](super::Supertable::writer);
 //! at most one writer is outstanding per supertable at a time
@@ -28,9 +28,9 @@
 //!   `vector_split`, pushes a `BufferedBatch` onto the writer's
 //!   buffer, and triggers an internal `commit()` if the running
 //!   buffer-byte estimate crosses the configured threshold.
-//! - `commit()` drains the buffer, partitions across the writer
-//!   pool, runs each shard build in parallel, and publishes all
-//!   shards as new superfiles in one manifest swap. Idempotent on
+//! - `commit()` drains the buffer, splits it by buffered bytes (capped
+//!   by the writer pool), builds each piece in parallel, and publishes
+//!   them all as new superfiles in one manifest swap. Idempotent on
 //!   an empty buffer (no-op return Ok). The writer slot is
 //!   released on `Drop`; callers don't need a separate `finish()`
 //!   call.
@@ -183,10 +183,16 @@ use crate::{
 /// is derived from this target; it is not copied from the outer/global grid or
 /// repeated as a fixed count for every small commit delta.
 const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
+
 /// Multipart chunk size for large superfile uploads.
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
+
 /// Stable IDs fed to the streamed shard Parquet builder per Arrow batch.
 const DRAIN_ID_BATCH_ROWS: usize = 64 * 1024;
+
+/// One mebibyte; converts `superfile_buffer_split_mb` into bytes.
+const MIB: usize = 1 << 20;
+
 pub(in crate::supertable) const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
 /// Local checkpoint filename inside one epoch scratch directory.
 const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
@@ -473,38 +479,57 @@ impl<'a> VectorColumnView<'a> {
     }
 }
 
-/// Row-balanced split of the writer's buffered batches into
-/// `n_shards` shard inputs, each shaped as a `Vec<BufferedBatch>`
-/// that [`build_one_shard_with_layout`] can consume directly. The split walks
-/// rows across the original buffer in order and emits zero-copy
-/// Arrow slices (`RecordBatch::slice` + `Float32Array::slice` —
-/// adjust buffer offsets only; underlying memory stays Arc-counted),
-/// so no payload bytes are copied even when a shard boundary falls
-/// in the middle of a `BufferedBatch`.
+/// How many superfiles one taken buffer becomes: `ceil(buffered_bytes / split_bytes)`, capped by
+/// the pool and the row count.
 ///
-/// Row imbalance across shards is ≤ 1: with `total_rows = q·n + r`,
-/// the first `r` shards get `q+1` rows and the rest get `q`.
+/// A 1 GiB buffer at the default 64 MiB split builds 16 superfiles on a 192-thread pool and 8 on
+/// an 8-thread pool, each carrying between half and one full split's worth of rows. Rounding up
+/// favours parallelism: every piece gets its own thread, since the count is capped by the pool.
+/// `split_bytes == 0` (the [`SupertableOptions::superfile_buffer_split_mb`] escape hatch) caps by
+/// the pool alone. Always at least one.
+fn superfiles_per_commit(
+    total_rows: usize,
+    buffered_bytes: usize,
+    pool_threads: usize,
+    target_bytes: usize,
+) -> usize {
+    let by_bytes = if target_bytes == 0 {
+        usize::MAX
+    } else {
+        buffered_bytes.div_ceil(target_bytes).max(1)
+    };
+    by_bytes.min(pool_threads.max(1)).min(total_rows.max(1))
+}
+
+/// Row-balanced split of the writer's buffered batches into `n_superfiles` build inputs, each
+/// shaped as a `Vec<BufferedBatch>` that [`build_one_shard_with_layout`] can consume directly.
+/// The split walks rows across the original buffer in order and emits zero-copy Arrow slices
+/// (`RecordBatch::slice` + `Float32Array::slice` — adjust buffer offsets only; underlying memory
+/// stays Arc-counted), so no payload bytes are copied even when a split boundary falls in the
+/// middle of a `BufferedBatch`.
 ///
-/// Trailing empty shards (only possible when `total_rows < n_shards`)
-/// are dropped before return; callers see exactly the shards that
-/// will produce a non-empty superfile.
-fn split_buffer_into_row_shards(
+/// Row imbalance across pieces is ≤ 1: with `total_rows = q·n + r`, the first `r` pieces get
+/// `q+1` rows and the rest get `q`.
+///
+/// Trailing empty pieces (only possible when `total_rows < n_superfiles`) are dropped before
+/// return; callers see exactly the pieces that will produce a non-empty superfile.
+fn split_buffer_into_superfile_inputs(
     buffer: Vec<BufferedBatch>,
-    n_shards: usize,
+    n_superfiles: usize,
     vector_dims: &[usize],
 ) -> Vec<Vec<BufferedBatch>> {
-    debug_assert!(n_shards > 0);
+    debug_assert!(n_superfiles > 0);
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
     if total_rows == 0 {
         return Vec::new();
     }
-    let base = total_rows / n_shards;
-    let remainder = total_rows % n_shards;
+    let base = total_rows / n_superfiles;
+    let remainder = total_rows % n_superfiles;
     let target = |i: usize| if i < remainder { base + 1 } else { base };
 
-    let mut shards: Vec<Vec<BufferedBatch>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut shard_idx = 0usize;
-    let mut shard_remaining = target(0);
+    let mut pieces: Vec<Vec<BufferedBatch>> = (0..n_superfiles).map(|_| Vec::new()).collect();
+    let mut piece_idx = 0usize;
+    let mut piece_remaining = target(0);
 
     for batch in buffer {
         let n_rows = batch.scalar.num_rows();
@@ -513,14 +538,14 @@ fn split_buffer_into_row_shards(
         }
         let mut row_cursor = 0;
         while row_cursor < n_rows {
-            // Skip ahead over any zero-target shards (only happens
-            // when total_rows < n_shards, leaving trailing shards
+            // Skip ahead over any zero-target pieces (only happens
+            // when total_rows < n_superfiles, leaving trailing pieces
             // with target == 0).
-            while shard_remaining == 0 && shard_idx + 1 < n_shards {
-                shard_idx += 1;
-                shard_remaining = target(shard_idx);
+            while piece_remaining == 0 && piece_idx + 1 < n_superfiles {
+                piece_idx += 1;
+                piece_remaining = target(piece_idx);
             }
-            let take = cmp::min(shard_remaining, n_rows - row_cursor);
+            let take = cmp::min(piece_remaining, n_rows - row_cursor);
             let scalar = batch.scalar.slice(row_cursor, take);
             let vectors: Vec<Arc<Float32Array>> = batch
                 .vectors
@@ -531,13 +556,13 @@ fn split_buffer_into_row_shards(
                     Arc::new(v.slice(row_cursor * dim, take * dim))
                 })
                 .collect();
-            shards[shard_idx].push(BufferedBatch { scalar, vectors });
+            pieces[piece_idx].push(BufferedBatch { scalar, vectors });
             row_cursor += take;
-            shard_remaining -= take;
+            piece_remaining -= take;
         }
     }
-    shards.retain(|s| !s.is_empty());
-    shards
+    pieces.retain(|s| !s.is_empty());
+    pieces
 }
 
 /// After a manifest swap that drops superfile references, schedule a deferred
@@ -1372,24 +1397,29 @@ impl SupertableWriter {
         })
     }
 
-    /// Drive one pending update entry through its full WAL
-    /// pipeline. Returns the per-op outcome on success.
-    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
-        let storage = self
-            .inner
-            .options
-            .storage
-            .as_ref()
-            .ok_or(MutationError::NoStorageAttached)?
-            .clone();
-
-        let wal_doc = WalStateDoc {
+    /// Build the `Intent` state doc for one buffered update.
+    ///
+    /// Leased at create for the same reason as [`Self::delete_wal_doc`], and
+    /// the window it closes is wider here: an unowned `Intent` UPDATE is
+    /// drivable by a sweep from its very first step, so a peer would run the
+    /// append phase — building and publishing the replacement superfile —
+    /// against the same preallocated id while this writer was doing it too.
+    ///
+    /// One `now` stamps `created_at` and both lease timestamps.
+    fn update_wal_doc(&self, entry: &PendingUpdateEntry, now: DateTime<Utc>) -> WalStateDoc {
+        let lease_span = ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+            .expect("default lease duration should be a valid chronoduration");
+        WalStateDoc {
             wal_id: entry.wal_id,
             schema_version: SCHEMA_VERSION,
             op_kind: OpKind::Update,
             state: WalState::Intent,
-            created_at: Utc::now(),
-            lease: None,
+            created_at: now,
+            lease: Some(Lease {
+                owner: self.inner.handle_id,
+                acquired_at: now,
+                expires_at: now + lease_span,
+            }),
             predicate_repr: "writer.update()".into(),
             target_ids: entry.target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: Some(entry.new_row_count),
@@ -1405,12 +1435,27 @@ impl SupertableWriter {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
-        };
+        }
+    }
+
+    /// Drive one pending update entry through its full WAL
+    /// pipeline. Returns the per-op outcome on success.
+    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        let wal_doc = self.update_wal_doc(entry, Utc::now());
 
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let wal_id = entry.wal_id;
         let ipc_bytes = entry.ipc_bytes.clone();
+        let owner = self.inner.handle_id;
         let drive = async move {
             wal_store
                 .put_arrow(wal_id, ipc_bytes)
@@ -1420,15 +1465,28 @@ impl SupertableWriter {
                 .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let (_outcome, doc_after_append, etag_after_append) =
-                pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await?;
-            let (outcome, _post, _post_etag) = pipeline::run_tombstone_phase(
+            let append = pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await;
+            let (_outcome, doc_after_append, etag_after_append) = match append {
+                Ok(appended) => appended,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
+            let tombstone = pipeline::run_tombstone_phase(
                 &supertable,
                 &wal_store,
                 &doc_after_append,
                 &etag_after_append,
             )
-            .await?;
+            .await;
+            let (outcome, _post, _post_etag) = match tombstone {
+                Ok(applied) => applied,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
             let (n_t, n_nf) = match outcome {
                 TombstonePhaseOutcome::Applied {
                     n_tombstoned,
@@ -1731,7 +1789,18 @@ impl SupertableWriter {
 
         let writer_pool = Arc::clone(&self.inner.options.writer_pool);
         let n_threads = writer_pool.current_num_threads().max(1);
-        let n_shards = n_threads.min(total_rows);
+
+        // `scalar` is the whole buffer here: vector tables took the drain branch above, and text
+        // columns live inside `scalar`. Arrow reports capacity, not logical bytes — fine for a
+        // fanout heuristic that is clamped to the pool anyway.
+        let buffered_bytes: usize = buffer
+            .iter()
+            .map(|b| b.scalar.get_array_memory_size())
+            .sum();
+        let target_bytes =
+            (self.inner.options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
+        let n_superfiles =
+            superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
 
         let vector_dims: Vec<usize> = self
             .inner
@@ -1786,12 +1855,13 @@ impl SupertableWriter {
                         .collect();
                     (shards, hints)
                 } else {
-                    let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
+                    let shards =
+                        split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
                     let hints = vec![None; shards.len()];
                     (shards, hints)
                 }
             } else {
-                let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
+                let shards = split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
                 let hints = vec![None; shards.len()];
                 (shards, hints)
             };
@@ -3919,11 +3989,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let scratch = drain_scratch.as_path();
         let n_cells_total = added_per_cell.len();
         let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
-        let n_shards = shard_count;
+        let n_superfiles = shard_count;
 
         let mut cell_counts_by_shard: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
         for (&cell, &count) in &added_per_cell {
-            let shard = packed_cell_shard(cell, n_shards) as u32;
+            let shard = packed_cell_shard(cell, n_superfiles) as u32;
             cell_counts_by_shard
                 .entry(shard)
                 .or_default()
@@ -3966,7 +4036,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 "drain has cell counts but no cell build sources".into(),
             ));
         }
-        let mut shard_sources = group_cells_by_packed_shard(sources, n_shards);
+        let mut shard_sources = group_cells_by_packed_shard(sources, n_superfiles);
         shard_sources.retain(|(shard_id, _)| !completed_shards.contains(shard_id));
         let checkpoint = Arc::new(Mutex::new(local_checkpoint));
         let vector_config = hidden_inner
@@ -4088,9 +4158,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map_err(|_| BuildError::Store("drain checkpoint lock poisoned".into()))?
             .clone();
 
-        if prepared_shards.len() + completed_shards.len() > n_shards {
+        if prepared_shards.len() + completed_shards.len() > n_superfiles {
             return Err(BuildError::Store(format!(
-                "drain produced {} packed shards for {n_shards} workers",
+                "drain produced {} packed shards for {n_superfiles} workers",
                 prepared_shards.len() + completed_shards.len()
             )));
         }
@@ -4359,7 +4429,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             total_rows,
             n_cells_total,
             n_shard_files,
-            n_shards,
+            n_superfiles,
             build_t0.elapsed().as_secs_f64() * 1e3,
         );
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
@@ -9008,7 +9078,7 @@ mod tests {
         config::Config,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::BoolMode,
+            fts::reader::{Bm25Stats, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -9097,6 +9167,136 @@ mod tests {
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"
         );
+    }
+
+    /// Default shard target for the fanout unit tests, in bytes — mirrors the shipped
+    /// `superfile_buffer_split_mb` default (64 MiB).
+    const TEST_SPLIT_BYTES: usize = 64 * MIB;
+
+    /// Shard fanout follows buffered bytes (one shard per target's worth, rounded up), capped
+    /// by the pool and the row count — a big pool must not fragment a small buffer.
+    #[test]
+    fn superfiles_per_commit_follows_bytes_capped_by_pool() {
+        const T: usize = TEST_SPLIT_BYTES;
+        // 10 MiB buffer on a 192-thread pool: one shard, not 192.
+        assert_eq!(superfiles_per_commit(1_000_000, 10 << 20, 192, T), 1);
+        // 1 GiB buffer: 16 shards by bytes, capped by a smaller pool.
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 192, T), 16);
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 8, T), 8);
+        // Never more shards than rows, and never zero.
+        assert_eq!(superfiles_per_commit(3, 1 << 30, 192, T), 3);
+        assert_eq!(superfiles_per_commit(1, 1, 0, T), 1);
+    }
+
+    /// Boundary behavior of the ceiling division: a buffer at the target is one shard, one
+    /// byte over splits, and each shard always carries at least half a target.
+    #[test]
+    fn superfiles_per_commit_split_boundaries() {
+        const T: usize = TEST_SPLIT_BYTES;
+        // Exactly one target: one shard. One byte over: two.
+        assert_eq!(superfiles_per_commit(1_000_000, T, 192, T), 1);
+        assert_eq!(superfiles_per_commit(1_000_000, T + 1, 192, T), 2);
+        // Exactly k targets: k shards. One byte over: k + 1.
+        assert_eq!(superfiles_per_commit(1_000_000, 4 * T, 192, T), 4);
+        assert_eq!(superfiles_per_commit(1_000_000, 4 * T + 1, 192, T), 5);
+        // Zero bytes still yields one shard (rows exist; bytes is a heuristic).
+        assert_eq!(superfiles_per_commit(10, 0, 192, T), 1);
+        // Documented lower bound: bytes-per-shard never drops below half a
+        // target while the pool cap is not binding.
+        for bytes in [T + 1, 2 * T - 1, 3 * T + T / 2, 10 * T + 1] {
+            let n = superfiles_per_commit(1_000_000, bytes, 192, T);
+            assert!(bytes.div_ceil(n) >= T / 2, "bytes={bytes} n={n}");
+        }
+    }
+
+    /// `target_bytes == 0` is the configured escape hatch back to thread-count fanout:
+    /// shards = pool width (still capped by rows).
+    #[test]
+    fn superfiles_per_commit_zero_split_restores_thread_fanout() {
+        assert_eq!(superfiles_per_commit(1_000_000, 10 << 20, 192, 0), 192);
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 8, 0), 8);
+        assert_eq!(superfiles_per_commit(3, 1 << 30, 192, 0), 3);
+    }
+
+    /// The configured `superfile_buffer_split_mb` reaches the commit fanout: a 1 MiB target splits
+    /// a small buffer, `0` restores thread fanout, a large target keeps one file.
+    #[test]
+    fn superfile_buffer_split_config_knob_reaches_commit_fanout() {
+        let batch = build_simple_batch(0, 50_000); // ~a few MiB in-memory
+        for (target_mb, expect) in [(1u64, 2usize), (0, 2)] {
+            let opts = options_id_title()
+                .with_writer_pool(writer_pool_with(2))
+                .with_superfile_buffer_split_mb(target_mb);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            let r = st.reader().expect("reader");
+            assert_eq!(
+                r.n_superfiles(),
+                expect,
+                "target_mb={target_mb} should shard to the 2-thread pool cap"
+            );
+        }
+        // Large target: the same buffer stays one superfile.
+        let opts = options_id_title()
+            .with_writer_pool(writer_pool_with(2))
+            .with_superfile_buffer_split_mb(4096);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 1);
+    }
+
+    /// Fanout never spans commit boundaries: three small commits produce exactly one
+    /// superfile each on a wide pool.
+    #[test]
+    fn each_small_commit_produces_exactly_one_superfile() {
+        let opts = options_id_title().with_writer_pool(writer_pool_with(4));
+        let st = Supertable::create(opts).expect("create");
+        for round in 0..3u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_simple_batch(round * 10, 5))
+                .expect("append");
+            w.commit().expect("commit");
+            let r = st.reader().expect("reader");
+            assert_eq!(
+                r.n_superfiles(),
+                (round + 1) as usize,
+                "one new superfile per small commit"
+            );
+        }
+        let r = st.reader().expect("reader");
+        assert_eq!(r.n_docs_total(), 15);
+    }
+
+    /// A one-piece FTS commit produces a queryable index, not just a counted superfile.
+    #[test]
+    fn single_piece_fts_commit_is_searchable() {
+        let opts = options_id_title().with_writer_pool(writer_pool_with(4));
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 100)).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let r = st.reader().expect("reader");
+        assert_eq!(r.n_superfiles(), 1, "small FTS commit stays one piece");
+        // Every doc's title contains "alpha" (see build_simple_batch); a match-all term must
+        // surface hits from the one-piece index.
+        let hits = st
+            .bm25_search(
+                "title",
+                "alpha",
+                10,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("bm25 over one-piece commit");
+        let n: usize = hits.iter().map(|b| b.num_rows()).sum();
+        assert!(n > 0, "single-shard FTS index must return hits");
     }
 
     /// `SupertableWriter`'s `Debug` impl renders its buffered-batch summary.
@@ -10433,15 +10633,13 @@ mod tests {
     // ---- rayon-shard parallelism -------------------------------------
 
     #[test]
-    fn commit_produces_one_superfile_per_writer_pool_thread() {
-        // With N writer-pool threads and a buffer of M >= N
-        // batches, commit should emit N superfiles (one per
-        // shard).
+    fn commit_superfile_count_follows_bytes_not_pool_size() {
+        // A small buffer commits as one superfile no matter how wide the pool is — pool width
+        // alone must not fragment the table.
         for n_threads in [1usize, 2, 4] {
             let opts = options_id_title().with_writer_pool(writer_pool_with(n_threads));
             let st = Supertable::create(opts).expect("create");
             let mut w = st.writer().expect("writer");
-            // Push enough batches to fill every shard.
             for i in 0..n_threads * 2 {
                 w.append(&build_simple_batch(i as u64 * 10, 3))
                     .expect("append");
@@ -10451,32 +10649,45 @@ mod tests {
             let r = st.reader().expect("reader");
             assert_eq!(
                 r.n_superfiles(),
-                n_threads,
-                "expected {n_threads} superfiles for {n_threads}-thread pool",
+                1,
+                "small buffer must stay one superfile on a {n_threads}-thread pool",
             );
             assert_eq!(r.n_docs_total(), (n_threads * 2 * 3) as u64);
         }
     }
 
     #[test]
-    fn commit_with_fewer_batches_than_threads_skips_empty_shards() {
-        // 4 threads, only 2 batches — chunk_size = 1, two chunks
-        // get one batch each, the other two get nothing.
-        // Should produce 2 superfiles, not 4.
-        let opts = options_id_title().with_writer_pool(writer_pool_with(4));
+    fn commit_splits_wide_buffer_up_to_pool_width() {
+        // A buffer over the shard target splits, capped by the pool. Arrow reports capacity
+        // (not logical bytes), so the ~100 MiB buffer wants 2-3 shards; the 2-thread pool pins
+        // it to exactly 2.
+        const ROWS: usize = 100_000;
+        let opts = options_id_title()
+            .with_writer_pool(writer_pool_with(2))
+            .with_commit_threshold_size_mb(4096);
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
-        w.append(&build_simple_batch(0, 1)).expect("a");
-        w.append(&build_simple_batch(1, 1)).expect("b");
+        // ~1 KiB per title × 100K rows ≈ 100 MiB buffered.
+        let titles = LargeStringArray::from(
+            (0..ROWS)
+                .map(|i| format!("doc {i} {}", "x".repeat(1024)))
+                .collect::<Vec<_>>(),
+        );
+        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
+        w.append(&batch).expect("append");
         w.commit().expect("commit");
 
         let r = st.reader().expect("reader");
-        assert_eq!(r.n_superfiles(), 2);
-        assert_eq!(r.n_docs_total(), 2);
+        assert_eq!(
+            r.n_superfiles(),
+            2,
+            "~100 MiB buffer splits, pinned to 2 by the pool cap"
+        );
+        assert_eq!(r.n_docs_total(), ROWS as u64);
     }
 
     #[test]
-    fn apply_config_with_fixed_writer_threads_emits_that_many_superfiles() {
+    fn apply_config_with_fixed_writer_threads_sizes_the_pool() {
         let yaml = r#"
 commit_threshold_size_mb: 1024
 supertable:
@@ -10486,10 +10697,16 @@ supertable:
         let cfg =
             Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
 
-        // End-to-end: build options, route them through apply_config,
-        // and verify the writer pool actually sized to the config's
-        // 4 threads (one superfile per shard).
+        // End-to-end: build options, route them through apply_config, and
+        // verify the writer pool actually sized to the config's 4 threads.
+        // The pool caps shard fanout but no longer sets it — a small buffer
+        // stays one superfile (geometry follows bytes, not thread count).
         let opts = options_id_title().apply_config(&cfg).expect("apply_config");
+        assert_eq!(
+            opts.writer_pool.current_num_threads(),
+            4,
+            "writer_threads=4 should size the pool to 4"
+        );
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         for i in 0..8u64 {
@@ -10498,11 +10715,7 @@ supertable:
         w.commit().expect("commit");
 
         let r = st.reader().expect("reader");
-        assert_eq!(
-            r.n_superfiles(),
-            4,
-            "writer_threads=4 should yield 4 shards"
-        );
+        assert_eq!(r.n_superfiles(), 1, "small buffer stays one superfile");
         assert_eq!(r.n_docs_total(), 24);
     }
 
@@ -11142,6 +11355,214 @@ supertable:
         assert!(
             doc.lease.is_none(),
             "a failed delete must release its lease so the next sweep can take \
+             the WAL immediately, still held by {:?}",
+            doc.lease
+        );
+    }
+
+    // ---- update-WAL lease ownership ----------------------------------
+
+    /// Owner id of the peer running the recovery sweep in the update-lease
+    /// tests. Distinct from the writer handle's own id, since `try_acquire`
+    /// treats a same-owner lease as a renewal rather than a conflict.
+    const UPDATE_LEASE_PEER_OWNER: i128 = 0x0BAD_CAFE;
+
+    /// A writer holding one buffered update against a committed row, so the
+    /// tests can inspect the exact entry — and therefore the exact state
+    /// doc — that `commit` would drive.
+    fn writer_with_buffered_update(table: &Supertable) -> SupertableWriter {
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+        writer
+            .update(col("title").eq(lit("alpha")), build_title_batch(&["gamma"]))
+            .expect("buffer update");
+        writer
+    }
+
+    /// An update's WAL state doc is born holding a live lease owned by the
+    /// handle about to drive it, from a single clock reading — and it still
+    /// carries the append-phase fields that make the WAL drivable.
+    #[test]
+    fn update_wal_doc_is_born_leased_by_this_handle() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let writer = writer_with_buffered_update(&table);
+        let entry = writer
+            .pending_updates
+            .first()
+            .expect("update() must buffer an entry");
+
+        let now = Utc::now();
+        let doc = writer.update_wal_doc(entry, now);
+
+        assert_eq!(doc.op_kind, OpKind::Update);
+        assert_eq!(doc.state, WalState::Intent);
+        assert_eq!(
+            doc.created_at, now,
+            "created_at must come from the passed clock reading, not a second sample"
+        );
+        let lease = doc
+            .lease
+            .expect("an update WAL must be born leased, not left unowned until a later acquire");
+        assert_eq!(
+            lease.owner,
+            table.handle_id(),
+            "the lease must name the handle that will drive the pipeline"
+        );
+        assert_eq!(
+            lease.acquired_at, now,
+            "acquired_at must share created_at's clock reading"
+        );
+        assert_eq!(
+            lease.expires_at,
+            now + ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+                .expect("default lease duration converts"),
+            "the lease must run a full default duration from the same reading"
+        );
+
+        // The append phase reads these off the doc; a lease that arrived by
+        // clobbering them would be no fix at all.
+        assert_eq!(doc.new_row_count, Some(1));
+        assert!(doc.preallocated_superfile_id.is_some());
+        assert_eq!(doc.tombstone_progress.len(), 1);
+    }
+
+    /// Regression: a peer's recovery sweep must not take an update WAL away
+    /// from the writer that just created it. The window is wider than the
+    /// delete case — an unowned `Intent` UPDATE is drivable from its first
+    /// step, so a sweep would run the append phase and publish the
+    /// replacement superfile while this writer was doing the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_sweep_skips_a_freshly_created_update_wal() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let storage = table
+            .inner()
+            .options
+            .storage
+            .as_ref()
+            .expect("storage attached")
+            .clone();
+        let writer = writer_with_buffered_update(&table);
+        let entry = writer
+            .pending_updates
+            .first()
+            .expect("update() must buffer an entry");
+        let wal_id = entry.wal_id;
+
+        // The WAL exactly as `drive_one_update` leaves it after its create:
+        // payload sidecar uploaded, `Intent` doc leased to this handle. The
+        // sidecar matters — without it the sweep could not run the append
+        // phase even if the lease were missing, and the test would pass for
+        // the wrong reason.
+        let wal_store = WalStore::new(storage);
+        wal_store
+            .put_arrow(wal_id, entry.ipc_bytes.clone())
+            .await
+            .expect("put arrow payload");
+        let doc = writer.update_wal_doc(entry, Utc::now());
+        let etag_before = wal_store.create(&doc).await.expect("create wal state doc");
+
+        let report = scan_and_recover(
+            &table,
+            SupertableHandleId(UPDATE_LEASE_PEER_OWNER),
+            DEFAULT_LEASE_DURATION,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(report.n_scanned, 1, "the sweep must see the seeded WAL");
+        assert_eq!(
+            report.n_held_by_peer, 1,
+            "the writer's live lease must fence the sweep off this WAL"
+        );
+        assert_eq!(
+            report.n_full_pipeline_completed, 0,
+            "the sweep must not run the append phase for an update the writer holds"
+        );
+
+        let (after, etag_after) = wal_store.read(wal_id).await.expect("read back");
+        assert_eq!(
+            etag_after, etag_before,
+            "etag unchanged → the sweep never wrote the state doc"
+        );
+        assert_eq!(
+            after.state,
+            WalState::Intent,
+            "the WAL must still be waiting for its owner's append phase"
+        );
+        assert_eq!(
+            after.lease.expect("lease survives the sweep").owner,
+            table.handle_id(),
+            "ownership must still sit with the creating handle"
+        );
+    }
+
+    /// An update that fails in its *tombstone* phase — after the append
+    /// phase has landed — hands its lease back too, so recovery can finish
+    /// the WAL from `Appended` on its next pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_update_hands_back_its_wal_lease() {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+
+        // Buffer while storage is healthy, then break every sidecar CAS.
+        // The append phase writes superfile + manifest and is untouched, so
+        // the failure lands in the tombstone phase that follows it.
+        writer
+            .update(col("title").eq(lit("alpha")), build_title_batch(&["gamma"]))
+            .expect("buffer update");
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            DELETE_LEASE_TOMBSTONES_SUFFIX,
+            DELETE_LEASE_SIDECAR_FAULTS,
+        );
+        let err = writer
+            .commit()
+            .expect_err("a sidecar CAS that never lands must fail the update");
+        assert!(
+            matches!(err, CommitError::PartialCommit { .. }),
+            "the failed update must surface as a partial commit, got {err:?}"
+        );
+        assert!(
+            faults.fired() > 1,
+            "the failure must come from the injected sidecar faults, fired {}",
+            faults.fired()
+        );
+
+        faults.clear();
+        let wal_store = WalStore::new(storage);
+        let wal_ids = wal_store.list_wal_ids().await.expect("list wal ids");
+        assert_eq!(
+            wal_ids.len(),
+            1,
+            "the failed update must leave its WAL for recovery, found {wal_ids:?}"
+        );
+        let (doc, _etag) = wal_store.read(wal_ids[0]).await.expect("read wal doc");
+        assert_eq!(
+            doc.state,
+            WalState::Appended,
+            "the append phase landed; only the tombstone phase is left"
+        );
+        assert!(
+            doc.lease.is_none(),
+            "a failed update must release its lease so the next sweep can take \
              the WAL immediately, still held by {:?}",
             doc.lease
         );

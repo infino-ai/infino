@@ -175,7 +175,7 @@ pub fn global() -> &'static Config {
 pub struct SupertableSettings {
     /// Reader fan-out pool size. `auto` resolves to `num_cpus`.
     pub reader_threads: ThreadCount,
-    /// Writer commit-shard pool size. `auto` resolves to
+    /// Writer commit-build pool size. `auto` resolves to
     /// `max(1, num_cpus / 2)`.
     pub writer_threads: ThreadCount,
     /// Name of the system-managed primary-key column the
@@ -193,6 +193,10 @@ pub struct SupertableSettings {
     /// disables auto-flush — only caller-driven `commit()`
     /// produces superfiles.
     pub commit_threshold_size_mb: u64,
+    /// Split point for a commit's buffer, in mebibytes: the writer cuts the buffered rows
+    /// every this many bytes and builds one superfile per piece, so the file count follows the
+    /// data volume rather than the core count. `0` falls back to one piece per pool thread.
+    pub superfile_buffer_split_mb: u64,
     /// Verify the trailing whole-blob CRC and per-subsection
     /// CRCs on every `SuperfileReader::open`. Defaults to
     /// `true`. Set to `false` only when the underlying
@@ -210,12 +214,14 @@ impl Default for SupertableSettings {
             writer_threads: ThreadCount::default(),
             id_column: default_id_column(),
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
+            superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
             verify_crc_on_open: DEFAULT_VERIFY_CRC_ON_OPEN,
         }
     }
 }
 
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
 const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
 
 // Compaction defaults
