@@ -459,10 +459,13 @@ impl FtsReader {
     /// and scored. This skips the flat-merge's per-leader-doc `skip_to` that
     /// fully decodes a common term's 128-doc block to read one doc — the profiled
     /// cost on n≥3-term AND with a common term. Score is `Σ` per-term BM25 at the
-    /// doc, identical to the flat-merge; emitted through the sink, so it serves
-    /// both the pure-AND and must+should sinks. Gated to the v4 bitset case with
-    /// a sparse rarest term (see [`and_prefer_membership`]); the flat-merge stays
-    /// for v1–v3 and the all-dense case.
+    /// doc, identical to the flat-merge; emitted through the generic sink, so the
+    /// walk is written against any [`AndSink`]. Only the pure-AND path
+    /// ([`run_and_intersect`](Self::run_and_intersect), a `ScoreSink`) routes here
+    /// today; must+should keeps the flat-merge so its should-clause scoring stays
+    /// in one place. Gated to the v4 bitset case with a sparse rarest term (see
+    /// [`and_prefer_membership`]); the flat-merge stays for v1–v3 and the
+    /// all-dense case.
     fn and_membership_scored<S: AndSink>(
         &self,
         mut cursors: Vec<TermCursor>,

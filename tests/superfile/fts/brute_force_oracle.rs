@@ -612,6 +612,106 @@ async fn oracle_and_membership_path_matches_brute_force() {
 }
 
 #[tokio::test]
+async fn oracle_and_membership_rejects_partial_matches() {
+    // Companion to `oracle_and_membership_path_matches_brute_force`, which
+    // planted the rarest term as a *subset* of the others — so every driver doc
+    // co-occurred and `others.all(contains)` was always true. That leaves the
+    // membership walk's reject path (a driver doc *absent* from some other term,
+    // short-circuited out and never emitted) untested. Here the driver term
+    // deliberately only *partially* overlaps the selective co-term, so most
+    // driver docs must be rejected — the walk has to bit-test, find a miss, and
+    // exclude the doc. The result set must be exactly the true 3-way
+    // intersection (not the whole driver list), and the scores must match.
+    const N: u64 = 2000; // multi-block ⇒ `common` forms bitset blocks
+    // `rare` drives (i % 80 == 0, df 25 < N/64 ⇒ sparse rarest ⇒ membership).
+    // `sel` (i % 3 == 0) is a dense bit-tested other. A driver doc is in the
+    // intersection only when it is also divisible by 3, i.e. i % 240 == 0 — so
+    // 16 of the 25 driver docs lack `sel` and must be rejected.
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let mut s = String::from("common");
+            if i % 3 == 0 {
+                s.push_str(" sel");
+            }
+            if i % 80 == 0 {
+                s.push_str(" rare");
+            }
+            (i, format!("{s} f{}", i % 13))
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+
+    // k exceeds the intersection size (9 docs, i % 240 == 0), so the whole match
+    // set is returned and checkable exactly.
+    let k = 64usize;
+    let got: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common sel rare", k, BoolMode::And)
+        .await
+        .expect("AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let want_set: HashSet<u64> = (0..N).filter(|i| i % 240 == 0).collect();
+    let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
+    assert_eq!(
+        got_set, want_set,
+        "membership-path AND must reject driver docs missing a co-term \
+         (result = i%240==0, not the whole rare list i%80==0)"
+    );
+    // The rejects are real: the driver list is larger than the result set, so the
+    // reject branch actually fired (guards against a future change that stops
+    // driving the rarest term or drops the co-occurrence check).
+    let driver_len = (0..N).filter(|i| i % 80 == 0).count();
+    assert!(
+        driver_len > want_set.len(),
+        "test would not exercise rejects: driver list ({driver_len}) must exceed \
+         the intersection ({})",
+        want_set.len()
+    );
+    // Per-doc scores match textbook BM25 (tie-robust via a doc→score map).
+    let terms = ["common".to_string(), "sel".to_string(), "rare".to_string()];
+    let want: HashMap<u64, f32> = oracle.top_k_terms_and(&terms, k).into_iter().collect();
+    for (d, s) in &got {
+        let w = want[d];
+        assert!(
+            (s - w).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "membership-path score mismatch on doc {d}: infino={s} oracle={w}"
+        );
+    }
+
+    // Truncated top-k on the membership route (k < intersection size): the
+    // ScoreSink heap must keep the k highest-scoring matches. Compare score
+    // multisets so a tie at the k-th place doesn't make the assertion flaky.
+    let k_trunc = 4usize;
+    let got_trunc: Vec<f32> = infino
+        .bm25_hits_async("title", "common sel rare", k_trunc, BoolMode::And)
+        .await
+        .expect("truncated AND search")
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(
+        got_trunc.len(),
+        k_trunc,
+        "truncated AND must return exactly k"
+    );
+    let want_trunc: Vec<f32> = oracle
+        .top_k_terms_and(&terms, k_trunc)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    for (g, w) in got_trunc.iter().zip(want_trunc.iter()) {
+        assert!(
+            (g - w).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "truncated membership-path score mismatch: infino={g} oracle={w}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
