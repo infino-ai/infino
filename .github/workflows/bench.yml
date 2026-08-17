@@ -9,9 +9,8 @@ name: Benchmark
 # gets none. Fork code is gated on maintainer approval before secrets are
 # exposed (see `is_fork_pr`).
 #
-# PR events only: a push to main has no `pull_request` context, so both arms
-# would resolve to main and the run would compare main against itself. For any
-# other pair of refs, dispatch supertable-bench-azure.yml with `ref`+`base_ref`.
+# PR events only: a push has no `pull_request` context, so both A/B arms would
+# resolve to main. Other ref pairs: dispatch supertable-bench-azure.yml.
 on:
   pull_request_target:
     branches: [main]
@@ -67,14 +66,13 @@ jobs:
       metric: ${{ matrix.metric }}
       corpus: ${{ matrix.corpus }}
       corpus_dir: ${{ matrix.corpus_dir }}
-      # Both A/B arms passed explicitly (PR head vs the PR's base branch);
-      # relying on the callee's `main` default hides a missing ref as main-vs-main.
+      # Both arms explicit: the callee's `main` default would hide a missing ref.
       ref: ${{ github.event.pull_request.head.sha }}
       base_ref: ${{ github.event.pull_request.base.ref }}
       name_suffix: -${{ matrix.suffix }}
       pr_number: ${{ github.event.pull_request.number }}
       # Fork PR ⇒ gate on maintainer approval before secrets are exposed. The
-      # event guard keeps a non-PR trigger (no pull_request context) from
-      # reading as "fork" and parking the run on approval.
+      # event guard stops a non-PR trigger from reading as "fork": `environment`
+      # resolves before any step, so approval would park the run for good.
       is_fork_pr: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository }}
     secrets: inherit

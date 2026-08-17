@@ -41,12 +41,12 @@ on:
         default: "main"
         type: string
       base_ref:
-        description: "A/B base arm ref (default main). Must differ from `ref` unless allow_same_ref is set."
+        description: "A/B base arm ref; must differ from `ref`."
         required: false
         default: "main"
         type: string
       allow_same_ref:
-        description: "Permit ref == base_ref. Only for measuring the same-host noise floor (A/B of a ref against itself)."
+        description: "Allow ref == base_ref (noise-floor run)."
         required: false
         default: false
         type: boolean
@@ -118,8 +118,7 @@ on:
       location:        { type: string, required: false, default: eastus }
       ref:             { type: string, required: false, default: main }
       base_ref:        { type: string, required: false, default: main }
-      # Opt-in for a ref benchmarked against itself (noise-floor measurement);
-      # otherwise two arms on the same commit fail the run as a config bug.
+      # Allow ref == base_ref; without it, two arms on one commit fail the run.
       allow_same_ref:  { type: boolean, required: false, default: false }
       keep_table:      { type: boolean, required: false, default: false }
       timeout_minutes: { type: string, required: false, default: "60" }
@@ -161,9 +160,8 @@ env:
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
   # Keepalive so a dead-but-unclosed SSH session fails in ~60s instead of
-  # hanging until the job timeout (ServerAliveInterval × CountMax). Left
-  # unquoted at every use — it is a flag list meant to word-split, hence the
-  # `shellcheck disable=SC2086` at each ssh/scp call.
+  # hanging until the job timeout (ServerAliveInterval × CountMax). A flag list
+  # meant to word-split, so each use is unquoted (hence the SC2086 disables).
   SSH_OPTS: "-o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
   # Set "false" to suppress PR comments (summary-only).
   POST_PR_COMMENT: "true"
@@ -231,8 +229,8 @@ jobs:
           echo "args=[$args] reports=[$reports]"
 
       # A/B needs two distinct arms: identical (or empty, hence defaulted) refs
-      # build the same commit twice and report noise as a delta. Runs before the
-      # VM exists so a misconfigured caller costs nothing.
+      # build one commit twice and report noise as a delta. Runs before the VM
+      # exists, so a misconfigured caller costs nothing.
       - name: Validate A/B arms
         env:
           REF: ${{ inputs.ref }}
@@ -242,42 +240,32 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          for v in REF BASE_REF; do
-            if [ -z "${!v}" ]; then
-              echo "::error::empty $v — the caller must pass both A/B arms explicitly (an omitted arm falls back to 'main', which would compare main against itself)"
-              exit 1
-            fi
-          done
-
+          die() { echo "::error::$1"; exit 1; }
           same_arms() {
-            if [ "$ALLOW_SAME_REF" = "true" ]; then
-              echo "::warning::same-ref A/B ($1) — this measures the same-host noise floor, not a code change"
-              exit 0
-            fi
-            echo "::error::both A/B arms are the same commit ($1). Benchmarking a ref against itself measures noise, not a change. Pass two different refs, or set allow_same_ref=true for a deliberate noise-floor run."
-            exit 1
+            [ "$ALLOW_SAME_REF" = "true" ] \
+              || die "both A/B arms are $1 — a ref benchmarked against itself measures noise. Pass two refs, or set allow_same_ref for a noise-floor run."
+            echo "::warning::same-ref A/B ($1) — noise floor, not a code change"
+            exit 0
           }
 
-          # Literal match: `main` vs `main`, the shape a caller lands on when it
-          # fails to pass the ref under test.
-          if [ "$REF" = "$BASE_REF" ]; then
-            same_arms "ref = base_ref = $REF"
-          fi
+          # An omitted arm defaults to 'main', which reads as a valid base arm.
+          [ -n "$REF" ]      || die "empty ref — the caller must pass the ref under test"
+          [ -n "$BASE_REF" ] || die "empty base_ref"
 
-          # SHA match: also catches `main` against main's tip SHA. A fork PR head
-          # isn't always reachable from the base repo, so an unresolvable arm is
-          # only a warning — the literal check above still holds.
+          # Literal match: `main` vs `main`, what a caller drops to on a missing ref.
+          [ "$REF" != "$BASE_REF" ] || same_arms "$REF"
+
+          # SHA match: also catches `main` vs main's tip SHA. A fork head is not
+          # always reachable from the base repo, so an unresolvable arm only warns.
           resolve() { gh api "repos/$REPO/commits/$1" --jq .sha 2>/dev/null || true; }
           REF_SHA="$(resolve "$REF")"
           BASE_SHA="$(resolve "$BASE_REF")"
           if [ -z "$REF_SHA" ] || [ -z "$BASE_SHA" ]; then
-            echo "::warning::could not resolve both arms to SHAs in $REPO (ref='$REF' -> '${REF_SHA:-unresolved}', base_ref='$BASE_REF' -> '${BASE_SHA:-unresolved}') — skipping the SHA-level same-commit check"
+            echo "::warning::unresolved in $REPO (ref='$REF'->'${REF_SHA:-?}', base_ref='$BASE_REF'->'${BASE_SHA:-?}') — skipping the SHA check"
             exit 0
           fi
-          echo "A/B arms: ref=$REF ($REF_SHA) vs base_ref=$BASE_REF ($BASE_SHA)"
-          if [ "$REF_SHA" = "$BASE_SHA" ]; then
-            same_arms "$REF and $BASE_REF both resolve to $REF_SHA"
-          fi
+          echo "A/B arms: $REF ($REF_SHA) vs $BASE_REF ($BASE_SHA)"
+          [ "$REF_SHA" != "$BASE_SHA" ] || same_arms "$REF_SHA"
 
       - name: Validate bench gate metric
         run: |
