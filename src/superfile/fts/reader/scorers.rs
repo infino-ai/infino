@@ -1360,6 +1360,235 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
+    /// Block-max windowed MaxScore for multi-term OR — the fusion of the
+    /// windowed union scanner and MaxScore. Per `OR_WINDOW`-doc window:
+    ///
+    /// 1. Bound each term by its block-max over the window; **skip the whole
+    ///    window** if their sum can't beat the threshold.
+    /// 2. **Partition** essential / non-essential by those per-window bounds:
+    ///    the low-max terms whose block-max sum still can't reach the threshold
+    ///    are non-essential — a doc lacking every essential term scores at most
+    ///    that sum, so it can't compete and need not be found.
+    /// 3. **Bulk-accumulate only the essentials** through the windowed scanner's
+    ///    SIMD fast path, but over the pruned term set.
+    /// 4. For each essential-seeded candidate, drop it if its partial score plus
+    ///    the non-essential bound can't beat the threshold; otherwise complete it
+    ///    with the non-essential terms per-candidate and admit.
+    ///
+    /// The threshold is re-read each window, so the essential set shrinks as the
+    /// heap fills. While the heap is filling every term is essential and this is
+    /// exactly [`Self::run_windowed_union`]; as the threshold rises it prunes
+    /// like MaxScore but keeps the SIMD bulk scan for the essentials, which a
+    /// doc-at-a-time MaxScore gives up. The demotion pays only when the
+    /// threshold is selective enough that few candidates survive the competitive
+    /// filter — a page-sized top-k; at a deep top-k the per-candidate completion
+    /// runs for most of the union and loses to the plain windowed SIMD scan, so
+    /// the caller routes deep-k unions to [`Self::run_windowed_union`] instead.
+    ///
+    /// Top-k identical to the other OR kernels (block-max is a valid upper
+    /// bound); gated by the all-algo-agreement and brute-force oracles. The one
+    /// nuance is summation order: the essentials are summed before the
+    /// non-essentials, so a score can differ from the term-major kernels by ≤1
+    /// ULP and a boundary tie can break to a different doc of equal score.
+    pub(super) fn run_maxscore_windowed(
+        &self,
+        column_id: u32,
+        mut cursors: Vec<TermCursor>,
+        k: usize,
+        mut filter: Option<&mut ExcludeFilter>,
+        floor_eff: f32,
+        doc_id_start: u32,
+        doc_id_end: u32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        if doc_id_start > 0 {
+            for c in &mut cursors {
+                c.skip_to(doc_id_start);
+            }
+        }
+        let n = cursors.len();
+        let initial_cap =
+            top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut threshold: f32 = floor_eff.max(0.0);
+        let mut scores = vec![0.0f32; OR_WINDOW as usize];
+        let mut present = [0u64; OR_WINDOW_WORDS];
+        let mut wbm = vec![0.0f32; n]; // per-term block-max over the current window
+        let mut essential = vec![true; n];
+        let mut order: Vec<usize> = (0..n).collect();
+
+        loop {
+            let mut min_doc = u32::MAX;
+            for c in &cursors {
+                if !c.is_exhausted() {
+                    min_doc = min_doc.min(c.current_doc_id());
+                }
+            }
+            if min_doc == u32::MAX || min_doc >= doc_id_end {
+                break;
+            }
+            let base = min_doc & !(OR_WINDOW - 1);
+            let window_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
+
+            // Per-term window block-max (a valid UB on each term's contribution
+            // in `[base, window_end)`).
+            let mut total_wbm = 0.0f32;
+            for i in 0..n {
+                wbm[i] = if cursors[i].is_exhausted() {
+                    0.0
+                } else {
+                    cursors[i].block_max_in_range(base, window_end - 1)
+                };
+                total_wbm += wbm[i];
+            }
+            // Window skip: nothing here can beat the bar.
+            if total_wbm <= threshold {
+                for c in &mut cursors {
+                    if !c.is_exhausted() {
+                        c.skip_to(window_end);
+                    }
+                }
+                continue;
+            }
+            // Partition: non-essential = the smallest-UB terms whose block-max
+            // sum still can't reach the bar. `total_wbm > threshold` guarantees
+            // at least the largest-UB term stays essential.
+            order.sort_by(|&a, &b| wbm[a].partial_cmp(&wbm[b]).unwrap_or(Ordering::Equal));
+            for e in essential.iter_mut() {
+                *e = true;
+            }
+            let mut nonessential_sum = 0.0f32;
+            for &i in &order {
+                if nonessential_sum + wbm[i] <= threshold {
+                    essential[i] = false;
+                    nonessential_sum += wbm[i];
+                } else {
+                    break;
+                }
+            }
+
+            // Bulk-accumulate the essential terms into the window score array.
+            for i in 0..n {
+                if !essential[i] {
+                    continue;
+                }
+                let c = &mut cursors[i];
+                while !c.is_exhausted() {
+                    let d = c.current_doc_id();
+                    if d >= window_end {
+                        break;
+                    }
+                    let pos = c.pos;
+                    if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
+                        let doc_ids = [
+                            c.block_doc_ids[pos],
+                            c.block_doc_ids[pos + 1],
+                            c.block_doc_ids[pos + 2],
+                            c.block_doc_ids[pos + 3],
+                        ];
+                        if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
+                            let contributions = bm25::score_one_term_x4(
+                                c.idf_x_k1p1,
+                                [
+                                    c.block_tfs[pos],
+                                    c.block_tfs[pos + 1],
+                                    c.block_tfs[pos + 2],
+                                    c.block_tfs[pos + 3],
+                                ],
+                                [
+                                    dl_norm_k1.get(doc_ids[0]),
+                                    dl_norm_k1.get(doc_ids[1]),
+                                    dl_norm_k1.get(doc_ids[2]),
+                                    dl_norm_k1.get(doc_ids[3]),
+                                ],
+                            );
+                            for lane in 0..bm25::SCORE_SIMD_LANES {
+                                let local = (doc_ids[lane] - base) as usize;
+                                scores[local] += contributions[lane];
+                                present[local >> 6] |= 1u64 << (local & 63);
+                            }
+                            c.advance_by(bm25::SCORE_SIMD_LANES);
+                            continue;
+                        }
+                    }
+                    let local = (d - base) as usize;
+                    scores[local] += bm25::score_with_dl_norm_k1(
+                        c.idf_x_k1p1,
+                        c.current_tf(),
+                        dl_norm_k1.get(d),
+                    );
+                    present[local >> 6] |= 1u64 << (local & 63);
+                    c.next();
+                }
+            }
+
+            // Drain candidates ascending: complete each with its non-essential
+            // contributions (per-candidate) and admit.
+            for (word_idx, word) in present.iter_mut().enumerate() {
+                let mut bits = *word;
+                *word = 0;
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let local = (word_idx << 6) | b;
+                    let mut score = scores[local];
+                    scores[local] = 0.0;
+                    let doc = base + local as u32;
+                    if let Some(f) = filter.as_deref_mut()
+                        && !f.admits(doc)
+                    {
+                        continue;
+                    }
+                    // Competitive filter: even every non-essential's full window
+                    // max can't lift this candidate over the bar ⇒ drop it
+                    // without the per-candidate `skip_to`s.
+                    if score + nonessential_sum <= threshold {
+                        continue;
+                    }
+                    let norm = dl_norm_k1.get(doc);
+                    for i in 0..n {
+                        if essential[i] {
+                            continue;
+                        }
+                        let c = &mut cursors[i];
+                        c.skip_to(doc);
+                        if !c.is_exhausted() && c.current_doc_id() == doc {
+                            score +=
+                                bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), norm);
+                        }
+                    }
+                    if heap.len() < k {
+                        heap.push(TopKEntry(score, doc));
+                        if heap.len() == k {
+                            threshold = heap.peek().expect("non-empty").0.max(threshold);
+                        }
+                    } else if score > threshold {
+                        heap.pop();
+                        heap.push(TopKEntry(score, doc));
+                        threshold = heap.peek().expect("non-empty").0.max(threshold);
+                    }
+                }
+            }
+
+            // Advance non-essentials past the window (the essentials already
+            // walked past it during accumulation), so the next window makes
+            // progress. Their docs here were non-competitive by construction.
+            for i in 0..n {
+                if !essential[i] {
+                    let c = &mut cursors[i];
+                    if !c.is_exhausted() {
+                        c.skip_to(window_end);
+                    }
+                }
+            }
+        }
+        Ok(drain_top_k_desc(heap))
+    }
+
     /// Exhaustive union walk for multi-term OR. No threshold-driven
     /// block skipping — every doc in the union of the cursor postings
     /// is scored and offered to the top-K heap.
@@ -1557,7 +1786,19 @@ impl FtsReader {
         {
             self.run_wand_bmw(column_id, cursors, k)
         } else if route_or_to_windowed(&cursors, k) {
-            self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
+            // MaxScore's per-doc merge prunes nothing at this `k` (see
+            // `route_or_to_windowed`), so the union is scored by a full SIMD
+            // window scan. At a page-sized `k` the fused scorer runs that same
+            // scan but keeps a live essential/non-essential partition and
+            // per-window block-max skip, reclaiming the pruning a plain windowed
+            // scan gives up — a large tail win. Past that depth the partition's
+            // per-candidate completion loses to the plain SIMD scan, so deep
+            // requests stay on the windowed scanner.
+            if k <= OR_MAXSCORE_WINDOWED_MAX_K {
+                self.run_maxscore_windowed(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
+            } else {
+                self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
+            }
         } else {
             self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
         }
@@ -1598,6 +1839,15 @@ impl FtsReader {
             OrAlgo::Windowed => {
                 self.run_windowed_union(column_id, cursors, k, None, f32::NEG_INFINITY, 0, u32::MAX)
             }
+            OrAlgo::MaxScoreWindowed => self.run_maxscore_windowed(
+                column_id,
+                cursors,
+                k,
+                None,
+                f32::NEG_INFINITY,
+                0,
+                u32::MAX,
+            ),
         }
     }
 }
@@ -1869,13 +2119,35 @@ mod tests {
                     .search_with_algo_for_bench("body", terms, k, OrAlgo::Windowed)
                     .await
                     .expect("windowed");
+                let msw = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::MaxScoreWindowed)
+                    .await
+                    .expect("maxscore-windowed");
                 assert_eq!(bmm.len(), win.len(), "len mismatch {terms:?} k={k}");
+                assert_eq!(bmm.len(), msw.len(), "msw len mismatch {terms:?} k={k}");
                 for ((db, sb), (dw, sw)) in bmm.iter().zip(win.iter()) {
                     assert_eq!(db, dw, "doc_id mismatch {terms:?} k={k}: bmm={db} win={dw}");
                     assert!(
                         (sb - sw).abs() < 1e-4,
                         "score mismatch {terms:?} k={k}: {sb} vs {sw}"
                     );
+                }
+                // MaxScoreWindowed sums the essential terms (into the window
+                // array) before the non-essential completion — a different
+                // float order than bmm's per-doc cursor-order sum — so near-tied
+                // scores may break to a different doc. Compare the top-k as a
+                // doc *set* plus the sorted score list (tolerance), not by
+                // position, the same way the brute-force oracle does.
+                use std::collections::HashSet;
+                let bset: HashSet<u32> = bmm.iter().map(|&(d, _)| d).collect();
+                let mset: HashSet<u32> = msw.iter().map(|&(d, _)| d).collect();
+                assert_eq!(bset, mset, "msw doc set mismatch {terms:?} k={k}");
+                let mut bs: Vec<f32> = bmm.iter().map(|&(_, s)| s).collect();
+                let mut ms: Vec<f32> = msw.iter().map(|&(_, s)| s).collect();
+                bs.sort_by(f32::total_cmp);
+                ms.sort_by(f32::total_cmp);
+                for (sb, sm) in bs.iter().zip(ms.iter()) {
+                    assert!((sb - sm).abs() < 1e-4, "msw score mismatch {terms:?} k={k}");
                 }
             }
         }

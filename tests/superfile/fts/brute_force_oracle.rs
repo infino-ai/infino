@@ -318,10 +318,12 @@ fn common_heavy_corpus(n: u64) -> Vec<(u64, String)> {
 
 #[tokio::test]
 async fn oracle_common_heavy_or_matches_brute_force_at_depth() {
-    // A common-heavy OR now defaults to MaxScore, which prunes differently at
-    // each k. Verify the rerouted default against ground-truth BM25 across k,
-    // not just against the windowed kernel it agrees with. The tie-free top-5
-    // anchors keep the head comparison deterministic under tail tie-breaking.
+    // A common-heavy OR routes by k: MaxScore at small k (k <= 32), the fused
+    // block-max windowed MaxScore at a page-sized k (32 < k <= 128), and the
+    // plain windowed scan at deep k. The k sweep exercises all three against
+    // ground-truth BM25 — not just the kernels they agree with. The tie-free
+    // top-5 anchors keep the head comparison deterministic under tail
+    // tie-breaking.
     let corp = common_heavy_corpus(4_000);
     let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
     let infino = build_infino_superfile(&corp_refs);

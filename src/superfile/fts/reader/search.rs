@@ -694,15 +694,31 @@ impl FtsReader {
         }
         let cursors = set.cursors.clone();
         if route_or_to_windowed(&cursors, k) {
-            self.run_windowed_union(
-                set.column_id,
-                cursors,
-                k,
-                None,
-                floor.next_down(),
-                doc_id_start,
-                doc_id_end,
-            )
+            // Fused windowed MaxScore where a plain windowed scan used to run,
+            // but only at a page-sized `k` where its per-window partition pays;
+            // deeper requests stay on the plain windowed scan. Mirrors
+            // `dispatch_or_algo` so a fanned-out query runs the same kernel.
+            if k <= OR_MAXSCORE_WINDOWED_MAX_K {
+                self.run_maxscore_windowed(
+                    set.column_id,
+                    cursors,
+                    k,
+                    None,
+                    floor.next_down(),
+                    doc_id_start,
+                    doc_id_end,
+                )
+            } else {
+                self.run_windowed_union(
+                    set.column_id,
+                    cursors,
+                    k,
+                    None,
+                    floor.next_down(),
+                    doc_id_start,
+                    doc_id_end,
+                )
+            }
         } else {
             self.run_max_score_bmm_range(
                 set.column_id,
@@ -1502,18 +1518,28 @@ mod tests {
             (3_000, N_DOCS),
             (0, N_DOCS),
         ];
-        for (lo, hi) in windows {
-            let fresh = r
-                .search_or_range_pretokenized("body", terms, K_ALL, lo, hi)
-                .await
-                .expect("fresh ranged search");
-            let pre = r
-                .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY)
-                .expect("prebuilt ranged search");
-            let fresh_bits: Vec<(u32, u32)> =
-                fresh.iter().map(|&(d, s)| (d, s.to_bits())).collect();
-            let pre_bits: Vec<(u32, u32)> = pre.iter().map(|&(d, s)| (d, s.to_bits())).collect();
-            assert_eq!(pre_bits, fresh_bits, "window ({lo},{hi})");
+        // The four terms have near-uniform df (common-heavy), so `k` selects the
+        // ranged kernel: `K_ALL` is deep enough to route to the plain windowed
+        // scan, while a page-sized `k` (> the pruning cutoff, <=
+        // `OR_MAXSCORE_WINDOWED_MAX_K`) routes to the fused block-max windowed
+        // MaxScore. Both `k`s must give the prebuilt (fan-out) entry the exact
+        // result of the fresh single-shot entry — the seam that keeps a
+        // fanned-out query on the same kernel as an unsliced one.
+        for k in [K_ALL, 64] {
+            for (lo, hi) in windows {
+                let fresh = r
+                    .search_or_range_pretokenized("body", terms, k, lo, hi)
+                    .await
+                    .expect("fresh ranged search");
+                let pre = r
+                    .search_or_range_prebuilt(&set, k, lo, hi, f32::NEG_INFINITY)
+                    .expect("prebuilt ranged search");
+                let fresh_bits: Vec<(u32, u32)> =
+                    fresh.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                let pre_bits: Vec<(u32, u32)> =
+                    pre.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                assert_eq!(pre_bits, fresh_bits, "k={k} window ({lo},{hi})");
+            }
         }
     }
 

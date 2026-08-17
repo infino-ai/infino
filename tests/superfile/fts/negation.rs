@@ -237,6 +237,47 @@ async fn or_four_term_minus_negative() {
 }
 
 #[tokio::test]
+async fn or_common_heavy_minus_negative_through_fused_scorer() {
+    // A common-heavy 3-term OR at a page-sized k (above the pruning cutoff,
+    // at or below the fused-scorer cutoff) is the shape dispatch sends to the
+    // block-max windowed MaxScore, and it must carry the negation filter into
+    // that scorer. Plant a corpus where all three positives are in every doc
+    // (identical upper bounds => common-heavy => the fused scorer) and the
+    // negative sits in every even doc. With k equal to the surviving-match
+    // count the whole result set is checkable: it must be exactly the odd docs,
+    // so the fused scorer's drain has to drop every even doc — including a
+    // high-tf even doc that would top the ranking if the filter were missed.
+    const N: u64 = 200; // < OR_WINDOW (single window); 100 odd docs == k
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let mut s = String::from("aa bb cc");
+            if i % 2 == 0 {
+                s.push_str(" zzz"); // negative term, even docs only
+            }
+            if i == 2 {
+                // a high-scoring even doc: absent only if the filter fires
+                s.push_str(" aa aa aa aa aa aa aa aa");
+            }
+            (i, format!("{s} f{}", i % 7))
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile(&refs);
+
+    // k = 100 = the number of odd (surviving) docs, so the full set is exact.
+    let got = search_set(&r, "aa bb cc -zzz", 100, BoolMode::Or).await;
+    let want: HashSet<u64> = (0..N).filter(|i| i % 2 == 1).collect();
+    assert_eq!(
+        got, want,
+        "fused-scorer OR must exclude every doc carrying zzz"
+    );
+    assert!(
+        !got.contains(&2),
+        "the high-tf even doc must be filtered out, not ranked in"
+    );
+}
+
+#[tokio::test]
 async fn or_multi_positive_multi_negative() {
     // Multiple positives AND multiple negatives together.
     // (rust ∪ python) minus (web ∪ go).

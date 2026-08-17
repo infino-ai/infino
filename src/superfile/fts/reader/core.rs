@@ -278,6 +278,10 @@ pub enum OrAlgo {
     /// merge; wins when no term dominates and the union is large (the
     /// MaxScore-can't-prune case).
     Windowed,
+    /// Block-max windowed MaxScore: the fusion — SIMD window accumulation of
+    /// the essential terms plus per-window block-max pruning and per-candidate
+    /// non-essential completion. The production OR default.
+    MaxScoreWindowed,
 }
 
 /// Doc-id window for the windowed union scorer. Power of two so the
@@ -358,6 +362,19 @@ pub(super) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 /// wins. Bench-tuned to the x86 target (the crossover is lower on wide-SIMD
 /// x86 than on ARM).
 pub(super) const OR_WINDOWED_UNIFORM_MAX_PRUNING_K: usize = 32;
+
+/// Largest `k` for which a windowed-routed multi-term OR uses the fused
+/// block-max windowed MaxScore (`FtsReader::run_maxscore_windowed`) rather than
+/// the plain windowed scan. The fusion's per-window essential/non-essential
+/// partition only pays when the top-k threshold is selective enough that its
+/// competitive filter rejects most candidates before the per-candidate
+/// non-essential completion — a page-sized request. Past this depth the
+/// threshold stays low, nearly every union doc survives the filter, and the
+/// scalar per-candidate completion loses to the plain windowed SIMD scan, so
+/// deep requests stay on `run_windowed_union`. Set at a page boundary
+/// (measured: a decisive tail win at `k = 100`, a small regression by
+/// `k = 1000`).
+pub(super) const OR_MAXSCORE_WINDOWED_MAX_K: usize = 128;
 
 /// True when no single term dominates the score upper bound
 /// (`max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`). Such a "common-heavy" OR
