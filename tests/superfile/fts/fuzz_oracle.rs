@@ -123,6 +123,22 @@ fn corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
     prop::collection::vec(doc, 1..=max_docs())
 }
 
+/// Like [`corpus_strategy`] but with a **skewed** token distribution:
+/// the first two vocab terms dominate (dense, bitset-encoded posting
+/// lists) while the other eight are rare. A uniform vocabulary produces
+/// near-equal document frequencies, so it rarely exercises the
+/// df-ratio-gated router branches — the 2-term WAND rare-anchor
+/// (`hi_df ≥ lo_df·16`) and the anchored OR count (`max_df ≥
+/// others·8`). Skewing the frequencies makes those branches fire.
+fn skewed_corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
+    let token = prop_oneof![
+        12 => 0usize..2,
+        1 => 2usize..VOCAB.len(),
+    ];
+    let doc = prop::collection::vec(token, 1..=max_doc_len());
+    prop::collection::vec(doc, 1..=max_docs())
+}
+
 fn atoms_strategy() -> impl Strategy<Value = Vec<Atom>> {
     let atom = (0u8..3u8, prop::collection::vec(0..VOCAB.len(), 1..=3))
         .prop_map(|(polarity, tokens)| Atom { polarity, tokens });
@@ -332,6 +348,20 @@ proptest! {
     #[test]
     fn fuzz_bm25_matches_brute_force(
         corpus in corpus_strategy(),
+        atoms in atoms_strategy(),
+        and_mode in any::<bool>(),
+        k in 1usize..=(max_docs() + 16),
+    ) {
+        run_case(&corpus, &atoms, and_mode, k)?;
+    }
+
+    /// Same agreement contract as [`fuzz_bm25_matches_brute_force`], but
+    /// over a skewed corpus so the rare-anchor and dominant-term router
+    /// branches — which a uniform vocabulary rarely triggers — are
+    /// exercised against the same brute-force reference.
+    #[test]
+    fn fuzz_bm25_skewed_vocab_matches_brute_force(
+        corpus in skewed_corpus_strategy(),
         atoms in atoms_strategy(),
         and_mode in any::<bool>(),
         k in 1usize..=(max_docs() + 16),
