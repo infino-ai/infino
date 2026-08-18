@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 pub mod brute_force_oracle;
+pub mod fuzz_oracle;
 pub mod must_should;
 pub mod negation;
 pub mod phrase;
