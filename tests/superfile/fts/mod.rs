@@ -10,4 +10,5 @@ pub mod negation;
 pub mod phrase;
 pub mod pipeline;
 pub mod prefix_and_floor;
+pub mod standard_tokenizer;
 pub mod uses_spill_builder;
