@@ -817,3 +817,111 @@ impl TermCursor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use crate::superfile::fts::{
+        bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+    };
+
+    /// The per-block BM25 upper bound stored in the skip table must be a
+    /// valid upper bound over the *query-time* score of every document in
+    /// that block. Query-time scoring reads each document's length from the
+    /// byte-quantized norm table, which truncates the length downward — and
+    /// a shorter length yields a *higher* BM25 score. If the stored block
+    /// max is computed from the exact (un-truncated) length, it lands below
+    /// the query score of a doc whose length quantizes down, and the
+    /// block-max skip in the ranked-OR walk drops that doc from the top-k.
+    ///
+    /// This plants a term spanning several 128-doc blocks whose documents
+    /// all have a length in the quantize-down region, then walks the term's
+    /// cursor and asserts `block_max >= query_score` for every posting.
+    /// Without the length-consistent block bound the assertion fires on the
+    /// highest-tf doc in each block; a small-doc corpus (every length in the
+    /// exact-quantization region) never exercises it.
+    #[tokio::test]
+    async fn block_max_bounds_query_time_score() {
+        // A length that truncates under the one-byte length quantizer:
+        // `dequantize_len(quantize_len(200)) == 192`, so a length-200 doc is
+        // scored as if length 192 and scores *higher* than at its true
+        // length.
+        const DOC_LEN: usize = 200;
+        assert!(
+            bm25::dequantize_len(bm25::quantize_len(DOC_LEN as u32)) < DOC_LEN as u32,
+            "corpus doc length must quantize downward to exercise the bound"
+        );
+        // The term under test lives in this many docs — enough to span
+        // multiple 128-doc blocks so the block-max skip engages.
+        const TERM_DOCS: u32 = 260;
+        // Total corpus size. Kept well above `TERM_DOCS` so the term's IDF
+        // is large enough that the quantization-induced score gap clears the
+        // skip table's fixed-point rounding and the assertion is decisive.
+        const N_DOCS: u32 = 1300;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        for doc_id in 0..N_DOCS {
+            // Every doc is `DOC_LEN` tokens long (so `avgdl == DOC_LEN` and
+            // every length quantizes down identically). The term docs carry
+            // `common` with a term frequency of 1..=3 — a genuine per-block
+            // spread of scores whose maximum is the highest-tf doc — padded
+            // with a filler token; the rest are filler only.
+            let common_tf = if doc_id < TERM_DOCS {
+                1 + (doc_id % 3) as usize
+            } else {
+                0
+            };
+            let mut text = String::with_capacity(DOC_LEN * 5);
+            for _ in 0..common_tf {
+                text.push_str("common ");
+            }
+            for _ in 0..(DOC_LEN - common_tf) {
+                text.push_str("pad ");
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
+        }
+        let bytes = Bytes::from(b.finish().expect("finish builder"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(bytes, json).expect("open FtsReader");
+
+        let mut cursors = reader
+            .build_term_cursors(0, &["common"], None, false)
+            .await
+            .expect("build term cursors");
+        let cursor = cursors.first_mut().expect("`common` present in dictionary");
+        assert!(
+            cursor.blocks.len() >= 2,
+            "term must span multiple blocks so the block-max skip engages \
+             (got {} block(s))",
+            cursor.blocks.len()
+        );
+        let col_meta = &reader.columns[0];
+
+        let mut checked = 0u32;
+        while !cursor.is_exhausted() {
+            let doc = cursor.current_doc_id();
+            let tf = cursor.current_tf();
+            let query_score =
+                bm25::score_with_dl_norm_k1(cursor.idf_x_k1p1, tf, col_meta.dl_norm_k1.get(doc));
+            let block_max = cursor.current_block_max_bm25();
+            assert!(
+                block_max >= query_score,
+                "stored block max {block_max} < query-time score {query_score} for \
+                 doc {doc} (tf={tf}): the per-block BM25 bound under-estimates a \
+                 document in its own block, so the ranked-OR block-max skip can drop it",
+            );
+            checked += 1;
+            cursor.next();
+        }
+        assert_eq!(
+            checked, TERM_DOCS,
+            "every posting for the term must be visited"
+        );
+    }
+}

@@ -3360,11 +3360,13 @@ struct TermScratch {
     doc_ids: Vec<u32>,
     /// Per-block tf column, same lifecycle as `doc_ids`.
     tfs: Vec<u32>,
-    /// Per-block BM25 upper bound for the skip table — the **exact**
-    /// maximum per-doc contribution over the block's docs (not the looser
-    /// `score(max_tf, min_dl)`, whose best-case tf and best-case dl need
-    /// not co-occur in one doc). A tighter bound lets the reader's
-    /// block-skip fire more often.
+    /// Per-block BM25 upper bound for the skip table — the maximum per-doc
+    /// contribution over the block's docs, scored with the same quantized
+    /// document length the reader uses (not the looser `score(max_tf,
+    /// min_dl)`, whose best-case tf and best-case dl need not co-occur in
+    /// one doc). Scoring against the quantized length keeps the bound a
+    /// true upper bound over query-time scores; a tighter bound lets the
+    /// reader's block-skip fire more often.
     block_ub_per_block: Vec<f32>,
     /// Per-term list of encoded blocks held across the meta + skip-
     /// table + block-bytes emit stages.
@@ -3637,16 +3639,29 @@ fn encode_and_emit_term<W: Write>(
             block_tfs.clear();
             block_doc_ids.extend(chunk.iter().map(|&(d, _)| d));
             block_tfs.extend(chunk.iter().map(|&(_, t)| t));
-            // Exact per-block BM25 upper bound: the max actual per-doc
-            // contribution over the block. score() rises with tf and falls
-            // with dl, so the looser `score(max_tf, min_dl)` over-estimates
-            // when the highest-tf doc isn't also the shortest. Computing the
-            // real max here (build-time, off the query path) tightens the
-            // skip-table bound so the reader skips more blocks.
+            // Tight per-block BM25 upper bound: the max per-doc contribution
+            // over the block. score() rises with tf and falls with dl, so the
+            // looser `score(max_tf, min_dl)` over-estimates when the
+            // highest-tf doc isn't also the shortest. Computing the real max
+            // here (build-time, off the query path) tightens the skip-table
+            // bound so the reader skips more blocks.
+            //
+            // Score against the *quantized* length the reader scores with —
+            // the resident norm table stores each length as a one-byte
+            // bucket and scores from its dequantized representative, which
+            // truncates the length downward. A shorter length means a
+            // smaller norm and thus a *higher* BM25 score, so bounding
+            // against the exact length would leave the stored max below the
+            // query-time score of that same doc and let the block-max skip
+            // drop a qualifying document.
             let block_ub = block_doc_ids
                 .iter()
                 .zip(block_tfs.iter())
-                .map(|(&d, &t)| bm25::score(idf_t, t, col_doc_lengths[d as usize], avgdl))
+                .map(|(&d, &t)| {
+                    let reader_dl =
+                        bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
+                    bm25::score(idf_t, t, reader_dl, avgdl)
+                })
                 .fold(0.0f32, f32::max);
             block_ub_per_block.push(block_ub);
             let block = Block {
