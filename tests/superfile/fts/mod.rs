@@ -3,6 +3,7 @@
 
 pub mod brute_force_oracle;
 pub mod fuzz_oracle;
+pub mod multi_column;
 pub mod must_should;
 pub mod negation;
 pub mod phrase;
