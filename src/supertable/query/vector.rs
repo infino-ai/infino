@@ -1575,9 +1575,11 @@ fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
 /// fault (the drain treats that as "skip the graph", never fatal).
 /// Held-out query count for calibration recall measurement.
 const HNSW_CALIB_QUERIES: usize = 200;
-/// The `k` calibration and the incremental recall re-check measure at (the
-/// engine's recall@10 acceptance anchor).
-const HNSW_CALIB_RECALL_K: usize = 10;
+/// The `k` calibration and the incremental recall re-check measure at.
+/// Calibrating at the serving depth (recall@100) provisions a wider `ef`
+/// than the recall@10 anchor did, so the graph clears the recall bar at the
+/// depth queries actually ask for instead of under-serving beyond the top 10.
+const HNSW_CALIB_RECALL_K: usize = 100;
 /// Deterministic calibration seed (no wall-clock / system randomness).
 const HNSW_CALIB_SEED: u64 = 0x_C0FF_EE00_CA11_B000;
 
