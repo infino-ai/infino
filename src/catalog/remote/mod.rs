@@ -15,7 +15,7 @@ pub(crate) mod wire;
 use std::{io::Read, sync::Arc};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use serde_json::{Value, json};
 
 use crate::{IndexSpec, InfinoError, Supertable};
@@ -119,7 +119,7 @@ impl RemoteCatalog {
     ) -> Result<Supertable, InfinoError> {
         let body = json!({
             "table_name": name,
-            "schema": wire::schema_to_json(&schema)?,
+            "schema_ipc": wire::schema_to_ipc_base64(&schema)?,
             "indexes": wire::index_spec_to_json(&indexes),
         });
         self.post_json("create_table", body)?;
@@ -133,12 +133,11 @@ impl RemoteCatalog {
     pub(crate) fn open_table(self: &Arc<Self>, name: &str) -> Result<Supertable, InfinoError> {
         // Fetch the schema: this validates the table exists (a missing table is
         // a 404 → NotFound) and caches the schema so `schema()` is infallible.
-        let response = self.post_json("schema", json!({ "table_name": name }))?;
-        let value = read_json("schema", response)?;
-        let fields = value.as_array().ok_or_else(|| {
-            InfinoError::Backend("schema response was not a JSON array".to_string())
-        })?;
-        let schema = Arc::new(wire::json_to_schema(fields)?);
+        let response = self.post_json(
+            "schema",
+            json!({ "table_name": name, "encoding": wire::IPC_ENCODING }),
+        )?;
+        let schema = Arc::new(read_arrow_schema("schema", response)?);
         Ok(Supertable::from_table(Arc::new(table::RemoteTable::new(
             Arc::clone(self),
             name.to_string(),
@@ -209,4 +208,16 @@ pub(crate) fn read_arrow(
         .read_to_end(&mut buf)
         .map_err(|e| InfinoError::Backend(format!("{op}: reading response: {e}")))?;
     wire::ipc_to_batches(&buf)
+}
+
+/// Read an Arrow-IPC response body into the schema it carries. The body is a
+/// schema message with no batches, so this cannot go through
+/// [`read_arrow`], which expects at least one batch to describe.
+pub(crate) fn read_arrow_schema(op: &str, response: ureq::Response) -> Result<Schema, InfinoError> {
+    let mut buf = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| InfinoError::Backend(format!("{op}: reading response: {e}")))?;
+    wire::ipc_to_schema(&buf)
 }

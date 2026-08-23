@@ -5,16 +5,21 @@
 //!
 //! Requests are JSON; read responses are Arrow IPC streams that decode straight
 //! into the engine's native `Vec<RecordBatch>`. This module owns the
-//! translations: an Arrow schema and an [`IndexSpec`] to their JSON request
-//! shapes, `RecordBatch`es to/from the Arrow IPC stream, and an HTTP status to
-//! an [`InfinoError`]. The string spellings mirror what the hosted service
-//! accepts.
+//! translations: a schema to and from Arrow's own IPC encoding, an
+//! [`IndexSpec`] to its JSON request shape, `RecordBatch`es to/from the Arrow
+//! IPC stream, and an HTTP status to an [`InfinoError`].
+//!
+//! The schema crosses as an Arrow IPC schema message rather than a hand-rolled
+//! JSON descriptor. That is Arrow's canonical encoding, so every type the
+//! engine can hold survives the trip, nested structs and lists included, and
+//! there is no per-type spelling table to keep in step with the service.
 
-use std::{io::Cursor, sync::Arc};
+use std::io::Cursor;
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::Schema;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
 use crate::{IndexSpec, InfinoError, Metric};
@@ -23,55 +28,10 @@ use crate::{IndexSpec, InfinoError, Metric};
 /// bodies and read responses.
 pub(crate) const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
-/// Canonical wire spelling for a scalar Arrow type, matching what the hosted
-/// service accepts. Non-scalar types are rejected so a schema that can't cross
-/// the wire fails loudly at the client instead of diverging from local.
-fn scalar_type_str(data_type: &DataType) -> Result<&'static str, InfinoError> {
-    Ok(match data_type {
-        DataType::Utf8 => "utf8",
-        DataType::LargeUtf8 => "large_utf8",
-        DataType::Boolean => "bool",
-        DataType::Int32 => "i32",
-        DataType::Int64 => "i64",
-        DataType::UInt32 => "u32",
-        DataType::UInt64 => "u64",
-        DataType::Float32 => "f32",
-        DataType::Float64 => "f64",
-        other => {
-            return Err(InfinoError::Schema(format!(
-                "column type not supported over the remote transport: {other:?}"
-            )));
-        }
-    })
-}
-
-/// One Arrow field as its `{name, type, nullable}` JSON descriptor. `nullable`
-/// is always written explicitly (the server defaults an omitted value to
-/// `true`, which would silently flip a non-nullable column). A
-/// `FixedSizeList<Float32, dim>` maps to `{type: "vector", dim}`; a `List<T>`
-/// to `{type: "list", item}`.
-fn field_to_json(field: &Field) -> Result<Value, InfinoError> {
-    let name = field.name();
-    let nullable = field.is_nullable();
-    match field.data_type() {
-        DataType::FixedSizeList(item, dim) if *item.data_type() == DataType::Float32 => {
-            Ok(json!({ "name": name, "type": "vector", "dim": dim, "nullable": nullable }))
-        }
-        DataType::List(item) => Ok(json!({
-            "name": name,
-            "type": "list",
-            "item": scalar_type_str(item.data_type())?,
-            "nullable": nullable,
-        })),
-        other => Ok(json!({ "name": name, "type": scalar_type_str(other)?, "nullable": nullable })),
-    }
-}
-
-/// A schema as the JSON array of field descriptors the create-table request
-/// carries.
-pub(crate) fn schema_to_json(schema: &Schema) -> Result<Vec<Value>, InfinoError> {
-    schema.fields().iter().map(|f| field_to_json(f)).collect()
-}
+/// The `encoding` value that asks a schema response for Arrow IPC rather than
+/// the JSON column descriptors. Only IPC can carry a nested column type, so the
+/// client always asks for it.
+pub(crate) const IPC_ENCODING: &str = "ipc";
 
 /// The wire spelling for a vector distance metric.
 pub(crate) fn metric_str(metric: Metric) -> &'static str {
@@ -141,70 +101,29 @@ pub(crate) fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, InfinoErr
         .map_err(|e| InfinoError::Backend(format!("arrow ipc read: {e}")))
 }
 
-/// The Arrow scalar type for a wire type spelling — the inverse of
-/// [`scalar_type_str`], accepting the same aliases the hosted service does.
-fn scalar_type_from_str(name: &str) -> Result<DataType, InfinoError> {
-    Ok(match name {
-        "utf8" | "string" => DataType::Utf8,
-        "large_utf8" | "large_string" => DataType::LargeUtf8,
-        "bool" | "boolean" => DataType::Boolean,
-        "i32" | "int32" => DataType::Int32,
-        "i64" | "int64" => DataType::Int64,
-        "u32" | "uint32" => DataType::UInt32,
-        "u64" | "uint64" => DataType::UInt64,
-        "f32" | "float32" => DataType::Float32,
-        "f64" | "float64" | "double" => DataType::Float64,
-        other => {
-            return Err(InfinoError::Schema(format!(
-                "unknown column type in schema response: {other}"
-            )));
-        }
-    })
+/// Encode a schema as the `schema_ipc` field of a create-table request: an
+/// Arrow IPC stream carrying only the schema message, base64 for the JSON body.
+///
+/// Base64 rather than a raw body because the request also carries `table_name`
+/// and the index spec, which belong in JSON; the overhead is irrelevant on a
+/// schema of a few kilobytes.
+pub(crate) fn schema_to_ipc_base64(schema: &Schema) -> Result<String, InfinoError> {
+    let mut out = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut out, schema)
+        .map_err(|e| InfinoError::Backend(format!("arrow ipc schema writer: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| InfinoError::Backend(format!("arrow ipc schema finish: {e}")))?;
+    Ok(BASE64.encode(&out))
 }
 
-fn field_from_json(value: &Value) -> Result<Field, InfinoError> {
-    let name = value
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| InfinoError::Schema("schema field missing `name`".to_string()))?;
-    let type_name = value
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| InfinoError::Schema("schema field missing `type`".to_string()))?;
-    let nullable = value
-        .get("nullable")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let data_type = match type_name {
-        "vector" => {
-            let dim = value
-                .get("dim")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| InfinoError::Schema("vector column missing `dim`".to_string()))?;
-            let item = Arc::new(Field::new("item", DataType::Float32, true));
-            DataType::FixedSizeList(item, dim as i32)
-        }
-        "list" => {
-            let item_type = value
-                .get("item")
-                .and_then(Value::as_str)
-                .ok_or_else(|| InfinoError::Schema("list column missing `item`".to_string()))?;
-            let item = Arc::new(Field::new("item", scalar_type_from_str(item_type)?, true));
-            DataType::List(item)
-        }
-        other => scalar_type_from_str(other)?,
-    };
-    Ok(Field::new(name, data_type, nullable))
-}
-
-/// Decode a schema response (`[{name, type, nullable}, …]`) into an Arrow
-/// schema — the inverse of [`schema_to_json`].
-pub(crate) fn json_to_schema(fields: &[Value]) -> Result<Schema, InfinoError> {
-    let fields = fields
-        .iter()
-        .map(field_from_json)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Schema::new(fields))
+/// Decode a schema response body — an Arrow IPC stream whose schema message is
+/// the whole payload — into an Arrow schema. Raw bytes, not base64: the
+/// response body is the schema, so it needs no JSON envelope.
+pub(crate) fn ipc_to_schema(bytes: &[u8]) -> Result<Schema, InfinoError> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|e| InfinoError::Backend(format!("arrow ipc schema reader: {e}")))?;
+    Ok(reader.schema().as_ref().clone())
 }
 
 /// Map an HTTP error status to an [`InfinoError`]. Best-effort: only a few
@@ -230,47 +149,6 @@ mod tests {
     use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 
     use super::*;
-
-    #[test]
-    fn schema_json_preserves_nullable_and_types() {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("body", DataType::LargeUtf8, true),
-        ]);
-        let json = schema_to_json(&schema).expect("schema to json");
-        assert_eq!(
-            json[0],
-            json!({"name": "id", "type": "i32", "nullable": false})
-        );
-        assert_eq!(
-            json[1],
-            json!({"name": "body", "type": "large_utf8", "nullable": true})
-        );
-    }
-
-    #[test]
-    fn schema_json_maps_vector_column() {
-        let item = Arc::new(Field::new("item", DataType::Float32, true));
-        let schema = Schema::new(vec![Field::new(
-            "embedding",
-            DataType::FixedSizeList(item, 384),
-            false,
-        )]);
-        let json = schema_to_json(&schema).expect("schema to json");
-        assert_eq!(
-            json[0],
-            json!({"name": "embedding", "type": "vector", "dim": 384, "nullable": false})
-        );
-    }
-
-    #[test]
-    fn schema_json_rejects_unsupported_type() {
-        let schema = Schema::new(vec![Field::new("ts", DataType::Date32, true)]);
-        assert!(matches!(
-            schema_to_json(&schema),
-            Err(InfinoError::Schema(_))
-        ));
-    }
 
     #[test]
     fn index_spec_json_shape() {
@@ -311,6 +189,35 @@ mod tests {
         let back = ipc_to_batches(&bytes).expect("decode");
         assert_eq!(back.len(), 1);
         assert_eq!(back[0], batch);
+    }
+
+    #[test]
+    fn schema_ipc_round_trips_a_nested_column() {
+        // A struct column is the case the previous JSON descriptors could not
+        // express at all, so it is the one worth pinning.
+        let inner: Fields = vec![
+            FieldRef::from(Field::new("url", DataType::Utf8, true)),
+            FieldRef::from(Field::new("height", DataType::Int64, true)),
+        ]
+        .into();
+        let schema = Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("image", DataType::Struct(inner), true),
+        ]);
+
+        let encoded = schema_to_ipc_base64(&schema).expect("encode schema");
+        let bytes = BASE64.decode(&encoded).expect("valid base64");
+        let back = ipc_to_schema(&bytes).expect("decode schema");
+
+        assert_eq!(back, schema, "the schema survives the round trip exactly");
+    }
+
+    #[test]
+    fn schema_ipc_rejects_a_body_that_is_not_an_ipc_stream() {
+        assert!(matches!(
+            ipc_to_schema(b"not arrow ipc"),
+            Err(InfinoError::Backend(_))
+        ));
     }
 
     #[test]

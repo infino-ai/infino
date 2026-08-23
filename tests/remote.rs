@@ -11,11 +11,12 @@
 
 #![cfg(feature = "remote")]
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, io::Cursor, sync::Arc, time::Duration};
 
-use arrow::ipc::writer::StreamWriter;
+use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError,
@@ -37,6 +38,17 @@ fn id_schema() -> SchemaRef {
 /// A one-column `id` batch, and its Arrow-IPC bytes (a canned search response).
 fn id_batch(ids: Vec<i32>) -> RecordBatch {
     RecordBatch::try_new(id_schema(), vec![Arc::new(Int32Array::from(ids))]).expect("batch")
+}
+
+/// A schema's Arrow-IPC bytes: a schema message and nothing else, which is what
+/// a describe response carries.
+fn schema_ipc_bytes(schema: &Schema) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut w = StreamWriter::try_new(&mut out, schema).expect("ipc schema writer");
+        w.finish().expect("ipc schema finish");
+    }
+    out
 }
 
 fn ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
@@ -76,7 +88,6 @@ async fn create_table_posts_expected_shape() {
         .and(header("authorization", format!("Bearer {KEY}").as_str()))
         .and(body_partial_json(json!({
             "table_name": "posts",
-            "schema": [{"name": "id", "type": "i32", "nullable": false}],
             "indexes": {"fts": ["id"]},
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
@@ -89,6 +100,30 @@ async fn create_table_posts_expected_shape() {
             .expect("create_table");
     })
     .await;
+
+    // The schema travels as base64 Arrow IPC. Assert on what it decodes to
+    // rather than on exact bytes, so the test pins the contract and not the
+    // encoder's byte layout.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("json request body");
+    let encoded = body["schema_ipc"]
+        .as_str()
+        .expect("schema_ipc is a base64 string");
+    let bytes = BASE64.decode(encoded).expect("valid base64");
+    let reader = StreamReader::try_new(Cursor::new(bytes), None).expect("an arrow ipc stream");
+    assert_eq!(
+        reader.schema().as_ref(),
+        id_schema().as_ref(),
+        "the posted schema decodes back to the declared one"
+    );
+    assert!(
+        body.get("schema").is_none(),
+        "the JSON descriptor form is no longer sent"
+    );
 }
 
 #[tokio::test]
@@ -97,9 +132,9 @@ async fn append_streams_arrow_body_with_table_query() {
     // open_table fetches the schema first.
     Mock::given(method("POST"))
         .and(path("/v1/schema/mydb"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"name": "id", "type": "i32", "nullable": false}
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(schema_ipc_bytes(&id_schema()), ARROW_CT),
+        )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -124,9 +159,9 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
     // open_table fetches the schema first.
     Mock::given(method("POST"))
         .and(path("/v1/schema/mydb"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"name": "id", "type": "i32", "nullable": false}
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(schema_ipc_bytes(&id_schema()), ARROW_CT),
+        )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -216,9 +251,9 @@ async fn open_table_missing_maps_to_not_found() {
 async fn mount_schema(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/schema/mydb"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"name": "id", "type": "i32", "nullable": false}
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(schema_ipc_bytes(&id_schema()), ARROW_CT),
+        )
         .mount(server)
         .await;
 }
