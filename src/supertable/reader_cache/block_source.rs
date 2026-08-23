@@ -124,7 +124,7 @@ impl BlockCachedSource {
         Self::new_with_accounting(inner, store, uri, path, false, passthrough)
     }
 
-    fn new_with_accounting(
+    pub(crate) fn new_with_accounting(
         inner: Arc<dyn LazyByteSource>,
         store: Weak<DiskCacheStore>,
         uri: SuperfileUri,
@@ -161,7 +161,6 @@ impl BlockCachedSource {
 
     /// Shared filled-bytes counter, installed as the cache entry's
     /// `size_bytes` so accounting and eviction see live growth.
-    #[cfg(test)]
     pub(crate) fn filled_bytes_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.filled_bytes)
     }

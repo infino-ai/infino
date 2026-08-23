@@ -205,7 +205,6 @@ enum EntryAccounting {
     /// Store-reserved entry; removal releases `size_bytes`.
     Eager,
     /// Block-source-reserved entry; source drop releases bytes.
-    #[cfg(test)]
     SourceOwned,
 }
 
@@ -1341,7 +1340,8 @@ impl DiskCacheStore {
         let result = cell
             .get_or_init(|| async {
                 let fetch_storage = self.resolve_storage(storage);
-                self.cold_fetch_lazy(uri, offsets, fetch_storage).await
+                self.cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
+                    .await
             })
             .await;
         let fetch_storage = self.resolve_storage(storage);
@@ -1354,7 +1354,10 @@ impl DiskCacheStore {
             }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                match self.cold_fetch_lazy(uri, offsets, fetch_storage).await {
+                match self
+                    .cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
+                    .await
+                {
                     Ok(entry) => {
                         if allow_background_fill {
                             self.maybe_spawn_background_fill(uri, &entry, storage);
@@ -1386,7 +1389,17 @@ impl DiskCacheStore {
         {
             return;
         }
-        let size = entry.size_bytes.load(Ordering::Acquire);
+        // A source-owned (vector-opened) entry accounts its live filled bytes,
+        // so `size_bytes` is NOT the object size. Take the full size from the
+        // block source, and reserve it here — the vector open never did, so the
+        // promotion's mmap needs budget reserved before it downloads.
+        let size = entry
+            .block_source
+            .as_ref()
+            .map(|bs| bs.size())
+            .filter(|&s| s > 0)
+            .unwrap_or_else(|| entry.size_bytes.load(Ordering::Acquire));
+        let needs_reserve = matches!(entry.accounting, EntryAccounting::SourceOwned);
         let skip_vec = vector_blob_range(&entry.reader);
         let store = Arc::downgrade(self);
         let reader = Arc::downgrade(&entry.reader);
@@ -1394,6 +1407,14 @@ impl DiskCacheStore {
         let storage_uri_owned = Self::storage_path(uri);
         let fetch_storage = self.resolve_storage(storage);
         tokio::spawn(async move {
+            if needs_reserve {
+                let Some(s) = store.upgrade() else {
+                    return;
+                };
+                if s.reserve_manual(size).await.is_err() {
+                    return;
+                }
+            }
             let _ = lazy_background_fill(
                 store,
                 reader,
@@ -1428,6 +1449,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         offsets: Option<&SubsectionOffsets>,
         fetch_storage: Arc<dyn StorageProvider>,
+        allow_background_fill: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
         let block_source_arc: Arc<BlockCachedSource>;
@@ -1471,11 +1493,12 @@ impl DiskCacheStore {
                 storage_uri.clone(),
                 total_size,
             ));
-            let block_source = BlockCachedSource::new_pre_reserved(
+            let block_source = BlockCachedSource::new_with_accounting(
                 inner,
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
+                !allow_background_fill,
                 // FTS subsection reads bypass block rounding (exact ranges);
                 // see the `passthrough` field docs.
                 offsets.fts,
@@ -1554,11 +1577,12 @@ impl DiskCacheStore {
                     Arc::clone(&fetch_storage),
                     storage_uri.clone(),
                 ));
-            let block_source = BlockCachedSource::new_pre_reserved(
+            let block_source = BlockCachedSource::new_with_accounting(
                 range_src,
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
+                !allow_background_fill,
                 // No manifest hints here, so the FTS subsection is unknown.
                 None,
             );
@@ -1573,15 +1597,30 @@ impl DiskCacheStore {
             (lazy_reader, size)
         };
 
-        self.reserve_manual(size).await?;
+        // Vector opens keep their blob sparse and never mmap-promote, so they
+        // account their live filled bytes (source-owned) instead of reserving
+        // the whole superfile up front. Otherwise a fanout touching many
+        // superfiles over-reserves and evicts live peers. FTS/SQL opens promote
+        // to a full mmap, so they keep the eager full-size reservation.
+        if allow_background_fill {
+            self.reserve_manual(size).await?;
+        }
 
         let lazy_reader = Arc::new(lazy_reader);
         let block_token = block_source_arc.entry_token();
+        let (size_bytes, accounting) = if allow_background_fill {
+            (Arc::new(AtomicU64::new(size)), EntryAccounting::Eager)
+        } else {
+            (
+                block_source_arc.filled_bytes_handle(),
+                EntryAccounting::SourceOwned,
+            )
+        };
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&lazy_reader),
             mmap: None,
-            size_bytes: Arc::new(AtomicU64::new(size)),
-            accounting: EntryAccounting::Eager,
+            size_bytes,
+            accounting,
             block_token: Some(block_token),
             block_source: Some(block_source_arc),
             // Fill is modality-gated via [`Self::maybe_spawn_background_fill`]
