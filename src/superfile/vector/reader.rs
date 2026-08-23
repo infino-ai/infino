@@ -1930,6 +1930,53 @@ impl VectorReader {
         Ok(out)
     }
 
+    /// Sibling of [`Self::global_fine_cluster_scores`] that emits the fp32
+    /// centroid VECTORS instead of their query scores, tagged with the exact
+    /// same per-superfile `flat` cluster ids. Feeds the in-memory centroid
+    /// router (an HNSW over the pooled fine centroids that replaces the
+    /// brute-force scan): building the graph from this guarantees a graph node
+    /// maps back to the same `flat` the scan path would have produced, so the
+    /// downstream per-cell read plan is identical. Cluster-major fp32-LE bytes,
+    /// `n_cent × dim` per cell.
+    pub(crate) fn global_fine_cluster_vectors(
+        &self,
+        column: &str,
+        section: &crate::supertable::slow_vector_state::CentroidSection,
+        superfile_id: uuid::Uuid,
+    ) -> Result<Vec<(u32, Vec<f32>)>, VectorError> {
+        if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (ci, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 {
+                continue;
+            }
+            let cell_id = self.cell_ids.get(ci).copied();
+            let Some(bytes) = section
+                .read_cell_bytes(superfile_id, column, cell_id)
+                .map_err(|e| VectorError::LazySource(e.to_string()))?
+            else {
+                continue;
+            };
+            let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
+            let dim = col.dim;
+            let stride = dim * 4;
+            for local in 0..col.n_cent as usize {
+                let off = local * stride;
+                let Some(slab) = bytes.get(off..off + stride) else {
+                    break;
+                };
+                let vec: Vec<f32> = slab
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                out.push((base + local as u32, vec));
+            }
+        }
+        Ok(out)
+    }
+
     /// Per-cell coalesced read plan for global-fine (`vector.global_fine_coalesce`):
     /// given selected flat cluster ids, return every cluster in each touched
     /// cell's `[min..max]` selected span. Clusters are stored in id order, so

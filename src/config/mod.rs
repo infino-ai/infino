@@ -517,6 +517,16 @@ pub struct VectorSettings {
     /// clusters within each cell into contiguous reads. Ignored under
     /// `search_mode = ivf`.
     pub global_fine_coalesce: bool,
+    /// For `search_mode = global_fine_centroid`: route via the centroid-HNSW
+    /// graph over the resident fp32 fine centroids (default) instead of the
+    /// brute-force centroid scan. The graph ranks centroids by normalized
+    /// cosine, which selects better clusters than the scan's raw-dot ranking.
+    /// Ignored under `search_mode = ivf`.
+    pub global_fine_use_graph: bool,
+    /// For `search_mode = global_fine_centroid` with the graph router: the
+    /// HNSW walk's `ef` (candidate breadth). `0` = auto (`fanout * 2`).
+    /// Ignored under `search_mode = ivf` or `global_fine_use_graph = false`.
+    pub global_fine_graph_ef: usize,
     /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
     /// the winning `ef` per table into the persisted bundle. Must be at least
@@ -624,6 +634,8 @@ impl Default for VectorSettings {
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
+            global_fine_use_graph: true,
+            global_fine_graph_ef: 0,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,

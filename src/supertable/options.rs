@@ -415,6 +415,14 @@ pub struct SupertableOptions {
     /// Warm queries never touch it — they resolve on the cache mutex's fast
     /// path — so the download never serializes steady-state serving.
     pub(crate) graph_hydration_lock: Arc<TokioMutex<()>>,
+    /// Build-once cache for the in-memory centroid-router HNSW (an HNSW over
+    /// the resident fp32 fine centroids that replaces the brute-force
+    /// `global_fine_cluster_scores` scan on the global-fine path). Built from
+    /// the resident centroid section at first global-fine query, so testing it
+    /// needs no re-drain; the persisted centroid graph is a follow-on.
+    /// Experimental: only populated when the global-fine graph path is enabled.
+    pub(crate) centroid_router_cache:
+        Arc<tokio::sync::OnceCell<Arc<crate::supertable::query::vector::CentroidRouterGraph>>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar
     /// projection over gapped user superfiles, so a hit resolves in O(k) after
     /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
@@ -742,6 +750,7 @@ impl SupertableOptions {
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
             graph_sections_cache: Arc::new(TokioMutex::new(None)),
             graph_hydration_lock: Arc::new(TokioMutex::new(())),
+            centroid_router_cache: Arc::new(tokio::sync::OnceCell::new()),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,

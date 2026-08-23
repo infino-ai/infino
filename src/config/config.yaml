@@ -211,6 +211,17 @@ vector:
   # within each cell into contiguous reads. Ignored under search_mode = ivf.
   global_fine_coalesce: false
 
+  # For search_mode = global_fine_centroid: route via the centroid-HNSW graph
+  # over the resident fp32 fine centroids (default) instead of the brute-force
+  # centroid scan. The graph ranks by normalized cosine, selecting better
+  # clusters. Ignored under search_mode = ivf.
+  global_fine_use_graph: true
+
+  # For search_mode = global_fine_centroid with the graph router: the HNSW
+  # walk's ef (candidate breadth). 0 = auto (fanout * 2). Ignored under
+  # search_mode = ivf or when global_fine_use_graph = false.
+  global_fine_graph_ef: 0
+
   # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table
   # ef into the persisted graph bundle; that stamped value drives every query.

@@ -746,6 +746,65 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
     selected
 }
 
+/// In-memory centroid router: an HNSW over the pooled fp32 fine centroids,
+/// used on the global-fine path to select the top-`fanout` clusters in place
+/// of the brute-force `global_fine_cluster_scores` scan. Experimental,
+/// validation-grade — built once per handle from the resident centroid section
+/// (no drain change). A graph node maps back to the `(superfile index, flat
+/// cluster id)` the scan path would have produced, so the downstream per-cell
+/// read plan is byte-identical.
+pub(crate) struct CentroidRouterGraph {
+    scorer: crate::superfile::vector::hnsw::Fp32Scorer,
+    graph: crate::superfile::vector::hnsw::Hnsw,
+    node_map: Vec<(usize, u32)>,
+}
+
+/// Unit-normalize in place so the centroid graph's `−dot` scorer ranks by
+/// cosine (the fine centroids are means of unit vectors, not themselves unit).
+fn gfc_unit_normalize(v: &mut [f32]) {
+    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        let inv = 1.0 / n;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
+/// Build the in-memory centroid router from the resident centroid section.
+/// `readers[si]` corresponds to `superfiles[si]`; centroids are pulled via
+/// `global_fine_cluster_vectors` so the flat ids match the scan path exactly.
+fn build_centroid_router(
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+) -> Result<CentroidRouterGraph, QueryError> {
+    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+    let mut vecs: Vec<Vec<f32>> = Vec::new();
+    let mut node_map: Vec<(usize, u32)> = Vec::new();
+    for (si, reader) in readers.iter().enumerate() {
+        let Some(vr) = reader.vec() else { continue };
+        let sfid = superfiles[si].superfile_id;
+        for (flat, mut vec) in vr
+            .global_fine_cluster_vectors(column, section, sfid)
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+        {
+            gfc_unit_normalize(&mut vec);
+            vecs.push(vec);
+            node_map.push((si, flat));
+        }
+    }
+    let scorer = Fp32Scorer::from_vectors(&vecs, dim);
+    let graph = Hnsw::build(&scorer, HnswParams::default());
+    Ok(CentroidRouterGraph {
+        scorer,
+        graph,
+        node_map,
+    })
+}
+
 /// Widen a grid cell cutoff so the probed cells' indexed row counts cover at
 /// least `k`. `grid_cell_cutoff`'s slack window stops at the nearest near-tie
 /// cluster — a single cell for a query blended between two clusters — so a
@@ -2521,37 +2580,97 @@ impl SupertableReader {
         // Phase 1: build the global candidate pool. Scores are comparable
         // across cells/superfiles (one metric + one query), so a single
         // top-`fc` cut over the pool is a valid global selection.
+        // Open every eligible superfile reader (phase 2 needs them regardless
+        // of how the top-`fanout` clusters are selected).
         let mut readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(superfiles.len());
-        let mut cands: Vec<(usize, u32, f32)> = Vec::new();
         for entry in superfiles.iter() {
             let reader =
                 dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
                     .await?;
-            let si = readers.len();
-            if let Some(vr) = reader.vec() {
-                let scores = vr
-                    .global_fine_cluster_scores(column, query, section.as_ref(), entry.superfile_id)
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
-                for (flat, score) in scores {
-                    cands.push((si, flat, score));
-                }
-            }
             readers.push(reader);
         }
-        if cands.is_empty() {
+
+        // Cluster selection: the centroid-router HNSW (default) walks a graph
+        // over the fp32 fine centroids to pick the top-`fanout` clusters; the
+        // fallback is the exact brute-force scan (`global_fine_use_graph =
+        // false`). Both produce the same `by_sf` map, so phase 2 is identical.
+        let use_graph = config::global().vector.global_fine_use_graph;
+        let by_sf: HashMap<usize, Vec<u32>> = if use_graph {
+            let cache = Arc::clone(&manifest.options.centroid_router_cache);
+            let router = {
+                let sfs = superfiles.to_vec();
+                let rdrs = readers.clone();
+                let col = column.to_string();
+                let sect = Arc::clone(&section);
+                let dim = query.len();
+                cache
+                    .get_or_try_init(|| async move {
+                        build_centroid_router(&sfs, &rdrs, &col, sect.as_ref(), dim).map(Arc::new)
+                    })
+                    .await?
+                    .clone()
+            };
+            let mut q = query.to_vec();
+            gfc_unit_normalize(&mut q);
+            let fc = fanout.clamp(1, router.node_map.len().max(1));
+            // `ef` governs graph-vs-exact parity; `global_fine_graph_ef = 0`
+            // auto-selects `fanout * 2`.
+            let ef_cfg = config::global().vector.global_fine_graph_ef;
+            let ef = if ef_cfg > 0 {
+                ef_cfg
+            } else {
+                fc.saturating_mul(2)
+            }
+            .max(fc);
+            let hits = router.graph.search(&router.scorer, &q, fc, ef);
+            let mut m: HashMap<usize, Vec<u32>> = HashMap::new();
+            for (node, _) in hits {
+                if let Some(&(si, flat)) = router.node_map.get(node as usize) {
+                    m.entry(si).or_default().push(flat);
+                }
+            }
+            m
+        } else {
+            let mut cands: Vec<(usize, u32, f32)> = Vec::new();
+            for (si, reader) in readers.iter().enumerate() {
+                if let Some(vr) = reader.vec() {
+                    let scores = vr
+                        .global_fine_cluster_scores(
+                            column,
+                            query,
+                            section.as_ref(),
+                            superfiles[si].superfile_id,
+                        )
+                        .map_err(|e| QueryError::Execute(e.to_string()))?;
+                    for (flat, score) in scores {
+                        cands.push((si, flat, score));
+                    }
+                }
+            }
+            // `cands` now holds EVERY fine cluster across all cells/superfiles;
+            // clamp the requested fanout to that total. Global top-`fc` by
+            // ascending distance (smaller = nearer).
+            let fc = fanout.clamp(1, cands.len().max(1));
+            if cands.len() > fc {
+                cands.select_nth_unstable_by(fc - 1, |a, b| a.2.total_cmp(&b.2));
+                cands.truncate(fc);
+            }
+            let mut m: HashMap<usize, Vec<u32>> = HashMap::new();
+            for (si, flat, _) in cands {
+                m.entry(si).or_default().push(flat);
+            }
+            m
+        };
+        if std::env::var("INFINO_LOG_GETS").is_ok() {
+            let probed: usize = by_sf.values().map(Vec::len).sum();
+            eprintln!(
+                "[GFC] clusters_probed={probed} superfiles={} fanout={fanout} graph={}",
+                by_sf.len(),
+                use_graph as u8
+            );
+        }
+        if by_sf.is_empty() {
             return Ok(Vec::new());
-        }
-        // `cands` now holds EVERY fine cluster across all cells/superfiles;
-        // clamp the requested fanout to that total. Global top-`fc` by
-        // ascending distance (smaller = nearer).
-        let fc = fanout.clamp(1, cands.len());
-        if cands.len() > fc {
-            cands.select_nth_unstable_by(fc - 1, |a, b| a.2.total_cmp(&b.2));
-            cands.truncate(fc);
-        }
-        let mut by_sf: HashMap<usize, Vec<u32>> = HashMap::new();
-        for (si, flat, _) in cands {
-            by_sf.entry(si).or_default().push(flat);
         }
 
         // Phase 2: DEFERRED per-cell scan on the selected clusters, pooling
@@ -2686,9 +2805,15 @@ impl SupertableReader {
             && vcfg.search_mode == config::VectorSearchMode::GlobalFineCentroid
             && vcfg.global_fine_fanout > 0
         {
-            let fanout = vcfg.global_fine_fanout;
             return self
-                .global_fine_fanout(&superfiles, column, query, k, &options, fanout)
+                .global_fine_fanout(
+                    &superfiles,
+                    column,
+                    query,
+                    k,
+                    &options,
+                    vcfg.global_fine_fanout,
+                )
                 .await;
         }
         // Borrow routing — do not clone the VectorCell centroid grid just to
