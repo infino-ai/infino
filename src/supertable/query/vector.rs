@@ -747,12 +747,11 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
 }
 
 /// In-memory centroid router: an HNSW over the pooled fp32 fine centroids,
-/// used on the global-fine path to select the top-`fanout` clusters in place
-/// of the brute-force `global_fine_cluster_scores` scan. Experimental,
-/// validation-grade — built once per handle from the resident centroid section
-/// (no drain change). A graph node maps back to the `(superfile index, flat
-/// cluster id)` the scan path would have produced, so the downstream per-cell
-/// read plan is byte-identical.
+/// used by `ivf_router = centroid_graph` to select the top-`fanout` clusters
+/// globally, bypassing the grid. Experimental, validation-grade — built once
+/// per handle from the resident centroid section (no drain change). A graph
+/// node maps back to the `(superfile index, flat cluster id)` the stamped
+/// per-cell read plan expects, so the downstream read is byte-identical.
 pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
     graph: crate::superfile::vector::hnsw::Hnsw,
@@ -2542,18 +2541,15 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-fine fanout (`vector.search_mode = global_fine_centroid`, reading
+    /// Global-fine fanout (`vector.ivf_router = centroid_graph`, reading
     /// `fanout = vector.global_fine_fanout` clusters, clamped to the table's
-    /// cluster total). Phase 1: score `query` against every cell's fp32 fine
-    /// centroids from the resident centroid section (a RAM scan — no superfile
-    /// opens for the scoring) and keep the global top-`fanout`
-    /// `(superfile, flat cluster)` by ascending distance. Phase 2: scan only those clusters per superfile, pool the
-    /// warm survivors across all cells, take one global shortlist cut, and
-    /// exact-rerank where the winners live. The router overrides only cluster
-    /// SELECTION; the byte fetch, 1-bit shortlist, rerank, and id remap are
-    /// the stamped path's own code. A tree/HNSW centroid router replaces the
-    /// brute-force scan later; see
-    /// [`SuperfileReader::global_fine_cluster_scores`].
+    /// cluster total). Phase 1: walk the centroid-HNSW over the resident fp32
+    /// fine centroids (a RAM op — no superfile opens for the selection) and
+    /// keep the global top-`fanout` `(superfile, flat cluster)`. Phase 2: scan
+    /// only those clusters per superfile, pool the warm survivors across all
+    /// cells, take one global shortlist cut, and exact-rerank where the winners
+    /// live. The router overrides only cluster SELECTION; the byte fetch, 1-bit
+    /// shortlist, rerank, and id remap are the stamped path's own code.
     async fn global_fine_fanout(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -2590,12 +2586,12 @@ impl SupertableReader {
             readers.push(reader);
         }
 
-        // Cluster selection: the centroid-router HNSW (default) walks a graph
-        // over the fp32 fine centroids to pick the top-`fanout` clusters; the
-        // fallback is the exact brute-force scan (`global_fine_use_graph =
-        // false`). Both produce the same `by_sf` map, so phase 2 is identical.
-        let use_graph = config::global().vector.global_fine_use_graph;
-        let by_sf: HashMap<usize, Vec<u32>> = if use_graph {
+        // Cluster selection: the centroid-router HNSW walks a graph over the
+        // resident fp32 fine centroids to pick the top-`fanout` clusters; phase
+        // 2 then reads only those clusters. The graph is built once (cached) at
+        // the first query from the same fine centroids, so a graph node maps
+        // back to the exact `flat` cluster id and the read plan is identical.
+        let by_sf: HashMap<usize, Vec<u32>> = {
             let cache = Arc::clone(&manifest.options.centroid_router_cache);
             let router = {
                 let sfs = superfiles.to_vec();
@@ -2630,45 +2626,7 @@ impl SupertableReader {
                 }
             }
             m
-        } else {
-            let mut cands: Vec<(usize, u32, f32)> = Vec::new();
-            for (si, reader) in readers.iter().enumerate() {
-                if let Some(vr) = reader.vec() {
-                    let scores = vr
-                        .global_fine_cluster_scores(
-                            column,
-                            query,
-                            section.as_ref(),
-                            superfiles[si].superfile_id,
-                        )
-                        .map_err(|e| QueryError::Execute(e.to_string()))?;
-                    for (flat, score) in scores {
-                        cands.push((si, flat, score));
-                    }
-                }
-            }
-            // `cands` now holds EVERY fine cluster across all cells/superfiles;
-            // clamp the requested fanout to that total. Global top-`fc` by
-            // ascending distance (smaller = nearer).
-            let fc = fanout.clamp(1, cands.len().max(1));
-            if cands.len() > fc {
-                cands.select_nth_unstable_by(fc - 1, |a, b| a.2.total_cmp(&b.2));
-                cands.truncate(fc);
-            }
-            let mut m: HashMap<usize, Vec<u32>> = HashMap::new();
-            for (si, flat, _) in cands {
-                m.entry(si).or_default().push(flat);
-            }
-            m
         };
-        if std::env::var("INFINO_LOG_GETS").is_ok() {
-            let probed: usize = by_sf.values().map(Vec::len).sum();
-            eprintln!(
-                "[GFC] clusters_probed={probed} superfiles={} fanout={fanout} graph={}",
-                by_sf.len(),
-                use_graph as u8
-            );
-        }
         if by_sf.is_empty() {
             return Ok(Vec::new());
         }
@@ -2760,7 +2718,7 @@ impl SupertableReader {
         let (resolved_nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
         let hidden_vector_index = is_hidden_vector_manifest(manifest);
-        // Global-fine routing (`vector.search_mode = global_fine_centroid`):
+        // Global-fine routing (`vector.ivf_router = centroid_graph`):
         // select the top-`global_fine_fanout` fine centroids GLOBALLY across
         // every cell/superfile from the resident centroid section, bypassing
         // the grid + stamped-law selection, and read only those clusters.
@@ -2802,7 +2760,8 @@ impl SupertableReader {
         }
         if !filtered
             && hidden_vector_index
-            && vcfg.search_mode == config::VectorSearchMode::GlobalFineCentroid
+            && vcfg.search_mode == config::VectorSearchMode::Ivf
+            && vcfg.ivf_router == config::IvfRouter::CentroidGraph
             && vcfg.global_fine_fanout > 0
         {
             return self

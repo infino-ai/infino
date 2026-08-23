@@ -416,11 +416,11 @@ pub struct SupertableOptions {
     /// path — so the download never serializes steady-state serving.
     pub(crate) graph_hydration_lock: Arc<TokioMutex<()>>,
     /// Build-once cache for the in-memory centroid-router HNSW (an HNSW over
-    /// the resident fp32 fine centroids that replaces the brute-force
-    /// `global_fine_cluster_scores` scan on the global-fine path). Built from
-    /// the resident centroid section at first global-fine query, so testing it
-    /// needs no re-drain; the persisted centroid graph is a follow-on.
-    /// Experimental: only populated when the global-fine graph path is enabled.
+    /// the resident fp32 fine centroids, used by `ivf_router = centroid_graph`
+    /// to select clusters). Built from the resident centroid section at the
+    /// first such query, so testing it needs no re-drain; the persisted
+    /// centroid graph is a follow-on. Only populated when the centroid-graph
+    /// router is enabled.
     pub(crate) centroid_router_cache:
         Arc<tokio::sync::OnceCell<Arc<crate::supertable::query::vector::CentroidRouterGraph>>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar

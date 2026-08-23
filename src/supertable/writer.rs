@@ -4359,9 +4359,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
         // Opt-in gate: only build the resident data graph when queries will
-        // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` (or
-        // `global_fine_centroid`) the drain skips the build — no build tax, no
-        // RAM-pinned graph — and queries serve ivf. Gating here (not inside
+        // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` the drain
+        // skips the build — no build tax, no RAM-pinned graph — and queries
+        // serve ivf. Gating here (not inside
         // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
         // build step.
         let building_graph =

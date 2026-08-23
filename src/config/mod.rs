@@ -287,9 +287,9 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
-/// Default fine-cluster fanout for `search_mode = global_fine_centroid`.
+/// Default fine-cluster fanout for `ivf_router = centroid_graph`.
 const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
-/// Default exact-rerank over-fetch for `search_mode = global_fine_centroid` —
+/// Default exact-rerank over-fetch for `ivf_router = centroid_graph` —
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
 const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
@@ -432,10 +432,6 @@ pub enum VectorSearchMode {
     /// queries.
     #[default]
     Ivf,
-    /// EXPERIMENTAL (opt-in): score every fine centroid globally and read the
-    /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
-    /// cold-read win at scale, not at small scale — see `config.yaml`.
-    GlobalFineCentroid,
     /// OPT-IN (`hnsw_ivf`): walk a resident in-memory HNSW graph built over
     /// every row's Sq16 codes, bypassing the grid, cell selection, and disk
     /// reads. Built at drain and held resident (RAM-pinned) for corpora
@@ -445,6 +441,21 @@ pub enum VectorSearchMode {
     /// or a different column) always serves `ivf`. Search walks the graph at
     /// the `k`-scaled `ef` law.
     HnswIvf,
+}
+
+/// Cluster router for `search_mode = ivf`: how a query selects which cells or
+/// clusters to read. Selected by `vector.ivf_router`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IvfRouter {
+    /// DEFAULT. Grid routing to cells, then the manifest's stamped per-cell
+    /// width. The established path.
+    #[default]
+    Stamped,
+    /// EXPERIMENTAL (opt-in): score fine centroids via an HNSW over the
+    /// resident fp32 fine centroids and read the top `global_fine_fanout`
+    /// clusters, bypassing the grid. A cold-read win at scale.
+    CentroidGraph,
 }
 
 /// Vector-index build / search / drain tuning knobs. Grouped so the
@@ -504,28 +515,24 @@ pub struct VectorSettings {
     /// Default `ivf`; `global_fine_centroid` is experimental (see
     /// [`VectorSearchMode`]).
     pub search_mode: VectorSearchMode,
-    /// For `search_mode = global_fine_centroid`: number of fine clusters the
-    /// query reads (globally scored, clamped to the table's total). See
-    /// `config.yaml` for sizing guidance. Ignored under `search_mode = ivf`.
+    /// For `search_mode = ivf`: the cluster router — the established stamped
+    /// grid, or the centroid-HNSW over the resident fp32 fine centroids.
+    /// Ignored under `search_mode = hnsw_ivf`.
+    pub ivf_router: IvfRouter,
+    /// For `ivf_router = centroid_graph`: number of fine clusters the query
+    /// reads (globally scored, clamped to the table's total). See `config.yaml`
+    /// for sizing guidance. Ignored otherwise.
     pub global_fine_fanout: usize,
-    /// For `search_mode = global_fine_centroid`: the exact-rerank over-fetch
+    /// For `ivf_router = centroid_graph`: the exact-rerank over-fetch
     /// multiplier for this path specifically (a caller-set `rerank_mult`
     /// still wins). Scoped here rather than the shared default so tuning
-    /// it never touches the ivf / filtered / user-table paths.
+    /// it never touches the stamped / filtered / user-table paths.
     pub global_fine_rerank_mult: usize,
-    /// For `search_mode = global_fine_centroid`: coalesce the selected
-    /// clusters within each cell into contiguous reads. Ignored under
-    /// `search_mode = ivf`.
+    /// For `ivf_router = centroid_graph`: coalesce the selected clusters
+    /// within each cell into contiguous reads. Ignored otherwise.
     pub global_fine_coalesce: bool,
-    /// For `search_mode = global_fine_centroid`: route via the centroid-HNSW
-    /// graph over the resident fp32 fine centroids (default) instead of the
-    /// brute-force centroid scan. The graph ranks centroids by normalized
-    /// cosine, which selects better clusters than the scan's raw-dot ranking.
-    /// Ignored under `search_mode = ivf`.
-    pub global_fine_use_graph: bool,
-    /// For `search_mode = global_fine_centroid` with the graph router: the
-    /// HNSW walk's `ef` (candidate breadth). `0` = auto (`fanout * 2`).
-    /// Ignored under `search_mode = ivf` or `global_fine_use_graph = false`.
+    /// For `ivf_router = centroid_graph`: the centroid-HNSW walk's `ef`
+    /// (candidate breadth). `0` = auto (`fanout * 2`). Ignored otherwise.
     pub global_fine_graph_ef: usize,
     /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
@@ -631,10 +638,10 @@ impl Default for VectorSettings {
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             search_mode: VectorSearchMode::Ivf,
+            ivf_router: IvfRouter::Stamped,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
-            global_fine_use_graph: true,
             global_fine_graph_ef: 0,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
