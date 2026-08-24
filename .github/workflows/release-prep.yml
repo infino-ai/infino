@@ -13,8 +13,11 @@ name: Release prep
 #   - all                   — coordinated minor/major; needs `version`, patch 0.
 #
 # Runs on a fresh checkout of main, so a stale or dirty local tree can never
-# leak into a release. All bump validation lives in scripts/release_prep.py;
-# a bad request fails here with the script's error, before anything is pushed.
+# leak into a release. Bump *shape* validation lives in
+# scripts/release_prep.py (single-package bumps stay on their release line, a
+# coordinated release is patch 0); a bad request fails here with the script's
+# error, before anything is pushed. Bump *size* is then checked against the
+# crate's actual API change, so a breaking change cannot go out as a patch.
 #
 # Needs the RELEASE_PAT secret: a fine-grained token with Contents and
 # Pull requests read/write on this repository. The default GITHUB_TOKEN can't
@@ -108,6 +111,52 @@ jobs:
           PACKAGE: ${{ inputs.package || 'each' }}
           VERSION: ${{ inputs.version }}
         run: make release-prep PACKAGE="$PACKAGE" VERSION="$VERSION"
+
+      # Prove the stamped version is a legal bump for what actually changed.
+      # `public-api.txt` already fails CI when the surface moves at all, which
+      # forces a snapshot update in the PR that moved it. This asks the other
+      # question: was the movement breaking, and is the version bump big enough
+      # for it? Nothing else in the pipeline asks, and a scheduled run stamps a
+      # patch, so without this a breaking change on main ships as one.
+      #
+      # `default-features` matches how `public-api.txt` is generated. Left
+      # unset, the check also grades the internals the `test-helpers` feature
+      # exposes (`supertable` and `superfile` are `pub` only under it) and
+      # reports breaking changes in items no release ever ships.
+      #
+      # A failure here is not a draft-and-reconcile situation like a shared-dep
+      # bump: the stamped version is simply wrong for the diff, so the job fails
+      # and pushes nothing. Re-run the workflow with the bump the check asks for
+      # (`all` with an explicit version) once the change is understood.
+      - name: Resolve the pinned toolchain
+        id: toolchain
+        if: steps.gate.outputs.skip != 'true' && (inputs.package == '' || inputs.package == 'crate' || inputs.package == 'each' || inputs.package == 'all')
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          test -n "$channel" || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Check the crate's bump against its API change
+        id: semver
+        if: steps.toolchain.outcome == 'success' && steps.gate.outputs.skip != 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: infino
+          feature-group: default-features
+          rust-toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Explain a rejected bump
+        if: failure() && steps.semver.outcome == 'failure'
+        run: |
+          {
+            echo "## The stamped version is not a large enough bump"
+            echo
+            echo "The crate's public API changed in a way that needs more than the"
+            echo "version this run stamped. Nothing was pushed. Read the check above"
+            echo "for the items involved, then re-run this workflow with the bump it"
+            echo "asks for (\`all\` with an explicit version), or narrow the change."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Push the release branch and open the PR
         if: steps.gate.outputs.skip != 'true'
