@@ -2900,9 +2900,10 @@ impl SupertableReader {
             // law's cell set AND misses, because an allow-set's eligible
             // neighbours sit deeper in the fine ranking rather than in
             // farther cells. With the fine-depth law above now applying,
-            // this serves filtered in the same shape as the unfiltered
-            // default — law floor at whole-cell depth, extended by the
-            // near-tie window below.
+            // filtered reads the law's cell set at whole-cell depth. It
+            // stops there: the near-tie serve window below is gated on
+            // `law_default`, which keeps its `!filtered` condition, so no
+            // extension cells are added for filtered.
             let law_width: Option<usize> = if hidden_vector_index && options.nprobe.is_none() {
                 hidden_routing
                     .and_then(|r| r.width_for_k_at(k))
