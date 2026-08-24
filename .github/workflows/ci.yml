@@ -45,9 +45,10 @@ jobs:
           if ! command -v cargo-llvm-cov &> /dev/null; then
             cargo install cargo-llvm-cov --locked
           fi
-      # Unit classification for the bench merge gate: a byte-valued column
-      # misread as nanoseconds blocks merges on a memory delta.
-      - run: python3 .github/scripts/test_bench_summary.py
+      # The bench merge gate's classification, ahead of `make ci` so a broken
+      # gate fails in seconds instead of after the Rust build. `make check`
+      # runs the same target; this is the early tripwire, not a second suite.
+      - run: make bench-gate
       - run: make ci
       - name: RustFS storage wire + smoke tests
         run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1

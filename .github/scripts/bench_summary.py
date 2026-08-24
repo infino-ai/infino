@@ -160,10 +160,11 @@ def is_gating(header, gate_header):
     """Whether `header` is the one statistic allowed to block a merge.
 
     An allowlist, not a denylist: every other time-valued column is reported
-    and never blocks. Exact (case-insensitive) match on the run's designated
-    gate metric — see GATE_REL_PCT for why the others are excluded.
+    and never blocks. Exact match on the run's designated gate metric, with
+    both sides normalized so neither report capitalization nor a caller's
+    spelling can silently kill the gate — see GATE_REL_PCT for the exclusions.
     """
-    return header.strip().lower() == gate_header
+    return header.strip().lower() == gate_header.strip().lower()
 
 
 def tier(header, primary_headers):
@@ -243,6 +244,22 @@ def load(path):
         return {}
 
 
+def entry(subsystem, area, label, header, old, new, pct, kind):
+    """One classified A/B finding, as `finding()` expects to render it.
+
+    `kind` is the bucket the finding landed in: the gate pass supplies
+    blocking / informational, the advisory pass a `tier()` result.
+    """
+    return {
+        "subsystem": subsystem,
+        "area": area,
+        "metric": f"{label} / {header}".strip(" /"),
+        "change": f"{human(header, old)} -> {human(header, new)}",
+        "pct": round(pct, 1),
+        "tier": kind,
+    }
+
+
 def diff(reports, baseline_dir, current_dir, threshold, gate_header):
     """Classify changes per report into a `Diff`.
 
@@ -273,53 +290,43 @@ def diff(reports, baseline_dir, current_dir, threshold, gate_header):
             if is_cost(header):
                 cost_present = True
                 continue
-            t = tier(header, primary_headers)
             old = base.get(key)
             if old is None or old == 0.0:
                 continue
             had_baseline = True
-            # Every time-valued metric is measured against the gate thresholds;
-            # only the designated gate metric may block on the result.
-            if is_latency(header):
+            latency = is_latency(header)
+            delta = new - old
+            pct = delta / old * 100.0
+
+            # Gate pass. Every time-valued metric is measured against the gate
+            # thresholds; only the designated gate metric may block on it.
+            if latency:
                 gating = is_gating(header, gate_header)
-                gate_metric_seen = gate_metric_seen or gating
-                delta_ns = new - old
-                gate_pct = delta_ns / old * 100.0
-                if delta_ns > GATE_ABS_NS and gate_pct > GATE_REL_PCT:
-                    entry = {
-                        "subsystem": subsystem,
-                        "area": area,
-                        "metric": f"{label} / {header}".strip(" /"),
-                        "change": f"{human(header, old)} -> {human(header, new)}",
-                        "pct": round(gate_pct, 1),
-                        "tier": "blocking" if gating else "informational",
-                    }
-                    (blocking if gating else informational).append(entry)
+                gate_metric_seen |= gating
+                if delta > GATE_ABS_NS and pct > GATE_REL_PCT:
+                    verdict = "blocking" if gating else "informational"
+                    bucket = blocking if gating else informational
+                    bucket.append(
+                        entry(subsystem, area, label, header, old, new, pct, verdict)
+                    )
+
+            # Advisory pass. The 5%/30% tier thresholds — report-only, and
+            # noise-floored so a big percent of nearly nothing never shows up.
+            t = tier(header, primary_headers)
             if t is None:
                 continue
-            if is_latency(header):
-                if max(abs(old), abs(new)) < MIN_LATENCY_NS:
-                    continue
-                if abs(new - old) < MIN_LATENCY_DELTA_NS:
-                    continue
+            if latency and (
+                max(abs(old), abs(new)) < MIN_LATENCY_NS or abs(delta) < MIN_LATENCY_DELTA_NS
+            ):
+                continue
             limit = threshold if t == "primary" else max(threshold, SECONDARY_THRESHOLD_PCT)
-            pct = (new - old) / old * 100.0
             if abs(pct) < limit:
                 continue
             improved = pct > 0 if higher_is_better(header) else pct < 0
-            entry = {
-                "subsystem": subsystem,
-                "area": area,
-                "metric": f"{label} / {header}".strip(" /"),
-                "change": f"{human(header, old)} -> {human(header, new)}",
-                "pct": round(pct, 1),
-                "tier": t,
-            }
-            (improvements if improved else regressions).append(entry)
-    regressions.sort(key=lambda e: -abs(e["pct"]))
-    improvements.sort(key=lambda e: -abs(e["pct"]))
-    blocking.sort(key=lambda e: -abs(e["pct"]))
-    informational.sort(key=lambda e: -abs(e["pct"]))
+            bucket = improvements if improved else regressions
+            bucket.append(entry(subsystem, area, label, header, old, new, pct, t))
+    for bucket in (regressions, improvements, blocking, informational):
+        bucket.sort(key=lambda e: -abs(e["pct"]))
     return Diff(
         regressions=regressions,
         improvements=improvements,
@@ -331,8 +338,8 @@ def diff(reports, baseline_dir, current_dir, threshold, gate_header):
     )
 
 
-def finding(entry):
-    return f"- `{entry['metric']}`: {entry['change']} ({entry['pct']:+.0f}%)"
+def finding(e):
+    return f"- `{e['metric']}`: {e['change']} ({e['pct']:+.0f}%)"
 
 
 def main():
@@ -356,14 +363,15 @@ def main():
     gate_file = os.environ.get("GATE_FILE", DEFAULT_GATE_FILE)
     info_file = os.environ.get("INFO_FILE", DEFAULT_INFO_FILE)
     failures = [ln.strip() for ln in os.environ.get("ERRORS", "").splitlines() if ln.strip()]
-    d = diff(reports, baseline_dir, current_dir, threshold, gate_header)
-    blocking, informational = d.blocking, d.informational
+    ab = diff(reports, baseline_dir, current_dir, threshold, gate_header)
+    blocking, informational = ab.blocking, ab.informational
+    regressions, improvements = ab.regressions, ab.improvements
 
-    prim_regr = [e for e in d.regressions if e["tier"] == "primary"]
-    prim_impr = [e for e in d.improvements if e["tier"] == "primary"]
-    secondary_present = any(e["tier"] == "secondary" for e in d.regressions + d.improvements)
+    prim_regr = [e for e in regressions if e["tier"] == "primary"]
+    prim_impr = [e for e in improvements if e["tier"] == "primary"]
+    secondary_present = any(e["tier"] == "secondary" for e in regressions + improvements)
     # A gate that cannot fire reads as a pass; say so rather than stay silent.
-    dead_gate = d.had_baseline and not d.gate_metric_seen
+    dead_gate = ab.had_baseline and not ab.gate_metric_seen
     if dead_gate:
         print(f"::warning::no report emitted `{gate_header}` — the merge gate had nothing to check")
 
@@ -408,7 +416,7 @@ def main():
         parts.extend(finding(e) for e in informational)
         parts.append("")
 
-    if not failures and not d.had_baseline:
+    if not failures and not ab.had_baseline:
         parts += [f"_No {base_ref} baseline to diff against (first run or new config)._", ""]
     elif not failures:
         parts += ["### Primary Findings", ""]
@@ -461,7 +469,7 @@ def main():
     parts.append("")
 
     parts.append("### Notes")
-    if secondary_present or d.cost_present:
+    if secondary_present or ab.cost_present:
         parts.append(
             "- Cold-search and cost metrics measured, non-gating."
         )
@@ -493,9 +501,9 @@ def main():
 
     print(
         f"wrote {out_file}: gate={gate_header}, {len(blocking)} blocking, "
-        f"{len(informational)} informational, {len(d.regressions)} advisory regressions, "
-        f"{len(d.improvements)} improvements, {len(failures)} failure line(s), "
-        f"baseline={'yes' if d.had_baseline else 'no'}"
+        f"{len(informational)} informational, {len(regressions)} advisory regressions, "
+        f"{len(improvements)} improvements, {len(failures)} failure line(s), "
+        f"baseline={'yes' if ab.had_baseline else 'no'}"
     )
 
 
