@@ -731,6 +731,40 @@ pub fn cold_cell_per_million(
     }
 }
 
+/// Full DIRECT cost of one write op, in dollars: compute billed at the
+/// binding leg — pool CPU or peak-RSS share of RAM, whichever is larger —
+/// over the op's wall window, plus its object-store request dollars.
+/// `None` when the op's CPU was unsampled (never a $0 guess — the same
+/// rule the phase and query cells follow).
+///
+/// "Direct" is deliberate: deferred maintenance the write will later
+/// cause (hidden-index drain merges, compaction) is excluded here and
+/// is already inside the amortized `write_per_million_docs` figure.
+/// Per-op cells exist to compare write shapes against each other on the
+/// work the op itself performed.
+pub fn write_op_usd(
+    cpu_s: Option<f64>,
+    wall_s: f64,
+    peak_rss_bytes: Option<u64>,
+    io: &ObjectStoreMeter,
+) -> Option<f64> {
+    cpu_s.map(|cpu| {
+        let inst = Instance::current();
+        inst.compute_usd(inst.phase_vcpu_seconds(cpu, wall_s, peak_rss_bytes)) + request_usd(io)
+    })
+}
+
+/// "$X/write ($Y/1M)" cell text for one write op's direct cost.
+pub fn write_cell(per_op: f64) -> String {
+    format!("{}/write ({})", usd(per_op), usd_per_million(per_op))
+}
+
+/// Plain "$X" cell text for an already-scaled dollar figure (e.g. a
+/// per-1M-rows value a caller computed from a per-op cost).
+pub fn usd_text(v: f64) -> String {
+    usd(v)
+}
+
 fn fmt_vcpu_seconds(s: f64) -> String {
     if s >= 10.0 {
         format!("{s:.1}")

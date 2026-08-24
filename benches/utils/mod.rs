@@ -41,3 +41,4 @@ pub mod sql_diag;
 pub mod supertable_update;
 pub mod tombstone_overhead;
 pub mod unified_object_store;
+pub mod write_diag;

@@ -16,7 +16,7 @@
 //! cargo bench -- supertable vector build cold
 //!
 //! # Diagnostics (standalone programs, same binary):
-//! cargo bench -- diagnostic              # all eight
+//! cargo bench -- diagnostic              # all nine
 //! cargo bench -- diagnostic scale        # a subset, grouped
 //! cargo bench -- tombstone               # bare names also work
 //!
@@ -34,9 +34,9 @@
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `object-store` | `concurrent` | `disk-warm`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `object-store` | `concurrent` | `disk-warm` | `write-diag`,
 //!                 by name, or grouped under the `diagnostic` keyword —
-//!                 `cargo bench -- diagnostic` runs all eight,
+//!                 `cargo bench -- diagnostic` runs all nine,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
@@ -72,6 +72,7 @@ enum Diagnostic {
     Concurrent,
     DiskWarm,
     RecallWhileIngest,
+    WriteDiag,
 }
 
 impl Diagnostic {
@@ -86,6 +87,7 @@ impl Diagnostic {
             Diagnostic::Concurrent => "concurrent",
             Diagnostic::DiskWarm => "disk-warm",
             Diagnostic::RecallWhileIngest => "recall_while_ingest",
+            Diagnostic::WriteDiag => "write-diag",
         }
     }
 
@@ -108,6 +110,7 @@ impl Diagnostic {
                 );
             }
             Diagnostic::RecallWhileIngest => infino_bench_utils::recall_while_ingest::run(),
+            Diagnostic::WriteDiag => infino_bench_utils::write_diag::run(),
         }
     }
 }
@@ -425,6 +428,7 @@ fn parse_args() -> Selection {
             "concurrent" => diagnostics.push(Diagnostic::Concurrent),
             "disk-warm" | "disk_warm" => diagnostics.push(Diagnostic::DiskWarm),
             "recall_while_ingest" => diagnostics.push(Diagnostic::RecallWhileIngest),
+            "write-diag" | "write_diag" => diagnostics.push(Diagnostic::WriteDiag),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
             other => match other.split_once('=') {
                 Some(("corpus", spec)) => corpus_spec = Some(spec.to_string()),
@@ -465,6 +469,7 @@ fn parse_args() -> Selection {
             Diagnostic::ObjectStore,
             Diagnostic::Concurrent,
             Diagnostic::DiskWarm,
+            Diagnostic::WriteDiag,
         ];
     }
 

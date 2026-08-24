@@ -70,10 +70,11 @@ INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
 
 # Diagnostics (standalone programs in the same binary; never implied by
 # `all` or a bare `cargo bench`).
-cargo bench -- diagnostic                  # all five
+cargo bench -- diagnostic                  # all nine
 cargo bench -- diagnostic scale tombstone  # a subset, grouped
 cargo bench -- tombstone                   # bare names also work
-# Names: scale | tombstone | update | sql-diag | object-store
+# Names: scale | tombstone | update | sql-diag | fts-diag | object-store
+#        | concurrent | disk-warm | write-diag
 ```
 
 ## Object-store backends
@@ -184,6 +185,7 @@ ingest/, fixture/           supertable object-store helpers
 scale.rs, sql_diag.rs       diagnostics (recall gates, SQL dispatch tax)
 tombstone_overhead.rs       diagnostics (delete/tombstone query overhead)
 supertable_update.rs        diagnostics (update/delete pipeline)
+write_diag.rs               diagnostics (per-write-op cost by shape)
 unified_object_store.rs     diagnostics (cold lazy-fetch request shape)
 ```
 
