@@ -46,7 +46,7 @@ use std::{
 use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
-    Metric, Sq16Kernel, dequantize_sq16_into, dot, encode_sq16_row,
+    Metric, Sq16Kernel, dequantize_sq16_into, dot, encode_sq16_row, quantize_query_i8, sq8_walk_dot,
 };
 
 /// Per-node distance the graph is generic over. Lower = nearer.
@@ -1176,6 +1176,11 @@ pub(crate) struct HnswIndex {
     /// different column (→ ivf) rather than silently answer it from this
     /// column's neighbors.
     pub column: String,
+    /// Resident contiguous SQ8 walk plane (`n × dim` bytes) — the high byte of
+    /// each Sq16 code, derived here at load, never persisted (no writer/bundle
+    /// change). Used by [`HnswIndex::search_sq8_refine`] for a cheap int8-VNNI
+    /// walk; the exact ranking comes from the Sq16 refine over `scorer`.
+    pub sq8_plane: Vec<u8>,
 }
 
 /// Serialize a `hnsw` index to a persistable byte bundle: header,
@@ -1216,7 +1221,7 @@ pub(crate) fn encode_hnsw(
 /// Rebuild a resident [`HnswIndex`] from [`encode_hnsw`].
 /// Returns `None` on any malformation so the caller falls back to the lazy
 /// build or scan path rather than failing the query.
-pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
+pub(crate) fn decode_hnsw(bytes: &[u8], sq8_walk: bool) -> Option<HnswIndex> {
     let mut c = Cursor::new(bytes);
     if c.take(HNSW_DATA_MAGIC.len())? != HNSW_DATA_MAGIC {
         return None;
@@ -1251,6 +1256,19 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
     if graph.len() != n {
         return None;
     }
+    // Resident SQ8 walk plane: the high byte of each little-endian u16 code,
+    // laid out contiguously (n × dim). Reader-side only — derived from the
+    // Sq16 plane, never persisted. Built only when SQ8-walk serving is on;
+    // empty otherwise, so the plane costs no memory when disabled and serving
+    // falls back to the Sq16 walk.
+    let sq8_plane: Vec<u8> = if sq8_walk {
+        // High byte of each little-endian u16 code — the second byte of every
+        // 2-byte pair. `chunks_exact(2)` elides the per-element bounds check on
+        // this `n × dim` hydration loop.
+        plane.chunks_exact(2).map(|w| w[1]).collect()
+    } else {
+        Vec::new()
+    };
     let scorer = Sq16Scorer::from_codes(plane, dim, n);
     Some(HnswIndex {
         scorer,
@@ -1259,7 +1277,104 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
         dim,
         ef_search,
         column,
+        sq8_plane,
     })
+}
+
+/// Prepared query for [`Sq8WalkScorer`]: the int8 query plus the constant
+/// `128·Σq_i8` baseline subtracted at score time.
+pub(crate) struct Sq8Query {
+    q: Vec<i8>,
+    /// `128·Σq_i8`. The stored code byte is unsigned in `[0, 255]`, centered
+    /// near 128, so subtracting this baseline turns the raw dot `Σ code·q` into
+    /// the centered dot `Σ(code−128)·q` — the same ranking (a per-query
+    /// constant shift), but small enough to stay in f32's exact-integer range.
+    /// The raw u8·i8 dot can reach `dim·255·127` (> 2^24 for `dim ≳ 519`, e.g.
+    /// 768-dim), where distinct dots would collapse to the same f32 in the beam
+    /// heap and mis-order candidates before the Sq16 refine sees them.
+    baseline: i32,
+}
+
+/// Walk scorer over the resident SQ8 plane: ranks candidates by the int8-VNNI
+/// dot `-Σ(code−128)·q_i8` (NegDot — lower is nearer). A coarse *navigation*
+/// proxy; exact ranking is restored by the Sq16 refine in
+/// [`HnswIndex::search_sq8_refine`].
+pub(crate) struct Sq8WalkScorer<'a> {
+    plane: &'a [u8],
+    dim: usize,
+    len: usize,
+}
+
+impl Sq8WalkScorer<'_> {
+    #[inline]
+    fn row(&self, node: u32) -> &[u8] {
+        let s = node as usize * self.dim;
+        &self.plane[s..s + self.dim]
+    }
+}
+
+impl NodeScorer for Sq8WalkScorer<'_> {
+    type Prepared = Sq8Query;
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn prepare(&self, query: &[f32]) -> Sq8Query {
+        let q = quantize_query_i8(query);
+        let baseline = 128 * q.iter().map(|&x| x as i32).sum::<i32>();
+        Sq8Query { q, baseline }
+    }
+    fn prepare_node(&self, node: u32) -> Sq8Query {
+        // Node-as-query for build-time node-to-node distance; unused by the
+        // search-only walk. Center the stored bytes into signed int8.
+        let q: Vec<i8> = self
+            .row(node)
+            .iter()
+            .map(|&c| (c as i16 - 128) as i8)
+            .collect();
+        let baseline = 128 * q.iter().map(|&x| x as i32).sum::<i32>();
+        Sq8Query { q, baseline }
+    }
+    #[inline]
+    fn score(&self, q: &Sq8Query, node: u32) -> f32 {
+        // Centered dot: raw `Σ code·q` minus the `128·Σq` baseline — see
+        // `Sq8Query::baseline` for why the centering is needed for f32 exactness.
+        -((sq8_walk_dot(self.row(node), &q.q) - q.baseline) as f32)
+    }
+}
+
+impl HnswIndex {
+    /// SQ8 walk + Sq16 refine: navigate the graph scoring the cheap int8 plane
+    /// (returning the top `refine_k` by SQ8), then re-score those on the exact
+    /// Sq16 plane and return the true top-`k`. Reader-side; no bundle change.
+    pub(crate) fn search_sq8_refine(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        refine_k: usize,
+    ) -> Vec<(u32, f32)> {
+        let sq8 = Sq8WalkScorer {
+            plane: &self.sq8_plane,
+            dim: self.dim,
+            len: self.graph.len(),
+        };
+        // Refine the top `refine_k` of the SQ8 beam on Sq16, clamped to
+        // `[k, ef]`: at least `k` (so there are enough to return) and at most
+        // the beam width `ef` (nothing beyond it was explored).
+        let shortlist = refine_k.max(k).min(ef);
+        let beam = self.graph.search(&sq8, query, shortlist, ef);
+        let prepared = self.scorer.prepare(query);
+        let mut refined: Vec<(u32, f32)> = beam
+            .into_iter()
+            .map(|(node, _)| (node, self.scorer.score(&prepared, node)))
+            .collect();
+        refined.sort_by(|a, b| a.1.total_cmp(&b.1));
+        refined.truncate(k);
+        refined
+    }
 }
 
 /// On-disk magic for the combined graph bundle (one slow-state section
@@ -2277,7 +2392,7 @@ mod tests {
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
         let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256, "emb");
-        let idx = decode_hnsw(&bytes).expect("decode bundle");
+        let idx = decode_hnsw(&bytes, true).expect("decode bundle");
         assert_eq!(idx.dim, dim);
         assert_eq!(idx.doc_ids, doc_ids);
         assert_eq!(idx.graph.len(), n);
@@ -2297,7 +2412,7 @@ mod tests {
                 assert_eq!(idx.doc_ids[*node as usize], doc_ids[*node as usize]);
             }
         }
-        assert!(decode_hnsw(b"short").is_none());
+        assert!(decode_hnsw(b"short", true).is_none());
 
         // A corrupt node count must degrade to None, not drive a huge
         // `with_capacity` alloc-abort. Overwrite the `n` word (right after the
@@ -2306,8 +2421,80 @@ mod tests {
         poisoned[HNSW_DATA_MAGIC.len()..HNSW_DATA_MAGIC.len() + 8]
             .copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(
-            decode_hnsw(&poisoned).is_none(),
+            decode_hnsw(&poisoned, true).is_none(),
             "a corrupt node count must decode to None, not attempt a giant alloc"
+        );
+    }
+
+    /// SQ8 walk + Sq16 refine returns essentially the same top-k as the Sq16
+    /// walk. Both are measured against the brute-force exact-Sq16 top-k so the
+    /// test asserts the PR's core claim directly: navigating on the cheap int8
+    /// plane then refining on Sq16 costs no meaningful recall versus walking on
+    /// Sq16 throughout.
+    #[test]
+    fn search_sq8_refine_matches_sq16_walk() {
+        use crate::superfile::vector::distance::encode_sq16_row;
+        let dim = 32;
+        let n = 1000;
+        let k = 10;
+        let ef = 64;
+        let vectors = random_unit_vectors(n, dim, 0xA11CE);
+        let stride = dim * 2;
+        let mut codes = vec![0u8; n * stride];
+        for (i, v) in vectors.iter().enumerate() {
+            encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
+        }
+        let doc_ids: Vec<i128> = (0..n as i128).collect();
+        let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, ef, "emb");
+        let idx = decode_hnsw(&bytes, true).expect("decode bundle");
+        assert!(
+            !idx.sq8_plane.is_empty(),
+            "sq8 plane must be built when sq8_walk=true"
+        );
+
+        let queries = random_unit_vectors(50, dim, 0xB0B);
+        let mut sq16_hits = 0usize;
+        let mut sq8_hits = 0usize;
+        for q in &queries {
+            // Brute-force exact-Sq16 top-k ground truth (NegDot: lower nearer).
+            let prep = scorer.prepare(q);
+            let mut all: Vec<(u32, f32)> = (0..n as u32)
+                .map(|node| (node, scorer.score(&prep, node)))
+                .collect();
+            all.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let gt: std::collections::HashSet<u32> =
+                all.iter().take(k).map(|(node, _)| *node).collect();
+
+            let sq16: Vec<u32> = graph
+                .search(&scorer, q, k, ef)
+                .into_iter()
+                .map(|(node, _)| node)
+                .collect();
+            // refine_k == ef refines the whole beam — the widest refine.
+            let sq8: Vec<u32> = idx
+                .search_sq8_refine(q, k, ef, ef)
+                .into_iter()
+                .map(|(node, _)| node)
+                .collect();
+            sq16_hits += sq16.iter().filter(|node| gt.contains(node)).count();
+            sq8_hits += sq8.iter().filter(|node| gt.contains(node)).count();
+        }
+        let denom = (queries.len() * k) as f32;
+        let sq16_recall = sq16_hits as f32 / denom;
+        let sq8_recall = sq8_hits as f32 / denom;
+        // The SQ8 walk navigates a slightly different beam, but refining on
+        // Sq16 recovers the ranking: its recall tracks the Sq16 walk within a
+        // small margin (not a lower fixed floor, which would pass even on a
+        // broken walk that always trailed).
+        assert!(
+            sq16_recall > 0.9,
+            "sanity: Sq16 walk recall {sq16_recall:.4} unexpectedly low"
+        );
+        assert!(
+            sq8_recall >= sq16_recall - 0.03,
+            "SQ8 refine recall {sq8_recall:.4} trails Sq16 walk {sq16_recall:.4} by too much"
         );
     }
 

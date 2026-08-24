@@ -2220,6 +2220,10 @@ impl SupertableReader {
         let manifest = self.manifest();
         let sections_for_walk = Arc::clone(&sections);
         let query_owned = query.to_vec();
+        // SQ8 int8-VNNI walk + Sq16 refine when the SQ8 plane is resident
+        // (built at decode under `vector.hnsw_sq8_walk`); otherwise walk on
+        // Sq16 directly. `hnsw_refine_k` is the re-rank width.
+        let refine_k = config::global().vector.hnsw_refine_k;
         let hits: Vec<SuperfileHit> = run_on_pool(
             Some(&manifest.options.reader_pool),
             "hnsw serving walk: reader pool dropped result",
@@ -2228,8 +2232,12 @@ impl SupertableReader {
                     .data
                     .as_ref()
                     .expect("data present: checked before dispatch");
-                data.graph
-                    .search(&data.scorer, &query_owned, k_fetch, ef)
+                let walked = if data.sq8_plane.is_empty() {
+                    data.graph.search(&data.scorer, &query_owned, k_fetch, ef)
+                } else {
+                    data.search_sq8_refine(&query_owned, k_fetch, ef, refine_k)
+                };
+                walked
                     .into_iter()
                     .filter_map(|(node, dist)| {
                         // Shift the graph's `−dot` onto the ivf/scan arm's
@@ -7823,8 +7831,8 @@ mod tests {
             let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
                 .expect("assemble ok")
                 .expect("sq16 rows must assemble into a graph");
-            let decoded =
-                crate::superfile::vector::hnsw::decode_hnsw(&bundle).expect("decode data bundle");
+            let decoded = crate::superfile::vector::hnsw::decode_hnsw(&bundle, true)
+                .expect("decode data bundle");
             assert_eq!(
                 decoded.graph.len(),
                 decoded.doc_ids.len(),
