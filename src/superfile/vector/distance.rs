@@ -1256,21 +1256,26 @@ unsafe fn sq8_dot_vnni(code_u8: &[u8], q_i8: &[i8]) -> i32 {
     use core::arch::x86_64::{
         _mm512_dpbusd_epi32, _mm512_loadu_epi8, _mm512_reduce_add_epi32, _mm512_setzero_si512,
     };
-    let dim = q_i8.len();
-    let mut acc = _mm512_setzero_si512();
-    let mut d = 0usize;
-    while d + 64 <= dim {
-        let a = _mm512_loadu_epi8(code_u8.as_ptr().add(d) as *const i8);
-        let b = _mm512_loadu_epi8(q_i8.as_ptr().add(d));
-        acc = _mm512_dpbusd_epi32(acc, a, b);
-        d += 64;
+    // SAFETY: called only after avx512f+bw+vnni detection. Each iteration loads
+    // 64 bytes from `code_u8` and `q_i8` strictly below `dim - dim % 64`; the
+    // scalar tail covers the remainder — no read past either slice.
+    unsafe {
+        let dim = q_i8.len();
+        let mut acc = _mm512_setzero_si512();
+        let mut d = 0usize;
+        while d + 64 <= dim {
+            let a = _mm512_loadu_epi8(code_u8.as_ptr().add(d) as *const i8);
+            let b = _mm512_loadu_epi8(q_i8.as_ptr().add(d));
+            acc = _mm512_dpbusd_epi32(acc, a, b);
+            d += 64;
+        }
+        let mut s = _mm512_reduce_add_epi32(acc);
+        while d < dim {
+            s += code_u8[d] as i32 * q_i8[d] as i32;
+            d += 1;
+        }
+        s
     }
-    let mut s = _mm512_reduce_add_epi32(acc);
-    while d < dim {
-        s += code_u8[d] as i32 * q_i8[d] as i32;
-        d += 1;
-    }
-    s
 }
 
 /// Quantize a query to signed int8 for [`sq8_walk_dot`]: scale by the query's
