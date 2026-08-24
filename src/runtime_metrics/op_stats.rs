@@ -192,6 +192,38 @@ pub struct OpStats {
     /// manifest parts and the pointer). Per-superfile fixed overhead
     /// scales with shard count, so width-dependent; recorded only.
     pub superfile_bytes_written: u64,
+    /// Object-store PUTs this op's *plan* implies — the write-side twin
+    /// of [`Self::planned_read_ranges`], and priceable for the same
+    /// reason.
+    ///
+    /// Actual PUTs ([`Self::put_requests`]) are ours, not the caller's:
+    /// they scale with how many shards the writer pool split the commit
+    /// into and how many times a contended publish retried. This counts
+    /// instead what the data itself requires, which neither varies with:
+    ///
+    /// - the objects the committed bytes occupy at the table's target
+    ///   superfile size, and
+    /// - the manifest json + pointer that every commit must publish
+    ///   ([`MANIFEST_PUTS_PER_COMMIT`]), counted once per successful
+    ///   commit rather than once per OCC attempt.
+    ///
+    /// Manifest *parts* are excluded deliberately: their count follows
+    /// the superfile count, so they carry the same width-dependence the
+    /// priced legs exist to avoid.
+    ///
+    /// One honest caveat: the object term is derived from the commit's
+    /// *sealed* bytes, which carry a per-superfile overhead that does
+    /// scale with shard count. Against a gibibyte-scale target that
+    /// overhead is kilobytes, so it cannot move the ceiling except on a
+    /// knife-edge boundary; `write_stats_are_invariant_to_writer_pool_width`
+    /// compares this counter across widths and would catch it if it did.
+    ///
+    /// Requests are a real and material share of write cost — a PUT is
+    /// 12.5x a GET in the bench cost model, and unlike a warm read's
+    /// ranges they never resolve from residency, so a commit always pays
+    /// them. A consumer that accounts for write cost without a request
+    /// term would understate every write by that share.
+    pub planned_write_requests: u64,
     /// Distinct FTS terms built, summed per column across this op's new
     /// superfiles. A term present in k shards counts k times, so
     /// width-dependent; recorded only.
@@ -216,6 +248,7 @@ pub(crate) struct OpStatsCollector {
     fts_text_bytes_written: AtomicU64,
     rows_tombstoned: AtomicU64,
     superfiles_written: AtomicU64,
+    planned_write_requests: AtomicU64,
     superfile_bytes_written: AtomicU64,
     fts_terms_indexed: AtomicU64,
 }
@@ -288,6 +321,20 @@ impl OpStatsCollector {
             .fetch_add(fts_terms, Ordering::Relaxed);
     }
 
+    /// Flush the PUTs one committed publish *planned*, from the bytes it
+    /// sealed and the table's target object size. Called beside
+    /// [`Self::add_commit_outputs`], under the same post-Ok discipline, so
+    /// a failed or retried publish never counts.
+    pub(crate) fn add_planned_write_requests(&self, sealed_bytes: u64, target_bytes: u64) {
+        let objects = if target_bytes == 0 {
+            0
+        } else {
+            sealed_bytes.div_ceil(target_bytes)
+        };
+        self.planned_write_requests
+            .fetch_add(objects.saturating_add(MANIFEST_PUTS_PER_COMMIT), Ordering::Relaxed);
+    }
+
     /// The counters accumulated so far.
     pub(crate) fn snapshot(&self) -> OpStats {
         OpStats {
@@ -305,6 +352,7 @@ impl OpStatsCollector {
             fts_text_bytes_written: self.fts_text_bytes_written.load(Ordering::Relaxed),
             rows_tombstoned: self.rows_tombstoned.load(Ordering::Relaxed),
             superfiles_written: self.superfiles_written.load(Ordering::Relaxed),
+            planned_write_requests: self.planned_write_requests.load(Ordering::Relaxed),
             superfile_bytes_written: self.superfile_bytes_written.load(Ordering::Relaxed),
             fts_terms_indexed: self.fts_terms_indexed.load(Ordering::Relaxed),
         }
@@ -319,6 +367,12 @@ thread_local! {
     /// so spawned tasks and pool closures never consult this slot.
     static CURRENT: RefCell<Option<Arc<OpStatsCollector>>> = const { RefCell::new(None) };
 }
+
+/// PUTs every successful commit publishes regardless of shape: the
+/// manifest json and the pointer file, one each. Manifest *parts* are
+/// excluded — their count follows the superfile count, which is
+/// width-dependent (see [`OpStats::planned_write_requests`]).
+const MANIFEST_PUTS_PER_COMMIT: u64 = 2;
 
 /// Live [`with_op_stats`] scopes, process-wide. Superfile-layer kernel
 /// brackets gate their procfs reads on this instead of a collector they

@@ -1823,6 +1823,7 @@ impl SupertableWriter {
                 (&self.op_stats, output_stats)
             {
                 stats.add_commit_outputs(superfiles, bytes, fts_terms);
+                stats.add_planned_write_requests(bytes, commit_target_object_bytes());
             }
             if crate::storage::io_counters::timeline_enabled() {
                 eprintln!(
@@ -1964,6 +1965,7 @@ impl SupertableWriter {
             (&self.op_stats, output_stats)
         {
             stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
+            stats.add_planned_write_requests(bytes, commit_target_object_bytes());
         }
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
@@ -2774,6 +2776,17 @@ fn collect_prepared_superfiles(
 /// entries. Callers compute this before the batch moves into the publish
 /// future and flush it only after the commit returns Ok, so a failed or
 /// retried publish never counts.
+/// The object size a table's data converges to — compaction's target, in
+/// bytes. Used to turn a commit's sealed bytes into the number of objects
+/// the data itself occupies, independent of how many shards this
+/// particular commit happened to split into.
+fn commit_target_object_bytes() -> u64 {
+    crate::config::global()
+        .compaction
+        .target_superfile_size_mb
+        .saturating_mul(1024 * 1024)
+}
+
 fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
     let superfiles = batch.new_entries.len() as u64;
     let bytes: u64 = batch

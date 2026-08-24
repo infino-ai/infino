@@ -127,6 +127,38 @@ fn write_stats_are_invariant_to_writer_pool_width() {
 }
 
 #[test]
+fn planned_write_requests_follow_the_data_not_the_shard_count() {
+    // The write-side twin of `planned_read_ranges`, and priceable for the
+    // same reason: a PUT is 12.5x a GET in the cost model and never
+    // resolves from residency, so requests are a real share of write
+    // COGS — but the ACTUAL PUTs are ours, rising with how wide the pool
+    // sharded and how often a contended publish retried. What is billed
+    // is what the data requires: the objects it occupies at the target
+    // size, plus the manifest json and pointer every commit publishes.
+    let batch = width_test_batch();
+    let narrow = scoped_append(options_with_pool_width(POOL_WIDTHS[0]), &batch);
+    let wide = scoped_append(options_with_pool_width(POOL_WIDTHS[2]), &batch);
+
+    assert!(
+        wide.superfiles_written > narrow.superfiles_written,
+        "the fixture must really shard wider ({} vs {}), or the invariance \
+         below proves nothing",
+        wide.superfiles_written,
+        narrow.superfiles_written
+    );
+    assert_eq!(
+        narrow.planned_write_requests, wide.planned_write_requests,
+        "more shards must not mean more planned requests"
+    );
+    assert!(
+        narrow.planned_write_requests >= 2,
+        "every commit publishes at least the manifest json and the pointer, \
+         got {}",
+        narrow.planned_write_requests
+    );
+}
+
+#[test]
 fn repeated_identical_appends_report_identical_counters() {
     // Same batch, same (fresh) table state, same pool width: the whole
     // masked snapshot matches, and the recorded superfile count does
