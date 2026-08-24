@@ -403,6 +403,12 @@ struct PendingUpdateEntry {
     new_row_count: u32,
     new_row_content_hash: String,
     ipc_bytes: Bytes,
+    /// Ingested-byte legs of the replacement batch, measured at call time
+    /// the same way an append measures its own — the batch itself is
+    /// dropped once IPC-encoded, so they cannot be recomputed at commit.
+    scalar_bytes_written: u64,
+    vector_bytes_written: u64,
+    fts_text_bytes_written: u64,
 }
 
 /// One buffered delete. Just the call-time resolved target_ids
@@ -1073,17 +1079,11 @@ impl SupertableWriter {
         // Arrow buffer allocations (rough but good enough); the vector payload is
         // its exact f32 size. The FTS text columns are a subset of the scalar
         // columns, summed separately only to weight the build-scratch reserve.
-        let scalar_bytes = scalar.get_array_memory_size();
-        let vector_bytes = vectors
-            .iter()
-            .map(|v| v.len() * mem::size_of::<f32>())
-            .sum::<usize>();
-        let fts_bytes = options
-            .fts_columns
-            .iter()
-            .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
-            .map(|idx| scalar.column(idx).get_array_memory_size())
-            .sum::<usize>();
+        let (scalar_bytes_u64, vector_bytes_u64, fts_bytes_u64) =
+            ingested_byte_legs(&scalar, vectors.iter().map(|v| v.len()).sum(), options);
+        let scalar_bytes = scalar_bytes_u64 as usize;
+        let vector_bytes = vector_bytes_u64 as usize;
+        let fts_bytes = fts_bytes_u64 as usize;
 
         self.buffer.push(BufferedBatch { scalar, vectors });
         self.buffer_scalar_bytes += scalar_bytes;
@@ -1097,9 +1097,9 @@ impl SupertableWriter {
         if let Some(stats) = &self.op_stats {
             stats.add_ingested_write(
                 n_rows as u64,
-                scalar_bytes as u64,
-                vector_bytes as u64,
-                fts_bytes as u64,
+                scalar_bytes_u64,
+                vector_bytes_u64,
+                fts_bytes_u64,
             );
         }
 
@@ -1285,6 +1285,18 @@ impl SupertableWriter {
         // call time (rather than commit time) means the caller
         // can drop the `RecordBatch` immediately — the buffer
         // owns the bytes from here on.
+        // Measure the replacement payload before the batch is dropped: the
+        // entry keeps only the IPC bytes from here on, so this is the last
+        // point the byte legs can be derived. Same helper `append` uses, so
+        // an updated row is measured exactly like an appended one.
+        let (upd_scalar_bytes, upd_vector_bytes, upd_fts_bytes) = {
+            let options = &self.inner.options;
+            let (scalar_no_id, vector_slices) =
+                split_vectors(&new_rows, options).map_err(MutationError::InvalidNewRows)?;
+            let elems = vector_slices.iter().map(|v| v.len()).sum();
+            ingested_byte_legs(&scalar_no_id, elems, options)
+        };
+
         let ipc_bytes = encode_record_batch_ipc(&new_rows).map_err(|e| {
             MutationError::Storage(StorageError::Permanent {
                 uri: "ipc encode".into(),
@@ -1301,6 +1313,9 @@ impl SupertableWriter {
             new_row_count: matched as u32,
             new_row_content_hash: content_hash,
             ipc_bytes,
+            scalar_bytes_written: upd_scalar_bytes,
+            vector_bytes_written: upd_vector_bytes,
+            fts_text_bytes_written: upd_fts_bytes,
         });
         Ok(PendingUpdate { matched })
     }
@@ -1537,7 +1552,12 @@ impl SupertableWriter {
         // they count here — after the drive returns Ok — alongside the
         // rows its tombstone phase retired.
         if let Some(stats) = &self.op_stats {
-            stats.add_ingested_write(u64::from(entry.new_row_count), 0, 0, 0);
+            stats.add_ingested_write(
+                u64::from(entry.new_row_count),
+                entry.scalar_bytes_written,
+                entry.vector_bytes_written,
+                entry.fts_text_bytes_written,
+            );
             stats.add_rows_tombstoned(n_tombstoned as u64);
             // An update commits a manifest (replacement superfile +
             // manifest json + pointer); a pure delete does not — its
@@ -2787,6 +2807,32 @@ fn collect_prepared_superfiles(
 /// bytes. Used to turn a commit's sealed bytes into the number of objects
 /// the data itself occupies, independent of how many shards this
 /// particular commit happened to split into.
+/// The three ingested-byte legs of one caller batch: scalar footprint,
+/// exact vector payload, and the FTS text subset of the scalar columns.
+///
+/// Shared by `append` and `update` so a replacement batch is measured the
+/// same way an appended one is — the update path reported zeros for all
+/// three before this existed, which under-counted every non-empty update.
+/// `vector_elems` is the total f32 count across the batch's vector
+/// columns — taken as a count rather than the arrays themselves because
+/// the two callers hold different representations of the same payload
+/// (`append` has built `Float32Array`s, `update` still has raw slices).
+fn ingested_byte_legs(
+    scalar: &RecordBatch,
+    vector_elems: usize,
+    options: &SupertableOptions,
+) -> (u64, u64, u64) {
+    let scalar_bytes = scalar.get_array_memory_size() as u64;
+    let vector_bytes = (vector_elems * mem::size_of::<f32>()) as u64;
+    let fts_bytes = options
+        .fts_columns
+        .iter()
+        .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
+        .map(|idx| scalar.column(idx).get_array_memory_size() as u64)
+        .sum::<u64>();
+    (scalar_bytes, vector_bytes, fts_bytes)
+}
+
 fn commit_target_object_bytes() -> u64 {
     crate::config::global()
         .compaction

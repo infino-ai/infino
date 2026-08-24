@@ -374,6 +374,22 @@ fn an_update_reports_replacement_rows_and_tombstones() {
         stats.planned_write_requests, 3,
         "an update plans exactly one data object + the manifest pair"
     );
+    // The replacement payload is ingested work and must be measured the
+    // same way an append's is. This reported zero until the byte legs
+    // were captured at call time — the batch is dropped once IPC-encoded,
+    // so there is no second chance at commit.
+    assert!(
+        stats.scalar_bytes_written > 0,
+        "an update's replacement rows must report their ingested bytes"
+    );
+    assert!(
+        stats.fts_text_bytes_written > 0,
+        "the replacement's indexed text is part of that payload"
+    );
+    assert!(
+        stats.fts_text_bytes_written <= stats.scalar_bytes_written,
+        "the FTS leg is a subset of the scalar leg, not additional payload"
+    );
 }
 
 #[test]
