@@ -1316,7 +1316,6 @@ fn create_bucket(
     // genuine error (bad auth, bad name) and fails immediately — except
     // 409, which means the bucket already exists and is success for us.
     let deadline = Instant::now() + Duration::from_secs(BUCKET_READY_TIMEOUT_SECS);
-    let mut last = String::new();
     loop {
         let response = client
             .put(&url)
@@ -1331,13 +1330,12 @@ fn create_bucket(
         if status.is_success() || status.as_u16() == 409 {
             return Ok(());
         }
-        last = format!(
-            "CreateBucket failed for {bucket}: HTTP {} {:?}",
-            status,
-            response.text().ok()
-        );
         if !status.is_server_error() || Instant::now() >= deadline {
-            return Err(last);
+            return Err(format!(
+                "CreateBucket failed for {bucket}: HTTP {} {:?}",
+                status,
+                response.text().ok()
+            ));
         }
         std::thread::sleep(Duration::from_millis(BUCKET_READY_POLL_INTERVAL_MS));
     }
