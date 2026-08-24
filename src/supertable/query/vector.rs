@@ -2878,20 +2878,38 @@ impl SupertableReader {
             // exactly where a flat config floor was measured scale-fragile:
             // 10M post-drain 0.982 at floor 4 vs 0.996 at 8, identical
             // latency).
+            // The stamped fine-depth law applies to FILTERED queries too.
+            // It is consumed as a floor (`max`), so it can only deepen a
+            // read, never narrow one — and an allow-set needs at least the
+            // unfiltered depth, not less: only a fraction of what a cell
+            // yields is eligible, so the matching neighbours sit deeper in
+            // the fine ranking than the unfiltered top-k ever has to reach.
+            // Filtered was pinned to the fixed FILTERED_HIDDEN_FINE_NPROBE
+            // floor while the drain's own measurement sat unused, which is
+            // the shape of the loss on real corpora (measured post-drain on
+            // Cohere: 0.793 at 200K falling to 0.630 at 9.4M as cells grow,
+            // against 0.997 unfiltered on the same table).
             if hidden_vector_index
-                && !filtered
                 && let Some(fine) = hidden_routing.and_then(|r| r.fine_for_k_at(k))
             {
                 cell_routing.fine_nprobe = cell_routing.fine_nprobe.max(fine);
             }
-            let law_width: Option<usize> =
-                if hidden_vector_index && !filtered && options.nprobe.is_none() {
-                    hidden_routing
-                        .and_then(|r| r.width_for_k_at(k))
-                        .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
-                } else {
-                    None
-                };
+            // The stamped width law serves FILTERED queries too. Sweeping
+            // every cell (`FILTERED_HIDDEN_CELL_NPROBE`) was a fallback for
+            // not consulting it: wide-and-shallow costs more reads than the
+            // law's cell set AND misses, because an allow-set's eligible
+            // neighbours sit deeper in the fine ranking rather than in
+            // farther cells. With the fine-depth law above now applying,
+            // this serves filtered in the same shape as the unfiltered
+            // default — law floor at whole-cell depth, extended by the
+            // near-tie window below.
+            let law_width: Option<usize> = if hidden_vector_index && options.nprobe.is_none() {
+                hidden_routing
+                    .and_then(|r| r.width_for_k_at(k))
+                    .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
+            } else {
+                None
+            };
             // Depth the DEFAULT (unpinned) path would read per cell — the
             // stamped fine-depth law over the routing base. Captured before
             // the pin lifts `fine_nprobe` to MAX: #515 serve-window
