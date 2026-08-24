@@ -40,6 +40,22 @@
             }
           }
         ],
+        "requestBody": {
+          "description": "The rows to append: a JSON `{\"data\": [...]}` envelope of rows keyed by column name (`application/json`), or an Arrow IPC stream of one record batch (`application/vnd.apache.arrow.stream`).",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RowsEnvelope"
+              }
+            },
+            "application/vnd.apache.arrow.stream": {
+              "schema": {
+                "$ref": "#/components/schemas/ArrowIpcRows"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Rows appended. Body is an Arrow IPC row stream (application/vnd.apache.arrow.stream), or a JSON `{\"data\": [...]}` envelope."
@@ -204,7 +220,7 @@
             "description": "Table created."
           },
           "400": {
-            "description": "Invalid request body."
+            "description": "Invalid request body, or a malformed table name — use non-empty [A-Za-z0-9_-], at most 128 characters, not starting with '_'."
           },
           "401": {
             "description": "Missing or invalid API key."
@@ -300,6 +316,16 @@
               }
             }
           },
+          "403": {
+            "description": "The API key may not address this database, or the account is not entitled to storage bindings (BYOB is an enterprise feature).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Database already exists.",
             "content": {
@@ -353,6 +379,67 @@
           },
           "412": {
             "description": "The database changed concurrently; retry the request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{name}/storage/verify": {
+      "post": {
+        "tags": [
+          "Databases"
+        ],
+        "summary": "Verify a storage binding",
+        "description": "Prove the database's bring-your-own-bucket grant end to end; workers start only after this passes.",
+        "operationId": "verify_database_storage",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The database name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The binding verified; workers may start."
+          },
+          "400": {
+            "description": "No binding, or the probe failed; the message names the failing stage.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such database.",
             "content": {
               "application/json": {
                 "schema": {
@@ -800,6 +887,22 @@
             }
           }
         ],
+        "requestBody": {
+          "description": "The replacement rows, 1:1 with the rows the predicate matches: a JSON `{\"data\": [...]}` envelope of rows keyed by column name (`application/json`), or an Arrow IPC stream of one record batch (`application/vnd.apache.arrow.stream`).",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RowsEnvelope"
+              }
+            },
+            "application/vnd.apache.arrow.stream": {
+              "schema": {
+                "$ref": "#/components/schemas/ArrowIpcRows"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Row counts as JSON `{matched, n_tombstoned, n_not_found}`. Body is the replacement rows as an Arrow IPC stream."
@@ -880,6 +983,11 @@
   },
   "components": {
     "schemas": {
+      "ArrowIpcRows": {
+        "type": "string",
+        "format": "binary",
+        "description": "A raw Arrow IPC stream request body: one record batch of rows, sent as\n`Content-Type: application/vnd.apache.arrow.stream`. The most efficient\ningest path — no JSON conversion; the batch's schema must match the\ntable's."
+      },
       "Bm25SearchRequest": {
         "type": "object",
         "description": "`POST /v1/bm25_search/{database}`. Projection is optional (absent ⇒ the\nengine-native `_id` + `score`).",
@@ -965,15 +1073,164 @@
           "name": {
             "type": "string",
             "description": "The database name, unique within the account."
+          },
+          "storage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreateDatabaseStorage",
+                "description": "Bring-your-own-bucket: where this database's data should live. Omitted\nmeans platform-hosted storage, exactly as before this field existed."
+              }
+            ]
           }
         }
+      },
+      "CreateDatabaseResponse": {
+        "type": "object",
+        "description": "Create-database response. Empty for a platform-hosted database; a bound\none carries what the caller needs to finish the handshake.",
+        "properties": {
+          "storage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreatedStorage",
+                "description": "Present when the database was created with a storage binding."
+              }
+            ]
+          }
+        }
+      },
+      "CreateDatabaseStorage": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Amazon S3 (or an S3-compatible store via `endpoint`).",
+            "required": [
+              "bucket",
+              "region",
+              "role_arn",
+              "provider"
+            ],
+            "properties": {
+              "bucket": {
+                "type": "string",
+                "description": "The customer's bucket."
+              },
+              "endpoint": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Custom endpoint for an S3-compatible store (https only)."
+              },
+              "prefix": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Root inside the bucket under which everything the platform writes\nlives. Omitted roots at the bucket."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "s3"
+                ]
+              },
+              "region": {
+                "type": "string",
+                "description": "The bucket's region."
+              },
+              "requester_pays": {
+                "type": "boolean",
+                "description": "Whether the bucket has Requester Pays enabled."
+              },
+              "role_arn": {
+                "type": "string",
+                "description": "The customer-owned IAM role the platform will assume\n(`arn:aws:iam::<account>:role/<name>`)."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Google Cloud Storage: the customer grants the platform's service\naccount an object role on the bucket.",
+            "required": [
+              "bucket",
+              "region",
+              "provider"
+            ],
+            "properties": {
+              "bucket": {
+                "type": "string",
+                "description": "The customer's bucket."
+              },
+              "prefix": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Root inside the bucket. Omitted roots at the bucket."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "gcs"
+                ]
+              },
+              "region": {
+                "type": "string",
+                "description": "The bucket's region."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Azure Blob Storage: the customer admin-consents the platform's Entra\napplication and grants it a data role on the storage account.",
+            "required": [
+              "container",
+              "region",
+              "tenant_id",
+              "provider"
+            ],
+            "properties": {
+              "container": {
+                "type": "string",
+                "description": "The customer's container."
+              },
+              "prefix": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Root inside the container. Omitted roots at the container."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "azure"
+                ]
+              },
+              "region": {
+                "type": "string",
+                "description": "The storage account's region."
+              },
+              "tenant_id": {
+                "type": "string",
+                "description": "The customer's Entra tenant id."
+              }
+            }
+          }
+        ],
+        "description": "A requested storage binding, tagged by provider. Deliberately NOT the\nstored [`StorageBinding`] shape: the AWS external id is generated by the\nplatform during the create call and returned to the caller — accepting one\nfrom the request would let a caller reuse another binding's id and reopen\nthe confused-deputy hole the id exists to close."
       },
       "CreateTableRequest": {
         "type": "object",
         "description": "`POST /v1/create_table/{database}`.",
         "required": [
-          "table_name",
-          "schema"
+          "table_name"
         ],
         "properties": {
           "indexes": {
@@ -987,16 +1244,47 @@
             ]
           },
           "schema": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "$ref": "#/components/schemas/SchemaField"
-            }
+            },
+            "description": "JSON column descriptors. Exactly one of `schema` or `schema_ipc` is\nrequired. Cannot express nested types; use `schema_ipc` for those."
+          },
+          "schema_ipc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The table's Arrow schema as a base64-encoded Arrow IPC stream carrying\nonly the schema message. Exactly one of `schema` or `schema_ipc` is\nrequired. Carries any Arrow type the engine accepts, nested included."
           },
           "table_name": {
             "type": "string"
           }
         },
         "additionalProperties": false
+      },
+      "CreatedStorage": {
+        "type": "object",
+        "description": "The binding half of a create response.",
+        "required": [
+          "verified"
+        ],
+        "properties": {
+          "external_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For AWS bindings: the external id to write into the role's trust\npolicy (`sts:ExternalId` condition). Returned exactly once, here."
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Always `false` at create. Call `POST /v1/databases/{name}/storage/verify`\nonce the grant is in place; workers will not start for this database\nuntil the binding verifies."
+          }
+        }
       },
       "DatabaseSummary": {
         "type": "object",
@@ -1019,7 +1307,7 @@
           },
           "state": {
             "type": "string",
-            "description": "Lifecycle state: `registered` (usable) or `purging` (being deleted)."
+            "description": "Lifecycle state: `registered` (usable), `purging` (being deleted), or\n`unreachable` (a bound database whose storage grant failed — restore\nthe grant and re-verify to restore service; the data is not lost)."
           }
         }
       },
@@ -1192,6 +1480,23 @@
           "and"
         ]
       },
+      "RowsEnvelope": {
+        "type": "object",
+        "description": "JSON row envelope for `POST /v1/append/{database}` and\n`POST /v1/update/{database}` — the `Content-Type: application/json`\nalternative to an Arrow IPC stream body. Rows are JSON objects keyed by\ncolumn name, converted server-side into one Arrow batch against the\ntable's schema.",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Rows as JSON objects keyed by column name."
+          }
+        },
+        "additionalProperties": false
+      },
       "SchemaField": {
         "type": "object",
         "description": "One column in a `create_table` schema. A scalar column is `{name, type}` where `type` is a scalar spelling (`\"i32\"`, `\"large_utf8\"`, …); a vector column is `{name, type: \"vector\", dim}`; a list column is `{name, type: \"list\", item}`. `dim` is required for `\"vector\"` and `item` for `\"list\"`.",
@@ -1205,8 +1510,9 @@
               "integer",
               "null"
             ],
-            "description": "Fixed length, required for `type: \"vector\"`.",
-            "minimum": 0
+            "description": "Fixed length, required for `type: \"vector\"`. Must be in [1, 4096].",
+            "maximum": 4096,
+            "minimum": 1
           },
           "item": {
             "type": [
@@ -1240,6 +1546,13 @@
           "table_name"
         ],
         "properties": {
+          "encoding": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Response encoding. Omitted (the default) returns the JSON column\ndescriptors; `\"ipc\"` returns an Arrow IPC schema message, which is the\nonly form that can carry a nested column type."
+          },
           "table_name": {
             "type": "string"
           }
