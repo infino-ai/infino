@@ -220,9 +220,10 @@ impl SupertableReader {
     /// Not metered: this entry runs on the cached, collector-detached
     /// [`SessionContext`] (see [`Self::sql_session_context`]), so a
     /// surrounding `with_op_stats` scope reports zero SQL work for it.
-    /// The metered SQL surface is the catalog `Connection::query_sql`,
-    /// which builds a fresh per-query provider that carries the scope's
-    /// collector.
+    /// The metered SQL surfaces are the catalog `Connection::query_sql`,
+    /// which builds a fresh per-query provider carrying the scope's
+    /// collector, and mutation predicate resolves, which go through
+    /// [`Self::metered_session_context`] for the same reason.
     // Single-table SQL — off the public surface; catalog-level SQL is the
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -327,20 +328,49 @@ impl SupertableReader {
             return Ok(ctx.clone());
         }
 
+        let ctx = op_stats::suppressed(|| self.build_session_context(reader))?;
+        *guard = Some((Arc::clone(&manifest), ctx.clone()));
+        Ok(ctx)
+    }
+
+    /// A context bound to **this** reader, collector and all, built fresh
+    /// on every call and never cached.
+    ///
+    /// [`Self::sql_session_context`] detaches the collector because its
+    /// context is shared across queries, and one that captured a live
+    /// collector would attribute later queries' work back into an old
+    /// scope. That makes it unusable for anything whose work should be
+    /// reported: a caller running through it measures zero no matter how
+    /// much it scans.
+    ///
+    /// Not caching is what makes carrying the collector safe — nothing
+    /// outlives the scope that created it — and it is the same trade the
+    /// catalog's `Connection::query_sql` already makes, building a fresh
+    /// provider per query so the scope's collector rides along.
+    fn metered_session_context(&self) -> Result<SessionContext, QueryError> {
+        self.build_session_context(Arc::new(self.clone()))
+    }
+
+    /// Assemble a context over `reader`'s pinned snapshot: pushdown-aware
+    /// provider, the covered-aggregate rewrite, and the search TVFs.
+    ///
+    /// Whether the result may be cached is the caller's call, and it turns
+    /// entirely on whether `reader` carries a work collector — see the two
+    /// callers above.
+    fn build_session_context(&self, reader: Arc<Self>) -> Result<SessionContext, QueryError> {
+        let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         // Cached per-table schemas: the provider scans the string-viewed `scan`
         // schema; the TVFs bind to the plain `scalar` schema.
         let schemas = self.sql_schemas();
-        let provider = op_stats::suppressed(|| {
-            SupertableProvider::new(
-                schemas.scan().clone(),
-                Arc::clone(&manifest),
-                store,
-                disk_cache,
-                reader.tombstone_cache.clone(),
-            )
-        });
+        let provider = SupertableProvider::new(
+            schemas.scan().clone(),
+            Arc::clone(&manifest),
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
 
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).
@@ -363,8 +393,6 @@ impl SupertableReader {
         // Unranked token / exact match TVFs (siblings of bm25_search).
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
-
-        *guard = Some((Arc::clone(&manifest), ctx.clone()));
 
         Ok(ctx)
     }
@@ -393,7 +421,10 @@ impl SupertableReader {
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
         // invoking this helper.
-        let ctx = self.sql_session_context()?;
+        // Metered deliberately: this scan is real read work the caller
+        // asked for, and routing it through the cached context would
+        // report zero for an arbitrarily large table scan.
+        let ctx = self.metered_session_context()?;
         let id_column = self.options().id_column.clone();
 
         let drive = async move {

@@ -336,19 +336,15 @@ fn a_delete_reports_its_tombstoned_rows_and_its_scan() {
         stats.planned_write_requests, 0,
         "a delete plans no commit requests"
     );
-    // The predicate resolve runs on the reader's cached, collector-
-    // detached SessionContext (the same deliberate suppression that
-    // keeps a cached context from billing later queries into an old
-    // scope), so the scan leg reports no read work today. Pinned here
-    // so a change to that exclusion is a visible decision, not drift:
-    // metering the mutation scan as read work closes a SELECT-then-
-    // delete-by-id arbitrage, but reopening the suppression design is
-    // its own discussion.
-    assert_eq!(
-        stats.planned_read_ranges, 0,
-        "the mutation's predicate scan is unmetered by design (cached \
-         detached context); if this starts reporting, the exclusion \
-         decision changed and the docs must follow"
+    // The predicate resolve is real read work the caller asked for, so
+    // it reports through the same scope as the write leg. It runs on a
+    // fresh, uncached context that carries the collector; routing it
+    // through the shared cached one would report zero for an
+    // arbitrarily large table scan, and would leave a SELECT-then-
+    // delete-by-id path costing more than the equivalent DELETE WHERE.
+    assert!(
+        stats.planned_read_ranges > 0,
+        "the mutation's predicate scan must report its read work"
     );
 }
 
