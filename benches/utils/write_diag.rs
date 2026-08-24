@@ -243,9 +243,8 @@ fn shape_row(label: &str, rows_per_op: usize, ops: usize, m: &OpMeasure) -> Vec<
         .scalar_bytes_written
         .saturating_add(m.stats.vector_bytes_written) as f64
         / ops_f;
-    let per_gib = per_op_usd.and_then(|usd| {
-        (logical_bytes > 0.0).then(|| usd / (logical_bytes / BYTES_PER_GIB_F64))
-    });
+    let per_gib = per_op_usd
+        .and_then(|usd| (logical_bytes > 0.0).then(|| usd / (logical_bytes / BYTES_PER_GIB_F64)));
     let wall_ns = wall_s * NS_PER_SEC;
     vec![
         text(label),
