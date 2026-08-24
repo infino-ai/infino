@@ -1237,10 +1237,10 @@ pub(crate) fn sq8_walk_dot(code_u8: &[u8], q_i8: &[i8]) -> i32 {
             return unsafe { sq8_dot_vnni(code_u8, q_i8) };
         }
     }
-    sq8_dot_scalar(code_u8, q_i8)
+    sq8_walk_dot_scalar(code_u8, q_i8)
 }
 
-fn sq8_dot_scalar(code_u8: &[u8], q_i8: &[i8]) -> i32 {
+fn sq8_walk_dot_scalar(code_u8: &[u8], q_i8: &[i8]) -> i32 {
     code_u8
         .iter()
         .zip(q_i8)
@@ -2413,7 +2413,7 @@ mod tests {
             let q: Vec<i8> = (0..dim)
                 .map(|_| ((next() % 255) as i32 - 127) as i8)
                 .collect();
-            let scalar = sq8_dot_scalar(&code, &q);
+            let scalar = sq8_walk_dot_scalar(&code, &q);
             assert_eq!(
                 sq8_walk_dot(&code, &q),
                 scalar,
