@@ -174,6 +174,7 @@ const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 /// complete at 4 runs (drain-diag: p4=1.000) and the default keeps 8.
 /// Explicit caller `nprobe` overrides; the per-run width sweep keeps the
 /// trade measured.
+const FILTERED_USER_CELL_NPROBE: usize = 4;
 /// Cells the UNDRAINED probe may widen to under the near-tie slack.
 ///
 /// Bounds the one path with no measurement behind it: until the drain
@@ -184,7 +185,6 @@ const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 /// table cannot fan out across the grid while it waits for `optimize()`.
 /// Drained serving never reads this: it pins the stamped width.
 const UNDRAINED_CELL_NPROBE_MAX: usize = 8;
-const FILTERED_USER_CELL_NPROBE: usize = 4;
 
 // The admit window keeps the shared
 // `manifest::RABITQ_ADMIT_CELL_SHORTLIST_FRACTION` (20%) slice of the
@@ -5461,11 +5461,6 @@ mod tests {
         assert_eq!(admit_shortlist_window(241), 49);
     }
 
-    /// The self-measured admit extension (#515) follows the query's own
-    /// evidence: with a flat estimate spectrum and an observed
-    /// estimate-to-exact residual, the near-tie run past the write
-    /// window qualifies; a cliff-scored spectrum admits nothing. The
-    /// residual floor is measured from already-scored cells, so with no
     /// The wider undrained probe stays scoped to the undrained branch.
     ///
     /// Widening `CellRoutingParams::default()` instead would reach every
@@ -5490,6 +5485,11 @@ mod tests {
         );
     }
 
+    /// The self-measured admit extension (#515) follows the query's own
+    /// evidence: with a flat estimate spectrum and an observed
+    /// estimate-to-exact residual, the near-tie run past the write
+    /// window qualifies; a cliff-scored spectrum admits nothing. The
+    /// residual floor is measured from already-scored cells, so with no
     /// exact scores in hand the round admits nothing (no guess).
     #[test]
     fn admit_extension_round_follows_evidence() {
