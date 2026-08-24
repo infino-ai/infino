@@ -1000,6 +1000,18 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 /// bounds). At and above [`COLD_GET_MID_MAX_DOCS`] the grid shape is
 /// still being calibrated, so no ceiling applies yet.
 const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
+/// Multiple of the stamped law width the #515 near-tie serve window may
+/// reach on a real corpus before its fan counts as a regression. See the
+/// derivation at the `law_extra` computation in
+/// [`assert_cold_data_gets`]; synthetic runs keep the 1x model.
+///
+/// Measured on Cohere-9.4M with the laws serving both the unfiltered and
+/// the filtered path: post-drain 53 GETs on the warmup query and 65
+/// steady at law width 23 (2.3x / 2.8x), post-compact 103 at law width 22
+/// (4.7x — compaction reshapes the cells, so the near-tie run is longer
+/// there). 6x covers the widest of those with headroom while still
+/// tripping on a whole-grid 256-cell read.
+const SERVE_WINDOW_WIDTH_MULTIPLE: u64 = 6;
 /// Upper doc bound for the mid-scale ceilings (exclusive).
 const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
 /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
@@ -1534,7 +1546,29 @@ fn assert_expected_cold_reads(
     // The ceiling tables assume a width-1 probe (one coalesced cell-GET);
     // a stamped law width w reads w cells by design, adding w-1 GETs to
     // both cold windows.
-    let law_extra = steady_law_width.saturating_sub(1) * width_scale;
+    //
+    // The law floor is not the whole story on a real corpus: the #515
+    // near-tie serve window keeps following the exact-fine ranking past
+    // the stamped width while scores stay inside
+    // `vector.serve_near_tie_slack`, and the engine deliberately puts no
+    // cap on that extension. Decisive geometry cliffs at the floor and
+    // never extends — which is why the synthetic planted-cluster corpus
+    // has always fit a width-1-plus-law model — while diffuse real
+    // embeddings follow a flat run of near-ties. Measured on Cohere-9.4M
+    // at law width 23: 50 GETs on the first (warmup) query and 66 on the
+    // steady one, i.e. 2.2x and 2.9x the floor, at recall@10 0.995.
+    // Budget that extension for real corpora only, so this gate keeps
+    // catching fan-out regressions (a whole-grid 256-cell read still
+    // trips it) without failing legitimate geometry, and every synthetic
+    // ceiling stays exactly where it was calibrated.
+    let serve_window_multiple = match crate::corpus::corpus_source() {
+        crate::corpus::CorpusSource::Synthetic => 1,
+        _ => SERVE_WINDOW_WIDTH_MULTIPLE,
+    };
+    let law_extra = steady_law_width
+        .saturating_mul(serve_window_multiple)
+        .saturating_sub(1)
+        .saturating_mul(width_scale);
     let user_data = split
         .first_query
         .class_io(storage_meter::UriClass::UserData)
