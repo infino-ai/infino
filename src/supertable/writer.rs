@@ -1539,6 +1539,13 @@ impl SupertableWriter {
         if let Some(stats) = &self.op_stats {
             stats.add_ingested_write(u64::from(entry.new_row_count), 0, 0, 0);
             stats.add_rows_tombstoned(n_tombstoned as u64);
+            // An update commits a manifest (replacement superfile +
+            // manifest json + pointer); a pure delete does not — its
+            // tombstone CAS-writes stay recorded-only, see
+            // `add_planned_commit_requests`.
+            if entry.new_row_count > 0 {
+                stats.add_planned_commit_requests(UPDATE_PLANNED_DATA_OBJECTS);
+            }
         }
         Ok(MutationStats {
             wal_id: entry.wal_id,
@@ -1823,7 +1830,7 @@ impl SupertableWriter {
                 (&self.op_stats, output_stats)
             {
                 stats.add_commit_outputs(superfiles, bytes, fts_terms);
-                stats.add_planned_write_requests(bytes, commit_target_object_bytes());
+                stats.add_planned_commit_requests(planned_data_objects(bytes));
             }
             if crate::storage::io_counters::timeline_enabled() {
                 eprintln!(
@@ -1965,7 +1972,7 @@ impl SupertableWriter {
             (&self.op_stats, output_stats)
         {
             stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
-            stats.add_planned_write_requests(bytes, commit_target_object_bytes());
+            stats.add_planned_commit_requests(planned_data_objects(bytes));
         }
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
@@ -2786,6 +2793,21 @@ fn commit_target_object_bytes() -> u64 {
         .target_superfile_size_mb
         .saturating_mul(1024 * 1024)
 }
+
+/// Data objects a buffered append's plan implies: the objects its sealed
+/// bytes occupy at the target object size.
+fn planned_data_objects(sealed_bytes: u64) -> u64 {
+    let target = commit_target_object_bytes();
+    if target == 0 {
+        0
+    } else {
+        sealed_bytes.div_ceil(target)
+    }
+}
+
+/// Data objects an update's plan implies: its replacement rows land in
+/// the WAL's single preallocated superfile, always exactly one.
+const UPDATE_PLANNED_DATA_OBJECTS: u64 = 1;
 
 fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
     let superfiles = batch.new_entries.len() as u64;

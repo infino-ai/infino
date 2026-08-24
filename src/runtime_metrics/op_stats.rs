@@ -321,18 +321,26 @@ impl OpStatsCollector {
             .fetch_add(fts_terms, Ordering::Relaxed);
     }
 
-    /// Flush the PUTs one committed publish *planned*, from the bytes it
-    /// sealed and the table's target object size. Called beside
-    /// [`Self::add_commit_outputs`], under the same post-Ok discipline, so
-    /// a failed or retried publish never counts.
-    pub(crate) fn add_planned_write_requests(&self, sealed_bytes: u64, target_bytes: u64) {
-        let objects = if target_bytes == 0 {
-            0
-        } else {
-            sealed_bytes.div_ceil(target_bytes)
-        };
-        self.planned_write_requests
-            .fetch_add(objects.saturating_add(MANIFEST_PUTS_PER_COMMIT), Ordering::Relaxed);
+    /// Flush the PUTs one committed publish *planned*: the data objects
+    /// the caller derived from its input shape, plus the manifest json +
+    /// pointer every manifest commit publishes. Called beside the other
+    /// commit flushes, under the same post-Ok discipline, so a failed or
+    /// retried publish never counts.
+    ///
+    /// Callers state their own object term because it is shape-specific:
+    /// a buffered append plans `ceil(sealed bytes / target object size)`;
+    /// an update plans exactly 1 (its replacement rows land in the WAL's
+    /// single preallocated superfile by design). A delete flushes nothing
+    /// here — it commits no manifest, and its per-superfile tombstone
+    /// CAS-writes (like the WAL state-doc writes of both mutations) stay
+    /// recorded-only in `put_requests` for now: their count follows where
+    /// the target rows live, a table-state quantity a later change can
+    /// plan from the resolve — deliberately not guessed at today.
+    pub(crate) fn add_planned_commit_requests(&self, data_objects: u64) {
+        self.planned_write_requests.fetch_add(
+            data_objects.saturating_add(MANIFEST_PUTS_PER_COMMIT),
+            Ordering::Relaxed,
+        );
     }
 
     /// The counters accumulated so far.

@@ -35,6 +35,20 @@ use tempfile::TempDir;
 /// pool below, so `n_shards = min(width, rows)` is genuinely
 /// width-bound and the shard split really differs between widths.
 const WIDTH_TEST_ROWS: usize = 40;
+
+/// Superfile split size for the cross-width fixtures, in MiB.
+///
+/// Shard count is `min(ceil(buffered_bytes / split), pool_threads, rows)`
+/// — bytes first, pool width only as a cap. At the shipped split a test
+/// batch would always be one shard, so the widest pool would produce the
+/// same single superfile as the narrowest and the invariance assertions
+/// would pass vacuously. Squeezing the split makes the pool width the
+/// binding term, which is the thing under test.
+const WIDTH_TEST_SPLIT_MB: u64 = 1;
+
+/// Rows for the fixtures that must span several shards: enough Arrow
+/// footprint to clear `WIDTH_TEST_SPLIT_MB` several times over.
+const SHARDING_TEST_ROWS: usize = 40_000;
 /// Writer-pool widths the invariance test compares.
 const POOL_WIDTHS: [usize; 3] = [1, 2, 8];
 /// Vector fixture dimensionality (engine minimum is 16).
@@ -75,6 +89,7 @@ fn options_with_pool_width(n_threads: usize) -> SupertableOptions {
     )
     .expect("valid options")
     .with_writer_pool(pool)
+    .with_superfile_buffer_split_mb(WIDTH_TEST_SPLIT_MB)
 }
 
 /// The width-test corpus: same titles every call, so every width builds
@@ -82,6 +97,17 @@ fn options_with_pool_width(n_threads: usize) -> SupertableOptions {
 fn width_test_batch() -> RecordBatch {
     let titles: Vec<String> = (0..WIDTH_TEST_ROWS)
         .map(|i| format!("row{i:03} common tokens"))
+        .collect();
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    build_title_batch(&refs)
+}
+
+/// A batch big enough to split across the widest pool: each row carries a
+/// kibibyte of title text, so 40k rows clear the 1 MiB split many times.
+fn sharding_test_batch() -> RecordBatch {
+    let filler = "lorem ipsum dolor sit amet ".repeat(38);
+    let titles: Vec<String> = (0..SHARDING_TEST_ROWS)
+        .map(|i| format!("row{i:06} common tokens {filler}"))
         .collect();
     let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
     build_title_batch(&refs)
@@ -101,7 +127,7 @@ fn scoped_append(options: SupertableOptions, batch: &RecordBatch) -> OpStats {
 fn write_stats_are_invariant_to_writer_pool_width() {
     // The load-bearing determinism test: the priced counters must not
     // depend on how many rayon threads happened to shard the build.
-    let batch = width_test_batch();
+    let batch = sharding_test_batch();
     let snapshots: Vec<OpStats> = POOL_WIDTHS
         .iter()
         .map(|&width| scoped_append(options_with_pool_width(width), &batch))
@@ -135,7 +161,7 @@ fn planned_write_requests_follow_the_data_not_the_shard_count() {
     // sharded and how often a contended publish retried. What is billed
     // is what the data requires: the objects it occupies at the target
     // size, plus the manifest json and pointer every commit publishes.
-    let batch = width_test_batch();
+    let batch = sharding_test_batch();
     let narrow = scoped_append(options_with_pool_width(POOL_WIDTHS[0]), &batch);
     let wide = scoped_append(options_with_pool_width(POOL_WIDTHS[2]), &batch);
 
@@ -304,6 +330,12 @@ fn a_delete_reports_its_tombstoned_rows_and_its_scan() {
         "the delete's write leg reports its retired rows"
     );
     assert_eq!(stats.rows_written, 0, "deletes index no new rows");
+    // A pure delete commits no manifest; its tombstone CAS-writes are
+    // recorded-only actuals, so the planned counter stays silent.
+    assert_eq!(
+        stats.planned_write_requests, 0,
+        "a delete plans no commit requests"
+    );
     // The predicate resolve runs on the reader's cached, collector-
     // detached SessionContext (the same deliberate suppression that
     // keeps a cached context from billing later queries into an old
@@ -339,6 +371,12 @@ fn an_update_reports_replacement_rows_and_tombstones() {
     assert_eq!(
         stats.rows_tombstoned, 1,
         "the update's retired rows count as tombstoned"
+    );
+    // An update's plan: its one WAL-preallocated replacement superfile
+    // plus the manifest json + pointer of its commit.
+    assert_eq!(
+        stats.planned_write_requests, 3,
+        "an update plans exactly one data object + the manifest pair"
     );
 }
 
