@@ -1317,15 +1317,26 @@ fn create_bucket(
     // 409, which means the bucket already exists and is success for us.
     let deadline = Instant::now() + Duration::from_secs(BUCKET_READY_TIMEOUT_SECS);
     loop {
-        let response = client
+        let sent = client
             .put(&url)
             .header("host", &host)
             .header("x-amz-date", &amz_date)
             .header("x-amz-content-sha256", &payload_hash)
             .header("authorization", authorization.clone())
             .body(Vec::<u8>::new())
-            .send()
-            .map_err(|e| e.to_string())?;
+            .send();
+        let response = match sent {
+            Ok(response) => response,
+            // A transport error is the earlier half of the same startup
+            // race: before rustfs is ready enough to answer 503 it can
+            // refuse or reset the connection outright. Retry those on the
+            // same deadline, or the loop still gives up too early.
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(BUCKET_READY_POLL_INTERVAL_MS));
+                continue;
+            }
+            Err(e) => return Err(format!("CreateBucket failed for {bucket}: {e}")),
+        };
         let status = response.status();
         if status.is_success() || status.as_u16() == 409 {
             return Ok(());
