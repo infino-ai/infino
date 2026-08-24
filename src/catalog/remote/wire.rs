@@ -22,8 +22,7 @@ use arrow_schema::Schema;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
-use crate::superfile::fts::tokenize::ASCII_LOWER_TOKENIZER;
-use crate::{IndexSpec, InfinoError, Metric};
+use crate::{IndexSpec, InfinoError, Metric, superfile::fts::tokenize::ASCII_LOWER_TOKENIZER};
 
 /// Content type for an Arrow IPC streaming body — the encoding for `append`
 /// bodies and read responses.
