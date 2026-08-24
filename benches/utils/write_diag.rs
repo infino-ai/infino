@@ -96,6 +96,9 @@ const CORPUS_TEXT_SEED: u64 = 1;
 /// Nanoseconds per second, for latency markdown.
 const NS_PER_SEC: f64 = 1e9;
 
+/// Bytes per GiB, as a float for the per-GiB cost division.
+const BYTES_PER_GIB_F64: f64 = (1u64 << 30) as f64;
+
 fn seed_docs() -> usize {
     env::var("INFINO_BENCH_WRITE_DIAG_SEED_DOCS")
         .ok()
@@ -231,6 +234,18 @@ fn shape_row(label: &str, rows_per_op: usize, ops: usize, m: &OpMeasure) -> Vec<
         cost::write_op_usd(m.cpu_s, m.wall.as_secs_f64(), Some(m.peak_rss_bytes), &m.io)
             .map(|total| total / ops_f);
     let per_million_rows = per_op_usd.map(|usd| usd / (rows_per_op.max(1) as f64) * 1e6);
+    // Logical payload this op ingested — the caller's own bytes, before
+    // any index or replication expansion. Carrying it here is what lets a
+    // per-op cost convert to $/GiB, so cost per byte is comparable across
+    // shapes whose row sizes differ.
+    let logical_bytes = m
+        .stats
+        .scalar_bytes_written
+        .saturating_add(m.stats.vector_bytes_written) as f64
+        / ops_f;
+    let per_gib = per_op_usd.and_then(|usd| {
+        (logical_bytes > 0.0).then(|| usd / (logical_bytes / BYTES_PER_GIB_F64))
+    });
     let wall_ns = wall_s * NS_PER_SEC;
     vec![
         text(label),
@@ -265,6 +280,15 @@ fn shape_row(label: &str, rows_per_op: usize, ops: usize, m: &OpMeasure) -> Vec<
             None => text("—"),
         },
         match per_million_rows {
+            Some(usd) => metric(usd, cost::usd_text(usd), Better::Lower),
+            None => text("—"),
+        },
+        metric(
+            logical_bytes,
+            rss::fmt_bytes(logical_bytes as u64),
+            Better::Higher,
+        ),
+        match per_gib {
             Some(usd) => metric(usd, cost::usd_text(usd), Better::Lower),
             None => text("—"),
         },
@@ -364,6 +388,8 @@ pub fn run() {
                deferred drain/compaction is excluded here and amortized into the \
                `write_per_million_docs` anchor. `PUT plan` is the engine's priceable \
                `planned_write_requests`; `PUT act` is the provider meter's actual count. \
+               `Logical` is the payload the caller sent, so `$/GiB logical` makes cost \
+               per byte comparable across shapes with different row sizes. \
                Δ is vs the previous run."
             .into(),
         blocks: vec![Block {
@@ -379,6 +405,8 @@ pub fn run() {
                 "GET".into(),
                 "$/write".into(),
                 "$/1M rows".into(),
+                "Logical".into(),
+                "$/GiB logical".into(),
             ],
             rows,
         }],
