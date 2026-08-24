@@ -77,6 +77,14 @@ const DEFAULT_TOP_APPEND_ROWS: usize = 100_000;
 /// Mid rung of the append ladder.
 const MID_APPEND_ROWS: usize = 1_000;
 
+/// Per-commit row cap while seeding. The ingest working set scales with
+/// the commit's doc count, not the table's (see the ingest path's
+/// MAX_DOCS_PER_COMMIT rationale), so a large seed lands as several
+/// modest commits — which also matches how a real table gets to that
+/// size. Measured ops are never chunked: an append shape's batch size
+/// IS the thing being measured.
+const SEED_CHUNK_ROWS: usize = 250_000;
+
 /// Single-row mutations averaged per mutation cell — enough iterations
 /// that the process-CPU sampler sees a measurable delta over the loop.
 const N_MUTATIONS: usize = 8;
@@ -202,9 +210,12 @@ fn seeded_table(
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let ms = storage_meter::wrap(Arc::clone(&storage));
     let st = Supertable::create(options_for(modality, Some(storage))).expect("create supertable");
-    if n_seed > 0 {
-        let batch = next_batch(stream, modality, n_seed);
+    let mut remaining = n_seed;
+    while remaining > 0 {
+        let chunk = remaining.min(SEED_CHUNK_ROWS);
+        let batch = next_batch(stream, modality, chunk);
         st.append(&batch).expect("seed append");
+        remaining -= chunk;
     }
     (dir, ms, st)
 }
