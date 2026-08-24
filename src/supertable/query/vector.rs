@@ -174,6 +174,16 @@ const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 /// complete at 4 runs (drain-diag: p4=1.000) and the default keeps 8.
 /// Explicit caller `nprobe` overrides; the per-run width sweep keeps the
 /// trade measured.
+/// Cells the UNDRAINED probe may widen to under the near-tie slack.
+///
+/// Bounds the one path with no measurement behind it: until the drain
+/// stamps a width law, nothing has looked at this table's geometry, and
+/// the shared one-cell default is calibrated for planted clusters.
+/// Real embeddings need more — recall@10 0.623 -> 0.932 at 9.4M Cohere,
+/// 0.367 -> 0.844 at 200K — and the widening is bounded so an undrained
+/// table cannot fan out across the grid while it waits for `optimize()`.
+/// Drained serving never reads this: it pins the stamped width.
+const UNDRAINED_CELL_NPROBE_MAX: usize = 8;
 const FILTERED_USER_CELL_NPROBE: usize = 4;
 
 // The admit window keeps the shared
@@ -2859,7 +2869,19 @@ impl SupertableReader {
                     ..CellRoutingParams::default()
                 }
             } else {
-                CellRoutingParams::default()
+                // UNDRAINED tail: no drain has run, so no law has been
+                // stamped and nothing has measured this table's geometry.
+                // The shipped one-cell probe is calibrated against
+                // planted-cluster geometry and collapses on real
+                // embeddings -- measured recall@10 0.623 at 9.4M Cohere,
+                // 0.367 at 200K. Let the near-tie widening reach further
+                // HERE ONLY: a drained table serves its stamped width
+                // instead, so a table whose law says one cell keeps its
+                // single cell rather than being widened by a default.
+                CellRoutingParams {
+                    nprobe_max: UNDRAINED_CELL_NPROBE_MAX,
+                    ..CellRoutingParams::default()
+                }
             };
             // Per-table probe-width law: when the drain calibrated one and
             // the caller passed nothing, the law's width for this `k` acts
@@ -5444,6 +5466,30 @@ mod tests {
     /// estimate-to-exact residual, the near-tie run past the write
     /// window qualifies; a cliff-scored spectrum admits nothing. The
     /// residual floor is measured from already-scored cells, so with no
+    /// The wider undrained probe stays scoped to the undrained branch.
+    ///
+    /// Widening `CellRoutingParams::default()` instead would reach every
+    /// path that falls back to it — including a DRAINED table whose
+    /// stamped width law is one cell, where the law filters to `None`
+    /// (`LAW_WIDTH_WITHIN_DEFAULT`), no pin happens, and the default is
+    /// what serves. That regression is invisible to recall (planted
+    /// clusters already serve ~1.0) and shows up only as cold-GET fan,
+    /// which is why it is asserted here rather than left to a bench.
+    #[test]
+    fn undrained_cap_is_scoped_and_wider_than_the_shared_default() {
+        let shared = CellRoutingParams::default();
+        assert_eq!(
+            (shared.nprobe_min, shared.nprobe_max),
+            (1, 1),
+            "the shared routing fallback must stay a one-cell probe"
+        );
+        assert!(
+            super::UNDRAINED_CELL_NPROBE_MAX > shared.nprobe_max,
+            "the undrained cap must exceed the shared default, or the \
+             undrained branch widens nothing"
+        );
+    }
+
     /// exact scores in hand the round admits nothing (no guess).
     #[test]
     fn admit_extension_round_follows_evidence() {

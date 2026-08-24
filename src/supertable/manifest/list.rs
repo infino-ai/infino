@@ -63,34 +63,21 @@ pub(crate) const BIRTH_VERSION_AGGREGATE_COLUMN: &str = "__infino_birth_version"
 /// bounded manifest cost.
 const MAX_EXACT_VALUE_COUNTS: usize = 256;
 
-/// Cells probed per query at minimum — the grid-nearest. One cell fetch
-/// stays the common case: the widening below fires only on genuine
-/// near-ties, so decisive geometry still serves at exactly one cell.
+/// Cells probed per query — exactly one, the grid-nearest. The p=1 read
+/// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs).
+///
+/// This is the SHARED fallback: every path that has no stamped law and
+/// no caller override lands here, drained or not. The undrained probe
+/// needs to reach further than one cell on real embeddings, but that is
+/// scoped to the undrained routing branch itself
+/// (`UNDRAINED_CELL_NPROBE_MAX` in `supertable::query::vector`) rather
+/// than widened here, so a drained table that stamped a width of one
+/// cell keeps its single cell.
 const DEFAULT_CELL_NPROBE_MIN: usize = 1;
-/// Hard cap on cells probed per query — the bound on the near-tie
-/// widening [`DEFAULT_CELL_SLACK`] governs.
-///
-/// This was equal to the floor (widening off) on the premise that
-/// coverage past one cell is bought at drain time by boundary
-/// replication rather than by probing wider. That compensator ships
-/// disabled — `vector.drain_replica_target_factor = 1.0`, replication
-/// having measured a net loss at 10M — so on the PRE-drain path nothing
-/// covered the gap: the width laws are stamped by the drain and do not
-/// exist yet, and there are no replicas. Measured on real Cohere
-/// embeddings at p=1: recall@10 0.367, where the synthetic
-/// planted-cluster corpus (whose clusters align to the grid) reads
-/// ~0.99 and hides the difference. Post-drain serving is unaffected —
-/// it is law-served and pins its own width.
-///
-/// The value matches the filtered path's own default probe width
-/// (`FILTERED_DEFAULT_NPROBE`), so the two paths bound fan-out alike.
-///
-/// This is a floor for the undrained state, not a substitute for
-/// measurement: it costs one constant and no ingest time. A table that
-/// wants the measured laws calls `optimize()`, whose drain stamps width,
-/// fine depth, and rerank budget from the whole corpus and serves them
-/// from the hidden manifest.
-const DEFAULT_CELL_NPROBE_MAX: usize = 8;
+/// Hard cap on cells probed per query. Equal to the floor: adaptive
+/// widening is off by default — see [`DEFAULT_CELL_NPROBE_MIN`] for
+/// where the undrained path opts into a wider cap.
+const DEFAULT_CELL_NPROBE_MAX: usize = 1;
 /// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
 /// With `nprobe_max > nprobe_min` this is what decides how far the probe
 /// set actually widens: cliff geometry stops at the first cell, diffuse
