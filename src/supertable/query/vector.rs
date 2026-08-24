@@ -80,7 +80,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
 use uuid::Uuid;
@@ -108,7 +108,7 @@ use crate::{
             distance::{Metric, distance, normalize, relative_score_window},
             hnsw::{self, HnswParams, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
-            reader::ScanCandidate,
+            reader::{ScanCandidate, ScanOutcome},
         },
     },
     supertable::{
@@ -2640,35 +2640,65 @@ impl SupertableReader {
         // ~4% of the true top-k at 10M (all neighbors are read — recall@100
         // is 1.0 — but a single cross-cell exact rerank is needed to seat
         // them in the top-k).
+        // Parallelize the per-cell cold scan across superfiles. Each selected
+        // superfile's scan is independent, and the stamped whole-cell path
+        // already fans out this way (`fanout_with`). A serial loop here
+        // RTT-serializes the cold Blob reads — the graph router's dominant cold
+        // cost — so run them concurrently, bounded to the reader-pool width
+        // (the same cap every other fan-out here uses). `coalesce` expands each
+        // touched cell's selection to its [min..max] contiguous span.
+        let coalesce = config::global().vector.global_fine_coalesce;
+        let scan_width = manifest.options.reader_pool.current_num_threads().max(1);
+        // Share the connection memory budget and reader pool across the
+        // concurrent scans, matching the stamped fan-out: cold fetches then gate
+        // on `OverBudget` and score on the reader pool. A serial loop needed
+        // neither (one fetch in flight), but concurrency does.
+        let scan_pool = Arc::clone(&manifest.options.reader_pool);
+        let scan_budget = Arc::clone(&manifest.options.connection_memory_budget);
+        // Build the per-superfile scan futures in a plain loop (concrete
+        // borrows) rather than a lifetime-generic `.map()` closure, then run
+        // them concurrently bounded to the pool width.
+        let mut scan_futs = Vec::new();
+        for (si, flats) in by_sf {
+            let Some(vr) = readers[si].as_ref().vec() else {
+                continue;
+            };
+            let pool = Arc::clone(&scan_pool);
+            let budget = Arc::clone(&scan_budget);
+            scan_futs.push(async move {
+                let flats = if coalesce {
+                    vr.coalesce_flats_to_cell_spans(&flats)
+                } else {
+                    flats
+                };
+                let scan = vr
+                    .search_clusters_scan_async(
+                        column,
+                        query,
+                        k,
+                        &flats,
+                        rerank_mult,
+                        rerank_mult,
+                        None,
+                        None,
+                        Some(pool),
+                        Some(budget),
+                    )
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                Ok::<_, QueryError>((si, scan))
+            });
+        }
+        let scans: Vec<(usize, ScanOutcome)> = stream::iter(scan_futs)
+            .buffer_unordered(scan_width)
+            .try_collect()
+            .await?;
+        // Tag + stable-id attach + pool the survivors (cheap, post-I/O).
         let mut per_superfile: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut pooled: Vec<(usize, ScanCandidate)> = Vec::new();
-        for (si, flats) in by_sf {
+        for (si, scan) in scans {
             let entry = &superfiles[si];
             let reader = readers[si].as_ref();
-            let Some(vr) = reader.vec() else { continue };
-            // Per-cell coalesced read (`vector.global_fine_coalesce`): expand
-            // each touched cell's selection to its [min..max] contiguous span
-            // so the cell reads as one GET instead of scattered clusters.
-            let flats = if config::global().vector.global_fine_coalesce {
-                vr.coalesce_flats_to_cell_spans(&flats)
-            } else {
-                flats
-            };
-            let scan = vr
-                .search_clusters_scan_async(
-                    column,
-                    query,
-                    k,
-                    &flats,
-                    rerank_mult,
-                    rerank_mult,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
             // Cold cells rerank in-scan; take their exact hits directly.
             if !scan.hits.is_empty() {
                 let mut tagged = dispatch::tag_hits(entry, scan.hits);
