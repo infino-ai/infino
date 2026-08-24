@@ -68,9 +68,9 @@ impl IndexSpec {
 
     /// Mark `column` as full-text (BM25) indexed with a named analyzer
     /// (`"ascii_lower"` or `"standard"` — the Unicode-aware UAX #29
-    /// tokenizer that keeps non-ASCII text). All FTS columns in a table
-    /// must use the same analyzer; a table mixing analyzers is rejected
-    /// at [`create_table`](crate::Connection::create_table).
+    /// tokenizer that keeps non-ASCII text). The analyzer is per column:
+    /// each FTS column is tokenized with its own, so columns in one table
+    /// may use different analyzers.
     pub fn fts_with_analyzer(
         mut self,
         column: impl Into<String>,
