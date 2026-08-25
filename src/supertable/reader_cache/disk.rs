@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -80,6 +80,11 @@ const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
 
+/// How old an in-flight tempfile must be before the open-time scan reclaims it. A live cold
+/// fetch's tempfile is seconds old, so one this stale can only be a crashed fetch's leftover;
+/// deleting a live one would fail the owner's rename and cost it a retried fetch.
+const TMP_RECLAIM_AGE: Duration = Duration::from_secs(15 * 60);
+
 /// Process-global count of in-flight foreground queries. Used with
 /// [`foreground_notify`] so a fill's `select!` wakes promptly when a query
 /// begins and can re-check its per-URI pause condition; it is **not** a
@@ -115,6 +120,15 @@ impl Drop for ForegroundQueryGuard {
         // query releases same-URI readers.
         foreground_notify().notify_waiters();
     }
+}
+
+/// File mtime in microseconds since the unix epoch, 0 if the filesystem has none.
+fn file_mtime_us(meta: &fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 /// Pause this URI's background full-object fill while a caller besides the
@@ -223,6 +237,8 @@ pub struct CacheStats {
     pub current_bytes: u64,
     pub budget_bytes: u64,
     pub n_cold_fetches: u64,
+    /// Reads served by adopting a cache file that was on disk but not yet indexed.
+    pub n_disk_reuses: u64,
     pub n_evictions: u64,
     /// Cumulative count of entries `madvise(MADV_DONTNEED)`'d
     /// by the idle-threshold sweep thread. Includes individual
@@ -230,6 +246,14 @@ pub struct CacheStats {
     pub n_madvise_calls: u64,
     /// Total count of entries dropped because GC deleted from objectstore.
     pub n_gc_drops: u64,
+}
+
+/// A cache file found on disk at open but not opened yet. Its bytes already count against the budget.
+#[derive(Debug, Clone, Copy)]
+struct UnindexedFile {
+    size_bytes: u64,
+    /// File mtime in microseconds since the unix epoch; eviction drops the oldest first.
+    mtime_us: u64,
 }
 
 /// Pulls superfile bytes through a [`StorageProvider`] and
@@ -247,6 +271,8 @@ pub struct DiskCacheStore {
     /// the same `OnceCell` and `await` it via
     /// `get_or_try_init`.
     coordinators: DashMap<SuperfileUri, Coordinator>,
+    /// Files on disk that no read has opened yet. Filled by `scan_cache_root`, drained by reuse or eviction.
+    unindexed: DashMap<SuperfileUri, UnindexedFile>,
     current_bytes: AtomicU64,
     /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
     /// An engine-managed (auto-sized) budget is raised — never lowered —
@@ -263,6 +289,7 @@ pub struct DiskCacheStore {
     /// footprint warns once, not on every reconcile.
     budget_warned: AtomicBool,
     n_cold_fetches: AtomicU64,
+    n_disk_reuses: AtomicU64,
     n_evictions: AtomicU64,
     n_gc_drops: AtomicU64,
     n_madvise_calls: AtomicU64,
@@ -331,11 +358,13 @@ impl DiskCacheStore {
             started_at: Instant::now(),
             cached: DashMap::new(),
             coordinators: DashMap::new(),
+            unindexed: DashMap::new(),
             current_bytes: AtomicU64::new(0),
             budget_bytes: AtomicU64::new(configured_budget),
             budget_auto_sized: AtomicBool::new(false),
             budget_warned: AtomicBool::new(false),
             n_cold_fetches: AtomicU64::new(0),
+            n_disk_reuses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
             n_gc_drops: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
@@ -344,10 +373,9 @@ impl DiskCacheStore {
             prefetch_semaphore,
         });
 
-        // Reuse any cache files a prior run (or another handle) left on disk:
-        // rebuild the in-memory index so reads hit the NVMe bytes instead of
-        // cold-fetching them back from object storage.
-        store.restore_from_cache_root();
+        // Record what is already on disk so the budget is correct from the start. Files are opened
+        // lazily, by the reads that need them.
+        store.scan_cache_root();
 
         // Idle-threshold sweep thread. Library-not-service
         // shape: holds a Weak<Self> and exits naturally when the last Arc
@@ -754,6 +782,7 @@ impl DiskCacheStore {
             current_bytes: self.current_bytes.load(Ordering::Acquire),
             budget_bytes: self.disk_budget_bytes(),
             n_cold_fetches: self.n_cold_fetches.load(Ordering::Acquire),
+            n_disk_reuses: self.n_disk_reuses.load(Ordering::Acquire),
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
@@ -1075,20 +1104,20 @@ impl DiskCacheStore {
         }))
     }
 
-    /// Rebuild the in-memory index from cache files a prior run (or another
-    /// handle) left under `cache_root`, so a fresh `DiskCacheStore` reuses the
-    /// NVMe bytes instead of cold-fetching them back from object storage. Each
-    /// complete `seg-<uuid>.sf.parquet` is mmap'd, opened (CRC-verified per
-    /// config), and inserted; `.tmp` in-flight files and anything that fails to
-    /// open (truncated / incompatible) are skipped and unlinked. Best-effort:
-    /// a scan error leaves the index empty (every read just cold-fetches, as
-    /// before). The budget is enforced lazily — entries are mmap-lazy (no RSS
-    /// until touched) and the first `sweep_for_budget` trims any excess.
-    fn restore_from_cache_root(self: &Arc<Self>) {
+    /// List `cache_root` and record each superfile's size and mtime in `unindexed`, adding the total
+    /// to `current_bytes`. Only a stat per file: files are opened later, by the reads that need them
+    /// ([`Self::try_reuse_cached_file`]).
+    ///
+    /// Deletes leftovers that can never be used: orphaned `.blocks` sidecars, zero-length files,
+    /// and `.tmp` files older than [`TMP_RECLAIM_AGE`] (a fresh one belongs to a sibling process's
+    /// in-flight fetch). On a scan error the map stays empty and reads just cold-fetch.
+    fn scan_cache_root(&self) {
         let dir = match fs::read_dir(&self.config.cache_root) {
             Ok(d) => d,
             Err(_) => return,
         };
+
+        let mut total: u64 = 0;
         for entry in dir.flatten() {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -1098,26 +1127,158 @@ impl DiskCacheStore {
                 let _ = fs::remove_file(&path);
                 continue;
             }
-            let Some(uri) = SuperfileUri::from_cache_filename(name) else {
-                continue; // `.tmp` in-flight or foreign file — skip.
-            };
-            let size = match entry.metadata() {
-                Ok(m) if m.len() > 0 => m.len(),
-                _ => continue,
-            };
-            match self.open_cached_entry(&path, size, self.config.verify_crc_on_open) {
-                Ok(cached_entry) => {
-                    if self.cached.insert(uri, cached_entry).is_none() {
-                        self.current_bytes.fetch_add(size, Ordering::Release);
-                    }
-                }
-                Err(_) => {
-                    // Truncated / corrupt / incompatible: drop it so the next
-                    // read cold-fetches a clean copy.
+
+            if SuperfileUri::from_cache_tmp_filename(name).is_some() {
+                // A fresh tempfile belongs to a sibling's in-flight fetch; only a stale one is a
+                // crashed fetch's leftover. See [`TMP_RECLAIM_AGE`].
+                let stale = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| SystemTime::now().duration_since(t).ok())
+                    .is_some_and(|age| age >= TMP_RECLAIM_AGE);
+
+                if stale {
                     let _ = fs::remove_file(&path);
                 }
+
+                continue;
+            }
+
+            let Some(uri) = SuperfileUri::from_cache_filename(name) else {
+                continue; // Foreign file: leave it alone.
+            };
+
+            let Ok(meta) = entry.metadata() else { continue };
+            let size = meta.len();
+
+            if size == 0 {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+
+            self.unindexed.insert(
+                uri,
+                UnindexedFile {
+                    size_bytes: size,
+                    mtime_us: file_mtime_us(&meta),
+                },
+            );
+
+            total += size;
+        }
+
+        self.current_bytes.fetch_add(total, Ordering::Release);
+    }
+
+    /// Serve `uri` from an existing cache file instead of fetching from storage. Runs before every
+    /// cold fetch and checks the filesystem directly, so it also finds files written after this
+    /// store opened.
+    ///
+    /// Returns `Ok(None)` when there is no usable file: missing, wrong size, or it fails to open.
+    /// Unusable files are deleted so the cold fetch writes a fresh one. A file can also vanish
+    /// between the stat and the open (GC deletes cache copies); that too is just `Ok(None)`.
+    ///
+    /// `expected_size` is optional: pass it when the caller already has the size (the lazy path gets
+    /// it from the manifest), never fetch one. A truncated file fails to open anyway, since the
+    /// footer sits at the end.
+    async fn try_reuse_cached_file(
+        &self,
+        uri: &SuperfileUri,
+        expected_size: Option<u64>,
+    ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
+        let path = self.cache_path(uri);
+        let Ok(meta) = fs::metadata(&path) else {
+            return Ok(None);
+        };
+
+        let size = meta.len();
+        if size == 0 || expected_size.is_some_and(|want| want != size) {
+            self.discard_cache_file(uri, size);
+            return Ok(None);
+        }
+
+        // The scan already counted this file's bytes. A file it never saw (written later by another
+        // process) is charged like a fetch.
+        let counted = self.unindexed.remove(uri).is_some();
+        let reservation = if counted {
+            None
+        } else {
+            Some(self.reserve(size).await?)
+        };
+
+        match self.open_cached_entry(&path, size, self.config.verify_crc_on_open) {
+            Ok(entry) => {
+                // Two racing reuses of one URI can both insert; the second insert must free the
+                // first one's bytes.
+                if let Some(replaced) = self.cached.insert(*uri, Arc::clone(&entry)) {
+                    self.release_entry_accounting(&replaced);
+                }
+
+                if let Some(r) = reservation {
+                    r.commit();
+                }
+
+                self.n_disk_reuses.fetch_add(1, Ordering::AcqRel);
+
+                Ok(Some(entry))
+            }
+            Err(_) => {
+                // A dropped reservation frees itself; scan-counted bytes are given back by hand.
+                if counted {
+                    self.current_bytes.fetch_sub(size, Ordering::Release);
+                }
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(self.blocks_path(uri));
+                Ok(None)
             }
         }
+    }
+
+    /// Delete an unusable cache file and give back any bytes the scan counted for it.
+    fn discard_cache_file(&self, uri: &SuperfileUri, size: u64) {
+        if self.unindexed.remove(uri).is_some() {
+            self.current_bytes.fetch_sub(size, Ordering::Release);
+        }
+
+        let _ = fs::remove_file(self.cache_path(uri));
+        let _ = fs::remove_file(self.blocks_path(uri));
+    }
+
+    /// Delete never-opened files, oldest first, until `bytes_needed` is freed. Returns the bytes
+    /// freed. These go before live entries: nothing holds them, so deleting one is safe and cheap.
+    fn evict_unindexed(&self, bytes_needed: u64) -> u64 {
+        // Usually empty after warmup; skip the snapshot allocation.
+        if self.unindexed.is_empty() {
+            return 0;
+        }
+
+        let mut candidates: Vec<(SuperfileUri, u64, u64)> = self
+            .unindexed
+            .iter()
+            .map(|e| (*e.key(), e.value().size_bytes, e.value().mtime_us))
+            .collect();
+
+        candidates.sort_by_key(|(_, _, mtime_us)| *mtime_us);
+
+        let mut freed: u64 = 0;
+        for (uri, size, _) in candidates {
+            if freed >= bytes_needed {
+                break;
+            }
+
+            // Only the winner of the remove deletes and subtracts, so two concurrent evictions
+            // cannot double-count.
+            if self.unindexed.remove(&uri).is_some() {
+                let _ = fs::remove_file(self.cache_path(&uri));
+                let _ = fs::remove_file(self.blocks_path(&uri));
+                self.current_bytes.fetch_sub(size, Ordering::Release);
+                self.n_evictions.fetch_add(1, Ordering::AcqRel);
+                freed += size;
+            }
+        }
+
+        freed
     }
 
     /// Build a per-URI cache file path under `cache_root`.
@@ -1157,6 +1318,12 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
+
+        // A finished cache file may already be on disk; use it before fetching.
+        if let Some(entry) = self.try_reuse_cached_file(uri, None).await? {
+            return Ok(entry);
+        }
+
         let head = fetch_storage.head(&storage_uri).await?;
         let size = head.size;
         // Don't use the borrow-lifetimed Reservation guard
@@ -1430,6 +1597,15 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
+
+        // A finished cache file may already be on disk; use it before fetching.
+        if let Some(entry) = self
+            .try_reuse_cached_file(uri, offsets.map(|o| o.total_size))
+            .await?
+        {
+            return Ok(entry);
+        }
+
         let block_source_arc: Arc<BlockCachedSource>;
         let (lazy_reader, size) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
@@ -1603,6 +1779,12 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
+
+        // A finished cache file may already be on disk; use it before fetching.
+        if let Some(entry) = self.try_reuse_cached_file(uri, None).await? {
+            return Ok(entry);
+        }
+
         let head = fetch_storage.head(&storage_uri).await?;
         let size = head.size;
 
@@ -1768,6 +1950,14 @@ impl DiskCacheStore {
     /// is freed or no eligible victims remain (→
     /// `BudgetExceeded`).
     async fn evict_at_least(&self, bytes_needed: u64) -> Result<(), DiskCacheError> {
+        // Never-opened files go first; freeing one cannot hurt a live reader.
+        let freed = self.evict_unindexed(bytes_needed);
+
+        if freed >= bytes_needed {
+            return Ok(());
+        }
+        let bytes_needed = bytes_needed - freed;
+
         // Clone the current pinned_fn out of the mutex
         // before invoking it — the closure itself may
         // acquire other locks (e.g., the supertable's
@@ -1793,6 +1983,11 @@ impl DiskCacheStore {
             .eviction
             .select_for_eviction(&candidates, &pinned, bytes_needed);
         if victims.is_empty() {
+            // Error only when nothing at all was freed; unindexed files may have covered part of
+            // the request.
+            if freed > 0 {
+                return Ok(());
+            }
             return Err(DiskCacheError::BudgetExceeded);
         }
         for uri in victims {
@@ -1824,6 +2019,12 @@ impl DiskCacheStore {
         } else {
             false
         };
+
+        // Give back bytes counted for a never-opened file.
+        if let Some((_, file)) = self.unindexed.remove(uri) {
+            self.current_bytes
+                .fetch_sub(file.size_bytes, Ordering::Release);
+        }
 
         self.coordinators.remove(uri);
         let _ = fs::remove_file(self.cache_path(uri));
@@ -2677,6 +2878,21 @@ mod tests {
         (dir, store)
     }
 
+    /// Open a second store over `store`'s cache_root, the way a restart or a sibling process
+    /// arrives at a directory it did not write. `mutate` adjusts the config first.
+    fn reopen_store(
+        store: &Arc<DiskCacheStore>,
+        mutate: impl FnOnce(&mut DiskCacheConfig),
+    ) -> Arc<DiskCacheStore> {
+        let mut cfg = DiskCacheConfig {
+            cache_root: store.config.cache_root.clone(),
+            mmap_cold_threshold_secs: 0,
+            ..Default::default()
+        };
+        mutate(&mut cfg);
+        DiskCacheStore::new_unpinned(Arc::clone(&store.storage), cfg).expect("reopened store")
+    }
+
     /// Put `bytes` at the storage location `store.reader(&uri)` will
     /// cold-fetch from, so the cold path has something to read.
     async fn put_superfile(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, bytes: Bytes) {
@@ -3054,11 +3270,81 @@ mod tests {
         assert_eq!(store.stats().n_gc_drops, 0);
     }
 
+    // ----- lazy open: cost scales with the working set, not the directory -----
+
+    /// Cache files to seed a directory with when the point of the test is "more files than the read
+    /// touches". Small: these tests assert on counters, not on wall time.
+    const SEEDED_CACHE_FILES: usize = 8;
+
+    /// Write `bytes` straight to the cache path for `uri`, the way a prior process (or a concurrent
+    /// writer) leaves a finished file behind.
+    fn seed_cache_file(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, bytes: &Bytes) -> u64 {
+        let path = store.cache_path(uri);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("cache root");
+        }
+        fs::write(&path, bytes.as_ref()).expect("seed cache file");
+        bytes.len() as u64
+    }
+
     #[tokio::test]
-    async fn rebuild_index_from_cache_root_on_open() {
-        // A prior handle's cache files on `cache_root` must be reused by a fresh
-        // store: the constructor rebuilds the in-memory index from them, so a
-        // restart / second handle serves reads off NVMe with no cold-fetch.
+    async fn open_does_not_index_the_whole_cache_directory() {
+        // Opening a table must not pay for files no query has asked for. The budget still has to
+        // know the directory, so the stat pass runs; only the mmap + footer parse + CRC is deferred.
+        let (_dir, store) = test_store();
+        let bytes = tiny_superfile_bytes();
+        let mut total = 0;
+        for _ in 0..SEEDED_CACHE_FILES {
+            total += seed_cache_file(&store, &SuperfileUri::new_v4(), &bytes);
+        }
+
+        // Second store over the same cache_root: this is the open under test.
+        let opened = reopen_store(&store, |_| {});
+
+        let s = opened.stats();
+        assert_eq!(
+            s.n_entries, 0,
+            "open indexes nothing: {SEEDED_CACHE_FILES} files on disk, none opened"
+        );
+        assert_eq!(
+            s.current_bytes, total,
+            "budget still knows the directory from the stat pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_reuses_a_cache_file_the_index_never_saw() {
+        // A file that appears after open (another process wrote it, or open deliberately skipped
+        // it) must still be served from local bytes.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+
+        // Present in BOTH places, so the fallback path also succeeds and the only difference
+        // between pass and fail is where the bytes came from.
+        put_superfile(&store, &uri, bytes.clone()).await;
+        seed_cache_file(&store, &uri, &bytes);
+
+        let _reader = store.reader(&uri).await.expect("reader");
+
+        let s = store.stats();
+        assert_eq!(
+            s.n_cold_fetches, 0,
+            "served from the local file, no storage round-trip"
+        );
+        assert_eq!(s.n_disk_reuses, 1);
+        assert_eq!(s.n_entries, 1, "the reused file is now indexed");
+        assert_eq!(
+            s.current_bytes,
+            bytes.len() as u64,
+            "a file the open-time scan never saw is charged like a fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_store_reuses_on_read_not_on_open() {
+        // Cross-process reuse under a lazy open: a fresh store over a warm cache_root starts empty
+        // and pays nothing until a read asks, and that read costs no source operations.
         let dir = TempDir::new().expect("tempdir");
         let cache_root = dir.path().join("cache");
         let storage: Arc<dyn StorageProvider> =
@@ -3067,44 +3353,226 @@ mod tests {
         let bytes = tiny_superfile_bytes();
         let size = bytes.len() as u64;
 
-        // First handle: warm-insert a superfile, then drop it (files persist).
         {
             let cfg = DiskCacheConfig {
                 cache_root: cache_root.clone(),
                 mmap_cold_threshold_secs: 0,
                 ..Default::default()
             };
-            let store = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("store1");
-            store.insert_warm(&uri, bytes).await.expect("insert_warm");
-            assert!(store.cache_path(&uri).is_file());
+            let first = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("store1");
+            first.insert_warm(&uri, bytes).await.expect("insert_warm");
+            assert!(first.cache_path(&uri).is_file());
         }
 
-        // Second handle on the SAME cache_root: constructor rebuilds the index.
         let cfg2 = DiskCacheConfig {
             cache_root: cache_root.clone(),
             mmap_cold_threshold_secs: 0,
             ..Default::default()
         };
-        let store2 = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg2).expect("store2");
+        let second = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg2).expect("store2");
 
-        let s = store2.stats();
-        assert_eq!(s.n_entries, 1, "rebuilt index has the cached superfile");
-        assert_eq!(s.current_bytes, size, "rebuilt byte accounting matches");
+        let at_open = second.stats();
+        assert_eq!(at_open.n_entries, 0, "nothing opened at construction");
         assert_eq!(
-            s.n_cold_fetches, 0,
-            "rebuild mmaps locally, never cold-fetches"
+            at_open.current_bytes, size,
+            "the file's bytes are counted against the budget"
         );
 
-        // A read is served from the rebuilt entry — still zero cold fetches.
-        let _r = store2
+        let _reader = second.reader(&uri).await.expect("reader from disk");
+        let after = second.stats();
+        assert_eq!(after.n_cold_fetches, 0, "reuse, not a re-fetch");
+        assert_eq!(after.n_disk_reuses, 1);
+        assert_eq!(after.n_entries, 1);
+        assert_eq!(
+            after.current_bytes, size,
+            "reuse moves ownership, not bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_budget_directory_still_serves_the_first_read() {
+        // Seeding the budget from the directory while the index is empty is only safe if eviction
+        // can reclaim files no entry owns. Without that, `reserve` finds a full budget and zero
+        // eviction candidates, and the first read fails with BudgetExceeded instead of serving.
+        let bytes = tiny_superfile_bytes();
+        let one = bytes.len() as u64;
+        let (_dir, store) = test_store_with(|cfg| {
+            // Room for a single superfile, so a directory of several is over budget.
+            cfg.disk_budget_bytes = one;
+        });
+        for _ in 0..SEEDED_CACHE_FILES {
+            seed_cache_file(&store, &SuperfileUri::new_v4(), &bytes);
+        }
+
+        let wanted = SuperfileUri::new_v4();
+        put_superfile(&store, &wanted, bytes.clone()).await;
+
+        let opened = reopen_store(&store, |cfg| cfg.disk_budget_bytes = one);
+
+        let reader = opened.reader(&wanted).await;
+        assert!(
+            reader.is_ok(),
+            "first read on an over-budget directory must serve, got {:?}",
+            reader.err()
+        );
+        assert!(
+            opened.stats().current_bytes <= one,
+            "eviction brought the directory back under budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_cache_files_fall_through_to_source() {
+        // Every rejection path lands in the same place: unlink the bad file and let the read
+        // cold-fetch a clean copy. Nothing is ever served from a file that failed to open.
+        let bytes = tiny_superfile_bytes();
+        for (label, seeded) in [
+            ("zero length", Bytes::new()),
+            ("not a superfile", Bytes::from_static(b"garbage bytes")),
+        ] {
+            let (_dir, store) = test_store();
+            let uri = SuperfileUri::new_v4();
+            put_superfile(&store, &uri, bytes.clone()).await;
+            seed_cache_file(&store, &uri, &seeded);
+
+            let reader = store.reader(&uri).await;
+            assert!(reader.is_ok(), "{label}: falls through and serves");
+            assert_eq!(
+                store.stats().n_cold_fetches,
+                1,
+                "{label}: came from storage, not the bad local file"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_reclaims_stale_tmp_files_and_spares_fresh_ones() {
+        // A stale tempfile can only be a crashed fetch's leftover, but a fresh one belongs to a
+        // sibling process's in-flight fetch: deleting it would fail that fetch's rename.
+        let (_dir, store) = test_store();
+        let bytes = tiny_superfile_bytes();
+        let stale = SuperfileUri::new_v4();
+        let fresh = SuperfileUri::new_v4();
+        let skewed = SuperfileUri::new_v4();
+        let now = SystemTime::now();
+        for (uri, mtime) in [
+            (stale, now - TMP_RECLAIM_AGE * 2),
+            (fresh, now),
+            // A future mtime (clock skew) must read as not-stale, never as reclaimable.
+            (skewed, now + TMP_RECLAIM_AGE),
+        ] {
+            let path = store.tmp_path(&uri);
+            fs::write(&path, bytes.as_ref()).expect("seed tmp");
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open tmp")
+                .set_modified(mtime)
+                .expect("set mtime");
+        }
+
+        let opened = reopen_store(&store, |_| {});
+
+        assert!(!opened.tmp_path(&stale).exists(), "stale tmp reclaimed");
+        assert!(
+            opened.tmp_path(&fresh).exists(),
+            "fresh tmp left for its owner"
+        );
+        assert!(
+            opened.tmp_path(&skewed).exists(),
+            "future mtime spared under clock skew"
+        );
+        assert_eq!(
+            opened.stats().current_bytes,
+            0,
+            "tmp files never count against the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_fetch_completes_after_a_scan_and_its_file_is_adopted() {
+        // The interleaving the age gate protects: another process's fetch is in flight while we
+        // open, its rename lands after our scan, and our read adopts the finished file.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        fs::write(store.tmp_path(&uri), bytes.as_ref()).expect("sibling's in-flight tmp");
+
+        let opened = reopen_store(&store, |_| {});
+        assert!(
+            opened.tmp_path(&uri).exists(),
+            "scan spared the in-flight tmp"
+        );
+
+        // The sibling finishes: fsync'd bytes, atomic rename to the final name.
+        fs::rename(opened.tmp_path(&uri), opened.cache_path(&uri)).expect("sibling renames");
+
+        let _r = opened
             .reader(&uri)
             .await
-            .expect("reader from rebuilt index");
-        assert_eq!(
-            store2.stats().n_cold_fetches,
-            0,
-            "read served from NVMe via rebuilt index, no object-store GET"
+            .expect("read adopts the finished file");
+        let stats = opened.stats();
+        assert_eq!(stats.n_disk_reuses, 1);
+        assert_eq!(stats.n_cold_fetches, 0, "no storage round-trip");
+    }
+
+    #[tokio::test]
+    async fn eviction_takes_unindexed_files_before_live_entries() {
+        // Budget pressure with both kinds present: the files no read has opened go first, so an
+        // entry a query just adopted keeps its mapping.
+        let bytes = tiny_superfile_bytes();
+        let one = bytes.len() as u64;
+        let (_dir, store) = test_store();
+        let adopted = SuperfileUri::new_v4();
+        seed_cache_file(&store, &adopted, &bytes);
+        for _ in 0..2 {
+            seed_cache_file(&store, &SuperfileUri::new_v4(), &bytes);
+        }
+
+        // Fresh store over the same root: three unindexed files, a budget with no slack.
+        let opened = reopen_store(&store, |cfg| cfg.disk_budget_bytes = 3 * one);
+        let _held = opened.reader(&adopted).await.expect("adopt one file");
+
+        // A warm insert needs one file's worth of room; eviction must find it among the two
+        // never-opened files, not under the adopted entry.
+        opened
+            .insert_warm(&SuperfileUri::new_v4(), bytes.clone())
+            .await
+            .expect("insert under pressure");
+
+        let s = opened.stats();
+        assert!(
+            opened.cached.contains_key(&adopted),
+            "adopted entry survives"
         );
+        assert!(
+            opened.cache_path(&adopted).is_file(),
+            "its file survives too"
+        );
+        assert_eq!(s.n_evictions, 1, "one unindexed file made the room");
+        assert!(s.current_bytes <= 3 * one, "back under budget");
+    }
+
+    #[tokio::test]
+    async fn reuse_rejects_a_file_of_the_wrong_size() {
+        // Only the lazy path knows the expected size; when it disagrees, the file must be unlinked
+        // and the caller sent to source, never served.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        seed_cache_file(&store, &uri, &bytes);
+
+        let wrong = bytes.len() as u64 + 1;
+        let reused = store
+            .try_reuse_cached_file(&uri, Some(wrong))
+            .await
+            .expect("reuse probe");
+        assert!(reused.is_none(), "size mismatch is a miss, not a serve");
+        assert!(
+            !store.cache_path(&uri).exists(),
+            "mismatched file unlinked so the fetch lands on a fresh inode"
+        );
+        assert_eq!(store.stats().n_disk_reuses, 0, "a rejection is not a reuse");
     }
 
     // ----- cold fetch: synchronous path -----

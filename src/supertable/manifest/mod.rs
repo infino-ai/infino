@@ -102,6 +102,10 @@ use crate::{
 /// and the GC live-set sweep so both agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
 
+/// Extra extension an in-flight cold-fetch tempfile carries on top of [`SuperfileUri::cache_filename`];
+/// the file is atomically renamed to the bare name once complete.
+pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
+
 /// Legacy storage-subtree prefix for the hidden vector-index sibling
 /// supertable — the commit-time default stamped when a vector table's
 /// manifest carries no explicit prefix. New tables generate a unique
@@ -2518,7 +2522,7 @@ impl SuperfileUri {
 
     /// Disk-cache tempfile while a cold fetch is in flight.
     pub fn cache_tmp_filename(self) -> String {
-        format!("seg-{}.sf.parquet.tmp", self.0)
+        format!("{}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
     /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk
@@ -2531,6 +2535,12 @@ impl SuperfileUri {
     pub fn from_cache_filename(name: &str) -> Option<Self> {
         let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
+    }
+
+    /// Inverse of [`Self::cache_tmp_filename`]: recover the URI from an in-flight tempfile's name.
+    /// A crash can leave one behind; the disk cache uses this to recognize and delete it.
+    pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
+        Self::from_cache_filename(name.strip_suffix(CACHE_TMP_EXTENSION)?)
     }
 
     /// Inverse of [`Self::storage_path`]. Fetches the superfile name from the path.
