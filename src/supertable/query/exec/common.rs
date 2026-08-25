@@ -89,15 +89,18 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// by every public row-returning search method (`bm25_search`,
 /// `vector_search`, `token_match`, `exact_match`); `what` labels error
 /// messages with the calling method.
-/// Fold DataFusion's own operator instrumentation into the per-query
-/// stats after a SQL plan has executed. Every operator's
-/// `elapsed_compute` (DataFusion brackets its synchronous poll sections
-/// with an `Instant` timer — approximately on-CPU for compute-bound
-/// operators, and excluding async I/O waits) sums into the kernel
-/// counter; leaf (source) operators' `output_rows` sum into
+/// Fold DataFusion's row instrumentation into the per-query stats after a
+/// SQL plan has executed: leaf (source) operators' `output_rows` sum into
 /// `rows_materialized` — the rows the scans decoded from storage.
-/// Infino's own TVF exec nodes report no DataFusion metrics (their
-/// kernels bracket and flush internally), so nothing double-counts.
+///
+/// Deliberately NOT `elapsed_compute`. That is an `Instant` timer around
+/// synchronous poll sections — wall time, so on a busy host it counts
+/// whatever the thread was descheduled for, the exact contention bleed
+/// per-op metering exists to remove. It also omits Parquet decode
+/// entirely. CPU now comes from
+/// [`MeteredExec`](crate::supertable::query::exec::metered_exec::MeteredExec),
+/// which brackets each scan poll with the same thread-CPU clock the
+/// search kernels use, so SQL and search are priced on one clock.
 pub(crate) fn harvest_datafusion_metrics(
     plan: &Arc<dyn ExecutionPlan>,
     op_stats: &Option<Arc<OpStatsCollector>>,
@@ -105,37 +108,26 @@ pub(crate) fn harvest_datafusion_metrics(
     // Deduped by node identity: plans are trees in practice, but nothing
     // forbids an operator `Arc` appearing under two parents, and a shared
     // node's metrics must not be added once per path.
-    fn walk(
-        node: &Arc<dyn ExecutionPlan>,
-        seen: &mut HashSet<usize>,
-        compute_ns: &mut u64,
-        leaf_rows: &mut u64,
-    ) {
+    fn walk(node: &Arc<dyn ExecutionPlan>, seen: &mut HashSet<usize>, leaf_rows: &mut u64) {
         if !seen.insert(Arc::as_ptr(node) as *const () as usize) {
             return;
         }
-        if let Some(metrics) = node.metrics() {
-            if let Some(ns) = metrics.elapsed_compute() {
-                *compute_ns += ns as u64;
-            }
-            if node.children().is_empty()
-                && let Some(rows) = metrics.output_rows()
-            {
-                *leaf_rows += rows as u64;
-            }
+        if let Some(metrics) = node.metrics()
+            && node.children().is_empty()
+            && let Some(rows) = metrics.output_rows()
+        {
+            *leaf_rows += rows as u64;
         }
         for child in node.children() {
-            walk(child, seen, compute_ns, leaf_rows);
+            walk(child, seen, leaf_rows);
         }
     }
     let Some(stats) = op_stats else {
         return;
     };
     let mut seen = HashSet::new();
-    let mut compute_ns = 0u64;
     let mut leaf_rows = 0u64;
-    walk(plan, &mut seen, &mut compute_ns, &mut leaf_rows);
-    stats.add_kernel_cpu_ns(compute_ns);
+    walk(plan, &mut seen, &mut leaf_rows);
     stats.add_rows_materialized(leaf_rows);
 }
 

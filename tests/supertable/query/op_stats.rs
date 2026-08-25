@@ -843,9 +843,30 @@ fn a_scoped_sql_scan_reports_page_bytes() {
         stats.rows_materialized > 0,
         "the scan's decoded rows come from DataFusion's own metrics; got 0"
     );
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+)]
+fn a_scoped_sql_scan_reports_kernel_cpu() {
+    // SQL CPU is bracketed per scan poll on the thread clock, like every
+    // other kernel — not DataFusion's `elapsed_compute`, which is wall
+    // time and omits Parquet decode. Same granularity handling as the
+    // BM25 and vector kernel-CPU tests: schedstat advances at scheduler
+    // events, so one sub-tick scan can legitimately read zero and only a
+    // batch is guaranteed to register.
+    const KERNEL_CPU_BATCH: usize = 200;
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let mut total = 0u64;
+    for _ in 0..KERNEL_CPU_BATCH {
+        total += scoped_sql_stats(&db, "SELECT rating FROM docs WHERE rating > 5").kernel_cpu_ns;
+    }
     assert!(
-        stats.kernel_cpu_ns > 0,
-        "the plan's elapsed compute comes from DataFusion's own metrics; got 0"
+        total > 0,
+        "the bracketed SQL scan reports on-CPU time over {KERNEL_CPU_BATCH} queries; got 0"
     );
 }
 

@@ -111,6 +111,7 @@ use crate::{
         query::{
             candidate::CandidatePlan,
             df_object_store::SuperfileObjectStore,
+            exec::metered_exec::MeteredExec,
             prune::{PruneLeaf, select_superfiles},
             skip::{ScalarOp, ScalarPredicate},
             superfile_reader::superfile_reader,
@@ -1019,7 +1020,14 @@ impl TableProvider for SupertableProvider {
             .with_projection_indices(projection.cloned())?
             .with_limit(effective_limit)
             .build();
-        Ok(DataSourceExec::from_data_source(config))
+        // Meter the scan's own poll time on the thread clock. DataFusion
+        // reports operator time as wall-clock `elapsed_compute` and does not
+        // report Parquet decode at all, so without this a SQL query's CPU is
+        // both mis-clocked and missing its dominant leg.
+        Ok(Arc::new(MeteredExec::new(
+            DataSourceExec::from_data_source(config),
+            self.scan_store.op_stats(),
+        )))
     }
 }
 

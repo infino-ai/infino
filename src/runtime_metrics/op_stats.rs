@@ -154,12 +154,18 @@ pub struct OpStats {
     /// reads count planned ranges only, never rows.
     pub rows_materialized: u64,
     /// Nanoseconds of the query's bracketed synchronous kernel sections.
-    /// Engine kernels use the thread-CPU clock; SQL operator sections use
-    /// DataFusion's own `elapsed_compute` instrumentation (an `Instant`
-    /// timer around synchronous poll work — approximately on-CPU for
-    /// compute-bound operators, excluding async I/O waits). A refinement
-    /// of — not a replacement for — a consumer's own process-level CPU
-    /// accounting: fan-out glue and async awaits are outside the brackets.
+    /// One clock everywhere: the thread-CPU clock (schedstat). Engine
+    /// kernels bracket their own sections; SQL scans are bracketed per
+    /// poll by `MeteredExec`, which measures on whichever worker polls
+    /// that partition. DataFusion's `elapsed_compute` is deliberately not
+    /// used — it is wall time and omits Parquet decode — so a SQL query
+    /// and a search query are priced on the same basis.
+    ///
+    /// Coverage is not total: orchestration between kernels and async
+    /// awaits sit outside the brackets, so this reads lower than a
+    /// process-level measurement of the same op. Measured on the standard
+    /// vector bench, then closed toward completeness — the remaining gap
+    /// is what a consumer must calibrate its reference against.
     pub kernel_cpu_ns: u64,
 
     // ---- Write-side work (see the module's write-side determinism
