@@ -3690,9 +3690,20 @@ impl VectorReader {
                         budget,
                     };
                     let coarse_limit = k.saturating_mul(rerank_mult);
+                    // Timed like the immediate path's shortlist below: this
+                    // warm deferred scan is the read the width pin certifies
+                    // (whole-cell depth), which made it the dominant span of
+                    // `vec.fanout_wall` — ~9 of an 11 ms filtered query at
+                    // 9.4M — while carrying no phase label at all, so a
+                    // phase table showed ~2 ms of timed work inside a 10 ms
+                    // wall and read as a scheduling mystery.
+                    let shortlist_t0 = io_counters::phase_start();
                     let (shortlist, scan_kernel_ns) =
                         scan_shortlist(col, cb, &cluster_meta, &blocks, true, coarse_limit, &ctx)
                             .await?;
+                    if let Some(t0) = shortlist_t0 {
+                        io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
+                    }
                     tally.kernel_cpu_ns += scan_kernel_ns;
                     let cands = shortlist
                         .into_iter()

@@ -4963,11 +4963,15 @@ fn rerank_mult_from_law(
 /// fine-first depth contributes only each cell's first runs — measured
 /// ~0.83 recall@100 on Cohere-1M REGARDLESS of width, a dial that
 /// widened without deepening. The per-fragment gate still clamps to
-/// each fragment's real run count. FILTERED queries keep their own fine
-/// floors (already applied to `routing` by the base branch) and never
-/// engage `sweep_width`: a sparse allow-set's shortlist divided across
-/// cells starves. `populated_cells` clamps the width the budget divide
-/// splits by — never more than the cells that actually carry postings.
+/// each fragment's real run count. FILTERED splits by arm: the LAW arm
+/// serves filtered exactly like unfiltered — same pin, same whole-cell
+/// depth (measured filtered recall@10 0.630 -> 0.993 on Cohere-9.4M) —
+/// while an explicit caller `nprobe` on a filtered query pins the width
+/// but returns `None` without lifting depth, so no sweep engages: a
+/// sparse allow-set's shortlist divided across caller-widened cells
+/// starves at the persisted fine floor. `populated_cells` clamps the
+/// width the budget divide splits by — never more than the cells that
+/// actually carry postings.
 fn apply_width_pin(
     routing: &mut CellRoutingParams,
     caller_nprobe: Option<usize>,
