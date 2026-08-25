@@ -63,6 +63,7 @@ use datafusion::{
     error::DataFusionError,
     execution::context::SessionContext,
     logical_expr::{Expr, LogicalPlan},
+    physical_plan::{ExecutionPlan, collect as collect_physical},
 };
 
 use crate::{
@@ -77,7 +78,8 @@ use crate::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
                 fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
-                match_exec::register_match, vector_exec::register_vector_search,
+                match_exec::register_match, metered_exec::MeteredExec,
+                vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
@@ -248,6 +250,12 @@ impl SupertableReader {
         });
         let cached_plan = self.cached_sql_logical_plan(sql);
         let cache_reader = self.clone();
+        // Picked up on the caller's thread, like reader mint: the drive
+        // future polls on runtime threads where the scope's slot is
+        // invisible. This is what lets the cached, collector-detached
+        // context still report the plan's CPU — the meter rides the
+        // wrapper below, not the context.
+        let op_stats = op_stats::current();
 
         let sql = sql.to_owned();
         let drive = async move {
@@ -279,7 +287,19 @@ impl SupertableReader {
                     df
                 }
             };
-            df.collect().await.map_err(exec_query_error)
+            // Meter the executed plan on the thread-CPU clock, the same
+            // way the catalog path does. The context is cached and
+            // deliberately carries no collector, so without this the
+            // reader-level SQL surface reports nothing at all.
+            let plan = df
+                .create_physical_plan()
+                .await
+                .map_err(|e| QueryError::Plan(e.to_string()))?;
+            let metered: Arc<dyn ExecutionPlan> =
+                Arc::new(MeteredExec::new(Arc::clone(&plan), op_stats));
+            collect_physical(metered, ctx.task_ctx())
+                .await
+                .map_err(exec_query_error)
         };
 
         // Drive through the shared sync→async bridge: ambient
