@@ -7,7 +7,9 @@
 //! BlockMaxWAND fast path, and the atom (phrase-aware) scored walk.
 //! Its own `impl FtsReader` block, split from the reader `core`.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
+
+use rustc_hash::FxHashMap;
 
 use super::{
     core::*,
@@ -729,7 +731,9 @@ impl FtsReader {
         // Tokenize the query with each column's configured tokenizer so
         // per-column analyzers are honored — a table may index different
         // columns with different analyzers.
-        let mut combined: HashMap<u32, f32> = HashMap::new();
+        // FxHashMap: the combine does a per-doc insert across columns; the
+        // default SipHash is needless work for small integer (doc-id) keys.
+        let mut combined: FxHashMap<u32, f32> = FxHashMap::default();
         for (col_name, weight) in columns {
             let col_id = self.resolve_column_id(col_name)?;
             let tok = &self.columns[col_id as usize].tokenizer;
