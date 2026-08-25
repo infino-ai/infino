@@ -2816,8 +2816,11 @@ impl SupertableReader {
         // their dead on-disk blocks are never selected or fetched.
         let empty_superseded = BTreeMap::new();
         let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
-        let (postings_by_cell, any_tagged) =
-            postings_by_cell_from_summaries(&superfiles, column, allow_ref, superseded);
+        // A pass over every superfile's per-cell summaries — the routing
+        // input, and pure CPU this query asked for.
+        let (postings_by_cell, any_tagged) = op_stats::timed_kernel(&self.op_stats, || {
+            postings_by_cell_from_summaries(&superfiles, column, allow_ref, superseded)
+        });
 
         let mut gated = Vec::new();
         let mut scored = Vec::new();

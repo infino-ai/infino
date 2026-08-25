@@ -3449,7 +3449,9 @@ impl VectorReader {
             return Ok((Vec::new(), ProbeTally::default()));
         }
 
-        let per_cell = self.resolve_cells_for_clusters(clusters);
+        // Mapping the selected flat clusters onto cells is a pass over the
+        // selection; at a wide sweep that is the whole probed set.
+        let (per_cell, resolve_ns) = timed_section(|| self.resolve_cells_for_clusters(clusters));
         if per_cell.is_empty() {
             return Ok((Vec::new(), ProbeTally::default()));
         }
@@ -3532,7 +3534,7 @@ impl VectorReader {
             .try_collect()
             .await?;
         let mut tally = ProbeTally::default();
-        tally.kernel_cpu_ns += rot_ns;
+        tally.kernel_cpu_ns += rot_ns.saturating_add(resolve_ns);
         for (_, cell_tally) in &per_cell {
             tally.cells_scanned += cell_tally.cells_scanned;
             tally.candidates_scanned += cell_tally.candidates_scanned;
