@@ -594,26 +594,52 @@ pub(crate) async fn fetch_graph_section(
     Ok((bytes, is_mmap))
 }
 
+/// Whether an `mmap` failure signals resource exhaustion (`ENOMEM`: address
+/// space, `vm.max_map_count`, or an `mmap` rlimit) rather than a benign,
+/// per-file error. On such a failure the striped heap fallback would pull the
+/// whole bundle into heap — strictly more memory than the mapping that just
+/// failed — so the caller surfaces the error instead of masking the pressure.
+fn is_mmap_resource_exhaustion(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::OutOfMemory
+}
+
 /// The bundle bytes for [`fetch_graph_section`] plus whether the backing is an
 /// `mmap`: `mmap`-backed for a local file (the default), else striped from
-/// storage into a heap buffer for remote backends. A local mmap failure is
-/// non-fatal — it falls through to the striped fetch so an open never fails on
-/// it. The mmap acquisition itself is cheap (no fault); only the hash + decode
-/// over the map are CPU/IO-heavy, and those run on the blocking pool.
+/// storage into a heap buffer for remote backends. A *benign* local mmap
+/// failure (missing/moved file, permissions) is non-fatal — it falls through to
+/// the striped fetch so an open never fails on it. A *resource-exhaustion*
+/// failure (see [`is_mmap_resource_exhaustion`]) is surfaced instead: the
+/// striped fallback would consume strictly more memory than the mapping that
+/// just failed, so masking it would turn mapping pressure into a likely OOM;
+/// the caller then degrades to the ivf scan (serving) or a full rebuild (drain).
+/// The `exists` + `mmap` syscalls run on the blocking pool, off the tokio
+/// workers (the striped remote fetch is async and yields on its own); only the
+/// hash + decode over the map are the heavy CPU/IO wave, also on the pool.
 async fn fetch_graph_bytes(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
 ) -> Result<(Bytes, bool), SlowVectorStateError> {
-    if let Some(path) = storage.local_path(&reference.uri)
-        && path.exists()
-    {
-        match disk::mmap_readonly_bytes(&path) {
-            Ok(bytes) => return Ok((bytes, true)),
-            Err(error) => tracing::warn!(
+    if let Some(path) = storage.local_path(&reference.uri) {
+        let mapped =
+            spawn_blocking(move || path.exists().then(|| disk::mmap_readonly_bytes(&path)))
+                .await
+                .map_err(|join_error| {
+                    SlowVectorStateError::Parse(format!("graph mmap task failed: {join_error}"))
+                })?;
+        match mapped {
+            Some(Ok(bytes)) => return Ok((bytes, true)),
+            Some(Err(error)) if is_mmap_resource_exhaustion(&error) => {
+                return Err(SlowVectorStateError::Storage(format!(
+                    "graph bundle mmap exhausted resources ({error}); \
+                     refusing the heavier striped heap fetch"
+                )));
+            }
+            Some(Err(error)) => tracing::warn!(
                 uri = reference.uri,
                 %error,
                 "graph bundle mmap failed; falling back to striped heap fetch"
             ),
+            None => {}
         }
     }
     let bytes = fetch_blob_striped(storage, &reference.uri, STRIPED_FETCH_CHUNK_BYTES).await?;
@@ -804,6 +830,24 @@ mod tests {
             vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
+    }
+
+    #[test]
+    fn mmap_resource_exhaustion_is_distinguished_from_benign_errors() {
+        // Only resource exhaustion (ENOMEM: address space / vm.max_map_count /
+        // rlimit) must be surfaced; the striped heap fallback would use more
+        // memory than the mapping that failed.
+        assert!(is_mmap_resource_exhaustion(&io::Error::from(
+            io::ErrorKind::OutOfMemory
+        )));
+        // Benign per-file failures fall through to the striped fetch so an open
+        // never fails on them.
+        assert!(!is_mmap_resource_exhaustion(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        assert!(!is_mmap_resource_exhaustion(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
     }
 
     /// Dim for the routing-sibling fixture's vector summary.
