@@ -1052,10 +1052,9 @@ impl FtsReader {
                     let mut packed = 1;
                     let mut score: f32 = 0.0;
                     for cursor in cursors.iter_mut().skip(1) {
-                        cursor.skip_to(candidate);
-                        if cursor.current_doc_id() == candidate {
+                        if let Some(tf) = cursor.bitset_probe_tf(candidate) {
                             idfs[packed] = cursor.idf_x_k1p1;
-                            tfs[packed] = cursor.current_tf() as f32;
+                            tfs[packed] = tf as f32;
                             packed += 1;
                             if packed == 4 {
                                 score += bm25::score_simd_x4(idfs, tfs, norm);
@@ -1221,13 +1220,12 @@ impl FtsReader {
                             if score + remaining_block_ub <= threshold {
                                 break;
                             }
-                            cursor.skip_to(candidate);
-                            if cursor.current_doc_id() == candidate {
-                                score += bm25::score_with_dl_norm_k1(
-                                    cursor.idf_x_k1p1,
-                                    cursor.current_tf(),
-                                    norm,
-                                );
+                            // Locate + score the non-essential without expanding
+                            // a dense block's doc ids: a bit-test + popcount-rank
+                            // tf read on a bitset block, decode-and-locate on a
+                            // PACKED one.
+                            if let Some(tf) = cursor.bitset_probe_tf(candidate) {
+                                score += bm25::score_with_dl_norm_k1(cursor.idf_x_k1p1, tf, norm);
                             }
                             remaining_block_ub -= block_ub;
                         }

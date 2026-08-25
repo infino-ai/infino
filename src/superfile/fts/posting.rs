@@ -265,6 +265,32 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
     count
 }
 
+/// Decode only the tf array of a block (the trailing tf-packed bytes) into
+/// `dest_tfs`, in doc order, skipping the doc-id half. The ranked-OR
+/// membership probe locates a bitset-block doc by bit-test + popcount-rank
+/// and needs only that doc's tf, never the expanded doc ids — so it decodes
+/// the tfs (which are BitPacker4x-packed and can't be single-value-indexed)
+/// once per block and reads the rank-th one, avoiding the doc-id expansion.
+pub fn decode_block_tfs(bytes: &[u8], dest_tfs: &mut [u32]) {
+    assert!(
+        dest_tfs.len() >= BLOCK_LEN,
+        "decode_block_tfs: dest_tfs must have at least {BLOCK_LEN} slots"
+    );
+    let tf_bits = bytes[2];
+    assert!(tf_bits <= 32, "decode_block_tfs: tf_bits {tf_bits} > 32");
+    let tfs_size = BLOCK_LEN * tf_bits as usize / 8;
+    assert!(
+        bytes.len() >= HEADER_SIZE + tfs_size,
+        "decode_block_tfs: bytes shorter than header+tfs"
+    );
+    let tfs_start = bytes.len() - tfs_size;
+    BitPacker4x::new().decompress(
+        &bytes[tfs_start..tfs_start + tfs_size],
+        &mut dest_tfs[..BLOCK_LEN],
+        tf_bits,
+    );
+}
+
 /// Decode only the doc ids of a posting block, skipping the term-frequency
 /// half entirely. Unranked counts (union, intersection) never look at
 /// `tf` — they tally doc ids — so decoding + reading the packed tfs is
