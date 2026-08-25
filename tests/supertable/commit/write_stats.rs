@@ -325,6 +325,30 @@ fn a_writer_minted_outside_the_scope_records_nothing() {
     assert_eq!(stats.superfiles_written, 0);
 }
 
+/// A writer holds its ingested work until the commit that publishes it
+/// returns Ok. Dropping the writer discards the buffer without committing
+/// — silently and by design — so it must discard the counters with it.
+/// Every call here returns Ok, which is what makes this the one path a
+/// "failed ops return Err" argument does not cover.
+#[test]
+fn a_dropped_writer_reports_nothing_it_never_committed() {
+    let st = Supertable::create(options_with_pool_width(1)).expect("create");
+    let batch = width_test_batch();
+    let ((), stats) = with_op_stats(|| {
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        drop(w);
+    });
+    assert_eq!(
+        stats.rows_written, 0,
+        "the buffer was dropped, so no row was durably indexed"
+    );
+    assert_eq!(stats.scalar_bytes_written, 0);
+    assert_eq!(stats.vector_bytes_written, 0);
+    assert_eq!(stats.fts_text_bytes_written, 0);
+    assert_eq!(stats.superfiles_written, 0);
+}
+
 /// A storage-backed table (mutations require storage for the WAL
 /// pipeline) with three committed rows.
 fn seeded_storage_table(dir: &TempDir) -> Supertable {

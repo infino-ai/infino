@@ -208,8 +208,8 @@ pub struct OpStats {
     /// into and how many times a contended publish retried. This counts
     /// instead what the data itself requires, which neither varies with:
     ///
-    /// - the objects the committed bytes occupy at the table's target
-    ///   superfile size, and
+    /// - the objects the commit's *ingested payload* occupies at the
+    ///   table's target superfile size, and
     /// - the manifest json + pointer that every commit must publish
     ///   ([`MANIFEST_PUTS_PER_COMMIT`]), counted once per successful
     ///   commit rather than once per OCC attempt.
@@ -218,12 +218,15 @@ pub struct OpStats {
     /// the superfile count, so they carry the same width-dependence the
     /// priced legs exist to avoid.
     ///
-    /// One honest caveat: the object term is derived from the commit's
-    /// *sealed* bytes, which carry a per-superfile overhead that does
-    /// scale with shard count. Against a gibibyte-scale target that
-    /// overhead is kilobytes, so it cannot move the ceiling except on a
-    /// knife-edge boundary; `write_stats_are_invariant_to_writer_pool_width`
-    /// compares this counter across widths and would catch it if it did.
+    /// The object term is derived from the buffered input rather than the
+    /// sealed output, and that distinction is load-bearing rather than
+    /// cosmetic. Per-superfile overhead is not a fixed footer: every shard
+    /// carries its own dictionary, FST and index headers, so on a corpus
+    /// whose vocabulary is shared across rows the same input seals to
+    /// roughly four times more bytes at pool width 16 than at width 1.
+    /// Dividing that by the target would make an identical append plan
+    /// more requests on a wider host — the exact width-dependence this
+    /// counter exists to avoid.
     ///
     /// Requests are a real and material share of write cost — a PUT is
     /// 12.5x a GET in the bench cost model, and unlike a warm read's
@@ -335,7 +338,7 @@ impl OpStatsCollector {
     /// retried publish never counts.
     ///
     /// Callers state their own object term because it is shape-specific:
-    /// a buffered append plans `ceil(sealed bytes / target object size)`;
+    /// a buffered append plans `ceil(ingested payload / target object size)`;
     /// an update plans exactly 1 (its replacement rows land in the WAL's
     /// single preallocated superfile by design). A delete flushes nothing
     /// here — it commits no manifest, and its per-superfile tombstone
