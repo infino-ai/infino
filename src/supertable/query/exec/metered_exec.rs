@@ -50,10 +50,10 @@ use datafusion::{
     common::{Statistics, config::ConfigOptions},
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
-    physical_expr::PhysicalExpr,
+    physical_expr::{PhysicalExpr, PhysicalSortExpr},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-        SendableRecordBatchStream,
+        SendableRecordBatchStream, SortOrderPushdownResult,
         execution_plan::CardinalityEffect,
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -216,6 +216,40 @@ impl ExecutionPlan for MeteredExec {
         _config: &ConfigOptions,
     ) -> DfResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DfResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // The default answer is `Unsupported`, which stops the pushdown
+        // walk dead. A meter sitting between a sort and the scan would
+        // then cost the query its row-group reorder, its reverse scan and
+        // any sort elimination — turning an early-terminating TopK into a
+        // full scan plus a full sort.
+        let rewrap = |input| -> Arc<dyn ExecutionPlan> {
+            Arc::new(MeteredExec::new(input, self.op_stats.clone()))
+        };
+        Ok(match self.input.try_pushdown_sort(order)? {
+            SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
+                inner: rewrap(inner),
+            },
+            SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
+                inner: rewrap(inner),
+            },
+            SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
+        })
+    }
+
+    fn with_preserve_order(&self, preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        // Order-sensitivity has to reach the data source, which decides
+        // whether it may skip row groups. Defaulting to `None` silently
+        // drops that signal at the meter.
+        self.input
+            .with_preserve_order(preserve_order)
+            .map(|input| -> Arc<dyn ExecutionPlan> {
+                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
+            })
     }
 
     fn execute(

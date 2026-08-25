@@ -59,16 +59,17 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::SchemaRef;
 use datafusion::{
+    dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    execution::context::SessionContext,
+    execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, LogicalPlan},
     physical_plan::{ExecutionPlan, collect as collect_physical},
 };
 
 use crate::{
     memory::budgeted_session_context,
-    runtime_metrics::op_stats,
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::permission_denied_in_chain,
     supertable::{
         error::QueryError,
@@ -291,23 +292,7 @@ impl SupertableReader {
             // way the catalog path does. The context is cached and
             // deliberately carries no collector, so without this the
             // reader-level SQL surface reports nothing at all.
-            let plan = df
-                .create_physical_plan()
-                .await
-                .map_err(|e| QueryError::Plan(e.to_string()))?;
-            let metered: Arc<dyn ExecutionPlan> =
-                Arc::new(MeteredExec::new(Arc::clone(&plan), op_stats.clone()));
-            let batches = collect_physical(metered, ctx.task_ctx())
-                .await
-                .map_err(exec_query_error)?;
-            // The cached context carries no collector by design, so the
-            // scan-level wrappers are inert here and `rows_materialized`
-            // would otherwise stay at zero while `kernel_cpu_ns` did not.
-            // Harvesting walks the executed plan and takes the collector
-            // explicitly, so it needs neither a metered context nor a
-            // cache bypass.
-            harvest_datafusion_metrics(&plan, &op_stats);
-            Ok(batches)
+            Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
 
         // Drive through the shared sync→async bridge: ambient
@@ -438,6 +423,35 @@ impl SupertableReader {
     /// large-table delete/update predicate never materializes every
     /// superfile into memory.
     ///
+    /// Plan, meter, execute and account for one DataFrame.
+    ///
+    /// The four steps belong together: a site that collects without
+    /// harvesting reports CPU, page bytes and ranges with no row count
+    /// beside them, which is how the mutation predicate resolve came to
+    /// report zero decoded rows for a scan it genuinely paid for. Keeping
+    /// them in one helper means a later call site cannot execute a plan
+    /// and quietly skip the accounting.
+    async fn collect_metered_df(
+        df: DataFrame,
+        task_ctx: Arc<TaskContext>,
+        op_stats: &Option<Arc<OpStatsCollector>>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        let metered: Arc<dyn ExecutionPlan> =
+            Arc::new(MeteredExec::new(Arc::clone(&plan), op_stats.clone()));
+        let batches = collect_physical(metered, task_ctx)
+            .await
+            .map_err(exec_query_error)?;
+        // Walks the executed plan and takes the collector explicitly, so
+        // it needs neither a metered context nor a cache bypass — the
+        // cached context carries no collector by design.
+        harvest_datafusion_metrics(&plan, op_stats);
+        Ok(batches)
+    }
+
     /// Note: the resolution is against the **current** manifest
     /// snapshot, exactly like a contemporaneous `query_sql` would
     /// see. Rows that newly match `expr` between this call and
@@ -445,6 +459,9 @@ impl SupertableReader {
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
     pub(crate) fn scan_ids_matching(&self, expr: Expr) -> Result<Vec<i128>, QueryError> {
+        // Picked up on the caller's thread, before any runtime hop, so the
+        // harvest below folds into this op's collector.
+        let op_stats = op_stats::current();
         let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
@@ -464,7 +481,12 @@ impl SupertableReader {
                 .map_err(|e| QueryError::Plan(e.to_string()))?
                 .select_columns(&[id_column.as_str()])
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
-            let batches = df.collect().await.map_err(exec_query_error)?;
+            // Same three steps as `query_sql`, and for the same reason:
+            // this scan's rows are real decoded rows. Collecting the
+            // DataFrame directly reported CPU, page bytes and ranges for a
+            // mutation's predicate resolve while leaving its row count at
+            // zero.
+            let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
             extract_id_column(&batches)
         };
 

@@ -349,6 +349,54 @@ fn a_dropped_writer_reports_nothing_it_never_committed() {
     assert_eq!(stats.superfiles_written, 0);
 }
 
+/// Rows in the parent batch the slice fixture carves from — large enough
+/// that billing its whole allocation is unmistakable.
+const SLICE_TEST_PARENT_ROWS: usize = 4_000;
+/// Rows the slice fixture actually appends.
+const SLICE_TEST_ROWS: usize = 10;
+
+/// Priced bytes measure the rows an append carries, not the allocation
+/// they happen to live in. Arrow slices share their parent's buffers, and
+/// `get_array_memory_size` sums buffer *capacity* while ignoring offset
+/// and length — so a 10-row slice of a 4,000-row batch reported the whole
+/// parent. Chunked ingest (read one large batch, append it in zero-copy
+/// slices) is exactly that pattern, and it billed every chunk for the
+/// entire batch.
+#[test]
+fn a_sliced_append_is_billed_for_its_own_rows() {
+    let titles: Vec<String> = (0..SLICE_TEST_PARENT_ROWS)
+        .map(|i| format!("row {i} carrying enough text to allocate a real buffer"))
+        .collect();
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let sliced = build_title_batch(&refs).slice(0, SLICE_TEST_ROWS);
+    let standalone = build_title_batch(&refs[..SLICE_TEST_ROWS]);
+
+    let st_sliced = Supertable::create(options_with_pool_width(1)).expect("create");
+    let ((), from_slice) = with_op_stats(|| {
+        st_sliced.append(&sliced).expect("append the slice");
+    });
+    let st_standalone = Supertable::create(options_with_pool_width(1)).expect("create");
+    let ((), from_standalone) = with_op_stats(|| {
+        st_standalone
+            .append(&standalone)
+            .expect("append the standalone batch");
+    });
+
+    assert_eq!(
+        from_slice.rows_written, from_standalone.rows_written,
+        "both appends carry the same rows"
+    );
+    assert_eq!(
+        from_slice.scalar_bytes_written, from_standalone.scalar_bytes_written,
+        "the same rows must price the same whether they arrive as a slice \
+         of a larger batch or as a batch of their own"
+    );
+    assert_eq!(
+        from_slice.fts_text_bytes_written, from_standalone.fts_text_bytes_written,
+        "and so must the indexed-text leg"
+    );
+}
+
 /// A storage-backed table (mutations require storage for the WAL
 /// pipeline) with three committed rows.
 fn seeded_storage_table(dir: &TempDir) -> Supertable {
@@ -388,6 +436,14 @@ fn a_delete_reports_its_tombstoned_rows_and_its_scan() {
     assert!(
         stats.planned_read_ranges > 0,
         "the mutation's predicate scan must report its read work"
+    );
+    // The resolve decodes rows, and `rows_materialized` is the counter
+    // that says so. It sat at zero while the CPU, page-byte and range
+    // counters beside it all reported, because the resolve collected its
+    // DataFrame without harvesting DataFusion's leaf metrics.
+    assert!(
+        stats.rows_materialized > 0,
+        "the predicate scan's decoded rows must reach the counter"
     );
 }
 
@@ -485,14 +541,28 @@ fn optimize_does_not_re_bill_ingested_rows() {
     // A second commit gives compaction something to merge.
     st.append(&build_title_batch(&["delta", "echo"]))
         .expect("second append");
+    let before = st.reader().expect("reader").n_superfiles();
     let ((), stats) = with_op_stats(|| {
         st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            // Without this the default is 50, so two superfiles never
+            // select a merge job and the zero assertions below hold
+            // because nothing ran.
+            min_superfiles_for_merge: 2,
             target_superfile_size_mb: 1,
             min_fill_percent: 1,
             ..CompactionSettings::default()
         }))
         .expect("optimize");
     });
+    // The zeros below only mean something if a merge actually ran. With
+    // the shipped `min_superfiles_for_merge` this fixture selected no job
+    // at all, so the assertions passed because nothing happened.
+    let after = st.reader().expect("reader").n_superfiles();
+    assert!(
+        after < before,
+        "the fixture must really merge ({before} -> {after}), or the \
+         zero assertions below prove nothing"
+    );
     assert_eq!(
         stats.rows_written, 0,
         "optimize must never re-count ingested rows"

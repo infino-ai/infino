@@ -30,7 +30,15 @@ pub fn classify_batch_bytes(batch: &RecordBatch) -> (u64, u64) {
     (text_bytes, vector_bytes)
 }
 
-fn visible_array_bytes(column: &dyn Array) -> u64 {
+/// One array's *visible* footprint: slice-aware, so an array that is a
+/// zero-copy window into a larger buffer is billed for the rows it
+/// actually carries rather than for its parent's whole allocation.
+/// Falls back to the capacity-based size only if slice sizing fails.
+///
+/// This is the right measure wherever bytes are *priced*. It is the wrong
+/// one for held-memory accounting (an auto-flush threshold, a scratch
+/// reserve), where the parent allocation really is what is resident.
+pub(crate) fn visible_array_bytes(column: &dyn Array) -> u64 {
     column
         .to_data()
         .get_slice_memory_size()

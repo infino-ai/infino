@@ -116,7 +116,10 @@ use crate::{
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
-    runtime_metrics::op_stats::{self, OpStatsCollector},
+    runtime_metrics::{
+        ingest::visible_array_bytes,
+        op_stats::{self, OpStatsCollector},
+    },
     storage::{StorageError, StorageProvider},
     superfile::{
         BuildError as SuperfileBuildError, ReadError, SuperfileReader,
@@ -2879,13 +2882,25 @@ fn ingested_byte_legs(
     vector_elems: usize,
     options: &SupertableOptions,
 ) -> (u64, u64, u64) {
-    let scalar_bytes = scalar.get_array_memory_size() as u64;
+    // Visible bytes, not buffer capacity. `get_array_memory_size` sums
+    // `Buffer::capacity()` — the whole shared allocation — and is blind to
+    // an array's offset and length, so a zero-copy slice reports its
+    // parent's footprint. Chunked ingest (read one large batch, append it
+    // as N slices) is the ordinary pattern arrow-rs makes cheap precisely
+    // because slices share buffers, and it would bill N times the whole
+    // batch. Capacity is still the right answer for the held-memory
+    // tallies and the build-scratch reserve, which is why those keep it.
+    let scalar_bytes = scalar
+        .columns()
+        .iter()
+        .map(|c| visible_array_bytes(c.as_ref()))
+        .sum::<u64>();
     let vector_bytes = (vector_elems * mem::size_of::<f32>()) as u64;
     let fts_bytes = options
         .fts_columns
         .iter()
         .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
-        .map(|idx| scalar.column(idx).get_array_memory_size() as u64)
+        .map(|idx| visible_array_bytes(scalar.column(idx).as_ref()))
         .sum::<u64>();
     (scalar_bytes, vector_bytes, fts_bytes)
 }
@@ -2925,7 +2940,11 @@ fn buffered_payload_bytes(buffer: &[BufferedBatch]) -> u64 {
     buffer
         .iter()
         .map(|b| {
-            b.scalar.get_array_memory_size() as u64
+            b.scalar
+                .columns()
+                .iter()
+                .map(|c| visible_array_bytes(c.as_ref()))
+                .sum::<u64>()
                 + b.vectors
                     .iter()
                     .map(|v| (v.len() * mem::size_of::<f32>()) as u64)
