@@ -21,9 +21,8 @@ use std::{
     sync::Arc,
 };
 
-use rustc_hash::FxHashMap;
-
 use bytes::Bytes;
+use rustc_hash::FxHashMap;
 
 use super::{
     cursor::{TermCursor, TermMeta},
