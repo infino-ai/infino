@@ -3477,8 +3477,14 @@ impl VectorReader {
         // same O(dim^2) transform once per probed cell, unmetered. Hoisted
         // and bracketed, mirroring the scan path's shared rotation.
         // `per_cell` is non-empty (guarded above), so [0] is safe; the
-        // column index it names is not — a corrupt cell map would index
-        // out of range and take the process with it.
+        // column indices it names are not — a corrupt cell map would index
+        // out of range and take the process with it. Validate the whole
+        // set here rather than just the first: the fan-out closure below
+        // indexes `self.columns` per cell and is a `filter_map`, so it has
+        // no way to report an error partway through the wave.
+        for &(cell_idx, ..) in &per_cell {
+            self.column_at(cell_idx)?;
+        }
         let (q_rot_shared, rot_ns) = timed_section(|| -> Result<Vec<f32>, VectorError> {
             let first_col = self.column_at(per_cell[0].0)?;
             let mut q_rot = vec![0f32; first_col.dim];
@@ -3670,6 +3676,12 @@ impl VectorReader {
         // depends on it), so per-cell re-rotation is duplicate work — at a
         // ~60-cell width sweep the repeated 768x768 applies measured
         // ~1.3ms of wall per query.
+        // Same reasoning as the multi-cell probe path: the scan closure
+        // below indexes `self.columns` for every cell and cannot return an
+        // error, so the whole resolved set is validated up front.
+        for &(cell_idx, ..) in &per_cell {
+            self.column_at(cell_idx)?;
+        }
         let first_col = self.column_at(per_cell[0].0)?;
         let (q_rot_shared, rot_ns) = timed_section(|| {
             let mut q_rot = vec![0f32; first_col.dim];
@@ -4955,6 +4967,19 @@ async fn build_shortlist(
                     "block index {bi} out of range for cluster {cluster_id}"
                 ))
             })?;
+            // `pos` is a cluster-order position and must fall inside this
+            // cluster's own span. These are u32: a position below `off`
+            // wraps to near-u32::MAX instead of going negative, and the
+            // `local * stride` offset built from it then points far past
+            // the block. Checking the lookups is not enough on its own —
+            // the arithmetic derived from them needs the same guard.
+            let end = off.saturating_add(cnt);
+            if pos < off || pos >= end {
+                return Err(VectorError::InconsistentIndex(format!(
+                    "shortlist position {pos} falls outside cluster {cluster_id}'s \
+                     span [{off}, {end})"
+                )));
+            }
             let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
             let local = (pos - off) as usize;
             let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
