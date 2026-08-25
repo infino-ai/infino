@@ -1692,8 +1692,11 @@ pub(super) fn or_cursor_into_bitset(
         return;
     }
     for block in c.blocks.iter() {
-        let bytes = c.bytes.slice(block.block_byte_offset..block.block_byte_end);
-        let bytes = bytes.as_ref();
+        // Borrow the block bytes in place rather than `.slice()` them: a
+        // per-block `.slice()` bumps and drops an atomic refcount on `c.bytes`
+        // for every block of the union, while a borrowed subslice needs none —
+        // the same fix already applied to the membership `contains` path.
+        let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
         if bytes[posting::ENCODING_OFF] == ENCODING_BITSET {
             // Word-OR the presence bitset in at its aligned base word.
             // Tfs trail; the bitset is everything between them.
