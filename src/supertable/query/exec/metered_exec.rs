@@ -28,6 +28,7 @@
 //! counters are atomics, so concurrent partitions fold safely.
 
 use std::{
+    cell::Cell,
     fmt,
     pin::Pin,
     sync::Arc,
@@ -50,6 +51,25 @@ use crate::runtime_metrics::{
     cpu,
     op_stats::{OpStatsCollector, metering_active},
 };
+
+thread_local! {
+    /// Depth of live [`MeteredStream`] polls on this thread.
+    ///
+    /// The node is placed both at the plan root and around each table
+    /// scan, because neither alone is enough: DataFusion spawns a task per
+    /// partition, so a root-only bracket misses every spawned partition,
+    /// while a scan-only bracket misses the aggregation and sort work
+    /// above it. With both, a single-partition plan would poll the scan
+    /// *inside* the root's poll on the same thread and count that time
+    /// twice.
+    ///
+    /// So only the outermost bracket on a given thread measures. On a
+    /// spawned partition the scan is outermost on its own thread and
+    /// counts there; on the coalescing thread the root counts, and the
+    /// nested scan defers to it. Each thread's CPU is attributed exactly
+    /// once.
+    static POLL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
 
 /// Wraps `input`, metering every partition's poll time into `op_stats`.
 #[derive(Debug)]
@@ -136,9 +156,17 @@ impl Stream for MeteredStream {
         if !metering_active() {
             return Pin::new(&mut self.inner).poll_next(cx);
         }
+        // Nested inside another bracket on this thread: that one is already
+        // measuring this poll, so counting here would double-charge it.
+        if POLL_DEPTH.with(|d| d.get()) > 0 {
+            return Pin::new(&mut self.inner).poll_next(cx);
+        }
+        POLL_DEPTH.with(|d| d.set(1));
         let start = cpu::thread_cpu_ns();
         let out = Pin::new(&mut self.inner).poll_next(cx);
-        stats.add_kernel_cpu_ns(cpu::thread_cpu_delta_ns(start));
+        let delta = cpu::thread_cpu_delta_ns(start);
+        POLL_DEPTH.with(|d| d.set(0));
+        stats.add_kernel_cpu_ns(delta);
         out
     }
 }
