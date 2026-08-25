@@ -2978,31 +2978,36 @@ impl SupertableReader {
                 .collect();
             // Round 0: the pre-#515 write-window slice plus the grid's
             // must-include picks, exactly scored.
-            let admit_ranking = estimate_admit_ranking(
-                &superfiles,
-                column,
-                query.len(),
-                metric,
-                &admit_q,
-                allow_ref,
-                superseded,
-            )?;
+            let admit_ranking = op_stats::timed_kernel(&self.op_stats, || {
+                estimate_admit_ranking(
+                    &superfiles,
+                    column,
+                    query.len(),
+                    metric,
+                    &admit_q,
+                    allow_ref,
+                    superseded,
+                )
+            })?;
             let mut admitted: HashSet<u32> = admit_ranking
                 .iter()
                 .take(admit_shortlist_window(admit_ranking.len()))
                 .map(|(cell, _)| *cell)
                 .collect();
             admitted.extend(must_include.iter().copied());
-            let (mut candidates, deferred) = score_fine_candidates(
-                &superfiles,
-                column,
-                query,
-                metric,
-                Some(&admitted),
-                true,
-                allow_ref,
-                superseded,
-            )?;
+            let (candidates, deferred) = op_stats::timed_kernel(&self.op_stats, || {
+                score_fine_candidates(
+                    &superfiles,
+                    column,
+                    query,
+                    metric,
+                    Some(&admitted),
+                    true,
+                    allow_ref,
+                    superseded,
+                )
+            })?;
+            let mut candidates = candidates;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(
                     &superfiles,
@@ -3025,7 +3030,9 @@ impl SupertableReader {
             let law_default = !filtered && options.nprobe.is_none() && law_width.is_some();
             if law_default {
                 loop {
-                    let fine_ranked_now = cells_ranked_by_fine_score(&candidates);
+                    let fine_ranked_now = op_stats::timed_kernel(&self.op_stats, || {
+                        cells_ranked_by_fine_score(&candidates)
+                    });
                     let Some(&(_, best_exact)) = fine_ranked_now.first() else {
                         break;
                     };
@@ -3043,16 +3050,20 @@ impl SupertableReader {
                     }
                     let delta: HashSet<u32> = round.into_iter().collect();
                     admitted.extend(delta.iter().copied());
-                    let (mut delta_candidates, delta_deferred) = score_fine_candidates(
-                        &superfiles,
-                        column,
-                        query,
-                        metric,
-                        Some(&delta),
-                        false,
-                        allow_ref,
-                        superseded,
-                    )?;
+                    let (delta_candidates, delta_deferred) =
+                        op_stats::timed_kernel(&self.op_stats, || {
+                            score_fine_candidates(
+                                &superfiles,
+                                column,
+                                query,
+                                metric,
+                                Some(&delta),
+                                false,
+                                allow_ref,
+                                superseded,
+                            )
+                        })?;
+                    let mut delta_candidates = delta_candidates;
                     if !delta_deferred.is_empty() {
                         self.rescore_deferred_cells(
                             &superfiles,
@@ -3077,7 +3088,9 @@ impl SupertableReader {
                 .as_ref()
                 .expect("ranked cell ids exist with scored ranking");
             if hidden_vector_index {
-                let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                let fine_ranked = op_stats::timed_kernel(&self.op_stats, || {
+                    cells_ranked_by_fine_score(&candidates)
+                });
                 #[cfg(feature = "test-helpers")]
                 admit_trace::record_fine(fine_ranked.clone());
                 // Default path: fine-first p=1, the same selection the user
@@ -3173,7 +3186,9 @@ impl SupertableReader {
             } else {
                 // Fine-first p=1 over all scored fines. Explicit nprobe /
                 // filtered search keep the grid/fine union.
-                let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                let fine_ranked = op_stats::timed_kernel(&self.op_stats, || {
+                    cells_ranked_by_fine_score(&candidates)
+                });
                 let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
                 let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
                     fine_first_cell_selection(&fine_ranked, ranked.first().copied())
@@ -3219,16 +3234,19 @@ impl SupertableReader {
             // (legacy flat path, no prefilter). Stripped summaries defer to
             // the exact rescore — untagged legacy tables have no per-cell
             // gating to absorb estimate noise.
-            let (mut candidates, deferred) = score_fine_candidates(
-                &superfiles,
-                column,
-                query,
-                metric,
-                None,
-                true,
-                allow_ref,
-                superseded,
-            )?;
+            let (candidates, deferred) = op_stats::timed_kernel(&self.op_stats, || {
+                score_fine_candidates(
+                    &superfiles,
+                    column,
+                    query,
+                    metric,
+                    None,
+                    true,
+                    allow_ref,
+                    superseded,
+                )
+            })?;
+            let mut candidates = candidates;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(
                     &superfiles,
