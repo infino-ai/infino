@@ -3906,26 +3906,31 @@ impl VectorReader {
                             .map(|bytes| (cid, (span.start, bytes)))
                     })
                     .collect();
-                let survivor_rows = match spans {
-                    Some(spans) => rerank_cands
-                        .iter()
-                        .zip(&ranges)
-                        .map(|(cand, range)| {
-                            let (base, region) = &spans[&cand.cluster_id];
-                            region.slice(range.start - base..range.end - base)
-                        })
-                        .collect(),
+                let (survivor_rows, gather_ns) = match spans {
+                    // Warm: slice survivors straight out of the spans
+                    // already in hand — a per-survivor pass, so bracketed.
+                    Some(spans) => timed_section(|| {
+                        rerank_cands
+                            .iter()
+                            .zip(&ranges)
+                            .map(|(cand, range)| {
+                                let (base, region) = &spans[&cand.cluster_id];
+                                region.slice(range.start - base..range.end - base)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
                     None => get_survivor_ranges_coalesced_async(&self.source, &ranges)
                         .await
                         .map_err(|e| VectorError::LazySource(e.to_string()))?,
                 };
+
                 if let Some(t0) = survivor_t0 {
                     io_counters::phase_record(
                         "vec.survivor_fetch",
                         t0.elapsed().as_micros() as u64,
                     );
                 }
-                io_counters::phase_timed_async("vec.rerank", async {
+                let (hits, rerank_ns) = io_counters::phase_timed_async("vec.rerank", async {
                     rerank_candidates_from_blocks(
                         &self.source,
                         meta_bytes.as_ref(),
@@ -3939,7 +3944,11 @@ impl VectorReader {
                     )
                     .await
                 })
-                .await
+                .await?;
+                Ok::<(Vec<(u32, f32)>, u64), VectorError>((
+                    hits,
+                    rerank_ns.saturating_add(gather_ns),
+                ))
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
@@ -3948,10 +3957,14 @@ impl VectorReader {
             .try_collect()
             .await?;
         let kernel_ns: u64 = per_cell.iter().map(|(_, ns)| ns).sum();
-        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
-        merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        merged.truncate(k);
-        Ok((merged, kernel_ns))
+        let (merged, merge_ns) = timed_section(|| {
+            let mut merged: Vec<(u32, f32)> =
+                per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
+            merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            merged.truncate(k);
+            merged
+        });
+        Ok((merged, kernel_ns.saturating_add(merge_ns)))
     }
 
     /// Shared async tail of the IVF probe: given a chosen set of cluster
@@ -4113,11 +4126,13 @@ impl VectorReader {
         // runtime; warm ranges resolve sync/zero-copy with no await.
         let survivor_t0 = io_counters::phase_start();
         let survivor_full_rows = match survivor_full_ranges {
-            Some(ranges) => Some(
-                get_survivor_ranges_coalesced_async(&self.source, &ranges)
+            Some(ranges) => {
+                let (rows, gather_ns) = get_survivor_ranges_coalesced_async(&self.source, &ranges)
                     .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
-            ),
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                tally.kernel_cpu_ns += gather_ns;
+                Some(rows)
+            }
             None => None,
         };
         if let Some(t0) = survivor_t0 {
@@ -4856,15 +4871,16 @@ async fn build_shortlist(
         // deterministically here exactly as it does on the multi-cell
         // merge path — otherwise the two paths diverge on top-k for a
         // corrupt/degenerate score.
-        shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let (done, sort_ns) = timed_section(|| {
+            shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            shortlist
+                .into_iter()
+                .map(|(did, est, _pos, _c)| (did, -est))
+                .collect::<Vec<_>>()
+        });
         return Ok((
-            ShortlistOutcome::Done(
-                shortlist
-                    .into_iter()
-                    .map(|(did, est, _pos, _c)| (did, -est))
-                    .collect(),
-            ),
-            scan_kernel_ns,
+            ShortlistOutcome::Done(done),
+            scan_kernel_ns.saturating_add(sort_ns),
         ));
     }
 
@@ -4873,44 +4889,50 @@ async fn build_shortlist(
     // Each block's `full_chunk` follows its `[codes][doc_ids]` prefix;
     // the candidate at cluster-order position `pos` lives at in-block
     // offset `cnt*cb + cnt*4 + local*stride`.
-    let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
-    for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
-        block_by_cid.insert(c as u32, bi);
-    }
     let stride = full_vec_bytes;
-    let mut candidates = Vec::with_capacity(shortlist.len());
-    let mut survivor_full_ranges = if survivor_only_rerank_fetch {
-        Some(Vec::with_capacity(shortlist.len()))
-    } else {
-        None
-    };
-    for &(did, _, pos, cluster_id) in &shortlist {
-        let bi = block_by_cid[&cluster_id];
-        let (_, off, cnt) = cluster_meta[bi];
-        let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
-        let local = (pos - off) as usize;
-        let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
-            let idx = ranges.len();
-            ranges.push(col.cluster_rerank_row_range(off, cnt, local));
-            Some(idx)
+    // One index build + one pass over every survivor, per probed cell. At
+    // a wide sweep that is the cell count times the shortlist width, all of
+    // it this query's CPU.
+    let ((candidates, survivor_full_ranges), refs_ns) = timed_section(|| {
+        let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
+        for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
+            block_by_cid.insert(c as u32, bi);
+        }
+        let mut candidates = Vec::with_capacity(shortlist.len());
+        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
+            Some(Vec::with_capacity(shortlist.len()))
         } else {
             None
         };
-        candidates.push(RerankCandidate {
-            did,
-            pos,
-            cluster_id,
-            block_idx: bi,
-            full_off: full_start + local * stride,
-            full_idx,
-        });
-    }
+        for &(did, _, pos, cluster_id) in &shortlist {
+            let bi = block_by_cid[&cluster_id];
+            let (_, off, cnt) = cluster_meta[bi];
+            let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
+            let local = (pos - off) as usize;
+            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
+                let idx = ranges.len();
+                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+                Some(idx)
+            } else {
+                None
+            };
+            candidates.push(RerankCandidate {
+                did,
+                pos,
+                cluster_id,
+                block_idx: bi,
+                full_off: full_start + local * stride,
+                full_idx,
+            });
+        }
+        (candidates, survivor_full_ranges)
+    });
     Ok((
         ShortlistOutcome::Rerank {
             candidates,
             survivor_full_ranges,
         },
-        scan_kernel_ns,
+        scan_kernel_ns.saturating_add(refs_ns),
     ))
 }
 
@@ -6180,25 +6202,35 @@ fn get_survivor_ranges_coalesced(
 }
 
 /// Async sibling of [`get_survivor_ranges_coalesced`].
+/// Returns the gathered survivor blocks plus the on-CPU nanoseconds its
+/// synchronous halves cost: planning the coalesce (a sort plus a merge
+/// pass over every survivor range) and restoring per-survivor slices out
+/// of the fetched spans. Both scale with survivor count times probed
+/// cells, so at a wide sweep they are a real share of the query — and
+/// neither is inside the fetch's await, which is I/O wait and correctly
+/// uncounted.
 async fn get_survivor_ranges_coalesced_async(
     source: &Source,
     ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, LazyByteSourceError> {
+) -> Result<(Vec<Bytes>, u64), LazyByteSourceError> {
     if ranges.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     if ranges.len() == 1 {
-        return source.get_ranges_parallel_async(ranges).await;
+        return Ok((source.get_ranges_parallel_async(ranges).await?, 0));
     }
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        SURVIVOR_RANGE_COALESCE_MAX_GAP,
-        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
-    );
+    let (plan, plan_ns) = timed_section(|| {
+        RangeCoalescePlan::new(
+            ranges,
+            SURVIVOR_RANGE_COALESCE_MAX_GAP,
+            SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
+        )
+    });
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
         .await?;
-    Ok(plan.restore(&fetched))
+    let (restored, restore_ns) = timed_section(|| plan.restore(&fetched));
+    Ok((restored, plan_ns.saturating_add(restore_ns)))
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
