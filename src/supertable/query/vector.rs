@@ -1990,11 +1990,11 @@ pub(crate) async fn assemble_hnsw_sections(
         vcfg.hnsw_recall_slack,
         vcfg.hnsw_ef_construction,
     );
-    let (scorer, choice, graph) = run_on_pool(
+    let (scorer, choice, ef_curve, graph) = run_on_pool(
         Some(&manifest.options.reader_pool),
         "hnsw calibrate: reader pool dropped result",
         move || {
-            let (choice, graph) = hnsw::calibrate_graph(
+            let (choice, ef_curve, graph) = hnsw::calibrate_graph(
                 &scorer,
                 &m0_cands,
                 &ef_cands,
@@ -2005,7 +2005,7 @@ pub(crate) async fn assemble_hnsw_sections(
                 HNSW_CALIB_RECALL_K,
                 HNSW_CALIB_SEED,
             );
-            (scorer, choice, graph)
+            (scorer, choice, ef_curve, graph)
         },
     )
     .await
@@ -2030,6 +2030,7 @@ pub(crate) async fn assemble_hnsw_sections(
         recall = choice.recall,
         target = vcfg.target_recall,
         at_target = choice.at_target,
+        ef_curve = ?ef_curve,
         "hnsw calibrate: graph registered"
     );
     let graph = graph.expect("registered choice carries its pruned graph");
@@ -2039,6 +2040,7 @@ pub(crate) async fn assemble_hnsw_sections(
         &graph,
         dim,
         choice.ef,
+        &ef_curve,
         column,
     )))
 }
@@ -2139,6 +2141,10 @@ pub(crate) async fn assemble_hnsw_incremental(
     // graph would be inconsistent), and the stamped query beam carries forward.
     let inherited_m0 = prior.graph.base_degree();
     let inherited_ef = prior.ef_search;
+    // An incremental extend inherits the prior graph's whole calibration —
+    // including its k→ef curve (a pure append does not recalibrate; a full
+    // rebuild does). Captured before `prior` is consumed by the moves below.
+    let inherited_curve = prior.ef_curve;
     let mut codes = prior.scorer.codes().to_vec();
     codes.extend_from_slice(&new_codes);
     let mut doc_ids = prior.doc_ids;
@@ -2225,7 +2231,15 @@ pub(crate) async fn assemble_hnsw_incremental(
     }
     let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
     Ok(Some((
-        encode_hnsw(scorer.codes(), &doc_ids, &graph, dim, inherited_ef, column),
+        encode_hnsw(
+            scorer.codes(),
+            &doc_ids,
+            &graph,
+            dim,
+            inherited_ef,
+            &inherited_curve,
+            column,
+        ),
         new_high_water,
         inserted,
     )))
@@ -2286,11 +2300,13 @@ impl SupertableReader {
         // window until the next full rebuild restamps the graph.
         let replica_factor = config::global().vector.drain_replica_target_factor.max(1.0);
         let k_fetch = ((k as f32) * replica_factor).ceil() as usize;
-        // The calibrated per-table `ef` stamped in the bundle drives the walk,
-        // never below the (over-)fetch width. Every persisted bundle carries a
-        // non-zero calibrated `ef`; a 0 (which cannot occur from the drain)
-        // degrades to `k_fetch`, still a valid beam.
-        let ef = data.ef_search.max(k_fetch);
+        // The calibrated per-`k` beam from the stamped k→ef curve drives the
+        // walk, never below the (over-)fetch width. Indexed by the ACTUAL
+        // requested `k` (not the replica-inflated `k_fetch`), so a large `k`
+        // gets its wider beam while a small `k` is not over-served; then
+        // floored at `k_fetch` so the beam always covers the fetch width. A
+        // pre-curve bundle returns its single stamped `ef` for every `k`.
+        let ef = data.ef_for_k(k).max(k_fetch);
         // The Sq16 walk is pure CPU (up to ef × m0 scores); run it on the
         // reader pool and await a oneshot, per the rayon-for-CPU / tokio-for-I/O
         // contract — inline it would block a tokio worker for the walk's whole

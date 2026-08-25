@@ -818,6 +818,13 @@ const CALIB_QUERY_STRIDE_MULT: usize = 2_654_435_761;
 /// renormalized) so measured recall reflects true off-node search rather than
 /// a node's trivial self-hit.
 const CALIB_QUERY_JITTER: f32 = 0.05;
+/// Recall-`k` anchors the calibrator stamps an `ef` for — a compact k→ef curve
+/// so each query's requested `k` gets the minimal `ef` that clears the recall
+/// target at that `k`. A single stamped `ef` cannot serve every `k`: an `ef`
+/// sized for k=10 under-serves recall@100, and the wide `ef` that clears
+/// recall@100 over-serves (needlessly slows) k=10. Ascending; the largest is
+/// the ground-truth depth the calibrator computes exhaustively.
+const HNSW_CALIB_K_ANCHORS: [usize; 4] = [1, 10, 50, 100];
 
 /// Held-out, perturbed (off-node) calibration queries drawn from the plane —
 /// evenly spread source nodes, each jittered off its exact position and
@@ -870,7 +877,10 @@ pub(crate) fn measure_recall(
     graph_recall(graph, scorer, &queries, &gt, k, ef)
 }
 
-/// Recall@k of `graph` walked at `ef` against exhaustive `gt`.
+/// Recall@k of `graph` walked at `ef` against exhaustive `gt`. `gt` truth lists
+/// may be deeper than `k` (the calibrator computes ground truth to the widest
+/// anchor); only the top-`k` prefix of each is scored, so recall@k is measured
+/// against the top-`k` truth regardless of how deep `gt` was computed.
 fn graph_recall(
     graph: &Hnsw,
     scorer: &Sq16Scorer,
@@ -885,6 +895,7 @@ fn graph_recall(
     // searches per drain — a fresh O(n) buffer each would dominate).
     let mut visited = VisitedSet::new(graph.len());
     for (q, truth) in queries.iter().zip(gt) {
+        let truth = &truth[..k.min(truth.len())];
         let got: HashSet<u32> = graph
             .search_scratch(scorer, q, k, ef, &mut visited)
             .into_iter()
@@ -898,6 +909,77 @@ fn graph_recall(
     } else {
         hit as f64 / total as f64
     }
+}
+
+/// For a fixed `graph`/`m0`, stamp the compact k→ef curve: the minimal `ef`
+/// (from ascending `efs`) that clears `target_recall` at each anchor in
+/// `anchors`. One graph search per (query, ef) at the widest anchor depth
+/// yields recall at every anchor as a prefix of the same candidate list — no
+/// extra walks — reusing the exhaustive `gt` (computed to the widest anchor)
+/// the caller already has. An anchor no `ef` clears gets the ceiling `ef`
+/// (`efs.last()`); the curve is forced monotonic non-decreasing in `k` so a
+/// larger `k` never asks for a narrower beam than a smaller one (measurement
+/// noise can otherwise invert two adjacent anchors).
+fn calibrate_ef_curve(
+    graph: &Hnsw,
+    scorer: &Sq16Scorer,
+    queries: &[Vec<f32>],
+    gt: &[Vec<u32>],
+    anchors: &[usize],
+    efs: &[usize],
+    target_recall: f64,
+) -> Vec<(u32, u32)> {
+    let kmax = anchors.iter().copied().max().unwrap_or(0);
+    let ceiling = efs.last().copied().unwrap_or(0);
+    // Minimal clearing ef per anchor, filled the first time an ascending ef
+    // clears that anchor's target.
+    let mut chosen: Vec<Option<usize>> = vec![None; anchors.len()];
+    let mut visited = VisitedSet::new(graph.len());
+    for &ef in efs {
+        if chosen.iter().all(Option::is_some) {
+            break;
+        }
+        let mut hit = vec![0usize; anchors.len()];
+        let mut total = vec![0usize; anchors.len()];
+        for (q, truth) in queries.iter().zip(gt) {
+            // Top-`kmax` candidates at this beam; recall@anchor is the top-anchor
+            // prefix of this same list intersected with the top-anchor truth.
+            let got: Vec<u32> = graph
+                .search_scratch(scorer, q, kmax, ef, &mut visited)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            for (ai, &a) in anchors.iter().enumerate() {
+                let got_a: HashSet<u32> = got.iter().copied().take(a).collect();
+                let truth_a = &truth[..a.min(truth.len())];
+                hit[ai] += truth_a.iter().filter(|t| got_a.contains(t)).count();
+                total[ai] += truth_a.len();
+            }
+        }
+        for (ai, slot) in chosen.iter_mut().enumerate() {
+            if slot.is_none() {
+                let recall = if total[ai] == 0 {
+                    0.0
+                } else {
+                    hit[ai] as f64 / total[ai] as f64
+                };
+                if recall >= target_recall {
+                    *slot = Some(ef);
+                }
+            }
+        }
+    }
+    // Emit (k, ef) pairs, defaulting an uncleared anchor to the ceiling ef and
+    // clamping each ef up to the running max so the curve is non-decreasing.
+    let mut running = 0usize;
+    anchors
+        .iter()
+        .zip(&chosen)
+        .map(|(&a, slot)| {
+            running = slot.unwrap_or(ceiling).max(running);
+            (a as u32, running as u32)
+        })
+        .collect()
 }
 
 /// Calibrate `(m0, ef)` to `target_recall` on `scorer` (the drained Sq16 plane,
@@ -919,7 +1001,7 @@ pub(crate) fn calibrate_graph(
     n_queries: usize,
     k: usize,
     seed: u64,
-) -> (CalibChoice, Option<Hnsw>) {
+) -> (CalibChoice, Vec<(u32, u32)>, Option<Hnsw>) {
     let register_floor = (target_recall - recall_slack).max(0.0);
     let n = scorer.len();
     let fallback = CalibChoice {
@@ -930,12 +1012,21 @@ pub(crate) fn calibrate_graph(
         at_target: false,
     };
     if n == 0 || m0_candidates.is_empty() || ef_candidates.is_empty() {
-        return (fallback, None);
+        return (fallback, Vec::new(), None);
     }
     let queries = calibration_queries(scorer, n_queries, seed);
+    // Ground truth is computed to the widest anchor (or the primary `k`,
+    // whichever is deeper) so the m0-selection recall@`k` and every curve
+    // anchor's recall are prefixes of the SAME exhaustive lists — no re-derive.
+    let gt_depth = HNSW_CALIB_K_ANCHORS
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(k)
+        .max(k);
     let gt: Vec<Vec<u32>> = queries
         .iter()
-        .map(|q| exhaustive_topk(scorer, q, k))
+        .map(|q| exhaustive_topk(scorer, q, gt_depth))
         .collect();
 
     let mut m0s: Vec<usize> = m0_candidates.to_vec();
@@ -1005,7 +1096,21 @@ pub(crate) fn calibrate_graph(
     } else {
         Some(base.pruned_base_layer(scorer, choice.m0))
     };
-    (choice, graph)
+    // Stamp the k→ef curve for the chosen m0's graph (the one that serves).
+    // Empty when nothing registered — no bundle is written in that case.
+    let curve = match graph.as_ref() {
+        Some(g) => calibrate_ef_curve(
+            g,
+            scorer,
+            &queries,
+            &gt,
+            &HNSW_CALIB_K_ANCHORS,
+            &efs,
+            target_recall,
+        ),
+        None => Vec::new(),
+    };
+    (choice, curve, graph)
 }
 
 /// Sentinel filling unused fixed-stride layer-0 adjacency slots. Node ids
@@ -1039,6 +1144,9 @@ impl<'a> Cursor<'a> {
     /// reserving, so a corrupt length word can't request a huge `Vec`.
     fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
@@ -1216,8 +1324,16 @@ impl Hnsw {
 /// until the next drain rebuilds it.
 const HNSW_DATA_MAGIC_V2: &[u8; 8] = b"INFDDG02";
 const HNSW_DATA_MAGIC_V3: &[u8; 8] = b"INFDDG03";
-/// Both magics are 8 bytes; the shared byte width of the leading tag.
-const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V3.len();
+/// `v04` appends the compact k→ef calibration curve as a trailing section after
+/// the graph — a `u16` pair count then that many `(u32 k, u32 ef)` pairs — so a
+/// query's requested `k` is served at its own calibrated beam (`v03` added the
+/// persisted SQ8 walk plane; `v04` adds the curve). Older bundles carry a
+/// single stamped `ef` and no curve; `decode_hnsw` reads the curve on `v04` and
+/// synthesizes a degenerate 1-point curve (`ef_for_k(k) = ef_search` for every
+/// `k`) on `v03`/`v02` — today's exact behavior, no forced rebuild.
+const HNSW_DATA_MAGIC_V4: &[u8; 8] = b"INFDDG04";
+/// All magics are 8 bytes; the shared byte width of the leading tag.
+const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V4.len();
 /// Byte size of the fixed frame of a data bundle: magic(8) + n(u64) + dim(u32)
 /// + ef(u32) + col_len(u32) + graph_len(u64). The variable-length column name,
 /// doc-id map, Sq16/SQ8 planes, and graph bytes are added on top; naming it
@@ -1233,10 +1349,18 @@ pub(crate) struct HnswIndex {
     pub graph: Hnsw,
     pub doc_ids: Vec<i128>,
     pub dim: usize,
-    /// Calibrated query beam stamped at drain — the served `ef` (a query knob,
-    /// so it rides in the bundle header, not the graph structure). Always
-    /// non-zero from the drain; a 0 (which cannot occur) degrades to `k`.
+    /// Calibrated query beam stamped at drain — the recall@10 `ef` (a query
+    /// knob, so it rides in the bundle header, not the graph structure). Always
+    /// non-zero from the drain; a 0 (which cannot occur) degrades to `k`. Also
+    /// the value the degenerate 1-point `ef_curve` carries for a pre-`v04`
+    /// bundle (no per-`k` curve stamped).
     pub ef_search: usize,
+    /// Compact k→ef calibration curve: ascending `(k_anchor, ef)` pairs,
+    /// monotonic non-decreasing in `ef`. Stamped on a `v04` bundle so each
+    /// query's requested `k` is served at its own calibrated beam; a pre-`v04`
+    /// bundle decodes to a degenerate 1-point curve `[(u32::MAX, ef_search)]`
+    /// (every `k` maps to the single stamped `ef`). Read via [`Self::ef_for_k`].
+    pub ef_curve: Vec<(u32, u32)>,
     /// Vector column this graph was built for. A table can carry several
     /// same-dim vector columns; the serving path must reject a query on a
     /// different column (→ ivf) rather than silently answer it from this
@@ -1263,6 +1387,7 @@ pub(crate) fn encode_hnsw(
     graph: &Hnsw,
     dim: usize,
     ef_search: usize,
+    ef_curve: &[(u32, u32)],
     column: &str,
 ) -> Vec<u8> {
     let n = doc_ids.len();
@@ -1271,13 +1396,21 @@ pub(crate) fn encode_hnsw(
     let col = column.as_bytes();
     // The SQ8 section is `n × dim` bytes (the high byte of each u16 Sq16 code).
     let sq8_len = n * dim;
+    // The trailing k→ef curve: a u16 count then `(u32 k, u32 ef)` per pair.
+    let curve_len = 2 + ef_curve.len() * 8;
     let mut out = Vec::with_capacity(
-        HNSW_DATA_FIXED_BYTES + col.len() + n * 16 + sq16_codes.len() + sq8_len + graph_bytes.len(),
+        HNSW_DATA_FIXED_BYTES
+            + col.len()
+            + n * 16
+            + sq16_codes.len()
+            + sq8_len
+            + graph_bytes.len()
+            + curve_len,
     );
-    out.extend_from_slice(HNSW_DATA_MAGIC_V3);
+    out.extend_from_slice(HNSW_DATA_MAGIC_V4);
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    // Was reserved / alignment; now the stamped query beam (u32).
+    // Was reserved / alignment; now the stamped recall@10 query beam (u32).
     out.extend_from_slice(&(ef_search as u32).to_le_bytes());
     // Stamped column name: length-prefixed UTF-8.
     out.extend_from_slice(&(col.len() as u32).to_le_bytes());
@@ -1293,6 +1426,13 @@ pub(crate) fn encode_hnsw(
     extend_sq8_plane(&mut out, sq16_codes);
     out.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(&graph_bytes);
+    // k→ef curve, appended AFTER the variable sections so the fixed-header
+    // byte count is unaffected. Bounded to u16 pairs (a handful of anchors).
+    out.extend_from_slice(&(ef_curve.len() as u16).to_le_bytes());
+    for &(k, ef) in ef_curve {
+        out.extend_from_slice(&k.to_le_bytes());
+        out.extend_from_slice(&ef.to_le_bytes());
+    }
     out
 }
 
@@ -1328,13 +1468,18 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, sq8_walk: bool) -> Option<HnswIndex> {
     let bytes: &[u8] = bundle.as_ref();
     let mut c = Cursor::new(bytes);
     let magic = c.take(HNSW_DATA_MAGIC_LEN)?;
-    // `v03` carries the SQ8 walk plane as an inline section; `v02` (pre-existing
-    // bundles) does not, so it is derived on read below. Any other tag (e.g. a
-    // legacy `01`) is unsupported → `None`, and the query falls back to ivf.
-    let has_sq8_section = if magic == HNSW_DATA_MAGIC_V3 {
-        true
+    // `v03`/`v04` carry the SQ8 walk plane as an inline section; `v02`
+    // (pre-existing bundles) does not, so it is derived on read below. `v04`
+    // additionally carries a trailing k→ef curve; `v03`/`v02` synthesize a
+    // degenerate 1-point curve from the single stamped `ef` below. Any other
+    // tag (e.g. a legacy `01`) is unsupported → `None`, and the query falls
+    // back to ivf.
+    let (has_sq8_section, has_curve) = if magic == HNSW_DATA_MAGIC_V4 {
+        (true, true)
+    } else if magic == HNSW_DATA_MAGIC_V3 {
+        (true, false)
     } else if magic == HNSW_DATA_MAGIC_V2 {
-        false
+        (false, false)
     } else {
         return None;
     };
@@ -1391,6 +1536,33 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, sq8_walk: bool) -> Option<HnswIndex> {
     if graph.len() != n {
         return None;
     }
+    // k→ef curve. On `v04` it is the trailing section after the graph; on an
+    // older bundle (no curve) synthesize a degenerate 1-point curve mapping
+    // every `k` to the single stamped `ef_search` — today's exact behavior.
+    let ef_curve = if has_curve {
+        let count = c.u16()? as usize;
+        // Bound the pair read against the bytes present (8 B/pair) before
+        // reserving, so a corrupt count cannot drive a huge allocation.
+        if count.checked_mul(8)? > c.remaining() {
+            return None;
+        }
+        let mut curve = Vec::with_capacity(count);
+        for _ in 0..count {
+            let k = c.u32()?;
+            let ef = c.u32()?;
+            curve.push((k, ef));
+        }
+        curve
+    } else {
+        Vec::new()
+    };
+    // An absent or empty curve degrades to the degenerate 1-point fallback so
+    // `ef_for_k` always has a value to return.
+    let ef_curve = if ef_curve.is_empty() {
+        vec![(u32::MAX, ef_search as u32)]
+    } else {
+        ef_curve
+    };
     let scorer = Sq16Scorer::from_plane(Plane::Shared(sq16_plane), dim, n);
     Some(HnswIndex {
         scorer,
@@ -1398,6 +1570,7 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, sq8_walk: bool) -> Option<HnswIndex> {
         doc_ids,
         dim,
         ef_search,
+        ef_curve,
         column,
         sq8_plane,
     })
@@ -1468,6 +1641,25 @@ impl NodeScorer for Sq8WalkScorer<'_> {
 }
 
 impl HnswIndex {
+    /// The calibrated query beam for a requested `k`, read from the stamped
+    /// k→ef curve: round `k` UP to the next anchor and return that anchor's
+    /// `ef` (the minimal beam that cleared the recall target there). A `k`
+    /// above the top anchor clamps to the top anchor's `ef` (the ceiling — no
+    /// measured-recall promise beyond the anchors). A degenerate 1-point curve
+    /// (a pre-`v04` bundle) returns its single stamped `ef` for every `k`.
+    pub(crate) fn ef_for_k(&self, k: usize) -> usize {
+        for &(anchor_k, ef) in &self.ef_curve {
+            if anchor_k as usize >= k {
+                return ef as usize;
+            }
+        }
+        // `k` past the widest anchor: clamp to the widest anchor's ef.
+        self.ef_curve
+            .last()
+            .map(|&(_, ef)| ef as usize)
+            .unwrap_or(self.ef_search)
+    }
+
     /// SQ8 walk + Sq16 refine: navigate the graph scoring the cheap int8 plane
     /// (returning the top `refine_k` by SQ8), then re-score those on the exact
     /// Sq16 plane and return the true top-`k`. Reader-side; no bundle change.
@@ -2156,7 +2348,7 @@ mod tests {
         let n = 5000;
         let vectors = clustered_unit_vectors(n, 32, dim, 0.3, 0x0CA_11B);
         let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
-        let (choice, graph) = calibrate_graph(
+        let (choice, curve, graph) = calibrate_graph(
             &scorer,
             &[32, 64, 128],
             &[128, 256, 512],
@@ -2168,7 +2360,7 @@ mod tests {
             0x5EED,
         );
         eprintln!(
-            "[calib] m0={} ef={} recall={:.3} registered={} at_target={}",
+            "[calib] m0={} ef={} recall={:.3} registered={} at_target={} curve={curve:?}",
             choice.m0, choice.ef, choice.recall, choice.registered, choice.at_target
         );
         assert!(
@@ -2198,6 +2390,42 @@ mod tests {
             choice.at_target,
             "expected to clear 0.90; got {:.3}",
             choice.recall
+        );
+        // A registered graph stamps a k→ef curve: one pair per anchor, its
+        // anchors ARE the calibrator's anchors, ascending in `k`, and its `ef`
+        // is monotonic non-decreasing (a larger `k` never asks for a narrower
+        // beam than a smaller one). In particular k=100's ef ≥ k=10's ef.
+        assert_eq!(
+            curve.len(),
+            HNSW_CALIB_K_ANCHORS.len(),
+            "one curve pair per anchor"
+        );
+        for (i, &(k_anchor, _)) in curve.iter().enumerate() {
+            assert_eq!(
+                k_anchor as usize, HNSW_CALIB_K_ANCHORS[i],
+                "curve anchor matches the calibrator's anchor"
+            );
+        }
+        for w in curve.windows(2) {
+            assert!(w[0].0 < w[1].0, "curve anchors strictly ascending in k");
+            assert!(
+                w[0].1 <= w[1].1,
+                "curve ef monotonic non-decreasing in k: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        let ef_at = |k: usize| {
+            curve
+                .iter()
+                .find(|&&(a, _)| a as usize == k)
+                .map(|&(_, e)| e)
+        };
+        assert!(
+            ef_at(100) >= ef_at(10),
+            "k=100 ef {:?} must be ≥ k=10 ef {:?}",
+            ef_at(100),
+            ef_at(10)
         );
     }
 
@@ -2537,11 +2765,13 @@ mod tests {
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
-        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256, "emb");
+        // A representative k→ef curve to round-trip through the v04 section.
+        let curve: Vec<(u32, u32)> = vec![(1, 128), (10, 128), (50, 256), (100, 512)];
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256, &curve, "emb");
         assert_eq!(
             &bytes[..HNSW_DATA_MAGIC_LEN],
-            HNSW_DATA_MAGIC_V3,
-            "encode_hnsw stamps the v03 data magic"
+            HNSW_DATA_MAGIC_V4,
+            "encode_hnsw stamps the v04 data magic"
         );
         let idx = decode_hnsw(&Bytes::from(bytes.clone()), true).expect("decode bundle");
         assert_eq!(idx.dim, dim);
@@ -2552,6 +2782,18 @@ mod tests {
             "stamped ef round-trips through the bundle"
         );
         assert_eq!(idx.column, "emb", "stamped column round-trips");
+        assert_eq!(idx.ef_curve, curve, "k→ef curve round-trips through v04");
+        // The accessor rounds a requested k UP to the next anchor and clamps
+        // above the top anchor to the ceiling ef.
+        assert_eq!(idx.ef_for_k(1), 128, "k=1 → anchor 1");
+        assert_eq!(idx.ef_for_k(10), 128, "k=10 → anchor 10");
+        assert_eq!(idx.ef_for_k(11), 256, "k=11 rounds up to anchor 50");
+        assert_eq!(idx.ef_for_k(100), 512, "k=100 → anchor 100");
+        assert_eq!(
+            idx.ef_for_k(1000),
+            512,
+            "k above top anchor clamps to ceiling"
+        );
 
         let queries = random_unit_vectors(20, dim, 0xFEED);
         for q in &queries {
@@ -2597,9 +2839,10 @@ mod tests {
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
-        // Current encoder → v03 (SQ8 section present).
-        let v3 = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, "emb");
-        assert_eq!(&v3[..HNSW_DATA_MAGIC_LEN], HNSW_DATA_MAGIC_V3);
+        // Current encoder → v04 (SQ8 section present, plus the trailing curve).
+        let curve: Vec<(u32, u32)> = vec![(1, 128), (10, 128), (50, 256), (100, 512)];
+        let v3 = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, &curve, "emb");
+        assert_eq!(&v3[..HNSW_DATA_MAGIC_LEN], HNSW_DATA_MAGIC_V4);
 
         // Synthesize a pre-existing v02 bundle: identical framing but no SQ8
         // section (Sq16 plane runs straight into the graph section) and the v02
@@ -2640,12 +2883,75 @@ mod tests {
             assert_eq!(a, b, "v03 section vs v02 derive diverged");
         }
 
-        // With SQ8-walk off, a v03 bundle still consumes the section (so the
+        // With SQ8-walk off, a v04 bundle still consumes the section (so the
         // graph is reachable) and serves correctly with an empty SQ8 plane.
-        let v3_again = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, "emb");
-        let idx_off = decode_hnsw(&Bytes::from(v3_again), false).expect("decode v03 sq8-off");
+        let v3_again = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, &curve, "emb");
+        let idx_off = decode_hnsw(&Bytes::from(v3_again), false).expect("decode v04 sq8-off");
         assert!(idx_off.sq8_plane.is_empty());
         assert_eq!(idx_off.graph.len(), n);
+    }
+
+    /// A pre-`v04` bundle (`v03` with the SQ8 section, or `v02` without) carries
+    /// a single stamped `ef` and no k→ef curve. Decoding must synthesize the
+    /// degenerate 1-point curve so `ef_for_k(k) == ef_search` for EVERY `k` —
+    /// exactly today's single-`ef` behavior, no forced rebuild.
+    #[test]
+    fn pre_v04_bundle_decodes_to_one_point_curve() {
+        use crate::superfile::vector::distance::encode_sq16_row;
+        let dim = 16;
+        let n = 300;
+        let stamped_ef = 200usize;
+        let vectors = random_unit_vectors(n, dim, 0xB0BB1E);
+        let stride = dim * 2;
+        let mut codes = vec![0u8; n * stride];
+        for (i, v) in vectors.iter().enumerate() {
+            encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
+        }
+        let doc_ids: Vec<i128> = (0..n as i128).collect();
+        let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+        let graph_bytes = graph.to_bytes();
+        let col = b"emb";
+
+        // Shared framing writer: magic + header + doc-ids + Sq16 plane, then
+        // (v03 only) the SQ8 section, then the graph section — NO curve section.
+        let frame = |magic: &[u8; 8], with_sq8: bool| -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(magic);
+            b.extend_from_slice(&(n as u64).to_le_bytes());
+            b.extend_from_slice(&(dim as u32).to_le_bytes());
+            b.extend_from_slice(&(stamped_ef as u32).to_le_bytes());
+            b.extend_from_slice(&(col.len() as u32).to_le_bytes());
+            b.extend_from_slice(col);
+            for &id in &doc_ids {
+                b.extend_from_slice(&id.to_le_bytes());
+            }
+            b.extend_from_slice(&codes);
+            if with_sq8 {
+                extend_sq8_plane(&mut b, &codes);
+            }
+            b.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
+            b.extend_from_slice(&graph_bytes);
+            b
+        };
+
+        let v3 = frame(HNSW_DATA_MAGIC_V3, true);
+        let v2 = frame(HNSW_DATA_MAGIC_V2, false);
+
+        for (label, fixture) in [("v03", v3), ("v02", v2)] {
+            let idx = decode_hnsw(&Bytes::from(fixture), true)
+                .unwrap_or_else(|| panic!("{label} fixture must decode"));
+            assert_eq!(idx.ef_search, stamped_ef, "{label} ef round-trips");
+            // Degenerate 1-point curve: constant ef for every k, small and large.
+            assert_eq!(idx.ef_curve.len(), 1, "{label} → degenerate 1-point curve");
+            for k in [1usize, 10, 50, 100, 1000, 100_000] {
+                assert_eq!(
+                    idx.ef_for_k(k),
+                    stamped_ef,
+                    "{label}: ef_for_k({k}) must equal the single stamped ef"
+                );
+            }
+        }
     }
 
     /// SQ8 walk + Sq16 refine returns essentially the same top-k as the Sq16
@@ -2669,7 +2975,7 @@ mod tests {
         let doc_ids: Vec<i128> = (0..n as i128).collect();
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
-        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, ef, "emb");
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, ef, &[(10, ef as u32)], "emb");
         let idx = decode_hnsw(&Bytes::from(bytes), true).expect("decode bundle");
         assert!(
             !idx.sq8_plane.is_empty(),
