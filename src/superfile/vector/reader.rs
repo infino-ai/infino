@@ -358,6 +358,20 @@ pub struct VectorReader {
 }
 
 impl VectorReader {
+    /// The column at `idx`, or a typed error. Cell maps resolve to column
+    /// indices by construction, so a miss is inconsistent index state
+    /// rather than bad input — surfaced as an error, on the same
+    /// reasoning as the warmed survivor spans, so one query fails instead
+    /// of the process panicking on a slice index.
+    fn column_at(&self, idx: usize) -> Result<&ColumnReader, VectorError> {
+        self.columns.get(idx).ok_or_else(|| {
+            VectorError::InconsistentIndex(format!(
+                "cell resolved to column index {idx}, past the {} this superfile carries",
+                self.columns.len()
+            ))
+        })
+    }
+
     /// Test-only accessor: the per-doc dequantized-norm table this
     /// reader loaded from a column's `codec_meta` region (residual
     /// family or `Sq16`). Returns `None` for a codec that carries no
@@ -3462,12 +3476,16 @@ impl VectorReader {
         // so recomputing it per cell — as this path used to — repeated the
         // same O(dim^2) transform once per probed cell, unmetered. Hoisted
         // and bracketed, mirroring the scan path's shared rotation.
-        let (q_rot_shared, rot_ns) = timed_section(|| {
-            let first_col = &self.columns[per_cell[0].0];
+        // `per_cell` is non-empty (guarded above), so [0] is safe; the
+        // column index it names is not — a corrupt cell map would index
+        // out of range and take the process with it.
+        let (q_rot_shared, rot_ns) = timed_section(|| -> Result<Vec<f32>, VectorError> {
+            let first_col = self.column_at(per_cell[0].0)?;
             let mut q_rot = vec![0f32; first_col.dim];
             first_col.rot.apply(query, &mut q_rot);
-            q_rot
+            Ok(q_rot)
         });
+        let q_rot_shared = q_rot_shared?;
         let q_rot_shared = &q_rot_shared;
 
         // Probe the selected cells CONCURRENTLY — the same wave shape the
@@ -3646,13 +3664,13 @@ impl VectorReader {
         // REQUESTED column's seed (every cell of one column shares it),
         // not `columns[0]`'s — a multi-column file's first column can be
         // a different column with a different rotation.
-        outcome.rot_seed = self.columns[per_cell[0].0].rot_seed;
+        outcome.rot_seed = self.column_at(per_cell[0].0)?.rot_seed;
         // Rotate the query once per superfile: every cell of a column
         // shares the table-wide rotation seed (cross-cell estimate pooling
         // depends on it), so per-cell re-rotation is duplicate work — at a
         // ~60-cell width sweep the repeated 768x768 applies measured
         // ~1.3ms of wall per query.
-        let first_col = &self.columns[per_cell[0].0];
+        let first_col = self.column_at(per_cell[0].0)?;
         let (q_rot_shared, rot_ns) = timed_section(|| {
             let mut q_rot = vec![0f32; first_col.dim];
             first_col.rot.apply(query, &mut q_rot);
@@ -4912,7 +4930,8 @@ async fn build_shortlist(
     // One index build + one pass over every survivor, per probed cell. At
     // a wide sweep that is the cell count times the shortlist width, all of
     // it this query's CPU.
-    let ((candidates, survivor_full_ranges), refs_ns) = timed_section(|| {
+    type ShortlistRefs = (Vec<RerankCandidate>, Option<Vec<Range<usize>>>);
+    let (built, refs_ns) = timed_section(|| -> Result<ShortlistRefs, VectorError> {
         let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
         for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
             block_by_cid.insert(c as u32, bi);
@@ -4924,8 +4943,18 @@ async fn build_shortlist(
             None
         };
         for &(did, _, pos, cluster_id) in &shortlist {
-            let bi = block_by_cid[&cluster_id];
-            let (_, off, cnt) = cluster_meta[bi];
+            // A shortlist entry naming a cluster the block metadata does
+            // not carry is an index inconsistency, not a user error.
+            let &bi = block_by_cid.get(&cluster_id).ok_or_else(|| {
+                VectorError::InconsistentIndex(format!(
+                    "shortlist cluster {cluster_id} is absent from the block metadata"
+                ))
+            })?;
+            let &(_, off, cnt) = cluster_meta.get(bi).ok_or_else(|| {
+                VectorError::InconsistentIndex(format!(
+                    "block index {bi} out of range for cluster {cluster_id}"
+                ))
+            })?;
             let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
             let local = (pos - off) as usize;
             let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
@@ -4944,8 +4973,9 @@ async fn build_shortlist(
                 full_idx,
             });
         }
-        (candidates, survivor_full_ranges)
+        Ok((candidates, survivor_full_ranges))
     });
+    let (candidates, survivor_full_ranges) = built?;
     Ok((
         ShortlistOutcome::Rerank {
             candidates,

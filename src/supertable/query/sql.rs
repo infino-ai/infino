@@ -77,9 +77,9 @@ use crate::{
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
-                fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
-                match_exec::register_match, metered_exec::MeteredExec,
-                vector_exec::register_vector_search,
+                common::harvest_datafusion_metrics, fts_exec::register_bm25,
+                hybrid_exec::register_hybrid_search, match_exec::register_match,
+                metered_exec::MeteredExec, vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
@@ -296,10 +296,18 @@ impl SupertableReader {
                 .await
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
             let metered: Arc<dyn ExecutionPlan> =
-                Arc::new(MeteredExec::new(Arc::clone(&plan), op_stats));
-            collect_physical(metered, ctx.task_ctx())
+                Arc::new(MeteredExec::new(Arc::clone(&plan), op_stats.clone()));
+            let batches = collect_physical(metered, ctx.task_ctx())
                 .await
-                .map_err(exec_query_error)
+                .map_err(exec_query_error)?;
+            // The cached context carries no collector by design, so the
+            // scan-level wrappers are inert here and `rows_materialized`
+            // would otherwise stay at zero while `kernel_cpu_ns` did not.
+            // Harvesting walks the executed plan and takes the collector
+            // explicitly, so it needs neither a metered context nor a
+            // cache bypass.
+            harvest_datafusion_metrics(&plan, &op_stats);
+            Ok(batches)
         };
 
         // Drive through the shared sync→async bridge: ambient

@@ -783,6 +783,29 @@ fn vector_work_stats_are_deterministic_across_cache_temperature() {
     assert_eq!(cold, warm, "same plan, same table state, same work");
 }
 
+/// The reader-level SQL surface (test/bench only) meters CPU through the
+/// plan root, but its session context is cached and deliberately carries
+/// no collector — so the scan-level wrappers are inert there and the
+/// row count has to come from DataFusion's own leaf metrics. Without
+/// that harvest the benches driving this surface got a CPU number with no
+/// row denominator to divide it by.
+#[test]
+fn the_reader_level_sql_surface_reports_materialized_rows() {
+    let st = demo_two_superfiles();
+    let (batches, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable")
+            .expect("reader-level query_sql")
+    });
+    let returned: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    assert!(returned > 0, "the fixture must return rows");
+    assert_eq!(
+        stats.rows_materialized, returned,
+        "every row the scan decoded must reach the counter"
+    );
+}
+
 // ---- SQL: the per-query channel through the catalog `query_sql` path ----
 
 /// Rows in the SQL fixture.
