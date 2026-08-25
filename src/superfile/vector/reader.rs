@@ -3681,7 +3681,11 @@ impl VectorReader {
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?;
                 let cb = col.quant.code_bytes();
-                let (cluster_meta, prefix_ranges) = chosen_cluster_meta(col, &cluster_idx, &locals);
+                // Per-cell metadata assembly: a pass over this cell's chosen
+                // clusters, on the worker that probes it. Scales with probe
+                // width, so at a wide sweep it is paid once per cell.
+                let ((cluster_meta, prefix_ranges), meta_ns) =
+                    timed_section(|| chosen_cluster_meta(col, &cluster_idx, &locals));
                 if cluster_meta.is_empty() {
                     // The cluster-index read itself was one planned range.
                     let tally = ProbeTally {
@@ -3705,6 +3709,7 @@ impl VectorReader {
                     rows_reranked: 0,
                     kernel_cpu_ns: 0,
                 };
+                tally.kernel_cpu_ns += meta_ns;
                 // Warm fast path: every prefix resident -> defer rerank.
                 // The resident-range assembly is a real memcpy per cell
                 // (codes + doc-ids blocks), so it counts as this query's
@@ -3987,7 +3992,8 @@ impl VectorReader {
         chosen: &[usize],
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         let cb = col.quant.code_bytes();
-        let (cluster_meta, cluster_prefix_ranges) = chosen_cluster_meta(col, cluster_idx, chosen);
+        let ((cluster_meta, cluster_prefix_ranges), meta_ns) =
+            timed_section(|| chosen_cluster_meta(col, cluster_idx, chosen));
         if cluster_meta.is_empty() {
             return Ok((Vec::new(), ProbeTally::default()));
         }
@@ -4006,6 +4012,7 @@ impl VectorReader {
             rows_reranked: 0,
             kernel_cpu_ns: 0,
         };
+        tally.kernel_cpu_ns += meta_ns;
         // Warm fast path: every prefix already resident → sync zero-copy.
         let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
             .iter()
