@@ -845,6 +845,39 @@ fn a_scoped_sql_scan_reports_page_bytes() {
     );
 }
 
+/// A whole-table aggregate is answerable from statistics the provider
+/// attaches to the scan, so the planner folds it to a constant and never
+/// opens a page. Measuring must not change that. `MeteredExec` sits
+/// directly between the aggregate and the scan, and an `ExecutionPlan`
+/// wrapper that takes the trait defaults reports unknown statistics —
+/// which silently turns an O(1) manifest read into a full columnar scan
+/// that the customer is then billed for. This asserts the billing-visible
+/// consequence rather than a plan string, so it holds whichever rule does
+/// the folding.
+#[test]
+fn a_whole_table_aggregate_folds_instead_of_scanning() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    for sql in [
+        "SELECT COUNT(*) FROM docs",
+        "SELECT MIN(rating), MAX(rating) FROM docs",
+    ] {
+        let stats = scoped_sql_stats(&db, sql);
+        assert_eq!(
+            stats.sql_page_bytes, 0,
+            "{sql} folds from statistics; it must not read Parquet pages"
+        );
+        assert_eq!(
+            stats.planned_read_ranges, 0,
+            "{sql} folds from statistics; it must not plan a read range"
+        );
+        assert_eq!(
+            stats.rows_materialized, 0,
+            "{sql} folds from statistics; it must not decode rows"
+        );
+    }
+}
+
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),

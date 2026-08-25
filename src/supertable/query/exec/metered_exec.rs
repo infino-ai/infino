@@ -21,11 +21,20 @@
 //! poll, so waiting is excluded and only real on-CPU time is counted,
 //! which is exactly the contract the search kernels already meet.
 //!
-//! Placed around the table scan rather than the plan root on purpose:
-//! DataFusion spawns a task per partition, so a root-level bracket would
-//! see only the coalescing thread. Wrapping the scan means each partition
-//! is measured on whichever worker actually polls it; the collector's
-//! counters are atomics, so concurrent partitions fold safely.
+//! Placed at BOTH the plan root and around each table scan, because
+//! neither alone is enough: DataFusion spawns a task per partition, so a
+//! root-only bracket misses work under an internal spawn boundary, while a
+//! scan-only bracket misses the aggregation and sort work above it. The
+//! `POLL_DEPTH` guard below keeps the overlap from counting twice. The
+//! collector's counters are atomics, so concurrent partitions fold safely.
+//!
+//! Everything the planner asks of this node is delegated to the child. A
+//! wrapper that answers those questions for itself is not transparent: the
+//! `ExecutionPlan` defaults report unknown statistics and refuse filter
+//! pushdown, and sitting between an aggregate and the scan that way stops
+//! `COUNT`/`MIN`/`MAX` folding from manifest statistics and turns an O(1)
+//! manifest read into a full columnar scan. Measuring a query must not
+//! change the query.
 
 use std::{
     cell::Cell,
@@ -38,11 +47,18 @@ use std::{
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::{
-    error::Result as DfResult,
+    common::{Statistics, config::ConfigOptions},
+    error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
+    physical_expr::PhysicalExpr,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
         SendableRecordBatchStream,
+        execution_plan::CardinalityEffect,
+        filter_pushdown::{
+            ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+        },
+        projection::ProjectionExec,
     },
 };
 use futures::Stream;
@@ -112,17 +128,94 @@ impl ExecutionPlan for MeteredExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Optimizer rewrites keep the meter attached to whatever the child
-        // became; dropping it here would silently unmeter the scan.
+        // became; dropping it here would silently unmeter the scan. A unary
+        // node handed anything but one child is a broken rewrite — say so,
+        // rather than papering over it by keeping the stale subtree.
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "MeteredExec requires exactly one child; got {}",
+                children.len()
+            )));
+        }
         Ok(Arc::new(MeteredExec::new(
-            children
-                .into_iter()
-                .next()
-                .unwrap_or(Arc::clone(&self.input)),
+            children.swap_remove(0),
             self.op_stats.clone(),
         )))
+    }
+
+    // ---- Everything below is delegation. See the module header: a meter
+    // that answers the planner for itself changes the plan it measures. ----
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Rows leave in the order the child produced them.
+        vec![true; self.children().len()]
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Arc<Statistics>> {
+        // The default is `Statistics::new_unknown`, which would hide the
+        // manifest statistics the provider attaches and stop the aggregate
+        // rule folding COUNT/MIN/MAX into a constant.
+        self.input.partition_statistics(partition)
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        config: &ConfigOptions,
+    ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+        // A scan that can split itself across partitions should still do so
+        // with the meter on. Refusing here doesn't prevent parallelism — it
+        // makes the planner insert a `RepartitionExec` *below* this node
+        // instead, which both adds an exchange and moves the Parquet decode
+        // into a spawned task where this node's thread clock cannot see it.
+        Ok(self.input.repartitioned(target_partitions, config)?.map(
+            |input| -> Arc<dyn ExecutionPlan> {
+                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
+            },
+        ))
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(self.input.try_swapping_with_projection(projection)?.map(
+            |input| -> Arc<dyn ExecutionPlan> {
+                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
+            },
+        ))
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DfResult<FilterDescription> {
+        // The default bars every parent filter, which leaves a redundant
+        // `FilterExec` above a scan that could have pushed the predicate
+        // down into the Parquet reader.
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DfResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
     }
 
     fn execute(
@@ -136,6 +229,18 @@ impl ExecutionPlan for MeteredExec {
             inner,
             op_stats: self.op_stats.clone(),
         }))
+    }
+}
+
+/// Restores `POLL_DEPTH` on unwind as well as on the normal path. A poll
+/// that panicked out of a raised depth would leave the thread-local set
+/// forever, and every later query polled on that worker would treat its
+/// outermost bracket as nested and bill zero CPU.
+struct PollDepthGuard(u32);
+
+impl Drop for PollDepthGuard {
+    fn drop(&mut self) {
+        POLL_DEPTH.with(|d| d.set(self.0));
     }
 }
 
@@ -161,11 +266,11 @@ impl Stream for MeteredStream {
         if POLL_DEPTH.with(|d| d.get()) > 0 {
             return Pin::new(&mut self.inner).poll_next(cx);
         }
-        POLL_DEPTH.with(|d| d.set(1));
+        let restore = PollDepthGuard(POLL_DEPTH.with(|d| d.replace(1)));
         let start = cpu::thread_cpu_ns();
         let out = Pin::new(&mut self.inner).poll_next(cx);
         let delta = cpu::thread_cpu_delta_ns(start);
-        POLL_DEPTH.with(|d| d.set(0));
+        drop(restore);
         stats.add_kernel_cpu_ns(delta);
         out
     }
