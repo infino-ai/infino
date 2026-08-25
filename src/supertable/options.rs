@@ -415,14 +415,30 @@ pub struct SupertableOptions {
     /// Warm queries never touch it — they resolve on the cache mutex's fast
     /// path — so the download never serializes steady-state serving.
     pub(crate) graph_hydration_lock: Arc<TokioMutex<()>>,
-    /// Build-once cache for the in-memory centroid-router HNSW (an HNSW over
+    /// Single-slot cache for the in-memory centroid-router HNSW (an HNSW over
     /// the resident fp32 fine centroids, used by `ivf_router = centroid_graph`
-    /// to select clusters). Built from the resident centroid section at the
-    /// first such query, so testing it needs no re-drain; the persisted
-    /// centroid graph is a follow-on. Only populated when the centroid-graph
-    /// router is enabled.
+    /// to select clusters). The cached graph is stamped with the `(generation,
+    /// column)` it was built for — the hidden manifest generation and the
+    /// vector column its nodes index — and a query reuses it only while both
+    /// match its own pinned manifest generation and queried column, otherwise
+    /// it rebuilds and restamps. A drain/compaction advances the generation and
+    /// renumbers the fine clusters, so the stamp alone invalidates a stale
+    /// graph — no explicit clear, and a late-storing stale build is rejected by
+    /// the next comparison. The column is part of the stamp because the slot is
+    /// shared across a table's vector columns; a graph built for column A must
+    /// never serve a query on column B (its nodes carry A's flat cluster ids).
+    /// Populated eagerly by the drain/optimize path (when the router is
+    /// enabled) and lazily by the query path as a fallback. `ArcSwapOption` so
+    /// the steady-state hot path loads lock-free.
     pub(crate) centroid_router_cache:
-        Arc<tokio::sync::OnceCell<Arc<crate::supertable::query::vector::CentroidRouterGraph>>>,
+        Arc<arc_swap::ArcSwapOption<crate::supertable::query::vector::StampedCentroidRouter>>,
+    /// Single-flight gate for [`Self::centroid_router_cache`] builds. The HNSW
+    /// build over every fine centroid is expensive at scale, so a miss holds
+    /// this lock across the build while concurrent misses park and then find
+    /// the published entry — exactly one build per `(generation, column)`.
+    /// Steady-state queries never touch it: they resolve on the cache's
+    /// lock-free fast path.
+    pub(crate) centroid_router_build_lock: Arc<TokioMutex<()>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar
     /// projection over gapped user superfiles, so a hit resolves in O(k) after
     /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
@@ -750,7 +766,8 @@ impl SupertableOptions {
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
             graph_sections_cache: Arc::new(TokioMutex::new(None)),
             graph_hydration_lock: Arc::new(TokioMutex::new(())),
-            centroid_router_cache: Arc::new(tokio::sync::OnceCell::new()),
+            centroid_router_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
+            centroid_router_build_lock: Arc::new(TokioMutex::new(())),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,

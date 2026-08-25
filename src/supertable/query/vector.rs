@@ -794,14 +794,56 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
 
 /// In-memory centroid router: an HNSW over the pooled fp32 fine centroids,
 /// used by `ivf_router = centroid_graph` to select the top-`fanout` clusters
-/// globally, bypassing the grid. Experimental, validation-grade — built once
-/// per handle from the resident centroid section (no drain change). A graph
-/// node maps back to the `(superfile index, flat cluster id)` the stamped
-/// per-cell read plan expects, so the downstream read is byte-identical.
+/// globally, bypassing the grid. Experimental, validation-grade — built from
+/// the resident centroid section and cached per manifest generation (see
+/// [`StampedCentroidRouter`]). A graph node maps back to the `(superfile
+/// index, flat cluster id)` the stamped per-cell read plan expects, so the
+/// downstream read is byte-identical.
 pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
     graph: crate::superfile::vector::hnsw::Hnsw,
     node_map: Vec<(usize, u32)>,
+}
+
+/// A [`CentroidRouterGraph`] stamped with the `(generation, column)` its nodes
+/// were built for: the hidden manifest generation (`manifest_id`) and the
+/// vector column the graph indexes. The load site reuses the entry only when
+/// BOTH match the query's own pinned manifest generation and queried column,
+/// and rebuilds otherwise. The generation covers structural change — a drain
+/// or compaction advances it and renumbers the fine clusters, so an entry
+/// stamped at an older generation (including a stale in-flight build that
+/// stored late) is rejected and rebuilt. The column covers the shared slot: a
+/// table with several vector columns caches through the one slot, and a graph
+/// built for column A carries A's flat cluster ids, so it must never serve a
+/// query on column B.
+pub(crate) struct StampedCentroidRouter {
+    pub(crate) generation: u64,
+    pub(crate) column: String,
+    pub(crate) graph: CentroidRouterGraph,
+}
+
+/// The column the eager centroid-router build should target, or `None` when
+/// the router is disabled or no column is eligible. The single-slot cache
+/// serves one column, so the eager path pre-warms the first cosine vector
+/// column (the router ranks by cosine, and single-vector-column tables are the
+/// common case). Pure and config-injected so the gating predicate and column
+/// pick are unit-testable without the process-global router config.
+pub(crate) fn select_eager_router_column(
+    search_mode: config::VectorSearchMode,
+    ivf_router: config::IvfRouter,
+    global_fine_fanout: usize,
+    vector_columns: &[crate::superfile::builder::VectorConfig],
+) -> Option<String> {
+    if search_mode != config::VectorSearchMode::Ivf
+        || ivf_router != config::IvfRouter::CentroidGraph
+        || global_fine_fanout == 0
+    {
+        return None;
+    }
+    vector_columns
+        .iter()
+        .find(|vc| vc.metric == Metric::Cosine)
+        .map(|vc| vc.column.clone())
 }
 
 /// Unit-normalize in place so the centroid graph's `−dot` scorer ranks by
@@ -2651,9 +2693,6 @@ impl SupertableReader {
         let section = self.centroid_section().await.ok_or_else(|| {
             QueryError::Execute("global-fine: centroid section unavailable".into())
         })?;
-        let store = Arc::clone(&manifest.options.store);
-        let disk_cache = manifest.options.disk_cache.clone();
-        let storage = manifest.options.storage.clone();
         // Path-scoped rerank: a caller-set `rerank_mult` wins, else this
         // path's own configured default — never the shared 256 that serves
         // the stamped / filtered / user-table paths.
@@ -2666,34 +2705,31 @@ impl SupertableReader {
         // top-`fc` cut over the pool is a valid global selection.
         // Open every eligible superfile reader (phase 2 needs them regardless
         // of how the top-`fanout` clusters are selected).
-        let mut readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(superfiles.len());
-        for entry in superfiles.iter() {
-            let reader =
-                dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                    .await?;
-            readers.push(reader);
-        }
+        let readers = self.open_superfile_readers(superfiles).await?;
 
         // Cluster selection: the centroid-router HNSW walks a graph over the
         // resident fp32 fine centroids to pick the top-`fanout` clusters; phase
-        // 2 then reads only those clusters. The graph is built once (cached) at
-        // the first query from the same fine centroids, so a graph node maps
-        // back to the exact `flat` cluster id and the read plan is identical.
+        // 2 then reads only those clusters. The graph is cached stamped with
+        // the `(generation, column)` it was built for and reused only while
+        // both match THIS query's pinned manifest generation and queried
+        // column, so a graph node always maps back to the live `flat` cluster
+        // id and the read plan stays consistent with the scan path. The
+        // generation is read from the query's OWN pinned manifest — a single
+        // field, no global "latest" lookup — so a drain/compaction (which
+        // advances it and renumbers the clusters) forces a rebuild, and a stale
+        // build that stored late loses the next comparison.
         let by_sf: HashMap<usize, Vec<u32>> = {
-            let cache = Arc::clone(&manifest.options.centroid_router_cache);
-            let router = {
-                let sfs = superfiles.to_vec();
-                let rdrs = readers.clone();
-                let col = column.to_string();
-                let sect = Arc::clone(&section);
-                let dim = query.len();
-                cache
-                    .get_or_try_init(|| async move {
-                        build_centroid_router(&sfs, &rdrs, &col, sect.as_ref(), dim).map(Arc::new)
-                    })
-                    .await?
-                    .clone()
-            };
+            let stamped = self
+                .resident_centroid_router(
+                    column,
+                    manifest.manifest_id,
+                    query.len(),
+                    superfiles,
+                    &readers,
+                    section.as_ref(),
+                )
+                .await?;
+            let router = &stamped.graph;
             let mut q = query.to_vec();
             gfc_unit_normalize(&mut q);
             let fc = fanout.clamp(1, router.node_map.len().max(1));
@@ -2839,6 +2875,117 @@ impl SupertableReader {
             }
         }
         Ok(top_k_ascending(per_superfile, k))
+    }
+
+    /// Open a [`SuperfileReader`] for each entry, index-aligned to `entries`
+    /// (`readers[i]` reads `entries[i]`), through this table's store and
+    /// caches. Shared by the centroid-router build sites so their reader-open
+    /// stays identical.
+    async fn open_superfile_readers(
+        &self,
+        entries: &[Arc<SuperfileEntry>],
+    ) -> Result<Vec<Arc<SuperfileReader>>, QueryError> {
+        let options = &self.manifest().options;
+        let store = &options.store;
+        let disk_cache = options.disk_cache.as_ref();
+        let storage = options.storage.as_ref();
+        let mut readers = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            readers.push(dispatch::open_reader(store, disk_cache, storage, entry, false).await?);
+        }
+        Ok(readers)
+    }
+
+    /// Load — or single-flight build — the centroid-router graph for
+    /// `(generation, column)`. The one place that builds, stamps, and publishes
+    /// it: both the lazy query path ([`Self::global_fine_fanout`]) and the eager
+    /// drain/optimize build ([`Self::build_and_cache_centroid_router`]) funnel
+    /// through here, so the cache key and store sequence cannot drift. Steady
+    /// state resolves on the cache's lock-free fast path; a miss takes the
+    /// per-table build lock, re-checks (a concurrent miss may have published
+    /// while it waited), and builds exactly once. `readers[i]` must read
+    /// `superfiles[i]`.
+    async fn resident_centroid_router(
+        &self,
+        column: &str,
+        generation: u64,
+        dim: usize,
+        superfiles: &[Arc<SuperfileEntry>],
+        readers: &[Arc<SuperfileReader>],
+        section: &CentroidSection,
+    ) -> Result<Arc<StampedCentroidRouter>, QueryError> {
+        let options = &self.manifest().options;
+        let is_fresh = |entry: &StampedCentroidRouter| {
+            entry.generation == generation && entry.column == column
+        };
+        if let Some(entry) = options.centroid_router_cache.load_full()
+            && is_fresh(&entry)
+        {
+            return Ok(entry);
+        }
+        let _build = options.centroid_router_build_lock.lock().await;
+        if let Some(entry) = options.centroid_router_cache.load_full()
+            && is_fresh(&entry)
+        {
+            return Ok(entry);
+        }
+        let graph = build_centroid_router(superfiles, readers, column, section, dim)?;
+        let entry = Arc::new(StampedCentroidRouter {
+            generation,
+            column: column.to_string(),
+            graph,
+        });
+        options
+            .centroid_router_cache
+            .store(Some(Arc::clone(&entry)));
+        Ok(entry)
+    }
+
+    /// Build the centroid-router graph for `column` from THIS reader's pinned
+    /// hidden manifest and publish it into `centroid_router_cache` stamped with
+    /// that manifest's generation. The drain/optimize path calls this once the
+    /// centroids settle at the final generation, so a steady-state
+    /// `ivf_router = centroid_graph` query loads a matching-`(generation,
+    /// column)` graph instead of building on the hot path. Any generation this
+    /// does not reach (a never-drained handle, the feature toggled on later) is
+    /// covered by the lazy build in [`Self::global_fine_fanout`]. Best-effort:
+    /// the caller logs a failure rather than failing the mutation.
+    pub(crate) async fn build_and_cache_centroid_router(
+        &self,
+        column: &str,
+    ) -> Result<(), QueryError> {
+        let manifest = self.manifest();
+        let generation = manifest.manifest_id;
+        let dim = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .map(|vc| vc.dim)
+            .ok_or_else(|| {
+                QueryError::Execute(format!("eager centroid-router: unknown column `{column}`"))
+            })?;
+        let section = self.centroid_section().await.ok_or_else(|| {
+            QueryError::Execute("eager centroid-router: centroid section unavailable".into())
+        })?;
+        let entries = manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let readers = self.open_superfile_readers(&entries).await?;
+        self.resident_centroid_router(
+            column,
+            generation,
+            dim,
+            &entries,
+            &readers,
+            section.as_ref(),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn vector_fanout_over_superfiles(
@@ -5619,6 +5766,70 @@ mod tests {
             .build()
             .expect("test runtime")
             .block_on(fut)
+    }
+
+    /// The eager centroid-router build's gating predicate + column pick. The
+    /// process-global router config can't be flipped per-test, so this drives
+    /// the pure selector `refresh_centroid_router_cache` delegates to directly:
+    /// it must gate off unless the router is fully enabled, and otherwise pick
+    /// the FIRST cosine vector column (the single-slot cache serves one column,
+    /// and the router ranks by cosine).
+    #[test]
+    fn select_eager_router_column_gates_and_picks_first_cosine() {
+        use super::select_eager_router_column;
+        use crate::config::{IvfRouter, VectorSearchMode};
+
+        let vc = |name: &str, metric: Metric| VectorConfig {
+            column: name.to_string(),
+            dim: 8,
+            rot_seed: 1,
+            metric,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let cols = vec![
+            // A non-cosine column ahead of the cosine ones must be skipped.
+            vc("l2", Metric::L2Sq),
+            vc("a", Metric::Cosine),
+            vc("b", Metric::Cosine),
+        ];
+
+        // Fully enabled: the first cosine column.
+        assert_eq!(
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 32, &cols)
+                .as_deref(),
+            Some("a"),
+        );
+        // Gated off: default `stamped` router.
+        assert_eq!(
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Stamped, 32, &cols),
+            None,
+        );
+        // Gated off: fanout of zero.
+        assert_eq!(
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 0, &cols),
+            None,
+        );
+        // Gated off: the HNSW search mode serves via its own graph.
+        assert_eq!(
+            select_eager_router_column(
+                VectorSearchMode::HnswIvf,
+                IvfRouter::CentroidGraph,
+                32,
+                &cols,
+            ),
+            None,
+        );
+        // Enabled but no cosine column: nothing to pre-warm.
+        assert_eq!(
+            select_eager_router_column(
+                VectorSearchMode::Ivf,
+                IvfRouter::CentroidGraph,
+                32,
+                &[vc("x", Metric::NegDot)],
+            ),
+            None,
+        );
     }
 
     /// Fine ranking takes each cell's best (minimum) candidate score,
