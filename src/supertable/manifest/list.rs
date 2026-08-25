@@ -64,16 +64,24 @@ pub(crate) const BIRTH_VERSION_AGGREGATE_COLUMN: &str = "__infino_birth_version"
 const MAX_EXACT_VALUE_COUNTS: usize = 256;
 
 /// Cells probed per query — exactly one, the grid-nearest. The p=1 read
-/// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs);
-/// recall past its coverage ceiling is bought with boundary replication at
-/// drain time, never by widening the probe set.
+/// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs).
+///
+/// This is the SHARED fallback: every path that has no stamped law and
+/// no caller override lands here, drained or not. The undrained probe
+/// needs to reach further than one cell on real embeddings, but that is
+/// scoped to the undrained routing branch itself
+/// (`UNDRAINED_CELL_NPROBE_MAX` in `supertable::query::vector`) rather
+/// than widened here, so a drained table that stamped a width of one
+/// cell keeps its single cell.
 const DEFAULT_CELL_NPROBE_MIN: usize = 1;
 /// Hard cap on cells probed per query. Equal to the floor: adaptive
-/// widening is off — coverage is a drain-side (replication) concern.
+/// widening is off by default — see [`DEFAULT_CELL_NPROBE_MIN`] for
+/// where the undrained path opts into a wider cap.
 const DEFAULT_CELL_NPROBE_MAX: usize = 1;
 /// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
-/// Inert while `nprobe_max == nprobe_min`; acts only when a table
-/// explicitly widens its persisted routing.
+/// With `nprobe_max > nprobe_min` this is what decides how far the probe
+/// set actually widens: cliff geometry stops at the first cell, diffuse
+/// real-embedding geometry follows its near-ties to the cap.
 const DEFAULT_CELL_SLACK: f32 = 1.0;
 
 // ---------- Public in-memory shapes ----------

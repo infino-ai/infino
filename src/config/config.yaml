@@ -239,6 +239,20 @@ vector:
   # demand near-target recall from the graph or step aside to ivf.
   hnsw_recall_slack: 0.01
 
+  # For search_mode = hnsw_ivf: navigate the resident graph on an int8 (SQ8)
+  # plane derived at load from the Sq16 codes' high byte (scored with an
+  # int8-VNNI kernel where present), then re-rank the final beam on full Sq16.
+  # Roughly halves warm hnsw latency at unchanged recall; costs an extra
+  # resident plane (~1 byte/dim/row, ~50% over the Sq16 plane), built only when
+  # enabled. false walks entirely on Sq16 (no extra plane).
+  hnsw_sq8_walk: true
+
+  # For search_mode = hnsw_ivf with hnsw_sq8_walk: how many of the SQ8 walk's
+  # nearest candidates to re-rank on full Sq16 before returning the top k.
+  # Clamped to [k, ef]. Recall saturates well below ef (256 is the knee for
+  # k <= 100); wider only adds tail cost.
+  hnsw_refine_k: 256
+
   # For search_mode = hnsw_ivf: scale ceiling for the per-row DATA graph. The
   # resident data HNSW is built at drain and persisted only when the table's
   # doc count is at or below this; above it, only the (much smaller) centroid

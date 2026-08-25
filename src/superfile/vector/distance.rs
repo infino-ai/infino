@@ -1215,6 +1215,81 @@ fn sq16_cross(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
     sq16_cross_wide(q_prime, code_bytes)
 }
 
+/// SQ8 walk dot: `Σ_d code_u8[d] · q_i8[d]` (unsigned code byte × signed int8
+/// query), int32. A *ranking proxy* for the graph walk only — the per-query
+/// offset baseline (`Σ 128·q_i8`) is a constant that doesn't change intra-query
+/// order, so it's dropped; exact scores come from the Sq16 refine afterward.
+/// `code_u8` is the contiguous high byte of each Sq16 code. int8 products over
+/// ≤768 dims stay far inside int32. Runtime-dispatched to AVX-512-VNNI
+/// `vpdpbusd`, else a scalar fallback. `code_u8.len() == q_i8.len() == dim`.
+pub(crate) fn sq8_walk_dot(code_u8: &[u8], q_i8: &[i8]) -> i32 {
+    debug_assert_eq!(code_u8.len(), q_i8.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+        {
+            // SAFETY: gated on avx512f+bw+vnni (the features the kernel
+            // enables). Each iteration reads 64 `code_u8` and 64 `q_i8`
+            // strictly below `dim - dim % 64`; the scalar tail covers the
+            // remainder — no out-of-bounds access.
+            return unsafe { sq8_dot_vnni(code_u8, q_i8) };
+        }
+    }
+    sq8_walk_dot_scalar(code_u8, q_i8)
+}
+
+fn sq8_walk_dot_scalar(code_u8: &[u8], q_i8: &[i8]) -> i32 {
+    code_u8
+        .iter()
+        .zip(q_i8)
+        .map(|(&c, &q)| c as i32 * q as i32)
+        .sum()
+}
+
+/// AVX-512-VNNI `vpdpbusd` tier of [`sq8_walk_dot`]: 64 unsigned code bytes ×
+/// 64 signed int8 query values per instruction, int32 accumulate.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn sq8_dot_vnni(code_u8: &[u8], q_i8: &[i8]) -> i32 {
+    use core::arch::x86_64::{
+        _mm512_dpbusd_epi32, _mm512_loadu_epi8, _mm512_reduce_add_epi32, _mm512_setzero_si512,
+    };
+    // SAFETY: called only after avx512f+bw+vnni detection. Each iteration loads
+    // 64 bytes from `code_u8` and `q_i8` strictly below `dim - dim % 64`; the
+    // scalar tail covers the remainder — no read past either slice.
+    unsafe {
+        let dim = q_i8.len();
+        let mut acc = _mm512_setzero_si512();
+        let mut d = 0usize;
+        while d + 64 <= dim {
+            let a = _mm512_loadu_epi8(code_u8.as_ptr().add(d) as *const i8);
+            let b = _mm512_loadu_epi8(q_i8.as_ptr().add(d));
+            acc = _mm512_dpbusd_epi32(acc, a, b);
+            d += 64;
+        }
+        let mut s = _mm512_reduce_add_epi32(acc);
+        while d < dim {
+            s += code_u8[d] as i32 * q_i8[d] as i32;
+            d += 1;
+        }
+        s
+    }
+}
+
+/// Quantize a query to signed int8 for [`sq8_walk_dot`]: scale by the query's
+/// own max magnitude so the largest component maps to ±127. The scale is a
+/// per-query constant, so it doesn't affect the walk's intra-query ranking.
+pub(crate) fn quantize_query_i8(query: &[f32]) -> Vec<i8> {
+    let max = query.iter().fold(0.0f32, |m, &q| m.max(q.abs())).max(1e-12);
+    let qs = 127.0 / max;
+    query
+        .iter()
+        .map(|&q| (q * qs).round().clamp(-127.0, 127.0) as i8)
+        .collect()
+}
+
 /// Safe `wide` tier of [`sq16_cross`]: fixed-size 16-byte chunks so the
 /// u16 conversions compile without per-byte bounds checks.
 fn sq16_cross_wide(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
@@ -2319,6 +2394,44 @@ mod tests {
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() < eps
+    }
+
+    /// The SQ8 walk kernel's SIMD tier must match its scalar reference exactly
+    /// (integer dot — bit-exact, no float slack). Covers a 64-aligned width and
+    /// widths with a scalar tail (`dim % 64 != 0`).
+    #[test]
+    fn sq8_walk_dot_simd_matches_scalar() {
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for dim in [64usize, 100, 768] {
+            let code: Vec<u8> = (0..dim).map(|_| (next() & 0xff) as u8).collect();
+            let q: Vec<i8> = (0..dim)
+                .map(|_| ((next() % 255) as i32 - 127) as i8)
+                .collect();
+            let scalar = sq8_walk_dot_scalar(&code, &q);
+            assert_eq!(
+                sq8_walk_dot(&code, &q),
+                scalar,
+                "runtime-dispatched sq8_walk_dot != scalar at dim={dim}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vnni")
+            {
+                // SAFETY: gated on the exact features `sq8_dot_vnni` enables.
+                let vnni = unsafe { sq8_dot_vnni(&code, &q) };
+                assert_eq!(
+                    vnni, scalar,
+                    "avx512-vnni sq8 kernel != scalar at dim={dim}"
+                );
+            }
+        }
     }
 
     fn scalar_nearest_two_centroids(

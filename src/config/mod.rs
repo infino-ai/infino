@@ -318,6 +318,15 @@ const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
 /// more hard high-dim tables on the graph; tighten it to demand near-target
 /// recall from the graph or step aside to ivf.
 const DEFAULT_VECTOR_HNSW_RECALL_SLACK: f64 = 0.01;
+/// Default for `hnsw_sq8_walk`: on. The int8 walk roughly halves warm hnsw
+/// latency at unchanged recall; the extra resident SQ8 plane (~50% over the
+/// Sq16 plane) is the accepted trade. Set `false` to reclaim that memory and
+/// walk on Sq16.
+const DEFAULT_VECTOR_HNSW_SQ8_WALK: bool = true;
+/// Default for `hnsw_refine_k`: re-rank the SQ8 walk's top 256 on full Sq16.
+/// The knee for k ≤ 100 — recall matches the Sq16 walk and saturates here, so
+/// a wider refine only adds tail cost.
+const DEFAULT_VECTOR_HNSW_REFINE_K: usize = 256;
 /// Base-layer degree candidates the drain calibrator sweeps (ascending).
 pub const HNSW_M0_CANDIDATES: &[usize] = &[32, 64, 128, 256];
 /// Query-beam (`ef`) candidates the drain calibrator sweeps (ascending),
@@ -540,6 +549,23 @@ pub struct VectorSettings {
     /// Recall shortfall below `target_recall` the hnsw graph is still accepted
     /// at before the drain gives up and serves ivf (`floor = target - this`).
     pub hnsw_recall_slack: f64,
+    /// For `search_mode = hnsw_ivf`: navigate the resident graph on an int8
+    /// (SQ8) plane derived at load from the Sq16 codes' high byte — scored with
+    /// an int8 dot kernel (AVX-512 VNNI where present) — then re-rank the final
+    /// beam on full Sq16. The walk dominates query cost (tens of thousands of
+    /// distance evals, far more than `ef`), so the cheaper int8 kernel roughly
+    /// halves warm latency at unchanged recall. Cost: an extra resident plane
+    /// (`+1 byte/dim/row`, ~50% on top of the Sq16 plane) — built only when
+    /// this is set. `false` walks entirely on Sq16 (no extra plane). Ignored
+    /// under any other search mode.
+    pub hnsw_sq8_walk: bool,
+    /// For `search_mode = hnsw_ivf` with `hnsw_sq8_walk`: how many of the SQ8
+    /// walk's nearest candidates to re-rank on full Sq16 before returning the
+    /// top `k`. Clamped to `[k, ef]`. Wider recovers more of the int8 walk's
+    /// ranking loss but adds Sq16 scores to the tail; recall saturates well
+    /// below `ef` (256 is the knee for k ≤ 100). Ignored when `hnsw_sq8_walk`
+    /// is off or under any other search mode.
+    pub hnsw_refine_k: usize,
     /// For `search_mode = hnsw_ivf`: scale ceiling for the per-row **data**
     /// graph. The resident data HNSW is built at drain and persisted only
     /// when the table's doc count ≤ this; above it, only the centroid graph
@@ -628,6 +654,8 @@ impl Default for VectorSettings {
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
             hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
+            hnsw_sq8_walk: DEFAULT_VECTOR_HNSW_SQ8_WALK,
+            hnsw_refine_k: DEFAULT_VECTOR_HNSW_REFINE_K,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,

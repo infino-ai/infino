@@ -175,6 +175,21 @@ const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 /// Explicit caller `nprobe` overrides; the per-run width sweep keeps the
 /// trade measured.
 const FILTERED_USER_CELL_NPROBE: usize = 4;
+/// Cells the UNDRAINED probe may widen to under the near-tie slack,
+/// COSINE columns only.
+///
+/// Bounds the one path with no measurement behind it: until the drain
+/// stamps a width law, nothing has looked at this table's geometry, and
+/// the shared one-cell default is calibrated for planted clusters.
+/// Real embeddings need more — recall@10 0.623 -> 0.932 at 9.4M Cohere,
+/// 0.367 -> 0.844 at 200K, both cosine — and the widening is bounded so
+/// an undrained table cannot fan out across the grid while it waits for
+/// `optimize()`. Non-cosine metrics keep the one-cell default: the
+/// near-tie window is metric-sensitive, and under L2 it admits second
+/// cells on decisive geometry (measured +100% warm p90 on synthetic
+/// l2sq for zero recall gain). Drained serving never reads this: it
+/// pins the stamped width.
+const UNDRAINED_CELL_NPROBE_MAX: usize = 8;
 
 // The admit window keeps the shared
 // `manifest::RABITQ_ADMIT_CELL_SHORTLIST_FRACTION` (20%) slice of the
@@ -2220,6 +2235,10 @@ impl SupertableReader {
         let manifest = self.manifest();
         let sections_for_walk = Arc::clone(&sections);
         let query_owned = query.to_vec();
+        // SQ8 int8-VNNI walk + Sq16 refine when the SQ8 plane is resident
+        // (built at decode under `vector.hnsw_sq8_walk`); otherwise walk on
+        // Sq16 directly. `hnsw_refine_k` is the re-rank width.
+        let refine_k = config::global().vector.hnsw_refine_k;
         let hits: Vec<SuperfileHit> = run_on_pool(
             Some(&manifest.options.reader_pool),
             "hnsw serving walk: reader pool dropped result",
@@ -2228,8 +2247,12 @@ impl SupertableReader {
                     .data
                     .as_ref()
                     .expect("data present: checked before dispatch");
-                data.graph
-                    .search(&data.scorer, &query_owned, k_fetch, ef)
+                let walked = if data.sq8_plane.is_empty() {
+                    data.graph.search(&data.scorer, &query_owned, k_fetch, ef)
+                } else {
+                    data.search_sq8_refine(&query_owned, k_fetch, ef, refine_k)
+                };
+                walked
                     .into_iter()
                     .filter_map(|(node, dist)| {
                         // Shift the graph's `−dot` onto the ivf/scan arm's
@@ -2867,7 +2890,31 @@ impl SupertableReader {
                     nprobe_max: FILTERED_USER_CELL_NPROBE,
                     ..CellRoutingParams::default()
                 }
+            } else if metric == Metric::Cosine {
+                // UNDRAINED tail: no drain has run, so no law has been
+                // stamped and nothing has measured this table's geometry.
+                // The shipped one-cell probe is calibrated against
+                // planted-cluster geometry and collapses on real
+                // embeddings -- measured recall@10 0.623 at 9.4M Cohere,
+                // 0.367 at 200K. Let the near-tie widening reach further
+                // HERE ONLY: a drained table serves its stamped width
+                // instead, so a table whose law says one cell keeps its
+                // single cell rather than being widened by a default.
+                CellRoutingParams {
+                    nprobe_max: UNDRAINED_CELL_NPROBE_MAX,
+                    ..CellRoutingParams::default()
+                }
             } else {
+                // Non-cosine UNDRAINED tail keeps the one-cell default.
+                // The near-tie window (`τ = d*·(1+slack)`) is
+                // metric-sensitive: under L2 the second-nearest cells sit
+                // within the window on decisive geometry far more often
+                // than under cosine, so the widened cap fires where it
+                // buys nothing -- measured +100% warm p90 on the synthetic
+                // l2sq lane (5.40 -> 10.81 ms) at unchanged ~0.99 recall.
+                // The collapse the cap exists to cover (0.367 / 0.623)
+                // was measured on cosine embeddings only; widening another
+                // metric's undrained tail takes its own measurement first.
                 CellRoutingParams::default()
             };
             // Per-table probe-width law: when the drain calibrated one and
@@ -2887,20 +2934,39 @@ impl SupertableReader {
             // exactly where a flat config floor was measured scale-fragile:
             // 10M post-drain 0.982 at floor 4 vs 0.996 at 8, identical
             // latency).
+            // The stamped fine-depth law applies to FILTERED queries too.
+            // It is consumed as a floor (`max`), so it can only deepen a
+            // read, never narrow one — and an allow-set needs at least the
+            // unfiltered depth, not less: only a fraction of what a cell
+            // yields is eligible, so the matching neighbours sit deeper in
+            // the fine ranking than the unfiltered top-k ever has to reach.
+            // Filtered was pinned to the fixed FILTERED_HIDDEN_FINE_NPROBE
+            // floor while the drain's own measurement sat unused, which is
+            // the shape of the loss on real corpora (measured post-drain on
+            // Cohere: 0.793 at 200K falling to 0.630 at 9.4M as cells grow,
+            // against 0.997 unfiltered on the same table).
             if hidden_vector_index
-                && !filtered
                 && let Some(fine) = hidden_routing.and_then(|r| r.fine_for_k_at(k))
             {
                 cell_routing.fine_nprobe = cell_routing.fine_nprobe.max(fine);
             }
-            let law_width: Option<usize> =
-                if hidden_vector_index && !filtered && options.nprobe.is_none() {
-                    hidden_routing
-                        .and_then(|r| r.width_for_k_at(k))
-                        .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
-                } else {
-                    None
-                };
+            // The stamped width law serves FILTERED queries too. Sweeping
+            // every cell (`FILTERED_HIDDEN_CELL_NPROBE`) was a fallback for
+            // not consulting it: wide-and-shallow costs more reads than the
+            // law's cell set AND misses, because an allow-set's eligible
+            // neighbours sit deeper in the fine ranking rather than in
+            // farther cells. With the fine-depth law above now applying,
+            // filtered reads the law's cell set at whole-cell depth. It
+            // stops there: the near-tie serve window below is gated on
+            // `law_default`, which keeps its `!filtered` condition, so no
+            // extension cells are added for filtered.
+            let law_width: Option<usize> = if hidden_vector_index && options.nprobe.is_none() {
+                hidden_routing
+                    .and_then(|r| r.width_for_k_at(k))
+                    .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
+            } else {
+                None
+            };
             // Depth the DEFAULT (unpinned) path would read per cell — the
             // stamped fine-depth law over the routing base. Captured before
             // the pin lifts `fine_nprobe` to MAX: #515 serve-window
@@ -5466,6 +5532,30 @@ mod tests {
         assert_eq!(admit_shortlist_window(241), 49);
     }
 
+    /// The wider undrained probe stays scoped to the undrained branch.
+    ///
+    /// Widening `CellRoutingParams::default()` instead would reach every
+    /// path that falls back to it — including a DRAINED table whose
+    /// stamped width law is one cell, where the law filters to `None`
+    /// (`LAW_WIDTH_WITHIN_DEFAULT`), no pin happens, and the default is
+    /// what serves. That regression is invisible to recall (planted
+    /// clusters already serve ~1.0) and shows up only as cold-GET fan,
+    /// which is why it is asserted here rather than left to a bench.
+    #[test]
+    fn undrained_cap_is_scoped_and_wider_than_the_shared_default() {
+        let shared = CellRoutingParams::default();
+        assert_eq!(
+            (shared.nprobe_min, shared.nprobe_max),
+            (1, 1),
+            "the shared routing fallback must stay a one-cell probe"
+        );
+        assert!(
+            super::UNDRAINED_CELL_NPROBE_MAX > shared.nprobe_max,
+            "the undrained cap must exceed the shared default, or the \
+             undrained branch widens nothing"
+        );
+    }
+
     /// The self-measured admit extension (#515) follows the query's own
     /// evidence: with a flat estimate spectrum and an observed
     /// estimate-to-exact residual, the near-tie run past the write
@@ -7850,8 +7940,8 @@ mod tests {
             let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
                 .expect("assemble ok")
                 .expect("sq16 rows must assemble into a graph");
-            let decoded =
-                crate::superfile::vector::hnsw::decode_hnsw(&bundle).expect("decode data bundle");
+            let decoded = crate::superfile::vector::hnsw::decode_hnsw(&bundle, true)
+                .expect("decode data bundle");
             assert_eq!(
                 decoded.graph.len(),
                 decoded.doc_ids.len(),

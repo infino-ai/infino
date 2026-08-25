@@ -32,6 +32,7 @@ use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
 use crate::{
+    config,
     storage::{StorageError, StorageProvider},
     superfile::vector::hnsw,
     supertable::manifest::{
@@ -596,7 +597,14 @@ pub(crate) async fn fetch_graph_sections(
     let raw = fetch_graph_section(storage, reference).await?;
     let bundle = hnsw::decode_graph_bundle(&raw)
         .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
-    let data = bundle.data_bundle.as_deref().and_then(hnsw::decode_hnsw);
+    // Build the resident SQ8 walk plane only when SQ8-walk serving is enabled
+    // (it costs ~1 byte/dim/row on top of the Sq16 plane); otherwise serving
+    // walks on Sq16 and the plane stays empty.
+    let sq8_walk = config::global().vector.hnsw_sq8_walk;
+    let data = bundle
+        .data_bundle
+        .as_deref()
+        .and_then(|b| hnsw::decode_hnsw(b, sq8_walk));
     if let Some(idx) = &data {
         // Surface the stamped params every time the resident graph hydrates,
         // so serving always shows what a table's graph is actually running.
