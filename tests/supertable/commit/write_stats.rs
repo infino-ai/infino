@@ -25,6 +25,7 @@ use infino::{
     supertable::{Supertable, SupertableOptions},
     test_helpers::{
         build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
+        fault_storage::{FaultKind, FaultOp, FaultStorage},
         schema_id_title,
     },
 };
@@ -349,6 +350,13 @@ fn a_dropped_writer_reports_nothing_it_never_committed() {
     assert_eq!(stats.superfiles_written, 0);
 }
 
+/// The manifest pointer's URI fragment — the object whose conditional
+/// write is the commit's CAS, and so the one to fail to force a retry.
+const POINTER_URI_FRAGMENT: &str = "_supertable/current";
+/// Rows in the two-column fixture that separates the FTS leg from the
+/// scalar leg.
+const MIXED_SCHEMA_ROWS: usize = 32;
+
 /// Rows in the parent batch the slice fixture carves from — large enough
 /// that billing its whole allocation is unmistakable.
 const SLICE_TEST_PARENT_ROWS: usize = 4_000;
@@ -394,6 +402,116 @@ fn a_sliced_append_is_billed_for_its_own_rows() {
     assert_eq!(
         from_slice.fts_text_bytes_written, from_standalone.fts_text_bytes_written,
         "and so must the indexed-text leg"
+    );
+}
+
+/// The determinism contract covers commit retries as well as pool width,
+/// and the collector promises the manifest pair is counted once per
+/// successful commit rather than once per OCC attempt. Only the width
+/// half had a test. A lost pointer CAS drives the retry deterministically,
+/// so this does not depend on winning a race.
+#[test]
+fn write_stats_are_invariant_to_a_commit_retry() {
+    let uncontended_dir = TempDir::new().expect("tempdir");
+    let uncontended: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(uncontended_dir.path()).expect("provider"));
+    let baseline_table =
+        Supertable::create(default_supertable_options().with_storage(uncontended)).expect("create");
+    let ((), baseline) = with_op_stats(|| {
+        baseline_table
+            .append(&width_test_batch())
+            .expect("uncontended append");
+    });
+
+    let contended_dir = TempDir::new().expect("tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(contended_dir.path()).expect("provider"));
+    let faults = FaultStorage::wrap(local);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    let retried_table =
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+    // Lose the pointer CAS exactly once: the commit must reissue and still
+    // report its work a single time.
+    faults.fail_with(
+        FaultKind::Precondition,
+        FaultOp::PutIfMatch,
+        POINTER_URI_FRAGMENT,
+        1,
+    );
+    let ((), retried) = with_op_stats(|| {
+        retried_table
+            .append(&width_test_batch())
+            .expect("append survives one lost CAS");
+    });
+
+    assert!(
+        faults.fired() > 0,
+        "the fixture must actually lose a CAS, or the retry half is untested"
+    );
+    assert_eq!(
+        retried.rows_written, baseline.rows_written,
+        "a retried commit indexes the same rows once"
+    );
+    assert_eq!(retried.scalar_bytes_written, baseline.scalar_bytes_written);
+    assert_eq!(
+        retried.fts_text_bytes_written,
+        baseline.fts_text_bytes_written
+    );
+    assert_eq!(
+        retried.planned_write_requests, baseline.planned_write_requests,
+        "the manifest pair counts once per successful commit, not once per \
+         attempt"
+    );
+}
+
+/// The FTS leg is documented as a subset of the scalar leg rather than
+/// additional payload. Every other fixture here has exactly one user
+/// column and it *is* the FTS column, so the two counters come out equal
+/// by construction and the subset relation is never actually exercised.
+/// This one carries an unindexed column too, so the inequality is strict.
+#[test]
+fn the_fts_leg_is_a_strict_subset_when_a_column_is_unindexed() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("rating", DataType::Int64, false),
+    ]));
+    let titles: Vec<String> = (0..MIXED_SCHEMA_ROWS)
+        .map(|i| format!("document {i} about rust and search"))
+        .collect();
+    let title_col: ArrayRef = Arc::new(LargeStringArray::from(
+        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    let rating_col: ArrayRef = Arc::new(arrow_array::Int64Array::from(
+        (0..MIXED_SCHEMA_ROWS as i64).collect::<Vec<_>>(),
+    ));
+    let batch =
+        RecordBatch::try_new(Arc::clone(&schema), vec![title_col, rating_col]).expect("batch");
+
+    let options = SupertableOptions::new(
+        Arc::clone(&schema),
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        Vec::new(),
+        Some(default_tokenizer()),
+    )
+    .expect("valid options");
+    let st = Supertable::create(options).expect("create");
+    let ((), stats) = with_op_stats(|| {
+        st.append(&batch).expect("append");
+    });
+
+    assert!(
+        stats.fts_text_bytes_written > 0,
+        "the indexed column carries text"
+    );
+    assert!(
+        stats.fts_text_bytes_written < stats.scalar_bytes_written,
+        "the FTS leg counts only the indexed column, so an unindexed \
+         column must make it a strict subset: fts={} scalar={}",
+        stats.fts_text_bytes_written,
+        stats.scalar_bytes_written
     );
 }
 

@@ -220,16 +220,21 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
 }
 
 #[test]
-fn work_stats_are_deterministic_across_cache_temperature() {
-    // The first run decodes from a cold state, the repeat hits every
-    // warm structure — the whole point of the counter is that the
-    // reported work is identical either way. Compare the full masked
-    // snapshot (like the vector/SQL siblings), not just posting bytes,
-    // so a warm/cold divergence in any FTS counter is caught.
+fn fts_work_stats_repeat_identically_on_the_same_table_state() {
+    // Named for what it guards. It used to claim the first run decodes
+    // from a cold state and the repeat hits warm structures, but this
+    // fixture has no cache-temperature axis at all: `demo_two_superfiles`
+    // attaches no storage, so every published superfile's bytes sit in
+    // the table's in-memory reader cache for its lifetime and both runs
+    // are served from the same resident reader. What it really pins is
+    // run-to-run repeatability across the full masked snapshot, which is
+    // worth having — the genuine cold-open axis is covered by
+    // `sql_work_stats_do_not_depend_on_reader_open_shape` for SQL and by
+    // the reader-lifetime transposition in the vector sibling.
     let st = demo_two_superfiles();
-    let cold = deterministic(scoped_fts_stats(&st, "rust"));
-    let warm = deterministic(scoped_fts_stats(&st, "rust"));
-    assert_eq!(cold, warm, "same plan, same table state, same work");
+    let first = deterministic(scoped_fts_stats(&st, "rust"));
+    let second = deterministic(scoped_fts_stats(&st, "rust"));
+    assert_eq!(first, second, "same plan, same table state, same work");
 }
 
 #[test]

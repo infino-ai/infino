@@ -265,6 +265,27 @@ const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 ///   fragment, so each fragment of a selected cell is probed (accepted read
 ///   amplification), and a small fragment is not crowded out by a larger
 ///   sibling in the same cell.
+/// Fold one superfile scan's work into the op's collector.
+///
+/// Both vector fan-outs produce a [`ScanOutcome`] and both must report the
+/// same five values. The global-fine path once folded only the CPU leg,
+/// which left its cells, candidates, cluster-index/block ranges and rerank
+/// rows unpriced while the stamped path counted them. One function, so a
+/// sixth field cannot be added to the struct and wired up at only one of
+/// the two sites.
+fn fold_scan_outcome(op_stats: &Option<Arc<OpStatsCollector>>, scan: &ScanOutcome) {
+    let Some(stats) = op_stats else {
+        return;
+    };
+    stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
+    // Request-shaped ranges only (cluster index + prefixes/blocks + Sq8
+    // meta). Rerank rows are diagnostics; their cost rides the priced CPU
+    // watermark.
+    stats.add_planned_read_ranges(scan.ranges_requested);
+    stats.add_vector_rows_reranked(scan.rows_reranked);
+    stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
+}
+
 fn gate_fine_candidates_by_fragment(
     candidates: Vec<(usize, u32, f32, Option<u32>, u64)>,
     selected: &HashSet<u32>,
@@ -2728,12 +2749,13 @@ impl SupertableReader {
         for (si, scan) in scans {
             let entry = &superfiles[si];
             let reader = readers[si].as_ref();
-            // The scan wave above already ran; fold each superfile's scan
-            // kernel time in here, on the calling thread, now that the
-            // concurrent block has been collected.
-            if let Some(stats) = &self.op_stats {
-                stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
-            }
+            // The scan wave above already ran; fold each superfile's work
+            // in here, on the calling thread, now that the concurrent block
+            // has been collected. This folded only the CPU leg and dropped
+            // the other four, so the cells, candidates and cluster-index /
+            // block ranges every probed cluster requested went unpriced on
+            // this path while the stamped one counted them.
+            fold_scan_outcome(&self.op_stats, &scan);
             // Cold cells rerank in-scan; take their exact hits directly.
             if !scan.hits.is_empty() {
                 let mut tagged = dispatch::tag_hits(entry, scan.hits);
@@ -3745,16 +3767,7 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(vector_read_query_error)?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
-                            // Request-shaped ranges only (cluster index +
-                            // prefixes/blocks + Sq8 meta). Rerank rows are
-                            // diagnostics; their cost rides the priced
-                            // CPU watermark.
-                            stats.add_planned_read_ranges(scan.ranges_requested);
-                            stats.add_vector_rows_reranked(scan.rows_reranked);
-                            stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
-                        }
+                        fold_scan_outcome(&op_stats, &scan);
                         max_replica_overhead
                             .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
                         if !scan.candidates.is_empty() {

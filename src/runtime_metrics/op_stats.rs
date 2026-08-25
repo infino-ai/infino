@@ -72,7 +72,7 @@
 //! `pool.install` for the whole fan-out.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -300,6 +300,16 @@ impl OpStatsCollector {
 
     /// Flush one bracketed kernel section's on-CPU nanoseconds.
     pub(crate) fn add_kernel_cpu_ns(&self, ns: u64) {
+        // An enclosing bracket on this thread is already measuring this
+        // work, so folding here too would charge the same nanoseconds
+        // twice. That is not hypothetical: a search TVF invoked through
+        // SQL runs its kernel inline inside the plan root's poll, and
+        // both brackets reported it — measured at roughly 59% of what a
+        // vector query through the TVF appeared to cost, against the
+        // identical operation called directly.
+        if outer_bracket_active() {
+            return;
+        }
         self.kernel_cpu_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
@@ -480,6 +490,51 @@ pub(crate) fn timed_kernel<T>(
     value
 }
 
+thread_local! {
+    /// Depth of live outer CPU brackets on this thread.
+    ///
+    /// `MeteredExec` brackets a whole DataFusion poll, and DataFusion is
+    /// pull-based, so that poll synchronously drives the operator subtree
+    /// beneath it — including the search kernels, which bracket their own
+    /// sections. Tokio runs one task at a time per thread, so a raised
+    /// depth means exactly "this thread is already inside a bracket that
+    /// covers whatever runs next", and the inner folds must stand down
+    /// and let the outermost one report.
+    ///
+    /// This lives here rather than beside `MeteredExec` because the fold
+    /// it guards is here: every CPU nanosecond reaches the collector
+    /// through [`OpStatsCollector::add_kernel_cpu_ns`], whether it came
+    /// from `timed_kernel` or from a `timed_section` value a caller
+    /// folded by hand. Gating one choke point covers them all.
+    static OUTER_BRACKET_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// True while an enclosing CPU bracket on this thread is already
+/// measuring, so an inner fold would double-charge.
+pub(crate) fn outer_bracket_active() -> bool {
+    OUTER_BRACKET_DEPTH.with(|d| d.get()) > 0
+}
+
+/// Marks this thread as inside an outer CPU bracket until dropped.
+///
+/// Restores the previous depth on drop, unwind included: a poll that
+/// panicked out of a raised depth would otherwise leave the thread
+/// permanently silenced, and every later query scheduled onto that worker
+/// would fold nothing.
+pub(crate) struct OuterBracketGuard(u32);
+
+impl OuterBracketGuard {
+    pub(crate) fn enter() -> Self {
+        Self(OUTER_BRACKET_DEPTH.with(|d| d.replace(1)))
+    }
+}
+
+impl Drop for OuterBracketGuard {
+    fn drop(&mut self) {
+        OUTER_BRACKET_DEPTH.with(|d| d.set(self.0));
+    }
+}
+
 /// Bracket one synchronous section with the thread-CPU clock, gated on
 /// [`metering_active`] so an unmetered process pays one relaxed load and
 /// no procfs reads. For the superfile layers, which have no collector —
@@ -518,6 +573,43 @@ mod tests {
         assert_eq!(value, 7);
         assert_eq!(stats.fts_postings_bytes, 123);
         assert!(current().is_none(), "scope uninstalls its collector");
+    }
+
+    #[test]
+    fn an_inner_fold_stands_down_inside_an_outer_bracket() {
+        // `MeteredExec` brackets a whole DataFusion poll, and that poll
+        // drives the search kernels inline — they bracket their own
+        // sections, so without this both fold the same nanoseconds. It was
+        // roughly 59% of what a vector query through the SQL TVF appeared
+        // to cost against the identical direct call.
+        let (_, stats) = with_op_stats(|| {
+            let c = current().expect("collector installed");
+            c.add_kernel_cpu_ns(100);
+            {
+                let _outer = OuterBracketGuard::enter();
+                c.add_kernel_cpu_ns(500);
+            }
+            c.add_kernel_cpu_ns(7);
+        });
+        assert_eq!(
+            stats.kernel_cpu_ns, 107,
+            "the fold inside the outer bracket is the outer bracket's to \
+             report; folds resume once it drops"
+        );
+    }
+
+    #[test]
+    fn an_outer_bracket_restores_its_depth_on_unwind() {
+        // A poll that panicked out of a raised depth would silence every
+        // later query scheduled onto that worker.
+        let _ = catch_unwind(|| {
+            let _outer = OuterBracketGuard::enter();
+            panic!("poll blew up");
+        });
+        assert!(
+            !outer_bracket_active(),
+            "the guard must restore the depth even when the poll unwinds"
+        );
     }
 
     #[test]

@@ -1394,9 +1394,9 @@ impl SupertableReader {
                         .token_match(&column_arc, &refs, BoolMode::And)
                         .await
                         .map_err(fts_read_error)?;
-                    // The prune pass's posting walk. The verify pass's
-                    // row reads count through the take path's own
-                    // collector accounting below.
+                    // The prune pass's posting walk. The verify pass's own
+                    // decode is folded into `rows_materialized` below; its
+                    // byte and range legs ride the take path's accounting.
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
                         stats.add_planned_read_ranges(work.planned_ranges);
@@ -1410,10 +1410,9 @@ impl SupertableReader {
                 // The verify pass — candidate decode + string compare — is
                 // this query's dominant CPU (a token-less value decodes the
                 // whole column), so it is bracketed like any other kernel.
-                // The warm take runs synchronously and is inside the bracket;
-                // the cold take awaits I/O, so only its post-fetch decode
-                // portion registers on this thread's clock, which is the
-                // on-CPU share and exactly what should.
+                // Only the warm take is inside this bracket; the cold arm's
+                // decode is not separable from the fetch it is interleaved
+                // with, which the comment on that arm explains.
                 let warm_batch = op_stats::timed_kernel(&op_stats, || {
                     if r.can_take_by_local_doc_ids() {
                         r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
@@ -1436,6 +1435,12 @@ impl SupertableReader {
                         .await
                         .map_err(|e| QueryError::Execute(e.to_string()))?,
                 };
+                // The verify decode materialized one row per candidate,
+                // on either arm. Folding it here rather than per-arm keeps
+                // the count invariant to which take served the batch.
+                if let Some(stats) = &op_stats {
+                    stats.add_rows_materialized(candidates.len() as u64);
+                }
                 let hits = op_stats::timed_kernel(&op_stats, || {
                     let values = batch
                         .column(0)

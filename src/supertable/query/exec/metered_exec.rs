@@ -25,7 +25,9 @@
 //! neither alone is enough: DataFusion spawns a task per partition, so a
 //! root-only bracket misses work under an internal spawn boundary, while a
 //! scan-only bracket misses the aggregation and sort work above it. The
-//! `POLL_DEPTH` guard below keeps the overlap from counting twice. The
+//! shared bracket depth in `op_stats` keeps the overlap from counting
+//! twice — it gates every CPU fold, including the search kernels' own
+//! brackets, which a poll of this node drives inline. The
 //! collector's counters are atomics, so concurrent partitions fold safely.
 //!
 //! Everything the planner asks of this node is delegated to the child. A
@@ -37,7 +39,6 @@
 //! change the query.
 
 use std::{
-    cell::Cell,
     fmt,
     pin::Pin,
     sync::Arc,
@@ -65,27 +66,8 @@ use futures::Stream;
 
 use crate::runtime_metrics::{
     cpu,
-    op_stats::{OpStatsCollector, metering_active},
+    op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
 };
-
-thread_local! {
-    /// Depth of live [`MeteredStream`] polls on this thread.
-    ///
-    /// The node is placed both at the plan root and around each table
-    /// scan, because neither alone is enough: DataFusion spawns a task per
-    /// partition, so a root-only bracket misses every spawned partition,
-    /// while a scan-only bracket misses the aggregation and sort work
-    /// above it. With both, a single-partition plan would poll the scan
-    /// *inside* the root's poll on the same thread and count that time
-    /// twice.
-    ///
-    /// So only the outermost bracket on a given thread measures. On a
-    /// spawned partition the scan is outermost on its own thread and
-    /// counts there; on the coalescing thread the root counts, and the
-    /// nested scan defers to it. Each thread's CPU is attributed exactly
-    /// once.
-    static POLL_DEPTH: Cell<u32> = const { Cell::new(0) };
-}
 
 /// Wraps `input`, metering every partition's poll time into `op_stats`.
 #[derive(Debug)]
@@ -266,18 +248,6 @@ impl ExecutionPlan for MeteredExec {
     }
 }
 
-/// Restores `POLL_DEPTH` on unwind as well as on the normal path. A poll
-/// that panicked out of a raised depth would leave the thread-local set
-/// forever, and every later query polled on that worker would treat its
-/// outermost bracket as nested and bill zero CPU.
-struct PollDepthGuard(u32);
-
-impl Drop for PollDepthGuard {
-    fn drop(&mut self) {
-        POLL_DEPTH.with(|d| d.set(self.0));
-    }
-}
-
 /// Per-poll CPU bracket around one partition's stream.
 struct MeteredStream {
     inner: SendableRecordBatchStream,
@@ -297,10 +267,13 @@ impl Stream for MeteredStream {
         }
         // Nested inside another bracket on this thread: that one is already
         // measuring this poll, so counting here would double-charge it.
-        if POLL_DEPTH.with(|d| d.get()) > 0 {
+        if outer_bracket_active() {
             return Pin::new(&mut self.inner).poll_next(cx);
         }
-        let restore = PollDepthGuard(POLL_DEPTH.with(|d| d.replace(1)));
+        // Raised for the duration of the poll so the kernels this poll
+        // drives stand down; dropped before the fold below, which is this
+        // bracket's own and must not be gated by it.
+        let restore = OuterBracketGuard::enter();
         let start = cpu::thread_cpu_ns();
         let out = Pin::new(&mut self.inner).poll_next(cx);
         let delta = cpu::thread_cpu_delta_ns(start);
