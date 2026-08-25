@@ -7850,8 +7850,9 @@ mod tests {
             let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
                 .expect("assemble ok")
                 .expect("sq16 rows must assemble into a graph");
-            let decoded = crate::superfile::vector::hnsw::decode_hnsw(&bundle, true)
-                .expect("decode data bundle");
+            let decoded =
+                crate::superfile::vector::hnsw::decode_hnsw(&bytes::Bytes::from(bundle), true)
+                    .expect("decode data bundle");
             assert_eq!(
                 decoded.graph.len(),
                 decoded.doc_ids.len(),

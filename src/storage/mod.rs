@@ -30,7 +30,7 @@
 //! specifically, re-reads the pointer to capture the winner's
 //! state, and retries the commit on top of it.
 
-use std::{fmt, ops::Range, sync::Arc, time::SystemTime};
+use std::{fmt, ops::Range, path::PathBuf, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -580,6 +580,16 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     fn usage_meter(&self) -> Arc<UsageMeter> {
         UsageMeter::process_default()
     }
+
+    /// Filesystem path this `uri` maps to, when the provider is backed by a
+    /// local directory (LocalFs). `Some(path)` lets an open-time caller mmap a
+    /// large immutable object zero-copy — sharing one physical page-cache copy
+    /// across processes — instead of assembling it into private heap via
+    /// range-GETs. `None` for object-store backends (S3/Azure/GCS) and test
+    /// doubles; those callers keep the buffered fetch path.
+    fn local_path(&self, _uri: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Convert an object-store LIST result back into the provider-relative key
@@ -722,6 +732,10 @@ impl StorageProvider for PrefixedStorageProvider {
 
     fn usage_meter(&self) -> Arc<UsageMeter> {
         self.inner.usage_meter()
+    }
+
+    fn local_path(&self, uri: &str) -> Option<PathBuf> {
+        self.inner.local_path(&self.prefixed(uri))
     }
 }
 
