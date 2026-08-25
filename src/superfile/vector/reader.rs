@@ -3916,16 +3916,25 @@ impl VectorReader {
                 let (survivor_rows, gather_ns) = match spans {
                     // Warm: slice survivors straight out of the spans
                     // already in hand — a per-survivor pass, so bracketed.
-                    Some(spans) => timed_section(|| {
-                        rerank_cands
-                            .iter()
-                            .zip(&ranges)
-                            .map(|(cand, range)| {
-                                let (base, region) = &spans[&cand.cluster_id];
-                                region.slice(range.start - base..range.end - base)
-                            })
-                            .collect::<Vec<_>>()
-                    }),
+                    Some(spans) => {
+                        let (rows, ns) = timed_section(|| {
+                            rerank_cands
+                                .iter()
+                                .zip(&ranges)
+                                .map(|(cand, range)| {
+                                    let (base, region) =
+                                        spans.get(&cand.cluster_id).ok_or_else(|| {
+                                            VectorError::InconsistentIndex(format!(
+                                                "no warmed survivor span for cluster {}",
+                                                cand.cluster_id
+                                            ))
+                                        })?;
+                                    Ok(region.slice(range.start - base..range.end - base))
+                                })
+                                .collect::<Result<Vec<_>, VectorError>>()
+                        });
+                        (rows?, ns)
+                    }
                     None => get_survivor_ranges_coalesced_async(&self.source, &ranges)
                         .await
                         .map_err(|e| VectorError::LazySource(e.to_string()))?,

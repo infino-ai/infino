@@ -1079,9 +1079,19 @@ impl SupertableWriter {
         // Arrow buffer allocations (rough but good enough); the vector payload is
         // its exact f32 size. The FTS text columns are a subset of the scalar
         // columns, summed separately only to weight the build-scratch reserve.
-        let (scalar_bytes_u64, vector_bytes_u64, fts_bytes_u64) =
-            ingested_byte_legs(&scalar, vectors.iter().map(|v| v.len()).sum(), options);
-        let scalar_bytes = scalar_bytes_u64 as usize;
+        //
+        // The priced legs measure `scalar_no_id` — the caller's own columns,
+        // without the engine-minted `_id`. `update` meters the same shape, so
+        // an update and an equivalent append report identical payload bytes
+        // instead of the update looking artificially cheaper.
+        let (scalar_bytes_u64, vector_bytes_u64, fts_bytes_u64) = ingested_byte_legs(
+            &scalar_no_id,
+            vectors.iter().map(|v| v.len()).sum(),
+            options,
+        );
+        // Buffer accounting is a different question — held memory — and the
+        // buffer owns `scalar`, ids included, so it measures that instead.
+        let scalar_bytes = scalar.get_array_memory_size();
         let vector_bytes = vector_bytes_u64 as usize;
         let fts_bytes = fts_bytes_u64 as usize;
 

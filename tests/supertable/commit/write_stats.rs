@@ -411,6 +411,45 @@ fn an_update_reports_replacement_rows_and_tombstones() {
     );
 }
 
+/// An update's replacement payload and an append of the very same batch
+/// must price identically. Both are one row of the caller's own columns;
+/// the `_id` the engine mints belongs to neither. Append measured the
+/// id-bearing batch until this was pinned, so every update looked
+/// cheaper than the append that wrote the same data.
+#[test]
+fn an_update_and_an_equivalent_append_price_the_same_payload() {
+    let batch = build_title_batch(&["bravo-replacement"]);
+
+    let update_dir = TempDir::new().expect("tempdir");
+    let update_table = seeded_storage_table(&update_dir);
+    let (outcome, update_stats) = with_op_stats(|| {
+        update_table
+            .update(col("title").eq(lit("bravo")), &batch)
+            .expect("update")
+    });
+    assert_eq!(outcome.matched(), 1, "the fixture must match one row");
+
+    let append_dir = TempDir::new().expect("tempdir");
+    let append_table = seeded_storage_table(&append_dir);
+    let ((), append_stats) = with_op_stats(|| {
+        append_table.append(&batch).expect("append");
+    });
+
+    assert_eq!(
+        update_stats.rows_written, append_stats.rows_written,
+        "one replacement row is one written row, same as an append"
+    );
+    assert_eq!(
+        update_stats.scalar_bytes_written, append_stats.scalar_bytes_written,
+        "the same batch must price the same whether it arrives as an \
+         update's replacement or as a plain append"
+    );
+    assert_eq!(
+        update_stats.fts_text_bytes_written, append_stats.fts_text_bytes_written,
+        "and so must its indexed-text leg"
+    );
+}
+
 #[test]
 fn optimize_does_not_re_bill_ingested_rows() {
     // Compaction rewrites rows the caller already paid to ingest; if

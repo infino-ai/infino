@@ -406,8 +406,13 @@ async fn do_apply(
     let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &inner.options)?;
 
     // ---- Step 4: Build the superfile bytes ----
-    // The replacement superfile's build is the update's own CPU, measured
-    // on this thread (the build below is synchronous).
+    // The replacement superfile's build is the update's own CPU. It is
+    // synchronous, and it runs on whichever thread drives this future:
+    // `update` reaches here through `bridge_on_runtime`, so that is the
+    // caller's own thread inside `block_on` — or, with an ambient
+    // multi-thread runtime, a worker already inside `block_in_place`.
+    // Either way no runtime worker is silently starved behind it, and this
+    // thread's clock is the build's on-CPU time.
     let bytes = timed_kernel(&op_stats, || {
         let mut builder = SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
             AppendPhaseError::SuperfileBuild {

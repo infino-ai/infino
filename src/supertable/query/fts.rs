@@ -1425,6 +1425,13 @@ impl SupertableReader {
                 })?;
                 let batch = match warm_batch {
                     Some(batch) => batch,
+                    // Cold: the fetch and its Parquet decode are interleaved
+                    // inside the async reader, so the decode leg is not
+                    // separable here and goes uncharged. Bracketing the await
+                    // itself would be worse than leaving it at zero — a thread
+                    // clock spanning an await bills whatever else the runtime
+                    // ran on this thread to this query. The verify comparison
+                    // below is charged on both arms.
                     None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
                         .await
                         .map_err(|e| QueryError::Execute(e.to_string()))?,

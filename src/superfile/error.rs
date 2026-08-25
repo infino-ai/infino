@@ -241,6 +241,14 @@ pub enum VectorError {
     /// panicking the process.
     #[error("vector compute task dropped its result during {0}")]
     TaskDropped(&'static str),
+
+    /// The warmed cluster-block span map is missing a cluster that the
+    /// rerank shortlist references. An internal inconsistency rather
+    /// than bad user input; surfaced as an error on the same reasoning
+    /// as [`VectorError::TaskDropped`], so one query fails instead of
+    /// the process panicking on a map index.
+    #[error("vector index inconsistency: {0}")]
+    InconsistentIndex(String),
 }
 
 impl VectorError {
