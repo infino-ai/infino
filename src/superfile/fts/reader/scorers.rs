@@ -1834,7 +1834,11 @@ mod tests {
         // Probe in ascending doc order (the cursor advances forward only).
         // doc 50 is absent; doc 100 needs word 0's popcount (rank 1); doc 165
         // needs words 0 and 1 summed (rank 66) — the multi-word path.
-        assert_eq!(cursor.bitset_probe_tf(50), None, "doc 50 absent from bitset");
+        assert_eq!(
+            cursor.bitset_probe_tf(50),
+            None,
+            "doc 50 absent from bitset"
+        );
         assert_eq!(
             cursor.bitset_probe_tf(100),
             Some(3),
