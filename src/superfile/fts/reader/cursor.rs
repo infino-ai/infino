@@ -653,7 +653,7 @@ impl TermCursor {
         for w in presence[..word_idx * 8].chunks_exact(8) {
             rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
         }
-        let below = if bit % 64 == 0 {
+        let below = if bit.is_multiple_of(64) {
             0u64
         } else {
             (1u64 << (bit % 64)) - 1
