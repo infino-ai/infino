@@ -28,6 +28,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use rustix::time::{ClockId, clock_gettime};
+
 /// Process stat file containing cumulative user/system CPU ticks.
 const PROC_SELF_STAT: &str = "/proc/self/stat";
 /// POSIX clock-tick query used once per process.
@@ -84,17 +87,37 @@ pub fn cpu_seconds_since(start_ns: Option<u128>) -> Option<f64> {
     Some(end.saturating_sub(start) as f64 / NS_PER_SEC as f64)
 }
 
-/// Thread-local schedstat path (Linux): first field is this thread's
-/// cumulative on-CPU nanoseconds.
-const PROC_THREAD_SELF_SCHEDSTAT: &str = "/proc/thread-self/schedstat";
-
-/// The calling thread's own on-CPU nanoseconds (ns resolution, unlike the
-/// process-wide tick counter), or `None` off Linux procfs. Two reads
-/// bracket one synchronous kernel section for per-query CPU attribution;
-/// only valid when both reads happen on the same thread.
+/// The calling thread's own on-CPU nanoseconds, or `None` where no
+/// per-thread CPU clock exists. Two reads bracket one synchronous kernel
+/// section for per-query CPU attribution; only valid when both reads
+/// happen on the same thread.
+///
+/// Reads `CLOCK_THREAD_CPUTIME_ID` rather than
+/// `/proc/thread-self/schedstat`. procfs prints the scheduler's stored
+/// `sum_exec_runtime` without refreshing it first, so for a thread that
+/// is currently running the value is stale until the next scheduler tick
+/// — measured on this host as exactly 1 ms steps. That made any bracket
+/// shorter than a tick read either 0 or a full millisecond, and made a
+/// bracket straddling a tick collect whatever else had run on the thread
+/// before it, so the estimate drifted toward "CPU accrued during the
+/// wall-clock windows the brackets covered" rather than "CPU this
+/// section burned". The POSIX clock is updated when it is read, so it
+/// resolves the section actually bracketed. It is also a vDSO read
+/// rather than opening and parsing a procfs file, which matters because
+/// the meter brackets every poll of every partition.
+#[cfg(target_os = "linux")]
 pub(crate) fn thread_cpu_ns() -> Option<u128> {
-    let raw = fs::read_to_string(PROC_THREAD_SELF_SCHEDSTAT).ok()?;
-    raw.split_whitespace().next()?.parse().ok()
+    let ts = clock_gettime(ClockId::ThreadCPUTime);
+    let secs = u128::try_from(ts.tv_sec).ok()?;
+    let nanos = u128::try_from(ts.tv_nsec).ok()?;
+    Some(secs * NS_PER_SEC + nanos)
+}
+
+/// No per-thread CPU clock: every bracket reports zero rather than an
+/// error, the same contract [`thread_cpu_delta_ns`] documents.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn thread_cpu_ns() -> Option<u128> {
+    None
 }
 
 /// On-CPU nanoseconds this thread accrued since `start` (a prior
@@ -148,6 +171,43 @@ mod tests {
     const TEST_WORKER_BUSY_WINDOW: Duration = Duration::from_millis(50);
     /// Minimum process CPU seconds from exited workers.
     const TEST_MIN_EXITED_WORKER_CPU_S: f64 = 0.01;
+    /// Busy window short enough that a tick-quantized clock could not
+    /// resolve it at all.
+    const SUB_TICK_BUSY_WINDOW: Duration = Duration::from_micros(100);
+    /// One scheduler tick at the common `CONFIG_HZ=1000`, in ns — the
+    /// granularity the old schedstat reading was pinned to.
+    const NS_PER_SCHEDULER_TICK: u64 = 1_000_000;
+
+    /// The per-thread clock must resolve work far shorter than a
+    /// scheduler tick. `/proc/thread-self/schedstat` prints a value the
+    /// scheduler refreshes only at ticks, so this same section read
+    /// either 0 or a full millisecond there — measured at exactly 1 ms
+    /// steps — which is what let short brackets collect a whole tick of
+    /// whatever else had run on the thread. Guards against going back.
+    #[test]
+    fn the_thread_clock_resolves_sub_tick_work() {
+        let Some(start) = thread_cpu_ns() else {
+            return;
+        };
+        let t = Instant::now();
+        let mut acc = 0u64;
+        while t.elapsed() < SUB_TICK_BUSY_WINDOW {
+            for i in 0..TEST_BUSY_INNER_ITERS {
+                acc = acc.wrapping_add(i.wrapping_mul(TEST_BUSY_MIX_CONST));
+            }
+        }
+        black_box(acc);
+        let measured = thread_cpu_delta_ns(Some(start));
+        assert!(
+            measured > 0,
+            "a busy section must register on-CPU time, not round to zero"
+        );
+        assert!(
+            measured < NS_PER_SCHEDULER_TICK,
+            "a {SUB_TICK_BUSY_WINDOW:?} section must not read as a whole \
+             scheduler tick; got {measured}ns"
+        );
+    }
     #[test]
     fn on_cpu_time_excludes_sleep() {
         let Some(start_busy) = thread_cpu_ns() else {

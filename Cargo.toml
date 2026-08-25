@@ -131,6 +131,11 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
+# Safe `clock_gettime` wrapper, for the per-thread CPU clock the per-op
+# meter brackets with. Already in the dependency graph (tempfile, fs4),
+# so this adds a direct edge rather than new supply-chain surface, and
+# its safe API keeps the syscall out of `unsafe`.
+rustix = { version = "1", features = ["time"] }
 static_assertions = "1"
 
 # Tokenization: UAX#29 word segmentation for the Unicode-aware standard
