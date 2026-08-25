@@ -175,15 +175,20 @@ const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 /// Explicit caller `nprobe` overrides; the per-run width sweep keeps the
 /// trade measured.
 const FILTERED_USER_CELL_NPROBE: usize = 4;
-/// Cells the UNDRAINED probe may widen to under the near-tie slack.
+/// Cells the UNDRAINED probe may widen to under the near-tie slack,
+/// COSINE columns only.
 ///
 /// Bounds the one path with no measurement behind it: until the drain
 /// stamps a width law, nothing has looked at this table's geometry, and
 /// the shared one-cell default is calibrated for planted clusters.
 /// Real embeddings need more — recall@10 0.623 -> 0.932 at 9.4M Cohere,
-/// 0.367 -> 0.844 at 200K — and the widening is bounded so an undrained
-/// table cannot fan out across the grid while it waits for `optimize()`.
-/// Drained serving never reads this: it pins the stamped width.
+/// 0.367 -> 0.844 at 200K, both cosine — and the widening is bounded so
+/// an undrained table cannot fan out across the grid while it waits for
+/// `optimize()`. Non-cosine metrics keep the one-cell default: the
+/// near-tie window is metric-sensitive, and under L2 it admits second
+/// cells on decisive geometry (measured +100% warm p90 on synthetic
+/// l2sq for zero recall gain). Drained serving never reads this: it
+/// pins the stamped width.
 const UNDRAINED_CELL_NPROBE_MAX: usize = 8;
 
 // The admit window keeps the shared
@@ -2868,7 +2873,7 @@ impl SupertableReader {
                     nprobe_max: FILTERED_USER_CELL_NPROBE,
                     ..CellRoutingParams::default()
                 }
-            } else {
+            } else if metric == Metric::Cosine {
                 // UNDRAINED tail: no drain has run, so no law has been
                 // stamped and nothing has measured this table's geometry.
                 // The shipped one-cell probe is calibrated against
@@ -2882,6 +2887,18 @@ impl SupertableReader {
                     nprobe_max: UNDRAINED_CELL_NPROBE_MAX,
                     ..CellRoutingParams::default()
                 }
+            } else {
+                // Non-cosine UNDRAINED tail keeps the one-cell default.
+                // The near-tie window (`τ = d*·(1+slack)`) is
+                // metric-sensitive: under L2 the second-nearest cells sit
+                // within the window on decisive geometry far more often
+                // than under cosine, so the widened cap fires where it
+                // buys nothing -- measured +100% warm p90 on the synthetic
+                // l2sq lane (5.40 -> 10.81 ms) at unchanged ~0.99 recall.
+                // The collapse the cap exists to cover (0.367 / 0.623)
+                // was measured on cosine embeddings only; widening another
+                // metric's undrained tail takes its own measurement first.
+                CellRoutingParams::default()
             };
             // Per-table probe-width law: when the drain calibrated one and
             // the caller passed nothing, the law's width for this `k` acts
