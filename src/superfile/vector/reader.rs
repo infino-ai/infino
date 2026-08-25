@@ -3270,8 +3270,11 @@ impl VectorReader {
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
         // 3. Rotate query once for the 1-bit code estimator.
-        let mut q_rot = vec![0f32; col.dim];
-        col.rot.apply(query, &mut q_rot);
+        let (q_rot, rot_ns) = timed_section(|| {
+            let mut q_rot = vec![0f32; col.dim];
+            col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
 
         // 4. Probe the centroid-scored clusters through the shared tail
         //    (also used by the externally-selected
@@ -3290,6 +3293,7 @@ impl VectorReader {
         let (hits, mut tally) = self
             .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await?;
+        tally.kernel_cpu_ns += rot_ns;
         // The centroid + cluster-index span above was one planned range.
         tally.ranges_requested += 1;
         Ok((hits, tally))
@@ -3346,8 +3350,11 @@ impl VectorReader {
             .range_async(idx_start..idx_end)
             .await
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        let mut q_rot = vec![0f32; col.dim];
-        col.rot.apply(query, &mut q_rot);
+        let (q_rot, rot_ns) = timed_section(|| {
+            let mut q_rot = vec![0f32; col.dim];
+            col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
         // No inverse-selectivity rerank inflation on the fan path: the
         // shortlist heap admits MATCHING rows only (the allow test runs
@@ -3372,6 +3379,7 @@ impl VectorReader {
         let (hits, mut tally) = self
             .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await?;
+        tally.kernel_cpu_ns += rot_ns;
         // The cluster-index fetch above was one planned range.
         tally.ranges_requested += 1;
         Ok((hits, tally))
@@ -3446,6 +3454,19 @@ impl VectorReader {
             return Ok((Vec::new(), ProbeTally::default()));
         }
 
+        // One rotation for every probed cell: it is seeded once per column,
+        // table-wide (that is what makes estimates comparable across cells),
+        // so recomputing it per cell — as this path used to — repeated the
+        // same O(dim^2) transform once per probed cell, unmetered. Hoisted
+        // and bracketed, mirroring the scan path's shared rotation.
+        let (q_rot_shared, rot_ns) = timed_section(|| {
+            let first_col = &self.columns[per_cell[0].0];
+            let mut q_rot = vec![0f32; first_col.dim];
+            first_col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
+        let q_rot_shared = &q_rot_shared;
+
         // Probe the selected cells CONCURRENTLY — the same wave shape the
         // supertable's cross-superfile fan-out (and FTS) already uses, one
         // level down. A width sweep selects many cells inside one packed
@@ -3479,10 +3500,8 @@ impl VectorReader {
                     .range_async(idx_start..idx_end)
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                let mut q_rot = vec![0f32; col.dim];
-                col.rot.apply(query, &mut q_rot);
                 let ctx = ProbeCtx {
-                    q_rot: &q_rot,
+                    q_rot: q_rot_shared,
                     k,
                     rerank_mult,
                     allow: cell_allow,
@@ -3513,6 +3532,7 @@ impl VectorReader {
             .try_collect()
             .await?;
         let mut tally = ProbeTally::default();
+        tally.kernel_cpu_ns += rot_ns;
         for (_, cell_tally) in &per_cell {
             tally.cells_scanned += cell_tally.cells_scanned;
             tally.candidates_scanned += cell_tally.candidates_scanned;
@@ -3520,12 +3540,18 @@ impl VectorReader {
             tally.rows_reranked += cell_tally.rows_reranked;
             tally.kernel_cpu_ns += cell_tally.kernel_cpu_ns;
         }
-        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
-        // Distance ascending (smaller = closer), matching every other vector
-        // search path. Descending here kept the farthest k hits and collapsed
-        // packed-shard recall to ~0.
-        merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        merged.truncate(k);
+        // The cross-cell merge is this query's CPU too.
+        let (merged, merge_ns) = timed_section(|| {
+            let mut merged: Vec<(u32, f32)> =
+                per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
+            // Distance ascending (smaller = closer), matching every other
+            // vector search path. Descending here kept the farthest k hits
+            // and collapsed packed-shard recall to ~0.
+            merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            merged.truncate(k);
+            merged
+        });
+        tally.kernel_cpu_ns += merge_ns;
         Ok((merged, tally))
     }
 
@@ -3624,8 +3650,12 @@ impl VectorReader {
         // ~60-cell width sweep the repeated 768x768 applies measured
         // ~1.3ms of wall per query.
         let first_col = &self.columns[per_cell[0].0];
-        let mut q_rot_shared = vec![0f32; first_col.dim];
-        first_col.rot.apply(query, &mut q_rot_shared);
+        let (q_rot_shared, rot_ns) = timed_section(|| {
+            let mut q_rot = vec![0f32; first_col.dim];
+            first_col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
+        outcome.kernel_cpu_ns += rot_ns;
         let q_rot_shared = &q_rot_shared;
         let cell_scans = per_cell.into_iter().filter_map(|(cell_idx, base, locals)| {
             let col = &self.columns[cell_idx];
@@ -3674,10 +3704,16 @@ impl VectorReader {
                     kernel_cpu_ns: 0,
                 };
                 // Warm fast path: every prefix resident -> defer rerank.
-                let prefix_blocks: Option<Vec<Bytes>> = prefix_ranges
-                    .iter()
-                    .map(|range| self.source.try_get_range_sync(range.clone()))
-                    .collect();
+                // The resident-range assembly is a real memcpy per cell
+                // (codes + doc-ids blocks), so it counts as this query's
+                // CPU like the scan it feeds.
+                let (prefix_blocks, fetch_ns) = timed_section(|| {
+                    prefix_ranges
+                        .iter()
+                        .map(|range| self.source.try_get_range_sync(range.clone()))
+                        .collect::<Option<Vec<Bytes>>>()
+                });
+                tally.kernel_cpu_ns += fetch_ns;
                 let rabitq_only = matches!(col.rerank_codec, RerankCodec::RabitqOnly);
                 if let (Some(blocks), false) = (prefix_blocks, rabitq_only) {
                     let ctx = ProbeCtx {
