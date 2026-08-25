@@ -785,7 +785,12 @@ fn build_centroid_router(
     let mut node_map: Vec<(usize, u32)> = Vec::new();
     for (si, reader) in readers.iter().enumerate() {
         let Some(vr) = reader.vec() else { continue };
-        let sfid = superfiles[si].superfile_id;
+        // Checked access: a concurrent optimize can shift the reader/superfile
+        // set while the router builds; skip a missing entry rather than panic.
+        let Some(sf) = superfiles.get(si) else {
+            continue;
+        };
+        let sfid = sf.superfile_id;
         for (flat, mut vec) in vr
             .global_fine_cluster_vectors(column, section, sfid)
             .map_err(|e| QueryError::Execute(e.to_string()))?
@@ -2788,11 +2793,28 @@ impl SupertableReader {
             warn_hnsw_no_resident_graph(column, manifest.slow_vector_state_graphs_blob().is_some());
             // fall through to the ivf scan below
         }
+        // The centroid router ranks by cosine (unit-normalized centroids, a
+        // -dot scorer), so it is only correct for a Cosine column. A NegDot or
+        // L2Sq table falls through to the stamped router rather than being
+        // mis-ranked; per-metric centroid scoring is a router-productionization
+        // follow-on.
+        let centroid_graph_metric_ok = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .is_some_and(|vc| {
+                matches!(
+                    vc.metric,
+                    crate::superfile::vector::distance::Metric::Cosine
+                )
+            });
         if !filtered
             && hidden_vector_index
             && vcfg.search_mode == config::VectorSearchMode::Ivf
             && vcfg.ivf_router == config::IvfRouter::CentroidGraph
             && vcfg.global_fine_fanout > 0
+            && centroid_graph_metric_ok
         {
             return self
                 .global_fine_fanout(
