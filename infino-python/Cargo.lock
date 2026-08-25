@@ -2151,6 +2151,7 @@ dependencies = [
  "rayon",
  "roaring",
  "rustc-hash",
+ "rustix",
  "serde",
  "serde_json",
  "static_assertions",
