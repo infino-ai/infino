@@ -2308,17 +2308,18 @@ impl SupertableReader {
                 return Some(Arc::clone(sections));
             }
         }
-        let sections = match fetch_graph_sections(storage.as_ref(), &reference).await {
-            Ok(sections) => Arc::new(sections),
-            Err(error) => {
-                tracing::warn!(
-                    "hnsw graph sections {} unavailable ({error}); falling back to \
+        let sections =
+            match fetch_graph_sections(storage.as_ref(), &reference, /* need_sq8 */ true).await {
+                Ok(sections) => Arc::new(sections),
+                Err(error) => {
+                    tracing::warn!(
+                        "hnsw graph sections {} unavailable ({error}); falling back to \
                      the ivf scan",
-                    reference.uri
-                );
-                return None;
-            }
-        };
+                        reference.uri
+                    );
+                    return None;
+                }
+            };
         // Publish under the cache lock. The gate makes this the only in-flight
         // hydration, so it installs the uri it just fetched.
         {

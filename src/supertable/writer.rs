@@ -7914,7 +7914,8 @@ async fn build_hnsw_graph_ref(
     // Incremental append: extend the prior persisted graph with only the new
     // rows, cloning it (fetch + decode) rather than mutating a serving graph.
     if let Some(prior_ref) = manifest.slow_vector_state_graphs_blob()
-        && let Ok(sections) = slow_vector_state::fetch_graph_sections(storage, prior_ref).await
+        && let Ok(sections) =
+            slow_vector_state::fetch_graph_sections(storage, prior_ref, /* need_sq8 */ false).await
         && let Some(prior_data) = sections.data
     {
         let prior_count = prior_data.doc_ids.len();
@@ -9175,11 +9176,15 @@ mod tests {
         let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
             .await
             .expect("full build registers a graph");
-        let prior = slow_vector_state::fetch_graph_sections(storage.as_ref(), &ref1)
-            .await
-            .expect("fetch built graph")
-            .data
-            .expect("data graph present after full build");
+        let prior = slow_vector_state::fetch_graph_sections(
+            storage.as_ref(),
+            &ref1,
+            /* need_sq8 */ false,
+        )
+        .await
+        .expect("fetch built graph")
+        .data
+        .expect("data graph present after full build");
         assert!(
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"

@@ -643,11 +643,14 @@ pub(crate) struct ResidentGraphSections {
 pub(crate) async fn fetch_graph_sections(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
+    need_sq8: bool,
 ) -> Result<ResidentGraphSections, SlowVectorStateError> {
     let (raw, mmap_backed) = fetch_graph_section(storage, reference).await?;
-    // Serve the resident SQ8 walk plane only when SQ8-walk serving is enabled;
-    // otherwise serving walks on Sq16 and the plane stays empty.
-    let sq8_walk = config::global().vector.hnsw_sq8_walk;
+    // Serve the resident SQ8 walk plane only when SQ8-walk serving is enabled
+    // AND the caller needs it. The drain/incremental-append maintenance path
+    // hydrates the graph but never walks the SQ8 plane, so it passes
+    // `need_sq8 = false` and skips the plane build entirely.
+    let sq8_walk = need_sq8 && config::global().vector.hnsw_sq8_walk;
     // Decoding faults the (mmap-backed) plane pages in and parses the graph — a
     // CPU/IO wave that must stay off the tokio workers (the runtime
     // anti-pattern), so it runs on the blocking pool. On a mapped bundle the
