@@ -22,7 +22,11 @@
 //! the pool width (`n_shards ≤ n_threads`); intra-shard work fills cores
 //! as shards drain.
 
+use std::sync::Arc;
+
 use rayon::{ThreadPool, prelude::*};
+
+use crate::runtime_metrics::op_stats::{OpStatsCollector, timed_kernel};
 
 /// Run shard build tasks on `pool`, preserving input order.
 ///
@@ -63,4 +67,33 @@ where
         return Ok(Vec::new());
     }
     tasks.par_iter().map(&build_one).collect()
+}
+
+/// [`fanout_shards`] with each task's on-CPU time folded into `op_stats`.
+///
+/// The bracket sits *inside* the per-task closure, on the pool thread that
+/// runs it — the calling thread blocks in `install` for the whole fan-out,
+/// so a bracket around the call would measure nothing. Concurrent tasks
+/// fold concurrently; the collector's counters are atomics.
+///
+/// Use this for shard builds that are a caller op's own work (an append's
+/// commit build, a vector commit's drain-pack). Maintenance fan-outs
+/// (hidden-index drain merges, compaction) keep the unmetered variant —
+/// their cost is deliberately not attributed to any op.
+pub(crate) fn fanout_shards_metered<T, O, E, F>(
+    pool: &ThreadPool,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    tasks: &[T],
+    build_one: F,
+) -> Result<Vec<O>, E>
+where
+    T: Sync,
+    O: Send,
+    E: Send,
+    F: Fn(&T) -> Result<O, E> + Sync,
+{
+    let stats = op_stats.clone();
+    fanout_shards(pool, tasks, move |task| {
+        timed_kernel(&stats, || build_one(task))
+    })
 }

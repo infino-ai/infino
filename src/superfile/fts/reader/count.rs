@@ -366,21 +366,26 @@ impl FtsReader {
         if !header_ranges.is_empty() {
             let fetched = self.fetch_term_postings(&header_ranges).await?;
             work.planned_ranges += header_ranges.len() as u64;
-            for (fetched_idx, &slot) in pfor_slots.iter().enumerate() {
-                let header = fetched.get(fetched_idx).ok_or_else(|| {
-                    FtsError::Read(ReadError::MalformedVersion(
-                        "term_dfs: fetched fewer headers than requested".into(),
-                    ))
-                })?;
-                work.postings_bytes += header.len() as u64;
-                let header_bytes = header.as_ref();
-                if header_bytes.len() < U32_BYTES {
-                    return Err(FtsError::Read(ReadError::MalformedVersion(
-                        "term_dfs: short postings header".into(),
-                    )));
+            let (decoded, decode_ns) = timed_section(|| {
+                for (fetched_idx, &slot) in pfor_slots.iter().enumerate() {
+                    let header = fetched.get(fetched_idx).ok_or_else(|| {
+                        FtsError::Read(ReadError::MalformedVersion(
+                            "term_dfs: fetched fewer headers than requested".into(),
+                        ))
+                    })?;
+                    work.postings_bytes += header.len() as u64;
+                    let header_bytes = header.as_ref();
+                    if header_bytes.len() < U32_BYTES {
+                        return Err(FtsError::Read(ReadError::MalformedVersion(
+                            "term_dfs: short postings header".into(),
+                        )));
+                    }
+                    dfs[slot] = read_u32_le(&header_bytes[0..U32_BYTES]) as u64;
                 }
-                dfs[slot] = read_u32_le(&header_bytes[0..U32_BYTES]) as u64;
-            }
+                Ok(())
+            });
+            decoded?;
+            work.kernel_cpu_ns += decode_ns;
         }
         Ok((dfs, work))
     }

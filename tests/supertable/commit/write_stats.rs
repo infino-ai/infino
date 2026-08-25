@@ -153,6 +153,25 @@ fn write_stats_are_invariant_to_writer_pool_width() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+)]
+fn an_append_reports_its_build_cpu() {
+    // The write meter's CPU leg. Before the metered fan-out existed, every
+    // append reported zero kernel CPU and a consumer pricing that field
+    // billed the per-write floor regardless of size. The sharding fixture
+    // guarantees a real multi-shard build, whose k-means/encode work is far
+    // above the schedstat tick.
+    let batch = sharding_test_batch();
+    let stats = scoped_append(options_with_pool_width(POOL_WIDTHS[2]), &batch);
+    assert!(
+        stats.kernel_cpu_ns > 0,
+        "a {SHARDING_TEST_ROWS}-row append must report its build CPU; got 0"
+    );
+}
+
+#[test]
 fn planned_write_requests_follow_the_data_not_the_shard_count() {
     // The write-side twin of `planned_read_ranges`, and priceable for the
     // same reason: a PUT is 12.5x a GET in the cost model and never

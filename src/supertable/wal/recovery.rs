@@ -275,7 +275,9 @@ async fn drive_to_complete(
 ) -> Result<OneWalOutcome, SweepStep> {
     let (post_doc, post_etag, append_ran) = match (doc.op_kind, doc.state) {
         (OpKind::Update, WalState::Intent) => {
-            match pipeline::run_append_phase(supertable, wal_store, &doc, &etag).await {
+            // Recovery is maintenance — a recovered WAL's build is not any
+            // live op's work, so no collector.
+            match pipeline::run_append_phase(supertable, wal_store, &doc, &etag, None).await {
                 Ok((_, d, e)) => (d, e, true),
                 Err(AppendPhaseError::WalStore(WalStoreError::CasFailed { .. })) => {
                     return Err(SweepStep::CasLost);

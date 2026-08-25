@@ -65,10 +65,11 @@
 //! [`super::io::UsageMeter`] ledger keeps the actuals); the deferred
 //! storage-reclaim sweep and ingest-triggered hidden-index maintenance
 //! (detached tasks never pick up a collector, so they are excluded by
-//! the mint discipline); and per-shard build CPU (the caller's thread
-//! blocks in `pool.install` while the writer pool burns the CPU, so a
-//! calling-thread bracket cannot see it — a consumer's process-level
-//! CPU accounting carries the compute leg).
+//! the mint discipline). Per-shard build CPU IS measured: the bracket
+//! sits inside each shard's pool closure (`fanout_shards_metered`) and
+//! the WAL update's build step, on the thread doing the work — a
+//! calling-thread bracket would see nothing, since the caller blocks in
+//! `pool.install` for the whole fan-out.
 
 use std::{
     cell::RefCell,

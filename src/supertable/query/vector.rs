@@ -2592,6 +2592,9 @@ impl SupertableReader {
                 )
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
+            if let Some(stats) = &self.op_stats {
+                stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
+            }
             // Cold cells rerank in-scan; take their exact hits directly.
             if !scan.hits.is_empty() {
                 let mut tagged = dispatch::tag_hits(entry, scan.hits);
@@ -2615,10 +2618,13 @@ impl SupertableReader {
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
                 let reader = readers[si].as_ref();
-                let (hits, _ns) = reader
+                let (hits, rerank_ns) = reader
                     .vector_rerank_selected(column, query, k, selected, None)
                     .await
                     .map_err(|e| QueryError::Execute(e.to_string()))?;
+                if let Some(stats) = &self.op_stats {
+                    stats.add_kernel_cpu_ns(rerank_ns);
+                }
                 let mut tagged = dispatch::tag_hits(entry, hits);
                 dispatch::attach_stable_ids(reader, entry, &mut tagged, false, &self.op_stats)
                     .await?;

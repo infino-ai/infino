@@ -1407,37 +1407,57 @@ impl SupertableReader {
                 if candidates.is_empty() {
                     return Ok(Vec::new());
                 }
-                let batch = if r.can_take_by_local_doc_ids() {
-                    r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
-                } else {
-                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
+                // The verify pass — candidate decode + string compare — is
+                // this query's dominant CPU (a token-less value decodes the
+                // whole column), so it is bracketed like any other kernel.
+                // The warm take runs synchronously and is inside the bracket;
+                // the cold take awaits I/O, so only its post-fetch decode
+                // portion registers on this thread's clock, which is the
+                // on-CPU share and exactly what should.
+                let warm_batch = op_stats::timed_kernel(&op_stats, || {
+                    if r.can_take_by_local_doc_ids() {
+                        r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
+                            .map(Some)
+                            .map_err(|e| QueryError::Parquet(e.to_string()))
+                    } else {
+                        Ok(None)
+                    }
+                })?;
+                let batch = match warm_batch {
+                    Some(batch) => batch,
+                    None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
                         .await
-                        .map_err(|e| QueryError::Execute(e.to_string()))?
+                        .map_err(|e| QueryError::Execute(e.to_string()))?,
                 };
-                let values = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| {
-                        QueryError::Execute(format!(
-                            "exact_match column '{}' is not LargeUtf8",
-                            column_arc
-                        ))
-                    })?;
-                let mut hits: Vec<SuperfileHit> = candidates
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| {
-                        !values.is_null(*index) && values.value(*index) == value_arc.as_str()
-                    })
-                    .map(|(_, &local_doc_id)| SuperfileHit {
-                        superfile: entry.uri,
-                        local_doc_id,
-                        score: 0.0,
-                        stable_id: None,
-                    })
-                    .collect();
+                let hits = op_stats::timed_kernel(&op_stats, || {
+                    let values = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .ok_or_else(|| {
+                            QueryError::Execute(format!(
+                                "exact_match column '{}' is not LargeUtf8",
+                                column_arc
+                            ))
+                        })?;
+                    Ok::<_, QueryError>(
+                        candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| {
+                                !values.is_null(*index)
+                                    && values.value(*index) == value_arc.as_str()
+                            })
+                            .map(|(_, &local_doc_id)| SuperfileHit {
+                                superfile: entry.uri,
+                                local_doc_id,
+                                score: 0.0,
+                                stable_id: None,
+                            })
+                            .collect::<Vec<SuperfileHit>>(),
+                    )
+                });
+                let mut hits: Vec<SuperfileHit> = hits?;
                 dispatch::apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut hits, now)?;
                 Ok(hits)
             }

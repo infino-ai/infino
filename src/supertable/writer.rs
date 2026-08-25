@@ -88,7 +88,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
-    build::fanout_shards,
+    build::{fanout_shards, fanout_shards_metered},
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
@@ -1500,6 +1500,7 @@ impl SupertableWriter {
         let wal_id = entry.wal_id;
         let ipc_bytes = entry.ipc_bytes.clone();
         let owner = self.inner.handle_id;
+        let drive_op_stats = self.op_stats.clone();
         let drive = async move {
             wal_store
                 .put_arrow(wal_id, ipc_bytes)
@@ -1509,7 +1510,14 @@ impl SupertableWriter {
                 .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let append = pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await;
+            let append = pipeline::run_append_phase(
+                &supertable,
+                &wal_store,
+                &wal_doc,
+                &etag,
+                drive_op_stats,
+            )
+            .await;
             let (_outcome, doc_after_append, etag_after_append) = match append {
                 Ok(appended) => appended,
                 Err(cause) => {
@@ -1824,7 +1832,7 @@ impl SupertableWriter {
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
             let (outputs, cell_hints) =
-                commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric)?;
+                commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric, &self.op_stats)?;
             let build_elapsed = commit_t0.elapsed();
             let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
             let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
@@ -1969,7 +1977,9 @@ impl SupertableWriter {
         // Phase B: user-only build + publish. No hidden incoming build/publish;
         // the hidden cell index is drained later straight from these user
         // superfiles, and pre-drain queries fall back to them.
-        let outputs = fanout_shards(&writer_pool, &shards, |slice| {
+        // The shard build is the append's own CPU — measured on the pool
+        // threads that run it, folded into the op's collector.
+        let outputs = fanout_shards_metered(&writer_pool, &self.op_stats, &shards, |slice| {
             build_one_shard_with_layout(
                 slice.as_slice(),
                 &user_options,
@@ -5570,6 +5580,7 @@ fn commit_shards_via_drain(
     inner: &SupertableInner,
     clusters: &ClusterCentroids,
     metric: Metric,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -5663,18 +5674,23 @@ fn commit_shards_via_drain(
         group_cells_by_packed_shard(assigned_cells, packed_cell_shard_count(&inner.options));
 
     let options = &inner.options;
-    let shard_outputs = fanout_shards(&inner.options.writer_pool, &packed_shards, |task| {
-        let (shard_id, cells) = task;
-        build_one_packed_shard_via_drain(
-            cells,
-            &source_scalar,
-            &vector_views,
-            &local_by_id,
-            options,
-            &vc,
-        )
-        .map(|output| output.map(|output| (*shard_id, output)))
-    })?;
+    let shard_outputs = fanout_shards_metered(
+        &inner.options.writer_pool,
+        op_stats,
+        &packed_shards,
+        |task| {
+            let (shard_id, cells) = task;
+            build_one_packed_shard_via_drain(
+                cells,
+                &source_scalar,
+                &vector_views,
+                &local_by_id,
+                options,
+                &vc,
+            )
+            .map(|output| output.map(|output| (*shard_id, output)))
+        },
+    )?;
     let fanout_elapsed = stage_t0
         .elapsed()
         .saturating_sub(flatten_elapsed)
