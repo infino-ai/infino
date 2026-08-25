@@ -650,11 +650,13 @@ impl Connection {
         Ok(Table { inner })
     }
 
-    /// Drop (unregister) a table.
+    /// Drop a table. `purge` defaults to `true`, which also deletes the
+    /// table's storage subtree after the catalog commit, reclaiming the bytes;
+    /// pass `false` to only unregister it from the catalog and keep the bytes.
     #[napi]
     pub fn drop_table(&self, name: String, purge: Option<bool>) -> Result<()> {
         self.inner
-            .drop_table(&name, purge.unwrap_or(false))
+            .drop_table(&name, purge.unwrap_or(true))
             .map_err(map_err)
     }
 

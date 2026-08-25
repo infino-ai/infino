@@ -308,11 +308,12 @@ impl Connection {
         Ok(Table { inner })
     }
 
-    /// Drop (unregister) a table. `purge=True` also deletes the table's
-    /// storage subtree after the catalog commit; the default leaves the
-    /// bytes in place (readers pinned to a pre-drop snapshot keep
-    /// working).
-    #[pyo3(signature = (name, purge=false))]
+    /// Drop a table. By default (`purge=True`) this also deletes the table's
+    /// storage subtree after the catalog commit, reclaiming the bytes. Pass
+    /// `purge=False` to only unregister the table from the catalog and leave
+    /// its storage in place (e.g. so readers pinned to a pre-drop snapshot
+    /// keep working).
+    #[pyo3(signature = (name, purge=true))]
     fn drop_table(&self, py: Python<'_>, name: &str, purge: bool) -> PyResult<()> {
         py.detach(|| self.inner.drop_table(name, purge))
             .map_err(py_err)
