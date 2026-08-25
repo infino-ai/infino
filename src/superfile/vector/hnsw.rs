@@ -43,6 +43,7 @@ use std::{
     sync::{Mutex, RwLock},
 };
 
+use bytes::Bytes;
 use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
@@ -85,6 +86,39 @@ pub(crate) trait NodeScorer {
     fn score(&self, q: &Self::Prepared, node: u32) -> f32;
 }
 
+/// Backing store for a serving byte plane (the Sq16 code plane or the derived
+/// SQ8 walk plane): either owned heap (`Vec`) or a zero-copy slice of the
+/// memory-mapped graph bundle (`Bytes`). [`Plane::bytes`] hands out a
+/// contiguous `&[u8]` either way, so the scoring / VNNI kernels are unchanged.
+///
+/// The mapped variant keeps its backing `Bytes` alive: when the bundle is
+/// served via `mmap` (the default for local backends, see
+/// `slow_vector_state::fetch_graph_section`), the Sq16 and SQ8 planes are
+/// `slice_ref` views of that one mapping — one physical page-cache copy shared
+/// across every process, and no per-open heap copy of the multi-GiB planes.
+pub(crate) enum Plane {
+    Owned(Vec<u8>),
+    Shared(Bytes),
+}
+
+impl Plane {
+    #[inline]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Plane::Owned(v) => v,
+            Plane::Shared(b) => b,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes().is_empty()
+    }
+}
+
 /// Sq16 node scorer: one `u16` code per dimension on the fixed cosine
 /// grid, scored with the existing fused-dequant [`Sq16Kernel`] under the
 /// [`Metric::NegDot`] convention (`score = −dot`, so smaller is nearer).
@@ -92,8 +126,9 @@ pub(crate) trait NodeScorer {
 /// The codes are stored row-major (`dim × 2` bytes per node) and scored
 /// straight from the code bytes — no per-candidate decode buffer.
 pub(crate) struct Sq16Scorer {
-    /// `len × dim × 2` little-endian `u16` codes, row-major.
-    codes: Vec<u8>,
+    /// `len × dim × 2` little-endian `u16` codes, row-major — owned heap, or a
+    /// zero-copy slice of the mapped graph bundle.
+    codes: Plane,
     dim: usize,
     len: usize,
 }
@@ -110,7 +145,7 @@ impl Sq16Scorer {
             encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
         }
         Self {
-            codes,
+            codes: Plane::Owned(codes),
             dim,
             len: vectors.len(),
         }
@@ -121,6 +156,19 @@ impl Sq16Scorer {
     /// on-disk `full[]` Sq16 plane. No decode/re-encode round trip.
     pub(crate) fn from_codes(codes: Vec<u8>, dim: usize, len: usize) -> Self {
         debug_assert_eq!(codes.len(), len * dim * 2);
+        Self {
+            codes: Plane::Owned(codes),
+            dim,
+            len,
+        }
+    }
+
+    /// Adopt an already-backed Sq16 code plane verbatim: the plane holds
+    /// exactly the `len × dim × 2` on-disk bytes, whether that is a zero-copy
+    /// slice of the mapped bundle (`Plane::Shared`) or an owned buffer. No
+    /// decode/re-encode round trip and, for the shared variant, no heap copy.
+    pub(crate) fn from_plane(codes: Plane, dim: usize, len: usize) -> Self {
+        debug_assert_eq!(codes.len(), len * dim * 2);
         Self { codes, dim, len }
     }
 
@@ -128,14 +176,14 @@ impl Sq16Scorer {
     /// concatenate the prior codes with a freshly-drained delta into one
     /// combined scorer.
     pub(crate) fn codes(&self) -> &[u8] {
-        &self.codes
+        self.codes.bytes()
     }
 
     #[inline]
     fn row(&self, node: u32) -> &[u8] {
         let stride = self.dim * 2;
         let start = node as usize * stride;
-        &self.codes[start..start + stride]
+        &self.codes.bytes()[start..start + stride]
     }
 }
 
@@ -1152,12 +1200,30 @@ impl Hnsw {
     }
 }
 
-/// On-disk magic for a persisted `hnsw` bundle (graph + node→doc-id
-/// map + node-ordered Sq16 plane), the self-contained payload a resident
-/// data index is rebuilt from at open. `02` carries the stamped column
-/// name; an older `01` bundle (no column) decodes to `None` so the query
-/// falls back to ivf until the next drain rebuilds it.
-const HNSW_DATA_MAGIC: &[u8; 8] = b"INFDDG02";
+/// On-disk magic for a persisted `hnsw` data bundle (graph + node→doc-id map +
+/// node-ordered Sq16 plane), the self-contained payload a resident data index
+/// is rebuilt from at open.
+///
+/// `v03` is the current format: it appends the derived SQ8 walk plane (`n ×
+/// dim` high bytes) as a section right after the Sq16 plane, so a mapped bundle
+/// serves *both* planes as zero-copy slices — no per-open derive of the ~0.77
+/// GiB SQ8 plane. `v02` (pre-existing bundles) carries only the Sq16 plane; it
+/// is still decoded, with the SQ8 plane derived on read as before — the
+/// backward-compatible fallback, so no forced rebuild. `v03` and `v02` share
+/// an identical header/doc-id/Sq16/graph framing; they differ only by the
+/// presence of the SQ8 section (and thus the magic). An older `01` bundle (no
+/// column) is neither, so it decodes to `None` and the query falls back to ivf
+/// until the next drain rebuilds it.
+const HNSW_DATA_MAGIC_V2: &[u8; 8] = b"INFDDG02";
+const HNSW_DATA_MAGIC_V3: &[u8; 8] = b"INFDDG03";
+/// Both magics are 8 bytes; the shared byte width of the leading tag.
+const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V3.len();
+/// Byte size of the fixed frame of a data bundle: magic(8) + n(u64) + dim(u32)
+/// + ef(u32) + col_len(u32) + graph_len(u64). The variable-length column name,
+/// doc-id map, Sq16/SQ8 planes, and graph bytes are added on top; naming it
+/// keeps the `encode_hnsw` capacity hint exact so the final `graph_len` extend
+/// after the multi-GiB planes cannot trigger a full-buffer realloc at drain.
+const HNSW_DATA_FIXED_BYTES: usize = HNSW_DATA_MAGIC_LEN + 8 + 4 + 4 + 4 + 8;
 
 /// A `hnsw` resident index rebuilt from a persisted bundle: the Sq16
 /// scorer over the node-ordered code plane, the walkable graph, and the
@@ -1177,16 +1243,20 @@ pub(crate) struct HnswIndex {
     /// column's neighbors.
     pub column: String,
     /// Resident contiguous SQ8 walk plane (`n × dim` bytes) — the high byte of
-    /// each Sq16 code, derived here at load, never persisted (no writer/bundle
-    /// change). Used by [`HnswIndex::search_sq8_refine`] for a cheap int8-VNNI
-    /// walk; the exact ranking comes from the Sq16 refine over `scorer`.
-    pub sq8_plane: Vec<u8>,
+    /// each Sq16 code. On a `v03` bundle it is a zero-copy slice of the mapped
+    /// bundle (persisted as a section); on a `v02` bundle it is derived on read
+    /// into owned heap. Empty when SQ8-walk serving is off, so it costs no
+    /// memory when disabled and serving falls back to the Sq16 walk. Used by
+    /// [`HnswIndex::search_sq8_refine`] for a cheap int8-VNNI walk; the exact
+    /// ranking comes from the Sq16 refine over `scorer`.
+    pub sq8_plane: Plane,
 }
 
-/// Serialize a `hnsw` index to a persistable byte bundle: header,
-/// the `node -> stable doc id` map, the node-ordered Sq16 code plane, and
-/// the graph section. The Sq16 plane is carried inline so the bundle is
-/// self-contained — reopening needs nothing but these bytes.
+/// Serialize a `hnsw` index to a persistable byte bundle (`v03`): header,
+/// the `node -> stable doc id` map, the node-ordered Sq16 code plane, the
+/// derived SQ8 walk plane, and the graph section. Both planes are carried
+/// inline so the bundle is self-contained — reopening needs nothing but these
+/// bytes, and a mapped bundle serves both planes zero-copy.
 pub(crate) fn encode_hnsw(
     sq16_codes: &[u8],
     doc_ids: &[i128],
@@ -1199,9 +1269,12 @@ pub(crate) fn encode_hnsw(
     debug_assert_eq!(sq16_codes.len(), n * dim * 2);
     let graph_bytes = graph.to_bytes();
     let col = column.as_bytes();
-    let mut out =
-        Vec::with_capacity(32 + col.len() + n * 16 + sq16_codes.len() + graph_bytes.len());
-    out.extend_from_slice(HNSW_DATA_MAGIC);
+    // The SQ8 section is `n × dim` bytes (the high byte of each u16 Sq16 code).
+    let sq8_len = n * dim;
+    let mut out = Vec::with_capacity(
+        HNSW_DATA_FIXED_BYTES + col.len() + n * 16 + sq16_codes.len() + sq8_len + graph_bytes.len(),
+    );
+    out.extend_from_slice(HNSW_DATA_MAGIC_V3);
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     // Was reserved / alignment; now the stamped query beam (u32).
@@ -1213,19 +1286,58 @@ pub(crate) fn encode_hnsw(
         out.extend_from_slice(&id.to_le_bytes());
     }
     out.extend_from_slice(sq16_codes);
+    // SQ8 walk plane, derived from the Sq16 plane just written. Persisting it
+    // (rather than deriving on read) lets a mapped bundle serve it as a
+    // zero-copy slice. Shares the derivation with the v02 read-time fallback so
+    // the two can't drift.
+    extend_sq8_plane(&mut out, sq16_codes);
     out.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(&graph_bytes);
+    out
+}
+
+/// Append the derived SQ8 walk plane — the high byte of each little-endian
+/// `u16` Sq16 code — to `out`. The single source of truth for the derivation,
+/// shared by [`encode_hnsw`] (persisting the v03 section) and
+/// [`derive_sq8_plane`] (the v02 read-time fallback) so the two can't drift.
+/// `chunks_exact(2)` elides the per-element bounds check on this hydration loop.
+fn extend_sq8_plane(out: &mut Vec<u8>, sq16_plane: &[u8]) {
+    out.extend(sq16_plane.chunks_exact(2).map(|w| w[1]));
+}
+
+/// The derived SQ8 walk plane as an owned buffer (`n × dim`). A pure function
+/// of the Sq16 plane — used to serve a `v02` bundle that has no persisted SQ8
+/// section.
+fn derive_sq8_plane(sq16_plane: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sq16_plane.len() / 2);
+    extend_sq8_plane(&mut out, sq16_plane);
     out
 }
 
 /// Rebuild a resident [`HnswIndex`] from [`encode_hnsw`].
 /// Returns `None` on any malformation so the caller falls back to the lazy
 /// build or scan path rather than failing the query.
-pub(crate) fn decode_hnsw(bytes: &[u8], sq8_walk: bool) -> Option<HnswIndex> {
+///
+/// `bundle` owns the encoded bytes. When it is the memory-mapped graph bundle
+/// (the default local serving path), the Sq16 plane — and, on a `v03` bundle,
+/// the SQ8 plane — are served as zero-copy [`Bytes::slice_ref`] slices of it,
+/// with no heap copy, and the returned index keeps the mapping alive. A `v02`
+/// bundle has no SQ8 section, so the SQ8 plane is derived on read into owned
+/// heap when SQ8-walk serving is on.
+pub(crate) fn decode_hnsw(bundle: &Bytes, sq8_walk: bool) -> Option<HnswIndex> {
+    let bytes: &[u8] = bundle.as_ref();
     let mut c = Cursor::new(bytes);
-    if c.take(HNSW_DATA_MAGIC.len())? != HNSW_DATA_MAGIC {
+    let magic = c.take(HNSW_DATA_MAGIC_LEN)?;
+    // `v03` carries the SQ8 walk plane as an inline section; `v02` (pre-existing
+    // bundles) does not, so it is derived on read below. Any other tag (e.g. a
+    // legacy `01`) is unsupported → `None`, and the query falls back to ivf.
+    let has_sq8_section = if magic == HNSW_DATA_MAGIC_V3 {
+        true
+    } else if magic == HNSW_DATA_MAGIC_V2 {
+        false
+    } else {
         return None;
-    }
+    };
     let n = c.u64()? as usize;
     let dim = c.u32()? as usize;
     let ef_search = c.u32()? as usize; // 0 on older bundles (was reserved)
@@ -1249,27 +1361,37 @@ pub(crate) fn decode_hnsw(bytes: &[u8], sq8_walk: bool) -> Option<HnswIndex> {
     for _ in 0..n {
         doc_ids.push(c.i128()?);
     }
-    let plane = c.take(n.checked_mul(dim)?.checked_mul(2)?)?.to_vec();
+    // Sq16 plane as a zero-copy slice of `bundle`: `c.take` yields a subslice of
+    // `bytes` (= `bundle.as_ref()`), so `slice_ref` recovers the owning `Bytes`
+    // view without copying — a mapped bundle never copies the ~1.5 GiB plane
+    // into this process's heap.
+    let sq16_slice = c.take(n.checked_mul(dim)?.checked_mul(2)?)?;
+    let sq16_plane = bundle.slice_ref(sq16_slice);
+    // SQ8 walk plane. On `v03` it is the next inline section — sliced zero-copy
+    // out of `bundle` exactly like Sq16; the cursor consumes it either way
+    // (the section is always present) so the graph section that follows is
+    // reachable. On `v02` it is derived on read from the Sq16 high byte. Empty
+    // when SQ8-walk serving is off, so it costs no memory when disabled and
+    // serving falls back to the Sq16 walk.
+    let sq8_plane: Plane = if has_sq8_section {
+        let sq8_slice = c.take(n.checked_mul(dim)?)?;
+        if sq8_walk {
+            Plane::Shared(bundle.slice_ref(sq8_slice))
+        } else {
+            Plane::Owned(Vec::new())
+        }
+    } else if sq8_walk {
+        Plane::Owned(derive_sq8_plane(sq16_slice))
+    } else {
+        Plane::Owned(Vec::new())
+    };
     let graph_len = c.u64()? as usize;
     let graph_bytes = c.take(graph_len)?;
     let graph = Hnsw::from_bytes(graph_bytes)?;
     if graph.len() != n {
         return None;
     }
-    // Resident SQ8 walk plane: the high byte of each little-endian u16 code,
-    // laid out contiguously (n × dim). Reader-side only — derived from the
-    // Sq16 plane, never persisted. Built only when SQ8-walk serving is on;
-    // empty otherwise, so the plane costs no memory when disabled and serving
-    // falls back to the Sq16 walk.
-    let sq8_plane: Vec<u8> = if sq8_walk {
-        // High byte of each little-endian u16 code — the second byte of every
-        // 2-byte pair. `chunks_exact(2)` elides the per-element bounds check on
-        // this `n × dim` hydration loop.
-        plane.chunks_exact(2).map(|w| w[1]).collect()
-    } else {
-        Vec::new()
-    };
-    let scorer = Sq16Scorer::from_codes(plane, dim, n);
+    let scorer = Sq16Scorer::from_plane(Plane::Shared(sq16_plane), dim, n);
     Some(HnswIndex {
         scorer,
         graph,
@@ -1357,7 +1479,7 @@ impl HnswIndex {
         refine_k: usize,
     ) -> Vec<(u32, f32)> {
         let sq8 = Sq8WalkScorer {
-            plane: &self.sq8_plane,
+            plane: self.sq8_plane.bytes(),
             dim: self.dim,
             len: self.graph.len(),
         };
@@ -1412,7 +1534,12 @@ pub(crate) struct GraphBundle {
     /// Largest stable doc id the graph covers (the append-delta boundary).
     pub high_water_id: i128,
     pub centroid_graph: Vec<u8>,
-    pub data_bundle: Option<Vec<u8>>,
+    /// The [`encode_hnsw`] payload, as a zero-copy slice of the input `Bytes`
+    /// (`raw.slice_ref`). When the input is the mapped bundle this is the
+    /// multi-GiB data section with no heap copy — the open-time transient the
+    /// mmap serving path removes; [`decode_hnsw`] then slices the Sq16 and SQ8
+    /// planes straight out of it.
+    pub data_bundle: Option<Bytes>,
 }
 
 /// Read the `(population_key, high_water_id)` header from a bundle's first
@@ -1450,14 +1577,6 @@ fn put_opt_section(out: &mut Vec<u8>, section: Option<&[u8]>) {
     }
 }
 
-fn take_opt_section(c: &mut Cursor<'_>) -> Option<Option<Vec<u8>>> {
-    if c.take(1)?[0] == 0 {
-        return Some(None);
-    }
-    let len = c.u64()? as usize;
-    Some(Some(c.take(len)?.to_vec()))
-}
-
 /// Frame the graph sections into one slow-state blob, stamping the
 /// `(high_water_id, count)` watermark into the fixed-offset header. The
 /// data bundle and its provenance are omitted (a `0` flag) above the
@@ -1481,7 +1600,20 @@ pub(crate) fn encode_graph_bundle(
 /// Parse an [`encode_graph_bundle`] blob into its raw sections + header.
 /// `None` on a bad magic or truncation, so a corrupt bundle degrades to a
 /// fallback.
-pub(crate) fn decode_graph_bundle(bytes: &[u8]) -> Option<GraphBundle> {
+///
+/// `mmap_backed` picks how the large `data_bundle` section is returned:
+/// - `true` (the local serving path, `raw` is the shared file mmap): a
+///   zero-copy `raw.slice_ref` — the multi-GiB payload never touches heap and
+///   the returned index keeps the one mapping alive.
+/// - `false` (remote/object-store, `raw` is a striped *heap* blob): the data
+///   section is copied out into its own `Bytes`, so `raw` — which also holds
+///   the centroid section and framing — is freed once this returns instead of
+///   being pinned for the index's whole lifetime.
+///
+/// The small `centroid_graph` (present at every scale, modest size) is always
+/// copied out into owned heap.
+pub(crate) fn decode_graph_bundle(raw: &Bytes, mmap_backed: bool) -> Option<GraphBundle> {
+    let bytes: &[u8] = raw.as_ref();
     let mut c = Cursor::new(bytes);
     if c.take(GRAPH_BUNDLE_MAGIC.len())? != GRAPH_BUNDLE_MAGIC {
         return None;
@@ -1490,7 +1622,21 @@ pub(crate) fn decode_graph_bundle(bytes: &[u8]) -> Option<GraphBundle> {
     let high_water_id = c.i128()?;
     let centroid_len = c.u64()? as usize;
     let centroid_graph = c.take(centroid_len)?.to_vec();
-    let data_bundle = take_opt_section(&mut c)?;
+    // Optional length-prefixed data-bundle section (`0` flag ⇒ absent). `c.take`
+    // yields a subslice of `bytes` (= `raw`): on the mmap path `slice_ref`
+    // shares that mapping zero-copy; on the heap path we copy it out so `raw`
+    // (the full striped blob) frees.
+    let data_bundle = if c.take(1)?[0] == 0 {
+        None
+    } else {
+        let len = c.u64()? as usize;
+        let section = c.take(len)?;
+        Some(if mmap_backed {
+            raw.slice_ref(section)
+        } else {
+            Bytes::copy_from_slice(section)
+        })
+    };
     Some(GraphBundle {
         population_key,
         high_water_id,
@@ -2392,7 +2538,12 @@ mod tests {
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
         let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256, "emb");
-        let idx = decode_hnsw(&bytes, true).expect("decode bundle");
+        assert_eq!(
+            &bytes[..HNSW_DATA_MAGIC_LEN],
+            HNSW_DATA_MAGIC_V3,
+            "encode_hnsw stamps the v03 data magic"
+        );
+        let idx = decode_hnsw(&Bytes::from(bytes.clone()), true).expect("decode bundle");
         assert_eq!(idx.dim, dim);
         assert_eq!(idx.doc_ids, doc_ids);
         assert_eq!(idx.graph.len(), n);
@@ -2412,18 +2563,89 @@ mod tests {
                 assert_eq!(idx.doc_ids[*node as usize], doc_ids[*node as usize]);
             }
         }
-        assert!(decode_hnsw(b"short", true).is_none());
+        assert!(decode_hnsw(&Bytes::from_static(b"short"), true).is_none());
 
         // A corrupt node count must degrade to None, not drive a huge
         // `with_capacity` alloc-abort. Overwrite the `n` word (right after the
         // 8-byte magic) with an absurd value and confirm the decode declines.
         let mut poisoned = bytes.clone();
-        poisoned[HNSW_DATA_MAGIC.len()..HNSW_DATA_MAGIC.len() + 8]
+        poisoned[HNSW_DATA_MAGIC_LEN..HNSW_DATA_MAGIC_LEN + 8]
             .copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(
-            decode_hnsw(&poisoned, true).is_none(),
+            decode_hnsw(&Bytes::from(poisoned), true).is_none(),
             "a corrupt node count must decode to None, not attempt a giant alloc"
         );
+    }
+
+    /// A `v03` bundle serves the SQ8 plane as a persisted section that is a
+    /// zero-copy slice of the same backing bytes as the Sq16 plane, and a
+    /// pre-existing `v02` bundle (Sq16 only) still decodes with the SQ8 plane
+    /// derived on read — the backward-compatible fallback. Both paths must
+    /// yield byte-identical planes and identical search results.
+    #[test]
+    fn sq8_section_v03_matches_derived_v02() {
+        use crate::superfile::vector::distance::encode_sq16_row;
+        let dim = 24;
+        let n = 400;
+        let vectors = random_unit_vectors(n, dim, 0x5EC7);
+        let stride = dim * 2;
+        let mut codes = vec![0u8; n * stride];
+        for (i, v) in vectors.iter().enumerate() {
+            encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
+        }
+        let doc_ids: Vec<i128> = (0..n as i128).collect();
+        let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+
+        // Current encoder → v03 (SQ8 section present).
+        let v3 = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, "emb");
+        assert_eq!(&v3[..HNSW_DATA_MAGIC_LEN], HNSW_DATA_MAGIC_V3);
+
+        // Synthesize a pre-existing v02 bundle: identical framing but no SQ8
+        // section (Sq16 plane runs straight into the graph section) and the v02
+        // magic. Built by re-laying the wire so the fixture matches exactly what
+        // an old drain wrote.
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(HNSW_DATA_MAGIC_V2);
+        v2.extend_from_slice(&(n as u64).to_le_bytes());
+        v2.extend_from_slice(&(dim as u32).to_le_bytes());
+        v2.extend_from_slice(&128u32.to_le_bytes());
+        let col = b"emb";
+        v2.extend_from_slice(&(col.len() as u32).to_le_bytes());
+        v2.extend_from_slice(col);
+        for &id in &doc_ids {
+            v2.extend_from_slice(&id.to_le_bytes());
+        }
+        v2.extend_from_slice(&codes);
+        let graph_bytes = graph.to_bytes();
+        v2.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
+        v2.extend_from_slice(&graph_bytes);
+
+        let idx_v3 = decode_hnsw(&Bytes::from(v3), true).expect("decode v03");
+        let idx_v2 = decode_hnsw(&Bytes::from(v2), true).expect("decode v02");
+
+        // The SQ8 plane the persisted section carries must equal the one derived
+        // from the Sq16 high byte.
+        let derived = derive_sq8_plane(&codes);
+        assert_eq!(idx_v3.sq8_plane.bytes(), derived.as_slice());
+        assert_eq!(idx_v2.sq8_plane.bytes(), derived.as_slice());
+        assert_eq!(idx_v3.sq8_plane.len(), n * dim);
+
+        // Sq16 plane and searches identical across both bundle versions.
+        assert_eq!(idx_v3.scorer.codes(), idx_v2.scorer.codes());
+        let queries = random_unit_vectors(30, dim, 0x1CE);
+        for q in &queries {
+            let a = idx_v3.search_sq8_refine(q, 10, 64, 32);
+            let b = idx_v2.search_sq8_refine(q, 10, 64, 32);
+            assert_eq!(a, b, "v03 section vs v02 derive diverged");
+        }
+
+        // With SQ8-walk off, a v03 bundle still consumes the section (so the
+        // graph is reachable) and serves correctly with an empty SQ8 plane.
+        let v3_again = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, "emb");
+        let idx_off = decode_hnsw(&Bytes::from(v3_again), false).expect("decode v03 sq8-off");
+        assert!(idx_off.sq8_plane.is_empty());
+        assert_eq!(idx_off.graph.len(), n);
     }
 
     /// SQ8 walk + Sq16 refine returns essentially the same top-k as the Sq16
@@ -2448,7 +2670,7 @@ mod tests {
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
         let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, ef, "emb");
-        let idx = decode_hnsw(&bytes, true).expect("decode bundle");
+        let idx = decode_hnsw(&Bytes::from(bytes), true).expect("decode bundle");
         assert!(
             !idx.sq8_plane.is_empty(),
             "sq8 plane must be built when sq8_walk=true"
@@ -2507,11 +2729,25 @@ mod tests {
         let centroid = vec![1u8, 2, 3, 4, 5];
         let data = vec![9u8; 300];
         let blob = encode_graph_bundle(0xDEAD_BEEF_1234, 987_654_321, &centroid, Some(&data));
-        let got = decode_graph_bundle(&blob).expect("decode full");
-        assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
-        assert_eq!(got.high_water_id, 987_654_321);
-        assert_eq!(got.centroid_graph, centroid);
-        assert_eq!(got.data_bundle.as_deref(), Some(&data[..]));
+        // Both modes recover identical sections; only the data-section backing
+        // differs (zero-copy slice of `raw` vs an owned copy).
+        for mmap_backed in [true, false] {
+            let raw = Bytes::from(blob.clone());
+            let got = decode_graph_bundle(&raw, mmap_backed).expect("decode full");
+            assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
+            assert_eq!(got.high_water_id, 987_654_321);
+            assert_eq!(got.centroid_graph, centroid);
+            assert_eq!(got.data_bundle.as_deref(), Some(&data[..]));
+            // On the heap path the data section must be an independent copy, not
+            // a view into `raw`, so `raw` can be freed.
+            if !mmap_backed {
+                let db = got.data_bundle.as_ref().expect("data present");
+                assert!(
+                    !raw.as_ref().as_ptr_range().contains(&db.as_ptr()),
+                    "heap-path data_bundle must not alias raw"
+                );
+            }
+        }
         // The header reads from the fixed-offset prefix alone (a tiny range
         // GET at settle time — no need for the multi-GiB body).
         assert_eq!(
@@ -2521,11 +2757,11 @@ mod tests {
 
         // Data-less bundle (above the scale ceiling): empty centroid, no data.
         let blob = encode_graph_bundle(0, 0, &[], None);
-        let got = decode_graph_bundle(&blob).expect("decode empty");
+        let got = decode_graph_bundle(&Bytes::from(blob), true).expect("decode empty");
         assert!(got.centroid_graph.is_empty());
         assert!(got.data_bundle.is_none());
 
-        assert!(decode_graph_bundle(b"bad").is_none());
+        assert!(decode_graph_bundle(&Bytes::from_static(b"bad"), true).is_none());
         assert!(graph_bundle_header(b"short").is_none());
     }
 

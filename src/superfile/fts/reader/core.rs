@@ -22,6 +22,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use rustc_hash::FxHashMap;
 
 use super::{
     cursor::{TermCursor, TermMeta},
@@ -1484,7 +1485,7 @@ impl OrCursorSet {
 /// broken by ascending doc_id. Used by `search_multi`'s cross-column
 /// combiner, where the per-column scores have already been weighted
 /// and summed into `scores`.
-pub(super) fn top_k(scores: HashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
+pub(super) fn top_k(scores: FxHashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
     // Iterate in ascending doc_id order so ties resolve deterministically
     // (smaller doc_ids enter the heap first; the strict `score > peek`
     // check below means subsequent equal-score entries don't displace
@@ -2300,7 +2301,7 @@ mod tests {
 
     #[test]
     fn top_k_keeps_highest_scores_with_doc_id_tiebreak() {
-        let mut scores: HashMap<u32, f32> = HashMap::new();
+        let mut scores: FxHashMap<u32, f32> = FxHashMap::default();
         scores.insert(0, 1.0);
         scores.insert(1, 3.0);
         scores.insert(2, 2.0);
@@ -2312,7 +2313,7 @@ mod tests {
 
     #[test]
     fn top_k_smaller_than_k_returns_all_sorted() {
-        let mut scores: HashMap<u32, f32> = HashMap::new();
+        let mut scores: FxHashMap<u32, f32> = FxHashMap::default();
         scores.insert(5, 2.0);
         scores.insert(9, 5.0);
         let out = top_k(scores, 10);

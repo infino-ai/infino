@@ -1052,10 +1052,9 @@ impl FtsReader {
                     let mut packed = 1;
                     let mut score: f32 = 0.0;
                     for cursor in cursors.iter_mut().skip(1) {
-                        cursor.skip_to(candidate);
-                        if cursor.current_doc_id() == candidate {
+                        if let Some(tf) = cursor.bitset_probe_tf(candidate) {
                             idfs[packed] = cursor.idf_x_k1p1;
-                            tfs[packed] = cursor.current_tf() as f32;
+                            tfs[packed] = tf as f32;
                             packed += 1;
                             if packed == 4 {
                                 score += bm25::score_simd_x4(idfs, tfs, norm);
@@ -1221,13 +1220,12 @@ impl FtsReader {
                             if score + remaining_block_ub <= threshold {
                                 break;
                             }
-                            cursor.skip_to(candidate);
-                            if cursor.current_doc_id() == candidate {
-                                score += bm25::score_with_dl_norm_k1(
-                                    cursor.idf_x_k1p1,
-                                    cursor.current_tf(),
-                                    norm,
-                                );
+                            // Locate + score the non-essential without expanding
+                            // a dense block's doc ids: a bit-test + popcount-rank
+                            // tf read on a bitset block, decode-and-locate on a
+                            // PACKED one.
+                            if let Some(tf) = cursor.bitset_probe_tf(candidate) {
+                                score += bm25::score_with_dl_norm_k1(cursor.idf_x_k1p1, tf, norm);
                             }
                             remaining_block_ub -= block_ub;
                         }
@@ -1695,7 +1693,10 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer,
+        builder::FtsBuilder,
+        posting::{ENCODING_BITSET, ENCODING_OFF},
+        reader::BoolMode,
+        tokenize::AsciiLowerTokenizer,
     };
 
     #[tokio::test]
@@ -1779,6 +1780,75 @@ mod tests {
                 "score mismatch: bmm={s_bmm} exhaustive={s_exh}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bitset_probe_tf_reads_correct_tf_across_presence_words() {
+        // Regression for the ranked-OR non-essential probe: `bitset_probe_tf`
+        // locates a doc in a dense (bitset) block by bit-test and reads its
+        // tf by popcount-rank — summing the popcounts of every 64-bit presence
+        // word ahead of the doc's word, then the set bits below it in its own
+        // word. The top-k oracle only exercised a 20-doc block, so every doc
+        // sat in presence word 0 (bit < 64) and the cross-word accumulation
+        // loop never ran. Plant a block where the probed docs sit at bit >= 64
+        // with a tf that differs from the rest, so a wrong cross-word popcount
+        // would land on the wrong tf.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        // `common` is present at doc 0 and docs 100..=165. First-doc 0 word-
+        // aligns the bitset base to 0, so doc 100 -> bit 100 (presence word 1)
+        // and doc 165 -> bit 165 (presence word 2); the 0->100 gap widens the
+        // deltas enough that the block takes the bitset encoding, not PFOR. tf
+        // is 1 everywhere except 3 at doc 100 and 2 at doc 165.
+        for id in 0u32..=165 {
+            let text = match id {
+                0 => "common",
+                100 => "common common common",
+                165 => "common common",
+                101..=164 => "common",
+                _ => "filler", // 1..=99: present docs that don't carry `common`
+            };
+            b.add_doc(0, id, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let mut cursors = r
+            .build_term_cursors(0, &["common"], None, false)
+            .await
+            .expect("build common cursor");
+        let cursor = &mut cursors[0];
+
+        // Guard the test's own premise: the block must be a bitset, else the
+        // probe takes the PACKED fallback and the rank path under test is skipped.
+        let blk = cursor.blocks[0];
+        assert_eq!(
+            cursor.bytes[blk.block_byte_offset + ENCODING_OFF],
+            ENCODING_BITSET,
+            "corpus must produce a bitset block for this test to be meaningful"
+        );
+
+        // Probe in ascending doc order (the cursor advances forward only).
+        // doc 50 is absent; doc 100 needs word 0's popcount (rank 1); doc 165
+        // needs words 0 and 1 summed (rank 66) — the multi-word path.
+        assert_eq!(
+            cursor.bitset_probe_tf(50),
+            None,
+            "doc 50 absent from bitset"
+        );
+        assert_eq!(
+            cursor.bitset_probe_tf(100),
+            Some(3),
+            "tf at doc 100 (bit 100, presence word 1)"
+        );
+        assert_eq!(
+            cursor.bitset_probe_tf(165),
+            Some(2),
+            "tf at doc 165 (bit 165, presence word 2)"
+        );
     }
 
     #[tokio::test]

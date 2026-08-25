@@ -35,11 +35,14 @@ use crate::{
     config,
     storage::{StorageError, StorageProvider},
     superfile::vector::hnsw,
-    supertable::manifest::{
-        SuperfileEntry, VectorSummary,
-        encoding::SummaryWireMode,
-        list::RoutingRef,
-        part::{self, ContentHash, ManifestPart, PartId},
+    supertable::{
+        manifest::{
+            SuperfileEntry, VectorSummary,
+            encoding::SummaryWireMode,
+            list::RoutingRef,
+            part::{self, ContentHash, ManifestPart, PartId},
+        },
+        reader_cache::disk,
     },
 };
 
@@ -554,20 +557,93 @@ pub(crate) async fn write_graph_section(
 }
 
 /// Fetch a graph section written by [`write_graph_section`], verifying its
-/// bytes hash to `reference.content_hash`. Returns the raw section bytes
-/// (the caller decodes them with `hnsw::decode_hnsw` /
-/// `Hnsw::from_bytes`). Striped like every other slow-state fetch. Callers
-/// fall back to the lazy build / scan path on any error — a bad or missing
-/// graph blob must never fail an open or a query.
+/// bytes hash to `reference.content_hash`. Returns the verified section bytes as
+/// a [`Bytes`] handed straight to the decoder (no `to_vec` copy) plus whether
+/// the backing is an `mmap` (the caller decodes with `hnsw::decode_hnsw` /
+/// `Hnsw::from_bytes`).
+///
+/// A local bundle file is loaded as a zero-copy `mmap`-backed `Bytes` (one
+/// faulted read for the hash check, then the mapping is what the resident
+/// graph holds), so the multi-GiB open-time transient never touches heap and N
+/// processes share one physical page-cache copy — the default serving path.
+/// Every non-local backend (`local_path` is `None`, i.e. S3/Azure/GCS) keeps
+/// the striped heap fetch, so remote correctness is unchanged. Callers fall
+/// back to the lazy build / scan path on any error — a bad or missing graph
+/// blob must never fail an open or a query.
+///
+/// The hash verification faults the whole (possibly multi-GiB, mmap-backed)
+/// bundle in synchronously — a CPU/IO wave that must not run on a tokio worker
+/// (the runtime anti-pattern). It runs on the blocking pool, mirroring
+/// [`load_full_state`].
 pub(crate) async fn fetch_graph_section(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
-) -> Result<Vec<u8>, SlowVectorStateError> {
-    let bytes = fetch_blob_striped(storage, &reference.uri, STRIPED_FETCH_CHUNK_BYTES).await?;
-    if ContentHash::of(bytes.as_ref()) != reference.content_hash {
-        return Err(SlowVectorStateError::HashMismatch);
+) -> Result<(Bytes, bool), SlowVectorStateError> {
+    let (bytes, is_mmap) = fetch_graph_bytes(storage, reference).await?;
+    let expected = reference.content_hash;
+    let bytes = spawn_blocking(move || {
+        if ContentHash::of(bytes.as_ref()) != expected {
+            return Err(SlowVectorStateError::HashMismatch);
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(|join_error| {
+        SlowVectorStateError::Parse(format!("graph section hash task failed: {join_error}"))
+    })??;
+    Ok((bytes, is_mmap))
+}
+
+/// Whether an `mmap` failure signals resource exhaustion (`ENOMEM`: address
+/// space, `vm.max_map_count`, or an `mmap` rlimit) rather than a benign,
+/// per-file error. On such a failure the striped heap fallback would pull the
+/// whole bundle into heap — strictly more memory than the mapping that just
+/// failed — so the caller surfaces the error instead of masking the pressure.
+fn is_mmap_resource_exhaustion(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::OutOfMemory
+}
+
+/// The bundle bytes for [`fetch_graph_section`] plus whether the backing is an
+/// `mmap`: `mmap`-backed for a local file (the default), else striped from
+/// storage into a heap buffer for remote backends. A *benign* local mmap
+/// failure (missing/moved file, permissions) is non-fatal — it falls through to
+/// the striped fetch so an open never fails on it. A *resource-exhaustion*
+/// failure (see [`is_mmap_resource_exhaustion`]) is surfaced instead: the
+/// striped fallback would consume strictly more memory than the mapping that
+/// just failed, so masking it would turn mapping pressure into a likely OOM;
+/// the caller then degrades to the ivf scan (serving) or a full rebuild (drain).
+/// The `exists` + `mmap` syscalls run on the blocking pool, off the tokio
+/// workers (the striped remote fetch is async and yields on its own); only the
+/// hash + decode over the map are the heavy CPU/IO wave, also on the pool.
+async fn fetch_graph_bytes(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+) -> Result<(Bytes, bool), SlowVectorStateError> {
+    if let Some(path) = storage.local_path(&reference.uri) {
+        let mapped =
+            spawn_blocking(move || path.exists().then(|| disk::mmap_readonly_bytes(&path)))
+                .await
+                .map_err(|join_error| {
+                    SlowVectorStateError::Parse(format!("graph mmap task failed: {join_error}"))
+                })?;
+        match mapped {
+            Some(Ok(bytes)) => return Ok((bytes, true)),
+            Some(Err(error)) if is_mmap_resource_exhaustion(&error) => {
+                return Err(SlowVectorStateError::Storage(format!(
+                    "graph bundle mmap exhausted resources ({error}); \
+                     refusing the heavier striped heap fetch"
+                )));
+            }
+            Some(Err(error)) => tracing::warn!(
+                uri = reference.uri,
+                %error,
+                "graph bundle mmap failed; falling back to striped heap fetch"
+            ),
+            None => {}
+        }
     }
-    Ok(bytes.to_vec())
+    let bytes = fetch_blob_striped(storage, &reference.uri, STRIPED_FETCH_CHUNK_BYTES).await?;
+    Ok((bytes, false))
 }
 
 /// The graph sections of one published generation, decoded resident. Held
@@ -593,18 +669,33 @@ pub(crate) struct ResidentGraphSections {
 pub(crate) async fn fetch_graph_sections(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
+    need_sq8: bool,
 ) -> Result<ResidentGraphSections, SlowVectorStateError> {
-    let raw = fetch_graph_section(storage, reference).await?;
-    let bundle = hnsw::decode_graph_bundle(&raw)
-        .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
-    // Build the resident SQ8 walk plane only when SQ8-walk serving is enabled
-    // (it costs ~1 byte/dim/row on top of the Sq16 plane); otherwise serving
-    // walks on Sq16 and the plane stays empty.
-    let sq8_walk = config::global().vector.hnsw_sq8_walk;
-    let data = bundle
-        .data_bundle
-        .as_deref()
-        .and_then(|b| hnsw::decode_hnsw(b, sq8_walk));
+    let (raw, mmap_backed) = fetch_graph_section(storage, reference).await?;
+    // Serve the resident SQ8 walk plane only when SQ8-walk serving is enabled
+    // AND the caller needs it. The drain/incremental-append maintenance path
+    // hydrates the graph but never walks the SQ8 plane, so it passes
+    // `need_sq8 = false` and skips the plane build entirely.
+    let sq8_walk = need_sq8 && config::global().vector.hnsw_sq8_walk;
+    // Decoding faults the (mmap-backed) plane pages in and parses the graph — a
+    // CPU/IO wave that must stay off the tokio workers (the runtime
+    // anti-pattern), so it runs on the blocking pool. On a mapped bundle the
+    // Sq16/SQ8 planes are zero-copy slices of `raw` and the returned index keeps
+    // the mapping alive; on the heap path the data section is copied out so
+    // `raw` frees.
+    let (high_water_id, data) = spawn_blocking(move || {
+        let bundle = hnsw::decode_graph_bundle(&raw, mmap_backed)
+            .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
+        let data = bundle
+            .data_bundle
+            .as_ref()
+            .and_then(|b| hnsw::decode_hnsw(b, sq8_walk));
+        Ok::<_, SlowVectorStateError>((bundle.high_water_id, data))
+    })
+    .await
+    .map_err(|join_error| {
+        SlowVectorStateError::Parse(format!("graph bundle decode task failed: {join_error}"))
+    })??;
     if let Some(idx) = &data {
         // Surface the stamped params every time the resident graph hydrates,
         // so serving always shows what a table's graph is actually running.
@@ -618,7 +709,7 @@ pub(crate) async fn fetch_graph_sections(
     }
     Ok(ResidentGraphSections {
         uri: reference.uri.clone(),
-        high_water_id: bundle.high_water_id,
+        high_water_id,
         data,
     })
 }
@@ -739,6 +830,24 @@ mod tests {
             vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
+    }
+
+    #[test]
+    fn mmap_resource_exhaustion_is_distinguished_from_benign_errors() {
+        // Only resource exhaustion (ENOMEM: address space / vm.max_map_count /
+        // rlimit) must be surfaced; the striped heap fallback would use more
+        // memory than the mapping that failed.
+        assert!(is_mmap_resource_exhaustion(&io::Error::from(
+            io::ErrorKind::OutOfMemory
+        )));
+        // Benign per-file failures fall through to the striped fetch so an open
+        // never fails on them.
+        assert!(!is_mmap_resource_exhaustion(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        assert!(!is_mmap_resource_exhaustion(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
     }
 
     /// Dim for the routing-sibling fixture's vector summary.
@@ -911,10 +1020,20 @@ mod tests {
             .expect("republish");
         assert_eq!(reference, again);
 
-        let fetched = fetch_graph_section(&storage, &reference)
+        // LocalFs → `local_path` is `Some`, so this exercises the mmap serving
+        // path; the bytes must round-trip byte-exact through the mapping.
+        let (fetched, is_mmap) = fetch_graph_section(&storage, &reference)
             .await
             .expect("fetch graph section");
-        assert_eq!(fetched, bytes, "graph section must round-trip byte-exact");
+        assert!(
+            is_mmap,
+            "LocalFs graph section must serve from the mmap path"
+        );
+        assert_eq!(
+            fetched.as_ref(),
+            bytes.as_slice(),
+            "graph section must round-trip byte-exact"
+        );
 
         let tampered = RoutingRef {
             uri: reference.uri.clone(),

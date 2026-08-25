@@ -1885,24 +1885,19 @@ impl VectorReader {
         Some((lo, flat - bases[lo]))
     }
 
-    /// Global-fine router scoring (`vector.search_mode = global_fine_centroid`):
-    /// score `query` against EVERY fine centroid of every cell in this superfile,
-    /// sourced from the resident centroid `section` (zero superfile opens —
-    /// the routing scan is a pure RAM op over the page-cache-backed spill).
-    /// Returns `(flat_cluster_id, score)` for all clusters, where the flat id
-    /// is the cumulative-`n_cent` numbering [`Self::resolve_flat_cluster`]
-    /// inverts — so the selected ids feed straight into
-    /// [`Self::search_clusters_async`]. Score is the same SIMD centroid
-    /// distance query-time fine ranking uses (smaller = nearer). Multi-cell
-    /// hidden readers only; others return empty (caller falls back to the
-    /// stamped-law path).
-    pub(crate) fn global_fine_cluster_scores(
+    /// Emit the fp32 centroid VECTORS of every fine cluster in this superfile,
+    /// tagged with their per-superfile `flat` cluster ids, from the resident
+    /// centroid `section` (zero superfile opens). Feeds the in-memory centroid
+    /// router (an HNSW over the pooled fine centroids): building the graph from
+    /// these guarantees a graph node maps back to the same `flat` the stamped
+    /// per-cell read plan expects, so the downstream read is identical.
+    /// Cluster-major fp32-LE bytes, `n_cent × dim` per cell.
+    pub(crate) fn global_fine_cluster_vectors(
         &self,
         column: &str,
-        query: &[f32],
         section: &crate::supertable::slow_vector_state::CentroidSection,
         superfile_id: uuid::Uuid,
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
+    ) -> Result<Vec<(u32, Vec<f32>)>, VectorError> {
         if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
             return Ok(Vec::new());
         }
@@ -1911,8 +1906,6 @@ impl VectorReader {
             if col.n_docs == 0 || col.n_cent == 0 {
                 continue;
             }
-            // Section is keyed by the grid cell id; multi-cell readers carry
-            // one per column entry (parallel to `columns`).
             let cell_id = self.cell_ids.get(ci).copied();
             let Some(bytes) = section
                 .read_cell_bytes(superfile_id, column, cell_id)
@@ -1921,10 +1914,18 @@ impl VectorReader {
                 continue;
             };
             let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
-            // `score_centroids` is the SIMD (`f32x8`) owner query-time fine
-            // ranking uses; `nprobe = n_cent` scores every cluster.
-            for (local, score) in score_centroids(&bytes, col, query, col.n_cent as usize) {
-                out.push((base + local as u32, score));
+            let dim = col.dim;
+            let stride = dim * 4;
+            for local in 0..col.n_cent as usize {
+                let off = local * stride;
+                let Some(slab) = bytes.get(off..off + stride) else {
+                    break;
+                };
+                let vec: Vec<f32> = slab
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                out.push((base + local as u32, vec));
             }
         }
         Ok(out)

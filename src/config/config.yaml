@@ -188,28 +188,37 @@ vector:
   #                          different column) serves `ivf` AUTOMATICALLY, so
   #                          correctness never depends on the graph. Best for
   #                          single-box, latency-tier, RAM-provisioned tables.
-  #   global_fine_centroid — EXPERIMENTAL: score every fine centroid globally
-  #                          across all cells and read the top fanout clusters,
-  #                          bypassing the grid. A cold-read win at scale (10M+);
-  #                          opt-in while the per-table fanout stamp is built.
   search_mode: ivf
 
-  # For search_mode = global_fine_centroid: the NUMBER of fine clusters the
+  # For search_mode = ivf: the cluster router.
+  #   stamped        — DEFAULT. Grid routing to cells, then the manifest's
+  #                    stamped per-cell width. The established path.
+  #   centroid_graph — EXPERIMENTAL: score fine centroids via an HNSW over the
+  #                    resident fp32 fine centroids and read the top fanout
+  #                    clusters, bypassing the grid. A cold-read win at scale
+  #                    (10M+); opt-in while the per-table fanout stamp is built.
+  ivf_router: stamped
+
+  # For ivf_router = centroid_graph: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
   # total. Higher reads more clusters — more cold bytes, higher recall.
   # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
   # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
-  # pending a per-table calibrated stamp. Ignored under search_mode = ivf.
+  # pending a per-table calibrated stamp. Ignored under ivf_router = stamped.
   global_fine_fanout: 1024
 
-  # For search_mode = global_fine_centroid: exact-rerank over-fetch multiplier
+  # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
   # for this path only (a caller-set rerank_mult still wins). Scoped here so
   # tuning it never touches the ivf / filtered / user-table defaults.
   global_fine_rerank_mult: 128
 
-  # For search_mode = global_fine_centroid: coalesce the selected clusters
-  # within each cell into contiguous reads. Ignored under search_mode = ivf.
+  # For ivf_router = centroid_graph: coalesce the selected clusters within
+  # each cell into contiguous reads. Ignored under ivf_router = stamped.
   global_fine_coalesce: false
+
+  # For ivf_router = centroid_graph: the centroid-HNSW walk's ef (candidate
+  # breadth). 0 = auto (fanout * 2). Ignored under ivf_router = stamped.
+  global_fine_graph_ef: 0
 
   # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table

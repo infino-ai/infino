@@ -353,6 +353,13 @@ pub(crate) struct TermCursor {
     /// PACKED block it already holds while probing membership across a
     /// run of ascending target docs.
     pub(super) decoded_block: usize,
+    /// Which block index has its tf array decoded into `block_tfs`
+    /// (`usize::MAX` = none). Set whenever `block_tfs` is filled — by a full
+    /// [`Self::decode_current_block`] (non-count) or by a tf-only decode in
+    /// [`Self::bitset_probe_tf`], which reads a single doc's tf by rank
+    /// without expanding the block's doc ids. Lets the probe reuse the
+    /// decoded tfs across a run of candidates landing in the same block.
+    pub(super) tf_decoded_block: usize,
 }
 
 impl TermCursor {
@@ -432,6 +439,7 @@ impl TermCursor {
             header_probed,
             count_only,
             decoded_block: usize::MAX,
+            tf_decoded_block: usize::MAX,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -489,6 +497,7 @@ impl TermCursor {
             // never call `decode_current_block`, so the flag is inert.
             count_only: false,
             decoded_block: 0,
+            tf_decoded_block: 0,
         }
     }
 
@@ -505,6 +514,11 @@ impl TermCursor {
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
+        // A non-count decode also fills `block_tfs` for this block, so the
+        // tf-only probe can reuse it without re-decoding.
+        if !self.count_only {
+            self.tf_decoded_block = self.current_block;
+        }
     }
 
     /// Membership probe: does this term contain `doc`? Advances the block
@@ -576,6 +590,83 @@ impl TermCursor {
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < doc {
             self.pos += 1;
         }
+    }
+
+    /// Ranked-OR non-essential membership probe returning the doc's tf
+    /// **without expanding the block's doc ids**. On a dense (bitset) block it
+    /// bit-tests presence and, on a hit, reads the one tf by popcount-rank into
+    /// the tf array (decoded once per block) — never materializing the 128 doc
+    /// ids, which is the dominant cost of the ranked-OR non-essential
+    /// completion on common terms. On a PACKED block there is no rank shortcut
+    /// (the doc ids must be decoded to locate the doc), so it falls back to
+    /// `skip_to` + `current_tf`. Like [`Self::contains`] it advances
+    /// `current_block`, so a cursor probed this way must not also be iterated.
+    pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < doc
+        {
+            self.current_block += 1;
+        }
+        if self.current_block >= self.blocks.len() {
+            return None;
+        }
+        // Inline (df=1) cursor: single pre-decoded posting, no postings bytes.
+        if self.bytes.is_empty() {
+            if self.block_n > 0 && self.block_doc_ids[0] == doc {
+                return Some(self.block_tfs[0]);
+            }
+            return None;
+        }
+        let block = self.blocks[self.current_block];
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        if raw[posting::ENCODING_OFF] != posting::ENCODING_BITSET {
+            // PACKED: no rank shortcut — decode + locate like the old path.
+            self.skip_to(doc);
+            return if self.current_doc_id() == doc {
+                Some(self.current_tf())
+            } else {
+                None
+            };
+        }
+        let base = read_u32_le(&raw[4..8]);
+        if doc < base {
+            return None;
+        }
+        let bit = (doc - base) as usize;
+        let tf_bits = raw[2] as usize;
+        let tfs_size = BLOCK_LEN * tf_bits / 8;
+        let bitset_end = raw.len() - tfs_size;
+        let word_idx = bit / 64;
+        let word_at = posting::HEADER_SIZE + word_idx * 8;
+        if word_at + 8 > bitset_end {
+            return None; // past this block's presence bits ⇒ absent
+        }
+        let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+        if (word >> (bit % 64)) & 1 == 0 {
+            return None; // doc not present in this block
+        }
+        // Present. `rank` = number of set bits before `bit` = popcount of the
+        // whole presence words ahead of this one + popcount of this word below
+        // `bit`. The r-th set bit (doc) maps to the r-th tf in doc order.
+        let presence = &raw[posting::HEADER_SIZE..bitset_end];
+        let mut rank: u32 = 0;
+        for w in presence[..word_idx * 8].chunks_exact(8) {
+            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
+        }
+        let below = if bit.is_multiple_of(64) {
+            0u64
+        } else {
+            (1u64 << (bit % 64)) - 1
+        };
+        rank += (word & below).count_ones();
+        // Decode this block's tf array once (doc order), reused across a run of
+        // candidates in the same block; the doc ids are never expanded.
+        if self.tf_decoded_block != self.current_block {
+            let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
+            posting::decode_block_tfs(bytes, &mut self.block_tfs);
+            self.tf_decoded_block = self.current_block;
+        }
+        Some(self.block_tfs[rank as usize])
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
