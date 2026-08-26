@@ -3070,32 +3070,31 @@ impl SupertableReader {
                     nprobe_max: FILTERED_USER_CELL_NPROBE,
                     ..CellRoutingParams::default()
                 }
-            } else if metric == Metric::Cosine {
-                // UNDRAINED tail: no drain has run, so no law has been
-                // stamped and nothing has measured this table's geometry.
-                // The shipped one-cell probe is calibrated against
-                // planted-cluster geometry and collapses on real
-                // embeddings -- measured recall@10 0.623 at 9.4M Cohere,
-                // 0.367 at 200K. Let the near-tie widening reach further
-                // HERE ONLY: a drained table serves its stamped width
-                // instead, so a table whose law says one cell keeps its
-                // single cell rather than being widened by a default.
+            } else {
+                // UNDRAINED tail: rows committed since the last drain, or a
+                // table never drained at all. Once a drain has stamped this
+                // table's width law, the delta rows are the SAME
+                // distribution the law measured — cells are assigned
+                // against the same grid — so the tail INHERITS the stamped
+                // width for this `k` rather than reading at a blanket
+                // default: a table stamped 1..1 reads its delta at one cell
+                // (the blanket cap read it at 8 — 12 user GETs on the
+                // synthetic post-delta bench for zero recall), and a
+                // diffuse table serves its delta at the width its own
+                // geometry measured. Only a table with NO stamp yet falls
+                // back to the blanket cap, and only on cosine — see
+                // [`UNDRAINED_CELL_NPROBE_MAX`] and
+                // [`undrained_nprobe_max`] for both measurements.
+                let stamped_width = self.vector_index_table().and_then(|vit| {
+                    vit.pinned_reader_with(self.op_stats.clone())
+                        .manifest()
+                        .vector_cell_routing()
+                        .and_then(|routing| routing.width_for_k_at(k))
+                });
                 CellRoutingParams {
-                    nprobe_max: UNDRAINED_CELL_NPROBE_MAX,
+                    nprobe_max: undrained_nprobe_max(stamped_width, metric),
                     ..CellRoutingParams::default()
                 }
-            } else {
-                // Non-cosine UNDRAINED tail keeps the one-cell default.
-                // The near-tie window (`τ = d*·(1+slack)`) is
-                // metric-sensitive: under L2 the second-nearest cells sit
-                // within the window on decisive geometry far more often
-                // than under cosine, so the widened cap fires where it
-                // buys nothing -- measured +100% warm p90 on the synthetic
-                // l2sq lane (5.40 -> 10.81 ms) at unchanged ~0.99 recall.
-                // The collapse the cap exists to cover (0.367 / 0.623)
-                // was measured on cosine embeddings only; widening another
-                // metric's undrained tail takes its own measurement first.
-                CellRoutingParams::default()
             };
             // Per-table probe-width law: when the drain calibrated one and
             // the caller passed nothing, the law's width for this `k` acts
@@ -5160,6 +5159,32 @@ fn subtract_tombstones(
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
+/// Probe cap for the UNDRAINED user tail.
+///
+/// A stamped width law wins outright, any metric: the tail's rows come
+/// from the same distribution the drain measured (cell assignment uses
+/// the same grid), so a table stamped 1..1 reads its delta at one cell
+/// and a diffuse table reads its delta at its own measured width —
+/// never a blanket constant that ignores the stamp the table already
+/// carries (measured: the blanket cap read a stamped-1..1 synthetic
+/// table's delta at 12 user GETs post-delta, for zero recall).
+///
+/// With no stamp yet, nothing has measured this table's geometry:
+/// cosine falls back to the bounded [`UNDRAINED_CELL_NPROBE_MAX`]
+/// (real cosine embeddings collapse at one cell — recall@10 0.367 at
+/// 200K, 0.623 at 9.4M Cohere), and every other metric keeps the
+/// one-cell default — the near-tie window (`τ = d*·(1+slack)`) is
+/// metric-sensitive, and under L2 it admits second cells on decisive
+/// geometry (measured +100% warm p90 on synthetic l2sq for zero
+/// recall gain).
+fn undrained_nprobe_max(stamped_width: Option<usize>, metric: Metric) -> usize {
+    match stamped_width {
+        Some(width) => width.max(1),
+        None if metric == Metric::Cosine => UNDRAINED_CELL_NPROBE_MAX,
+        None => CellRoutingParams::default().nprobe_max,
+    }
+}
+
 /// The rerank-law multiplier for this query, or `None` to keep the
 /// caller's options untouched. `Some` only when ALL of: the query runs
 /// on the hidden vector-index table, it is unfiltered (filtered queries
@@ -5719,6 +5744,34 @@ mod tests {
             "the undrained cap must exceed the shared default, or the \
              undrained branch widens nothing"
         );
+    }
+
+    /// The undrained tail honors the stamp the table already carries.
+    ///
+    /// A stamped width law wins over the blanket cap on every metric — a
+    /// synthetic table stamped 1..1 reads its delta at ONE cell, not at
+    /// [`UNDRAINED_CELL_NPROBE_MAX`] (measured: the blanket read that
+    /// delta at 12 user GETs on the post-delta bench for zero recall).
+    /// The blanket applies only with no stamp at all, and only on cosine,
+    /// where the one-cell collapse was measured; unstamped non-cosine
+    /// keeps the shared one-cell default (the L2 near-tie window widens
+    /// on decisive geometry for nothing).
+    #[test]
+    fn undrained_cap_inherits_the_stamped_width() {
+        use super::undrained_nprobe_max;
+        let one_cell = CellRoutingParams::default().nprobe_max;
+        // Stamped: the law wins on every metric, at any width.
+        assert_eq!(undrained_nprobe_max(Some(1), Metric::Cosine), 1);
+        assert_eq!(undrained_nprobe_max(Some(1), Metric::L2Sq), 1);
+        assert_eq!(undrained_nprobe_max(Some(21), Metric::Cosine), 21);
+        assert_eq!(undrained_nprobe_max(Some(21), Metric::L2Sq), 21);
+        // Unstamped: cosine gets the bounded blanket, others one cell.
+        assert_eq!(
+            undrained_nprobe_max(None, Metric::Cosine),
+            super::UNDRAINED_CELL_NPROBE_MAX
+        );
+        assert_eq!(undrained_nprobe_max(None, Metric::L2Sq), one_cell);
+        assert_eq!(undrained_nprobe_max(None, Metric::NegDot), one_cell);
     }
 
     /// The self-measured admit extension (#515) follows the query's own

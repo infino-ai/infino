@@ -981,14 +981,14 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
 /// whole-cell at <5M (cells ~6 MiB), 2–4 islands at 10M.
 const VECTOR_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("post-drain", 4, 8),
-    // post-delta is the only state that serves an UNDRAINED user tail
-    // beside the drained bulk, and the user table never carries a probe
-    // law -- the laws describe the hidden table. That tail therefore
-    // probes up to `UNDRAINED_CELL_NPROBE_MAX` (8) cells rather than the
-    // single cell these ceilings were calibrated against, measured at 8
-    // user + 1 hidden GET at 1M. Budget the widened tail; the hidden
-    // side of the same query is unchanged.
-    ("post-delta", 14, 18),
+    // post-delta serves the undrained user tail beside the drained bulk,
+    // and the tail INHERITS the table's stamped width law (the delta is
+    // the same distribution the drain measured), so a stamped-1..1 table
+    // reads its delta at one cell and these ceilings hold at their
+    // original calibration. They were briefly rebudgeted to 14/18 while
+    // the tail read at a blanket 8-cell cap that ignored the stamp --
+    // that accommodation is gone with the blanket.
+    ("post-delta", 6, 10),
     ("post-compact", 4, 8),
 ];
 /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the SECOND
@@ -1000,8 +1000,8 @@ const VECTOR_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 /// shard generations after a budgeted optimize).
 const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("post-drain", 1, 4),
-    // Same undrained-tail allowance as the first-query table above.
-    ("post-delta", 10, 13),
+    // Stamp-inherited tail, as in the first-query table above.
+    ("post-delta", 2, 5),
     ("post-compact", 1, 5),
 ];
 /// Doc-count cutoffs for the two ceiling columns (exclusive upper
