@@ -140,6 +140,7 @@ impl FtsEngine for InfinoFtsEngine {
             vector: true,
             sql: true,
             hybrid: true,
+            ..Default::default()
         }
     }
 

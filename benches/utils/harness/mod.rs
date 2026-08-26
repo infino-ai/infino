@@ -82,6 +82,19 @@ pub struct Capabilities {
     pub vector: bool,
     pub sql: bool,
     pub hybrid: bool,
+    /// Engine can add vectors to an existing index without a full rebuild.
+    /// See [`VectorEngine::insert`] — an immutable-artifact engine may
+    /// still advertise this if it implements `insert` as an honest, if
+    /// heavier, incremental build; the capability flag alone does not
+    /// promise a cheap in-place add.
+    pub vector_insert: bool,
+    /// Engine can remove vectors from an existing index by id, without a
+    /// full rebuild. See [`VectorEngine::remove`].
+    pub vector_remove: bool,
+    /// Engine can serialize its index to bytes and reopen it — i.e. has a
+    /// real save/load boundary distinct from "keep the in-process handle".
+    /// See [`VectorEngine::save`] / [`VectorEngine::load`].
+    pub vector_save_load: bool,
 }
 
 /// A full-text retrieval engine under comparison.
@@ -182,6 +195,43 @@ pub trait VectorEngine {
     fn close(index: &mut Self::Index);
 
     fn delete(index: Self::Index);
+
+    /// Add `vectors` (a flat buffer of `vectors.len() / dim` new rows) to
+    /// an already-built, queryable index. Ids are assigned starting at
+    /// `next_id` (the caller tracks the running id counter so ids stay
+    /// unique across insert calls). Returns `false` if unsupported —
+    /// callers must check [`Capabilities::vector_insert`] before calling
+    /// and treat a `false` return as a harness bug, not a normal outcome.
+    ///
+    /// Deliberately vague about *how* the engine achieves "add to a
+    /// queryable index": an immutable-artifact engine may implement this
+    /// as an incremental rebuild rather than a true append-to-served
+    /// -index. Implementors must document which they do.
+    fn insert(_index: &mut Self::Index, _vectors: &[f32], _next_id: u64) -> bool {
+        false
+    }
+
+    /// Remove the rows named by `ids` from the index. Returns `false` if
+    /// unsupported (see [`VectorEngine::insert`]'s return-value contract).
+    fn remove(_index: &mut Self::Index, _ids: &[u64]) -> bool {
+        false
+    }
+
+    /// Serialize the index to bytes. `None` if unsupported.
+    fn save(_index: &Self::Index) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Reopen an index from bytes previously produced by [`VectorEngine::save`].
+    /// `None` if unsupported.
+    fn load(
+        _column: &str,
+        _dim: usize,
+        _metric: VectorMetric,
+        _bytes: &[u8],
+    ) -> Option<Self::Index> {
+        None
+    }
 }
 
 /// A scalar row ingested by SQL engines.
