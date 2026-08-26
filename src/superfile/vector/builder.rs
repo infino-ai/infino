@@ -1757,7 +1757,13 @@ fn stream_fp32_rows_to_buckets(
                 .expect("residual-family codec has divisor"),
         )
     });
-    let chunk_rows = materialized_chunk_rows_for_dim(dim);
+    // Bound the chunk by the rows this call actually holds: the budgeted
+    // chunk is 32K rows (~128 MiB per fp32 buffer at dim=1024), and the
+    // commit path reaches here once per small per-cell subsection — sizing
+    // the scratch to the budget regardless of `n_docs` zeroed ~320 MiB per
+    // call to process a few hundred rows. Measured: 46% of supertable
+    // vector ingest wall was memset under these allocations.
+    let chunk_rows = materialized_chunk_rows_for_dim(dim).min(n_docs.max(1));
     let mut chunk_rotated = vec![0.0f32; chunk_rows * dim];
     // Cosine rows must be unit before ANY consumer below sees them: the
     // fixed cosine grid spans [-1, 1], so a non-unit component saturates at
