@@ -5046,7 +5046,14 @@ async fn build_shortlist(
             // `local * stride` offset built from it then points far past
             // the block. Checking the lookups is not enough on its own —
             // the arithmetic derived from them needs the same guard.
-            let end = off.saturating_add(cnt);
+            // Checked, not saturating: a saturated end masks a corrupt
+            // span by letting near-MAX positions pass the very bound the
+            // check exists to enforce.
+            let end = off.checked_add(cnt).ok_or_else(|| {
+                VectorError::InconsistentIndex(format!(
+                    "cluster {cluster_id}'s span overflows: off={off}, cnt={cnt}"
+                ))
+            })?;
             if pos < off || pos >= end {
                 return Err(VectorError::InconsistentIndex(format!(
                     "shortlist position {pos} falls outside cluster {cluster_id}'s \
