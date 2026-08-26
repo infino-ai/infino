@@ -167,6 +167,37 @@ fn n_cent_row_count_cap(n_docs: usize) -> usize {
     }
 }
 
+/// Target rows per IVF cluster for a STREAMING user-superfile build.
+/// Matches the layout the banded cap produces at its design points
+/// (1M rows / 1024 clusters = 976; the drain's fine-cluster p50 sits
+/// ~1000 on the same corpora), so the continuous rule below reproduces
+/// the measured shapes where they were measured and interpolates
+/// between them instead of stepping.
+const STREAM_ROWS_PER_CENT: usize = 1000;
+
+/// IVF centroid count for a streaming user-superfile build, derived
+/// continuously from the rows the build holds:
+/// `next_pow2(rows / STREAM_ROWS_PER_CENT)` clamped to
+/// `[N_CENT_SMALL, N_CENT_LARGE]`.
+///
+/// Replaces the banded `n_cent_row_count_cap` on THIS path only. The
+/// band step made the centroid count a step function of shard size:
+/// sharding 1M rows across 7 builders put every 142K-row shard in the
+/// ≥100K band, so each shard trained the full 1024 centroids on all of
+/// its rows and 7 writers did ~2.6x the k-means work of 1 writer —
+/// measured 2x SLOWER wall time on a 4-core box. Under the continuous
+/// rule a 142K shard trains 256 centroids (~558 rows/cluster) and
+/// sharding divides the centroid work the way it divides the rows.
+/// The 1M single-build point is unchanged (1000 -> 1024).
+///
+/// Cell packs and maintenance rebuilds keep the banded cap — those are
+/// the measured 1M/10M cell layouts, not this path.
+fn stream_n_cent_for_rows(n_docs: usize) -> usize {
+    (n_docs / STREAM_ROWS_PER_CENT)
+        .next_power_of_two()
+        .clamp(N_CENT_SMALL, N_CENT_LARGE)
+}
+
 /// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
 /// 2 = NegDot.
 fn metric_id(m: Metric) -> u32 {
@@ -2516,8 +2547,8 @@ fn build_subsection_streaming(
         // `n_cent > sample_rows` would crash k-means (`k > n` is asserted
         // by the trainer). At steady-state shapes (`n_docs > sample_size`,
         // `sample_size ≥ 100_000`) the sample_rows bound is the active
-        // one and is comfortably above the row-count cap.
-        let n_cent = n_cent_row_count_cap(n_docs)
+        // one and is comfortably above the row-count rule.
+        let n_cent = stream_n_cent_for_rows(n_docs)
             .min(n_docs.max(1))
             .min(sample_rows.max(1))
             .max(1);
@@ -3442,6 +3473,36 @@ mod tests {
             n_cent_row_count_cap(N_CENT_LARGE_DOC_THRESHOLD),
             N_CENT_LARGE
         );
+    }
+
+    /// The streaming rule preserves the banded cap's design points and
+    /// interpolates between them, so sharding a corpus divides the
+    /// k-means work instead of multiplying it.
+    #[test]
+    fn stream_n_cent_scales_with_rows_and_keeps_design_points() {
+        // Clamp floor: empty and small builds keep the small layout.
+        assert_eq!(stream_n_cent_for_rows(0), N_CENT_SMALL);
+        assert_eq!(stream_n_cent_for_rows(62_500), N_CENT_SMALL);
+        // Design point: the 1M single build keeps its measured layout.
+        assert_eq!(stream_n_cent_for_rows(1_000_000), N_CENT_MEDIUM);
+        // Clamp ceiling: at and past the large threshold, the large cap.
+        assert_eq!(stream_n_cent_for_rows(5_000_000), N_CENT_LARGE);
+        assert_eq!(stream_n_cent_for_rows(10_000_000), N_CENT_LARGE);
+        // The fix itself: a 1M/7 shard no longer trains the full 1024 —
+        // its centroid count follows its own rows.
+        let shard = stream_n_cent_for_rows(1_000_000_usize.div_ceil(7));
+        assert!(
+            shard < N_CENT_MEDIUM,
+            "a 142K shard must train fewer centroids than the whole 1M \
+             corpus, or sharding multiplies the k-means work (got {shard})"
+        );
+        // Monotone in rows: more rows never means fewer clusters.
+        let mut prev = 0;
+        for rows in [0, 10_000, 62_500, 142_858, 500_000, 1_000_000, 5_000_000] {
+            let n = stream_n_cent_for_rows(rows);
+            assert!(n >= prev, "n_cent must be monotone in rows");
+            prev = n;
+        }
     }
 
     #[test]
