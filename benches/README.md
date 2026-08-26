@@ -111,13 +111,6 @@ scale.rs, sql_diag.rs, tombstone_overhead.rs, …
 
 JSON metrics land in `target/infino-bench/<bench>.json` (local only).
 
-## Archived tables (2026-06-13)
-
-Frozen snapshot from
-[`33fdc59`](https://github.com/infino-ai/infino/commit/33fdc593aba335df9190bd7e3ebb3e3feab316fe)
-(S3, 1M docs, **384-d** vectors). Prefer the CI table above for current
-defaults. Blocks below are rewritten by `INFINO_BENCH_UPDATE_README=1`.
-
 ### Superfile FTS
 
 <!-- BEGIN: bench/fts/superfile/ingest -->
