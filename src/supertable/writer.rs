@@ -8132,6 +8132,48 @@ pub(in crate::supertable) async fn refresh_slow_vector_state(
     stamp_slow_vector_state(inner, None).await
 }
 
+/// Build + PUT the centroid-router section for the settled generation and
+/// return its ref, or `None` when the `centroid_graph` router is off, no
+/// column is eligible, or any step fails. Best-effort: the settle stamps
+/// whatever this returns, and an absent ref just means queries reconstruct the
+/// router in memory. The router graph indexes the fp32 fine centroids, so it is
+/// built from the freshly published centroid section (fetched here) — no
+/// centroid duplication in the section itself.
+async fn build_and_publish_centroid_router_section(
+    inner: &SupertableInner,
+    storage: &dyn StorageProvider,
+    entries: &[Arc<SuperfileEntry>],
+    centroids_ref: &crate::supertable::manifest::list::RoutingRef,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    // Cheap gate first, so a router-off table never fetches the centroid section.
+    let vcfg = &crate::config::global().vector;
+    crate::supertable::query::vector::select_eager_router_column(
+        vcfg.search_mode,
+        vcfg.ivf_router,
+        vcfg.global_fine_fanout,
+        &inner.options.vector_columns,
+    )?;
+    let section = fetch_centroid_section(storage, centroids_ref, entries)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "centroid-router publish: centroid section fetch failed")
+        })
+        .ok()?;
+    let bytes = crate::supertable::query::vector::compose_centroid_router_section(
+        &inner.options,
+        entries,
+        &section,
+    )
+    .await?;
+    slow_vector_state::write_graph_section(storage, bytes)
+        .await
+        .inspect(|reference| {
+            tracing::debug!(uri = %reference.uri, "centroid-router: published section");
+        })
+        .map_err(|error| tracing::warn!(%error, "centroid-router publish: section write failed"))
+        .ok()
+}
+
 /// The PREVIOUS generation's centroid section for `manifest`, through the
 /// table's single-slot cache (fetch on miss, reuse on URI match). `None`
 /// when no section is stamped (fresh table) or the fetch fails — the
@@ -8378,6 +8420,12 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     };
     let max_retries = inner.options.max_commit_retries.max(1);
     let mut next_id_floor: u64 = 0;
+    // The centroid-router section is content-addressed and membership-fixed for
+    // this settle, so build + PUT it at most once and reuse the ref across CAS
+    // retries. `None` until computed; the inner `Option` is the resolved ref
+    // (absent when the router is off or the build failed).
+    let mut centroid_graph_ref: Option<Option<crate::supertable::manifest::list::RoutingRef>> =
+        None;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
         // A prior attempt found its id occupied by a crash-orphaned
@@ -8432,13 +8480,39 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         // just-drained row is invisible to both arms, the exact visibility gap
         // the atomic-drain stamp closes.
         let graphs_ref = old.slow_vector_state_graphs_blob().cloned();
-        // No-op only when NOTHING changed — routing blob, centroid section,
-        // and the resolved graph ref all already stamped.
+        // Build + publish the centroid-router section once for this settle. A
+        // membership commit CLEARED the ref (its node map indexes the visible
+        // superfile set), so a present ref means a prior no-op settle already
+        // covered THIS membership — reuse it; absent means build it now. Gated
+        // on the router being enabled and best-effort: a `None` just leaves the
+        // ref unstamped and queries reconstruct the router in memory.
+        let centroid_graph = match &centroid_graph_ref {
+            Some(resolved) => resolved.clone(),
+            None => {
+                let resolved = match old.slow_vector_state_centroid_graph_blob() {
+                    Some(existing) => Some(existing.clone()),
+                    None => {
+                        build_and_publish_centroid_router_section(
+                            inner,
+                            storage.as_ref(),
+                            entries,
+                            &published.centroids,
+                        )
+                        .await
+                    }
+                };
+                centroid_graph_ref = Some(resolved.clone());
+                resolved
+            }
+        };
+        // No-op only when NOTHING changed — routing blob, centroid section, the
+        // resolved graph ref, and the centroid-router section all already stamped.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
             && old.slow_vector_state_graphs_blob() == graphs_ref.as_ref()
+            && old.slow_vector_state_centroid_graph_blob() == centroid_graph.as_ref()
         {
             return Ok(());
         }
@@ -8447,6 +8521,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             published.content_hash,
             published.centroids,
             graphs_ref,
+            centroid_graph,
         );
         let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))

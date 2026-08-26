@@ -112,6 +112,7 @@ use crate::{
         },
     },
     supertable::{
+        SupertableOptions,
         error::QueryError,
         handle::{Supertable, SupertableReader},
         manifest::{
@@ -123,7 +124,8 @@ use crate::{
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
         slow_vector_state::{
-            CentroidSection, ResidentGraphSections, fetch_centroid_section, fetch_graph_sections,
+            CentroidSection, ResidentGraphSections, fetch_centroid_section, fetch_graph_section,
+            fetch_graph_sections,
         },
         tombstones::SidecarCache,
     },
@@ -858,17 +860,21 @@ fn gfc_unit_normalize(v: &mut [f32]) {
     }
 }
 
-/// Build the in-memory centroid router from the resident centroid section.
-/// `readers[si]` corresponds to `superfiles[si]`; centroids are pulled via
-/// `global_fine_cluster_vectors` so the flat ids match the scan path exactly.
-fn build_centroid_router(
+/// Walk the resident centroid section, pulling each superfile's fp32 fine
+/// centroids (unit-normalized) in the deterministic `readers × flat` order the
+/// router's graph nodes follow. Returns `(vecs, node_map)` where `vecs[i]` is
+/// the fp32 centroid for graph node `i` and `node_map[i] = (superfile index,
+/// flat cluster id)`. Both the in-memory build and the persisted-section load
+/// share this walk, so their node order is identical by construction (the
+/// invariant the persisted section relies on). `readers[si]` corresponds to
+/// `superfiles[si]`; centroids are pulled via `global_fine_cluster_vectors` so
+/// the flat ids match the scan path exactly.
+fn centroid_router_walk(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
     section: &crate::supertable::slow_vector_state::CentroidSection,
-    dim: usize,
-) -> Result<CentroidRouterGraph, QueryError> {
-    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+) -> Result<(Vec<Vec<f32>>, Vec<(usize, u32)>), QueryError> {
     let mut vecs: Vec<Vec<f32>> = Vec::new();
     let mut node_map: Vec<(usize, u32)> = Vec::new();
     for (si, reader) in readers.iter().enumerate() {
@@ -888,6 +894,21 @@ fn build_centroid_router(
             node_map.push((si, flat));
         }
     }
+    Ok((vecs, node_map))
+}
+
+/// Build the in-memory centroid router from the resident centroid section — the
+/// legacy fallback for a generation that carries no persisted centroid-graph
+/// section (older tables, router-off-at-drain, or a build failure).
+fn build_centroid_router(
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+) -> Result<CentroidRouterGraph, QueryError> {
+    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+    let (vecs, node_map) = centroid_router_walk(superfiles, readers, column, section)?;
     let scorer = Fp32Scorer::from_vectors(&vecs, dim);
     let graph = Hnsw::build(&scorer, HnswParams::default());
     Ok(CentroidRouterGraph {
@@ -895,6 +916,152 @@ fn build_centroid_router(
         graph,
         node_map,
     })
+}
+
+/// Magic + version for the persisted centroid-router section. A new field is
+/// additive after the topology; a bad magic or an unknown layout decodes to
+/// `None`, so a query falls back to the in-memory build rather than panicking.
+const CENTROID_ROUTER_SECTION_MAGIC: &[u8; 8] = b"INFCGR01";
+
+/// Serialize the centroid router to a versioned, self-describing section: magic
+/// + `dim`, the `(superfile index, flat cluster)` node map, then the graph
+/// topology ([`Hnsw::to_bytes`]). The fp32 centroids are NOT stored — they
+/// already live in the mmap'd centroid section and are re-derived on load — so
+/// the section stays small (topology + node map, on the order of KBs at typical
+/// cluster counts) regardless of corpus size, even at ~500 MB of centroids.
+fn encode_centroid_router_section(router: &CentroidRouterGraph, dim: usize) -> Vec<u8> {
+    let topology = router.graph.to_bytes();
+    let mut out = Vec::with_capacity(8 + 4 + 8 + router.node_map.len() * 8 + 8 + topology.len());
+    out.extend_from_slice(CENTROID_ROUTER_SECTION_MAGIC);
+    out.extend_from_slice(&(dim as u32).to_le_bytes());
+    out.extend_from_slice(&(router.node_map.len() as u64).to_le_bytes());
+    for &(si, flat) in &router.node_map {
+        out.extend_from_slice(&(si as u32).to_le_bytes());
+        out.extend_from_slice(&flat.to_le_bytes());
+    }
+    out.extend_from_slice(&(topology.len() as u64).to_le_bytes());
+    out.extend_from_slice(&topology);
+    out
+}
+
+/// Reconstruct a centroid router from a section written by
+/// [`encode_centroid_router_section`]. The graph topology comes from the
+/// section; the fp32 scorer is rebuilt by re-walking the resident centroid
+/// section (the section carries no centroids). Returns `None` — so the caller
+/// falls back to a full in-memory build — on a bad/absent frame, a `dim`
+/// mismatch, or any drift between the persisted node map and the current walk
+/// (a stale section against changed membership), never a panic. The drift check
+/// is what guarantees the persisted node-map indices line up with the
+/// reconstructed scorer vectors.
+fn decode_centroid_router_section(
+    bytes: &[u8],
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+) -> Option<CentroidRouterGraph> {
+    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
+    if bytes.get(..CENTROID_ROUTER_SECTION_MAGIC.len())? != CENTROID_ROUTER_SECTION_MAGIC {
+        return None;
+    }
+    let mut pos = CENTROID_ROUTER_SECTION_MAGIC.len();
+    let sec_dim = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
+    pos += 4;
+    if sec_dim != dim {
+        return None;
+    }
+    let n = u64::from_le_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?) as usize;
+    pos += 8;
+    // Bound the node-map allocation by the bytes actually present before
+    // reserving, so a corrupt count can't drive a huge `Vec`.
+    let node_map_bytes = n.checked_mul(8)?;
+    let end = pos.checked_add(node_map_bytes)?;
+    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let si = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        let flat = u32::from_le_bytes(bytes.get(pos + 4..pos + 8)?.try_into().ok()?);
+        node_map.push((si, flat));
+        pos += 8;
+    }
+    debug_assert_eq!(pos, end);
+    let topo_len = u64::from_le_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?) as usize;
+    pos += 8;
+    let topology = bytes.get(pos..pos.checked_add(topo_len)?)?;
+    let graph = Hnsw::from_bytes(topology)?;
+    // Re-derive the scorer from the resident centroids and verify the walk
+    // still matches the persisted node map + graph, so a stale section (built
+    // against different membership) is rejected rather than misrouted.
+    let (vecs, node_map_walk) = centroid_router_walk(superfiles, readers, column, section).ok()?;
+    if vecs.len() != n || graph.len() != n || node_map_walk != node_map {
+        return None;
+    }
+    let scorer = Fp32Scorer::from_vectors(&vecs, dim);
+    Some(CentroidRouterGraph {
+        scorer,
+        graph,
+        node_map,
+    })
+}
+
+/// Build the centroid-router section bytes for the settled generation: pick the
+/// eligible column, open readers over `entries`, build the router from the
+/// freshly published centroid `section`, and serialize it. `None` when the
+/// router is disabled, no column is eligible, membership is empty, or the build
+/// fails — the settle then stamps no ref and queries reconstruct in memory.
+/// Called from the drain/compaction settle so the graph is published once per
+/// generation, `mmap`-loaded identically on every node and after a restart.
+pub(crate) async fn compose_centroid_router_section(
+    options: &SupertableOptions,
+    entries: &[Arc<SuperfileEntry>],
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+) -> Option<Vec<u8>> {
+    if entries.is_empty() {
+        return None;
+    }
+    let vcfg = &config::global().vector;
+    let column = select_eager_router_column(
+        vcfg.search_mode,
+        vcfg.ivf_router,
+        vcfg.global_fine_fanout,
+        &options.vector_columns,
+    )?;
+    let dim = options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+        .map(|vc| vc.dim)?;
+    let readers = open_readers_from_options(options, entries)
+        .await
+        .map_err(|error| tracing::warn!(%error, "centroid-router publish: reader open failed"))
+        .ok()?;
+    let router = build_centroid_router(entries, &readers, &column, section, dim)
+        .map_err(|error| tracing::warn!(%error, "centroid-router publish: build failed"))
+        .ok()?;
+    Some(encode_centroid_router_section(&router, dim))
+}
+
+/// Open a [`SuperfileReader`] per entry through a table's store + caches,
+/// index-aligned to `entries`. Shared by the reader-side and settle-side
+/// centroid-router build paths.
+async fn open_readers_from_options(
+    options: &SupertableOptions,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<Vec<Arc<SuperfileReader>>, QueryError> {
+    let mut readers = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        readers.push(
+            dispatch::open_reader(
+                &options.store,
+                options.disk_cache.as_ref(),
+                options.storage.as_ref(),
+                entry,
+                false,
+            )
+            .await?,
+        );
+    }
+    Ok(readers)
 }
 
 /// Widen a grid cell cutoff so the probed cells' indexed row counts cover at
@@ -2885,26 +3052,21 @@ impl SupertableReader {
         &self,
         entries: &[Arc<SuperfileEntry>],
     ) -> Result<Vec<Arc<SuperfileReader>>, QueryError> {
-        let options = &self.manifest().options;
-        let store = &options.store;
-        let disk_cache = options.disk_cache.as_ref();
-        let storage = options.storage.as_ref();
-        let mut readers = Vec::with_capacity(entries.len());
-        for entry in entries.iter() {
-            readers.push(dispatch::open_reader(store, disk_cache, storage, entry, false).await?);
-        }
-        Ok(readers)
+        open_readers_from_options(&self.manifest().options, entries).await
     }
 
     /// Load — or single-flight build — the centroid-router graph for
-    /// `(generation, column)`. The one place that builds, stamps, and publishes
-    /// it: both the lazy query path ([`Self::global_fine_fanout`]) and the eager
-    /// drain/optimize build ([`Self::build_and_cache_centroid_router`]) funnel
-    /// through here, so the cache key and store sequence cannot drift. Steady
-    /// state resolves on the cache's lock-free fast path; a miss takes the
-    /// per-table build lock, re-checks (a concurrent miss may have published
-    /// while it waited), and builds exactly once. `readers[i]` must read
-    /// `superfiles[i]`.
+    /// `(generation, column)`. The one place that resolves the router: both the
+    /// lazy query path ([`Self::global_fine_fanout`]) and the eager warm
+    /// ([`Self::build_and_cache_centroid_router`]) funnel through here, so the
+    /// cache key and store sequence cannot drift. Steady state resolves on the
+    /// cache's lock-free fast path; a miss takes the per-table build lock,
+    /// re-checks (a concurrent miss may have published while it waited), and
+    /// then, in order: (1) `mmap`-loads the generation's persisted
+    /// centroid-graph section — the path every node and a restarted process
+    /// share, no build; (2) failing that (older tables, router-off-at-drain, or
+    /// a decode/drift rejection), builds in memory as the legacy fallback.
+    /// `readers[i]` must read `superfiles[i]`.
     async fn resident_centroid_router(
         &self,
         column: &str,
@@ -2929,7 +3091,13 @@ impl SupertableReader {
         {
             return Ok(entry);
         }
-        let graph = build_centroid_router(superfiles, readers, column, section, dim)?;
+        let graph = match self
+            .load_persisted_centroid_router(column, dim, superfiles, readers, section)
+            .await
+        {
+            Some(graph) => graph,
+            None => build_centroid_router(superfiles, readers, column, section, dim)?,
+        };
         let entry = Arc::new(StampedCentroidRouter {
             generation,
             column: column.to_string(),
@@ -2939,6 +3107,33 @@ impl SupertableReader {
             .centroid_router_cache
             .store(Some(Arc::clone(&entry)));
         Ok(entry)
+    }
+
+    /// Fetch + `mmap` the persisted centroid-router section stamped on THIS
+    /// query's pinned manifest generation and reconstruct the router from it
+    /// (topology from the section, scorer re-derived from the resident
+    /// centroids). `None` — so the caller builds in memory — when the manifest
+    /// carries no such ref (older tables, router-off-at-drain, or a build that
+    /// failed at settle) or the fetch/decode/drift check rejects it. Never
+    /// panics; a bad section degrades to the build.
+    async fn load_persisted_centroid_router(
+        &self,
+        column: &str,
+        dim: usize,
+        superfiles: &[Arc<SuperfileEntry>],
+        readers: &[Arc<SuperfileReader>],
+        section: &CentroidSection,
+    ) -> Option<CentroidRouterGraph> {
+        let manifest = self.manifest();
+        let reference = manifest.slow_vector_state_centroid_graph_blob()?.clone();
+        let storage = manifest.options.storage.as_ref()?;
+        let (bytes, _mmap) = fetch_graph_section(storage.as_ref(), &reference)
+            .await
+            .map_err(|error| {
+                tracing::warn!(uri = reference.uri, %error, "centroid-router section fetch failed")
+            })
+            .ok()?;
+        decode_centroid_router_section(bytes.as_ref(), superfiles, readers, column, section, dim)
     }
 
     /// Build the centroid-router graph for `column` from THIS reader's pinned
@@ -5727,13 +5922,15 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
-        VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        calibrated_query_for, cells_ranked_by_fine_score, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, hidden_hits_user_ids,
-        id_score_projection_indices, is_hidden_vector_manifest, law_floor_serve_selection,
-        postings_by_cell_from_summaries, rerank_mult_from_law, score_fine_candidates,
-        select_global_shortlist, union_cell_selection, vector_read_query_error,
+        CentroidRouterGraph, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate,
+        VectorFilter, VectorSearchOptions, admit_extension_round, admit_shortlist_window,
+        apply_width_pin, build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
+        decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
+        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_unit_normalize,
+        hidden_hits_user_ids, id_score_projection_indices, is_hidden_vector_manifest,
+        law_floor_serve_selection, postings_by_cell_from_summaries, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        vector_read_query_error,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -5762,6 +5959,17 @@ mod tests {
     /// reader's own search methods are sync and need no runtime here.
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(fut)
+    }
+
+    /// Multi-threaded runtime driver, for futures that reach `spawn_blocking` /
+    /// `block_in_place` (the storage reader-open + graph-section fetch paths).
+    fn block_on_mt<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("test runtime")
@@ -7269,6 +7477,163 @@ mod tests {
             HashSet::from([1, 3]),
             "superseded cell is not fine-scored or fetched"
         );
+    }
+
+    /// Persisted-section round trip: build the router, serialize it, PUT it
+    /// through `write_graph_section`, fetch + `mmap` it back, decode (which
+    /// reconstructs the scorer from the resident centroids), and assert the
+    /// reloaded graph routes IDENTICALLY to the freshly built one across a set
+    /// of queries. This is the single-node == multi-node == post-restart
+    /// contract: every reader loads the same section rather than rebuilding.
+    #[test]
+    fn centroid_router_section_roundtrip_routes_identically() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(Arc::clone(&storage))).expect("create");
+        for c in 0..4u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        block_on_mt(async {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let entries = hr
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+
+            let built =
+                build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim).unwrap();
+            assert!(!built.node_map.is_empty(), "fixture must produce a router");
+
+            // Real storage round trip: serialize -> PUT -> fetch+mmap -> decode.
+            let bytes = encode_centroid_router_section(&built, dim);
+            let reference =
+                crate::supertable::slow_vector_state::write_graph_section(storage.as_ref(), bytes)
+                    .await
+                    .expect("publish section");
+            let (fetched, _mmap) = crate::supertable::slow_vector_state::fetch_graph_section(
+                storage.as_ref(),
+                &reference,
+            )
+            .await
+            .expect("fetch section");
+            let loaded = decode_centroid_router_section(
+                fetched.as_ref(),
+                &entries,
+                &readers,
+                "emb",
+                section.as_ref(),
+                dim,
+            )
+            .expect("decode section");
+
+            assert_eq!(
+                built.node_map, loaded.node_map,
+                "the persisted node map must reload identically"
+            );
+            let route = |router: &CentroidRouterGraph, q: &[f32]| -> Vec<(usize, u32)> {
+                let fanout = 3usize;
+                let ef = fanout.saturating_mul(2).max(fanout);
+                let mut sel: Vec<(usize, u32)> = router
+                    .graph
+                    .search(&router.scorer, q, fanout, ef)
+                    .into_iter()
+                    .filter_map(|(node, _)| router.node_map.get(node as usize).copied())
+                    .collect();
+                sel.sort_unstable();
+                sel
+            };
+            for seed in 0..8usize {
+                let mut q = vec![0.0f32; dim];
+                q[seed % dim] = 1.0;
+                gfc_unit_normalize(&mut q);
+                assert_eq!(
+                    route(&built, &q),
+                    route(&loaded, &q),
+                    "query {seed} must route identically after the round trip"
+                );
+            }
+        });
+    }
+
+    /// Legacy fallback: a generation that carries no centroid-graph section (a
+    /// table drained with the router off — the default) reconstructs the router
+    /// in memory. `load_persisted_centroid_router` returns `None` and
+    /// `resident_centroid_router` still produces a usable graph.
+    #[test]
+    fn centroid_router_absent_section_builds_in_memory() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        for c in 0..4u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        block_on_mt(async {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let entries = hr
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+
+            // Router off at drain (default), so no section was stamped.
+            assert!(
+                hr.manifest()
+                    .slow_vector_state_centroid_graph_blob()
+                    .is_none(),
+                "the default drain must not stamp a centroid-graph ref"
+            );
+            assert!(
+                hr.load_persisted_centroid_router("emb", dim, &entries, &readers, section.as_ref())
+                    .await
+                    .is_none(),
+                "absent ref must load as None"
+            );
+            // The resident path still yields a usable graph (built in memory).
+            let generation = hr.manifest().manifest_id;
+            let entry = hr
+                .resident_centroid_router(
+                    "emb",
+                    generation,
+                    dim,
+                    &entries,
+                    &readers,
+                    section.as_ref(),
+                )
+                .await
+                .expect("resident router");
+            assert_eq!(entry.generation, generation);
+            assert!(
+                !entry.graph.node_map.is_empty(),
+                "the in-memory fallback must build a non-empty router"
+            );
+        });
     }
 
     #[test]

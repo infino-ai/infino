@@ -170,6 +170,16 @@ pub struct Manifest {
     /// manifests and above the scale ceiling (consumers fall back to the
     /// lazy build or the scan path).
     pub slow_vector_state_graphs: Option<RoutingRef>,
+    /// Centroid-router-graph sibling of the slow-CAS state: one
+    /// content-addressed blob holding the HNSW over the fp32 fine centroids
+    /// (topology + `(superfile, flat cluster)` node map) used by
+    /// `ivf_router = centroid_graph`. Membership-dependent — its node map
+    /// indexes the visible superfile set — so it is CLEARED on every
+    /// membership change (like the centroid section) and the settle restamps
+    /// it for the new generation, never carried forward. Absent on older
+    /// manifests, when the router is off at drain, or on a build failure
+    /// (consumers reconstruct it in memory).
+    pub slow_vector_state_centroid_graph: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1236,6 +1246,10 @@ struct ManifestDto {
     slow_vector_state_graphs_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_graphs_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroid_graph_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroid_graph_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1806,6 +1820,14 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_graphs
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
+        slow_vector_state_centroid_graph_uri: l
+            .slow_vector_state_centroid_graph
+            .as_ref()
+            .map(|r| r.uri.clone()),
+        slow_vector_state_centroid_graph_content_hash: l
+            .slow_vector_state_centroid_graph
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1914,6 +1936,17 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
         slow_vector_state_graphs: match (
             d.slow_vector_state_graphs_uri,
             d.slow_vector_state_graphs_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        // Same both-halves discipline as the refs above.
+        slow_vector_state_centroid_graph: match (
+            d.slow_vector_state_centroid_graph_uri,
+            d.slow_vector_state_centroid_graph_content_hash.as_deref(),
         ) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
@@ -2529,6 +2562,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             parts: vec![],
         }
     }
