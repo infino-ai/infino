@@ -305,6 +305,10 @@ const DEFAULT_VECTOR_HNSW_EF_CEIL: usize = 2048;
 /// is set by `m`, not this). 200 is the sweet spot for recall ~0.93–0.95;
 /// raising it mainly helps the >0.97 end.
 const DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION: usize = 200;
+/// Default serve-time beam override: `0` serves each query at the stamped k→ef
+/// curve's beam (the calibrated default). A non-zero value overrides it — a
+/// serve-only knob for sweeping an already-built graph's recall/latency curve.
+const DEFAULT_VECTOR_HNSW_EF_SEARCH: usize = 0;
 /// Default base-layer degree knob: `0` means the drain calibrator picks it
 /// (search over `HNSW_M0_CANDIDATES`). A non-zero config value overrides.
 const DEFAULT_VECTOR_HNSW_M0: usize = 0;
@@ -554,6 +558,13 @@ pub struct VectorSettings {
     /// build cost and no extra resident memory. Ignored under any other
     /// search mode.
     pub hnsw_ef_construction: usize,
+    /// For `search_mode = hnsw_ivf`: a serve-time override of the per-query beam.
+    /// `0` (the default) serves each query at the beam from the stamped k→ef
+    /// curve (`ef_for_k`). A non-zero value overrides that curve and walks every
+    /// query at this fixed `ef` (still floored at the over-fetch width) — a
+    /// serve-only knob (no rebuild) for tracing the recall/latency curve of an
+    /// already-built graph at chosen beams. Ignored under any other search mode.
+    pub hnsw_ef_search: usize,
     /// For `search_mode = hnsw_ivf`: base-layer (layer-0) graph degree. This is
     /// the recall lever for high-dimensional vectors — the base layer must be
     /// denser as dimension grows or greedy search under-finds the true
@@ -671,6 +682,7 @@ impl Default for VectorSettings {
             global_fine_graph_ef: 0,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: DEFAULT_VECTOR_HNSW_EF_SEARCH,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
             hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
             hnsw_sq8_walk: DEFAULT_VECTOR_HNSW_SQ8_WALK,
@@ -1146,6 +1158,15 @@ mod tests {
     fn hnsw_calibration_config_validates() {
         let cfg = Config::defaults().expect("defaults parse");
         assert_eq!(cfg.vector.hnsw_ef_ceil, 2048);
+        // The serve-time beam override is off by default (the stamped k→ef curve
+        // drives the beam) and accepts any positive fixed beam when set.
+        assert_eq!(cfg.vector.hnsw_ef_search, 0);
+        let overridden =
+            Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+                Serialized::defaults(json!({ "vector": { "hnsw_ef_search": 768 } })),
+            ))
+            .expect("ef override parses");
+        assert_eq!(overridden.vector.hnsw_ef_search, 768);
 
         let invalid = |patch: serde_json::Value| {
             let fig = Figment::new()

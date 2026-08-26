@@ -2308,8 +2308,17 @@ impl SupertableReader {
         // requested `k` (not the replica-inflated `k_fetch`), so a large `k`
         // gets its wider beam while a small `k` is not over-served; then
         // floored at `k_fetch` so the beam always covers the fetch width. A
-        // pre-curve bundle returns its single stamped `ef` for every `k`.
-        let ef = data.ef_for_k(k).max(k_fetch);
+        // pre-curve bundle returns its single stamped `ef` for every `k`. A
+        // non-zero `hnsw_ef_search` config overrides the curve with a fixed
+        // serve-time beam — a rebuild-free knob for sweeping an already-built
+        // graph's recall/latency curve.
+        let ef_override = config::global().vector.hnsw_ef_search;
+        let ef = if ef_override > 0 {
+            ef_override
+        } else {
+            data.ef_for_k(k)
+        }
+        .max(k_fetch);
         // The Sq16 walk is pure CPU (up to ef × m0 scores); run it on the
         // reader pool and await a oneshot, per the rayon-for-CPU / tokio-for-I/O
         // contract — inline it would block a tokio worker for the walk's whole
