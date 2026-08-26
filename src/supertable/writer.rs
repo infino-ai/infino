@@ -371,7 +371,10 @@ pub struct SupertableWriter {
     /// Byte size of the FTS-indexed text columns within `buffer`. A
     /// subset of `buffer_scalar_bytes`, not extra held memory; tracked
     /// only to weight the build-scratch reserve, since the FTS index
-    /// structures built at commit scale with the text input.
+    /// structures built at commit scale with the text input. Measured as
+    /// visible (slice-aware) bytes — what the build will actually index —
+    /// unlike the two held-memory tallies above, which measure resident
+    /// allocation.
     buffer_fts_bytes: usize,
     /// Ingested work for the batches sitting in `buffer`, computed at
     /// `append` time from the caller's own batch and held here until the
@@ -2889,7 +2892,12 @@ fn ingested_byte_legs(
     // as N slices) is the ordinary pattern arrow-rs makes cheap precisely
     // because slices share buffers, and it would bill N times the whole
     // batch. Capacity is still the right answer for the held-memory
-    // tallies and the build-scratch reserve, which is why those keep it.
+    // tallies (`buffer_scalar_bytes`, `buffer_vector_bytes`), which
+    // measure resident allocation and keep `get_array_memory_size`. The
+    // FTS leg moves with the priced legs deliberately: it weights the
+    // build-scratch reserve, and the builder's scratch scales with the
+    // text it will actually index — a slice's visible rows — not with the
+    // parent allocation the slice shares.
     let scalar_bytes = scalar
         .columns()
         .iter()

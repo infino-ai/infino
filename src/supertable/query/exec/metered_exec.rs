@@ -204,11 +204,13 @@ impl ExecutionPlan for MeteredExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> DfResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        // The default answer is `Unsupported`, which stops the pushdown
-        // walk dead. A meter sitting between a sort and the scan would
-        // then cost the query its row-group reorder, its reverse scan and
-        // any sort elimination — turning an early-terminating TopK into a
-        // full scan plus a full sort.
+        // On today's plans the sort sinks BELOW this node —
+        // `maintains_input_order` above is what lets EnforceSorting do
+        // that — so the reorder and reverse-scan wins come from that hook
+        // and this one is rarely consulted. It still must delegate: the
+        // default answer is `Unsupported`, which stops the pushdown walk
+        // dead for any shape where the sort cannot sink, and a blocked
+        // walk costs that shape its row-group reorder and reverse scan.
         let rewrap = |input| -> Arc<dyn ExecutionPlan> {
             Arc::new(MeteredExec::new(input, self.op_stats.clone()))
         };
@@ -223,10 +225,27 @@ impl ExecutionPlan for MeteredExec {
         })
     }
 
+    fn fetch(&self) -> Option<usize> {
+        self.input.fetch()
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        // A limit the child can absorb must reach it through the meter, or
+        // the Exact arm of the sort pushdown above preserves an order whose
+        // early-termination fetch never arrives at the source.
+        self.input
+            .with_fetch(limit)
+            .map(|input| -> Arc<dyn ExecutionPlan> {
+                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
+            })
+    }
+
     fn with_preserve_order(&self, preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
-        // Order-sensitivity has to reach the data source, which decides
-        // whether it may skip row groups. Defaulting to `None` silently
-        // drops that signal at the meter.
+        // Completeness rather than a measured win: no optimizer path in
+        // this DataFusion reaches a wrapper here (both call sites target
+        // sources and unions). If a rewrite ever does ask, the answer must
+        // come from the source that decides whether it may skip row
+        // groups, not from a meter defaulting to `None`.
         self.input
             .with_preserve_order(preserve_order)
             .map(|input| -> Arc<dyn ExecutionPlan> {

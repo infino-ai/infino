@@ -34,11 +34,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use dashmap::DashMap;
-use datafusion::{
-    config::Dialect,
-    error::DataFusionError,
-    physical_plan::{ExecutionPlan, collect as collect_plan},
-};
+use datafusion::{config::Dialect, error::DataFusionError};
 use futures::future::try_join_all;
 pub use index_spec::IndexSpec;
 use manifest::{
@@ -71,7 +67,7 @@ use crate::{
     supertable::{
         Supertable as SupertableHandle,
         options::SupertableOptions,
-        query::exec::{common::harvest_datafusion_metrics, metered_exec::MeteredExec},
+        query::exec::common::collect_plan_metered,
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
@@ -841,17 +837,15 @@ impl Connection {
                 .create_physical_plan()
                 .await
                 .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
-            // Meter the whole plan, not just its scans: aggregation, sort
-            // and join work sits above the scan and is this query's CPU
-            // too. The scan wrapper still counts on spawned partitions,
-            // where the root's thread never runs; MeteredExec's depth
-            // guard keeps a single-partition plan from counting both.
-            let plan: Arc<dyn ExecutionPlan> =
-                Arc::new(MeteredExec::new(Arc::clone(&plan), op_stats.clone()));
-            let batches = collect_plan(Arc::clone(&plan), task_ctx)
+            // The shared meter-collect-harvest step: the root wrapper
+            // meters the whole plan (aggregation, sort and join work sits
+            // above the scan and is this query's CPU too), the scan
+            // wrapper still counts on spawned partitions where the root's
+            // thread never runs, and the shared bracket depth keeps a
+            // single-partition plan from counting both.
+            let batches = collect_plan_metered(&plan, task_ctx, &op_stats)
                 .await
                 .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
-            harvest_datafusion_metrics(&plan, &op_stats);
             if batches.is_empty() {
                 // An empty Vec carries no schema, so hand back one empty batch
                 // instead. Its schema comes from the physical plan, not the

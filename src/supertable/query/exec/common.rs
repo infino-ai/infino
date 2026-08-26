@@ -23,8 +23,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::{
     error::{DataFusionError, Result as DfResult},
+    execution::TaskContext,
     logical_expr::Expr,
-    physical_plan::ExecutionPlan,
+    physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
 use futures::{
@@ -57,7 +58,8 @@ use crate::{
         manifest::SuperfileUri,
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
-            SuperfileHit, superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
+            SuperfileHit, exec::metered_exec::MeteredExec, superfile_reader::superfile_reader,
+            vector::row_id_from_manifest_entry,
         },
     },
 };
@@ -101,6 +103,30 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// [`MeteredExec`](crate::supertable::query::exec::metered_exec::MeteredExec),
 /// which brackets each scan poll with the same thread-CPU clock the
 /// search kernels use, so SQL and search are priced on one clock.
+/// Meter, execute and account for one physical plan: wrap the root in
+/// [`MeteredExec`], collect, then harvest the executed plan's own
+/// metrics. The three steps belong together — a site that collects
+/// without harvesting reports CPU, page bytes and ranges with no row
+/// count beside them, which is how the mutation predicate resolve once
+/// reported zero decoded rows for a scan it genuinely paid for. Every
+/// SQL execution site (catalog, reader-level, predicate resolve) goes
+/// through here; error mapping stays with the caller, whose surface it
+/// belongs to.
+pub(crate) async fn collect_plan_metered(
+    plan: &Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> DfResult<Vec<RecordBatch>> {
+    let metered: Arc<dyn ExecutionPlan> =
+        Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
+    let batches = collect(metered, task_ctx).await?;
+    // Harvesting the unwrapped plan and the wrapped one reach the same
+    // leaves — the walk dedupes by node identity and sums childless nodes
+    // only, and the meter delegates `execute` to this same tree.
+    harvest_datafusion_metrics(plan, op_stats);
+    Ok(batches)
+}
+
 pub(crate) fn harvest_datafusion_metrics(
     plan: &Arc<dyn ExecutionPlan>,
     op_stats: &Option<Arc<OpStatsCollector>>,

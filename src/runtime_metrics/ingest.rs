@@ -58,10 +58,11 @@ pub fn classify_batch_bytes(batch: &RecordBatch) -> (u64, u64) {
 ///   values array — the over-count this function exists to avoid. Lists
 ///   size the child window their offsets actually name.
 ///
-/// `Dictionary` keeps the same over-count for a slice (the whole
-/// dictionary is counted per chunk) and is left alone deliberately: the
-/// dictionary genuinely is shared, so amortizing it across chunks needs a
-/// policy rather than a measurement.
+/// `Dictionary` — and `Map`, which shares its entries child the same way
+/// — keeps the over-count for a slice (the whole shared child is counted
+/// per chunk) and is left alone deliberately: the child genuinely is
+/// shared, so amortizing it across chunks needs a policy rather than a
+/// measurement.
 pub(crate) fn visible_array_bytes(column: &dyn Array) -> u64 {
     match column.data_type() {
         DataType::Utf8View | DataType::BinaryView => view_visible_bytes(column),

@@ -1396,7 +1396,9 @@ impl SupertableReader {
                         .map_err(fts_read_error)?;
                     // The prune pass's posting walk. The verify pass's own
                     // decode is folded into `rows_materialized` below; its
-                    // byte and range legs ride the take path's accounting.
+                    // byte and range legs are deliberately unpriced — both
+                    // take paths report no planned ranges by design, so the
+                    // counter stays identical warm or cold.
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
                         stats.add_planned_read_ranges(work.planned_ranges);

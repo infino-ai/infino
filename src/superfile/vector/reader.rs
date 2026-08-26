@@ -4836,6 +4836,22 @@ pub struct ProbeTally {
     pub kernel_cpu_ns: u64,
 }
 
+impl ScanOutcome {
+    /// The scan's five work tallies in the shared carrier, so every
+    /// supertable fold site prices the same field set through one
+    /// function — a sixth tally added here is a compile error at the
+    /// fold, not a silent gap at one of three call sites.
+    pub(crate) fn work(&self) -> ProbeTally {
+        ProbeTally {
+            cells_scanned: self.cells_scanned,
+            candidates_scanned: self.candidates_scanned,
+            ranges_requested: self.ranges_requested,
+            rows_reranked: self.rows_reranked,
+            kernel_cpu_ns: self.kernel_cpu_ns,
+        }
+    }
+}
+
 /// Result of a deferred-rerank scan over one superfile
 /// ([`VectorReader::search_clusters_scan_async`]).
 pub(crate) struct ScanOutcome {

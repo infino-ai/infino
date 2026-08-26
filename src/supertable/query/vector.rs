@@ -108,7 +108,7 @@ use crate::{
             distance::{Metric, distance, normalize, relative_score_window},
             hnsw::{self, HnswParams, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
-            reader::{ScanCandidate, ScanOutcome},
+            reader::{ProbeTally, ScanCandidate, ScanOutcome},
         },
     },
     supertable::{
@@ -245,6 +245,28 @@ const FILTERED_HIDDEN_CELL_NPROBE: usize = 256;
 /// is in-cell loss, recovered by probing deeper, not wider.
 const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 
+/// Fold one probe's work tallies into the op's collector.
+///
+/// Three fan-out sites produce the same five tallies — the stamped scan
+/// (as a [`ScanOutcome`], via [`ScanOutcome::work`]), the filtered scan
+/// (as a [`ProbeTally`] directly), and the global-fine scan. All three
+/// must price the same field set; the global-fine path once folded only
+/// the CPU leg, which left its cells, candidates, cluster-index/block
+/// ranges and rerank rows unpriced while the stamped path counted them.
+/// One function, so a sixth tally cannot be wired up at only one site.
+fn fold_probe_work(op_stats: &Option<Arc<OpStatsCollector>>, work: &ProbeTally) {
+    let Some(stats) = op_stats else {
+        return;
+    };
+    stats.add_vector_scan(work.cells_scanned, work.candidates_scanned);
+    // Request-shaped ranges only (cluster index + prefixes/blocks + Sq8
+    // meta). Rerank rows are diagnostics; their cost rides the priced CPU
+    // watermark.
+    stats.add_planned_read_ranges(work.ranges_requested);
+    stats.add_vector_rows_reranked(work.rows_reranked);
+    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+}
+
 /// Build the fine-cluster probe set, then refill globally (best score first)
 /// toward `gated_target` postings. Candidates without a cell go to `scored`
 /// for the flat (non-cell) path.
@@ -265,27 +287,6 @@ const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 ///   fragment, so each fragment of a selected cell is probed (accepted read
 ///   amplification), and a small fragment is not crowded out by a larger
 ///   sibling in the same cell.
-/// Fold one superfile scan's work into the op's collector.
-///
-/// Both vector fan-outs produce a [`ScanOutcome`] and both must report the
-/// same five values. The global-fine path once folded only the CPU leg,
-/// which left its cells, candidates, cluster-index/block ranges and rerank
-/// rows unpriced while the stamped path counted them. One function, so a
-/// sixth field cannot be added to the struct and wired up at only one of
-/// the two sites.
-fn fold_scan_outcome(op_stats: &Option<Arc<OpStatsCollector>>, scan: &ScanOutcome) {
-    let Some(stats) = op_stats else {
-        return;
-    };
-    stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
-    // Request-shaped ranges only (cluster index + prefixes/blocks + Sq8
-    // meta). Rerank rows are diagnostics; their cost rides the priced CPU
-    // watermark.
-    stats.add_planned_read_ranges(scan.ranges_requested);
-    stats.add_vector_rows_reranked(scan.rows_reranked);
-    stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
-}
-
 fn gate_fine_candidates_by_fragment(
     candidates: Vec<(usize, u32, f32, Option<u32>, u64)>,
     selected: &HashSet<u32>,
@@ -2751,11 +2752,10 @@ impl SupertableReader {
             let reader = readers[si].as_ref();
             // The scan wave above already ran; fold each superfile's work
             // in here, on the calling thread, now that the concurrent block
-            // has been collected. This folded only the CPU leg and dropped
-            // the other four, so the cells, candidates and cluster-index /
-            // block ranges every probed cluster requested went unpriced on
-            // this path while the stamped one counted them.
-            fold_scan_outcome(&self.op_stats, &scan);
+            // has been collected. Note this whole path sits behind
+            // `vector.ivf_router = centroid_graph` (experimental, off by
+            // default) and is not exercised by the test suite.
+            fold_probe_work(&self.op_stats, &scan.work());
             // Cold cells rerank in-scan; take their exact hits directly.
             if !scan.hits.is_empty() {
                 let mut tagged = dispatch::tag_hits(entry, scan.hits);
@@ -2775,6 +2775,15 @@ impl SupertableReader {
             let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
             for (si, c) in winners {
                 by_seg.entry(si).or_default().push(c);
+            }
+            if let Some(stats) = &self.op_stats {
+                // Actual winner rows, folded once for the whole phase-C
+                // rerank. The scan-time tallies carry only the cold arm's
+                // immediate reranks; on this deferred design the phase-C
+                // winners are the dominant rerank leg, and the stamped
+                // fan-out already counts its equivalent.
+                let rows: u64 = by_seg.values().map(|sel| sel.len() as u64).sum();
+                stats.add_vector_rows_reranked(rows);
             }
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
@@ -3767,7 +3776,7 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(vector_read_query_error)?;
-                        fold_scan_outcome(&op_stats, &scan);
+                        fold_probe_work(&op_stats, &scan.work());
                         max_replica_overhead
                             .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
                         if !scan.candidates.is_empty() {
@@ -3784,17 +3793,7 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(vector_read_query_error)?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_vector_scan(tally.cells_scanned, tally.candidates_scanned);
-                            // Request-shaped ranges only — rerank rows are
-                            // diagnostics; their cost rides the priced CPU
-                            // watermark (survivor fetches coalesce into a
-                            // handful of real requests, so counting one
-                            // range per row would not be request-shaped).
-                            stats.add_planned_read_ranges(tally.ranges_requested);
-                            stats.add_vector_rows_reranked(tally.rows_reranked);
-                            stats.add_kernel_cpu_ns(tally.kernel_cpu_ns);
-                        }
+                        fold_probe_work(&op_stats, &tally);
                         hits
                     };
                     let mut tagged = dispatch::tag_hits(&entry, hits);

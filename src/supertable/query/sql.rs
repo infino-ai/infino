@@ -64,7 +64,6 @@ use datafusion::{
     error::DataFusionError,
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, LogicalPlan},
-    physical_plan::{ExecutionPlan, collect as collect_physical},
 };
 
 use crate::{
@@ -78,9 +77,9 @@ use crate::{
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
-                common::harvest_datafusion_metrics, fts_exec::register_bm25,
+                common::collect_plan_metered, fts_exec::register_bm25,
                 hybrid_exec::register_hybrid_search, match_exec::register_match,
-                metered_exec::MeteredExec, vector_exec::register_vector_search,
+                vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
@@ -410,6 +409,23 @@ impl SupertableReader {
         Ok(ctx)
     }
 
+    /// Plan one DataFrame, then run it through the shared
+    /// meter-collect-harvest step every SQL execution site uses
+    /// ([`collect_plan_metered`]).
+    async fn collect_metered_df(
+        df: DataFrame,
+        task_ctx: Arc<TaskContext>,
+        op_stats: &Option<Arc<OpStatsCollector>>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        collect_plan_metered(&plan, task_ctx, op_stats)
+            .await
+            .map_err(exec_query_error)
+    }
+
     /// Resolve a predicate to the matching `_id` values. Used by
     /// the writer's `delete()` / `update()` entry points to
     /// capture the target-id set at call time (step 0a in the
@@ -423,35 +439,6 @@ impl SupertableReader {
     /// large-table delete/update predicate never materializes every
     /// superfile into memory.
     ///
-    /// Plan, meter, execute and account for one DataFrame.
-    ///
-    /// The four steps belong together: a site that collects without
-    /// harvesting reports CPU, page bytes and ranges with no row count
-    /// beside them, which is how the mutation predicate resolve came to
-    /// report zero decoded rows for a scan it genuinely paid for. Keeping
-    /// them in one helper means a later call site cannot execute a plan
-    /// and quietly skip the accounting.
-    async fn collect_metered_df(
-        df: DataFrame,
-        task_ctx: Arc<TaskContext>,
-        op_stats: &Option<Arc<OpStatsCollector>>,
-    ) -> Result<Vec<RecordBatch>, QueryError> {
-        let plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| QueryError::Plan(e.to_string()))?;
-        let metered: Arc<dyn ExecutionPlan> =
-            Arc::new(MeteredExec::new(Arc::clone(&plan), op_stats.clone()));
-        let batches = collect_physical(metered, task_ctx)
-            .await
-            .map_err(exec_query_error)?;
-        // Walks the executed plan and takes the collector explicitly, so
-        // it needs neither a metered context nor a cache bypass — the
-        // cached context carries no collector by design.
-        harvest_datafusion_metrics(&plan, op_stats);
-        Ok(batches)
-    }
-
     /// Note: the resolution is against the **current** manifest
     /// snapshot, exactly like a contemporaneous `query_sql` would
     /// see. Rows that newly match `expr` between this call and

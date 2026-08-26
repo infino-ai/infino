@@ -171,25 +171,22 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
             };
             partials.push(partial);
         }
-        let out_names: Vec<String> = agg
-            .schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
         let mut expressions = Vec::with_capacity(kinds.len());
-        for ((kind, partial), name) in kinds.iter().zip(&partials).zip(out_names) {
+        for (i, (kind, partial)) in kinds.iter().zip(&partials).enumerate() {
+            let field = agg.schema.field(i);
             let expression = match (kind, partial) {
                 (AggKind::CountStar, Partial::Count(count)) => lit(*count),
                 (AggKind::Sum(_), Partial::Sum(value))
                 | (AggKind::Min(_), Partial::Bound(value))
-                | (AggKind::Max(_), Partial::Bound(value)) => lit(value.clone()),
+                | (AggKind::Max(_), Partial::Bound(value)) => {
+                    covered_literal(value, field.data_type())
+                }
                 (AggKind::Avg(_), Partial::Avg { sum, count }) => {
                     cast(lit(sum.clone()), DataType::Float64) / cast(lit(*count), DataType::Float64)
                 }
                 _ => return Ok(None),
             };
-            expressions.push(expression.alias(name));
+            expressions.push(expression.alias(field.name().clone()));
         }
         let rewritten = LogicalPlanBuilder::empty(true)
             .project(expressions)?
@@ -305,7 +302,14 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
                 partial_exprs.push(max(col(column)).alias(format!("__resid_{i}_max")));
             }
             AggKind::Avg(column) => {
-                partial_exprs.push(sum(col(column)).alias(format!("__resid_{i}_sum")));
+                // Explicitly cast: the analyzer's coercion pass has already
+                // run, so a bare `sum(col)` over a numeric narrower than
+                // the sum accumulator (Int32, Float32, ...) is untypeable
+                // here. Float64 matches the cast the planner had put on
+                // the original AVG argument, which parse_aggregates peeled.
+                partial_exprs.push(
+                    sum(cast(col(column), DataType::Float64)).alias(format!("__resid_{i}_sum")),
+                );
                 partial_exprs.push(count(col(column)).alias(format!("__resid_{i}_cnt")));
             }
         }
@@ -315,15 +319,10 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     // Final projection: combine each residual partial with its covered
     // literal, aliased to the original aggregate's output name so the
     // rewritten plan's schema matches the original node's exactly.
-    let out_names: Vec<String> = agg
-        .schema
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
     let mut final_exprs: Vec<Expr> = Vec::with_capacity(kinds.len());
     for (i, (kind, partial)) in kinds.iter().zip(&partials).enumerate() {
-        let name = &out_names[i];
+        let field = agg.schema.field(i);
+        let name = field.name().clone();
         let expr = match (kind, partial) {
             (AggKind::CountStar, Partial::Count(n)) => {
                 // COUNT over an empty residual is 0, never NULL.
@@ -334,19 +333,25 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
                 (coalesce(vec![col(format!("__resid_{i}_sum")), lit(zero)]) + lit(value.clone()))
                     .alias(name)
             }
-            (AggKind::Min(_), Partial::Bound(value)) => {
-                least(vec![col(format!("__resid_{i}_min")), lit(value.clone())]).alias(name)
-            }
-            (AggKind::Max(_), Partial::Bound(value)) => {
-                greatest(vec![col(format!("__resid_{i}_max")), lit(value.clone())]).alias(name)
-            }
+            (AggKind::Min(_), Partial::Bound(value)) => least(vec![
+                col(format!("__resid_{i}_min")),
+                covered_literal(value, field.data_type()),
+            ])
+            .alias(name),
+            (AggKind::Max(_), Partial::Bound(value)) => greatest(vec![
+                col(format!("__resid_{i}_max")),
+                covered_literal(value, field.data_type()),
+            ])
+            .alias(name),
             (AggKind::Avg(_), Partial::Avg { sum, count }) => {
-                let zero = typed_zero(sum)?;
-                let total_sum =
-                    coalesce(vec![col(format!("__resid_{i}_sum")), lit(zero)]) + lit(sum.clone());
+                // The residual partial is Float64 by construction (its sum
+                // is over an explicit cast), so the whole combiner stays in
+                // Float64 — the coalesce zero and the covered sum must
+                // match it, since nothing coerces after this rule.
+                let total_sum = coalesce(vec![col(format!("__resid_{i}_sum")), lit(0.0_f64)])
+                    + cast(lit(sum.clone()), DataType::Float64);
                 let total_cnt = col(format!("__resid_{i}_cnt")) + lit(*count);
-                (cast(total_sum, DataType::Float64) / cast(total_cnt, DataType::Float64))
-                    .alias(name)
+                (total_sum / cast(total_cnt, DataType::Float64)).alias(name)
             }
             _ => return Ok(None),
         };
@@ -355,6 +360,22 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
 
     let rewritten = builder.project(final_exprs)?.build()?;
     Ok(Some(rewritten))
+}
+
+/// The covered statistic as a literal, cast to the aggregate's own output
+/// type when the stored value's type differs. Optimizer rules run after
+/// the analyzer's type-coercion pass, so nothing downstream repairs a
+/// mismatch — and one exists for every non-FTS string column: the scan
+/// serves it as `Utf8View` while the manifest stores its bounds as
+/// `LargeUtf8`. Uncast, the bound fails arrow's comparison kernel at
+/// execution (filtered arm) or breaks the rewritten plan's schema
+/// (unfiltered arm).
+fn covered_literal(value: &ScalarValue, output: &DataType) -> Expr {
+    if &value.data_type() == output {
+        lit(value.clone())
+    } else {
+        cast(lit(value.clone()), output.clone())
+    }
 }
 
 fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Option<LogicalPlan>> {
@@ -569,7 +590,10 @@ fn parse_aggregates(exprs: &[Expr]) -> Option<Vec<AggKind>> {
             ("max", [Expr::Column(c)]) => AggKind::Max(c.name.clone()),
             // AVG's int arguments arrive wrapped in a coercion cast to
             // Float64; peeling it is safe here (and only here) because
-            // the combiner re-casts both totals to Float64 itself.
+            // the residual partial re-applies the cast explicitly and the
+            // combiner works in Float64 throughout — no coercion pass runs
+            // after an optimizer rule, so every expression this rewrite
+            // emits must arrive fully typed.
             ("avg", [arg]) => AggKind::Avg(avg_column(arg)?),
             _ => return None,
         };

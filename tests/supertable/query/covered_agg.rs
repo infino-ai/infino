@@ -14,7 +14,9 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringViewArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
@@ -108,6 +110,24 @@ fn scalar_i64(st: &Supertable, sql: &str) -> i64 {
         .downcast_ref::<Int64Array>()
         .expect("i64 result")
         .value(0)
+}
+
+/// First-row string result. The provider serves non-FTS string columns
+/// as `Utf8View`, so a covered bound comes back as a view array; the
+/// LargeUtf8 arm covers plans that kept the stored type.
+fn scalar_string(st: &Supertable, sql: &str) -> String {
+    let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
+    let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
+    let column = batch.column(0);
+    if let Some(views) = column.as_any().downcast_ref::<StringViewArray>() {
+        return views.value(0).to_string();
+    }
+    column
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .expect("string result")
+        .value(0)
+        .to_string()
 }
 
 fn scalar_f64(st: &Supertable, sql: &str) -> f64 {
@@ -457,4 +477,90 @@ fn not_in_returns_the_complement() {
         "SELECT COUNT(*) AS n FROM supertable WHERE rating NOT IN (1, 2, 3, 1001)",
     );
     assert_eq!(n, total - 4);
+}
+
+/// MIN/MAX over a non-FTS string column: the scan serves it as
+/// `Utf8View` while the manifest stores its bounds as `LargeUtf8`, and no
+/// coercion pass runs after an optimizer rule — so an uncast covered
+/// bound fails arrow's comparison kernel at execution (filtered arm) or
+/// breaks the rewritten plan's schema (unfiltered arm). Both arms cast.
+#[test]
+fn string_min_max_survive_the_utf8view_retype() {
+    let st = build_table();
+
+    // Cuts into commit 2, so the residual least/greatest combiner runs.
+    let where_range = "rating BETWEEN 1000 AND 2025";
+    let min_sql = format!("SELECT MIN(category) FROM supertable WHERE {where_range}");
+    let max_sql = format!("SELECT MAX(category) FROM supertable WHERE {where_range}");
+    assert_eq!(scalar_string(&st, &min_sql), "cat1_000");
+    assert_eq!(scalar_string(&st, &max_sql), "cat2_025");
+    for sql in [&min_sql, &max_sql] {
+        let plan = explain(&st, sql);
+        assert!(
+            plan.contains("__resid_0"),
+            "{sql}: expected the covered/residual rewrite; plan was:\n{plan}"
+        );
+    }
+
+    // Unfiltered arm: fully covered, answered without any scan.
+    assert_eq!(
+        scalar_string(&st, "SELECT MIN(category) FROM supertable"),
+        "cat0_000"
+    );
+    assert_eq!(
+        scalar_string(&st, "SELECT MAX(category) FROM supertable"),
+        format!("cat{}_{:03}", COMMITS - 1, ROWS_PER_COMMIT - 1)
+    );
+    let plan = explain(&st, "SELECT MAX(category) FROM supertable");
+    assert!(
+        !plan.contains("DataSourceExec") && !plan.contains("Parquet"),
+        "manifest-only string bound must not retain a Parquet scan:\n{plan}"
+    );
+}
+
+/// Rows per commit in the narrow-numeric fixture.
+const NARROW_ROWS: usize = 40;
+
+/// AVG over a numeric narrower than the sum accumulator: the planner
+/// coerces `avg(int32_col)` to `avg(CAST(... AS Float64))` and the rule
+/// peels that cast — so the residual partial must re-apply it, because
+/// DataFusion's `sum` has no return type for Int32 and nothing coerces
+/// after an optimizer rule.
+#[test]
+fn narrow_numeric_avg_survives_the_peeled_cast() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "score",
+        DataType::Int32,
+        false,
+    )]));
+    let options =
+        SupertableOptions::new(Arc::clone(&schema), vec![], vec![], None).expect("valid options");
+    let st = Supertable::create(options).expect("create");
+    let mut w = st.writer().expect("writer");
+    for idx in 0..COMMITS {
+        let scores: Vec<i32> = (0..NARROW_ROWS).map(|r| (idx * 1000 + r) as i32).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(scores))],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+
+    // Cuts into commit 2 -> commit 1 covered, commit 2 scanned residually.
+    let sql = "SELECT AVG(score) FROM supertable WHERE score BETWEEN 1000 AND 2019";
+    let values: Vec<f64> = (1000..1000 + NARROW_ROWS as i64)
+        .chain(2000..=2019)
+        .map(|v| v as f64)
+        .collect();
+    let expected = values.iter().sum::<f64>() / values.len() as f64;
+    let got = scalar_f64(&st, sql);
+    assert!((got - expected).abs() < 1e-9, "avg {got} vs {expected}");
+    let plan = explain(&st, sql);
+    assert!(
+        plan.contains("__resid_0"),
+        "expected the covered/residual rewrite; plan was:\n{plan}"
+    );
 }

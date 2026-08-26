@@ -362,6 +362,9 @@ const MIXED_SCHEMA_ROWS: usize = 32;
 const SLICE_TEST_PARENT_ROWS: usize = 4_000;
 /// Rows the slice fixture actually appends.
 const SLICE_TEST_ROWS: usize = 10;
+/// Mid-array offset for the second slice arm — far enough in that a
+/// sizing blind to offsets would visibly bill the wrong window.
+const SLICE_TEST_OFFSET: usize = 1_700;
 
 /// Priced bytes measure the rows an append carries, not the allocation
 /// they happen to live in. Arrow slices share their parent's buffers, and
@@ -376,33 +379,41 @@ fn a_sliced_append_is_billed_for_its_own_rows() {
         .map(|i| format!("row {i} carrying enough text to allocate a real buffer"))
         .collect();
     let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
-    let sliced = build_title_batch(&refs).slice(0, SLICE_TEST_ROWS);
-    let standalone = build_title_batch(&refs[..SLICE_TEST_ROWS]);
+    // Two windows: one at offset 0 and one from the middle. Chunked
+    // ingest slices at 0, then len, then 2*len — every chunk after the
+    // first carries a non-zero offset, and a sizing that honoured length
+    // while ignoring offset would pass the first arm and still over-bill
+    // every later chunk.
+    for offset in [0, SLICE_TEST_OFFSET] {
+        let sliced = build_title_batch(&refs).slice(offset, SLICE_TEST_ROWS);
+        let standalone = build_title_batch(&refs[offset..offset + SLICE_TEST_ROWS]);
 
-    let st_sliced = Supertable::create(options_with_pool_width(1)).expect("create");
-    let ((), from_slice) = with_op_stats(|| {
-        st_sliced.append(&sliced).expect("append the slice");
-    });
-    let st_standalone = Supertable::create(options_with_pool_width(1)).expect("create");
-    let ((), from_standalone) = with_op_stats(|| {
-        st_standalone
-            .append(&standalone)
-            .expect("append the standalone batch");
-    });
+        let st_sliced = Supertable::create(options_with_pool_width(1)).expect("create");
+        let ((), from_slice) = with_op_stats(|| {
+            st_sliced.append(&sliced).expect("append the slice");
+        });
+        let st_standalone = Supertable::create(options_with_pool_width(1)).expect("create");
+        let ((), from_standalone) = with_op_stats(|| {
+            st_standalone
+                .append(&standalone)
+                .expect("append the standalone batch");
+        });
 
-    assert_eq!(
-        from_slice.rows_written, from_standalone.rows_written,
-        "both appends carry the same rows"
-    );
-    assert_eq!(
-        from_slice.scalar_bytes_written, from_standalone.scalar_bytes_written,
-        "the same rows must price the same whether they arrive as a slice \
-         of a larger batch or as a batch of their own"
-    );
-    assert_eq!(
-        from_slice.fts_text_bytes_written, from_standalone.fts_text_bytes_written,
-        "and so must the indexed-text leg"
-    );
+        assert_eq!(
+            from_slice.rows_written, from_standalone.rows_written,
+            "offset {offset}: both appends carry the same rows"
+        );
+        assert_eq!(
+            from_slice.scalar_bytes_written, from_standalone.scalar_bytes_written,
+            "offset {offset}: the same rows must price the same whether \
+             they arrive as a slice of a larger batch or as a batch of \
+             their own"
+        );
+        assert_eq!(
+            from_slice.fts_text_bytes_written, from_standalone.fts_text_bytes_written,
+            "offset {offset}: and so must the indexed-text leg"
+        );
+    }
 }
 
 /// The determinism contract covers commit retries as well as pool width,

@@ -148,10 +148,13 @@ pub struct OpStats {
     pub sql_page_bytes: u64,
     /// Rows decoded from stored columns to build results — the scalar
     /// projection decode (`resolve_columns`, including the `_id` stamping
-    /// fallback it serves) plus, for SQL, the scan operators' output rows
-    /// from DataFusion's own metrics. The id-score arithmetic fast path
-    /// decodes nothing and counts nothing; remap/tombstone-internal id
-    /// reads count planned ranges only, never rows.
+    /// fallback it serves); for SQL, the scan operators' output rows from
+    /// DataFusion's own metrics; and filter-side verify decodes
+    /// (`exact_match` decodes one row per candidate to compare values,
+    /// counted once whichever take served the batch). The id-score
+    /// arithmetic fast path decodes nothing and counts nothing;
+    /// remap/tombstone-internal id reads count planned ranges only, never
+    /// rows.
     pub rows_materialized: u64,
     /// Nanoseconds of the query's bracketed synchronous kernel sections.
     /// One clock everywhere: the thread-CPU clock (schedstat). Engine
