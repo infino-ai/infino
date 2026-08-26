@@ -77,34 +77,51 @@ fn filter_survivors(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usi
 #[target_feature(enable = "avx2")]
 unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usize {
     use std::arch::x86_64::*;
-    let n = docs.len();
-    let thr = _mm256_set1_ps(min_score);
-    let dptr = docs.as_mut_ptr();
-    let sptr = scores.as_mut_ptr();
-    let mut out = 0usize;
-    let mut i = 0usize;
-    while i + 8 <= n {
-        let vs = _mm256_loadu_ps(sptr.add(i));
-        let vd = _mm256_loadu_si256(dptr.add(i) as *const __m256i);
-        let mask = _mm256_movemask_ps(_mm256_cmp_ps(vs, thr, _CMP_GE_OQ)) as usize;
-        let ctrl =
-            _mm256_cvtepu8_epi32(_mm_loadl_epi64(LEFT_PACK[mask].as_ptr() as *const __m128i));
-        _mm256_storeu_ps(sptr.add(out), _mm256_permutevar8x32_ps(vs, ctrl));
-        _mm256_storeu_si256(
-            dptr.add(out) as *mut __m256i,
-            _mm256_permutevar8x32_epi32(vd, ctrl),
-        );
-        out += (mask as u32).count_ones() as usize;
-        i += 8;
+    // SAFETY, per obligation:
+    // - AVX2 intrinsics: reachable only through the dispatcher's
+    //   `is_x86_feature_detected!("avx2")` guard, so the target feature the
+    //   `#[target_feature]` attribute requires is present at runtime.
+    // - `loadu`/`storeu` + `*ptr`: the unaligned variants impose no alignment
+    //   precondition; `dptr`/`sptr` come from the same `n`-element slices, and
+    //   every access is bounded below (see per-site notes).
+    // - `LEFT_PACK[mask]`: `mask` is an 8-lane movemask, so `0..=255` — always
+    //   in range of the 256-entry table; `_mm_loadl_epi64` reads its 8 bytes.
+    unsafe {
+        let n = docs.len();
+        let thr = _mm256_set1_ps(min_score);
+        let dptr = docs.as_mut_ptr();
+        let sptr = scores.as_mut_ptr();
+        let mut out = 0usize;
+        let mut i = 0usize;
+        while i + 8 <= n {
+            // SAFETY: `i + 8 <= n` bounds the source span `[i, i+8)`; `out <= i`
+            // holds every iteration (out grows by popcount ≤ 8, i by 8), so the
+            // dest span `[out, out+8)` is in-bounds too. `vs`/`vd` are read into
+            // registers before the store, so the in-place left-pack overwrite of
+            // `[out, out+8)` cannot clobber a source lane not yet read.
+            let vs = _mm256_loadu_ps(sptr.add(i));
+            let vd = _mm256_loadu_si256(dptr.add(i) as *const __m256i);
+            let mask = _mm256_movemask_ps(_mm256_cmp_ps(vs, thr, _CMP_GE_OQ)) as usize;
+            let ctrl =
+                _mm256_cvtepu8_epi32(_mm_loadl_epi64(LEFT_PACK[mask].as_ptr() as *const __m128i));
+            _mm256_storeu_ps(sptr.add(out), _mm256_permutevar8x32_ps(vs, ctrl));
+            _mm256_storeu_si256(
+                dptr.add(out) as *mut __m256i,
+                _mm256_permutevar8x32_epi32(vd, ctrl),
+            );
+            out += (mask as u32).count_ones() as usize;
+            i += 8;
+        }
+        while i < n {
+            // SAFETY: `i < n` and `out <= i` keep every `.add` within `[0, n)`.
+            let keep = *sptr.add(i) >= min_score;
+            *dptr.add(out) = *dptr.add(i);
+            *sptr.add(out) = *sptr.add(i);
+            out += keep as usize;
+            i += 1;
+        }
+        out
     }
-    while i < n {
-        let keep = *sptr.add(i) >= min_score;
-        *dptr.add(out) = *dptr.add(i);
-        *sptr.add(out) = *sptr.add(i);
-        out += keep as usize;
-        i += 1;
-    }
-    out
 }
 
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
