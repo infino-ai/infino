@@ -110,7 +110,18 @@ fn view_visible_bytes(column: &dyn Array) -> u64 {
     };
     ((column.len() * VIEW_STRIDE) as u64)
         .saturating_add(payload)
-        .saturating_add(column.nulls().map_or(0, |n| n.buffer().len() as u64))
+        .saturating_add(null_bitmap_visible_bytes(column))
+}
+
+/// Visible bytes of a column's null bitmap: one bit per visible row,
+/// rounded up — never the backing buffer's length, which a slice shares
+/// with its parent the same way it shares value buffers.
+fn null_bitmap_visible_bytes(column: &dyn Array) -> u64 {
+    if column.nulls().is_some() {
+        column.len().div_ceil(8) as u64
+    } else {
+        0
+    }
 }
 
 /// Slice-aware size for a type whose own layout describes it fully.
@@ -134,8 +145,7 @@ fn list_window_bytes<O: OffsetSizeTrait>(column: &dyn Array) -> u64 {
         (Some(first), Some(last)) => (first.as_usize(), last.as_usize()),
         _ => (0, 0),
     };
-    let own =
-        mem::size_of_val(offsets) as u64 + list.nulls().map_or(0, |n| n.buffer().len() as u64);
+    let own = mem::size_of_val(offsets) as u64 + null_bitmap_visible_bytes(column);
     let child = if end > start {
         visible_array_bytes(list.values().slice(start, end - start).as_ref())
     } else {

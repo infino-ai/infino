@@ -2934,9 +2934,14 @@ fn commit_target_object_bytes() -> u64 {
 /// pricing off them would make the same append cost different amounts on
 /// different hosts. See [`buffered_payload_bytes`].
 fn planned_data_objects(payload_bytes: u64) -> u64 {
+    if payload_bytes == 0 {
+        return 0;
+    }
     let target = commit_target_object_bytes();
     if target == 0 {
-        0
+        // A zero target is a misconfiguration, not a license to write for
+        // free: any committed payload occupies at least one object.
+        1
     } else {
         payload_bytes.div_ceil(target)
     }

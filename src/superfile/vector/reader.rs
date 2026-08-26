@@ -3468,7 +3468,15 @@ impl VectorReader {
         // selection; at a wide sweep that is the whole probed set.
         let (per_cell, resolve_ns) = timed_section(|| self.resolve_cells_for_clusters(clusters));
         if per_cell.is_empty() {
-            return Ok((Vec::new(), ProbeTally::default()));
+            // The resolve itself was real work; a zero-hit probe still
+            // reports the CPU it spent finding that out.
+            return Ok((
+                Vec::new(),
+                ProbeTally {
+                    kernel_cpu_ns: resolve_ns,
+                    ..ProbeTally::default()
+                },
+            ));
         }
 
         // One rotation for every probed cell: it is seeded once per column,
@@ -3481,17 +3489,27 @@ impl VectorReader {
         // out of range and take the process with it. Validate the whole
         // set here rather than just the first: the fan-out closure below
         // indexes `self.columns` per cell and is a `filter_map`, so it has
-        // no way to report an error partway through the wave.
+        // no way to report an error partway through the wave. Layout
+        // agreement is part of the same validation — sharing one rotated
+        // query across cells is only correct while every cell carries the
+        // column's dim and table-wide rotation seed, and a mismatch would
+        // otherwise score silently wrong rather than fail.
+        let first_col = self.column_at(per_cell[0].0)?;
         for &(cell_idx, ..) in &per_cell {
-            self.column_at(cell_idx)?;
+            let cell_col = self.column_at(cell_idx)?;
+            if cell_col.dim != first_col.dim || cell_col.rot_seed != first_col.rot_seed {
+                return Err(VectorError::InconsistentIndex(format!(
+                    "cell {cell_idx} disagrees with the column's layout \
+                     (dim {} seed {}, expected dim {} seed {})",
+                    cell_col.dim, cell_col.rot_seed, first_col.dim, first_col.rot_seed
+                )));
+            }
         }
-        let (q_rot_shared, rot_ns) = timed_section(|| -> Result<Vec<f32>, VectorError> {
-            let first_col = self.column_at(per_cell[0].0)?;
+        let (q_rot_shared, rot_ns) = timed_section(|| {
             let mut q_rot = vec![0f32; first_col.dim];
             first_col.rot.apply(query, &mut q_rot);
-            Ok(q_rot)
+            q_rot
         });
-        let q_rot_shared = q_rot_shared?;
         let q_rot_shared = &q_rot_shared;
 
         // Probe the selected cells CONCURRENTLY — the same wave shape the
@@ -3670,7 +3688,6 @@ impl VectorReader {
         // REQUESTED column's seed (every cell of one column shares it),
         // not `columns[0]`'s — a multi-column file's first column can be
         // a different column with a different rotation.
-        outcome.rot_seed = self.column_at(per_cell[0].0)?.rot_seed;
         // Rotate the query once per superfile: every cell of a column
         // shares the table-wide rotation seed (cross-cell estimate pooling
         // depends on it), so per-cell re-rotation is duplicate work — at a
@@ -3678,11 +3695,20 @@ impl VectorReader {
         // ~1.3ms of wall per query.
         // Same reasoning as the multi-cell probe path: the scan closure
         // below indexes `self.columns` for every cell and cannot return an
-        // error, so the whole resolved set is validated up front.
-        for &(cell_idx, ..) in &per_cell {
-            self.column_at(cell_idx)?;
-        }
+        // error, so the whole resolved set — indices and layout agreement
+        // both — is validated up front.
         let first_col = self.column_at(per_cell[0].0)?;
+        for &(cell_idx, ..) in &per_cell {
+            let cell_col = self.column_at(cell_idx)?;
+            if cell_col.dim != first_col.dim || cell_col.rot_seed != first_col.rot_seed {
+                return Err(VectorError::InconsistentIndex(format!(
+                    "cell {cell_idx} disagrees with the column's layout \
+                     (dim {} seed {}, expected dim {} seed {})",
+                    cell_col.dim, cell_col.rot_seed, first_col.dim, first_col.rot_seed
+                )));
+            }
+        }
+        outcome.rot_seed = first_col.rot_seed;
         let (q_rot_shared, rot_ns) = timed_section(|| {
             let mut q_rot = vec![0f32; first_col.dim];
             first_col.rot.apply(query, &mut q_rot);
@@ -3718,9 +3744,11 @@ impl VectorReader {
                 let ((cluster_meta, prefix_ranges), meta_ns) =
                     timed_section(|| chosen_cluster_meta(col, &cluster_idx, &locals));
                 if cluster_meta.is_empty() {
-                    // The cluster-index read itself was one planned range.
+                    // The cluster-index read itself was one planned range,
+                    // and the metadata walk was real CPU.
                     let tally = ProbeTally {
                         ranges_requested: 1,
+                        kernel_cpu_ns: meta_ns,
                         ..ProbeTally::default()
                     };
                     return Ok((Vec::new(), Vec::new(), tally));
@@ -3960,7 +3988,27 @@ impl VectorReader {
                                                 cand.cluster_id
                                             ))
                                         })?;
-                                    Ok(region.slice(range.start - base..range.end - base))
+                                    // Checked arithmetic for the same reason
+                                    // the lookup is checked: a stale span
+                                    // base underflows the subtraction and a
+                                    // short region fails the slice — both
+                                    // are index inconsistency, not a reason
+                                    // to abort the process.
+                                    let (start, end) = range
+                                        .start
+                                        .checked_sub(*base)
+                                        .zip(range.end.checked_sub(*base))
+                                        .filter(|&(s, e)| s <= e && e <= region.len())
+                                        .ok_or_else(|| {
+                                            VectorError::InconsistentIndex(format!(
+                                                "survivor range {:?} falls outside cluster {}'s \
+                                                 warmed span (base {base}, len {})",
+                                                range,
+                                                cand.cluster_id,
+                                                region.len()
+                                            ))
+                                        })?;
+                                    Ok(region.slice(start..end))
                                 })
                                 .collect::<Result<Vec<_>, VectorError>>()
                         });
@@ -4035,7 +4083,14 @@ impl VectorReader {
         let ((cluster_meta, cluster_prefix_ranges), meta_ns) =
             timed_section(|| chosen_cluster_meta(col, cluster_idx, chosen));
         if cluster_meta.is_empty() {
-            return Ok((Vec::new(), ProbeTally::default()));
+            // The metadata walk was real work; keep its CPU on the tally.
+            return Ok((
+                Vec::new(),
+                ProbeTally {
+                    kernel_cpu_ns: meta_ns,
+                    ..ProbeTally::default()
+                },
+            ));
         }
         // Plan tallies, fixed before the warm/cold fetch branch: both arms
         // scan the same clusters and request one prefix/block range each
