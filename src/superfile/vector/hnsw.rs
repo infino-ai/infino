@@ -931,6 +931,16 @@ fn calibrate_ef_curve(
 ) -> Vec<(u32, u32)> {
     let kmax = anchors.iter().copied().max().unwrap_or(0);
     let ceiling = efs.last().copied().unwrap_or(0);
+    // `search_scratch` walks at `ef.max(k)` with `k = kmax`, so the recall an
+    // anchor is credited with is measured at beam `max(ef, kmax)` while `chosen`
+    // records the un-clamped `ef`. That only agrees when every candidate `ef` is
+    // at least the widest anchor; otherwise a small cleared `ef` would be stamped
+    // yet served at a narrower beam than it was measured at.
+    debug_assert!(
+        efs.first().copied().unwrap_or(usize::MAX) >= kmax,
+        "ef candidates must be >= the widest anchor ({kmax}) so a stamped ef is served \
+         at the beam its recall was measured at"
+    );
     // Minimal clearing ef per anchor, filled the first time an ascending ef
     // clears that anchor's target.
     let mut chosen: Vec<Option<usize>> = vec![None; anchors.len()];
@@ -990,6 +1000,11 @@ fn calibrate_ef_curve(
 /// the best achieved with `registered` gated by the `target_recall −
 /// recall_slack` graceful floor. Queries are held-out, perturbed (off-node) so
 /// recall is realistic.
+///
+/// `want_curve` gates the per-`k` calibration: callers that only need the
+/// `(m0, ef)` choice (the corpus-size probe, the incremental-append recall
+/// check) pass `false` to skip the extra anchor sweep, whose result they would
+/// discard anyway — the authoritative curve is stamped on the full-corpus build.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn calibrate_graph(
     scorer: &Sq16Scorer,
@@ -1001,6 +1016,7 @@ pub(crate) fn calibrate_graph(
     n_queries: usize,
     k: usize,
     seed: u64,
+    want_curve: bool,
 ) -> (CalibChoice, Vec<(u32, u32)>, Option<Hnsw>) {
     let register_floor = (target_recall - recall_slack).max(0.0);
     let n = scorer.len();
@@ -1097,9 +1113,17 @@ pub(crate) fn calibrate_graph(
         Some(base.pruned_base_layer(scorer, choice.m0))
     };
     // Stamp the k→ef curve for the chosen m0's graph (the one that serves).
-    // Empty when nothing registered — no bundle is written in that case.
+    // Per-`k` widening only earns its keep on a graph that clears the target:
+    // uncleared anchors widen to the ceiling to chase recall, which is what a
+    // larger `k` wants. A graceful-band graph (registered but below target at
+    // every ef) has no anchor to clear, so a curve would just serve every `k`
+    // at the ceiling — strictly slower than the single stamped `choice.ef` it
+    // used before this curve existed. Stamp an empty curve there so serving
+    // degrades to `ef_search` (= `choice.ef`) for every `k`, exactly the
+    // pre-curve behavior. Empty too when the caller does not want a curve, or
+    // when nothing registered (no bundle is written in that case).
     let curve = match graph.as_ref() {
-        Some(g) => calibrate_ef_curve(
+        Some(g) if want_curve && choice.at_target => calibrate_ef_curve(
             g,
             scorer,
             &queries,
@@ -1108,7 +1132,7 @@ pub(crate) fn calibrate_graph(
             &efs,
             target_recall,
         ),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     (choice, curve, graph)
 }
@@ -1644,8 +1668,9 @@ impl HnswIndex {
     /// The calibrated query beam for a requested `k`, read from the stamped
     /// k→ef curve: round `k` UP to the next anchor and return that anchor's
     /// `ef` (the minimal beam that cleared the recall target there). A `k`
-    /// above the top anchor clamps to the top anchor's `ef` (the ceiling — no
-    /// measured-recall promise beyond the anchors). A degenerate 1-point curve
+    /// above the top anchor clamps to the top anchor's `ef` (the widest
+    /// calibrated beam — no measured-recall promise beyond the anchors). A
+    /// degenerate 1-point curve
     /// (a pre-`v04` bundle) returns its single stamped `ef` for every `k`.
     pub(crate) fn ef_for_k(&self, k: usize) -> usize {
         for &(anchor_k, ef) in &self.ef_curve {
@@ -2358,6 +2383,7 @@ mod tests {
             100,
             10,
             0x5EED,
+            /* want_curve */ true,
         );
         eprintln!(
             "[calib] m0={} ef={} recall={:.3} registered={} at_target={} curve={curve:?}",

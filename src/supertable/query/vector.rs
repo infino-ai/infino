@@ -1911,6 +1911,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
                     HNSW_CALIB_SEED,
+                    /* want_curve */ false,
                 )
                 .0
             },
@@ -2004,6 +2005,7 @@ pub(crate) async fn assemble_hnsw_sections(
                 HNSW_CALIB_QUERIES,
                 HNSW_CALIB_RECALL_K,
                 HNSW_CALIB_SEED,
+                /* want_curve */ true,
             );
             (scorer, choice, ef_curve, graph)
         },
@@ -2208,6 +2210,7 @@ pub(crate) async fn assemble_hnsw_incremental(
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
                     HNSW_CALIB_SEED,
+                    /* want_curve */ false,
                 )
                 .0
                 .recall
