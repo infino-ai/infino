@@ -258,13 +258,22 @@ fn fold_probe_work(op_stats: &Option<Arc<OpStatsCollector>>, work: &ProbeTally) 
     let Some(stats) = op_stats else {
         return;
     };
-    stats.add_vector_scan(work.cells_scanned, work.candidates_scanned);
+    // Exhaustive on purpose: a field added to `ProbeTally` fails to
+    // compile here until someone decides how it is priced.
+    let ProbeTally {
+        cells_scanned,
+        candidates_scanned,
+        ranges_requested,
+        rows_reranked,
+        kernel_cpu_ns,
+    } = *work;
+    stats.add_vector_scan(cells_scanned, candidates_scanned);
     // Request-shaped ranges only (cluster index + prefixes/blocks + Sq8
     // meta). Rerank rows are diagnostics; their cost rides the priced CPU
     // watermark.
-    stats.add_planned_read_ranges(work.ranges_requested);
-    stats.add_vector_rows_reranked(work.rows_reranked);
-    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+    stats.add_planned_read_ranges(ranges_requested);
+    stats.add_vector_rows_reranked(rows_reranked);
+    stats.add_kernel_cpu_ns(kernel_cpu_ns);
 }
 
 /// Build the fine-cluster probe set, then refill globally (best score first)

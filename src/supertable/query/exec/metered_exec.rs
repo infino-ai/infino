@@ -230,9 +230,13 @@ impl ExecutionPlan for MeteredExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        // A limit the child can absorb must reach it through the meter, or
-        // the Exact arm of the sort pushdown above preserves an order whose
-        // early-termination fetch never arrives at the source.
+        // Not consulted on today's plan shapes: `supports_limit_pushdown`
+        // above routes the LimitPushdown walk into the child directly, so
+        // the fetch reaches the source either way (verified by A/B EXPLAIN
+        // — the plans are identical with this pair deleted). Kept because
+        // the module contract is that every planner question is answered
+        // by the child: a shape or rule that does consult this must get
+        // the source's answer, not a meter defaulting to `None`.
         self.input
             .with_fetch(limit)
             .map(|input| -> Arc<dyn ExecutionPlan> {
@@ -241,11 +245,13 @@ impl ExecutionPlan for MeteredExec {
     }
 
     fn with_preserve_order(&self, preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
-        // Completeness rather than a measured win: no optimizer path in
-        // this DataFusion reaches a wrapper here (both call sites target
-        // sources and unions). If a rewrite ever does ask, the answer must
-        // come from the source that decides whether it may skip row
-        // groups, not from a meter defaulting to `None`.
+        // Reachable, not theoretical: LimitPushdown embeds a fetch into
+        // whatever fetch-capable non-pushdown node carries it — a residual
+        // `FilterExec` directly above a metered scan is an ordinary shape
+        // on this engine — and then calls `with_preserve_order` on that
+        // node, which delegates into its input, i.e. into this meter. The
+        // answer must come from the source that decides whether it may
+        // skip row groups, not from a meter defaulting to `None`.
         self.input
             .with_preserve_order(preserve_order)
             .map(|input| -> Arc<dyn ExecutionPlan> {

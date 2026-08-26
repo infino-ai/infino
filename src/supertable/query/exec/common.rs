@@ -83,26 +83,6 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
     }
 }
 
-/// Resolve `hits` to one `RecordBatch`, with `projection` naming the
-/// output columns (any of `_id`, the visible scalar columns, or the
-/// trailing `score`); `None` returns the engine-native `_id` + `score`
-/// pair. Names are resolved to output-schema indices and forwarded to
-/// [`resolve_hits`], which decodes only the projected columns. Shared
-/// by every public row-returning search method (`bm25_search`,
-/// `vector_search`, `token_match`, `exact_match`); `what` labels error
-/// messages with the calling method.
-/// Fold DataFusion's row instrumentation into the per-query stats after a
-/// SQL plan has executed: leaf (source) operators' `output_rows` sum into
-/// `rows_materialized` — the rows the scans decoded from storage.
-///
-/// Deliberately NOT `elapsed_compute`. That is an `Instant` timer around
-/// synchronous poll sections — wall time, so on a busy host it counts
-/// whatever the thread was descheduled for, the exact contention bleed
-/// per-op metering exists to remove. It also omits Parquet decode
-/// entirely. CPU now comes from
-/// [`MeteredExec`](crate::supertable::query::exec::metered_exec::MeteredExec),
-/// which brackets each scan poll with the same thread-CPU clock the
-/// search kernels use, so SQL and search are priced on one clock.
 /// Meter, execute and account for one physical plan: wrap the root in
 /// [`MeteredExec`], collect, then harvest the executed plan's own
 /// metrics. The three steps belong together — a site that collects
@@ -127,6 +107,18 @@ pub(crate) async fn collect_plan_metered(
     Ok(batches)
 }
 
+/// Fold DataFusion's row instrumentation into the per-query stats after a
+/// SQL plan has executed: leaf (source) operators' `output_rows` sum into
+/// `rows_materialized` — the rows the scans decoded from storage.
+///
+/// Deliberately NOT `elapsed_compute`. That is an `Instant` timer around
+/// synchronous poll sections — wall time, so on a busy host it counts
+/// whatever the thread was descheduled for, the exact contention bleed
+/// per-op metering exists to remove. It also omits Parquet decode
+/// entirely. CPU now comes from
+/// [`MeteredExec`](crate::supertable::query::exec::metered_exec::MeteredExec),
+/// which brackets each scan poll with the same thread-CPU clock the
+/// search kernels use, so SQL and search are priced on one clock.
 pub(crate) fn harvest_datafusion_metrics(
     plan: &Arc<dyn ExecutionPlan>,
     op_stats: &Option<Arc<OpStatsCollector>>,
@@ -157,6 +149,14 @@ pub(crate) fn harvest_datafusion_metrics(
     stats.add_rows_materialized(leaf_rows);
 }
 
+/// Resolve `hits` to one `RecordBatch`, with `projection` naming the
+/// output columns (any of `_id`, the visible scalar columns, or the
+/// trailing `score`); `None` returns the engine-native `_id` + `score`
+/// pair. Names are resolved to output-schema indices and forwarded to
+/// [`resolve_hits`], which decodes only the projected columns. Shared
+/// by every public row-returning search method (`bm25_search`,
+/// `vector_search`, `token_match`, `exact_match`); `what` labels error
+/// messages with the calling method.
 pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],

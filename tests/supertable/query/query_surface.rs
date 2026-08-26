@@ -347,3 +347,43 @@ fn explain_base_table_scan() {
     let plan = explain_text(&st, "SELECT title FROM supertable WHERE rating > 4");
     assert!(!plan.trim().is_empty(), "base-table EXPLAIN was empty");
 }
+
+/// The meter must be invisible to the planner: limit pushdown reaches the
+/// Parquet source and sort pushdown reorders/reverses row groups THROUGH
+/// [`MeteredExec`]. Guards the delegation surface as a whole — an
+/// `ExecutionPlan` wrapper that takes the trait defaults silently costs
+/// these plans their source-side limit and their reverse scan, the same
+/// class of bug whose `partition_statistics` variant once turned a
+/// whole-table `COUNT(*)` into a full columnar scan.
+#[test]
+fn metered_exec_is_invisible_to_limit_and_sort_pushdown() {
+    let st = demo_table();
+
+    let limit_plan = explain_text(&st, "SELECT rating FROM supertable LIMIT 5");
+    let source = limit_plan
+        .lines()
+        .find(|line| line.contains("DataSourceExec"))
+        .expect("physical plan has a source");
+    assert!(
+        source.contains("limit=5"),
+        "the limit must reach the source through the meter; plan was:\n{limit_plan}"
+    );
+    assert!(
+        !limit_plan.contains("GlobalLimitExec") && !limit_plan.contains("LocalLimitExec"),
+        "no residual limit node may sit above the meter; plan was:\n{limit_plan}"
+    );
+
+    let sort_plan = explain_text(
+        &st,
+        "SELECT rating FROM supertable ORDER BY _id DESC LIMIT 5",
+    );
+    let source = sort_plan
+        .lines()
+        .find(|line| line.contains("DataSourceExec"))
+        .expect("physical plan has a source");
+    assert!(
+        source.contains("reverse_row_groups=true") && source.contains("sort_order_for_reorder"),
+        "the DESC sort must reach the source as a reverse scan through the \
+         meter; plan was:\n{sort_plan}"
+    );
+}

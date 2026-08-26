@@ -4839,8 +4839,10 @@ pub struct ProbeTally {
 impl ScanOutcome {
     /// The scan's five work tallies in the shared carrier, so every
     /// supertable fold site prices the same field set through one
-    /// function — a sixth tally added here is a compile error at the
-    /// fold, not a silent gap at one of three call sites.
+    /// function. A new `ProbeTally` field is a compile error here (this
+    /// literal is exhaustive) and at the fold's destructure; a new
+    /// `ScanOutcome`-side tally still has to be threaded through this one
+    /// mapping, which is the single place to look.
     pub(crate) fn work(&self) -> ProbeTally {
         ProbeTally {
             cells_scanned: self.cells_scanned,
