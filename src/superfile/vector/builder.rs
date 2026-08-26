@@ -186,16 +186,32 @@ const STREAM_ROWS_PER_CENT: usize = 1000;
 /// ≥100K band, so each shard trained the full 1024 centroids on all of
 /// its rows and 7 writers did ~2.6x the k-means work of 1 writer —
 /// measured 2x SLOWER wall time on a 4-core box. Under the continuous
-/// rule a 142K shard trains 256 centroids (~558 rows/cluster) and
+/// rule a 142K shard trains 128 centroids (~1116 rows/cluster) and
 /// sharding divides the centroid work the way it divides the rows.
-/// The 1M single-build point is unchanged (1000 -> 1024).
+///
+/// NEAREST power of two, not round-up: rounding up would keep every
+/// shard finer than the target (500..1000 rows/cluster) and shift the
+/// measured 10M supertable shard layout (~78K rows: 64 under the band,
+/// 128 rounded up). Nearest keeps rows-per-cluster bracketing the
+/// target (707..1414) and reproduces EVERY measured design shape
+/// exactly: 1M -> 1024, ~78K supertable shards -> 64, small builds ->
+/// 64, >=5M -> 4096.
 ///
 /// Cell packs and maintenance rebuilds keep the banded cap — those are
 /// the measured 1M/10M cell layouts, not this path.
 fn stream_n_cent_for_rows(n_docs: usize) -> usize {
-    (n_docs / STREAM_ROWS_PER_CENT)
-        .next_power_of_two()
-        .clamp(N_CENT_SMALL, N_CENT_LARGE)
+    let target = n_docs / STREAM_ROWS_PER_CENT;
+    let up = target.next_power_of_two();
+    let down = up / 2;
+    // Nearest in log space: `down` wins iff `target <= down·√2`, i.e.
+    // `target² <= 2·down² = down·up`. `target` is rows/1000, so the
+    // square fits usize comfortably at any realistic corpus size.
+    let nearest = if target * target <= down * up {
+        down
+    } else {
+        up
+    };
+    nearest.clamp(N_CENT_SMALL, N_CENT_LARGE)
 }
 
 /// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
@@ -3485,17 +3501,21 @@ mod tests {
         assert_eq!(stream_n_cent_for_rows(62_500), N_CENT_SMALL);
         // Design point: the 1M single build keeps its measured layout.
         assert_eq!(stream_n_cent_for_rows(1_000_000), N_CENT_MEDIUM);
+        // 10M supertable commit shards (~78K rows) keep the measured 64:
+        // nearest-pow2 rounds 78 DOWN, where round-up would have shifted
+        // a measured layout to 128 for nothing.
+        assert_eq!(stream_n_cent_for_rows(78_125), N_CENT_SMALL);
         // Clamp ceiling: at and past the large threshold, the large cap.
         assert_eq!(stream_n_cent_for_rows(5_000_000), N_CENT_LARGE);
         assert_eq!(stream_n_cent_for_rows(10_000_000), N_CENT_LARGE);
         // The fix itself: a 1M/7 shard no longer trains the full 1024 —
-        // its centroid count follows its own rows.
-        let shard = stream_n_cent_for_rows(1_000_000_usize.div_ceil(7));
-        assert!(
-            shard < N_CENT_MEDIUM,
-            "a 142K shard must train fewer centroids than the whole 1M \
-             corpus, or sharding multiplies the k-means work (got {shard})"
-        );
+        // its centroid count follows its own rows, landing rows/cluster
+        // near the target (142,858 / 128 ≈ 1116).
+        assert_eq!(stream_n_cent_for_rows(1_000_000_usize.div_ceil(7)), 128);
+        // Power-of-two fractions of the design point keep the design
+        // ratio: half the corpus, half the clusters.
+        assert_eq!(stream_n_cent_for_rows(500_000), 512);
+        assert_eq!(stream_n_cent_for_rows(250_000), 256);
         // Monotone in rows: more rows never means fewer clusters.
         let mut prev = 0;
         for rows in [0, 10_000, 62_500, 142_858, 500_000, 1_000_000, 5_000_000] {
