@@ -252,7 +252,9 @@ pub struct CacheStats {
 #[derive(Debug, Clone, Copy)]
 struct UnindexedFile {
     size_bytes: u64,
-    /// File mtime in microseconds since the unix epoch; eviction drops the oldest first.
+    /// File mtime in microseconds since the unix epoch; eviction drops the oldest first. mtime and
+    /// not atime: relatime/noatime mounts make atime undependable, and for a file no read has
+    /// opened the two match anyway, so oldest-mtime is oldest-copy, the likeliest dead one.
     mtime_us: u64,
 }
 
@@ -1189,12 +1191,16 @@ impl DiskCacheStore {
     ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
         let path = self.cache_path(uri);
         let Ok(meta) = fs::metadata(&path) else {
+            // A counted file that is gone (deleted outside the engine) must stop counting now:
+            // left in place, its record double-counts against the fetched replacement and a later
+            // eviction of it would unlink the replacement's file.
+            self.discard_cache_file(uri);
             return Ok(None);
         };
 
         let size = meta.len();
         if size == 0 || expected_size.is_some_and(|want| want != size) {
-            self.discard_cache_file(uri, size);
+            self.discard_cache_file(uri);
             return Ok(None);
         }
 
@@ -1235,10 +1241,13 @@ impl DiskCacheStore {
         }
     }
 
-    /// Delete an unusable cache file and give back any bytes the scan counted for it.
-    fn discard_cache_file(&self, uri: &SuperfileUri, size: u64) {
-        if self.unindexed.remove(uri).is_some() {
-            self.current_bytes.fetch_sub(size, Ordering::Release);
+    /// Delete an unusable cache file and give back the bytes the scan counted for it. Subtracts the
+    /// record's own size, so the accounting balances even when the file on disk no longer matches
+    /// what the scan saw (or is gone entirely).
+    fn discard_cache_file(&self, uri: &SuperfileUri) {
+        if let Some((_, file)) = self.unindexed.remove(uri) {
+            self.current_bytes
+                .fetch_sub(file.size_bytes, Ordering::Release);
         }
 
         let _ = fs::remove_file(self.cache_path(uri));
@@ -3514,6 +3523,45 @@ mod tests {
         let stats = opened.stats();
         assert_eq!(stats.n_disk_reuses, 1);
         assert_eq!(stats.n_cold_fetches, 0, "no storage round-trip");
+    }
+
+    #[tokio::test]
+    async fn externally_deleted_counted_file_stops_counting_on_first_touch() {
+        // A file the scan counted can be deleted outside the engine. The first read that misses it
+        // must drop its record: left counted, it double-counts against the fetched replacement and
+        // a later eviction of the phantom would unlink the replacement's live file.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes.clone()).await;
+        seed_cache_file(&store, &uri, &bytes);
+
+        let opened = reopen_store(&store, |_| {});
+        assert_eq!(opened.stats().current_bytes, size, "scan counted the file");
+        fs::remove_file(opened.cache_path(&uri)).expect("external deletion");
+
+        // The synchronous path renames the replacement into place before returning, so the
+        // file's presence is deterministic to assert.
+        let _r = opened
+            .reader_synchronous(&uri)
+            .await
+            .expect("cold fetch replaces it");
+        let s = opened.stats();
+        assert_eq!(s.n_cold_fetches, 1);
+        assert_eq!(
+            s.current_bytes, size,
+            "no phantom bytes: the record died with the file"
+        );
+        assert!(opened.cache_path(&uri).is_file(), "replacement landed");
+
+        // The phantom is gone, so nothing can unlink the replacement out from under its entry.
+        assert_eq!(
+            opened.evict_unindexed(u64::MAX),
+            0,
+            "no unindexed leftovers"
+        );
+        assert!(opened.cache_path(&uri).is_file());
     }
 
     #[tokio::test]
