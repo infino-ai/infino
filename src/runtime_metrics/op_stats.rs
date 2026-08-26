@@ -528,21 +528,24 @@ pub(crate) fn outer_bracket_active() -> bool {
 
 /// Marks this thread as inside an outer CPU bracket until dropped.
 ///
-/// Restores the previous depth on drop, unwind included: a poll that
-/// panicked out of a raised depth would otherwise leave the thread
+/// A real counter, so the guard holds without a LIFO argument: overlapping
+/// lifetimes each add one and remove one, and the depth is zero exactly
+/// when no bracket is live. Decrements on drop, unwind included — a poll
+/// that panicked out of a raised depth would otherwise leave the thread
 /// permanently silenced, and every later query scheduled onto that worker
 /// would fold nothing.
-pub(crate) struct OuterBracketGuard(u32);
+pub(crate) struct OuterBracketGuard;
 
 impl OuterBracketGuard {
     pub(crate) fn enter() -> Self {
-        Self(OUTER_BRACKET_DEPTH.with(|d| d.replace(1)))
+        OUTER_BRACKET_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Self
     }
 }
 
 impl Drop for OuterBracketGuard {
     fn drop(&mut self) {
-        OUTER_BRACKET_DEPTH.with(|d| d.set(self.0));
+        OUTER_BRACKET_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
 
