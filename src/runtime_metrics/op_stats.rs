@@ -300,16 +300,14 @@ impl OpStatsCollector {
 
     /// Flush one bracketed kernel section's on-CPU nanoseconds.
     pub(crate) fn add_kernel_cpu_ns(&self, ns: u64) {
-        // An enclosing bracket on this thread is already measuring this
-        // work, so folding here too would charge the same nanoseconds
-        // twice. That is not hypothetical: a search TVF invoked through
-        // SQL runs its kernel inline inside the plan root's poll, and
-        // both brackets reported it — measured at roughly 59% of what a
-        // vector query through the TVF appeared to cost, against the
-        // identical operation called directly.
-        if outer_bracket_active() {
-            return;
-        }
+        // Unconditional by design. Much of what reaches here was measured
+        // on a rayon worker and carried back as data — the resident decode
+        // wave, the per-cell probes — and the poll-level bracket reads only
+        // its own thread's clock, so it never contained those nanoseconds.
+        // Suppressing them here would not de-duplicate, it would delete.
+        // De-duplication happens where the measurement happens, in
+        // [`timed_kernel`] and [`timed_section`], which run on the same
+        // thread as the bracket that would otherwise cover them.
         self.kernel_cpu_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
@@ -484,6 +482,16 @@ pub(crate) fn timed_kernel<T>(
     let Some(stats) = collector else {
         return f();
     };
+    // An enclosing bracket on THIS thread already covers whatever `f`
+    // does — DataFusion is pull-based, so a poll drives its subtree
+    // synchronously on the polling thread. Measuring again here would
+    // charge the same nanoseconds twice; it was roughly 59% of what a
+    // vector query through the SQL TVF appeared to cost against the
+    // identical direct call. Same-thread by construction, which is why
+    // the check belongs here and not at the collector's sink.
+    if outer_bracket_active() {
+        return f();
+    }
     let start = cpu::thread_cpu_ns();
     let value = f();
     stats.add_kernel_cpu_ns(cpu::thread_cpu_delta_ns(start));
@@ -540,6 +548,14 @@ impl Drop for OuterBracketGuard {
 /// no procfs reads. For the superfile layers, which have no collector —
 /// the ns travel back to the supertable as data.
 pub(crate) fn timed_section<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    // Zero when an enclosing bracket on this thread already covers the
+    // section, so the caller's later fold adds nothing. A section running
+    // on a rayon worker sees depth 0 — thread-locals are per-thread — and
+    // reports its real time, which is exactly right: the poll-level
+    // bracket never measured that worker's CPU.
+    if outer_bracket_active() {
+        return (f(), 0);
+    }
     let start = metering_active().then(cpu::thread_cpu_ns).flatten();
     let out = f();
     (out, cpu::thread_cpu_delta_ns(start))
@@ -576,25 +592,47 @@ mod tests {
     }
 
     #[test]
-    fn an_inner_fold_stands_down_inside_an_outer_bracket() {
+    fn a_same_thread_measurement_stands_down_inside_an_outer_bracket() {
         // `MeteredExec` brackets a whole DataFusion poll, and that poll
         // drives the search kernels inline — they bracket their own
-        // sections, so without this both fold the same nanoseconds. It was
-        // roughly 59% of what a vector query through the SQL TVF appeared
-        // to cost against the identical direct call.
+        // sections, so without this both measure the same nanoseconds. It
+        // was roughly 59% of what a vector query through the SQL TVF
+        // appeared to cost against the identical direct call.
         let (_, stats) = with_op_stats(|| {
-            let c = current().expect("collector installed");
-            c.add_kernel_cpu_ns(100);
-            {
-                let _outer = OuterBracketGuard::enter();
-                c.add_kernel_cpu_ns(500);
-            }
-            c.add_kernel_cpu_ns(7);
+            let collector = current();
+            let mut ran = 0u32;
+            let _outer = OuterBracketGuard::enter();
+            timed_kernel(&collector, || ran += 1);
+            let (_, section_ns) = timed_section(|| ran += 1);
+            assert_eq!(ran, 2, "the work still runs; only the clock stands down");
+            assert_eq!(
+                section_ns, 0,
+                "a section the enclosing bracket already covers reports \
+                 nothing for its caller to fold"
+            );
         });
         assert_eq!(
-            stats.kernel_cpu_ns, 107,
-            "the fold inside the outer bracket is the outer bracket's to \
-             report; folds resume once it drops"
+            stats.kernel_cpu_ns, 0,
+            "the enclosing bracket is the one that reports this thread's CPU"
+        );
+    }
+
+    #[test]
+    fn a_carried_measurement_folds_even_under_an_outer_bracket() {
+        // The counterpart, and the reason the check cannot live at the
+        // collector's sink: nanoseconds measured on a rayon worker and
+        // carried back as data were never inside the poll-level bracket,
+        // which reads only its own thread's clock. Dropping them would not
+        // de-duplicate, it would delete — measured at 0.25-1.16 ms per
+        // query on the search TVF path.
+        let (_, stats) = with_op_stats(|| {
+            let collector = current().expect("collector installed");
+            let _outer = OuterBracketGuard::enter();
+            collector.add_kernel_cpu_ns(4_242);
+        });
+        assert_eq!(
+            stats.kernel_cpu_ns, 4_242,
+            "a value measured elsewhere must still reach the collector"
         );
     }
 

@@ -71,10 +71,7 @@ use crate::{
     supertable::{
         Supertable as SupertableHandle,
         options::SupertableOptions,
-        query::{
-            covered_agg::CoveredAggregateRewrite,
-            exec::{common::harvest_datafusion_metrics, metered_exec::MeteredExec},
-        },
+        query::exec::{common::harvest_datafusion_metrics, metered_exec::MeteredExec},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
@@ -788,12 +785,6 @@ impl Connection {
         // working set (sort / aggregate / join), so its pool is the gate.
         let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
-        // Answer covered aggregates from manifest statistics instead of
-        // scanning for them. The rule was only ever registered on the
-        // reader-level session, which is test-gated — so on the surface
-        // real users call, a fully-covered aggregate scanned every
-        // superfile, and per-op metering now bills that scan.
-        ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
 
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
