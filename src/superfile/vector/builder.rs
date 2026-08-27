@@ -200,12 +200,18 @@ const STREAM_ROWS_PER_CENT: usize = 1000;
 /// Cell packs and maintenance rebuilds keep the banded cap — those are
 /// the measured 1M/10M cell layouts, not this path.
 fn stream_n_cent_for_rows(n_docs: usize) -> usize {
-    let target = n_docs / STREAM_ROWS_PER_CENT;
+    // Clamp the target to the ceiling BEFORE the power-of-two math: any
+    // target past `N_CENT_LARGE` resolves to `N_CENT_LARGE` regardless
+    // (rounding only moves values between adjacent powers of two, and
+    // the final clamp caps them), and the pre-clamp makes every
+    // operation below total — `next_power_of_two` cannot overflow-panic
+    // and the squared comparison stays far inside `usize` — with no
+    // assumption about how large a corpus a caller hands in.
+    let target = (n_docs / STREAM_ROWS_PER_CENT).min(N_CENT_LARGE);
     let up = target.next_power_of_two();
     let down = up / 2;
     // Nearest in log space: `down` wins iff `target <= down·√2`, i.e.
-    // `target² <= 2·down² = down·up`. `target` is rows/1000, so the
-    // square fits usize comfortably at any realistic corpus size.
+    // `target² <= 2·down² = down·up`.
     let nearest = if target * target <= down * up {
         down
     } else {
@@ -3508,6 +3514,10 @@ mod tests {
         // Clamp ceiling: at and past the large threshold, the large cap.
         assert_eq!(stream_n_cent_for_rows(5_000_000), N_CENT_LARGE);
         assert_eq!(stream_n_cent_for_rows(10_000_000), N_CENT_LARGE);
+        // Total for ANY input: the pre-clamp keeps the pow2 math from
+        // overflowing, so even an absurd row count resolves instead of
+        // panicking.
+        assert_eq!(stream_n_cent_for_rows(usize::MAX), N_CENT_LARGE);
         // The fix itself: a 1M/7 shard no longer trains the full 1024 —
         // its centroid count follows its own rows, landing rows/cluster
         // near the target (142,858 / 128 ≈ 1116).
