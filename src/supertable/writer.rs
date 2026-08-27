@@ -77,13 +77,16 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
 use futures::{
     future::try_join_all,
-    stream::{self, StreamExt},
+    stream::{self, FuturesUnordered, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use tokio::time::sleep;
+use tokio::{
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -1912,23 +1915,82 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            let (outputs, cell_hints) = commit_shards_via_drain(
-                buffer,
-                &self.inner,
-                &pack_grid,
-                metric,
-                packed_cell_shard_count(&self.inner.options),
-                &self.op_stats,
-            )?;
-            let build_elapsed = commit_t0.elapsed();
-            let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
-            let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-            let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
-            let data_put_bytes: usize = user_batch
-                .pending_storage_writes
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum();
+            // Pipelined publish on storage-backed tables: shards stream
+            // to the uploader as each finishes packing, so the commit
+            // pays ~max(pack, PUT) instead of pack + PUT. The manifest
+            // CAS below still runs strictly after every byte is durable —
+            // the durability boundary is unmoved. The in-memory path
+            // keeps the collected build: there is no upload to overlap.
+            let piped_storage = self.inner.options.storage.as_ref().cloned();
+            let (user_batch, build_elapsed, prepare_elapsed, output_bytes, data_put_bytes) =
+                if let Some(storage) = piped_storage {
+                    let (tx, rx) = unbounded_channel::<(u32, PreparedSuperfile)>();
+                    let runtime = self.inner.query_runtime();
+                    let uploader = runtime.spawn(upload_prepared_shards(
+                        storage,
+                        self.inner.options.put_multipart_threshold_bytes,
+                        rx,
+                    ));
+                    let built = commit_shards_via_drain(
+                        buffer,
+                        &self.inner,
+                        &pack_grid,
+                        metric,
+                        packed_cell_shard_count(&self.inner.options),
+                        &self.op_stats,
+                        Some(&tx),
+                    );
+                    // Close the channel even on a build error so the
+                    // uploader terminates; join it BEFORE surfacing the
+                    // build result so no upload outlives this commit.
+                    drop(tx);
+                    let uploaded = bridge_on_runtime(
+                        async move {
+                            uploader.await.map_err(|join| {
+                                BuildError::Store(format!("pipelined uploader: {join}"))
+                            })?
+                        },
+                        &runtime,
+                    );
+                    let (outputs, _hints) = built?;
+                    debug_assert!(
+                        outputs.is_empty(),
+                        "piped drain-commit build returns no collected shards"
+                    );
+                    let build_elapsed = commit_t0.elapsed();
+                    let (prepared, uploaded_bytes) = uploaded?;
+                    let user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
+                    let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                    let bytes = uploaded_bytes as usize;
+                    (user_batch, build_elapsed, prepare_elapsed, bytes, bytes)
+                } else {
+                    let (outputs, cell_hints) = commit_shards_via_drain(
+                        buffer,
+                        &self.inner,
+                        &pack_grid,
+                        metric,
+                        packed_cell_shard_count(&self.inner.options),
+                        &self.op_stats,
+                        None,
+                    )?;
+                    let build_elapsed = commit_t0.elapsed();
+                    let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
+                    let user_batch =
+                        prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+                    let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                    let data_put_bytes: usize = user_batch
+                        .pending_storage_writes
+                        .iter()
+                        .map(|(_, bytes)| bytes.len())
+                        .sum();
+                    (
+                        user_batch,
+                        build_elapsed,
+                        prepare_elapsed,
+                        output_bytes,
+                        data_put_bytes,
+                    )
+                };
             // Computed before the batch moves into the publish future;
             // flushed only after Ok below, so a failed or retried commit
             // never counts.
@@ -5714,6 +5776,59 @@ fn build_prepared_from_spilled_cells(
 /// Rows are resharded by centroid distance instead of arrival time; drain
 /// never writes superfiles or touches S3 here — the writer publishes through
 /// the normal batch path.
+/// Streaming handoff for the pipelined commit publish: each pool task
+/// sends its shard the moment prepare finishes, so the uploader has the
+/// storage bytes in flight while the remaining shards are still packing.
+type PipelinedShardTx = UnboundedSender<(u32, PreparedSuperfile)>;
+
+/// Drain `rx`, PUTting each shard's storage bytes as it arrives, at most
+/// [`commit_write_concurrency`] uploads in flight. Returns the prepared
+/// shards in shard-id order (manifest entry order must not depend on
+/// upload completion order) with their storage bytes taken, plus the
+/// uploaded byte total.
+///
+/// The manifest CAS runs strictly after this completes, so the
+/// durability boundary is unmoved. A failure after some PUTs leaves
+/// orphans that gc reaps past its reclaim grace — the same recovery as a
+/// crash between the batch upload wave and the CAS on the unpiped path.
+async fn upload_prepared_shards(
+    storage: Arc<dyn StorageProvider>,
+    multipart_threshold: u64,
+    mut rx: UnboundedReceiver<(u32, PreparedSuperfile)>,
+) -> Result<(Vec<PreparedSuperfile>, u64), BuildError> {
+    let cap = commit_write_concurrency();
+    let mut in_flight = FuturesUnordered::new();
+    let mut done: Vec<(u32, PreparedSuperfile)> = Vec::new();
+    let mut uploaded_bytes: u64 = 0;
+    let mut open = true;
+    while open || !in_flight.is_empty() {
+        tokio::select! {
+            received = rx.recv(), if open && in_flight.len() < cap => match received {
+                Some((shard_id, mut prepared)) => {
+                    let Some((uri, bytes)) = prepared.bytes_for_storage.take() else {
+                        done.push((shard_id, prepared));
+                        continue;
+                    };
+                    uploaded_bytes += bytes.len() as u64;
+                    let storage = Arc::clone(&storage);
+                    in_flight.push(async move {
+                        put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                            .await
+                            .map(|()| (shard_id, prepared))
+                            .map_err(|error| BuildError::Store(error.to_string()))
+                    });
+                }
+                None => open = false,
+            },
+            Some(finished) = in_flight.next(), if !in_flight.is_empty() => {
+                done.push(finished?);
+            }
+        }
+    }
+    done.sort_by_key(|(shard_id, _)| *shard_id);
+    Ok((done.into_iter().map(|(_, p)| p).collect(), uploaded_bytes))
+}
+
 fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
@@ -5721,6 +5836,7 @@ fn commit_shards_via_drain(
     metric: Metric,
     n_packed_shards: usize,
     op_stats: &Option<Arc<OpStatsCollector>>,
+    pipeline: Option<&PipelinedShardTx>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -5817,17 +5933,47 @@ fn commit_shards_via_drain(
         &inner.options.writer_pool,
         op_stats,
         &packed_shards,
-        |task| {
+        |task| -> Result<Option<(u32, ShardOutput)>, BuildError> {
             let (shard_id, cells) = task;
-            build_one_packed_shard_via_drain(
+            let output = build_one_packed_shard_via_drain(
                 cells,
                 &source_scalar,
                 &vector_views,
                 &local_by_id,
                 options,
                 &vc,
-            )
-            .map(|output| output.map(|output| (*shard_id, output)))
+            )?;
+            let Some(tx) = pipeline else {
+                return Ok(output.map(|output| (*shard_id, output)));
+            };
+            // Pipelined publish: prepare on this pool thread and hand the
+            // shard to the uploader NOW, so its storage bytes go out while
+            // the remaining shards are still packing — sealed bytes never
+            // accumulate across the fan-out.
+            let Some(output) = output else {
+                return Ok(None);
+            };
+            let Some(prepared) = prepare_superfile(inner, output)? else {
+                return Ok(None);
+            };
+            let PreparedSuperfile {
+                entry,
+                bytes_for_store,
+                bytes_for_storage,
+                bytes_for_cache,
+            } = prepared;
+            let entry = finish_superfile_entry(entry, Some(*shard_id))?;
+            tx.send((
+                *shard_id,
+                PreparedSuperfile {
+                    entry,
+                    bytes_for_store,
+                    bytes_for_storage,
+                    bytes_for_cache,
+                },
+            ))
+            .map_err(|_| BuildError::Store("pipelined commit uploader closed mid-build".into()))?;
+            Ok(None)
         },
     )?;
     let fanout_elapsed = stage_t0
@@ -5897,6 +6043,7 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         metric,
         UPDATE_PACKED_SHARDS,
         op_stats,
+        None,
     )?;
     let output = outputs.pop().ok_or(BuildError::NoDocsToBuild)?;
     if !outputs.is_empty() || output.n_docs != expected_rows {
