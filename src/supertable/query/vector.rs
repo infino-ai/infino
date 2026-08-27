@@ -2871,9 +2871,10 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-fine fanout (`vector.ivf_router = centroid_graph`, reading
-    /// `fanout = vector.global_fine_fanout` clusters, clamped to the table's
-    /// cluster total). Phase 1: walk the centroid-HNSW over the resident fp32
+    /// Global-fine fanout (`vector.ivf_router = centroid_graph`, reading the
+    /// caller-passed `fanout` clusters — the per-table stamped `fanout_for_k`
+    /// when present, else the `vector.global_fine_fanout` constant — clamped to
+    /// the table's cluster total). Phase 1: walk the centroid-HNSW over the resident fp32
     /// fine centroids (a RAM op — no superfile opens for the selection) and
     /// keep the global top-`fanout` `(superfile, flat cluster)`. Phase 2: scan
     /// only those clusters per superfile, pool the warm survivors across all
@@ -3285,22 +3286,26 @@ impl SupertableReader {
                     crate::superfile::vector::distance::Metric::Cosine
                 )
             });
+        // Per-table calibrated fanout wins over the scale-blind
+        // `vector.global_fine_fanout` constant: a drain stamps `width × fine`
+        // (clamped to the table's cluster count) per k, so a ~1M table no
+        // longer over-reads to a full scan. A table stamped before this feature
+        // (or with the router off at drain) has no stamp and falls back to the
+        // constant. There is no caller-set fanout knob, so precedence is
+        // stamp-then-constant.
+        let resolved_fanout = manifest
+            .vector_cell_routing()
+            .and_then(|routing| routing.fanout_for_k_at(k))
+            .unwrap_or(vcfg.global_fine_fanout);
         if !filtered
             && hidden_vector_index
             && vcfg.search_mode == config::VectorSearchMode::Ivf
             && vcfg.ivf_router == config::IvfRouter::CentroidGraph
-            && vcfg.global_fine_fanout > 0
+            && resolved_fanout > 0
             && centroid_graph_metric_ok
         {
             return self
-                .global_fine_fanout(
-                    &superfiles,
-                    column,
-                    query,
-                    k,
-                    &options,
-                    vcfg.global_fine_fanout,
-                )
+                .global_fine_fanout(&superfiles, column, query, k, &options, resolved_fanout)
                 .await;
         }
         // Borrow routing — do not clone the VectorCell centroid grid just to

@@ -425,6 +425,17 @@ pub struct CellRoutingParams {
     /// surviving next to fresh wide-pool ones). Pre-provenance
     /// manifests decode to the legacy floor.
     pub rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
+    /// Per-table centroid-graph router fanout: the number of fine clusters the
+    /// `ivf_router = centroid_graph` selection reads GLOBALLY, per `k`,
+    /// calibrated at the same [`WIDTH_LAW_KS`] points. First-order prior is the
+    /// width law times the fine-depth law (`width_for_k × fine_for_k` — the
+    /// cells-to-probe times the fine-runs-per-cell that together cover the
+    /// top-k), clamped to the table's total fine-cluster count. `0` =
+    /// uncalibrated; all-zero (older manifests, or the router off at drain)
+    /// means the reader falls back to the `vector.global_fine_fanout` constant.
+    /// The router derives its graph `ef` from this fanout (×2), so a per-table
+    /// fanout gives a per-table `ef`.
+    pub fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 impl Default for CellRoutingParams {
@@ -438,6 +449,7 @@ impl Default for CellRoutingParams {
             fine_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_pool_cells: [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
+            fanout_for_k: [0; WIDTH_LAW_KS.len()],
         }
     }
 }
@@ -477,6 +489,14 @@ impl CellRoutingParams {
     /// interpolation and clamping as [`Self::width_for_k_at`].
     pub(crate) fn fine_for_k_at(&self, k: usize) -> Option<usize> {
         Self::law_at(&self.fine_for_k, k)
+    }
+
+    /// The stamped centroid-graph router fanout at this query's `k` — same
+    /// log-linear interpolation and clamping as [`Self::width_for_k_at`].
+    /// `None` when uncalibrated (all-zero), so the router falls back to the
+    /// `vector.global_fine_fanout` constant.
+    pub(crate) fn fanout_for_k_at(&self, k: usize) -> Option<usize> {
+        Self::law_at(&self.fanout_for_k, k)
     }
 
     /// The rerank law at this query's `k` — same log-linear interpolation
@@ -1354,6 +1374,10 @@ struct CellRoutingParamsDto {
     /// them).
     #[serde(default = "legacy_rerank_pool")]
     rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
+    /// Centroid-graph router fanout law; absent on manifests stamped before
+    /// it existed (all-zero = no stamp, reader falls back to the constant).
+    #[serde(default)]
+    fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 /// Serde default for [`CellRoutingParamsDto::rerank_pool_cells`]: every
@@ -1373,6 +1397,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             fine_for_k: r.fine_for_k,
             rerank_for_k: r.rerank_for_k,
             rerank_pool_cells: r.rerank_pool_cells,
+            fanout_for_k: r.fanout_for_k,
         }
     }
 }
@@ -1396,6 +1421,7 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.fine_for_k = d.fine_for_k;
         r.rerank_for_k = d.rerank_for_k;
         r.rerank_pool_cells = d.rerank_pool_cells.map(|p| p.max(1));
+        r.fanout_for_k = d.fanout_for_k;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -2825,6 +2851,7 @@ mod tests {
                 width_for_k: [1, 2, 30, 48],
                 fine_for_k: [1, 3, 6, 9],
                 rerank_for_k: [2, 20, 200, 2000],
+                fanout_for_k: [1, 6, 180, 432],
                 ..CellRoutingParams::default()
             },
         };
@@ -2836,12 +2863,18 @@ mod tests {
         assert_eq!(routing.width_for_k, [1, 2, 30, 48]);
         assert_eq!(routing.fine_for_k, [1, 3, 6, 9]);
         assert_eq!(routing.rerank_for_k, [2, 20, 200, 2000]);
+        assert_eq!(routing.fanout_for_k, [1, 6, 180, 432]);
 
         // Strip the whole `"width_for_k": [...]` member (the encoder
         // pretty-prints, so cut structurally: from the comma preceding the
         // key through the closing bracket).
         let mut stripped = from_utf8(&bytes).expect("utf8").to_string();
-        for field in ["\"width_for_k\"", "\"fine_for_k\"", "\"rerank_for_k\""] {
+        for field in [
+            "\"width_for_k\"",
+            "\"fine_for_k\"",
+            "\"rerank_for_k\"",
+            "\"fanout_for_k\"",
+        ] {
             let key = stripped.find(field).expect("field present in encoding");
             let comma = stripped[..key].rfind(',').expect("preceding member comma");
             let close = key + stripped[key..].find(']').expect("array close") + 1;
@@ -2866,6 +2899,11 @@ mod tests {
             [0; WIDTH_LAW_KS.len()],
             "absent rerank law decodes to all-zero (no law)"
         );
+        assert_eq!(
+            routing.fanout_for_k,
+            [0; WIDTH_LAW_KS.len()],
+            "absent fanout law decodes to all-zero (falls back to the constant)"
+        );
         assert_eq!(routing.width_for_k_at(100), None, "no law resolves None");
         assert_eq!(
             routing.fine_for_k_at(100),
@@ -2876,6 +2914,11 @@ mod tests {
             routing.rerank_for_k_at(100),
             None,
             "no rerank law resolves None"
+        );
+        assert_eq!(
+            routing.fanout_for_k_at(100),
+            None,
+            "no fanout law resolves None (reader falls back to the constant)"
         );
     }
 
@@ -2930,6 +2973,34 @@ mod tests {
         assert_eq!(full.fine_for_k_at(100_000), Some(12), "clamps above range");
         assert_eq!(law([0, 0, 8, 0]).fine_for_k_at(1), Some(8), "zeros skip");
         assert_eq!(law([0; WIDTH_LAW_KS.len()]).fine_for_k_at(10), None);
+    }
+
+    /// The read side resolves fanout as
+    /// `fanout_for_k_at(k).unwrap_or(global_fine_fanout)`: a stamped law wins,
+    /// an unstamped (all-zero) one falls back to the constant.
+    #[test]
+    fn fanout_for_k_at_resolves_and_falls_back() {
+        const CONSTANT: usize = 512;
+        let stamped = CellRoutingParams {
+            fanout_for_k: [1, 6, 180, 432],
+            ..CellRoutingParams::default()
+        };
+        // Stamped: the per-table value is used, not the constant.
+        assert_eq!(stamped.fanout_for_k_at(1), Some(1));
+        assert_eq!(stamped.fanout_for_k_at(1000), Some(432));
+        assert_eq!(
+            stamped.fanout_for_k_at(100).unwrap_or(CONSTANT),
+            180,
+            "stamp wins over the constant"
+        );
+        // Unstamped: resolution yields None → the constant.
+        let bare = CellRoutingParams::default();
+        assert_eq!(bare.fanout_for_k_at(100), None);
+        assert_eq!(
+            bare.fanout_for_k_at(100).unwrap_or(CONSTANT),
+            CONSTANT,
+            "no stamp falls back to the constant"
+        );
     }
 
     /// The repair predicate fires exactly on the cleared-law signature:

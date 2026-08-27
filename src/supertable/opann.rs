@@ -774,6 +774,38 @@ pub(crate) fn rerank_pool_hint(width_for_k: &[u32; WIDTH_LAW_KS.len()], n_cent: 
         .min(n_cent.max(1))
 }
 
+/// First-order centroid-graph router fanout prior, per `k`. The stamped grid
+/// path reads `width_for_k` cells at `fine_for_k` fine runs each to cover the
+/// exact top-k, so `width × fine` fine clusters is the natural starting point
+/// for how many the global centroid-graph selection should read; it is stamped
+/// as the router's per-table fanout in place of the scale-blind
+/// `vector.global_fine_fanout` constant. Clamped to `total_fine_clusters`
+/// (selecting more clusters than exist is a full scan — the exact failure at
+/// ~1M where the constant already exceeds the table's cluster count). A `k`
+/// with an uncalibrated width or fine point (`0`), or a table with no fine
+/// clusters, stays `0` so the reader falls back to the constant there.
+pub(crate) fn fanout_prior_for_k(
+    width_for_k: &[u32; WIDTH_LAW_KS.len()],
+    fine_for_k: &[u32; WIDTH_LAW_KS.len()],
+    total_fine_clusters: u32,
+) -> [u32; WIDTH_LAW_KS.len()] {
+    let mut out = [0u32; WIDTH_LAW_KS.len()];
+    if total_fine_clusters == 0 {
+        return out;
+    }
+    for (slot, (&w, &f)) in out
+        .iter_mut()
+        .zip(width_for_k.iter().zip(fine_for_k.iter()))
+    {
+        if w == 0 || f == 0 {
+            continue;
+        }
+        let prior = (u64::from(w) * u64::from(f)).min(u64::from(total_fine_clusters));
+        *slot = prior.max(1) as u32;
+    }
+    out
+}
+
 /// Rerank-law estimate histogram resolution: per-query counts of pool-row
 /// 1-bit estimates, binned linearly over `[-Σ|q_rot|, +Σ|q_rot|]` (the
 /// sign-dot estimator's exact range). A candidate's distractor count reads
@@ -939,6 +971,40 @@ mod pool_hint_tests {
         assert_eq!(rerank_pool_hint(&[33, 79, 97, 104], 150), 150);
         // Tiny grids never zero the pool.
         assert_eq!(rerank_pool_hint(&[1, 0, 0, 0], 0), 1);
+    }
+
+    /// The fanout prior is `width × fine` per k, clamped to the total fine
+    /// clusters, with uncalibrated points (either factor zero, or no clusters)
+    /// staying zero so the reader falls back to the constant.
+    #[test]
+    fn fanout_prior_is_width_times_fine_clamped_to_total() {
+        // width × fine per point, all below the total.
+        assert_eq!(
+            fanout_prior_for_k(&[1, 8, 30, 40], &[1, 4, 8, 8], 4000),
+            [1, 32, 240, 320],
+        );
+        // The clamp binds at small scale: width × fine exceeds the table's
+        // cluster count, so each point caps at the total (never a
+        // larger-than-full-scan fanout — the ~1M failure the constant hits).
+        assert_eq!(
+            fanout_prior_for_k(&[10, 20, 30, 40], &[8, 8, 8, 8], 64),
+            [64, 64, 64, 64],
+        );
+        // An uncalibrated width or fine point stays zero (falls back).
+        assert_eq!(
+            fanout_prior_for_k(&[0, 8, 0, 40], &[1, 0, 8, 8], 4000),
+            [0, 0, 0, 320],
+        );
+        // No fine clusters (degenerate) → all zero.
+        assert_eq!(
+            fanout_prior_for_k(&[1, 8, 30, 40], &[1, 4, 8, 8], 0),
+            [0; 4]
+        );
+        // A nonzero product with total 1 floors at 1, never below.
+        assert_eq!(
+            fanout_prior_for_k(&[1, 0, 0, 0], &[1, 0, 0, 0], 1),
+            [1, 0, 0, 0]
+        );
     }
 }
 
