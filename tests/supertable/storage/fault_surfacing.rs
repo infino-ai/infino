@@ -16,7 +16,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use arrow_array::{LargeStringArray, RecordBatch};
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use datafusion::prelude::{col, lit};
@@ -28,17 +28,31 @@ use infino::{
         fts::reader::BoolMode,
     },
     supertable::{
-        SuperfileUri, Supertable,
+        SuperfileUri, Supertable, SupertableOptions,
         manifest::commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
     },
     test_helpers::{
         build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
-        default_tokenizer,
+        default_tokenizer, default_vector_config,
         fault_storage::{FaultKind, FaultOp, FaultStorage},
         lazy_foreground_disk_cache,
     },
 };
+use rayon::ThreadPoolBuilder;
 use tempfile::TempDir;
+
+/// Dimension of the vector fixture's column; matches
+/// `default_vector_config`.
+const VECTOR_DIM: usize = 16;
+/// Rows in the vector fixture, planted in two directions so the commit
+/// assigns them across cells rather than into one.
+const VECTOR_ROWS: usize = 24;
+/// Rotation seed for the vector fixture's column.
+const VECTOR_ROT_SEED: u64 = 21;
+/// Writer threads for the vector fixture, and so the commit's packed-shard
+/// count. Two is the smallest width that puts one shard on the wire while
+/// another is still packing — the shape the pipelined publish exists for.
+const VECTOR_WRITERS: usize = 2;
 
 /// Top-k for the recovery searches; above corpus size.
 const FTS_TOP_K: usize = 8;
@@ -68,6 +82,120 @@ fn faulted_table() -> (Supertable, Arc<FaultStorage>, TempDir) {
     w.commit().expect("commit");
     assert_eq!(st.manifest_id(), 1);
     (st, faults, dir)
+}
+
+/// A LocalFS-backed VECTOR table wrapped in `FaultStorage`, empty, with a
+/// batch ready to append. A vector table is what puts a commit on the
+/// pipelined publish — a table with no vector columns never enters the
+/// drain-commit path at all — so this is the fixture for faulting a PUT
+/// the uploader issues while other shards are still packing.
+fn faulted_vector_table() -> (Supertable, RecordBatch, Arc<FaultStorage>, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let faults = FaultStorage::wrap(local);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::clone(&item), VECTOR_DIM as i32),
+            false,
+        ),
+    ]));
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(VECTOR_WRITERS)
+            .build()
+            .expect("rayon pool"),
+    );
+    let options = SupertableOptions::new(
+        Arc::clone(&schema),
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: false,
+        }],
+        vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+        Some(default_tokenizer()),
+    )
+    .expect("valid options")
+    .with_writer_pool(pool)
+    .with_storage(storage);
+
+    let titles: Vec<String> = (0..VECTOR_ROWS).map(|i| format!("vec row{i:03}")).collect();
+    let mut flat = vec![0.0f32; VECTOR_ROWS * VECTOR_DIM];
+    for row in 0..VECTOR_ROWS {
+        flat[row * VECTOR_DIM + usize::from(row >= VECTOR_ROWS / 2)] = 1.0;
+    }
+    let fsl = FixedSizeListArray::try_new(
+        item,
+        VECTOR_DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(LargeStringArray::from(titles)) as ArrayRef,
+            Arc::new(fsl),
+        ],
+    )
+    .expect("batch");
+
+    let st = Supertable::create(options).expect("create");
+    (st, batch, faults, dir)
+}
+
+#[test]
+fn pipelined_commit_surfaces_shard_put_fault_and_recovers() {
+    let (st, batch, faults, _dir) = faulted_vector_table();
+
+    // The uploader starts PUTting as soon as the first shard seals, so this
+    // fault lands mid-commit rather than in a publish wave after the pack.
+    faults.fail(FaultOp::PutAtomic, "data/", 1);
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    let err = w
+        .commit()
+        .expect_err("a failed shard upload must fail the commit");
+    assert!(
+        format!("{err:?}").contains("injected"),
+        "the injected fault must reach the caller, got: {err:?}"
+    );
+    assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+    assert_eq!(
+        st.manifest_id(),
+        0,
+        "a commit that lost a shard upload publishes nothing"
+    );
+    assert_eq!(
+        st.reader().expect("reader").n_superfiles(),
+        0,
+        "shards uploaded before the failure are orphans, not table state"
+    );
+
+    // Same contract the text path keeps: the buffered rows survive the
+    // failure, so the retry publishes once the fault is spent.
+    w.commit().expect("retry after the fault clears");
+    assert_eq!(st.manifest_id(), 1, "the retry publishes");
+    let reader = st.reader().expect("reader");
+    assert!(
+        reader.n_superfiles() >= 1,
+        "the retried commit published its shards"
+    );
+    let mut query = vec![0.0f32; VECTOR_DIM];
+    query[0] = 1.0;
+    let hits = reader
+        .vector_search("emb", &query, VECTOR_ROWS, Default::default(), None, None)
+        .expect("vector search after recovery");
+    let found: usize = hits.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        found > 0,
+        "rows from the retried commit must be searchable, found {found}"
+    );
 }
 
 #[test]
