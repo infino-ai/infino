@@ -256,33 +256,34 @@ impl PreparedClauses {
 }
 
 /// Multi-term OR algorithm selector for the bench harness's
-/// `search_with_algo_for_bench` entry point. Production code routes
-/// through `FtsReader::dispatch_or_algo`, which picks
-/// automatically; this enum exists so head-to-head bench runs can
-/// compare all three under identical inputs.
+/// `search_with_algo_for_bench` entry point, so head-to-head bench runs can
+/// compare the kernels under identical inputs. Production code routes through
+/// `FtsReader::dispatch_or_algo`, which sends every multi-term union to
+/// `WindowedMaxscore` and a 2-term rare+common OR to WAND+BMW.
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OrAlgo {
-    /// Block-Max MaxScore: production default for dominant-term ORs.
+    /// Per-candidate Block-Max MaxScore. Superseded on the production path by
+    /// `WindowedMaxscore`; retained as a bench baseline and the correctness
+    /// oracle the windowed kernels are checked against.
     Bmm,
-    /// WAND + Block-Max-WAND: historical baseline; retained for
-    /// regression comparisons.
+    /// WAND + Block-Max-WAND. The production path for a 2-term rare+common OR
+    /// (it pivots on the rare term to skip the common term's long list); a
+    /// bench baseline otherwise.
     WandBmw,
-    /// Exhaustive union walk with SIMD scoring + top-K heap. Wins
-    /// when no term dominates (uniform `term_max_bm25` upper bounds)
-    /// so BMM/BMW's skip checks rarely trigger and become pure
-    /// overhead.
+    /// Exhaustive union walk with SIMD scoring + top-K heap. Bench-only — the
+    /// dispatcher never routes here (see `run_exhaustive_union`); kept for the
+    /// one narrow shape where it narrowly wins.
     Exhaustive,
-    /// Windowed union: accumulate each term's contribution into a
-    /// fixed doc-id window (presence bitset + score array), then drain
-    /// in doc order into the top-k heap. Removes the per-doc f-way
-    /// merge; wins when no term dominates and the union is large (the
-    /// MaxScore-can't-prune case).
+    /// Windowed union: accumulate each term's contribution into a fixed doc-id
+    /// window (presence bitset + score array), then drain in doc order into the
+    /// top-k heap. Superseded by `WindowedMaxscore` (which adds the
+    /// essential/non-essential split); bench-only.
     Windowed,
-    /// Windowed MaxScore: the windowed OR-sum with a per-window
-    /// essential/non-essential split recomputed from the live threshold,
-    /// so one kernel covers both the dense (all-essential OR-sum) and
-    /// selective (pruned) regimes without an a-priori route.
+    /// Windowed MaxScore: **the production union kernel.** The windowed OR-sum
+    /// with a per-window essential/non-essential split recomputed from the live
+    /// threshold, so one kernel covers both the dense (all-essential OR-sum)
+    /// and selective (pruned-leader) regimes without an a-priori route.
     WindowedMaxscore,
 }
 

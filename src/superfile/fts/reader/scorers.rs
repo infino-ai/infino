@@ -2058,33 +2058,17 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
-    /// Multi-term OR dispatch. Routes everything to MaxScore+BMM.
+    /// Multi-term OR dispatch. Routes every union to the one windowed MaxScore
+    /// kernel ([`Self::run_windowed_maxscore`]), except a 2-term rare+common OR,
+    /// which goes to WAND+BMW ([`Self::run_wand_bmw`]) — it pivots on the rare
+    /// term to skip the common term's long posting list, the one shape the
+    /// windowed kernel can't beat. The rationale for that cutoff is inline below.
     ///
-    /// **Routing decision (1M docs — head-to-head WAND+BMW vs MaxScore+BMM):**
-    ///
-    /// | Query shape                                 | WAND+BMW | MaxScore+BMM |
-    /// |---|---|---|
-    /// | two-term wide (rank 1 + 50)                 | 1.25 ms  | **0.28 ms**  |
-    /// | three-term wide (rank 1 + 50 + 100)         | 17.2 ms  | 18.3 ms      |
-    /// | three-term similar UBs (rank 50/51/52)      | 28.3 ms  | **24.7 ms**  |
-    /// | five-term similar UBs (rank 50–54)          | 59.1 ms  | **55.1 ms**  |
-    ///
-    /// BMM wins on most shapes once we have:
-    ///   1. A precomputed per-doc length-norm table (no per-call
-    ///      `dl/avgdl` work in scoring).
-    ///   2. SIMD x4 scoring of all aligned cursors per doc.
-    ///   3. A block-batch fast path when only one cursor is essential
-    ///      (`f_essential == 1`) — the steady state for wide-UB and
-    ///      heap-warmed similar-UB queries.
-    ///
-    /// **Exhaustive union walk** ([`Self::run_exhaustive_union`]) is
-    /// implemented and reachable via `search_with_algo_for_bench`,
-    /// but the dispatcher does NOT route to it. Empirically it
-    /// regressed mid-rank uniform-UB shapes by 50–80% — see
-    /// `run_exhaustive_union`'s doc comment for the cost model and
-    /// the one shape (prefix-of-very-rare-terms in parallel mode)
-    /// where it narrowly wins. WAND+BMW remains in the codebase
-    /// for the same reason — bench-harness comparison only.
+    /// The per-candidate MaxScore+BMM ([`Self::run_max_score_bmm`]), the plain
+    /// windowed OR-sum ([`Self::run_windowed_union`]), and the exhaustive walk
+    /// ([`Self::run_exhaustive_union`]) remain in the tree only as bench
+    /// baselines and the correctness oracle, reachable via
+    /// `search_with_algo_for_bench`; the dispatcher routes to none of them.
     pub(super) fn dispatch_or_algo(
         &self,
         column_id: u32,
