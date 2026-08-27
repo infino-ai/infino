@@ -2312,25 +2312,20 @@ pub mod sql {
                 let lossy_rows = corpus.lossy_rows();
                 let corpus_bytes = payload_bytes(corpus.batches()).1;
                 log_build_start(phases, actual_docs, Some(corpus::corpus_label()));
-                // Empty unless `phases.warm`: this call always runs (warm/cold
-                // need the table too), so an unconditional battery would run
-                // every ClickBench query on a `build`-only invocation.
-                let queries = if phases.warm {
-                    corpus::clickbench::queries()
-                } else {
-                    &[]
-                };
+                // Real corpora carry no vendored query battery: the lane
+                // measures schema-driven ingest, and warm scalar queries are
+                // measured via `crate::executors::sql`, same as synthetic.
                 let (result, index) = run_sql_batches_with_index::<InfinoSqlEngine>(
                     cfg,
                     corpus.spec(),
                     corpus.batches(),
-                    queries,
+                    &[],
                 );
                 SqlBuildArtifact {
                     corpus_bytes,
                     actual_docs,
                     synthetic: None,
-                    battery: queries,
+                    battery: &[],
                     result,
                     index,
                     lossy_rows,

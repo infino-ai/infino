@@ -689,7 +689,6 @@ fn page_floor(off: usize) -> usize {
     off & !(PAGE_BYTES - 1)
 }
 
-pub mod clickbench;
 pub mod combined;
 pub mod grading;
 pub mod sql;
