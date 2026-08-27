@@ -861,6 +861,70 @@ fn column_metric(
         .map(|vc| vc.metric)
 }
 
+/// Resolve `ivf_router = auto` for one hidden-vector table. Pure, so the
+/// scale/concentration policy is unit-testable without a live table; only ever
+/// returns [`config::IvfRouter::Stamped`] or [`config::IvfRouter::CentroidGraph`],
+/// never `Auto`. Explicit `stamped` / `centroid_graph` never reach here — they
+/// are honored verbatim.
+///
+/// `centroid_graph` iff BOTH:
+/// - CONCENTRATION — the calibrated fanout selects a real subset of the fine
+///   clusters (`stamped_fanout < ratio × total_fine_clusters`). A fanout that
+///   clamped to ≈ the total has no subset to concentrate on, so the graph buys
+///   nothing. An unstamped table (`None`) carries no concentration signal →
+///   `stamped`.
+/// - SCALE — `n_docs >= scale_floor_docs`. The selected clusters coalesce into
+///   a cold-read win only at large N (the graph measured a win at 10M+, a loss
+///   at 1M, where the selection is spread too thin across cells to coalesce).
+pub(crate) fn auto_router_choice(
+    stamped_fanout: Option<usize>,
+    total_fine_clusters: usize,
+    n_docs: u64,
+    concentration_ratio: f64,
+    scale_floor_docs: u64,
+) -> config::IvfRouter {
+    let concentrated = match stamped_fanout {
+        Some(fanout) if total_fine_clusters > 0 => {
+            (fanout as f64) < concentration_ratio * (total_fine_clusters as f64)
+        }
+        _ => false,
+    };
+    let at_scale = n_docs >= scale_floor_docs;
+    if concentrated && at_scale {
+        config::IvfRouter::CentroidGraph
+    } else {
+        config::IvfRouter::Stamped
+    }
+}
+
+/// The router a query actually uses. Only `auto` consults the per-table gate
+/// (`auto`, evaluated lazily so its inputs are computed only when needed); every
+/// explicit mode is returned verbatim — `stamped` and `centroid_graph` are
+/// never overridden by the gate.
+fn resolve_ivf_router(
+    configured: config::IvfRouter,
+    auto: impl FnOnce() -> config::IvfRouter,
+) -> config::IvfRouter {
+    match configured {
+        config::IvfRouter::Auto => auto(),
+        explicit => explicit,
+    }
+}
+
+/// Total fine clusters across the hidden manifest for `column`: the sum of each
+/// resident cell summary's fine-centroid count, which equals the centroid
+/// router's node count. Resident, no I/O — the `auto` gate's concentration
+/// denominator.
+fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
+    manifest
+        .get_all_superfiles()
+        .iter()
+        .filter_map(|e| e.vector_summary.get(column))
+        .flat_map(|s| s.cells.iter())
+        .map(|c| c.clusters.n_cent as usize)
+        .sum()
+}
+
 /// Unit-normalize in place so the centroid graph's `−dot` scorer ranks by
 /// cosine (the fine centroids are means of unit vectors, not themselves unit).
 fn gfc_unit_normalize(v: &mut [f32]) {
@@ -3329,14 +3393,31 @@ impl SupertableReader {
         // (or with the router off at drain) has no stamp and falls back to the
         // constant. There is no caller-set fanout knob, so precedence is
         // stamp-then-constant.
-        let resolved_fanout = manifest
+        let stamped_fanout = manifest
             .vector_cell_routing()
-            .and_then(|routing| routing.fanout_for_k_at(k))
-            .unwrap_or(vcfg.global_fine_fanout);
+            .and_then(|routing| routing.fanout_for_k_at(k));
+        let resolved_fanout = stamped_fanout.unwrap_or(vcfg.global_fine_fanout);
+        // `auto` picks the router per hidden-vector table by scale +
+        // concentration; explicit `stamped` / `centroid_graph` are honored
+        // verbatim (no gating). The per-table inputs are resident (no I/O) and
+        // computed only on the hidden path under `auto`.
+        let effective_router = if hidden_vector_index {
+            resolve_ivf_router(vcfg.ivf_router, || {
+                auto_router_choice(
+                    stamped_fanout,
+                    total_fine_clusters(manifest, column),
+                    manifest.n_docs_total(),
+                    vcfg.centroid_graph_concentration_ratio,
+                    vcfg.centroid_graph_scale_floor_docs,
+                )
+            })
+        } else {
+            vcfg.ivf_router
+        };
         if !filtered
             && hidden_vector_index
             && vcfg.search_mode == config::VectorSearchMode::Ivf
-            && vcfg.ivf_router == config::IvfRouter::CentroidGraph
+            && effective_router == config::IvfRouter::CentroidGraph
             && resolved_fanout > 0
         {
             return self
@@ -6116,6 +6197,71 @@ mod tests {
         assert_eq!(
             select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 32, &[]),
             None,
+        );
+    }
+
+    /// `ivf_router = auto` picks `centroid_graph` only for a concentrated
+    /// calibrated fanout at large scale, and explicit modes bypass the gate.
+    #[test]
+    fn auto_router_choice_gates_on_scale_and_concentration() {
+        use super::{auto_router_choice, resolve_ivf_router};
+        use crate::config::IvfRouter;
+
+        const RATIO: f64 = 0.5;
+        const FLOOR: u64 = 10_000_000;
+
+        // Concentrated (100 < 0.5 × 4000 = 2000) + large → centroid_graph.
+        assert_eq!(
+            auto_router_choice(Some(100), 4000, 12_000_000, RATIO, FLOOR),
+            IvfRouter::CentroidGraph,
+        );
+        // Concentrated + small (below the floor) → stamped.
+        assert_eq!(
+            auto_router_choice(Some(100), 4000, 1_000_000, RATIO, FLOOR),
+            IvfRouter::Stamped,
+        );
+        // Not concentrated (3000 ≥ 2000) + large → stamped.
+        assert_eq!(
+            auto_router_choice(Some(3000), 4000, 12_000_000, RATIO, FLOOR),
+            IvfRouter::Stamped,
+        );
+        // Exactly at the floor counts as large.
+        assert_eq!(
+            auto_router_choice(Some(100), 4000, FLOOR, RATIO, FLOOR),
+            IvfRouter::CentroidGraph,
+        );
+        // Unstamped table: no concentration signal → stamped even at scale.
+        assert_eq!(
+            auto_router_choice(None, 4000, 12_000_000, RATIO, FLOOR),
+            IvfRouter::Stamped,
+        );
+        // No fine clusters (degenerate) → stamped.
+        assert_eq!(
+            auto_router_choice(Some(100), 0, 12_000_000, RATIO, FLOOR),
+            IvfRouter::Stamped,
+        );
+
+        // Explicit modes ignore the gate entirely — the closure never runs.
+        assert_eq!(
+            resolve_ivf_router(IvfRouter::Stamped, || panic!(
+                "gate must not run for stamped"
+            )),
+            IvfRouter::Stamped,
+        );
+        assert_eq!(
+            resolve_ivf_router(IvfRouter::CentroidGraph, || {
+                panic!("gate must not run for centroid_graph")
+            }),
+            IvfRouter::CentroidGraph,
+        );
+        // Auto delegates to the gate's decision.
+        assert_eq!(
+            resolve_ivf_router(IvfRouter::Auto, || IvfRouter::CentroidGraph),
+            IvfRouter::CentroidGraph,
+        );
+        assert_eq!(
+            resolve_ivf_router(IvfRouter::Auto, || IvfRouter::Stamped),
+            IvfRouter::Stamped,
         );
     }
 
