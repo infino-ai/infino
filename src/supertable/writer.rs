@@ -8145,14 +8145,21 @@ async fn build_and_publish_centroid_router_section(
     entries: &[Arc<SuperfileEntry>],
     centroids_ref: &crate::supertable::manifest::list::RoutingRef,
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
-    // Cheap gate first, so a router-off table never fetches the centroid section.
+    // Cheap gate first (resolving the column once, reused below), so a
+    // router-off table never fetches the centroid section.
     let vcfg = &crate::config::global().vector;
-    crate::supertable::query::vector::select_eager_router_column(
+    let column = crate::supertable::query::vector::select_eager_router_column(
         vcfg.search_mode,
         vcfg.ivf_router,
         vcfg.global_fine_fanout,
         &inner.options.vector_columns,
     )?;
+    let dim = inner
+        .options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+        .map(|vc| vc.dim)?;
     let section = fetch_centroid_section(storage, centroids_ref, entries)
         .await
         .map_err(|error| {
@@ -8163,6 +8170,8 @@ async fn build_and_publish_centroid_router_section(
         &inner.options,
         entries,
         &section,
+        &column,
+        dim,
     )
     .await?;
     slow_vector_state::write_graph_section(storage, bytes)
@@ -8420,12 +8429,16 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     };
     let max_retries = inner.options.max_commit_retries.max(1);
     let mut next_id_floor: u64 = 0;
-    // The centroid-router section is content-addressed and membership-fixed for
-    // this settle, so build + PUT it at most once and reuse the ref across CAS
-    // retries. `None` until computed; the inner `Option` is the resolved ref
+    // Cache the built centroid-router ref across CAS retries, keyed by the
+    // published centroid-section URI (a content hash over this membership +
+    // centroids). Reuse it while that key is unchanged; if a retry reloads a
+    // manifest whose membership moved, the key differs and the section is
+    // rebuilt for the new membership. The inner `Option` is the resolved ref
     // (absent when the router is off or the build failed).
-    let mut centroid_graph_ref: Option<Option<crate::supertable::manifest::list::RoutingRef>> =
-        None;
+    let mut centroid_graph_ref: Option<(
+        String,
+        Option<crate::supertable::manifest::list::RoutingRef>,
+    )> = None;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
         // A prior attempt found its id occupied by a crash-orphaned
@@ -8487,8 +8500,8 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         // on the router being enabled and best-effort: a `None` just leaves the
         // ref unstamped and queries reconstruct the router in memory.
         let centroid_graph = match &centroid_graph_ref {
-            Some(resolved) => resolved.clone(),
-            None => {
+            Some((key, resolved)) if *key == published.centroids.uri => resolved.clone(),
+            _ => {
                 let resolved = match old.slow_vector_state_centroid_graph_blob() {
                     Some(existing) => Some(existing.clone()),
                     None => {
@@ -8501,7 +8514,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                         .await
                     }
                 };
-                centroid_graph_ref = Some(resolved.clone());
+                centroid_graph_ref = Some((published.centroids.uri.clone(), resolved.clone()));
                 resolved
             }
         };

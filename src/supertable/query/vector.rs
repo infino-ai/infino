@@ -924,19 +924,26 @@ fn build_centroid_router(
 const CENTROID_ROUTER_SECTION_MAGIC: &[u8; 8] = b"INFCGR01";
 
 /// Serialize the centroid router to a versioned, self-describing section: magic
-/// + `dim`, the `(superfile index, flat cluster)` node map, then the graph
-/// topology ([`Hnsw::to_bytes`]). The fp32 centroids are NOT stored — they
-/// already live in the mmap'd centroid section and are re-derived on load — so
-/// the section stays small (topology + node map, on the order of KBs at typical
-/// cluster counts) regardless of corpus size, even at ~500 MB of centroids.
-fn encode_centroid_router_section(router: &CentroidRouterGraph, dim: usize) -> Vec<u8> {
+/// + `dim`, the node map as `(superfile_id, flat cluster)` per graph node, then
+/// the graph topology ([`Hnsw::to_bytes`]). The node map is keyed by the STABLE
+/// `superfile_id`, not a bare array index, so the load path never depends on the
+/// settle-time and query-time superfile arrays having the same order — it
+/// resolves each id to the current index. The fp32 centroids are NOT stored —
+/// they already live in the mmap'd centroid section and are re-derived on load
+/// — so the section stays small (topology + node map, KBs at typical cluster
+/// counts) regardless of corpus size, even at ~500 MB of centroids.
+fn encode_centroid_router_section(
+    router: &CentroidRouterGraph,
+    superfiles: &[Arc<SuperfileEntry>],
+    dim: usize,
+) -> Vec<u8> {
     let topology = router.graph.to_bytes();
-    let mut out = Vec::with_capacity(8 + 4 + 8 + router.node_map.len() * 8 + 8 + topology.len());
+    let mut out = Vec::with_capacity(8 + 4 + 8 + router.node_map.len() * 20 + 8 + topology.len());
     out.extend_from_slice(CENTROID_ROUTER_SECTION_MAGIC);
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.extend_from_slice(&(router.node_map.len() as u64).to_le_bytes());
     for &(si, flat) in &router.node_map {
-        out.extend_from_slice(&(si as u32).to_le_bytes());
+        out.extend_from_slice(superfiles[si].superfile_id.as_bytes());
         out.extend_from_slice(&flat.to_le_bytes());
     }
     out.extend_from_slice(&(topology.len() as u64).to_le_bytes());
@@ -946,13 +953,19 @@ fn encode_centroid_router_section(router: &CentroidRouterGraph, dim: usize) -> V
 
 /// Reconstruct a centroid router from a section written by
 /// [`encode_centroid_router_section`]. The graph topology comes from the
-/// section; the fp32 scorer is rebuilt by re-walking the resident centroid
-/// section (the section carries no centroids). Returns `None` — so the caller
-/// falls back to a full in-memory build — on a bad/absent frame, a `dim`
-/// mismatch, or any drift between the persisted node map and the current walk
-/// (a stale section against changed membership), never a panic. The drift check
-/// is what guarantees the persisted node-map indices line up with the
-/// reconstructed scorer vectors.
+/// section; the fp32 scorer is rebuilt from the resident centroids, one vector
+/// per node IN THE PERSISTED NODE-MAP ORDER (so scorer node `i` lines up with
+/// topology node `i` by construction, independent of how the current superfile
+/// array is ordered). Returns `None` — so the caller falls back to a full
+/// in-memory build — on a bad/absent frame, a `dim` mismatch, an
+/// `n`/topology-node-count disagreement, or a persisted `(superfile_id, flat)`
+/// the current membership no longer covers, never a panic.
+///
+/// The membership guarantee is the clearing invariant: `ManifestSnapshot::update`
+/// clears the centroid-graph ref on EVERY membership commit and the settle
+/// restamps it, so a section can only ever be read against the exact membership
+/// it was built for. The id-resolution + cluster-presence checks here are
+/// index-level defense-in-depth on top of that invariant.
 fn decode_centroid_router_section(
     bytes: &[u8],
     superfiles: &[Arc<SuperfileEntry>],
@@ -974,27 +987,56 @@ fn decode_centroid_router_section(
     let n = u64::from_le_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?) as usize;
     pos += 8;
     // Bound the node-map allocation by the bytes actually present before
-    // reserving, so a corrupt count can't drive a huge `Vec`.
-    let node_map_bytes = n.checked_mul(8)?;
+    // reserving, so a corrupt count can't drive a huge `Vec`. Each entry is a
+    // 16-byte `superfile_id` + a 4-byte flat cluster.
+    let node_map_bytes = n.checked_mul(20)?;
     let end = pos.checked_add(node_map_bytes)?;
-    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(n);
+    let mut persisted: Vec<(Uuid, u32)> = Vec::with_capacity(n);
     for _ in 0..n {
-        let si = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
-        let flat = u32::from_le_bytes(bytes.get(pos + 4..pos + 8)?.try_into().ok()?);
-        node_map.push((si, flat));
-        pos += 8;
+        let sfid = Uuid::from_slice(bytes.get(pos..pos + 16)?).ok()?;
+        let flat = u32::from_le_bytes(bytes.get(pos + 16..pos + 20)?.try_into().ok()?);
+        persisted.push((sfid, flat));
+        pos += 20;
     }
     debug_assert_eq!(pos, end);
     let topo_len = u64::from_le_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?) as usize;
     pos += 8;
     let topology = bytes.get(pos..pos.checked_add(topo_len)?)?;
     let graph = Hnsw::from_bytes(topology)?;
-    // Re-derive the scorer from the resident centroids and verify the walk
-    // still matches the persisted node map + graph, so a stale section (built
-    // against different membership) is rejected rather than misrouted.
-    let (vecs, node_map_walk) = centroid_router_walk(superfiles, readers, column, section).ok()?;
-    if vecs.len() != n || graph.len() != n || node_map_walk != node_map {
+    if graph.len() != n {
         return None;
+    }
+    // Resolve each stable id to its CURRENT array index, and gather every
+    // resident `(superfile_id, flat) -> normalized centroid` so the scorer can
+    // be assembled in persisted node order.
+    let mut id_to_si: HashMap<Uuid, usize> = HashMap::with_capacity(superfiles.len());
+    for (si, sf) in superfiles.iter().enumerate() {
+        id_to_si.insert(sf.superfile_id, si);
+    }
+    let mut cluster_vecs: HashMap<(Uuid, u32), Vec<f32>> = HashMap::new();
+    for (si, reader) in readers.iter().enumerate() {
+        let Some(vr) = reader.vec() else { continue };
+        let Some(sf) = superfiles.get(si) else {
+            continue;
+        };
+        let sfid = sf.superfile_id;
+        for (flat, mut vec) in vr.global_fine_cluster_vectors(column, section, sfid).ok()? {
+            gfc_unit_normalize(&mut vec);
+            cluster_vecs.insert((sfid, flat), vec);
+        }
+    }
+    // Assemble the scorer + in-memory node map in topology-node order, driven by
+    // the persisted map. A missing id or cluster (membership drifted) rejects.
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
+    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(n);
+    for (sfid, flat) in &persisted {
+        let si = *id_to_si.get(sfid)?;
+        let vec = cluster_vecs.get(&(*sfid, *flat))?;
+        if vec.len() != dim {
+            return None;
+        }
+        vecs.push(vec.clone());
+        node_map.push((si, *flat));
     }
     let scorer = Fp32Scorer::from_vectors(&vecs, dim);
     Some(CentroidRouterGraph {
@@ -1004,41 +1046,32 @@ fn decode_centroid_router_section(
     })
 }
 
-/// Build the centroid-router section bytes for the settled generation: pick the
-/// eligible column, open readers over `entries`, build the router from the
-/// freshly published centroid `section`, and serialize it. `None` when the
-/// router is disabled, no column is eligible, membership is empty, or the build
-/// fails — the settle then stamps no ref and queries reconstruct in memory.
-/// Called from the drain/compaction settle so the graph is published once per
-/// generation, `mmap`-loaded identically on every node and after a restart.
+/// Build the centroid-router section bytes for the settled generation: open
+/// readers over `entries`, build the router for `column`/`dim` from the freshly
+/// published centroid `section`, and serialize it. `None` when membership is
+/// empty or the build fails — the settle then stamps no ref and queries
+/// reconstruct in memory. The caller has already resolved `column`/`dim` via
+/// [`select_eager_router_column`], so this does not re-gate. Called from the
+/// drain/compaction settle so the graph is published once per generation,
+/// `mmap`-loaded identically on every node and after a restart.
 pub(crate) async fn compose_centroid_router_section(
     options: &SupertableOptions,
     entries: &[Arc<SuperfileEntry>],
     section: &crate::supertable::slow_vector_state::CentroidSection,
+    column: &str,
+    dim: usize,
 ) -> Option<Vec<u8>> {
     if entries.is_empty() {
         return None;
     }
-    let vcfg = &config::global().vector;
-    let column = select_eager_router_column(
-        vcfg.search_mode,
-        vcfg.ivf_router,
-        vcfg.global_fine_fanout,
-        &options.vector_columns,
-    )?;
-    let dim = options
-        .vector_columns
-        .iter()
-        .find(|vc| vc.column == column)
-        .map(|vc| vc.dim)?;
     let readers = open_readers_from_options(options, entries)
         .await
         .map_err(|error| tracing::warn!(%error, "centroid-router publish: reader open failed"))
         .ok()?;
-    let router = build_centroid_router(entries, &readers, &column, section, dim)
+    let router = build_centroid_router(entries, &readers, column, section, dim)
         .map_err(|error| tracing::warn!(%error, "centroid-router publish: build failed"))
         .ok()?;
-    Some(encode_centroid_router_section(&router, dim))
+    Some(encode_centroid_router_section(&router, entries, dim))
 }
 
 /// Open a [`SuperfileReader`] per entry through a table's store + caches,
@@ -7519,7 +7552,7 @@ mod tests {
             assert!(!built.node_map.is_empty(), "fixture must produce a router");
 
             // Real storage round trip: serialize -> PUT -> fetch+mmap -> decode.
-            let bytes = encode_centroid_router_section(&built, dim);
+            let bytes = encode_centroid_router_section(&built, &entries, dim);
             let reference =
                 crate::supertable::slow_vector_state::write_graph_section(storage.as_ref(), bytes)
                     .await
@@ -7564,6 +7597,99 @@ mod tests {
                     route(&built, &q),
                     route(&loaded, &q),
                     "query {seed} must route identically after the round trip"
+                );
+            }
+        });
+    }
+
+    /// Cross-path ordering robustness: the node map is keyed by the stable
+    /// `superfile_id`, so a section built against one superfile ordering must
+    /// load + route correctly against a DIFFERENT ordering of the same
+    /// superfiles (the guard against settle-order and query-order silently
+    /// differing and disengaging the feature). Build in one order, decode in the
+    /// reversed order, and assert the section is ACCEPTED and routes identically
+    /// (compared by `(superfile_id, flat)`, which is order-invariant).
+    #[test]
+    fn centroid_router_section_loads_under_reordered_superfiles() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(Arc::clone(&storage))).expect("create");
+        // Several commits so the drained hidden table holds more than one
+        // superfile — reordering is only meaningful with multiple entries.
+        for c in 0..6u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+            st.drain_vectors_to_cells_sync().expect("drain");
+        }
+
+        block_on_mt(async {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let entries = hr
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+
+            let built =
+                build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim).unwrap();
+            let bytes = encode_centroid_router_section(&built, &entries, dim);
+
+            // Decode against the REVERSED superfile + reader arrays (lockstep),
+            // simulating a query path that enumerates superfiles differently.
+            let mut entries_rev = entries.clone();
+            entries_rev.reverse();
+            let mut readers_rev = readers.clone();
+            readers_rev.reverse();
+            let loaded = decode_centroid_router_section(
+                &bytes,
+                &entries_rev,
+                &readers_rev,
+                "emb",
+                section.as_ref(),
+                dim,
+            )
+            .expect("section must be accepted under a reordered superfile array");
+
+            // Compare routing by (superfile_id, flat), which is invariant to the
+            // array order the two routers used for their `si` indices.
+            let route_by_id = |router: &CentroidRouterGraph,
+                               sfs: &[Arc<SuperfileEntry>],
+                               q: &[f32]|
+             -> Vec<(uuid::Uuid, u32)> {
+                let fanout = 3usize;
+                let ef = fanout.saturating_mul(2).max(fanout);
+                let mut sel: Vec<(uuid::Uuid, u32)> = router
+                    .graph
+                    .search(&router.scorer, q, fanout, ef)
+                    .into_iter()
+                    .filter_map(|(node, _)| {
+                        router
+                            .node_map
+                            .get(node as usize)
+                            .map(|&(si, flat)| (sfs[si].superfile_id, flat))
+                    })
+                    .collect();
+                sel.sort_unstable();
+                sel
+            };
+            for seed in 0..8usize {
+                let mut q = vec![0.0f32; dim];
+                q[seed % dim] = 1.0;
+                gfc_unit_normalize(&mut q);
+                assert_eq!(
+                    route_by_id(&built, &entries, &q),
+                    route_by_id(&loaded, &entries_rev, &q),
+                    "query {seed} must select the same superfile clusters under reordering"
                 );
             }
         });

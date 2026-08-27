@@ -89,6 +89,9 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     if let Some(graphs) = manifest.slow_vector_state_graphs_blob() {
         live.insert(graphs.uri.clone());
     }
+    if let Some(centroid_graph) = manifest.slow_vector_state_centroid_graph_blob() {
+        live.insert(centroid_graph.uri.clone());
+    }
 
     // Each resident superfile's tombstone sidecar. `superfiles/` is swept whatever the flag says,
     // so these have to be named here or a sidecar past the gap is deleted and its deleted rows
@@ -531,5 +534,61 @@ mod tests {
         let (live, superfiles_complete) = build_live_set(&bare);
         assert!(superfiles_complete);
         assert!(!live.contains(&uri));
+    }
+
+    /// A referenced centroid-router section is live and survives a sweep. The
+    /// section lives under the swept `slow-vector-state/` prefix, so if it were
+    /// omitted from the live set GC would delete a referenced section and every
+    /// subsequent query would silently rebuild the router in memory.
+    #[test]
+    fn build_live_set_contains_centroid_graph_section() {
+        let hash = ContentHash::of(b"slow state");
+        let uri = slow_vector_state::storage_path(&hash);
+        let centroid_graph_hash = ContentHash::of(b"centroid router section");
+        let centroid_graph_uri = slow_vector_state::storage_path(&centroid_graph_hash);
+        let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
+        let manifest = ManifestSnapshot::new(
+            TEST_MANIFEST_ID,
+            opts(),
+            Vec::new(),
+            None,
+            Some(Manifest {
+                tombstone_seqs: Default::default(),
+                superseded_cells: Default::default(),
+                format_version: FORMAT_VERSION.into(),
+                manifest_id: TEST_MANIFEST_ID,
+                options_hash: ContentHash::of(b"options"),
+                schema: Vec::new(),
+                id_column: "_id".into(),
+                fts_columns: Vec::new(),
+                vector_columns: Vec::new(),
+                partition_strategy: PartitionStrategy::Hash {
+                    column: "_id".into(),
+                    n_buckets: TEST_HASH_BUCKETS,
+                },
+                vector_index_storage_prefix: None,
+                global_vector_index: None,
+                drained_ranges: Default::default(),
+                deleted_user_ids_inline: None,
+                slow_vector_state_uri: Some(uri.clone()),
+                slow_vector_state_content_hash: Some(hash),
+                slow_vector_state_centroids: None,
+                slow_vector_state_graphs: None,
+                slow_vector_state_centroid_graph: Some(RoutingRef {
+                    uri: centroid_graph_uri.clone(),
+                    content_hash: centroid_graph_hash,
+                }),
+                parts: Vec::new(),
+            }),
+        );
+        let (live, _) = build_live_set(&manifest);
+        assert!(
+            live.contains(&centroid_graph_uri),
+            "referenced centroid-router section must be live"
+        );
+        assert!(
+            !live.contains(&orphan),
+            "unreferenced blob must still be sweepable"
+        );
     }
 }
