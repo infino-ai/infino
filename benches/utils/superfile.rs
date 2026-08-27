@@ -2314,9 +2314,10 @@ pub mod sql {
                 log_build_start(phases, actual_docs, Some(corpus::corpus_label()));
                 // Empty unless `phases.warm`: this call always runs (warm/cold
                 // need the table too), so an unconditional battery would run
-                // every ClickBench query on a `build`-only invocation.
+                // every query on a `build`-only invocation. The battery is
+                // derived from the corpus's own schema — no vendored text.
                 let queries = if phases.warm {
-                    corpus::clickbench::queries()
+                    corpus::sql_battery::battery_for(corpus.spec())
                 } else {
                     &[]
                 };

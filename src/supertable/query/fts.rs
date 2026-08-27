@@ -114,6 +114,8 @@ const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
 
 pub use crate::superfile::fts::reader::BoolMode;
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     runtime_bridge::run_on_pool,
@@ -314,7 +316,7 @@ impl SupertableReader {
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn bm25_search_async(
         &self,
@@ -1079,7 +1081,7 @@ impl SupertableReader {
     /// [`SupertableReader::token_match`].
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn token_match_async(
         &self,
@@ -1834,7 +1836,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn bm25_search(
         &self,
@@ -1866,7 +1868,7 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn token_match(
         &self,
@@ -1893,7 +1895,7 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column))
+        tracing::instrument(skip_all, fields(column = column, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn exact_match(
         &self,

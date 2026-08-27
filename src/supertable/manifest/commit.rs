@@ -59,6 +59,7 @@ use crate::{
             },
         },
     },
+    utils::trace::record,
 };
 
 /// Pointer-file location under the supertable root. The only
@@ -190,12 +191,26 @@ impl PointerFile {
 ///
 /// Returns `Ok(None)` if the pointer doesn't exist (fresh
 /// supertable). Returns `Err` on any other failure.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "manifest.read_pointer",
+        skip_all,
+        fields(found = tracing::field::Empty)
+    )
+)]
 pub async fn read_pointer(
     storage: &dyn StorageProvider,
 ) -> Result<Option<(PointerFile, ObjectMeta)>, ManifestLoadError> {
     match storage.get(POINTER_PATH).await {
-        Ok((bytes, meta)) => Ok(Some((PointerFile::from_bytes(&bytes)?, meta))),
-        Err(StorageError::NotFound { .. }) => Ok(None),
+        Ok((bytes, meta)) => {
+            record("found", true);
+            Ok(Some((PointerFile::from_bytes(&bytes)?, meta)))
+        }
+        Err(StorageError::NotFound { .. }) => {
+            record("found", false);
+            Ok(None)
+        }
         Err(e) => Err(ManifestLoadError::Storage(e)),
     }
 }
@@ -223,20 +238,46 @@ pub enum PointerProbe {
 /// consistency check under `Consistency::Strong` (and the per-window
 /// check under `BoundedStaleness`) costs a roundtrip but no
 /// transfer or parse. `None` degrades to a plain [`read_pointer`].
+// The freshness roundtrip itself. On the read path this is what a query
+// pays before touching any data, so it gets its own span: `conditional`
+// says whether the cheap 304 was even available, `outcome` whether it hit.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "manifest.probe_pointer",
+        skip_all,
+        fields(conditional = if_none_match.is_some(), outcome = tracing::field::Empty)
+    )
+)]
 pub async fn probe_pointer(
     storage: &dyn StorageProvider,
     if_none_match: Option<&str>,
 ) -> Result<PointerProbe, ManifestLoadError> {
     let Some(etag) = if_none_match else {
         return Ok(match read_pointer(storage).await? {
-            Some((pointer, meta)) => PointerProbe::Read(pointer, meta),
-            None => PointerProbe::Absent,
+            Some((pointer, meta)) => {
+                record("outcome", "read");
+                PointerProbe::Read(pointer, meta)
+            }
+            None => {
+                record("outcome", "absent");
+                PointerProbe::Absent
+            }
         });
     };
     match storage.get_if_none_match(POINTER_PATH, etag).await {
-        Ok(None) => Ok(PointerProbe::NotModified),
-        Ok(Some((bytes, meta))) => Ok(PointerProbe::Read(PointerFile::from_bytes(&bytes)?, meta)),
-        Err(StorageError::NotFound { .. }) => Ok(PointerProbe::Absent),
+        Ok(None) => {
+            record("outcome", "not_modified");
+            Ok(PointerProbe::NotModified)
+        }
+        Ok(Some((bytes, meta))) => {
+            record("outcome", "read");
+            Ok(PointerProbe::Read(PointerFile::from_bytes(&bytes)?, meta))
+        }
+        Err(StorageError::NotFound { .. }) => {
+            record("outcome", "absent");
+            Ok(PointerProbe::Absent)
+        }
         Err(e) => Err(ManifestLoadError::Storage(e)),
     }
 }

@@ -2,3 +2,4 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 pub(crate) mod schema;
+pub(crate) mod trace;

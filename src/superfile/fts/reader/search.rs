@@ -679,10 +679,10 @@ impl FtsReader {
     /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
     /// The ranged path carries no negation in v1.
     ///
-    /// Kernel choice goes through the same `route_or_to_windowed` seam as the
-    /// single-shot path, so a query runs the same kernel whether or not the
-    /// fan-out sliced it — hardcoding BMM here once caused an 11-24x
-    /// post-compact broad-OR regression.
+    /// Runs the same windowed MaxScore union kernel as the single-shot path, so
+    /// a query runs the identical kernel whether or not the fan-out sliced it —
+    /// hardcoding a single-regime scorer here once caused an 11-24x post-compact
+    /// broad-OR regression.
     pub(crate) fn search_or_range_prebuilt(
         &self,
         set: &OrCursorSet,
@@ -695,27 +695,15 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
-        if route_or_to_windowed(&cursors, k) {
-            self.run_windowed_union(
-                set.column_id,
-                cursors,
-                k,
-                None,
-                floor.next_down(),
-                doc_id_start,
-                doc_id_end,
-            )
-        } else {
-            self.run_max_score_bmm_range(
-                set.column_id,
-                cursors,
-                k,
-                doc_id_start,
-                doc_id_end,
-                None,
-                floor.next_down(),
-            )
-        }
+        self.run_windowed_maxscore(
+            set.column_id,
+            cursors,
+            k,
+            None,
+            floor.next_down(),
+            doc_id_start,
+            doc_id_end,
+        )
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -1374,35 +1362,15 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        // k-gated routing exercises both ranged kernels: the uniform OR takes
-        // the windowed scan at K_ALL (deep k) but MaxScore at the small top-k;
-        // the dominant-UB OR stays on MaxScore throughout. Assert it rather
-        // than assume it, so a corpus tweak can't silently test one branch twice.
+        // Two shapes through the one ranged union kernel: a uniform OR
+        // (exercises the windowed accumulate) and a rare+common OR (exercises
+        // the dominant-leader path), each sliced identically to the un-ranged
+        // search so the partition union must reproduce the whole-superfile
+        // result regardless of where the cuts fall.
         let shapes: [&[&str]; 2] = [
             &["alpha", "beta", "gamma", "delta"],
             &["rareterm", "alpha", "beta"],
         ];
-        let column_id = r.resolve_column_id("body").expect("column");
-        let uniform = r
-            .build_term_cursors(column_id, shapes[0], None, false)
-            .await
-            .expect("cursors");
-        assert!(
-            route_or_to_windowed(&uniform, K_ALL),
-            "uniform OR at K_ALL (deep k) must route to the windowed ranged branch"
-        );
-        assert!(
-            !route_or_to_windowed(&uniform, K_TOP),
-            "uniform OR at small k must route to the MaxScore ranged branch"
-        );
-        let dominant = r
-            .build_term_cursors(column_id, shapes[1], None, false)
-            .await
-            .expect("cursors");
-        assert!(
-            !route_or_to_windowed(&dominant, K_ALL) && !route_or_to_windowed(&dominant, K_TOP),
-            "dominant-UB OR must route to MaxScore at every k (not uniform, no ≥100k list)"
-        );
         // Uneven partitions, including window-boundary-crossing cuts.
         let partitions: [&[(u32, u32)]; 3] = [
             &[(0, N_DOCS)],

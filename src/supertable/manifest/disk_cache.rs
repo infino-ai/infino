@@ -41,7 +41,7 @@ use std::{
 
 use dashmap::{DashMap, Entry};
 
-use crate::supertable::manifest::part::ContentHash;
+use crate::{supertable::manifest::part::ContentHash, utils::trace::record};
 
 /// File-name prefix for a cached manifest part. The blake3 hex of the
 /// part's compressed bytes follows; the `.avro.zst` suffix mirrors the
@@ -159,9 +159,21 @@ impl ManifestDiskCache {
     /// requested `hash`; a mismatch (disk corruption) is treated as a
     /// miss and the bad file is removed, so the loader transparently
     /// falls back to storage.
+    // A hit is not free: it reads the file and re-hashes it end to end, so
+    // on a large part this is real I/O plus a blake3 pass. `outcome`
+    // separates the cheap index miss from the expensive verified hit.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.part_cache_get",
+            skip_all,
+            fields(outcome = tracing::field::Empty, bytes = tracing::field::Empty)
+        )
+    )]
     pub async fn get(&self, hash: &ContentHash) -> Option<Vec<u8>> {
         // Fast negative: not in the accounting index ⇒ not cached.
         if !self.entries.contains_key(hash) {
+            record("outcome", "miss");
             self.n_misses.fetch_add(1, Ordering::AcqRel);
             return None;
         }
@@ -171,6 +183,7 @@ impl ManifestDiskCache {
             Err(_) => {
                 // File vanished out from under the index (manual
                 // delete, external eviction). Drop the stale entry.
+                record("outcome", "file_missing");
                 self.drop_entry(hash);
                 self.n_misses.fetch_add(1, Ordering::AcqRel);
                 return None;
@@ -179,6 +192,7 @@ impl ManifestDiskCache {
         // Content-addressing guarantee: the bytes must hash to the key.
         // A mismatch means on-disk corruption — discard and miss.
         if ContentHash::of(&bytes) != *hash {
+            record("outcome", "corrupt");
             let _ = tokio::fs::remove_file(&path).await;
             self.drop_entry(hash);
             self.n_misses.fetch_add(1, Ordering::AcqRel);
@@ -187,6 +201,8 @@ impl ManifestDiskCache {
         if let Some(entry) = self.entries.get(hash) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
         }
+        record("outcome", "hit");
+        record("bytes", bytes.len() as u64);
         self.n_hits.fetch_add(1, Ordering::AcqRel);
         Some(bytes)
     }
@@ -271,6 +287,16 @@ impl ManifestDiskCache {
     /// Evict least-recently-accessed entries until at least
     /// `bytes_needed` is freed. Returns `false` if there were no
     /// entries left to evict before reaching the target.
+    // Runs inline under `put`, so a full cache makes the caller pay for the
+    // unlink sweep. `freed` vs `bytes_needed` shows when that is happening.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.part_cache_evict",
+            skip_all,
+            fields(bytes_needed = bytes_needed, freed = tracing::field::Empty)
+        )
+    )]
     fn evict_at_least(&self, bytes_needed: u64) -> bool {
         let mut candidates: Vec<(ContentHash, u64, u64)> = self
             .entries
@@ -301,6 +327,7 @@ impl ManifestDiskCache {
                 freed = freed.saturating_add(size);
             }
         }
+        record("freed", freed);
         freed >= bytes_needed
     }
 

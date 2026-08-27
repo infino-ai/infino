@@ -66,6 +66,8 @@ use datafusion::{
     logical_expr::{Expr, LogicalPlan},
 };
 
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     memory::budgeted_session_context,
     runtime_metrics::op_stats::{self, OpStatsCollector},
@@ -231,7 +233,7 @@ impl SupertableReader {
     #[cfg(any(test, feature = "test-helpers"))]
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(sql = sql))
+        tracing::instrument(skip_all, fields(sql = sql, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();

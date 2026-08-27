@@ -38,6 +38,8 @@ use super::{
     },
     options::SupertableOptions,
 };
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     config,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
@@ -65,6 +67,7 @@ use crate::{
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
     },
+    utils::trace::{TableRole, record},
 };
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
@@ -81,6 +84,14 @@ pub struct Supertable {
 /// commit and to manipulate `writer_outstanding` for the
 /// single-writer slot enforcement.
 pub(super) struct SupertableInner {
+    /// Which of the two tables this handle drives — the user's own rows,
+    /// or the derived vector index. Both run the same code, so without
+    /// this the two are indistinguishable in a trace. Recorded as the
+    /// `role` field on the spans this handle roots. Immutable for the
+    /// handle's lifetime. Only read by the span sites, which are behind
+    /// `detailed-tracing`.
+    #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
+    pub(super) role: TableRole,
     /// Schema, FTS columns, vector columns, tokenizer, thread
     /// pools, superfile store, commit threshold. Immutable for
     /// the supertable's lifetime; shared via Arc so readers,
@@ -266,6 +277,18 @@ impl SupertableInner {
     /// Lives on the inner because the deferred storage reclaim holds only an `Arc<SupertableInner>`
     /// and still has to resolve the committed manifest when it fires.
     /// [`Supertable::refresh`] is the handle-level spelling of the same call.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.refresh",
+            skip_all,
+            fields(
+                role = self.role.as_str(),
+                outcome = tracing::field::Empty,
+                manifest_id = tracing::field::Empty
+            )
+        )
+    )]
     pub(super) async fn refresh(&self) -> Result<bool, ManifestLoadError> {
         let storage = self
             .options
@@ -292,10 +315,15 @@ impl SupertableInner {
             // already has a pointer by then, since `open` fails with `PointerNotFound` without one
             // and `create` publishes an empty manifest first.
             PointerProbe::Absent => {
+                record("outcome", "pointer_vanished");
                 let _ = self.pointer_vanished.set(());
                 return Err(ManifestLoadError::PointerVanished);
             }
-            PointerProbe::NotModified => return Ok(false),
+            // The steady state: one conditional roundtrip, no body, no parse.
+            PointerProbe::NotModified => {
+                record("outcome", "not_modified");
+                return Ok(false);
+            }
             PointerProbe::Read(pointer, meta) => (pointer, meta),
         };
 
@@ -319,6 +347,7 @@ impl SupertableInner {
             // this process's own commit leaves behind. Nothing newer to load, so record the etag
             // and let the next probe be a cheap 304.
             Err(ManifestLoadError::AlreadyLoaded) => {
+                record("outcome", "already_loaded");
                 *self
                     .last_pointer_etag
                     .lock()
@@ -339,10 +368,10 @@ impl SupertableInner {
             .lock()
             .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
 
-        debug!(
-            manifest_id = self.manifest.load().manifest_id,
-            "refreshed manifest"
-        );
+        let manifest_id = self.manifest.load().manifest_id;
+        record("outcome", "advanced");
+        record("manifest_id", manifest_id);
+        debug!(manifest_id, "refreshed manifest");
 
         Ok(true)
     }
@@ -462,7 +491,14 @@ impl Supertable {
                         .await
                     {
                         Ok(hidden_manifest) => {
-                            match open_table_async(hidden_arc, hidden_manifest, None).await {
+                            match open_table_async(
+                                hidden_arc,
+                                hidden_manifest,
+                                None,
+                                TableRole::VectorIndex,
+                            )
+                            .await
+                            {
                                 Ok(t) => (Some(Arc::new(t)), None),
                                 Err(e) => {
                                     warn!(
@@ -485,16 +521,19 @@ impl Supertable {
                 // correct — queries fall back to the user fan until a writer
                 // handle materializes the index.
                 Ok(None) if options_arc.summary_centroids_from_superfiles => (None, None),
-                Ok(None) => match create_table_async(hidden_opts, None, None).await {
-                    Ok(table) => (Some(Arc::new(table)), None),
-                    Err(e) => {
-                        // Surface a genuine bootstrap failure as Broken (carry the
-                        // error) rather than Absent, matching the sibling arms —
-                        // otherwise a storage fault silently degrades to full scan.
-                        warn!("supertable: hidden vector-index bootstrap-create failed: {e}");
-                        (None, Some(e.to_string()))
+                Ok(None) => {
+                    match create_table_async(hidden_opts, None, None, TableRole::VectorIndex).await
+                    {
+                        Ok(table) => (Some(Arc::new(table)), None),
+                        Err(e) => {
+                            // Surface a genuine bootstrap failure as Broken (carry the
+                            // error) rather than Absent, matching the sibling arms —
+                            // otherwise a storage fault silently degrades to full scan.
+                            warn!("supertable: hidden vector-index bootstrap-create failed: {e}");
+                            (None, Some(e.to_string()))
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     warn!("supertable: hidden vector-index pointer unreadable: {e}");
                     (None, Some(e.to_string()))
@@ -503,7 +542,8 @@ impl Supertable {
         } else {
             (None, None)
         };
-        let handle = open_table_async(options_arc, manifest, vector_index_table).await?;
+        let handle =
+            open_table_async(options_arc, manifest, vector_index_table, TableRole::User).await?;
         if let Some(err) = hidden_index_broken {
             let _ = handle.inner.hidden_index_open_error.set(err);
         }
@@ -543,7 +583,13 @@ impl Supertable {
                 build_vector_index_options(&options, None, Some(prefix.as_str()))
             {
                 Some(Arc::new(
-                    create_table_async(hidden_opts, None, Some(prefix.clone())).await?,
+                    create_table_async(
+                        hidden_opts,
+                        None,
+                        Some(prefix.clone()),
+                        TableRole::VectorIndex,
+                    )
+                    .await?,
                 ))
             } else {
                 None
@@ -551,7 +597,13 @@ impl Supertable {
         } else {
             None
         };
-        create_table_async(options, vector_index_table, vector_index_storage_prefix).await
+        create_table_async(
+            options,
+            vector_index_table,
+            vector_index_storage_prefix,
+            TableRole::User,
+        )
+        .await
     }
 
     /// Re-read the manifest pointer from storage and advance this supertable to whatever it names.
@@ -632,6 +684,12 @@ impl Supertable {
             inner: Arc::clone(&self.inner),
             op_stats,
         }
+    }
+
+    /// Which table this handle drives, for the `role` span field.
+    #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
+    pub(crate) fn role(&self) -> TableRole {
+        self.inner.role
     }
 
     test_visible! {
@@ -1580,16 +1638,25 @@ fn build_vector_index_options(
 }
 
 /// Build one supertable handle. Leaf — never creates a hidden sibling.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        skip_all,
+        fields(role = role.as_str(), origin = OpOrigin::Open.as_str())
+    )
+)]
 async fn build_handle(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let tombstone_cache = build_tombstone_cache(&options, &manifest);
     let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
     let handle_id = crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
     let inner = Arc::new(SupertableInner {
         options,
+        role,
         manifest: ArcSwap::new(manifest),
         writer_outstanding: AtomicBool::new(false),
         compaction_outstanding: AtomicBool::new(false),
@@ -1627,6 +1694,7 @@ async fn create_table_async(
     options: SupertableOptions,
     vector_index_table: Option<Arc<Supertable>>,
     vector_index_storage_prefix: Option<String>,
+    role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let options = Arc::new(options);
     // A durable create *persists* the initial empty manifest — its list plus
@@ -1671,7 +1739,7 @@ async fn create_table_async(
             vector_index_table,
         )
     };
-    build_handle(options, manifest, vector_index_table).await
+    build_handle(options, manifest, vector_index_table, role).await
 }
 
 /// After a lost create-race, open (or bootstrap) the hidden vector-index
@@ -1695,7 +1763,7 @@ async fn reconcile_vector_index_table_to_manifest(
             let hidden_manifest =
                 ManifestSnapshot::load(None, hidden_storage, Some(hidden_arc.clone())).await?;
             Ok(Some(Arc::new(
-                open_table_async(hidden_arc, hidden_manifest, None).await?,
+                open_table_async(hidden_arc, hidden_manifest, None, TableRole::VectorIndex).await?,
             )))
         }
         Ok(None) => {
@@ -1724,7 +1792,7 @@ async fn reconcile_vector_index_table_to_manifest(
                 ))
             };
             Ok(Some(Arc::new(
-                build_handle(hidden_arc, manifest, None).await?,
+                build_handle(hidden_arc, manifest, None, TableRole::VectorIndex).await?,
             )))
         }
         Err(e) => Err(OpenError::Storage(StorageError::Permanent {
@@ -1739,8 +1807,9 @@ async fn open_table_async(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    role: TableRole,
 ) -> Result<Supertable, OpenError> {
-    build_handle(options, manifest, vector_index_table).await
+    build_handle(options, manifest, vector_index_table, role).await
 }
 
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
@@ -1883,6 +1952,12 @@ impl SupertableReader {
     /// reader-vs-writer visibility ordering in tests.
     pub fn manifest_id(&self) -> u64 {
         self.manifest.manifest_id
+    }
+
+    /// Which table this reader queries, for the `role` span field.
+    #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
+    pub(crate) fn role(&self) -> TableRole {
+        self.inner.role
     }
 
     /// Sync→async bridge for this reader's public query surface.
@@ -6246,6 +6321,50 @@ mod tests {
             !stamped,
             "an all-zero width law must not trigger calibration"
         );
+    }
+
+    /// The derived vector-index table runs the same code as the user table,
+    /// so its spans are only distinguishable by the `role` tag threaded
+    /// through handle construction. Assert the two handles disagree — a
+    /// regression here silently merges both tables into one trace.
+    #[test]
+    fn hidden_vector_index_handle_carries_the_vector_index_role() {
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(item_field, dim as i32),
+            false,
+        )]));
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema,
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage);
+
+        let st = Supertable::create(options).expect("create");
+        assert_eq!(st.role(), TableRole::User);
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("a vector column means a hidden index handle")
+            .clone();
+        assert_eq!(hidden.role(), TableRole::VectorIndex);
     }
 
     /// The cleared-law repair, end to end through the PUBLIC `optimize()`:

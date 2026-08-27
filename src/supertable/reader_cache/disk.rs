@@ -33,7 +33,7 @@ use tokio::{
     sync::{Notify, OnceCell, Semaphore, oneshot},
     task::{JoinHandle, spawn_blocking},
 };
-use tracing::Instrument;
+use tracing::{Instrument, debug_span};
 
 use super::{
     block_source::BlockCachedSource,
@@ -53,6 +53,7 @@ use crate::{
         StorageRangeSource,
         manifest::{SubsectionOffsets, SuperfileUri},
     },
+    utils::trace::{OpOrigin, detached},
 };
 
 /// Parquet footer tail-speculation length for cold opens. Must match
@@ -1472,6 +1473,16 @@ impl DiskCacheStore {
         let tmp_owned = tmp.clone();
         let final_owned = final_path.clone();
         let file_owned = Arc::clone(&file);
+        // Detached: the finalizer outlives the fetch that spawned it, so it
+        // gets a root of its own that merely follows from the caller. See
+        // `trace::detached` for why inheriting the caller's span here would
+        // corrupt that span's reported duration.
+        let finalize_span = detached(debug_span!(
+            "cache.finalize_fill",
+            uri = %uri_owned.0,
+            bytes = size,
+            origin = OpOrigin::Maintenance.as_str(),
+        ));
         tokio::spawn(
             async move {
                 let _ = finalize_to_mmap(
@@ -1486,7 +1497,7 @@ impl DiskCacheStore {
                 )
                 .await;
             }
-            .in_current_span(),
+            .instrument(finalize_span),
         );
 
         Ok(entry)
@@ -1593,6 +1604,16 @@ impl DiskCacheStore {
         let uri_owned = *uri;
         let storage_uri_owned = Self::storage_path(uri);
         let fetch_storage = self.resolve_storage(storage);
+        // Detached, and deliberately long-lived: the fill waits for the
+        // foreground's lazy readers to release before it downloads. Parenting
+        // it to the query that happened to trigger it would bill the query for
+        // every second of that wait.
+        let fill_span = detached(debug_span!(
+            "cache.background_fill",
+            uri = %uri_owned.0,
+            bytes = size,
+            origin = OpOrigin::Maintenance.as_str(),
+        ));
         tokio::spawn(
             async move {
                 if needs_reserve {
@@ -1615,7 +1636,7 @@ impl DiskCacheStore {
                 )
                 .await;
             }
-            .in_current_span(),
+            .instrument(fill_span),
         );
     }
 

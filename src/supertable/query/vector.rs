@@ -95,6 +95,8 @@ use super::{
 pub use crate::superfile::reader::VectorSearchOptions;
 #[cfg(feature = "test-helpers")]
 use crate::test_helpers::{admit_trace, served_shortlist_probe};
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     config,
     runtime_bridge::run_on_pool,
@@ -4100,7 +4102,7 @@ impl SupertableReader {
     /// `vector_search` with a filter; this drives the cross-superfile fan-out.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len(), role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn vector_hits_filtered_async(
         &self,
@@ -5534,7 +5536,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len(), role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn vector_search(
         &self,

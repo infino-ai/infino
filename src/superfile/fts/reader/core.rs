@@ -256,29 +256,35 @@ impl PreparedClauses {
 }
 
 /// Multi-term OR algorithm selector for the bench harness's
-/// `search_with_algo_for_bench` entry point. Production code routes
-/// through `FtsReader::dispatch_or_algo`, which picks
-/// automatically; this enum exists so head-to-head bench runs can
-/// compare all three under identical inputs.
+/// `search_with_algo_for_bench` entry point, so head-to-head bench runs can
+/// compare the kernels under identical inputs. Production code routes through
+/// `FtsReader::dispatch_or_algo`, which sends every multi-term union to
+/// `WindowedMaxscore` and a 2-term rare+common OR to WAND+BMW.
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OrAlgo {
-    /// Block-Max MaxScore: production default for dominant-term ORs.
+    /// Per-candidate Block-Max MaxScore. Superseded on the production path by
+    /// `WindowedMaxscore`; retained as a bench baseline and the correctness
+    /// oracle the windowed kernels are checked against.
     Bmm,
-    /// WAND + Block-Max-WAND: historical baseline; retained for
-    /// regression comparisons.
+    /// WAND + Block-Max-WAND. The production path for a 2-term rare+common OR
+    /// (it pivots on the rare term to skip the common term's long list); a
+    /// bench baseline otherwise.
     WandBmw,
-    /// Exhaustive union walk with SIMD scoring + top-K heap. Wins
-    /// when no term dominates (uniform `term_max_bm25` upper bounds)
-    /// so BMM/BMW's skip checks rarely trigger and become pure
-    /// overhead.
+    /// Exhaustive union walk with SIMD scoring + top-K heap. Bench-only — the
+    /// dispatcher never routes here (see `run_exhaustive_union`); kept for the
+    /// one narrow shape where it narrowly wins.
     Exhaustive,
-    /// Windowed union: accumulate each term's contribution into a
-    /// fixed doc-id window (presence bitset + score array), then drain
-    /// in doc order into the top-k heap. Removes the per-doc f-way
-    /// merge; wins when no term dominates and the union is large (the
-    /// MaxScore-can't-prune case).
+    /// Windowed union: accumulate each term's contribution into a fixed doc-id
+    /// window (presence bitset + score array), then drain in doc order into the
+    /// top-k heap. Superseded by `WindowedMaxscore` (which adds the
+    /// essential/non-essential split); bench-only.
     Windowed,
+    /// Windowed MaxScore: **the production union kernel.** The windowed OR-sum
+    /// with a per-window essential/non-essential split recomputed from the live
+    /// threshold, so one kernel covers both the dense (all-essential OR-sum)
+    /// and selective (pruned-leader) regimes without an a-priori route.
+    WindowedMaxscore,
 }
 
 /// Doc-id window for the windowed union scorer. Power of two so the
@@ -357,105 +363,6 @@ pub(super) const WAND_BMW_2TERM_MAX_K: usize = 128;
 /// term can dominate the BM25 UB (higher idf) while still being common
 /// (long list), which WAND can't skip — only df separates the cases.
 pub(super) const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
-
-/// Score upper-bound spread below which a multi-term OR counts as
-/// "common-heavy" (no single term dominates): `max_ub <=
-/// OR_WINDOW_DOMINANCE_MULT * avg_ub`. Uniform terms sit near the average;
-/// a dominant (rarer) term sits well above it. See [`no_dominant_term_ub`].
-pub(super) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
-
-/// `k` cutoff for a common-heavy OR: at or below it MaxScore prunes (its
-/// heap fills and the threshold rises above the common terms' block maxima),
-/// so keep it there; above it pruning is dead and the SIMD windowed scan
-/// wins. Bench-tuned to the x86 target (the crossover is lower on wide-SIMD
-/// x86 than on ARM).
-pub(super) const OR_WINDOWED_UNIFORM_MAX_PRUNING_K: usize = 32;
-
-/// True when no single term dominates the score upper bound
-/// (`max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`). Such a "common-heavy" OR
-/// only prunes on MaxScore at small `k`; a dominant term skips hard at any `k`.
-pub(super) fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
-    let total: f32 = cursors.iter().map(|c| c.term_max_bm25).sum();
-    if total <= 0.0 {
-        return false;
-    }
-    let max = cursors
-        .iter()
-        .map(|c| c.term_max_bm25)
-        .fold(0.0f32, f32::max);
-    let avg = total / cursors.len() as f32;
-    max <= OR_WINDOW_DOMINANCE_MULT * avg
-}
-
-/// Route a multi-term OR to the non-pruning windowed scan instead of MaxScore,
-/// true only where MaxScore's pruning is dead at this `k`: a dominant long list
-/// too deep to fill the heap without its tail ([`or_topk_pruning_ineffective`]),
-/// or a common-heavy shape past [`OR_WINDOWED_UNIFORM_MAX_PRUNING_K`]. Otherwise
-/// MaxScore. Shared by the single-shot and ranged OR entries so a query runs the
-/// same kernel whether or not the fan-out sliced it.
-pub(super) fn route_or_to_windowed(cursors: &[TermCursor], k: usize) -> bool {
-    or_topk_pruning_ineffective(cursors, k)
-        || (k > OR_WINDOWED_UNIFORM_MAX_PRUNING_K
-            && cursors.len() >= OR_WINDOW_MIN_TERMS
-            && no_dominant_term_ub(cursors))
-}
-
-/// Minimum dominant-term df for the deep-`k` reroute to the windowed
-/// scorer to pay off. Below this the union is small enough that
-/// MaxScore's scalar full scan beats the windowed scorer's fixed
-/// per-window setup, so short unions stay on MaxScore. Calibrated on the
-/// warm FTS bench: the win concentrates on dominant lists in the millions
-/// (~corpus-scale), the mid range is a wash, and lists shorter than this
-/// regressed. See [`or_topk_pruning_ineffective`].
-pub(super) const OR_WINDOWED_MIN_DOMINANT_DF: u64 = 100_000;
-
-/// True when block-max pruning (MaxScore / WAND) can no longer skip
-/// blocks at this `k`, so both degrade to a full union scan — at which
-/// point the SIMD windowed scorer does that same scan far faster than
-/// MaxScore's scalar per-doc f-way merge.
-///
-/// Pruning stays alive only while the top-k threshold sits *above* the
-/// common (low-idf, longest-list) term's score upper bound: only then
-/// can that term's blocks be skipped. The threshold holds there only as
-/// long as the rarer terms alone can fill the heap. Once `k` reaches the
-/// combined df of every term *except* the single longest list, the heap
-/// must admit docs from that longest list's tail — docs whose only
-/// matching term is the common one — the threshold collapses toward its
-/// low upper bound, and no block clears the skip test any more.
-///
-/// `rest_df` (sum of all dfs but the largest) is a conservative bound on
-/// how many docs the rarer terms can contribute: it ignores overlap, so
-/// the true fillable count is `<= rest_df`. When `k >= rest_df` the heap
-/// therefore *cannot* be filled without the common term's tail, and
-/// pruning is dead. This is `df`-only — no extra reads — and
-/// self-correcting: a "rare" second term that is actually long keeps
-/// `rest_df` high, leaves pruning alive, and stays on MaxScore.
-///
-/// Reroute only when the dominant list is also *long* (`max_df >=`
-/// [`OR_WINDOWED_MIN_DOMINANT_DF`]). Once pruning is dead both scorers
-/// scan the whole union, but the windowed scorer's per-window bookkeeping
-/// (a 4096-wide score accumulator + presence bitset) only pays off when
-/// the dominant list is long enough to amortize it; on a short union it
-/// is pure overhead and MaxScore's scalar scan is faster. A union with
-/// fewer than the floor's matches can't have a longer dominant list than
-/// the floor, so this gates out exactly the small-union case that
-/// regressed on the bench.
-pub(super) fn or_topk_pruning_ineffective(cursors: &[TermCursor], k: usize) -> bool {
-    let max_df = cursors.iter().map(|c| c.df).max().unwrap_or(0);
-    let total_df: u64 = cursors.iter().map(|c| c.df).sum();
-    or_reroute_by_df(max_df, total_df, cursors.len(), k)
-}
-
-/// Pure df-math behind [`or_topk_pruning_ineffective`], split out so the
-/// routing decision can be unit-tested at df values (hundreds of
-/// thousands) that a fast in-memory corpus can't reach.
-pub(super) fn or_reroute_by_df(max_df: u64, total_df: u64, n_terms: usize, k: usize) -> bool {
-    if n_terms < 2 || max_df < OR_WINDOWED_MIN_DOMINANT_DF {
-        return false;
-    }
-    let rest_df = total_df.saturating_sub(max_df);
-    k as u64 >= rest_df
-}
 
 /// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
 ///
