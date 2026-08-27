@@ -54,6 +54,19 @@ use serde::{
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 
+/// Keys that used to exist, paired with what to write instead.
+///
+/// A retired key is REJECTED at load rather than ignored. Unknown keys are
+/// dropped silently (no `deny_unknown_fields`, and figment discards what no
+/// field claims), so a user who set the old key precisely to move off a default
+/// would otherwise be handed that default back with nothing to indicate their
+/// setting had stopped applying — resident memory and per-open cost changing
+/// under them on an upgrade. Failing the load is the loud version.
+const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[(
+    "vector.hnsw_sq8_walk",
+    "vector.hnsw_plane — `sq8` is the old `true`, `sq16` the old `false`",
+)];
+
 /// Engine default connection budget when none is configured; used by both
 /// [`MemorySettings`] and the connect path. `0` is the deliberate measure-only
 /// (no-ceiling) sentinel that `from_budget_bytes` maps to a measured budget.
@@ -322,11 +335,6 @@ const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
 /// more hard high-dim tables on the graph; tighten it to demand near-target
 /// recall from the graph or step aside to ivf.
 const DEFAULT_VECTOR_HNSW_RECALL_SLACK: f64 = 0.01;
-/// Default for `hnsw_sq8_walk`: on. The int8 walk roughly halves warm hnsw
-/// latency at unchanged recall; the extra resident SQ8 plane (~50% over the
-/// Sq16 plane) is the accepted trade. Set `false` to reclaim that memory and
-/// walk on Sq16.
-const DEFAULT_VECTOR_HNSW_SQ8_WALK: bool = true;
 /// Default for `hnsw_refine_k`: re-rank the SQ8 walk's top 256 on full Sq16.
 /// The knee for k ≤ 100 — recall matches the Sq16 walk and saturates here, so
 /// a wider refine only adds tail cost.
@@ -432,6 +440,37 @@ pub enum DrainConsolidate {
     Splice,
 }
 
+/// Resident plane the `hnsw_ivf` graph walk scores candidates on. Selected by
+/// `vector.hnsw_plane`.
+///
+/// Every variant re-ranks its final beam on the full Sq16 plane, which is
+/// always resident. So this decides which candidates reach the beam and what
+/// the walk costs per candidate — never the returned order. That is why a
+/// coarser walk plane buys latency rather than costing recall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorHnswPlane {
+    /// Fixed-grid 16-bit plane (2 bytes/dim). The only variant that adds no
+    /// plane, and so the smallest resident footprint; also the slowest walk.
+    Sq16,
+    /// DEFAULT. Int8 plane derived from the Sq16 high byte (+1 byte/dim),
+    /// scored with an int8-VNNI kernel. Roughly halves warm walk latency at
+    /// unchanged recall. Derivable from Sq16 on read, so selecting it never
+    /// requires a rebuild.
+    #[default]
+    Sq8,
+    /// Fitted 4-bit plane in rotated space (+0.5 bytes/dim), scored with the
+    /// AVX-512 / VNNI nibble kernel: half SQ8's plane bytes and fewer bytes
+    /// touched per candidate. NOT derivable on read — the fit needs a rotation
+    /// and a moment pass over the corpus — so it is written at drain and takes
+    /// effect at the next full rebuild. Incremental drains inherit the prior
+    /// bundle's plane and ruler, as they inherit `(m0, ef)`.
+    Sq4,
+    /// [`Self::Sq4`] plus sub-step residual nibbles (+1 byte/dim total), which
+    /// recover most of the 4-bit reconstruction error. Same rebuild caveat.
+    Sq4Residual,
+}
+
 /// Query search mode for the hidden vector index on the UNFILTERED path.
 /// Selected by `vector.search_mode`. Filtered queries and pre-drain user
 /// tables always take the stamped grid path regardless of this setting.
@@ -528,6 +567,13 @@ pub struct VectorSettings {
     /// Default `ivf`; `global_fine_centroid` is experimental (see
     /// [`VectorSearchMode`]).
     pub search_mode: VectorSearchMode,
+    /// For `search_mode = hnsw_ivf`: which resident plane the graph walk
+    /// scores candidates on. Every variant re-ranks its final beam on the
+    /// full Sq16 plane, so this decides which candidates reach the beam and
+    /// what each costs — never the returned order. See
+    /// [`VectorHnswPlane`] for each variant's bytes and rebuild semantics.
+    /// Ignored under any other search mode.
+    pub hnsw_plane: VectorHnswPlane,
     /// For `search_mode = ivf`: the cluster router — the established stamped
     /// grid, or the centroid-HNSW over the resident fp32 fine centroids.
     /// Ignored under `search_mode = hnsw_ivf`.
@@ -577,22 +623,14 @@ pub struct VectorSettings {
     /// Recall shortfall below `target_recall` the hnsw graph is still accepted
     /// at before the drain gives up and serves ivf (`floor = target - this`).
     pub hnsw_recall_slack: f64,
-    /// For `search_mode = hnsw_ivf`: navigate the resident graph on an int8
-    /// (SQ8) plane derived at load from the Sq16 codes' high byte — scored with
-    /// an int8 dot kernel (AVX-512 VNNI where present) — then re-rank the final
-    /// beam on full Sq16. The walk dominates query cost (tens of thousands of
-    /// distance evals, far more than `ef`), so the cheaper int8 kernel roughly
-    /// halves warm latency at unchanged recall. Cost: an extra resident plane
-    /// (`+1 byte/dim/row`, ~50% on top of the Sq16 plane) — built only when
-    /// this is set. `false` walks entirely on Sq16 (no extra plane). Ignored
-    /// under any other search mode.
-    pub hnsw_sq8_walk: bool,
-    /// For `search_mode = hnsw_ivf` with `hnsw_sq8_walk`: how many of the SQ8
-    /// walk's nearest candidates to re-rank on full Sq16 before returning the
-    /// top `k`. Clamped to `[k, ef]`. Wider recovers more of the int8 walk's
-    /// ranking loss but adds Sq16 scores to the tail; recall saturates well
-    /// below `ef` (256 is the knee for k ≤ 100). Ignored when `hnsw_sq8_walk`
-    /// is off or under any other search mode.
+
+    /// For `search_mode = hnsw_ivf` with a lossy [`Self::hnsw_plane`]: how many
+    /// of the walk's nearest candidates to re-rank on full Sq16 before
+    /// returning the top `k`. Clamped to `[k, ef]`. Wider recovers more of the
+    /// coarse walk's ranking loss but adds Sq16 scores to the tail; recall
+    /// saturates well below `ef` (256 is the knee for k ≤ 100). Ignored when
+    /// `hnsw_plane = sq16` (the walk already scores Sq16) or under any other
+    /// search mode.
     pub hnsw_refine_k: usize,
     /// For `search_mode = hnsw_ivf`: scale ceiling for the per-row **data**
     /// graph. The resident data HNSW is built at drain and persisted only
@@ -675,6 +713,7 @@ impl Default for VectorSettings {
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             search_mode: VectorSearchMode::Ivf,
+            hnsw_plane: VectorHnswPlane::default(),
             ivf_router: IvfRouter::Stamped,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
@@ -685,7 +724,6 @@ impl Default for VectorSettings {
             hnsw_ef_search: DEFAULT_VECTOR_HNSW_EF_SEARCH,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
             hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
-            hnsw_sq8_walk: DEFAULT_VECTOR_HNSW_SQ8_WALK,
             hnsw_refine_k: DEFAULT_VECTOR_HNSW_REFINE_K,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
@@ -1014,9 +1052,27 @@ impl Config {
     /// CLI that adds a `--config-file` source) without duplicating
     /// the embedded-default + extraction machinery.
     pub fn from_figment(fig: Figment) -> Result<Self, ConfigError> {
+        // Before extraction, because extraction is exactly where a retired key
+        // would vanish without trace.
+        Self::reject_retired_keys(&fig)?;
         let cfg: Config = fig.extract()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Fail the load if any [`RETIRED_CONFIG_KEYS`] entry is present, naming
+    /// its replacement.
+    fn reject_retired_keys(fig: &Figment) -> Result<(), ConfigError> {
+        for (retired, replacement) in RETIRED_CONFIG_KEYS {
+            if fig.find_value(retired).is_ok() {
+                return Err(ConfigError::Invalid(format!(
+                    "`{retired}` was removed — use `{replacement}`. It is rejected \
+                     rather than ignored so an upgrade cannot silently revert the \
+                     behaviour this setting was pinning."
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Semantic checks that deserialization alone cannot express, run at
@@ -1149,6 +1205,39 @@ mod tests {
     fn embedded_default_loads_with_expected_value() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    /// A retired key must FAIL the load, not be quietly dropped.
+    ///
+    /// Nothing in the deserializer objects to an unknown key — no
+    /// `deny_unknown_fields`, and figment discards what no field claims — so
+    /// without this check a config that set `hnsw_sq8_walk: false` to walk Sq16
+    /// would come back as the `sq8` default on upgrade: a different resident
+    /// plane, a different per-open cost, and no diagnostic anywhere. The error
+    /// has to name the replacement, because a bare "unknown key" would leave
+    /// the reader to guess which knob took over.
+    #[test]
+    fn a_retired_config_key_is_rejected_and_names_its_replacement() {
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let fig =
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Serialized::defaults(serde_json::json!({
+                        "vector": { "hnsw_sq8_walk": value }
+                    })));
+            let err = Config::from_figment(fig).expect_err("a retired key must fail the load");
+            let ConfigError::Invalid(message) = &err else {
+                panic!("expected a validation error, got {err:?}");
+            };
+            assert!(
+                message.contains("hnsw_sq8_walk") && message.contains("hnsw_plane"),
+                "the error must name both the retired key and its replacement: {message}"
+            );
+        }
+        // The shipped default must not itself trip the check.
+        Config::defaults().expect("embedded default carries no retired key");
+        Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)))
+            .expect("a clean config still loads");
     }
 
     /// The `hnsw` calibration knobs default to the shipped values, and

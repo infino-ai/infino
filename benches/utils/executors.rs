@@ -1439,11 +1439,41 @@ pub mod vector {
             default_config: DEFAULT_CONFIG_RECALL_FLOOR,
         };
 
+        /// Pre-drain supertable tripwires on a REAL corpus: the incoming
+        /// staging table serves the UNSTAMPED default width (the drain
+        /// hasn't stamped the laws yet), which under-serves real corpora
+        /// by construction exactly like the superfile tier does (measured:
+        /// dbpedia-1536 pre-drain 0.497 at 100K, 0.555 at 1M, against
+        /// ~0.99 on synthetic). Loose enough to report rather than abort,
+        /// still far above chance (~1e-4 at 100K) so a broken index trips.
+        ///
+        /// How low the legitimate value goes is corpus geometry, not
+        /// quality: dbpedia-1536 reads 0.497 at 100K, while the far more
+        /// diffuse glove-200 reads 0.207 on the same code — one cell is
+        /// simply a smaller share of a low-dimensional neighbourhood.
+        /// The floor sits below the worst measured value with room to
+        /// spare and still three orders of magnitude above chance.
+        const SUPERTABLE_PRE_DRAIN_REAL: Self = Self {
+            correctness: 0.05,
+            default_config: 0.05,
+        };
+
         /// The superfile tier's floors for the active corpus source.
         pub fn superfile() -> Self {
             match corpus::corpus_source() {
                 corpus::CorpusSource::Synthetic => Self::SUPERFILE_SYNTHETIC,
                 _ => Self::SUPERFILE_REAL,
+            }
+        }
+
+        /// The supertable tier's PRE-DRAIN floors for the active corpus
+        /// source. Every post-drain phase keeps [`Self::SUPERTABLE`] — the
+        /// stamped laws hold ≥ 0.99 on real corpora too, so only this
+        /// phase loosens, and only off-synthetic.
+        pub fn supertable_pre_drain() -> Self {
+            match corpus::corpus_source() {
+                corpus::CorpusSource::Synthetic => Self::SUPERTABLE,
+                _ => Self::SUPERTABLE_PRE_DRAIN_REAL,
             }
         }
     }

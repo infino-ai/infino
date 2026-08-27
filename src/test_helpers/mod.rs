@@ -27,6 +27,7 @@
 pub mod brute_force_bm25;
 pub mod cas_conformance;
 pub mod fault_storage;
+pub mod sq4_flat;
 
 /// Observability probe for the vector query path's EFFECTIVE served
 /// shortlist budget — the regression guard for the serve-the-law scope

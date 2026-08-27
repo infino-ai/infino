@@ -663,6 +663,25 @@ pub(crate) struct ResidentGraphSections {
     pub data: Option<hnsw::HnswIndex>,
 }
 
+/// Why a caller is hydrating the graph — which decides what the walk section
+/// decodes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphWalkRequest {
+    /// A SERVING hydration: make resident the plane `vector.hnsw_plane` names.
+    /// Free to ask for a narrower view than the bundle stores, because it only
+    /// reads.
+    Configured,
+    /// A MAINTENANCE hydration: make resident the plane the bundle actually
+    /// stored, whatever the running config says.
+    ///
+    /// An incremental drain re-encodes the bundle, so it must see the plane on
+    /// disk in order to extend it. Asking for a narrower view here would hand
+    /// the drain an index whose walk plane looks absent and make it rewrite the
+    /// bundle without one — dropping a persisted section that, for the fitted
+    /// 4-bit codecs, nothing can reconstruct afterwards.
+    AsStored,
+}
+
 /// Fetch + decode the combined graph bundle for one generation. A decode
 /// failure on a sub-section leaves that section `None` (the caller falls
 /// back) rather than failing the whole fetch — only a bad bundle frame or a
@@ -670,14 +689,19 @@ pub(crate) struct ResidentGraphSections {
 pub(crate) async fn fetch_graph_sections(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
-    need_sq8: bool,
+    request: GraphWalkRequest,
 ) -> Result<ResidentGraphSections, SlowVectorStateError> {
     let (raw, mmap_backed) = fetch_graph_section(storage, reference).await?;
-    // Serve the resident SQ8 walk plane only when SQ8-walk serving is enabled
-    // AND the caller needs it. The drain/incremental-append maintenance path
-    // hydrates the graph but never walks the SQ8 plane, so it passes
-    // `need_sq8 = false` and skips the plane build entirely.
-    let sq8_walk = need_sq8 && config::global().vector.hnsw_sq8_walk;
+    // A serving caller gets the configured walk plane and nothing else, so a
+    // table configured for the Sq16 walk pays no plane residency at all. A
+    // maintenance caller gets the stored plane (`None` = "as stored"); see
+    // `GraphWalkRequest`.
+    let want = match request {
+        GraphWalkRequest::Configured => Some(hnsw::WalkCodec::from_config(
+            config::global().vector.hnsw_plane,
+        )),
+        GraphWalkRequest::AsStored => None,
+    };
     // Decoding faults the (mmap-backed) plane pages in and parses the graph — a
     // CPU/IO wave that must stay off the tokio workers (the runtime
     // anti-pattern), so it runs on the blocking pool. On a mapped bundle the
@@ -690,7 +714,7 @@ pub(crate) async fn fetch_graph_sections(
         let data = bundle
             .data_bundle
             .as_ref()
-            .and_then(|b| hnsw::decode_hnsw(b, sq8_walk));
+            .and_then(|b| hnsw::decode_hnsw(b, want));
         Ok::<_, SlowVectorStateError>((bundle.high_water_id, data))
     })
     .await

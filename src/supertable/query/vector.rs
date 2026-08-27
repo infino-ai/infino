@@ -108,7 +108,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
-            hnsw::{self, HnswParams, Sq16Scorer, encode_hnsw},
+            hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{ProbeTally, ScanCandidate, ScanOutcome},
         },
@@ -125,7 +125,8 @@ use crate::{
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
         slow_vector_state::{
-            CentroidSection, ResidentGraphSections, fetch_centroid_section, fetch_graph_sections,
+            CentroidSection, GraphWalkRequest, ResidentGraphSections, fetch_centroid_section,
+            fetch_graph_sections,
         },
         tombstones::SidecarCache,
     },
@@ -1684,6 +1685,13 @@ fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
 /// the codes, and return the encoded bundle bytes. `Ok(None)` when the
 /// column is absent, not Sq16, or empty; `Err` only on a genuine read
 /// fault (the drain treats that as "skip the graph", never fatal).
+/// Rotation seed for a freshly built Sq4 resident plane. Private to the
+/// plane (it need not match the column's RaBitQ rotation — any seeded
+/// orthogonal rotation isotropizes the coordinates); persisted in the
+/// bundle so decode reconstructs the identical rotation, and inherited by
+/// incremental drains like the ruler and `(m0, ef)`.
+const HNSW_PLANE_ROT_SEED: u64 = 0x5147_5240_7031_A11E;
+
 /// Held-out query count for calibration recall measurement.
 const HNSW_CALIB_QUERIES: usize = 200;
 /// The `k` calibration and the incremental recall re-check measure at (the
@@ -1934,7 +1942,10 @@ pub(crate) async fn assemble_hnsw_sections(
             Some(&manifest.options.reader_pool),
             "hnsw probe calibrate: reader pool dropped result",
             move || {
+                // A Sq16 subsample: walk and reference are the same plane
+                // here, since this probe only sizes `m0` against scale.
                 hnsw::calibrate_graph(
+                    &pscorer,
                     &pscorer,
                     &pm0,
                     &pef,
@@ -2019,28 +2030,75 @@ pub(crate) async fn assemble_hnsw_sections(
     // Calibrate on the reader pool, not inline on the tokio worker or the
     // global rayon pool. The scorer owns the (multi-GB) plane, so move it into
     // the closure and hand it back for the encode below rather than cloning.
+    //
+    // The walk codec is gated here and NOWHERE else. Calibration WALKS the
+    // configured plane and GRADES against Sq16, so the recall it reports is
+    // the recall that will be served — codec error included. A plane too
+    // coarse for the table's target therefore declines itself to ivf through
+    // the existing None→fallback, with no separate safety mechanism. Grading
+    // against the walk plane itself could not do that: the ground truth would
+    // carry the same error it is meant to detect.
     let (target_recall, recall_slack, ef_construction) = (
         vcfg.target_recall,
         vcfg.hnsw_recall_slack,
         vcfg.hnsw_ef_construction,
     );
-    let (scorer, choice, ef_curve, graph) = run_on_pool(
+    let walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
+    let n_rows = doc_ids.len();
+    let (scorer, sq4, choice, ef_curve, graph) = run_on_pool(
         Some(&manifest.options.reader_pool),
         "hnsw calibrate: reader pool dropped result",
         move || {
-            let (choice, ef_curve, graph) = hnsw::calibrate_graph(
-                &scorer,
-                &m0_cands,
-                &ef_cands,
-                target_recall,
-                recall_slack,
-                ef_construction,
-                HNSW_CALIB_QUERIES,
-                HNSW_CALIB_RECALL_K,
-                HNSW_CALIB_SEED,
-                /* want_curve */ true,
-            );
-            (scorer, choice, ef_curve, graph)
+            // The 4-bit plane is a re-quantization of the very rows being
+            // calibrated: a rotation and a moment pass per row, so it belongs
+            // on this pool beside the calibration it feeds, never inline on a
+            // tokio worker. Built only when the codec names it.
+            let sq4 = walk.is_sq4().then(|| {
+                hnsw::Sq4Scorer::from_sq16_plane(
+                    scorer.codes(),
+                    dim,
+                    n_rows,
+                    walk.with_residual(),
+                    HNSW_PLANE_ROT_SEED,
+                    None,
+                )
+            });
+            // The k→ef curve is swept on the SERVING plane, so it is calibrated
+            // against the walk that will actually run — a coarser plane needs a
+            // wider beam at the same `k`, which is exactly what the curve is
+            // there to record.
+            let (choice, ef_curve, graph) = match &sq4 {
+                Some(s) => hnsw::calibrate_graph(
+                    s,
+                    &scorer,
+                    &m0_cands,
+                    &ef_cands,
+                    target_recall,
+                    recall_slack,
+                    ef_construction,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_SEED,
+                    /* want_curve */ true,
+                ),
+                // Sq16 and SQ8 both walk representations derived from these
+                // codes, so Sq16 is both the walk and the reference here; the
+                // SQ8 walk's own loss is recovered by the refine.
+                None => hnsw::calibrate_graph(
+                    &scorer,
+                    &scorer,
+                    &m0_cands,
+                    &ef_cands,
+                    target_recall,
+                    recall_slack,
+                    ef_construction,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_SEED,
+                    /* want_curve */ true,
+                ),
+            };
+            (scorer, sq4, choice, ef_curve, graph)
         },
     )
     .await
@@ -2077,6 +2135,8 @@ pub(crate) async fn assemble_hnsw_sections(
         choice.ef,
         &ef_curve,
         column,
+        walk,
+        sq4.as_ref(),
     )))
 }
 
@@ -2176,18 +2236,92 @@ pub(crate) async fn assemble_hnsw_incremental(
     // graph would be inconsistent), and the stamped query beam carries forward.
     let inherited_m0 = prior.graph.base_degree();
     let inherited_ef = prior.ef_search;
-    // An incremental extend inherits the prior graph's whole calibration —
-    // including its k→ef curve (a pure append does not recalibrate; a full
-    // rebuild does). Captured before `prior` is consumed by the moves below.
+    // The walk codec is inherited exactly like `(m0, ef)`: the resident nodes
+    // were built, calibrated and registered on that plane's geometry, so the
+    // delta must land on the same one. A change to `vector.hnsw_plane` takes
+    // effect at the next FULL rebuild, not mid-extend.
+    //
+    // It comes from the bundle HEADER, never from which planes this particular
+    // decode happens to hold. Those are two different questions: a decode is
+    // free to filter a plane out, and an absent plane would then be
+    // indistinguishable from a bundle that never stored one. Guessing from the
+    // decoded state re-encodes the bundle without a section it did store, which
+    // for the fitted 4-bit codecs is unrecoverable — the fit needs a moment
+    // pass over the whole corpus that this path does not have.
+    let inherited_walk = prior.stored_walk;
+    // The plane the codec names must actually be resident, or this path cannot
+    // extend it. Full rebuild instead of writing a bundle that silently drops
+    // it: a rebuild is expensive but correct, and it re-fits the ruler.
+    if inherited_walk.is_sq4() && prior.sq4.is_none() {
+        return Ok(None);
+    }
+    // The k→ef curve is inherited for the same reason and on the same terms: a
+    // pure append does not recalibrate, so it carries forward the beam widths
+    // the prior graph measured. Captured before `prior` is consumed below.
     let inherited_curve = prior.ef_curve;
-    let mut codes = prior.scorer.codes().to_vec();
-    codes.extend_from_slice(&new_codes);
     let mut doc_ids = prior.doc_ids;
     doc_ids.extend_from_slice(&new_doc_ids);
     let total = doc_ids.len();
-    // The scorer owns the extended plane; the encoder borrows it back via
-    // `scorer.codes()` rather than holding a second owned copy.
-    let scorer = Sq16Scorer::from_codes(codes, dim, total);
+    // The plane CODEC is inherited from the prior bundle exactly like
+    // (m0, ef): the resident nodes were built, calibrated and registered on
+    // that codec's geometry, so the delta must land on the same plane — and
+    // for the fitted Sq4 codecs, on the same RULER (the first-input-ruler
+    // rule the adaptive rerank codecs follow on merge; a refit would move
+    // every existing node's reconstruction). A config change to
+    // `vector.hnsw_plane` therefore takes effect on the next FULL rebuild,
+    // not mid-extend.
+    // The Sq16 plane always extends by concatenation — it is the refine and
+    // calibration reference, and its grid is fixed, so there is nothing to
+    // inherit beyond the codes themselves.
+    let mut sq16_codes = prior.scorer.codes().to_vec();
+    sq16_codes.extend_from_slice(&new_codes);
+    let scorer = Sq16Scorer::from_codes(sq16_codes.clone(), dim, total);
+    // The 4-bit walk plane, when the prior bundle carried one, extends onto
+    // the PRIOR ruler and rotation seed — never a refit. `from_sq16_plane`
+    // with `Some((offset, step))` is what pins that.
+    let sq4 = match &prior.sq4 {
+        None => None,
+        Some(prior_sq4) => {
+            let (pcodes, pres, offset, step) = prior_sq4.parts();
+            let delta = Sq4Scorer::from_sq16_plane(
+                &new_codes,
+                dim,
+                new_doc_ids.len(),
+                prior_sq4.has_residual(),
+                prior_sq4.rot_seed(),
+                Some((offset, step)),
+            );
+            let (dcodes, dres, _, _) = delta.parts();
+            let mut codes = pcodes.to_vec();
+            codes.extend_from_slice(dcodes);
+            let residual = match (pres, dres) {
+                (Some(a), Some(b)) => {
+                    let mut r = a.to_vec();
+                    r.extend_from_slice(b);
+                    Some(Plane::Owned(r))
+                }
+                (None, None) => None,
+                // A prior bundle cannot disagree with a delta it derived:
+                // `from_sq16_plane` was told the prior's residual-ness.
+                _ => return Ok(None),
+            };
+            let offset = offset.to_vec();
+            let step = step.to_vec();
+            match Sq4Scorer::from_parts(
+                Plane::Owned(codes),
+                residual,
+                offset,
+                step,
+                prior_sq4.rot_seed(),
+                dim,
+                total,
+            ) {
+                Some(sc) => Some(sc),
+                // Shape mismatch means a corrupt prior plane: full rebuild.
+                None => return Ok(None),
+            }
+        }
+    };
     let vcfg = &config::global().vector;
     let (target_recall, recall_slack, ef_construction, probe_cap) = (
         vcfg.target_recall,
@@ -2200,7 +2334,7 @@ pub(crate) async fn assemble_hnsw_incremental(
     // The extend fans the new-node inserts across rayon, and the recall
     // recheck is pure CPU; both belong on the reader pool, not inline on the
     // tokio worker or the global rayon pool — matching the full-build path.
-    let (scorer, graph, recall) = run_on_pool(
+    let (scorer, sq4, graph, recall) = run_on_pool(
         Some(&manifest.options.reader_pool),
         "hnsw incremental extend + recheck: reader pool dropped result",
         move || {
@@ -2209,8 +2343,13 @@ pub(crate) async fn assemble_hnsw_incremental(
                 m0: inherited_m0,
                 ..HnswParams::default()
             };
-            // Insert ONLY the new node range into a copy of the prior graph.
-            let graph = prior_graph.extend(&scorer, params);
+            // Insert ONLY the new node range into a copy of the prior graph,
+            // on whichever plane the walk uses — the graph's neighbour lists
+            // must describe the distances the walk will see.
+            let graph = match &sq4 {
+                Some(s) => prior_graph.extend(s, params),
+                None => prior_graph.extend(&scorer, params),
+            };
             // Re-check recall on the grown graph. The base-layer degree
             // requirement rises with N, so inherited `(m0, ef)` calibrated at a
             // smaller population can drift below the bar as an append-only table
@@ -2222,6 +2361,10 @@ pub(crate) async fn assemble_hnsw_incremental(
             // O(corpus) per query, so measure a bounded strided subsample
             // instead — the same probe the full build gates on — keeping the
             // recheck ~O(probe_cap) regardless of how large the table has grown.
+            //
+            // The subsample is always taken from the Sq16 plane: it is the
+            // reference the recall is graded against, and sampling the walk
+            // plane instead would reintroduce grading a codec against itself.
             let recall = if total > probe_cap {
                 let step = total / probe_cap;
                 let stride_bytes = dim * 2;
@@ -2234,6 +2377,7 @@ pub(crate) async fn assemble_hnsw_incremental(
                 let pn = sample.len() / stride_bytes;
                 let psc = Sq16Scorer::from_codes(sample, dim, pn);
                 hnsw::calibrate_graph(
+                    &psc,
                     &psc,
                     &[inherited_m0],
                     &[inherited_ef],
@@ -2248,16 +2392,28 @@ pub(crate) async fn assemble_hnsw_incremental(
                 .0
                 .recall
             } else {
-                hnsw::measure_recall(
-                    &graph,
-                    &scorer,
-                    inherited_ef,
-                    HNSW_CALIB_RECALL_K,
-                    HNSW_CALIB_QUERIES,
-                    HNSW_CALIB_SEED,
-                )
+                match &sq4 {
+                    Some(s) => hnsw::measure_recall(
+                        &graph,
+                        s,
+                        &scorer,
+                        inherited_ef,
+                        HNSW_CALIB_RECALL_K,
+                        HNSW_CALIB_QUERIES,
+                        HNSW_CALIB_SEED,
+                    ),
+                    None => hnsw::measure_recall(
+                        &graph,
+                        &scorer,
+                        &scorer,
+                        inherited_ef,
+                        HNSW_CALIB_RECALL_K,
+                        HNSW_CALIB_QUERIES,
+                        HNSW_CALIB_SEED,
+                    ),
+                }
             };
-            (scorer, graph, recall)
+            (scorer, sq4, graph, recall)
         },
     )
     .await
@@ -2275,6 +2431,8 @@ pub(crate) async fn assemble_hnsw_incremental(
             inherited_ef,
             &inherited_curve,
             column,
+            inherited_walk,
+            sq4.as_ref(),
         ),
         new_high_water,
         inserted,
@@ -2359,9 +2517,10 @@ impl SupertableReader {
         let manifest = self.manifest();
         let sections_for_walk = Arc::clone(&sections);
         let query_owned = query.to_vec();
-        // SQ8 int8-VNNI walk + Sq16 refine when the SQ8 plane is resident
-        // (built at decode under `vector.hnsw_sq8_walk`); otherwise walk on
-        // Sq16 directly. `hnsw_refine_k` is the re-rank width.
+        // Walk on whichever plane decode made resident for `vector.hnsw_plane`
+        // — the 4-bit plane, the SQ8 int8-VNNI plane, or Sq16 directly when the
+        // config asks for no extra plane — then refine the beam on Sq16.
+        // `hnsw_refine_k` is the re-rank width.
         let refine_k = config::global().vector.hnsw_refine_k;
         let hits: Vec<SuperfileHit> = run_on_pool(
             Some(&manifest.options.reader_pool),
@@ -2371,10 +2530,17 @@ impl SupertableReader {
                     .data
                     .as_ref()
                     .expect("data present: checked before dispatch");
-                let walked = if data.sq8_plane.is_empty() {
-                    data.graph.search(&data.scorer, &query_owned, k_fetch, ef)
-                } else {
+                // One dispatch per query, not per candidate: pick the walk
+                // plane the bundle carries and hand the concrete scorer to the
+                // monomorphized walk. A coarse plane re-ranks its beam on Sq16
+                // (`refine_k`), so the plane changes which candidates are
+                // considered, never the order returned.
+                let walked = if let Some(sq4) = &data.sq4 {
+                    data.search_walk_refine(sq4, &query_owned, k_fetch, ef, refine_k)
+                } else if !data.sq8_plane.is_empty() {
                     data.search_sq8_refine(&query_owned, k_fetch, ef, refine_k)
+                } else {
+                    data.graph.search(&data.scorer, &query_owned, k_fetch, ef)
                 };
                 walked
                     .into_iter()
@@ -2448,7 +2614,9 @@ impl SupertableReader {
             }
         }
         let sections =
-            match fetch_graph_sections(storage.as_ref(), &reference, /* need_sq8 */ true).await {
+            match fetch_graph_sections(storage.as_ref(), &reference, GraphWalkRequest::Configured)
+                .await
+            {
                 Ok(sections) => Arc::new(sections),
                 Err(error) => {
                     tracing::warn!(
@@ -8188,9 +8356,11 @@ mod tests {
             let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
                 .expect("assemble ok")
                 .expect("sq16 rows must assemble into a graph");
-            let decoded =
-                crate::superfile::vector::hnsw::decode_hnsw(&bytes::Bytes::from(bundle), true)
-                    .expect("decode data bundle");
+            let decoded = crate::superfile::vector::hnsw::decode_hnsw(
+                &bytes::Bytes::from(bundle),
+                Some(crate::superfile::vector::hnsw::WalkCodec::Sq8),
+            )
+            .expect("decode data bundle");
             assert_eq!(
                 decoded.graph.len(),
                 decoded.doc_ids.len(),

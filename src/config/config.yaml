@@ -248,18 +248,32 @@ vector:
   # demand near-target recall from the graph or step aside to ivf.
   hnsw_recall_slack: 0.01
 
-  # For search_mode = hnsw_ivf: navigate the resident graph on an int8 (SQ8)
-  # plane derived at load from the Sq16 codes' high byte (scored with an
-  # int8-VNNI kernel where present), then re-rank the final beam on full Sq16.
-  # Roughly halves warm hnsw latency at unchanged recall; costs an extra
-  # resident plane (~1 byte/dim/row, ~50% over the Sq16 plane), built only when
-  # enabled. false walks entirely on Sq16 (no extra plane).
-  hnsw_sq8_walk: true
+  # For search_mode = hnsw_ivf: which resident plane the graph walk scores
+  # candidates on. Every option re-ranks its final beam on the full Sq16 plane
+  # (always resident), so this decides which candidates reach the beam and what
+  # each candidate costs — never the returned order.
+  #
+  #   sq16         walk the Sq16 codes directly. Adds no plane (smallest
+  #                resident footprint), slowest walk.
+  #   sq8          DEFAULT. Int8 plane from the Sq16 high byte (+1 byte/dim),
+  #                scored with an int8-VNNI kernel. Roughly halves warm walk
+  #                latency at unchanged recall. Derived from Sq16 on read when
+  #                absent, so selecting it never needs a rebuild.
+  #   sq4          Fitted 4-bit nibbles in rotated space (+0.5 bytes/dim),
+  #                scored with the AVX-512 / VNNI nibble kernel: half sq8's
+  #                plane bytes and fewer bytes touched per candidate. Cannot be
+  #                derived on read (the fit needs a rotation and a moment pass),
+  #                so it is written at drain and applies at the next full
+  #                rebuild. Incremental drains inherit the prior plane + ruler.
+  #   sq4_residual sq4 plus a residual nibble plane (+1 byte/dim total), which
+  #                recovers most of the 4-bit reconstruction error. Same
+  #                rebuild caveat.
+  hnsw_plane: sq8
 
-  # For search_mode = hnsw_ivf with hnsw_sq8_walk: how many of the SQ8 walk's
+  # For search_mode = hnsw_ivf on a coarse walk plane: how many of the walk's
   # nearest candidates to re-rank on full Sq16 before returning the top k.
   # Clamped to [k, ef]. Recall saturates well below ef (256 is the knee for
-  # k <= 100); wider only adds tail cost.
+  # k <= 100); wider only adds tail cost. Ignored when hnsw_plane is sq16.
   hnsw_refine_k: 256
 
   # For search_mode = hnsw_ivf: scale ceiling for the per-row DATA graph. The
