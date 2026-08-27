@@ -1922,82 +1922,110 @@ impl SupertableWriter {
             // the durability boundary is unmoved. The in-memory path
             // keeps the collected build: there is no upload to overlap.
             let piped_storage = self.inner.options.storage.as_ref().cloned();
-            let (user_batch, build_elapsed, prepare_elapsed, output_bytes, data_put_bytes) =
-                if let Some(storage) = piped_storage {
-                    let (tx, rx) =
-                        channel::<(u32, PreparedSuperfile)>(commit_write_concurrency().get());
-                    let runtime = self.inner.query_runtime();
-                    let uploader = runtime.spawn(upload_prepared_shards(
-                        storage,
-                        self.inner.options.put_multipart_threshold_bytes,
-                        rx,
+            let (
+                user_batch,
+                build_elapsed,
+                upload_drain_elapsed,
+                prepare_elapsed,
+                output_bytes,
+                data_put_bytes,
+            ) = if let Some(storage) = piped_storage {
+                let (tx, rx) =
+                    channel::<(u32, PreparedSuperfile)>(commit_write_concurrency().get());
+                let runtime = self.inner.query_runtime();
+                let uploader = runtime.spawn(upload_prepared_shards(
+                    storage,
+                    self.inner.options.put_multipart_threshold_bytes,
+                    rx,
+                ));
+                let built = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    Some(&tx),
+                );
+                // Stamped where the pack ends, not after the join below:
+                // every shard has been handed off by now, so this is the
+                // pack's own cost. Charging the join to it would bury the
+                // upload time that did NOT fit under the pack inside the
+                // build number — which is the one number that would show
+                // this change failing to overlap anything.
+                let build_elapsed = commit_t0.elapsed();
+                // Close the channel even on a build error so the
+                // uploader terminates; join it BEFORE surfacing the
+                // build result so no upload outlives this commit.
+                drop(tx);
+                let uploaded = bridge_on_runtime(
+                    async move {
+                        uploader.await.map_err(|join| {
+                            BuildError::Store(format!("pipelined uploader: {join}"))
+                        })?
+                    },
+                    &runtime,
+                );
+                // The upload tail: PUTs still in flight when the last
+                // shard finished packing. Zero here means the network kept
+                // up with the pack entirely.
+                let upload_drain_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let (outputs, _hints) = built?;
+                // A real error, not a `debug_assert`: on the piped path
+                // every shard leaves through the channel, so a collected
+                // shard here is one the uploader never saw. Releasing it
+                // would publish a manifest entry whose bytes were never
+                // PUT, so the commit must fail instead.
+                if !outputs.is_empty() {
+                    return Err(BuildError::Store(
+                        "pipelined drain-commit returned collected shards".into(),
                     ));
-                    let built = commit_shards_via_drain(
-                        buffer,
-                        &self.inner,
-                        &pack_grid,
-                        metric,
-                        packed_cell_shard_count(&self.inner.options),
-                        &self.op_stats,
-                        Some(&tx),
-                    );
-                    // Close the channel even on a build error so the
-                    // uploader terminates; join it BEFORE surfacing the
-                    // build result so no upload outlives this commit.
-                    drop(tx);
-                    let uploaded = bridge_on_runtime(
-                        async move {
-                            uploader.await.map_err(|join| {
-                                BuildError::Store(format!("pipelined uploader: {join}"))
-                            })?
-                        },
-                        &runtime,
-                    );
-                    let (outputs, _hints) = built?;
-                    // A real error, not a `debug_assert`: on the piped path
-                    // every shard leaves through the channel, so a collected
-                    // shard here is one the uploader never saw. Releasing it
-                    // would publish a manifest entry whose bytes were never
-                    // PUT, so the commit must fail instead.
-                    if !outputs.is_empty() {
-                        return Err(BuildError::Store(
-                            "pipelined drain-commit returned collected shards".into(),
-                        ));
-                    }
-                    let build_elapsed = commit_t0.elapsed();
-                    let (prepared, uploaded_bytes) = uploaded?;
-                    let user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
-                    let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
-                    let bytes = uploaded_bytes as usize;
-                    (user_batch, build_elapsed, prepare_elapsed, bytes, bytes)
-                } else {
-                    let (outputs, cell_hints) = commit_shards_via_drain(
-                        buffer,
-                        &self.inner,
-                        &pack_grid,
-                        metric,
-                        packed_cell_shard_count(&self.inner.options),
-                        &self.op_stats,
-                        None,
-                    )?;
-                    let build_elapsed = commit_t0.elapsed();
-                    let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
-                    let user_batch =
-                        prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-                    let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
-                    let data_put_bytes: usize = user_batch
-                        .pending_storage_writes
-                        .iter()
-                        .map(|(_, bytes)| bytes.len())
-                        .sum();
-                    (
-                        user_batch,
-                        build_elapsed,
-                        prepare_elapsed,
-                        output_bytes,
-                        data_put_bytes,
-                    )
-                };
+                }
+                let (prepared, uploaded_bytes) = uploaded?;
+                let user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
+                let prepare_elapsed = commit_t0
+                    .elapsed()
+                    .saturating_sub(build_elapsed)
+                    .saturating_sub(upload_drain_elapsed);
+                let bytes = uploaded_bytes as usize;
+                (
+                    user_batch,
+                    build_elapsed,
+                    upload_drain_elapsed,
+                    prepare_elapsed,
+                    bytes,
+                    bytes,
+                )
+            } else {
+                let (outputs, cell_hints) = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    None,
+                )?;
+                let build_elapsed = commit_t0.elapsed();
+                let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
+                let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+                let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let data_put_bytes: usize = user_batch
+                    .pending_storage_writes
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .sum();
+                (
+                    user_batch,
+                    build_elapsed,
+                    // The unpiped path uploads in the publish wave, so it
+                    // has no tail to drain here.
+                    time::Duration::ZERO,
+                    prepare_elapsed,
+                    output_bytes,
+                    data_put_bytes,
+                )
+            };
             // Computed before the batch moves into the publish future;
             // flushed only after Ok below, so a failed or retried commit
             // never counts.
@@ -2018,10 +2046,11 @@ impl SupertableWriter {
             }
             if crate::storage::io_counters::timeline_enabled() {
                 eprintln!(
-                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
-                     publish {:.1}ms ({:.1} MiB data PUT)",
+                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + upload drain \
+                     {:.1}ms + prepare {:.1}ms + publish {:.1}ms ({:.1} MiB data PUT)",
                     build_elapsed.as_secs_f64() * 1e3,
                     output_bytes as f64 / (1u64 << 20) as f64,
+                    upload_drain_elapsed.as_secs_f64() * 1e3,
                     prepare_elapsed.as_secs_f64() * 1e3,
                     publish_t0.elapsed().as_secs_f64() * 1e3,
                     data_put_bytes as f64 / (1u64 << 20) as f64,
