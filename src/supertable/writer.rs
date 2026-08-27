@@ -1924,7 +1924,8 @@ impl SupertableWriter {
             let piped_storage = self.inner.options.storage.as_ref().cloned();
             let (user_batch, build_elapsed, prepare_elapsed, output_bytes, data_put_bytes) =
                 if let Some(storage) = piped_storage {
-                    let (tx, rx) = channel::<(u32, PreparedSuperfile)>(commit_write_concurrency());
+                    let (tx, rx) =
+                        channel::<(u32, PreparedSuperfile)>(commit_write_concurrency().get());
                     let runtime = self.inner.query_runtime();
                     let uploader = runtime.spawn(upload_prepared_shards(
                         storage,
@@ -4202,7 +4203,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             }
                         },
                     ))
-                    .buffered(commit_write_concurrency())
+                    .buffered(commit_write_concurrency().get())
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
@@ -4574,7 +4575,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
-        let mut uploads = stream::iter(put_futures).buffer_unordered(commit_write_concurrency());
+        let mut uploads =
+            stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
         while let Some(uploaded) = uploads.next().await {
             let uri = uploaded?;
             let entry = entry_by_uri.get(&uri).cloned().ok_or_else(|| {
@@ -5808,15 +5810,28 @@ async fn upload_prepared_shards(
     multipart_threshold: u64,
     mut rx: Receiver<(u32, PreparedSuperfile)>,
 ) -> Result<(Vec<PreparedSuperfile>, u64), BuildError> {
-    let cap = commit_write_concurrency();
+    let cap = commit_write_concurrency().get();
     let mut in_flight = FuturesUnordered::new();
     let mut done: Vec<(u32, PreparedSuperfile)> = Vec::new();
     let mut uploaded_bytes: u64 = 0;
     let mut open = true;
+    // The first upload error, held until every PUT already started has
+    // settled. Returning at the first failure would drop the other futures
+    // mid-request: a cancelled multipart leaves its uploaded parts behind
+    // with no abort, and those parts are not an orphaned superfile that gc
+    // reclaims. Draining also keeps receiving, so a packing thread parked on
+    // a full queue is never left there.
+    let mut failure: Option<BuildError> = None;
     while open || !in_flight.is_empty() {
         tokio::select! {
             received = rx.recv(), if open && in_flight.len() < cap => match received {
                 Some((shard_id, mut prepared)) => {
+                    if failure.is_some() {
+                        // The commit is already lost; take the shard off the
+                        // queue and drop it rather than starting a PUT whose
+                        // bytes nothing will reference.
+                        continue;
+                    }
                     let Some((uri, bytes)) = prepared.bytes_for_storage.take() else {
                         done.push((shard_id, prepared));
                         continue;
@@ -5832,10 +5847,16 @@ async fn upload_prepared_shards(
                 }
                 None => open = false,
             },
-            Some(finished) = in_flight.next(), if !in_flight.is_empty() => {
-                done.push(finished?);
+            Some(finished) = in_flight.next(), if !in_flight.is_empty() => match finished {
+                Ok(shard) => done.push(shard),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
         }
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     done.sort_by_key(|(shard_id, _)| *shard_id);
     Ok((done.into_iter().map(|(_, p)| p).collect(), uploaded_bytes))
@@ -6990,7 +7011,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(upload) = in_flight.next().await {
         if let Err(error) = upload {
             drop(in_flight);
@@ -7478,7 +7499,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(landed) = in_flight.next().await {
         if let Err(error) = landed {
             drop(in_flight);
@@ -8927,11 +8948,14 @@ async fn put_superfile_replace(
 /// maintenance compaction each fan out their PUTs at this width, so keeping
 /// each at ~50% of cores bounds the combined in-flight PUTs to roughly the
 /// core count rather than a multiple of it.
-fn commit_write_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
-        .unwrap_or(1)
-        .max(1)
+///
+/// Returns `NonZeroUsize` because several callers are unsound at zero — a
+/// zero-capacity `channel` panics, and a zero-width `buffered` stalls — and
+/// a single-core host divides to zero before the floor applies. Carrying the
+/// floor in the type means no caller has to restate it.
+fn commit_write_concurrency() -> NonZeroUsize {
+    let half = available_parallelism().map(|n| n.get() / 2).unwrap_or(1);
+    NonZeroUsize::new(half).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// Upper bound on the drain's auto-sized read fan-out — keeps a very large box
@@ -9014,7 +9038,7 @@ async fn write_superfile_list_with_threshold(
     // fanout from each stacks and starves the connection pool until requests
     // hit the per-request timeout. Capping each operation at ~50% of cores
     // leaves headroom for a concurrent maintenance pass without saturation.
-    let write_concurrency = commit_write_concurrency();
+    let write_concurrency = commit_write_concurrency().get();
 
     let replace_futs = pending_storage_replaces
         .iter()
@@ -9505,7 +9529,7 @@ async fn put_superfile_multipart(
 
     let mut upload = storage.put_multipart(path).await?;
     let total = bytes.len();
-    let part_concurrency = commit_write_concurrency().max(1);
+    let part_concurrency = commit_write_concurrency().get();
     let mut parts: Vec<UploadPart> = Vec::with_capacity(part_concurrency);
     let mut offset = 0;
     while offset < total {
