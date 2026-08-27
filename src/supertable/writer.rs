@@ -84,7 +84,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::mpsc::{Receiver, Sender, channel},
     time::sleep,
 };
 use tracing::{debug, error, info, warn};
@@ -1924,7 +1924,7 @@ impl SupertableWriter {
             let piped_storage = self.inner.options.storage.as_ref().cloned();
             let (user_batch, build_elapsed, prepare_elapsed, output_bytes, data_put_bytes) =
                 if let Some(storage) = piped_storage {
-                    let (tx, rx) = unbounded_channel::<(u32, PreparedSuperfile)>();
+                    let (tx, rx) = channel::<(u32, PreparedSuperfile)>(commit_write_concurrency());
                     let runtime = self.inner.query_runtime();
                     let uploader = runtime.spawn(upload_prepared_shards(
                         storage,
@@ -1953,10 +1953,16 @@ impl SupertableWriter {
                         &runtime,
                     );
                     let (outputs, _hints) = built?;
-                    debug_assert!(
-                        outputs.is_empty(),
-                        "piped drain-commit build returns no collected shards"
-                    );
+                    // A real error, not a `debug_assert`: on the piped path
+                    // every shard leaves through the channel, so a collected
+                    // shard here is one the uploader never saw. Releasing it
+                    // would publish a manifest entry whose bytes were never
+                    // PUT, so the commit must fail instead.
+                    if !outputs.is_empty() {
+                        return Err(BuildError::Store(
+                            "pipelined drain-commit returned collected shards".into(),
+                        ));
+                    }
                     let build_elapsed = commit_t0.elapsed();
                     let (prepared, uploaded_bytes) = uploaded?;
                     let user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
@@ -5779,7 +5785,13 @@ fn build_prepared_from_spilled_cells(
 /// Streaming handoff for the pipelined commit publish: each pool task
 /// sends its shard the moment prepare finishes, so the uploader has the
 /// storage bytes in flight while the remaining shards are still packing.
-type PipelinedShardTx = UnboundedSender<(u32, PreparedSuperfile)>;
+///
+/// Bounded, and sent to with `blocking_send` from the pack's pool threads:
+/// an unbounded queue would let a fast pack outrun a slow object store and
+/// hold every sealed shard at once, which is the peak memory the pipeline
+/// exists to avoid. At this depth the bytes in memory are what the uploader
+/// has in flight plus one queued shard per upload slot.
+type PipelinedShardTx = Sender<(u32, PreparedSuperfile)>;
 
 /// Drain `rx`, PUTting each shard's storage bytes as it arrives, at most
 /// [`commit_write_concurrency`] uploads in flight. Returns the prepared
@@ -5794,7 +5806,7 @@ type PipelinedShardTx = UnboundedSender<(u32, PreparedSuperfile)>;
 async fn upload_prepared_shards(
     storage: Arc<dyn StorageProvider>,
     multipart_threshold: u64,
-    mut rx: UnboundedReceiver<(u32, PreparedSuperfile)>,
+    mut rx: Receiver<(u32, PreparedSuperfile)>,
 ) -> Result<(Vec<PreparedSuperfile>, u64), BuildError> {
     let cap = commit_write_concurrency();
     let mut in_flight = FuturesUnordered::new();
@@ -5963,7 +5975,11 @@ fn commit_shards_via_drain(
                 bytes_for_cache,
             } = prepared;
             let entry = finish_superfile_entry(entry, Some(*shard_id))?;
-            tx.send((
+            // `blocking_send`, not `send`: this runs on a rayon pool thread
+            // (the fan-out is a `pool.install`), never a tokio worker, so
+            // parking here parks the pack — which is the backpressure. The
+            // uploader is a separate runtime task and keeps draining.
+            tx.blocking_send((
                 *shard_id,
                 PreparedSuperfile {
                     entry,

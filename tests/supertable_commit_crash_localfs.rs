@@ -122,6 +122,18 @@ const KP_HIDDEN_REPACK_SEG: &str = "hidden-repack-seg";
 /// batch 2's window, after batch 1's commit is durable.
 const KP_HIDDEN_SPLIT_SECOND_LIST: &str = "hidden-split-second-list";
 
+/// Vector-commit kill point: crash on a USER-table superfile PUT issued by
+/// the pipelined publish, i.e. while the remaining shards of the same
+/// commit are still packing. The text kill points above cannot reach this
+/// window — a table with no vector columns never enters the drain-commit
+/// path — so this is the one that covers uploads that start before the
+/// batch is complete.
+const KP_VECTOR_COMMIT_SEG: &str = "vector-commit-seg";
+/// Writer threads (and so packed shards) for the pipelined-commit child.
+/// Two is the smallest count that puts one shard on the wire while another
+/// is still being packed, which is the property under test.
+const VECTOR_COMMIT_SHARDS: usize = 2;
+
 /// Exit code used when the crash child finishes WITHOUT aborting —
 /// signals a misconfigured kill point (distinct from a clean exit).
 const MISCONFIGURED_KILL_POINT_EXIT_CODE: i32 = 2;
@@ -299,6 +311,15 @@ const DRAINED_HIDDEN_ID_MARKER: &str = "drained-hidden-manifest-id";
 /// shard so the hidden PUT sequence is deterministic. Rows: 8 at `e_0` and
 /// 8 at `e_1` → two populated hidden cells after the drain.
 fn vector_crash_fixture() -> (SupertableOptions, arrow_array::RecordBatch) {
+    vector_crash_fixture_with_writers(1)
+}
+
+/// [`vector_crash_fixture`] with an explicit writer-pool size. The pool
+/// size is the commit's packed-shard count, so this is how a test asks for
+/// more than one shard per commit.
+fn vector_crash_fixture_with_writers(
+    writers: usize,
+) -> (SupertableOptions, arrow_array::RecordBatch) {
     let dim = CRASH_EMB_DIM;
     let item_field = Arc::new(Field::new("item", DataType::Float32, true));
     let schema = Arc::new(Schema::new(vec![
@@ -311,7 +332,7 @@ fn vector_crash_fixture() -> (SupertableOptions, arrow_array::RecordBatch) {
     ]));
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(writers)
             .build()
             .expect("rayon pool"),
     );
@@ -425,6 +446,32 @@ fn run_vector_crash_child(dir: PathBuf, kill_point: &str) -> ! {
     std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
 }
 
+/// Child path for [`KP_VECTOR_COMMIT_SEG`]: create a vector table and
+/// commit one batch wide enough to pack [`VECTOR_COMMIT_SHARDS`] shards.
+/// The commit takes the pipelined publish, so its first user superfile PUT
+/// lands while the other shard is still packing; the wrapper aborts there,
+/// mid-commit and before the manifest list or pointer is written.
+fn run_vector_commit_crash_child(dir: PathBuf) -> ! {
+    let local = LocalFsStorageProvider::new(&dir).expect("local fs provider");
+    // `data/` is the user table's superfile prefix; the hidden index writes
+    // under `_infino_<uuid>_vector_index/data/`, which this prefix match
+    // does not accept — so the first match is the commit's own shard PUT.
+    let wrapped = Arc::new(CrashStorage::new(local, "data/", 1, KP_VECTOR_COMMIT_SEG));
+    let storage: Arc<dyn StorageProvider> = wrapped;
+
+    let (options, batch) = vector_crash_fixture_with_writers(VECTOR_COMMIT_SHARDS);
+    let st = Supertable::create(options.with_storage(storage)).expect("create");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+
+    eprintln!(
+        "CRASH-CHILD: completed the vector commit without aborting \
+         (kill_point={KP_VECTOR_COMMIT_SEG}) — test configuration is wrong"
+    );
+    std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
+}
+
 /// Child path: build a Supertable on `CrashStorage` and run
 /// up to `n_commits` commits. The wrapper triggers
 /// `std::process::abort()` mid-flight in the last commit
@@ -505,6 +552,9 @@ fn dispatch_child_if_set() -> Option<()> {
         let kp = env::var(ENV_KILL_POINT).expect("ENV_KILL_POINT must be set with ENV_DIR");
         if kp.starts_with("hidden-") {
             run_vector_crash_child(PathBuf::from(dir), &kp);
+        }
+        if kp == KP_VECTOR_COMMIT_SEG {
+            run_vector_commit_crash_child(PathBuf::from(dir));
         }
         run_crash_child(PathBuf::from(dir), &kp);
     }
@@ -612,6 +662,66 @@ fn verify_hidden_split_crash(dir: &PathBuf, expected_id_delta: u64) -> u64 {
     let second_sweep = hidden.gc(Duration::ZERO).expect("hidden gc after optimize");
 
     first_sweep.objects_deleted + second_sweep.objects_deleted
+}
+
+#[test]
+fn crash_mid_pipelined_vector_commit_yields_empty_table() {
+    if dispatch_child_if_set().is_some() {
+        return; // unreachable; child never returns
+    }
+    let dir = spawn_crash_child(
+        "crash_mid_pipelined_vector_commit_yields_empty_table",
+        KP_VECTOR_COMMIT_SEG,
+    );
+
+    // The abort fired on a shard PUT the pipelined publish issued while the
+    // commit's other shard was still packing — the window this path opens
+    // that the batch-wave publish did not. The durability boundary must be
+    // where it always was: no manifest list, no pointer, so recovery lands
+    // on create's empty id-0 manifest and every uploaded shard is an orphan.
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
+    let (options, _) = vector_crash_fixture_with_writers(VECTOR_COMMIT_SHARDS);
+    let recovered =
+        Supertable::open(options.with_storage(storage)).expect("open recovers the id-0 manifest");
+    assert_eq!(
+        recovered.manifest_id(),
+        0,
+        "the crashing commit never stamped a manifest → recover create's empty id-0"
+    );
+    let reader = recovered.reader().expect("reader");
+    assert_eq!(
+        reader.n_superfiles(),
+        0,
+        "shards uploaded before the crash are orphans, invisible without a committed list"
+    );
+
+    // A query on the recovered table must answer from the empty manifest
+    // rather than fault on the orphaned bytes.
+    let mut query = vec![0.0f32; CRASH_EMB_DIM];
+    query[0] = 1.0;
+    let hits = reader
+        .vector_search(
+            "emb",
+            &query,
+            CRASH_ROWS_PER_DIRECTION,
+            VectorSearchOptions::new().with_nprobe(CRASH_NPROBE),
+            None,
+            None,
+        )
+        .expect("vector search on the recovered table");
+    assert!(
+        hits.iter().all(|batch| batch.num_rows() == 0),
+        "an uncommitted shard must not be readable after recovery"
+    );
+
+    let n_orphans = std::fs::read_dir(dir.join("data"))
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert!(
+        n_orphans >= 1,
+        "the pipelined PUT that preceded the abort must be on disk as an orphan; found {n_orphans}"
+    );
 }
 
 #[test]
