@@ -1373,6 +1373,8 @@ pub mod vector {
     };
 
     use super::*;
+    use std::time::{Duration, Instant};
+
     use crate::{
         corpus::{self, Calibrated},
         cpu,
@@ -1569,6 +1571,60 @@ pub mod vector {
         ) -> Option<f64> {
             None
         }
+    }
+
+    /// One row of [`per_k_sweep`]: recall and latency at a single `k`.
+    #[derive(Clone, Copy, Debug)]
+    pub struct PerKCell {
+        pub k: usize,
+        pub recall: f32,
+        pub p50_ns: f64,
+        pub p95_ns: f64,
+    }
+
+    /// Median percentile rank for [`per_k_sweep`] latency columns.
+    const SWEEP_P50: usize = 50;
+    /// Tail percentile rank for [`per_k_sweep`] latency columns.
+    const SWEEP_P95: usize = 95;
+
+    /// Per-`k` recall/latency sweep over ONE search surface — the single
+    /// measurement loop every comparison arm shares. `search` is the
+    /// engine's own call (its public API where it has one: a supertable
+    /// arm passes a closure over `vector_search` via
+    /// [`SupertableVectorRead`], a library peer passes its `search`);
+    /// this function owns the timing, the recall division against the
+    /// deep oracle's `k`-prefix, and the percentile math, so no battery
+    /// re-implements any of them. `truth_deep` rows are rank-sorted and
+    /// at least as deep as the largest `k`.
+    pub fn per_k_sweep(
+        queries: &[Vec<f32>],
+        truth_deep: &[Vec<u32>],
+        ks: &[usize],
+        mut search: impl FnMut(&[f32], usize) -> Vec<corpus::Hit>,
+    ) -> Vec<PerKCell> {
+        let percentile = |sorted: &[Duration], pct: usize| -> f64 {
+            let rank = (pct * sorted.len()).div_ceil(100);
+            sorted[rank.saturating_sub(1).min(sorted.len() - 1)].as_nanos() as f64
+        };
+        ks.iter()
+            .map(|&k| {
+                let mut latencies = Vec::with_capacity(queries.len());
+                let mut recall_sum = 0.0_f32;
+                for (query, truth) in queries.iter().zip(truth_deep) {
+                    let started = Instant::now();
+                    let hits = search(query, k);
+                    latencies.push(started.elapsed());
+                    recall_sum += corpus::recall_at_k(&hits, &truth[..k.min(truth.len())]);
+                }
+                latencies.sort_unstable();
+                PerKCell {
+                    k,
+                    recall: recall_sum / queries.len().max(1) as f32,
+                    p50_ns: percentile(&latencies, SWEEP_P50),
+                    p95_ns: percentile(&latencies, SWEEP_P95),
+                }
+            })
+            .collect()
     }
 
     impl VectorRead for SuperfileReader {
