@@ -805,6 +805,10 @@ pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
     graph: crate::superfile::vector::hnsw::Hnsw,
     node_map: Vec<(usize, u32)>,
+    /// The column metric the scorer ranks by — set at build and reproduced on
+    /// load. The query is transformed into the same space before the walk
+    /// ([`gfc_prepare_for_metric`]), so build-time and query-time scoring agree.
+    metric: Metric,
 }
 
 /// A [`CentroidRouterGraph`] stamped with the `(generation, column)` its nodes
@@ -826,10 +830,10 @@ pub(crate) struct StampedCentroidRouter {
 
 /// The column the eager centroid-router build should target, or `None` when
 /// the router is disabled or no column is eligible. The single-slot cache
-/// serves one column, so the eager path pre-warms the first cosine vector
-/// column (the router ranks by cosine, and single-vector-column tables are the
-/// common case). Pure and config-injected so the gating predicate and column
-/// pick are unit-testable without the process-global router config.
+/// serves one column, so the eager path pre-warms the first vector column (any
+/// metric — the router now scores per-metric, and single-vector-column tables
+/// are the common case). Pure and config-injected so the gating predicate and
+/// column pick are unit-testable without the process-global router config.
 pub(crate) fn select_eager_router_column(
     search_mode: config::VectorSearchMode,
     ivf_router: config::IvfRouter,
@@ -842,10 +846,19 @@ pub(crate) fn select_eager_router_column(
     {
         return None;
     }
+    vector_columns.first().map(|vc| vc.column.clone())
+}
+
+/// The configured [`Metric`] for `column`, or `None` when the column is not a
+/// declared vector column.
+fn column_metric(
+    vector_columns: &[crate::superfile::builder::VectorConfig],
+    column: &str,
+) -> Option<Metric> {
     vector_columns
         .iter()
-        .find(|vc| vc.metric == Metric::Cosine)
-        .map(|vc| vc.column.clone())
+        .find(|vc| vc.column == column)
+        .map(|vc| vc.metric)
 }
 
 /// Unit-normalize in place so the centroid graph's `−dot` scorer ranks by
@@ -857,6 +870,18 @@ fn gfc_unit_normalize(v: &mut [f32]) {
         for x in v.iter_mut() {
             *x *= inv;
         }
+    }
+}
+
+/// Transform a centroid or query vector into the space the column metric's
+/// scorer expects before it enters (or queries) the centroid graph: `Cosine`
+/// needs unit vectors (so the `−dot` scorer ranks by cosine); `NegDot` and
+/// `L2Sq` score raw magnitudes and pass through untouched. Build and load apply
+/// this to centroids, and the query path applies it to the query, so the graph
+/// is always scored in one consistent space.
+fn gfc_prepare_for_metric(metric: Metric, v: &mut [f32]) {
+    if metric == Metric::Cosine {
+        gfc_unit_normalize(v);
     }
 }
 
@@ -874,6 +899,7 @@ fn centroid_router_walk(
     readers: &[Arc<SuperfileReader>],
     column: &str,
     section: &crate::supertable::slow_vector_state::CentroidSection,
+    metric: Metric,
 ) -> Result<(Vec<Vec<f32>>, Vec<(usize, u32)>), QueryError> {
     let mut vecs: Vec<Vec<f32>> = Vec::new();
     let mut node_map: Vec<(usize, u32)> = Vec::new();
@@ -889,7 +915,7 @@ fn centroid_router_walk(
             .global_fine_cluster_vectors(column, section, sfid)
             .map_err(|e| QueryError::Execute(e.to_string()))?
         {
-            gfc_unit_normalize(&mut vec);
+            gfc_prepare_for_metric(metric, &mut vec);
             vecs.push(vec);
             node_map.push((si, flat));
         }
@@ -899,22 +925,26 @@ fn centroid_router_walk(
 
 /// Build the in-memory centroid router from the resident centroid section — the
 /// legacy fallback for a generation that carries no persisted centroid-graph
-/// section (older tables, router-off-at-drain, or a build failure).
+/// section (older tables, router-off-at-drain, or a build failure). `metric` is
+/// the column's configured metric: it selects the scorer's ranking and the
+/// centroid transform, so the graph is built in the metric's own space.
 fn build_centroid_router(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
+    metric: Metric,
 ) -> Result<CentroidRouterGraph, QueryError> {
     use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-    let (vecs, node_map) = centroid_router_walk(superfiles, readers, column, section)?;
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim);
+    let (vecs, node_map) = centroid_router_walk(superfiles, readers, column, section, metric)?;
+    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
     let graph = Hnsw::build(&scorer, HnswParams::default());
     Ok(CentroidRouterGraph {
         scorer,
         graph,
         node_map,
+        metric,
     })
 }
 
@@ -973,6 +1003,7 @@ fn decode_centroid_router_section(
     column: &str,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
+    metric: Metric,
 ) -> Option<CentroidRouterGraph> {
     use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
     if bytes.get(..CENTROID_ROUTER_SECTION_MAGIC.len())? != CENTROID_ROUTER_SECTION_MAGIC {
@@ -1021,7 +1052,7 @@ fn decode_centroid_router_section(
         };
         let sfid = sf.superfile_id;
         for (flat, mut vec) in vr.global_fine_cluster_vectors(column, section, sfid).ok()? {
-            gfc_unit_normalize(&mut vec);
+            gfc_prepare_for_metric(metric, &mut vec);
             cluster_vecs.insert((sfid, flat), vec);
         }
     }
@@ -1038,11 +1069,12 @@ fn decode_centroid_router_section(
         vecs.push(vec.clone());
         node_map.push((si, *flat));
     }
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim);
+    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
     Some(CentroidRouterGraph {
         scorer,
         graph,
         node_map,
+        metric,
     })
 }
 
@@ -1064,11 +1096,12 @@ pub(crate) async fn compose_centroid_router_section(
     if entries.is_empty() {
         return None;
     }
+    let metric = column_metric(&options.vector_columns, column)?;
     let readers = open_readers_from_options(options, entries)
         .await
         .map_err(|error| tracing::warn!(%error, "centroid-router publish: reader open failed"))
         .ok()?;
-    let router = build_centroid_router(entries, &readers, column, section, dim)
+    let router = build_centroid_router(entries, &readers, column, section, dim, metric)
         .map_err(|error| tracing::warn!(%error, "centroid-router publish: build failed"))
         .ok()?;
     Some(encode_centroid_router_section(&router, entries, dim))
@@ -2891,6 +2924,9 @@ impl SupertableReader {
         fanout: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
+        let metric = column_metric(&manifest.options.vector_columns, column).ok_or_else(|| {
+            QueryError::Execute(format!("global-fine: unknown vector column `{column}`"))
+        })?;
         let section = self.centroid_section().await.ok_or_else(|| {
             QueryError::Execute("global-fine: centroid section unavailable".into())
         })?;
@@ -2925,6 +2961,7 @@ impl SupertableReader {
                     column,
                     manifest.manifest_id,
                     query.len(),
+                    metric,
                     superfiles,
                     &readers,
                     section.as_ref(),
@@ -2932,7 +2969,7 @@ impl SupertableReader {
                 .await?;
             let router = &stamped.graph;
             let mut q = query.to_vec();
-            gfc_unit_normalize(&mut q);
+            gfc_prepare_for_metric(router.metric, &mut q);
             let fc = fanout.clamp(1, router.node_map.len().max(1));
             // `ef` governs graph-vs-exact parity; `global_fine_graph_ef = 0`
             // auto-selects `fanout * 2`.
@@ -3106,6 +3143,7 @@ impl SupertableReader {
         column: &str,
         generation: u64,
         dim: usize,
+        metric: Metric,
         superfiles: &[Arc<SuperfileEntry>],
         readers: &[Arc<SuperfileReader>],
         section: &CentroidSection,
@@ -3126,11 +3164,11 @@ impl SupertableReader {
             return Ok(entry);
         }
         let graph = match self
-            .load_persisted_centroid_router(column, dim, superfiles, readers, section)
+            .load_persisted_centroid_router(column, dim, metric, superfiles, readers, section)
             .await
         {
             Some(graph) => graph,
-            None => build_centroid_router(superfiles, readers, column, section, dim)?,
+            None => build_centroid_router(superfiles, readers, column, section, dim, metric)?,
         };
         let entry = Arc::new(StampedCentroidRouter {
             generation,
@@ -3154,6 +3192,7 @@ impl SupertableReader {
         &self,
         column: &str,
         dim: usize,
+        metric: Metric,
         superfiles: &[Arc<SuperfileEntry>],
         readers: &[Arc<SuperfileReader>],
         section: &CentroidSection,
@@ -3167,7 +3206,15 @@ impl SupertableReader {
                 tracing::warn!(uri = reference.uri, %error, "centroid-router section fetch failed")
             })
             .ok()?;
-        decode_centroid_router_section(bytes.as_ref(), superfiles, readers, column, section, dim)
+        decode_centroid_router_section(
+            bytes.as_ref(),
+            superfiles,
+            readers,
+            column,
+            section,
+            dim,
+            metric,
+        )
     }
 
     /// Build the centroid-router graph for `column` from THIS reader's pinned
@@ -3185,15 +3232,16 @@ impl SupertableReader {
     ) -> Result<(), QueryError> {
         let manifest = self.manifest();
         let generation = manifest.manifest_id;
-        let dim = manifest
+        let vector_config = manifest
             .options
             .vector_columns
             .iter()
             .find(|vc| vc.column == column)
-            .map(|vc| vc.dim)
             .ok_or_else(|| {
                 QueryError::Execute(format!("eager centroid-router: unknown column `{column}`"))
             })?;
+        let dim = vector_config.dim;
+        let metric = vector_config.metric;
         let section = self.centroid_section().await.ok_or_else(|| {
             QueryError::Execute("eager centroid-router: centroid section unavailable".into())
         })?;
@@ -3209,6 +3257,7 @@ impl SupertableReader {
             column,
             generation,
             dim,
+            metric,
             &entries,
             &readers,
             section.as_ref(),
@@ -3270,22 +3319,9 @@ impl SupertableReader {
             warn_hnsw_no_resident_graph(column, manifest.slow_vector_state_graphs_blob().is_some());
             // fall through to the ivf scan below
         }
-        // The centroid router ranks by cosine (unit-normalized centroids, a
-        // -dot scorer), so it is only correct for a Cosine column. A NegDot or
-        // L2Sq table falls through to the stamped router rather than being
-        // mis-ranked; per-metric centroid scoring is a router-productionization
-        // follow-on.
-        let centroid_graph_metric_ok = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .is_some_and(|vc| {
-                matches!(
-                    vc.metric,
-                    crate::superfile::vector::distance::Metric::Cosine
-                )
-            });
+        // The centroid router scores per the column's configured metric
+        // (Cosine unit-normalizes and ranks by −dot; NegDot ranks by raw −dot;
+        // L2Sq by squared distance), so it engages for any metric.
         // Per-table calibrated fanout wins over the scale-blind
         // `vector.global_fine_fanout` constant: a drain stamps `width × fine`
         // (clamped to the table's cluster count) per k, so a ~1M table no
@@ -3302,7 +3338,6 @@ impl SupertableReader {
             && vcfg.search_mode == config::VectorSearchMode::Ivf
             && vcfg.ivf_router == config::IvfRouter::CentroidGraph
             && resolved_fanout > 0
-            && centroid_graph_metric_ok
         {
             return self
                 .global_fine_fanout(&superfiles, column, query, k, &options, resolved_fanout)
@@ -5964,10 +5999,10 @@ mod tests {
         VectorFilter, VectorSearchOptions, admit_extension_round, admit_shortlist_window,
         apply_width_pin, build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
         decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_unit_normalize,
-        hidden_hits_user_ids, id_score_projection_indices, is_hidden_vector_manifest,
-        law_floor_serve_selection, postings_by_cell_from_summaries, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
+        gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
+        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
     use crate::{
@@ -6018,10 +6053,10 @@ mod tests {
     /// process-global router config can't be flipped per-test, so this drives
     /// the pure selector `refresh_centroid_router_cache` delegates to directly:
     /// it must gate off unless the router is fully enabled, and otherwise pick
-    /// the FIRST cosine vector column (the single-slot cache serves one column,
-    /// and the router ranks by cosine).
+    /// the FIRST vector column regardless of metric (the router scores
+    /// per-metric now, so a NegDot/L2Sq column is eligible — no cosine filter).
     #[test]
-    fn select_eager_router_column_gates_and_picks_first_cosine() {
+    fn select_eager_router_column_gates_and_picks_first_column() {
         use super::select_eager_router_column;
         use crate::config::{IvfRouter, VectorSearchMode};
 
@@ -6033,18 +6068,29 @@ mod tests {
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
+        // A NegDot column first: it is eligible now (no cosine-only filter).
         let cols = vec![
-            // A non-cosine column ahead of the cosine ones must be skipped.
-            vc("l2", Metric::L2Sq),
+            vc("nd", Metric::NegDot),
             vc("a", Metric::Cosine),
-            vc("b", Metric::Cosine),
+            vc("l2", Metric::L2Sq),
         ];
 
-        // Fully enabled: the first cosine column.
+        // Fully enabled: the first column, whatever its metric.
         assert_eq!(
             select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 32, &cols)
                 .as_deref(),
-            Some("a"),
+            Some("nd"),
+        );
+        // An L2Sq-only table is also eligible.
+        assert_eq!(
+            select_eager_router_column(
+                VectorSearchMode::Ivf,
+                IvfRouter::CentroidGraph,
+                32,
+                &[vc("only", Metric::L2Sq)],
+            )
+            .as_deref(),
+            Some("only"),
         );
         // Gated off: default `stamped` router.
         assert_eq!(
@@ -6066,14 +6112,9 @@ mod tests {
             ),
             None,
         );
-        // Enabled but no cosine column: nothing to pre-warm.
+        // No vector columns: nothing to pre-warm.
         assert_eq!(
-            select_eager_router_column(
-                VectorSearchMode::Ivf,
-                IvfRouter::CentroidGraph,
-                32,
-                &[vc("x", Metric::NegDot)],
-            ),
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 32, &[]),
             None,
         );
     }
@@ -7517,12 +7558,80 @@ mod tests {
         );
     }
 
+    /// Metric-aware selection: the centroid graph, built with each metric's
+    /// scorer + centroid transform, selects the same clusters a brute-force
+    /// nearest-centroid scan does under that metric. Uses magnitude-varying
+    /// synthetic centroids so Cosine (unit-normalized), NegDot (raw −dot), and
+    /// L2Sq (squared distance) each rank differently — the graph must track its
+    /// configured metric, not always cosine.
+    #[test]
+    fn centroid_router_selects_metric_nearest_centroids() {
+        use crate::superfile::vector::distance::distance;
+        use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+
+        let dim = 8usize;
+        // Well-separated centroids with varied magnitudes and directions, so the
+        // three metrics genuinely disagree on the nearest set.
+        let raw: Vec<Vec<f32>> = (0..24usize)
+            .map(|i| {
+                let mut v = vec![0.0f32; dim];
+                v[i % dim] = 1.0 + (i as f32) * 0.17;
+                v[(i + 3) % dim] = 0.3 + 0.2 * ((i % 5) as f32);
+                v[(i + 6) % dim] = 0.05 * (i as f32);
+                v
+            })
+            .collect();
+        let query: Vec<f32> = {
+            let mut q = vec![0.1f32; dim];
+            q[2] = 1.4;
+            q[5] = 0.7;
+            q
+        };
+        let fanout = 4usize;
+
+        for metric in [Metric::Cosine, Metric::NegDot, Metric::L2Sq] {
+            // Prepare centroids + query into the metric's space (as build does).
+            let mut prepared = raw.clone();
+            for c in &mut prepared {
+                gfc_prepare_for_metric(metric, c);
+            }
+            let mut q = query.clone();
+            gfc_prepare_for_metric(metric, &mut q);
+
+            let scorer = Fp32Scorer::from_vectors(&prepared, dim, metric);
+            let graph = Hnsw::build(&scorer, HnswParams::default());
+            // ef well past the node count → the small graph search is exhaustive.
+            let mut selected: Vec<u32> = graph
+                .search(&scorer, &q, fanout, 64)
+                .into_iter()
+                .map(|(node, _)| node)
+                .collect();
+            selected.sort_unstable();
+
+            // Brute-force nearest under the metric (smaller distance = nearer).
+            let mut ranked: Vec<(u32, f32)> = prepared
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i as u32, distance(metric, &q, c)))
+                .collect();
+            ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let mut brute: Vec<u32> = ranked.iter().take(fanout).map(|(i, _)| *i).collect();
+            brute.sort_unstable();
+
+            assert_eq!(
+                selected, brute,
+                "{metric:?}: graph selection must match brute-force nearest-centroid"
+            );
+        }
+    }
+
     /// Persisted-section round trip: build the router, serialize it, PUT it
     /// through `write_graph_section`, fetch + `mmap` it back, decode (which
     /// reconstructs the scorer from the resident centroids), and assert the
     /// reloaded graph routes IDENTICALLY to the freshly built one across a set
-    /// of queries. This is the single-node == multi-node == post-restart
-    /// contract: every reader loads the same section rather than rebuilding.
+    /// of queries, for EACH metric. This is the single-node == multi-node ==
+    /// post-restart contract: every reader loads the same section rather than
+    /// rebuilding.
     #[test]
     fn centroid_router_section_roundtrip_routes_identically() {
         let dim = 16usize;
@@ -7552,36 +7661,6 @@ mod tests {
                 .expect("entries");
             let readers = hr.open_superfile_readers(&entries).await.expect("readers");
 
-            let built =
-                build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim).unwrap();
-            assert!(!built.node_map.is_empty(), "fixture must produce a router");
-
-            // Real storage round trip: serialize -> PUT -> fetch+mmap -> decode.
-            let bytes = encode_centroid_router_section(&built, &entries, dim);
-            let reference =
-                crate::supertable::slow_vector_state::write_graph_section(storage.as_ref(), bytes)
-                    .await
-                    .expect("publish section");
-            let (fetched, _mmap) = crate::supertable::slow_vector_state::fetch_graph_section(
-                storage.as_ref(),
-                &reference,
-            )
-            .await
-            .expect("fetch section");
-            let loaded = decode_centroid_router_section(
-                fetched.as_ref(),
-                &entries,
-                &readers,
-                "emb",
-                section.as_ref(),
-                dim,
-            )
-            .expect("decode section");
-
-            assert_eq!(
-                built.node_map, loaded.node_map,
-                "the persisted node map must reload identically"
-            );
             let route = |router: &CentroidRouterGraph, q: &[f32]| -> Vec<(usize, u32)> {
                 let fanout = 3usize;
                 let ef = fanout.saturating_mul(2).max(fanout);
@@ -7594,15 +7673,55 @@ mod tests {
                 sel.sort_unstable();
                 sel
             };
-            for seed in 0..8usize {
-                let mut q = vec![0.0f32; dim];
-                q[seed % dim] = 1.0;
-                gfc_unit_normalize(&mut q);
+            // Round-trip each metric over the same fixture centroids: the
+            // scorer is reconstructed on load from the column metric, so a
+            // NegDot/L2Sq section must route identically to its freshly-built
+            // graph, not just a Cosine one.
+            for metric in [Metric::Cosine, Metric::NegDot, Metric::L2Sq] {
+                let built =
+                    build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim, metric)
+                        .unwrap();
+                assert!(!built.node_map.is_empty(), "fixture must produce a router");
+
+                // Real storage round trip: serialize -> PUT -> fetch+mmap -> decode.
+                let bytes = encode_centroid_router_section(&built, &entries, dim);
+                let reference = crate::supertable::slow_vector_state::write_graph_section(
+                    storage.as_ref(),
+                    bytes,
+                )
+                .await
+                .expect("publish section");
+                let (fetched, _mmap) = crate::supertable::slow_vector_state::fetch_graph_section(
+                    storage.as_ref(),
+                    &reference,
+                )
+                .await
+                .expect("fetch section");
+                let loaded = decode_centroid_router_section(
+                    fetched.as_ref(),
+                    &entries,
+                    &readers,
+                    "emb",
+                    section.as_ref(),
+                    dim,
+                    metric,
+                )
+                .expect("decode section");
+
                 assert_eq!(
-                    route(&built, &q),
-                    route(&loaded, &q),
-                    "query {seed} must route identically after the round trip"
+                    built.node_map, loaded.node_map,
+                    "{metric:?}: the persisted node map must reload identically"
                 );
+                for seed in 0..8usize {
+                    let mut q = vec![0.0f32; dim];
+                    q[seed % dim] = 1.0;
+                    gfc_prepare_for_metric(metric, &mut q);
+                    assert_eq!(
+                        route(&built, &q),
+                        route(&loaded, &q),
+                        "{metric:?}: query {seed} must route identically after the round trip"
+                    );
+                }
             }
         });
     }
@@ -7645,8 +7764,15 @@ mod tests {
                 .expect("entries");
             let readers = hr.open_superfile_readers(&entries).await.expect("readers");
 
-            let built =
-                build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim).unwrap();
+            let built = build_centroid_router(
+                &entries,
+                &readers,
+                "emb",
+                section.as_ref(),
+                dim,
+                Metric::Cosine,
+            )
+            .unwrap();
             let bytes = encode_centroid_router_section(&built, &entries, dim);
 
             // Decode against the REVERSED superfile + reader arrays (lockstep),
@@ -7662,6 +7788,7 @@ mod tests {
                 "emb",
                 section.as_ref(),
                 dim,
+                Metric::Cosine,
             )
             .expect("section must be accepted under a reordered superfile array");
 
@@ -7741,9 +7868,16 @@ mod tests {
                 "the default drain must not stamp a centroid-graph ref"
             );
             assert!(
-                hr.load_persisted_centroid_router("emb", dim, &entries, &readers, section.as_ref())
-                    .await
-                    .is_none(),
+                hr.load_persisted_centroid_router(
+                    "emb",
+                    dim,
+                    Metric::Cosine,
+                    &entries,
+                    &readers,
+                    section.as_ref()
+                )
+                .await
+                .is_none(),
                 "absent ref must load as None"
             );
             // The resident path still yields a usable graph (built in memory).
@@ -7753,6 +7887,7 @@ mod tests {
                     "emb",
                     generation,
                     dim,
+                    Metric::Cosine,
                     &entries,
                     &readers,
                     section.as_ref(),

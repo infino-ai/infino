@@ -16,12 +16,12 @@
 //!   source of truth for the SIMD-tiered scoring math; the graph never
 //!   materializes a decoded vector to score a candidate. This is the
 //!   impl used in practice.
-//! - [`Fp32Scorer`] — raw f32 vectors scored with a plain dot. A
-//!   reference impl that proves the graph is codec-agnostic: the same
+//! - [`Fp32Scorer`] — raw f32 vectors scored by a configured [`Metric`]
+//!   (`distance`). Proves the graph is codec-agnostic: the same
 //!   [`Hnsw::build`] / [`Hnsw::search`] drive it unchanged.
 //!
-//! Scores are dot-*distances* (`−dot` on unit vectors, so smaller is
-//! nearer, equivalent to `1 − cos` up to a constant).
+//! Scores are *distances* — smaller is nearer for every metric (`−dot` for
+//! Cosine/NegDot, squared distance for L2Sq).
 //!
 //! Layer assignment is deterministic (seeded SplitMix64), so the tower a
 //! node lands on never depends on insert order. [`Hnsw::build`] then
@@ -47,7 +47,8 @@ use bytes::Bytes;
 use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
-    Metric, Sq16Kernel, dequantize_sq16_into, dot, encode_sq16_row, quantize_query_i8, sq8_walk_dot,
+    Metric, Sq16Kernel, dequantize_sq16_into, distance, encode_sq16_row, quantize_query_i8,
+    sq8_walk_dot,
 };
 
 /// Per-node distance the graph is generic over. Lower = nearer.
@@ -222,18 +223,22 @@ impl NodeScorer for Sq16Scorer {
     }
 }
 
-/// Raw-f32 reference scorer: plain dot, `score = −dot`. Proves the graph
-/// abstracts the codec — the same build/search run over this and
-/// [`Sq16Scorer`] with no changes.
+/// Raw-f32 scorer over stored vectors, ranking by a configured [`Metric`]
+/// (`distance`, smaller = nearer): `Cosine`/`NegDot` reduce to `−dot`, `L2Sq`
+/// to squared distance. The graph abstracts the codec — the same build/search
+/// run over this and [`Sq16Scorer`] with no changes. The caller is responsible
+/// for feeding vectors in the metric's expected space (unit-normalized for
+/// `Cosine`, raw otherwise).
 pub(crate) struct Fp32Scorer {
     /// `len × dim` contiguous f32s, row-major.
     data: Vec<f32>,
     dim: usize,
     len: usize,
+    metric: Metric,
 }
 
 impl Fp32Scorer {
-    pub(crate) fn from_vectors(vectors: &[Vec<f32>], dim: usize) -> Self {
+    pub(crate) fn from_vectors(vectors: &[Vec<f32>], dim: usize, metric: Metric) -> Self {
         let mut data = Vec::with_capacity(vectors.len() * dim);
         for v in vectors {
             debug_assert_eq!(v.len(), dim);
@@ -243,6 +248,7 @@ impl Fp32Scorer {
             data,
             dim,
             len: vectors.len(),
+            metric,
         }
     }
 
@@ -276,7 +282,7 @@ impl NodeScorer for Fp32Scorer {
 
     #[inline]
     fn score(&self, q: &Box<[f32]>, node: u32) -> f32 {
-        -dot(q, self.row(node))
+        distance(self.metric, q, self.row(node))
     }
 }
 
@@ -2465,7 +2471,7 @@ mod tests {
         let vectors = random_unit_vectors(n, dim, 0xC0FFEE);
 
         let sq16 = Sq16Scorer::from_unit_vectors(&vectors, dim);
-        let fp32 = Fp32Scorer::from_vectors(&vectors, dim);
+        let fp32 = Fp32Scorer::from_vectors(&vectors, dim, Metric::NegDot);
 
         // Query with a stored vector: it must come back as node 0's rank.
         let probe = &vectors[123];
@@ -3102,13 +3108,13 @@ mod tests {
     fn degenerate_graphs() {
         let dim = 8;
         let empty: Vec<Vec<f32>> = Vec::new();
-        let scorer = Fp32Scorer::from_vectors(&empty, dim);
+        let scorer = Fp32Scorer::from_vectors(&empty, dim, Metric::NegDot);
         let hnsw = Hnsw::build(&scorer, HnswParams::default());
         assert!(hnsw.is_empty());
         assert!(hnsw.search(&scorer, &vec![0.0; dim], 5, 16).is_empty());
 
         let one = random_unit_vectors(1, dim, 7);
-        let scorer = Fp32Scorer::from_vectors(&one, dim);
+        let scorer = Fp32Scorer::from_vectors(&one, dim, Metric::NegDot);
         let hnsw = Hnsw::build(&scorer, HnswParams::default());
         let got = hnsw.search(&scorer, &one[0], 5, 16);
         assert_eq!(got.len(), 1);
