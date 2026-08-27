@@ -13,8 +13,6 @@
 //! (`> (SELECT AVG(..))`), so the battery is valid for any data
 //! distribution without knowing one row of it.
 
-use std::sync::OnceLock;
-
 use arrow_schema::DataType;
 
 use crate::harness::{SqlCorpusSpec, SqlQuery};
@@ -27,15 +25,14 @@ const TABLE: &str = "supertable";
 /// transfer never competes with the aggregation being measured.
 const GROUP_TOP_LIMIT: usize = 10;
 
-/// Generated query text, built once from the first corpus spec this
-/// process benches (one bench process loads one corpus). Held in a
-/// static so [`SqlQuery`]'s `&'static str` fields can borrow from it.
-static TEXT: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
-/// The battery borrowing from [`TEXT`].
-static BATTERY: OnceLock<Vec<SqlQuery>> = OnceLock::new();
+/// Whether a column is orderable — MIN/MAX are valid. Dates qualify.
+fn supports_min_max(dt: &DataType) -> bool {
+    supports_avg(dt) || matches!(dt, DataType::Date32)
+}
 
-/// Whether a column is a plain orderable numeric the aggregates can use.
-fn is_numeric(dt: &DataType) -> bool {
+/// Whether a column can be averaged — `AVG(date)` is rejected by the
+/// engine, so [`supports_min_max`] admits `Date32` and this does not.
+fn supports_avg(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Int8
@@ -48,8 +45,13 @@ fn is_numeric(dt: &DataType) -> bool {
             | DataType::UInt64
             | DataType::Float32
             | DataType::Float64
-            | DataType::Date32
     )
+}
+
+/// Quote an identifier for SQL, doubling any embedded `"` — an Arrow
+/// schema can legally carry quote characters in a column name.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// The schema-derived battery for `spec`.
@@ -61,61 +63,86 @@ fn is_numeric(dt: &DataType) -> bool {
 /// group keys are low-fanout labels rather than document text), and a
 /// distinct count over the same column. Deterministic for a given
 /// schema: same corpus, same battery, comparable across runs.
+/// The schema-derived battery for `spec`.
+///
+/// Shapes, each emitted only when the schema carries a fitting column:
+/// full-table count; min/max over the first orderable column (dates
+/// qualify); a selective count above the first AVERAGEABLE column's
+/// mean (dates are excluded there — `AVG(date)` is rejected by the
+/// engine, so a date-first schema still gets min/max but skips the
+/// mean filter unless a true numeric exists); grouped top-K over the
+/// first string column (preferring one that is not FTS-indexed, so the
+/// group keys are low-fanout labels rather than document text); and a
+/// distinct count over the same column. Deterministic for a given
+/// schema: same corpus, same battery, comparable across runs.
+///
+/// Built fresh per call and leaked into `'static` (the [`SqlQuery`]
+/// contract): bench-only code that runs once per corpus load, so the
+/// leak is a handful of strings per process — and no process-global
+/// cache means a second corpus in the same process can never be served
+/// the first corpus's battery.
 pub fn battery_for(spec: &SqlCorpusSpec) -> &'static [SqlQuery] {
-    let text = TEXT.get_or_init(|| {
-        let mut queries: Vec<(&'static str, String)> = Vec::new();
-        queries.push(("count_star", format!("SELECT COUNT(*) FROM {TABLE}")));
+    let mut queries: Vec<(&'static str, String)> = Vec::new();
+    queries.push(("count_star", format!("SELECT COUNT(*) FROM {TABLE}")));
 
-        let numeric = spec
-            .schema
-            .fields()
-            .iter()
-            .find(|f| is_numeric(f.data_type()))
-            .map(|f| f.name().clone());
-        if let Some(col) = &numeric {
-            queries.push((
-                "numeric_min_max",
-                format!("SELECT MIN(\"{col}\"), MAX(\"{col}\") FROM {TABLE}"),
-            ));
-            queries.push((
-                "count_above_mean",
-                format!(
-                    "SELECT COUNT(*) FROM {TABLE} WHERE \"{col}\" > \
-                     (SELECT AVG(\"{col}\") FROM {TABLE})"
-                ),
-            ));
-        }
+    let min_max_col = spec
+        .schema
+        .fields()
+        .iter()
+        .find(|f| supports_min_max(f.data_type()))
+        .map(|f| quote_ident(f.name()));
+    if let Some(col) = &min_max_col {
+        queries.push((
+            "numeric_min_max",
+            format!("SELECT MIN({col}), MAX({col}) FROM {TABLE}"),
+        ));
+    }
+    let avg_col = spec
+        .schema
+        .fields()
+        .iter()
+        .find(|f| supports_avg(f.data_type()))
+        .map(|f| quote_ident(f.name()));
+    if let Some(col) = &avg_col {
+        queries.push((
+            "count_above_mean",
+            format!(
+                "SELECT COUNT(*) FROM {TABLE} WHERE {col} > \
+                 (SELECT AVG({col}) FROM {TABLE})"
+            ),
+        ));
+    }
 
-        let string_col = spec
-            .schema
-            .fields()
-            .iter()
-            .filter(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
-            .map(|f| f.name().clone())
-            .min_by_key(|name| spec.fts_columns.contains(name));
-        if let Some(col) = &string_col {
-            queries.push((
-                "group_top_k",
-                format!(
-                    "SELECT \"{col}\", COUNT(*) AS n FROM {TABLE} \
-                     GROUP BY \"{col}\" ORDER BY n DESC LIMIT {GROUP_TOP_LIMIT}"
-                ),
-            ));
-            queries.push((
-                "distinct_count",
-                format!("SELECT COUNT(DISTINCT \"{col}\") FROM {TABLE}"),
-            ));
-        }
-        queries
-    });
-    BATTERY.get_or_init(|| {
-        text.iter()
-            .map(|(name, sql)| SqlQuery {
-                name,
-                sql: sql.as_str(),
-            })
-            .collect()
-    })
+    let string_col = spec
+        .schema
+        .fields()
+        .iter()
+        .filter(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+        .map(|f| f.name().clone())
+        .min_by_key(|name| spec.fts_columns.contains(name))
+        .map(|name| quote_ident(&name));
+    if let Some(col) = &string_col {
+        queries.push((
+            "group_top_k",
+            format!(
+                "SELECT {col}, COUNT(*) AS n FROM {TABLE} \
+                 GROUP BY {col} ORDER BY n DESC LIMIT {GROUP_TOP_LIMIT}"
+            ),
+        ));
+        queries.push((
+            "distinct_count",
+            format!("SELECT COUNT(DISTINCT {col}) FROM {TABLE}"),
+        ));
+    }
+
+    let battery: Vec<SqlQuery> = queries
+        .into_iter()
+        .map(|(name, sql)| SqlQuery {
+            name,
+            sql: Box::leak(sql.into_boxed_str()),
+        })
+        .collect();
+    Box::leak(battery.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -146,6 +173,15 @@ mod tests {
         assert!(names.contains(&"count_star"));
         assert!(names.contains(&"numeric_min_max"));
         assert!(names.contains(&"group_top_k"));
+        // Date32 is orderable but NOT averageable: this schema's only
+        // orderable column is the date, so min/max targets it and the
+        // mean filter is absent — never `AVG(date)`.
+        let min_max = battery
+            .iter()
+            .find(|q| q.name == "numeric_min_max")
+            .unwrap();
+        assert!(min_max.sql.contains("\"EventDate\""));
+        assert!(!names.contains(&"count_above_mean"));
         // The grouped query prefers the non-FTS string column.
         let group = battery.iter().find(|q| q.name == "group_top_k").unwrap();
         assert!(group.sql.contains("\"Title\""));
@@ -153,5 +189,45 @@ mod tests {
         for q in battery {
             assert!(q.sql.contains(TABLE), "{} must query {TABLE}", q.name);
         }
+    }
+
+    /// A true numeric column gets the mean filter, an embedded quote in
+    /// a column name is doubled, and two schemas in one process each get
+    /// their own battery (no process-global cache to go stale).
+    #[test]
+    fn battery_handles_numerics_quoting_and_multiple_schemas() {
+        let spec = SqlCorpusSpec {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("watch\"count", DataType::Int64, true),
+                Field::new("label", DataType::Utf8, true),
+            ])),
+            fts_columns: Vec::new(),
+            vector: None,
+        };
+        let battery = battery_for(&spec);
+        let mean = battery
+            .iter()
+            .find(|q| q.name == "count_above_mean")
+            .expect("Int64 column must produce the mean filter");
+        assert!(mean.sql.contains("\"watch\"\"count\""), "{}", mean.sql);
+
+        let other = SqlCorpusSpec {
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "score",
+                DataType::Float32,
+                true,
+            )])),
+            fts_columns: Vec::new(),
+            vector: None,
+        };
+        let other_battery = battery_for(&other);
+        let other_min_max = other_battery
+            .iter()
+            .find(|q| q.name == "numeric_min_max")
+            .expect("second schema derives its own battery");
+        assert!(
+            other_min_max.sql.contains("\"score\""),
+            "stale battery served"
+        );
     }
 }
