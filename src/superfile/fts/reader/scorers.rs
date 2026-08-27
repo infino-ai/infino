@@ -1860,7 +1860,6 @@ impl FtsReader {
             // `(doc, essential-score)` list (dropping negated docs), then run
             // the reference pipeline: SIMD-filter to competitive survivors,
             // complete the non-essentials over the survivors only, collect.
-            let non_ess_ub = partial_max[f_essential];
             let (_, non_ess) = cursors.split_at_mut(f_essential);
             let heap_full = heap.len() >= k;
             let words = ((window_end - base) as usize)
@@ -1893,7 +1892,6 @@ impl FtsReader {
             // budget) before each and batch-scoring matches — so weaker terms
             // touch a shrinking survivor set. While filling, every doc must be
             // admitted, so score all non-essentials over every candidate.
-            let _ = non_ess_ub;
             if heap_full && !non_ess.is_empty() {
                 let nn = non_ess.len();
                 for jj in 0..nn {
