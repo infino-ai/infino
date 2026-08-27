@@ -542,6 +542,9 @@ mod tests {
     /// subsequent query would silently rebuild the router in memory.
     #[test]
     fn build_live_set_contains_centroid_graph_section() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let hash = ContentHash::of(b"slow state");
         let uri = slow_vector_state::storage_path(&hash);
         let centroid_graph_hash = ContentHash::of(b"centroid router section");
@@ -551,7 +554,7 @@ mod tests {
             TEST_MANIFEST_ID,
             opts(),
             Vec::new(),
-            None,
+            Some(storage),
             Some(Manifest {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
