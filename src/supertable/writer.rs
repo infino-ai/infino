@@ -2053,8 +2053,8 @@ impl SupertableWriter {
             }
             if crate::storage::io_counters::timeline_enabled() {
                 info!(
-                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
-                     publish {:.1}ms ({:.1} MiB data PUT)",
+                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + upload drain \
+                     {:.1}ms + prepare {:.1}ms + publish {:.1}ms ({:.1} MiB data PUT)",
                     build_elapsed.as_secs_f64() * 1e3,
                     output_bytes as f64 / (1u64 << 20) as f64,
                     upload_drain_elapsed.as_secs_f64() * 1e3,
