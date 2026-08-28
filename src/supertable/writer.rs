@@ -5869,7 +5869,18 @@ async fn upload_prepared_shards(
                         continue;
                     }
                     let Some((uri, bytes)) = prepared.bytes_for_storage.take() else {
-                        done.push((shard_id, prepared));
+                        // Unreachable as written: `prepare_superfile` fills
+                        // `bytes_for_storage` whenever the table has storage,
+                        // and this path runs only when it does. Fail closed
+                        // regardless — accepting the shard would hand
+                        // `collect_prepared_superfiles` an entry to publish
+                        // for an object nothing ever PUT, which is the same
+                        // hazard the collected-shards guard above refuses.
+                        failure.get_or_insert_with(|| {
+                            BuildError::Store(format!(
+                                "pipelined shard {shard_id} carries no storage bytes"
+                            ))
+                        });
                         continue;
                     };
                     uploaded_bytes += bytes.len() as u64;
