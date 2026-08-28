@@ -384,6 +384,19 @@ pub struct SupertableWriter {
     /// allocation. (`buffer_vector_bytes` is the exact f32 payload on
     /// either reading; slices share nothing wider than their rows.)
     buffer_fts_bytes: usize,
+    /// Visible (slice-aware) scalar bytes across `buffer`: what a build
+    /// will actually read, rather than the allocation the buffer holds.
+    ///
+    /// Separate from `buffer_scalar_bytes` because the two answer
+    /// different questions and the right measure is opposite for each.
+    /// Held memory is capacity: a slice pins its parent's whole buffer,
+    /// so that *is* the resident cost, and the auto-flush threshold
+    /// should see it. Build scratch scales with the rows the builder
+    /// touches, so it must not. Feeding capacity to the reserve made a
+    /// batch decoded from an Arrow IPC stream look ~160x its size,
+    /// because that decode points every child array at one shared
+    /// message buffer and capacity bills each child for all of it.
+    buffer_scalar_visible_bytes: usize,
     /// Ingested work for the batches sitting in `buffer`, computed at
     /// `append` time from the caller's own batch and held here until the
     /// commit that publishes them returns `Ok`. Counting at append time is
@@ -1001,6 +1014,7 @@ impl Supertable {
                 buffer_scalar_bytes: 0,
                 buffer_vector_bytes: 0,
                 buffer_fts_bytes: 0,
+                buffer_scalar_visible_bytes: 0,
                 pending_ingest: IngestTally::default(),
                 pending_updates: Vec::new(),
                 pending_deletes: Vec::new(),
@@ -1149,6 +1163,11 @@ impl SupertableWriter {
         self.buffer_scalar_bytes += scalar_bytes;
         self.buffer_vector_bytes += vector_bytes;
         self.buffer_fts_bytes += fts_bytes;
+        // `ingested_byte_legs` measured this already, on `scalar_no_id`. The
+        // engine-minted `_id` column is left out: 16 bytes a row against a
+        // payload measured in kilobytes, and counting it here would mean
+        // measuring a second batch to no purpose.
+        self.buffer_scalar_visible_bytes += scalar_bytes_u64 as usize;
 
         // Per-op work stats: the write's input shape, counted here from
         // the caller's batch — before any shard split or commit retry — so
@@ -1793,7 +1812,7 @@ impl SupertableWriter {
         // Held until this function returns, i.e. past `publish_superfiles` below.
         let _build_guard = reserve_build_scratch(
             &self.inner.options.connection_memory_budget,
-            self.buffer_scalar_bytes,
+            self.buffer_scalar_visible_bytes,
             self.buffer_vector_bytes,
             self.buffer_fts_bytes,
         )?;
@@ -1803,11 +1822,13 @@ impl SupertableWriter {
         let saved_scalar = self.buffer_scalar_bytes;
         let saved_vector = self.buffer_vector_bytes;
         let saved_fts = self.buffer_fts_bytes;
+        let saved_scalar_visible = self.buffer_scalar_visible_bytes;
         let saved_ingest = mem::take(&mut self.pending_ingest);
         let buffer = mem::take(&mut self.buffer);
         self.buffer_scalar_bytes = 0;
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
+        self.buffer_scalar_visible_bytes = 0;
 
         match self.commit_appends_with_taken_buffer(&buffer) {
             Ok(()) => {
@@ -1829,6 +1850,7 @@ impl SupertableWriter {
                 self.buffer_scalar_bytes = saved_scalar;
                 self.buffer_vector_bytes = saved_vector;
                 self.buffer_fts_bytes = saved_fts;
+                self.buffer_scalar_visible_bytes = saved_scalar_visible;
                 self.pending_ingest = saved_ingest;
                 Err(e)
             }
@@ -2162,7 +2184,12 @@ impl ShardOutput {
     }
 }
 
-/// Reserve the build's estimated transient heap:
+/// Reserve the build's estimated transient heap.
+///
+/// Every leg is visible bytes, not buffer capacity: this sizes work the build
+/// is about to do, so it has to follow the rows the builder will touch rather
+/// than whatever allocation those rows happen to sit inside.
+///
 ///
 /// estimate = (2.5*scalar_raw_bytes + 6.5*vector_raw_bytes + 1.5*fts_text_raw_bytes)
 ///

@@ -14,12 +14,15 @@
 
 use std::{io::Cursor, sync::Arc, time::Duration};
 
-use arrow::json::ReaderBuilder;
+use arrow::{
+    ipc::{reader::StreamReader, writer::StreamWriter},
+    json::ReaderBuilder,
+};
 use infino::{
-    Bm25SearchOptions, BoolMode, Connection, IndexSpec, OptimizeOptions,
+    Bm25SearchOptions, BoolMode, ConnectOptions, Connection, IndexSpec, OptimizeOptions,
     arrow_array::{Array, Int64Array, ListArray, RecordBatch, StructArray},
     arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit},
-    connect,
+    connect, connect_with,
 };
 use tempfile::TempDir;
 
@@ -388,4 +391,93 @@ fn nested_schema_survives_reopen_compaction_and_gc() {
         TALLEST_IMAGE_HEIGHT,
         "nested values must survive the rewrite unchanged"
     );
+}
+
+/// Rows enough that the shared-buffer effect is unmistakable rather than noise.
+const BUDGET_FIXTURE_ROWS: usize = 400;
+
+/// One nested row, repeated, as newline-delimited JSON.
+fn many_nested_rows(rows: usize) -> String {
+    let mut out = String::new();
+    for i in 0..rows {
+        out.push_str(&format!(
+            r#"{{"title":"article {i}","image":{{"content_url":"https://example.test/{i}.png","height":{i}}},"entities":[{{"identifier":"Q{i}","url":"https://example.test/Q{i}"}}],"updated":"2026-01-02T03:04:05Z"}}"#
+        ));
+        if i + 1 < rows {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Send a batch through an Arrow IPC stream and back, the way a hosted append
+/// reaches the engine.
+fn ipc_round_trip(batch: &RecordBatch) -> RecordBatch {
+    let mut buf = Vec::new();
+    {
+        let mut w = StreamWriter::try_new(&mut buf, &batch.schema()).expect("ipc writer");
+        w.write(batch).expect("ipc write");
+        w.finish().expect("ipc finish");
+    }
+    StreamReader::try_new(Cursor::new(buf), None)
+        .expect("ipc reader")
+        .next()
+        .expect("one batch")
+        .expect("decodable")
+}
+
+/// Visible bytes of a batch: the rows it spans, not the allocation they sit in.
+fn visible_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0))
+        .sum()
+}
+
+#[test]
+fn build_budget_measures_rows_not_the_buffer_they_share() {
+    // An Arrow IPC decode points every child array at one shared message
+    // buffer. A nested schema has many children, and measuring buffer capacity
+    // bills each of them for the whole message, so the batch reads as orders of
+    // magnitude larger than it is. The build reserve then refuses a batch that
+    // fits comfortably -- and only over a hosted connection, since decoding
+    // parquet locally gives each column buffers of its own.
+    let schema = nested_schema();
+    let decoded = ipc_round_trip(&batch_from_json(
+        schema.clone(),
+        &many_nested_rows(BUDGET_FIXTURE_ROWS),
+    ));
+
+    let visible = visible_bytes(&decoded);
+    let capacity = decoded.get_array_memory_size();
+    assert!(
+        capacity > visible * 4,
+        "fixture must exhibit the inflation it is testing: \
+         capacity {capacity} B vs visible {visible} B"
+    );
+
+    // A budget of one capacity-measure. Reserving 2.5x the visible size fits
+    // inside it; reserving 2.5x the capacity cannot.
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect_with(
+        dir.path().to_str().expect("utf-8 path"),
+        ConnectOptions::new().with_connection_memory_budget_bytes(capacity as u64),
+    )
+    .expect("connect");
+    let table = db
+        .create_table(TABLE, schema, IndexSpec::new().fts("title"))
+        .expect("create_table");
+
+    table
+        .append(&decoded)
+        .expect("a batch this size must fit the budget");
+
+    let rows: usize = db
+        .query_sql(&format!("SELECT title FROM {TABLE}"))
+        .expect("query_sql")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, BUDGET_FIXTURE_ROWS, "every row must be committed");
 }
