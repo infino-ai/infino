@@ -427,14 +427,19 @@ pub struct CellRoutingParams {
     pub rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
     /// Per-table centroid-graph router fanout: the number of fine clusters the
     /// `ivf_router = centroid_graph` selection reads GLOBALLY, per `k`,
-    /// calibrated at the same [`WIDTH_LAW_KS`] points. First-order prior is the
-    /// width law times the fine-depth law (`width_for_k × fine_for_k` — the
-    /// cells-to-probe times the fine-runs-per-cell that together cover the
-    /// top-k), clamped to the table's total fine-cluster count. `0` =
-    /// uncalibrated; all-zero (older manifests, or the router off at drain)
-    /// means the reader falls back to the `vector.global_fine_fanout` constant.
-    /// The router derives its graph `ef` from this fanout (×2), so a per-table
-    /// fanout gives a per-table `ef`.
+    /// calibrated at the same [`WIDTH_LAW_KS`] points. The drain's third
+    /// calibration stage measures it directly — the smallest number of nearest
+    /// GLOBAL fine centroids whose coverage of the exact top-k meets the recall
+    /// target — capped at the `width_for_k × fine_for_k` prior. A `0` means "no
+    /// fanout at this `k`": EITHER uncalibrated (older manifests, router off at
+    /// drain, or a `k` the sample can't support) OR "GFC loses" (the crossing
+    /// needs more than the prior — the grid already routes at least as tightly).
+    /// Both resolve to `None` in [`Self::fanout_for_k_at`], so the reader falls
+    /// back to the `vector.global_fine_fanout` constant and `auto` picks
+    /// stamped. Set only by a FULL calibration (which overwrites in either
+    /// direction, clearing a stale win or loss); an incremental drain, whose
+    /// partial centroid set can't measure a global fanout, carries it forward.
+    /// The router derives its graph `ef` from a positive fanout (×2).
     pub fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
@@ -496,7 +501,38 @@ impl CellRoutingParams {
     /// `None` when uncalibrated (all-zero), so the router falls back to the
     /// `vector.global_fine_fanout` constant.
     pub(crate) fn fanout_for_k_at(&self, k: usize) -> Option<usize> {
-        Self::law_at(&self.fanout_for_k, k)
+        // Unlike width/fine, the fanout law does NOT skip zeros: a `0` at (or
+        // bracketing) the query's `k` means "no fanout applies at this k" —
+        // either uncalibrated or "GFC loses" — so it must resolve to `None`
+        // (reader → constant, `auto` → stamped), never interpolate a positive
+        // value across the gap. Only a k whose bracketing knots are BOTH
+        // calibrated returns an interpolated fanout.
+        let law = &self.fanout_for_k;
+        let k = k.max(1);
+        // An exact knot match resolves to that knot directly.
+        if let Some(i) = WIDTH_LAW_KS.iter().position(|&kp| kp == k) {
+            return (law[i] > 0).then_some(law[i] as usize);
+        }
+        // At/below the first knot, or at/above the last: clamp to that knot.
+        if k <= WIDTH_LAW_KS[0] {
+            return (law[0] > 0).then_some(law[0] as usize);
+        }
+        let last = WIDTH_LAW_KS.len() - 1;
+        if k >= WIDTH_LAW_KS[last] {
+            return (law[last] > 0).then_some(law[last] as usize);
+        }
+        // Strictly between two knots: log-linear interpolation, but only when
+        // BOTH ends of the bracket are calibrated.
+        let hi = WIDTH_LAW_KS.iter().position(|&kp| kp >= k)?;
+        let (w0, w1) = (law[hi - 1], law[hi]);
+        if w0 == 0 || w1 == 0 {
+            return None;
+        }
+        let x = (k as f64).ln();
+        let x0 = (WIDTH_LAW_KS[hi - 1] as f64).ln();
+        let x1 = (WIDTH_LAW_KS[hi] as f64).ln();
+        let t = (x - x0) / (x1 - x0);
+        Some((f64::from(w0) + t * (f64::from(w1) - f64::from(w0))).ceil() as usize)
     }
 
     /// The rerank law at this query's `k` — same log-linear interpolation
@@ -3000,6 +3036,52 @@ mod tests {
             bare.fanout_for_k_at(100).unwrap_or(CONSTANT),
             CONSTANT,
             "no stamp falls back to the constant"
+        );
+
+        // A per-k `0` (uncalibrated or "GFC loses") is HONORED at that k — it
+        // must NOT interpolate/clamp into a positive value across the gap.
+        let partial = CellRoutingParams {
+            fanout_for_k: [2, 5, 0, 0],
+            ..CellRoutingParams::default()
+        };
+        assert_eq!(partial.fanout_for_k_at(1), Some(2), "calibrated knot k=1");
+        assert_eq!(partial.fanout_for_k_at(10), Some(5), "calibrated knot k=10");
+        assert_eq!(
+            partial.fanout_for_k_at(100),
+            None,
+            "a 0 at knot k=100 resolves None, not clamped to k=10's 5"
+        );
+        assert_eq!(
+            partial.fanout_for_k_at(1000),
+            None,
+            "a 0 at knot k=1000 resolves None, not clamped up"
+        );
+        assert_eq!(
+            partial.fanout_for_k_at(50),
+            None,
+            "a bracket [k=10:5, k=100:0] with a 0 end resolves None"
+        );
+        // A leading 0 at the first knot: below/at k=1 resolves None; the
+        // bracket to the next knot also has a 0 end.
+        let leading_zero = CellRoutingParams {
+            fanout_for_k: [0, 5, 30, 48],
+            ..CellRoutingParams::default()
+        };
+        assert_eq!(leading_zero.fanout_for_k_at(1), None, "0 at the first knot");
+        assert_eq!(
+            leading_zero.fanout_for_k_at(5),
+            None,
+            "bracket [k=1:0, k=10:5] with a 0 end resolves None"
+        );
+        assert_eq!(leading_zero.fanout_for_k_at(10), Some(5), "calibrated knot");
+        // Fully calibrated: interpolation still works between two nonzero knots.
+        let full = CellRoutingParams {
+            fanout_for_k: [2, 6, 30, 48],
+            ..CellRoutingParams::default()
+        };
+        assert!(
+            matches!(full.fanout_for_k_at(50), Some(v) if (6..=30).contains(&v)),
+            "interpolates between calibrated knots"
         );
     }
 

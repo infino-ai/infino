@@ -28,7 +28,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
@@ -932,6 +932,11 @@ struct GlobalFanoutState {
     /// GT candidate row `(stable id, surviving cell)` -> its global cluster
     /// index into `centroid_bytes`.
     row_cluster: HashMap<(i128, u32), u32>,
+    /// Grid cells whose fine centroids were unioned in. Used to tell a FULL
+    /// observation (every non-empty cell packed this pass) from an incremental
+    /// one (only the new tail): a partial global set can't measure a global
+    /// fanout, so only a full observation stamps or clears it.
+    observed_cells: HashSet<u32>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -986,10 +991,33 @@ pub(crate) struct CalibratedLaws {
     pub(crate) pool_cells: u32,
     /// Centroid-graph router fanout: the smallest number of nearest GLOBAL
     /// fine centroids that covers the exact top-k at the target, capped at the
-    /// `width × fine` prior. `0` = uncalibrated OR "GFC loses" (the crossing
-    /// needs more than the prior — the grid already routes at least as tightly,
-    /// so the reader falls back to the constant and `auto` to stamped).
+    /// `width × fine` prior. `0` = "no fanout at this k" — EITHER uncalibrated
+    /// OR "GFC loses" (the crossing needs more than the prior). The two are
+    /// read-identical (both make the reader fall back to the constant and
+    /// `auto` pick stamped); they differ only in the stamp merge, disambiguated
+    /// by [`Self::fanout_complete`], not by the value.
     pub(crate) fanout_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Whether this calibration observed the FULL global fine-centroid set
+    /// (every non-empty grid cell packed this pass). Only a full observation
+    /// can measure a GLOBAL fanout, so the stamp OVERWRITES `fanout_for_k`
+    /// (clearing a stale win or a stale loss in either direction) only when
+    /// this is `true`; an incremental/partial pass (`false`) leaves the prior
+    /// fanout untouched rather than latching an under-measured value.
+    pub(crate) fanout_complete: bool,
+}
+
+/// Unit-normalize in place — the transform `ivf_router = centroid_graph`
+/// applies to fine centroids and the query for `Cosine` before scoring (fine
+/// centroids are means of unit vectors, not themselves unit). The fanout stage
+/// applies the SAME transform so it ranks centroids exactly as the reader does.
+fn unit_normalize(v: &mut [f32]) {
+    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        let inv = 1.0 / n;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1481,6 +1509,7 @@ impl WidthLawCalibration {
                 let offset = (g.centroid_bytes.len() / stride) as u32;
                 g.centroid_bytes
                     .extend_from_slice(&view.fine_centroids_bytes);
+                g.observed_cells.insert(cell_id);
                 if let Some(cands) = per_cell.get(&cell_id) {
                     for &(_, id) in cands {
                         if let Some(&local) = view.cluster_of_stable.get(&id) {
@@ -1753,20 +1782,49 @@ impl WidthLawCalibration {
             .unwrap_or_else(PoisonError::into_inner);
         let stride = self.dim * 4;
         let n_global = global.centroid_bytes.len().checked_div(stride).unwrap_or(0);
-        if n_global > 0 {
+        // Full observation iff every non-empty grid cell was packed + unioned
+        // this pass (a full drain/rebuild); an incremental pass sees only the
+        // new tail, whose partial global set can't measure a GLOBAL fanout.
+        let non_empty_cells = grid.counts.iter().filter(|&&c| c > 0).count();
+        let fanout_complete = non_empty_cells > 0 && global.observed_cells.len() >= non_empty_cells;
+        // The router normalizes fine centroids AND the query for Cosine before
+        // scoring (means of unit vectors aren't unit); rank against the SAME
+        // transform so the calibrated ordering is the one the reader uses.
+        // NegDot / L2Sq score raw magnitudes — no transform.
+        let scored_bytes = if self.metric == Metric::Cosine {
+            let mut normalized = global.centroid_bytes.clone();
+            for chunk in normalized.chunks_exact_mut(stride) {
+                let mut v: Vec<f32> = chunk
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                unit_normalize(&mut v);
+                for (dst, s) in chunk.chunks_exact_mut(4).zip(v) {
+                    dst.copy_from_slice(&s.to_le_bytes());
+                }
+            }
+            normalized
+        } else {
+            global.centroid_bytes.clone()
+        };
+        if fanout_complete && n_global > 0 {
             let cap = fanout_prior_for_k(&law, &fine_law, n_global.min(u32::MAX as usize) as u32);
             let cap_max = cap.iter().copied().max().unwrap_or(0) as usize;
             if cap_max > 0 {
                 let mut fanout_sums: Vec<Vec<f64>> = vec![vec![0f64; cap_max]; WIDTH_LAW_KS.len()];
                 let mut rank_of_global = vec![u32::MAX; n_global];
+                let mut q_scratch = vec![0f32; self.dim];
                 for (qi, cand) in tops.iter().enumerate() {
-                    let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
+                    q_scratch.copy_from_slice(&frozen.queries[qi * self.dim..(qi + 1) * self.dim]);
+                    if self.metric == Metric::Cosine {
+                        unit_normalize(&mut q_scratch);
+                    }
                     // Exact global centroid ranking (top `cap_max`) — the SAME
-                    // kernel the router's query-time selection uses.
+                    // kernel + transform the router's query-time selection uses.
                     let ranked = nearest_k_centroids_bytes(
                         self.metric,
-                        q,
-                        &global.centroid_bytes,
+                        &q_scratch,
+                        &scored_bytes,
                         n_global,
                         self.dim,
                         cap_max,
@@ -1819,6 +1877,7 @@ impl WidthLawCalibration {
             rerank_for_k: rerank_law,
             pool_cells: self.pool_cells as u32,
             fanout_for_k: fanout_law,
+            fanout_complete,
         })
     }
 }
@@ -2259,6 +2318,133 @@ mod tests {
             laws.fanout_for_k[0], 0,
             "GFC needs a 2nd global cluster (a nearer distractor in cell 1) but \
              the grid's W×F is 1 — GFC loses, sentinel 0"
+        );
+    }
+
+    /// The fanout stage ranks global centroids the way the Cosine router does —
+    /// unit-normalizing centroids AND the query — not raw `-dot`. A GT row's
+    /// cluster that a higher-MAGNITUDE distractor beats on raw dot but not on
+    /// cosine must rank first, so the calibrated fanout matches the reader.
+    #[test]
+    fn fanout_stage_ranks_by_cosine_not_raw_dot() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1]);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // One GT top-1 row (id 1) in the on-axis cluster 0.
+        let mut acc = Vec::new();
+        merge_candidates(
+            &mut acc,
+            vec![(0.01f32, 0u32, 1i128, f32::NEG_INFINITY)],
+            WIDTH_LAW_MAX_K,
+        );
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+
+        // Cluster 0 = the query's exact direction (unit). Cluster 1 = a
+        // higher-magnitude off-axis vector: raw dot(e0, c1)=1.5 > dot(e0,c0)=1
+        // (raw ranks c1 first), but cosine dot(e0, c1_norm)=0.83 < 1 (cosine
+        // ranks c0 first). The GT row is in c0.
+        let mut members = HashMap::new();
+        members.insert(1i128, 0u32);
+        let view = CellFineCalibrationView {
+            cell_id: Some(0),
+            dim: DIM,
+            n_fine: 2,
+            fine_centroids_bytes: fp32_le_bytes(&[
+                1.0, 0.0, 0.0, 0.0, // cluster 0 (unit, on-axis)
+                1.5, 1.0, 0.0, 0.0, // cluster 1 (bigger magnitude, off-axis)
+            ]),
+            cluster_of_stable: members,
+        };
+        cal.observe_shard_views(&[view]);
+
+        let laws = cal.finish(&grid).expect("laws");
+        // The fine stage ranks by raw dot (the stamped path), so c0 sits at
+        // raw rank 1 → fine depth 2.
+        assert_eq!(
+            laws.fine_for_k[0], 2,
+            "raw-dot fine rank puts the higher-magnitude cluster first"
+        );
+        // The fanout stage normalizes (cosine), so c0 is the nearest cluster →
+        // fanout 1. If it scored raw dot, this would be 2 (matching fine).
+        assert_eq!(
+            laws.fanout_for_k[0], 1,
+            "cosine-normalized ranking puts the on-axis cluster first → fanout 1"
+        );
+    }
+
+    /// The fanout stage stamps only on a FULL observation — every non-empty
+    /// grid cell packed this pass. An incremental pass that sees a subset
+    /// reports `fanout_complete = false` and measures no fanout, so the writer
+    /// leaves the prior stamp untouched rather than latching a partial value.
+    #[test]
+    fn fanout_complete_requires_every_non_empty_cell() {
+        const DIM: usize = 4;
+        // Two non-empty grid cells.
+        let grid = ClusterCentroids::from_fp32(
+            2,
+            DIM as u32,
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            vec![1, 1],
+        );
+        let build = |observe_both: bool| {
+            let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
+            let mut query = vec![0.0f32; DIM];
+            query[0] = 1.0;
+            cal.frozen = Some(WidthLawQueries {
+                queries: query,
+                ids: vec![999],
+            });
+            let mut acc = Vec::new();
+            merge_candidates(
+                &mut acc,
+                vec![(0.01f32, 0u32, 1i128, f32::NEG_INFINITY)],
+                WIDTH_LAW_MAX_K,
+            );
+            *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+            let mut members = HashMap::new();
+            members.insert(1i128, 0u32);
+            let cell0 = CellFineCalibrationView {
+                cell_id: Some(0),
+                dim: DIM,
+                n_fine: 1,
+                fine_centroids_bytes: fp32_le_bytes(&[1.0, 0.0, 0.0, 0.0]),
+                cluster_of_stable: members,
+            };
+            if observe_both {
+                let cell1 = CellFineCalibrationView {
+                    cell_id: Some(1),
+                    dim: DIM,
+                    n_fine: 1,
+                    fine_centroids_bytes: fp32_le_bytes(&[0.0, 1.0, 0.0, 0.0]),
+                    cluster_of_stable: HashMap::new(),
+                };
+                cal.observe_shard_views(&[cell0, cell1]);
+            } else {
+                cal.observe_shard_views(&[cell0]);
+            }
+            cal.finish(&grid).expect("laws")
+        };
+
+        // Partial (only cell 0): incomplete, no fanout measured.
+        let partial = build(false);
+        assert!(!partial.fanout_complete, "one of two cells is not complete");
+        assert_eq!(
+            partial.fanout_for_k,
+            [0; WIDTH_LAW_KS.len()],
+            "a partial pass measures no fanout"
+        );
+        // Full (both cells): complete, fanout measured.
+        let full = build(true);
+        assert!(full.fanout_complete, "both non-empty cells observed");
+        assert!(
+            full.fanout_for_k[0] > 0,
+            "a full pass measures a positive fanout for the supported k"
         );
     }
 

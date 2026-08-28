@@ -4637,14 +4637,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 &routing.rerank_pool_cells,
             );
             // Stamp the CALIBRATED centroid-graph router fanout — the third
-            // calibration stage's measured knee, capped at the `width × fine`
-            // prior (a `0` means GFC needs ≈ the prior/full set, i.e. it does
-            // not beat the grid here). Max-merged like width/fine: an
-            // incremental drain sees only the tail (a partial global centroid
-            // set), which can only under-estimate the fanout, so it may widen
-            // the prior stamp but never narrow it; a full rebuild recalibrates.
-            for (slot, measured) in routing.fanout_for_k.iter_mut().zip(laws.fanout_for_k) {
-                *slot = (*slot).max(measured);
+            // stage's measured knee, capped at the `width × fine` prior (a `0`
+            // means uncalibrated OR "GFC loses"). OVERWRITTEN, not max-merged,
+            // and only on a FULL observation: a global fanout is meaningful only
+            // when the whole centroid set was seen, so an incremental/partial
+            // pass leaves the prior stamp untouched (never latches an
+            // under-measured value), while a full recalibration replaces it in
+            // either direction — clearing a stale win or a stale loss.
+            if laws.fanout_complete {
+                routing.fanout_for_k = laws.fanout_for_k;
             }
             info!(
                 "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}; fanout measured {:?} stamped {:?}",
@@ -7990,10 +7991,12 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
             *slot = (*slot).max(measured);
         }
-        // Centroid-graph fanout: MAX-merge like fine depth (a partial global
-        // centroid set under-measures the fanout; keep the deeper stamp).
-        for (slot, measured) in routing.fanout_for_k.iter_mut().zip(laws.fanout_for_k) {
-            *slot = (*slot).max(measured);
+        // Centroid-graph fanout: OVERWRITE on a full observation only (a global
+        // fanout can't be measured from a partial cell set), so a full
+        // recalibration clears a stale win or loss in either direction and a
+        // partial pass carries the prior forward. Never max-merged.
+        if laws.fanout_complete {
+            routing.fanout_for_k = laws.fanout_for_k;
         }
         // Same per-knot merge + provenance as the drain stamp.
         opann::merge_rerank_with_pools(
