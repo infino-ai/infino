@@ -492,14 +492,27 @@ fn parse_args() -> Selection {
 }
 
 fn main() {
+    // Every bench run installs a subscriber, unconditionally
+    // `RUST_LOG` overrides; unset, default to `infino=debug` so the engine's
+    // own diagnostics always surface in CI without a caller having to know
+    // the right directive.
+    //
     // Span-timing diagnosis: with a `--features detailed-tracing` build,
-    // `INFINO_TRACE_SPANS=1` (+ `RUST_LOG=infino=info`) prints every
-    // instrumented span's busy time on close — per-stage attribution for
-    // query-path latency without touching engine code.
+    // `INFINO_TRACE_SPANS=1` additionally prints every instrumented span's
+    // busy time on close — per-stage attribution for query-path latency
+    // without touching engine code.
+    let env_filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,infino=debug"))
+    };
     if std::env::var("INFINO_TRACE_SPANS").is_ok() {
         tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
+            .with_env_filter(env_filter())
             .with_span_events(FmtSpan::CLOSE)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
             .with_writer(std::io::stderr)
             .init();
     }

@@ -88,6 +88,7 @@ use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
+use tracing::debug;
 
 use crate::superfile::{
     BuildError,
@@ -2907,7 +2908,7 @@ impl FtsBuilder {
                         let merge_total = merge_profile_start.elapsed();
                         let encode_total = finish_profile.encode_total - encode_total_before;
                         let non_encode = merge_total.saturating_sub(encode_total);
-                        eprintln!(
+                        debug!(
                             "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s fst_insert={:.3}s",
                             col_name,
                             merge_total.as_secs_f64(),
@@ -3321,7 +3322,7 @@ fn assemble_and_write_blob<W: Write>(
     }
 
     if finish_profile.enabled {
-        eprintln!(
+        debug!(
             "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
             finish_profile.partition_flush.as_secs_f64(),
             finish_profile.lex_rank_build.as_secs_f64(),

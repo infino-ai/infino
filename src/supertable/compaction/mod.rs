@@ -456,7 +456,7 @@ impl Supertable {
 
         let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
         if clamped_components > 0 {
-            eprintln!(
+            warn!(
                 "[supertable compaction] BUG: {clamped_components} component(s) saturated \
                  their destination quantizer during this pass's merges/splits — a \
                  destination grid failed to cover its inputs; affected rows' recall \
