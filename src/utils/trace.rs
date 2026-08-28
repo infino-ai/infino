@@ -146,3 +146,25 @@ pub(crate) fn record<V: Value>(field: &'static str, value: V) {
         Span::current().record(field, value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The span-field vocabulary is an observability contract: dashboards
+    /// and log filters key on these exact strings, so a rename is a
+    /// breaking change to anything consuming the spans. Both renderings
+    /// are `const fn` returning `&'static str`, and only the span sites
+    /// call them — which are behind `detailed-tracing`, so nothing else
+    /// in a default build pins the spelling.
+    #[test]
+    fn span_field_renderings_are_stable() {
+        assert_eq!(OpOrigin::Query.as_str(), "query");
+        assert_eq!(OpOrigin::Ingest.as_str(), "ingest");
+        assert_eq!(OpOrigin::Optimize.as_str(), "optimize");
+        assert_eq!(OpOrigin::Maintenance.as_str(), "maintenance");
+        assert_eq!(OpOrigin::Open.as_str(), "open");
+        assert_eq!(TableRole::User.as_str(), "user");
+        assert_eq!(TableRole::VectorIndex.as_str(), "vector_index");
+    }
+}

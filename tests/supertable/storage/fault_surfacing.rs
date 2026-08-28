@@ -275,6 +275,14 @@ fn drain_surfaces_a_hidden_index_put_fault_and_re_runs() {
         committed_id,
         "the user table is the durable source and the drain never rewrites it"
     );
+    // A wrapped provider is not a local directory, so the mmap fast path
+    // must decline it: `local_path` returning `Some` here would hand an
+    // open-time caller a path that does not name the object it wants.
+    let wrapped: &dyn StorageProvider = faults.as_ref();
+    assert!(
+        wrapped.local_path("data/anything").is_none(),
+        "a wrapper provider has no local directory to mmap from"
+    );
 
     // Fault spent: the drain re-runs from the same user superfiles.
     st.drain_vectors_to_cells_sync()
