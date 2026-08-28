@@ -22,6 +22,8 @@ use std::{
     time::Duration,
 };
 
+use tracing::debug;
+
 /// Force the global allocator (mimalloc, default-on) to return freed-but-
 /// retained arenas to the OS. No-op when mimalloc is not the global allocator.
 pub fn purge_allocator() {
@@ -217,7 +219,7 @@ pub fn log_rss_breakdown(label: &str) {
     let Some((rss, anon, file_backed, shmem)) = settled_rss_breakdown() else {
         return;
     };
-    eprintln!(
+    debug!(
         "[rss-breakdown] {label}: rss={} anonymous={} file_backed={} shmem={}",
         fmt_bytes(rss),
         fmt_bytes(anon),

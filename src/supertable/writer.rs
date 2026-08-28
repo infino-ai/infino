@@ -1955,7 +1955,7 @@ impl SupertableWriter {
                 stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
             }
             if crate::storage::io_counters::timeline_enabled() {
-                eprintln!(
+                info!(
                     "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
                      publish {:.1}ms ({:.1} MiB data PUT)",
                     build_elapsed.as_secs_f64() * 1e3,
@@ -3632,7 +3632,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     }
     let batch_cfg = drain_batch_superfiles(&user_inner.options);
     if batch_cfg == 0 {
-        eprintln!("[supertable drain] skipped (drain_batch_superfiles = 0)");
+        info!("[supertable drain] skipped (drain_batch_superfiles = 0)");
         return Ok(());
     }
 
@@ -3742,7 +3742,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .cloned()
             .collect();
         if selected.is_empty() {
-            eprintln!(
+            info!(
                 "[supertable drain] nothing to drain: all {} user superfile(s) already drained",
                 sources.len()
             );
@@ -4040,7 +4040,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             } else {
                 0.0
             };
-            eprintln!(
+            info!(
                 "[supertable drain] batch {}/{} materialize I/O: {} object reads, {:.1} MiB, wall {:.1}ms, Σdur {:.1}ms, implied concurrency {:.1}x ({} range-gets)",
                 batch_idx + 1,
                 n_batches,
@@ -4296,7 +4296,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             DrainTestFailurePhase::AfterBatch,
             local_checkpoint.batches_done,
         )?;
-        eprintln!(
+        info!(
             "[supertable drain] batch {}/{} ({} sf, {batch_log})",
             batch_idx + 1,
             n_batches,
@@ -4759,7 +4759,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         {
             tracing::warn!("drain local checkpoint cleanup failed: {error}");
         }
-        eprintln!(
+        info!(
             "[supertable drain] cell build: {} row(s), {} cell(s) -> {} packed shard superfile(s) for {} worker(s), {:.1}ms",
             total_rows,
             n_cells_total,
@@ -4770,13 +4770,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
             let (train_ms, assign_ms, calib_ms) =
                 crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
-            eprintln!(
+            info!(
                 "[supertable drain] cell build phases (summed CPU, {n_cells_total} cells): train {train_ms:.1}ms + assign {assign_ms:.1}ms + calibrate {calib_ms:.1}ms",
             );
         }
     }
 
-    eprintln!(
+    info!(
         "[supertable drain] done ({}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
         match consolidate {
             DrainConsolidate::Kmeans => "kmeans",
@@ -4794,7 +4794,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     );
     let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
     if clamped_components > 0 {
-        eprintln!(
+        warn!(
             "[supertable drain] BUG: {clamped_components} component(s) saturated their \
              destination quantizer during this drain's re-encodes. Cosine: an ingest \
              path bypassed normalization; L2/NegDot: a destination grid failed to \
@@ -5842,7 +5842,7 @@ fn commit_shards_via_drain(
         .saturating_sub(flatten_elapsed)
         .saturating_sub(assign_elapsed);
     if crate::storage::io_counters::timeline_enabled() {
-        eprintln!(
+        info!(
             "[supertable commit] flatten {:.1}ms + assign {:.1}ms + shard pack/finish {:.1}ms",
             flatten_elapsed.as_secs_f64() * 1e3,
             assign_elapsed.as_secs_f64() * 1e3,

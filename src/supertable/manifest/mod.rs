@@ -56,6 +56,7 @@ use futures::future;
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
+use tracing::warn;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -1598,7 +1599,7 @@ impl ManifestSnapshot {
                 Some(cache)
             }
             Err(error) => {
-                eprintln!(
+                warn!(
                     "[supertable] full-part centroid hydration unavailable ({error}); falling \
                      back to per-superfile centroid reads"
                 );
