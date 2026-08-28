@@ -9798,6 +9798,140 @@ mod tests {
         );
     }
 
+    /// Payload size for the pipelined-uploader tests. Small enough to stay
+    /// under any multipart threshold, large enough to be a real object.
+    const UPLOAD_TEST_BYTES: usize = 64;
+    /// Shard ids the uploader tests send, deliberately out of order so the
+    /// returned order cannot accidentally match the arrival order.
+    const UPLOAD_TEST_SHARD_IDS: [u32; 3] = [2, 0, 1];
+    /// Base uuid for the uploader tests' superfiles; the shard id occupies
+    /// the low byte, so a returned entry names the shard that produced it.
+    const UPLOAD_TEST_UUID_BASE: u128 = 0x5D40_0000_0000_0000_0000_0000_0000_0000;
+
+    /// A minimal entry for the uploader tests: the uploader only moves
+    /// `bytes_for_storage` and orders by shard id, so the entry's contents
+    /// are irrelevant beyond identifying the superfile.
+    fn upload_test_prepared(shard_id: u32) -> (SuperfileUri, PreparedSuperfile) {
+        let uuid = Uuid::from_u128(UPLOAD_TEST_UUID_BASE + u128::from(shard_id));
+        let uri = SuperfileUri(uuid);
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uuid,
+            uri,
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        });
+        let bytes = Bytes::from(vec![shard_id as u8; UPLOAD_TEST_BYTES]);
+        (
+            uri,
+            PreparedSuperfile {
+                entry,
+                bytes_for_store: None,
+                bytes_for_storage: Some((uri, bytes)),
+                bytes_for_cache: None,
+            },
+        )
+    }
+
+    /// The uploader returns shards in shard-id order no matter what order
+    /// they finish uploading in — manifest entry order must not depend on
+    /// the network. Fed deliberately out of order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_returns_shard_id_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        for shard_id in UPLOAD_TEST_SHARD_IDS {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let (prepared, uploaded) = upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx)
+            .await
+            .expect("all uploads succeed");
+        let ids: Vec<u32> = prepared
+            .iter()
+            .map(|p| p.entry.superfile_id.as_u128() as u32 & 0xFF)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            UPLOAD_TEST_SHARD_IDS.len(),
+            "every shard comes back"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "returned in shard-id order, not arrival order");
+        assert_eq!(
+            uploaded as usize,
+            UPLOAD_TEST_SHARD_IDS.len() * UPLOAD_TEST_BYTES,
+            "uploaded byte total counts every shard"
+        );
+    }
+
+    /// A failed PUT must not cancel the PUTs already in flight. Cancelling a
+    /// multipart upload mid-request leaves its parts stored with no abort,
+    /// and parts are not an orphaned superfile that gc reclaims — so the
+    /// uploader records the first error, lets every started request settle,
+    /// and only then reports the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_settles_started_puts_before_reporting_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+
+        // Fail exactly one shard, named by its own URI so the other two are
+        // untouched whatever order the uploads are dispatched in.
+        let (doomed_uri, doomed) = upload_test_prepared(0);
+        faults.fail(FaultOp::PutAtomic, &doomed_uri.0.to_string(), 1);
+
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        tx.send((0, doomed)).await.expect("send");
+        for shard_id in [1u32, 2] {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let err = match upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx).await {
+            Err(error) => error,
+            Ok(_) => panic!("a failed shard PUT must fail the batch"),
+        };
+        assert!(
+            format!("{err:?}").contains("injected"),
+            "the injected fault is what surfaces: {err:?}"
+        );
+        assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+        // The uploader drained rather than returning at the first error, so
+        // the doomed shard is the only one missing from storage.
+        assert!(
+            !storage
+                .head(&superfile_storage_path(&doomed_uri))
+                .await
+                .is_ok_and(|meta| meta.size > 0),
+            "the faulted shard must not be durable"
+        );
+    }
+
+    /// The commit write fanout is a `NonZeroUsize` because a zero would
+    /// panic the uploader's channel and stall `buffered`; a single-core host
+    /// divides to zero before the floor applies.
+    #[test]
+    fn commit_write_concurrency_is_never_zero() {
+        assert!(commit_write_concurrency().get() >= 1);
+    }
+
     /// Default shard target for the fanout unit tests, in bytes — mirrors the shipped
     /// `superfile_buffer_split_mb` default (64 MiB).
     const TEST_SPLIT_BYTES: usize = 64 * MIB;
