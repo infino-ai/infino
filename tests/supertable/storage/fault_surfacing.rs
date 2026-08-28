@@ -22,6 +22,7 @@ use bytes::Bytes;
 use datafusion::prelude::{col, lit};
 use infino::{
     InfinoError,
+    config::OptimizeOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
@@ -53,6 +54,10 @@ const VECTOR_ROT_SEED: u64 = 21;
 /// count. Two is the smallest width that puts one shard on the wire while
 /// another is still packing — the shape the pipelined publish exists for.
 const VECTOR_WRITERS: usize = 2;
+
+/// Commits made before the faulted optimize, so there is genuinely more
+/// than one superfile for maintenance to consider.
+const OPTIMIZE_FAULT_COMMITS: usize = 3;
 
 /// Top-k for the recovery searches; above corpus size.
 const FTS_TOP_K: usize = 8;
@@ -196,6 +201,92 @@ fn pipelined_commit_surfaces_shard_put_fault_and_recovers() {
         found > 0,
         "rows from the retried commit must be searchable, found {found}"
     );
+}
+
+/// Maintenance is not allowed to damage the table it is maintaining. A
+/// storage failure anywhere in `optimize` must leave every committed row
+/// readable and the next maintenance pass able to complete — whether the
+/// faulted pass reports the error or absorbs it as a skipped step.
+#[test]
+fn optimize_survives_a_storage_fault_without_losing_rows() {
+    let (st, batch, faults, _dir) = faulted_vector_table();
+    for _ in 0..OPTIMIZE_FAULT_COMMITS {
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    let rows_before = st.reader().expect("reader").n_superfiles();
+    assert!(
+        rows_before >= OPTIMIZE_FAULT_COMMITS,
+        "the sources committed"
+    );
+
+    faults.fail(FaultOp::PutAtomic, "data/", 1);
+    let outcome = st.optimize(&OptimizeOptions::default());
+    if let Err(error) = &outcome {
+        assert!(
+            format!("{error:?}").contains("injected"),
+            "a maintenance failure must name the injected fault: {error:?}"
+        );
+    }
+    assert_eq!(faults.fired(), 1, "the armed fault fired");
+
+    // Whatever the pass decided, the table is intact: every committed row
+    // is still searchable, and maintenance completes on a second pass.
+    let reader = st.reader().expect("reader");
+    let mut query = vec![0.0f32; VECTOR_DIM];
+    query[0] = 1.0;
+    let hits = reader
+        .vector_search("emb", &query, VECTOR_ROWS, Default::default(), None, None)
+        .expect("search after a faulted optimize");
+    let found: usize = hits.iter().map(|b| b.num_rows()).sum();
+    assert!(found > 0, "rows survive a faulted maintenance pass");
+    st.optimize(&OptimizeOptions::default())
+        .expect("maintenance completes once the fault clears");
+}
+
+/// The drain publishes the hidden vector index from durable user
+/// superfiles. A storage failure there must surface, leave the user table
+/// exactly as it was (it is the durable source, never rewritten by the
+/// drain), and leave the drain re-runnable — the next attempt rebuilds
+/// from the same user superfiles and serves.
+#[test]
+fn drain_surfaces_a_hidden_index_put_fault_and_re_runs() {
+    let (st, batch, faults, _dir) = faulted_vector_table();
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    let committed_id = st.manifest_id();
+    assert!(committed_id >= 1, "the source commit landed");
+
+    // Fail the hidden index's own superfile PUT. The token is the hidden
+    // table's prefix, so the user table's writes are untouched.
+    faults.fail(FaultOp::PutAtomic, "_vector_index/data/", 1);
+    let failed = st.drain_vectors_to_cells_sync();
+    assert!(
+        failed.is_err(),
+        "a failed hidden-index PUT must surface, got {failed:?}"
+    );
+    assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+    assert_eq!(
+        st.manifest_id(),
+        committed_id,
+        "the user table is the durable source and the drain never rewrites it"
+    );
+
+    // Fault spent: the drain re-runs from the same user superfiles.
+    st.drain_vectors_to_cells_sync()
+        .expect("drain re-runs once the fault clears");
+    let reader = st.reader().expect("reader");
+    let mut query = vec![0.0f32; VECTOR_DIM];
+    query[0] = 1.0;
+    let hits = reader
+        .vector_search("emb", &query, VECTOR_ROWS, Default::default(), None, None)
+        .expect("post-drain vector search");
+    let found: usize = hits.iter().map(|b| b.num_rows()).sum();
+    assert!(found > 0, "the re-run drain serves its rows, found {found}");
 }
 
 #[test]
