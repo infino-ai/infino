@@ -430,6 +430,10 @@ pub struct FtsReader {
     /// bitset-encoded, so the unranked count kernels prefer membership
     /// bit-tests (no decode) over decoding a common term's blocks.
     pub(super) has_bitset_blocks: bool,
+    /// True iff the blob is `VERSION_V5` — each PFOR term's postings region
+    /// ends with a coarse block-max table. `V1`–`V4` blobs lack it, so the
+    /// ranked walk skips the coarse level and the threshold seed there.
+    pub(super) has_coarse_block_max: bool,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -486,6 +490,7 @@ impl FtsReader {
             && version != format::fts::VERSION_V2
             && version != format::fts::VERSION_V3
             && version != format::fts::VERSION_V4
+            && version != format::fts::VERSION_V5
         {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
@@ -499,7 +504,8 @@ impl FtsReader {
         let header_size = match version {
             v if v == format::fts::VERSION_V2
                 || v == format::fts::VERSION_V3
-                || v == format::fts::VERSION_V4 =>
+                || v == format::fts::VERSION_V4
+                || v == format::fts::VERSION_V5 =>
             {
                 format::fts::HEADER_SIZE_V2
             }
@@ -589,15 +595,20 @@ impl FtsReader {
             v if v == format::fts::VERSION_V2 => true,
             v if v == format::fts::VERSION_V3 => true,
             v if v == format::fts::VERSION_V4 => true,
+            v if v == format::fts::VERSION_V5 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
                 ))));
             }
         };
-        let has_position_subindex =
-            version == format::fts::VERSION_V3 || version == format::fts::VERSION_V4;
-        let has_bitset_blocks = version == format::fts::VERSION_V4;
+        let has_position_subindex = version == format::fts::VERSION_V3
+            || version == format::fts::VERSION_V4
+            || version == format::fts::VERSION_V5;
+        let has_bitset_blocks =
+            version == format::fts::VERSION_V4 || version == format::fts::VERSION_V5;
+        // V5 appends a per-term coarse block-max table; V1–V4 do not.
+        let has_coarse_block_max = version == format::fts::VERSION_V5;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -858,6 +869,7 @@ impl FtsReader {
             positions_range,
             has_position_subindex,
             has_bitset_blocks,
+            has_coarse_block_max,
             columns,
             column_id_by_name,
         })
@@ -1112,6 +1124,7 @@ impl FtsReader {
                             0,
                             true,
                             self.has_position_subindex,
+                            self.has_coarse_block_max,
                         )?;
                         positional.push((Some(term_meta), None));
                     }
@@ -1249,7 +1262,13 @@ impl FtsReader {
                     // one `decode_run` per doc in posting order. Read the slice
                     // once and walk it in lockstep with the doc cursor.
                     let position_bytes = if positional {
-                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true, false)?;
+                        let meta = TermMeta::parse(
+                            term_bytes.as_ref(),
+                            0,
+                            true,
+                            false,
+                            self.has_coarse_block_max,
+                        )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
                                 "positional column missing a positions region".into(),
@@ -1267,8 +1286,15 @@ impl FtsReader {
                     };
                     let mut pos_at = 0usize;
 
-                    let mut cursor =
-                        TermCursor::new(term_bytes, n_docs, positional, None, false, false)?;
+                    let mut cursor = TermCursor::new(
+                        term_bytes,
+                        n_docs,
+                        positional,
+                        None,
+                        false,
+                        false,
+                        self.has_coarse_block_max,
+                    )?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];

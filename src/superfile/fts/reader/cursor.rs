@@ -63,6 +63,17 @@ pub(super) struct TermMeta {
     /// skip table on a `VERSION_V3` positional term. `None` on
     /// `V1`/`V2` (no sub-index) and on positionless terms.
     pub(super) subindex_start: Option<usize>,
+    /// Absolute offset (within the postings region) of the coarse
+    /// block-max table — `ceil(num_blocks / COARSE_BLOCK_MAX_SPAN)`
+    /// fixed-point `u32`s at the tail of the term region.
+    pub(super) coarse_start: usize,
+    /// Term-relative end of the last posting block: `postings_length`
+    /// minus the coarse table's bytes. The blocks end here; the coarse
+    /// table follows.
+    pub(super) blocks_end_in_term: usize,
+    /// Whether this term carries a coarse block-max table (V5 blobs).
+    /// `false` for V1–V4 — the ranked walk then skips the coarse level.
+    pub(super) has_coarse: bool,
 }
 
 impl TermMeta {
@@ -75,6 +86,7 @@ impl TermMeta {
         metadata_offset: usize,
         positional: bool,
         has_subindex: bool,
+        has_coarse: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -149,6 +161,21 @@ impl TermMeta {
             }
             false => None,
         };
+        // Coarse block-max table (V5 only): `ceil(num_blocks / span)` u32s at
+        // the tail of the term region, so the blocks end where it begins.
+        // V1–V4 blobs have no such table — the blocks run to `postings_length`
+        // and the ranked walk skips the coarse level.
+        let coarse_size = match has_coarse {
+            true => num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * U32_BYTES,
+            false => 0,
+        };
+        if coarse_size > postings_length {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "coarse block-max table larger than the term region".into(),
+            )));
+        }
+        let blocks_end_in_term = postings_length - coarse_size;
+        let coarse_start = metadata_offset + blocks_end_in_term;
         Ok(Self {
             df,
             postings_length,
@@ -157,7 +184,22 @@ impl TermMeta {
             positions_offset,
             positions_length,
             subindex_start,
+            coarse_start,
+            blocks_end_in_term,
+            has_coarse,
         })
+    }
+
+    /// Decode coarse block-max entry `g` into a guaranteed upper bound
+    /// on the BM25 score of every block in span `g` (blocks
+    /// `[g*SPAN .. (g+1)*SPAN)`). Same fixed-point decode as
+    /// [`Self::skip_entry`]'s `block_max_bm25`, including the +1 step
+    /// that keeps the decoded value at or above the true span max.
+    #[inline]
+    pub(super) fn coarse_entry(&self, postings: &[u8], g: usize) -> f32 {
+        let at = self.coarse_start + g * U32_BYTES;
+        let x1000 = read_u32_le(&postings[at..at + U32_BYTES]);
+        x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
     }
 
     /// For a `VERSION_V3` positional term, the run offset of the nearest
@@ -247,7 +289,9 @@ impl TermMeta {
             let next_off = self.skip_start + (i + 1) * SKIP_ENTRY_SIZE;
             read_u32_le(&postings[next_off + 4..next_off + 8]) as usize
         } else {
-            self.postings_length
+            // The coarse block-max table follows the last block, so the
+            // blocks end before it — not at `postings_length`.
+            self.blocks_end_in_term
         }
     }
 }
@@ -375,13 +419,16 @@ impl TermCursor {
         global_idf: Option<f32>,
         header_probed: bool,
         count_only: bool,
+        has_coarse: bool,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
         // The plain-term cursor never decodes positions, so it needs no
         // sub-index (it reads block offsets straight from the skip table).
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false)?;
+        // `has_coarse` (V5) tells it the last block ends before the coarse
+        // table, not at `postings_length`.
+        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false, has_coarse)?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         let idf = global_idf.unwrap_or(local_idf);
         // Stored per-block BMW upper bounds bake in the LOCAL idf. Only a

@@ -71,6 +71,18 @@ pub mod fts {
     /// unchanged, so existing indices need no reindex.
     pub const VERSION_V4: u32 = 4;
 
+    /// The version new code writes: everything `V4` allows (positions region
+    /// iff positional, `V3` sub-index for positional terms, bitset blocks
+    /// self-describing per block) **plus** a per-term **coarse block-max
+    /// table** at the tail of each PFOR term's postings region — one
+    /// fixed-point `u32` per [`COARSE_BLOCK_MAX_SPAN`] blocks, the span's max
+    /// of the per-block bounds — giving the ranked walk a second, coarser
+    /// skip level. The header + region layout is otherwise identical to
+    /// `V2`–`V4`. Readers accept `V1`–`V5`; `V1`–`V4` blobs carry **no** coarse
+    /// table (the reader gates on the version), so existing indices read
+    /// unchanged and need no reindex.
+    pub const VERSION_V5: u32 = 5;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
@@ -99,6 +111,21 @@ pub mod fts {
     /// by dividing by this. Drives WAND / block-max skip decisions, so
     /// write and read must agree on the scale.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
+
+    /// Number of consecutive posting blocks summarised by one entry of
+    /// a term's coarse block-max table. The table sits at the tail of a
+    /// PFOR term's postings region: `ceil(num_blocks / this)` fixed-point
+    /// `u32`s, each the max of its span's per-block `max_bm25_x1000`.
+    ///
+    /// It gives the ranked single-term walk a second, coarser skip level:
+    /// when the running k-th-best score already dominates a whole span's
+    /// upper bound, the walk jumps the span in one comparison instead of
+    /// touching each block's skip entry. On a very long, heavily-skipped
+    /// posting list (a common term at small k) the per-block skip scan is
+    /// itself the dominant cost; the coarse level removes ~31/32 of it.
+    /// The span is a coarse-max of already-`ceil`-quantised block bounds,
+    /// so it stays a true upper bound and the top-k is unchanged.
+    pub const COARSE_BLOCK_MAX_SPAN: usize = 32;
 
     /// Total FTS blob header size in bytes for [`VERSION_V1_LEGACY`] (no
     /// positions). The FST directory begins immediately after this

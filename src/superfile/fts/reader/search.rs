@@ -30,6 +30,7 @@ use crate::{
     superfile::{
         ReadError,
         error::FtsError,
+        format,
         fts::{
             bm25,
             dict::{DictReader, make_key},
@@ -38,6 +39,35 @@ use crate::{
         },
     },
 };
+
+/// Threshold-first seed tuning for the single-term ranked walk. The walk
+/// fills its top-k heap in doc-id order, so its skip threshold rises only
+/// as the heap fills and it decodes many blocks before the threshold is
+/// high enough to skip them. Decoding the highest-block-max blocks up front
+/// (found via the coarse block-max table) raises the k-th threshold first,
+/// so the main walk prunes those otherwise-wasted decodes.
+mod seed {
+    /// Don't seed lists shorter than this many blocks — the setup isn't
+    /// worth it when there's little waste to prune.
+    pub const MIN_BLOCKS: usize = 256;
+    /// Minimum coarse spans to gather when selecting seed-block candidates.
+    pub const TOP_SPANS: usize = 16;
+    /// Floor on seed-block count (enough for a tight threshold at small k).
+    pub const MIN_BLOCKS_SEED: usize = 32;
+    /// Hard cap so a pathological k can't make the seed scan the whole list.
+    pub const MAX_BLOCKS_SEED: usize = 2048;
+}
+
+/// Seed-block count for top-k `k`: `~1.25·k`, clamped. The top-k spreads
+/// roughly one doc per high-block-max block, so the decoded count reaches
+/// its irreducible floor when the seed covers about one block per top-k
+/// doc; decoding past that is pure cost, so target just enough (the `k/4`
+/// slack absorbs blocks that hold more than one top doc). Saturating so a
+/// merge caller's huge `k` clamps to the cap rather than overflowing.
+fn seed_blocks_for(k: usize) -> usize {
+    k.saturating_add(k / 4)
+        .clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
+}
 
 impl FtsReader {
     /// Ranked search over heterogeneous atoms — the walk every
@@ -832,7 +862,13 @@ impl FtsReader {
         // Gated: an unmetered process must not pay the procfs reads on
         // the most common query shape.
         let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions, false)?;
+        let term_meta = TermMeta::parse(
+            postings,
+            metadata_offset,
+            col_meta.positions,
+            false,
+            self.has_coarse_block_max,
+        )?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
@@ -845,14 +881,144 @@ impl FtsReader {
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
-        for i in 0..term_meta.num_blocks {
+        let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
+        // The coarse block-max table exists only on V5 blobs; on V1–V4 the
+        // walk falls back to the flat per-block skip (and no seed).
+        let coarse_enabled = term_meta.has_coarse;
+
+        // Threshold-first seed. The doc-id-order walk below fills `heap_min`
+        // slowly, so on a common term it decodes ~2/3 of its blocks before
+        // the k-th threshold has risen enough to skip them (measured: `the`
+        // TOP_10 decodes ~1,209 blocks, only ~368 of them irreducible). To
+        // raise the bar first, decode the highest-block-max blocks up front
+        // — found cheaply via the coarse level — and take the k-th score of
+        // those as a floor for the main walk's skip bar.
+        //
+        // Correctness: `seed_threshold` is the k-th of a *subset* of docs, so
+        // it is a true lower bound on the final k-th; skipping a block whose
+        // block-max is *strictly* below it drops only docs that score below a
+        // lower bound on the k-th — never a top-k or tied-at-k doc. The seed
+        // does not touch `heap`; the main walk re-decodes any seed block it
+        // needs and admits in doc-id order, so the top-k (and its tie-break)
+        // is bit-identical to the un-seeded walk. Only applied without a
+        // negation filter (so the seed's admitted set matches the final one)
+        // and on lists long enough to have waste to prune.
+        let seed_threshold: f32 = if coarse_enabled
+            && filter.is_none()
+            && term_meta.num_blocks >= seed::MIN_BLOCKS
+        {
+            let num_coarse = term_meta.num_blocks.div_ceil(coarse_span);
+            // Seed depth scales with k: a fixed handful of blocks gives a
+            // tight k-th only at small k; at k=100/1000 the top-k spreads
+            // across more blocks, so decode more to raise the threshold.
+            let m_want = seed_blocks_for(k);
+            // Gather enough top spans to contain the top `m_want` blocks
+            // (over-cover: worst case each is in its own span).
+            let mut spans: Vec<(f32, usize)> = (0..num_coarse)
+                .map(|g| (term_meta.coarse_entry(postings, g), g))
+                .collect();
+            let s = m_want.max(seed::TOP_SPANS).min(spans.len());
+            spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+            // Candidate blocks from those spans, then the top blocks by
+            // block-max across them.
+            let mut cand: Vec<(f32, usize)> = Vec::with_capacity(s * coarse_span);
+            for &(_, g) in &spans[..s] {
+                let start = g * coarse_span;
+                let end = (start + coarse_span).min(term_meta.num_blocks);
+                for bi in start..end {
+                    let (_, _, bm) = term_meta.skip_entry(postings, bi);
+                    cand.push((bm, bi));
+                }
+            }
+            let m = m_want.min(cand.len());
+            cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+            // Decode those blocks, score, keep a k-sized seed heap.
+            let mut seed_heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(k);
+            for &(_, bi) in &cand[..m] {
+                let (_, off, _) = term_meta.skip_entry(postings, bi);
+                let end = term_meta.block_end_in_term(postings, bi);
+                let bytes = &postings[metadata_offset + off..metadata_offset + end];
+                let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+                for j in 0..n {
+                    let score =
+                        bm25::score_with_dl_norm_k1(idf_x_k1p1, buf_t[j], dl_norm_k1.get(buf_d[j]));
+                    if score <= floor_eff {
+                        continue;
+                    }
+                    if seed_heap.len() < k {
+                        seed_heap.push(TopKEntry(score, buf_d[j]));
+                    } else if let Some(TopKEntry(mn, _)) = seed_heap.peek()
+                        && score > *mn
+                    {
+                        seed_heap.pop();
+                        seed_heap.push(TopKEntry(score, buf_d[j]));
+                    }
+                }
+            }
+            // Only a *full* seed heap gives a valid k-th lower bound.
+            match seed_heap.len() >= k {
+                true => seed_heap
+                    .peek()
+                    .map(|TopKEntry(s, _)| *s)
+                    .unwrap_or(f32::NEG_INFINITY),
+                false => f32::NEG_INFINITY,
+            }
+        } else {
+            f32::NEG_INFINITY
+        };
+
+        // Two skip levels. The coarse table bounds a whole span of
+        // `COARSE_BLOCK_MAX_SPAN` blocks with a single entry, so a span
+        // the running k-th-best already dominates is jumped in one
+        // comparison instead of one skip-entry read per block. On a long,
+        // heavily-skipped list (a common term at small k) that per-block
+        // scan is the dominant cost; the coarse level removes ~31/32 of
+        // it. Inside a span that might qualify, the walk falls back to
+        // the per-block bar — identical decisions, identical top-k.
+        let mut i = 0usize;
+        while i < term_meta.num_blocks {
+            if coarse_enabled && i.is_multiple_of(coarse_span) {
+                let coarse_max = term_meta.coarse_entry(postings, i / coarse_span);
+                let span_end = (i + coarse_span).min(term_meta.num_blocks);
+                // Seed skip, span-wide (strict): no block in the span can
+                // reach the seeded lower bound on the k-th, so none can be
+                // top-k. Strict `<` keeps a block exactly at the bound in
+                // play, preserving the tie-break.
+                if coarse_max < seed_threshold {
+                    i = span_end;
+                    continue;
+                }
+                // Floor skip, span-wide: nothing in the span reaches the
+                // caller's floor.
+                if coarse_max <= floor_eff {
+                    i = span_end;
+                    continue;
+                }
+                // BMW skip, span-wide: heap full AND no block in the span
+                // can beat the kth-best.
+                if heap.len() >= k
+                    && let Some(TopKEntry(min_score, _)) = heap.peek()
+                    && coarse_max <= *min_score
+                {
+                    i = span_end;
+                    continue;
+                }
+            }
+
             // last_doc_id (first tuple slot) is unused here — it serves
             // AND-merge seeks, which single-term never does.
             let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
 
+            // Seed skip (strict): block can't reach the seeded lower bound
+            // on the k-th, so it holds no top-k doc.
+            if block_max_bm25 < seed_threshold {
+                i += 1;
+                continue;
+            }
             // Floor skip: nothing in this block can reach the caller's
             // floor — dead regardless of local heap state.
             if block_max_bm25 <= floor_eff {
+                i += 1;
                 continue;
             }
             // BMW skip: heap full AND this block can't beat the kth-best.
@@ -860,6 +1026,7 @@ impl FtsReader {
                 && let Some(TopKEntry(min_score, _)) = heap.peek()
                 && block_max_bm25 <= *min_score
             {
+                i += 1;
                 continue;
             }
 
@@ -896,6 +1063,7 @@ impl FtsReader {
                     heap.push(TopKEntry(score, doc_id));
                 }
             }
+            i += 1;
         }
 
         Ok((
@@ -1019,6 +1187,7 @@ impl FtsReader {
                         gidf,
                         header_probed,
                         count_only,
+                        self.has_coarse_block_max,
                     )?);
                 }
             }

@@ -33,6 +33,17 @@ const BMW_TF_MODULUS: u32 = 8;
 const BMW_FILLER_MODULUS: u32 = 20;
 /// Score-equality tolerance comparing the BMW vs multi-term paths.
 const BMW_SCORE_TOLERANCE: f32 = 1e-5;
+/// Corpus size for the coarse-skip multi-span fixture: large enough that
+/// a near-ubiquitous term spans many `COARSE_BLOCK_MAX_SPAN`-block spans
+/// (>> 4096 postings), so the coarse skip level jumps whole spans rather
+/// than degenerating to a single span.
+const BMW_MULTISPAN_N_DOCS: u32 = 40_000;
+/// The high-scoring docs sit at the low doc-ids (early blocks), so the
+/// heap fills with them early and every later span drops below the k-th
+/// bar — the case that makes the coarse skip jump spans.
+const BMW_MULTISPAN_HIGH_TF_DOCS: u32 = 32;
+/// High term frequency for the planted top docs.
+const BMW_MULTISPAN_HIGH_TF: usize = 40;
 
 fn build_with_two_columns() -> (Bytes, String) {
     let tok = default_tokenizer();
@@ -285,6 +296,87 @@ async fn bmw_single_term_matches_brute_force() {
     // Scores should match within FP noise.
     for ((d_bmw, s_bmw), (d_mt, s_mt)) in bmw_hits.iter().zip(mt_hits.iter()) {
         assert_eq!(d_bmw, d_mt);
+        assert!(
+            (s_bmw - s_mt).abs() < BMW_SCORE_TOLERANCE,
+            "scores differ: BMW={s_bmw} multi-term={s_mt}"
+        );
+    }
+}
+
+/// A near-ubiquitous term over a corpus spanning many coarse spans, with
+/// the high-scoring docs clustered at the low doc-ids so the running
+/// k-th-best dominates whole later spans. This is the fixture that makes
+/// the coarse skip level actually jump spans. The full-decode multi-term
+/// path never coarse-skips, so BMW matching it end-to-end proves the span
+/// jumps drop no qualifying doc.
+#[tokio::test]
+async fn bmw_single_term_multispan_matches_brute_force() {
+    use infino::superfile::fts::reader::BoolMode;
+
+    let mut b = FtsBuilder::new(default_tokenizer());
+    b.register_column("body".into(), false)
+        .expect("register column");
+
+    // "foo" is common but NOT ubiquitous (so idf > 0 and scores vary, like a
+    // real stopword-ish term): present in ~90% of docs. The `HIGH_TF_DOCS`
+    // top scorers are **scattered** evenly across doc-id space (high tf +
+    // distinct, short filler ⇒ unique high scores), so the doc-id-order walk
+    // meets them late and the threshold-first seed must prune the blocks
+    // between them. The list spans well past the seed's MIN_BLOCKS. Every
+    // doc gets at least one token so none is empty.
+    let stride = BMW_MULTISPAN_N_DOCS / BMW_MULTISPAN_HIGH_TF_DOCS;
+    for i in 0..BMW_MULTISPAN_N_DOCS {
+        let high_rank = i % stride == 0 && i / stride < BMW_MULTISPAN_HIGH_TF_DOCS;
+        let has_foo = high_rank || i % 10 != 0;
+        let n_foo = if high_rank {
+            BMW_MULTISPAN_HIGH_TF
+        } else if has_foo {
+            (i % 3) as usize + 1
+        } else {
+            0
+        };
+        let n_filler = if high_rank {
+            (i / stride) as usize
+        } else {
+            (i % BMW_FILLER_MODULUS) as usize
+        };
+        let mut toks: Vec<String> = std::iter::repeat_n("foo".to_string(), n_foo).collect();
+        for j in 0..n_filler {
+            toks.push(format!("filler{j}"));
+        }
+        if toks.is_empty() {
+            toks.push("pad".to_string());
+        }
+        b.add_doc(0, i, &toks.join(" ")).expect("add doc");
+    }
+    let bytes = b.finish().expect("finish fts");
+    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
+
+    // Single term → coarse-skip BMW path.
+    let bmw_hits = r
+        .search("body", &["foo"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
+        .await
+        .expect("FTS search");
+    // Full-decode reference (OR drops the bogus second term).
+    let mt_hits = r
+        .search(
+            "body",
+            &["foo", "nonexistent_term_xyz"],
+            FTS_PIPELINE_SEARCH_K,
+            BoolMode::Or,
+        )
+        .await
+        .expect("search");
+
+    assert_eq!(bmw_hits.len(), FTS_PIPELINE_SEARCH_K);
+    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| *d).collect();
+    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| *d).collect();
+    assert_eq!(
+        bmw_ids, mt_ids,
+        "coarse-skip BMW and full-decode paths must agree across many spans"
+    );
+    for ((_, s_bmw), (_, s_mt)) in bmw_hits.iter().zip(mt_hits.iter()) {
         assert!(
             (s_bmw - s_mt).abs() < BMW_SCORE_TOLERANCE,
             "scores differ: BMW={s_bmw} multi-term={s_mt}"
