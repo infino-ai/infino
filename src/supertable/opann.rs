@@ -806,6 +806,20 @@ pub(crate) fn fanout_prior_for_k(
     out
 }
 
+/// Apply the `width × fine` cap to a measured fanout crossing (the `rank`
+/// position where a query's top-k coverage first meets the target): the fanout
+/// `rank + 1` when it is within the `cap`, else `0` — the "GFC loses" sentinel.
+/// A crossing beyond the prior means the centroid-graph selection needs more
+/// clusters than the grid's `W × F` to hit the same recall, so it cannot beat
+/// the grid here; `0` makes the reader fall back to the constant and the `auto`
+/// gate to `stamped`. `None` (no crossing within the cap) is also a loss.
+fn cap_fanout(crossing: Option<usize>, cap: u32) -> u32 {
+    match crossing {
+        Some(rank) if cap > 0 && (rank as u64) < u64::from(cap) => rank as u32 + 1,
+        _ => 0,
+    }
+}
+
 /// Rerank-law estimate histogram resolution: per-query counts of pool-row
 /// 1-bit estimates, binned linearly over `[-Σ|q_rot|, +Σ|q_rot|]` (the
 /// sign-dot estimator's exact range). A candidate's distractor count reads
@@ -898,6 +912,26 @@ pub(crate) struct WidthLawCalibration {
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
+    /// Fanout-stage state: the GLOBAL fine-centroid set (union across cells)
+    /// plus each GT candidate row's global cluster index — the inputs to the
+    /// third calibration stage, which measures how many nearest global fine
+    /// centroids a query must select to cover its exact top-k (the global
+    /// analogue of the per-cell fine-depth stage). Filled in the same
+    /// [`Self::observe_shard_views`] pass that measures the fine ranks.
+    global_fanout: Mutex<GlobalFanoutState>,
+}
+
+/// Accumulated inputs for the global fanout stage (see
+/// [`WidthLawCalibration::global_fanout`]).
+#[derive(Default)]
+struct GlobalFanoutState {
+    /// Row-major fp32-le fine centroids, one contiguous block per observed
+    /// cell (the union is what `ivf_router = centroid_graph` scores at query
+    /// time). Global cluster index = block offset + within-cell cluster.
+    centroid_bytes: Vec<u8>,
+    /// GT candidate row `(stable id, surviving cell)` -> its global cluster
+    /// index into `centroid_bytes`.
+    row_cluster: HashMap<(i128, u32), u32>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -950,6 +984,12 @@ pub(crate) struct CalibratedLaws {
     /// against — the stamp records it so a later, wider law knows
     /// whether the budget's evidence still covers it.
     pub(crate) pool_cells: u32,
+    /// Centroid-graph router fanout: the smallest number of nearest GLOBAL
+    /// fine centroids that covers the exact top-k at the target, capped at the
+    /// `width × fine` prior. `0` = uncalibrated OR "GFC loses" (the crossing
+    /// needs more than the prior — the grid already routes at least as tightly,
+    /// so the reader falls back to the constant and `auto` to stamped).
+    pub(crate) fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 #[cfg(test)]
@@ -1005,6 +1045,23 @@ mod pool_hint_tests {
             fanout_prior_for_k(&[1, 0, 0, 0], &[1, 0, 0, 0], 1),
             [1, 0, 0, 0]
         );
+    }
+
+    /// The `width × fine` cap: a crossing within the cap stamps `rank + 1`; a
+    /// crossing at or beyond the cap (GFC needs more than the grid), no
+    /// crossing, or a zero cap all stamp `0` — the "GFC loses" sentinel.
+    #[test]
+    fn cap_fanout_stamps_within_cap_else_sentinel() {
+        // rank 0 covered, cap 4 → fanout 1.
+        assert_eq!(cap_fanout(Some(0), 4), 1);
+        // rank 3 covered, cap 4 → fanout 4 (== cap, still within).
+        assert_eq!(cap_fanout(Some(3), 4), 4);
+        // rank 4 covered, cap 4 → fanout 5 > cap → GFC loses.
+        assert_eq!(cap_fanout(Some(4), 4), 0);
+        // No crossing at all → GFC loses.
+        assert_eq!(cap_fanout(None, 8), 0);
+        // Zero cap (uncalibrated width/fine) → 0.
+        assert_eq!(cap_fanout(Some(0), 0), 0);
     }
 }
 
@@ -1108,6 +1165,7 @@ impl WidthLawCalibration {
             pool_cells: RERANK_LAW_POOL_CELLS,
             target_recall,
             rerank: None,
+            global_fanout: Mutex::new(GlobalFanoutState::default()),
         }
     }
 
@@ -1400,6 +1458,38 @@ impl WidthLawCalibration {
             }
             map
         };
+        // Fanout stage: union EVERY cell's fine centroids into the global set
+        // (a query's true neighbors can sit in any cell, and the centroid-graph
+        // router scores against all of them), and record each GT candidate
+        // row's global cluster. One lock for the whole shard.
+        {
+            let stride = self.dim * 4;
+            let mut g = self
+                .global_fanout
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for view in views {
+                let Some(cell_id) = view.cell_id else {
+                    continue;
+                };
+                if view.n_fine == 0
+                    || view.dim != self.dim
+                    || view.fine_centroids_bytes.len() != view.n_fine * stride
+                {
+                    continue;
+                }
+                let offset = (g.centroid_bytes.len() / stride) as u32;
+                g.centroid_bytes
+                    .extend_from_slice(&view.fine_centroids_bytes);
+                if let Some(cands) = per_cell.get(&cell_id) {
+                    for &(_, id) in cands {
+                        if let Some(&local) = view.cluster_of_stable.get(&id) {
+                            g.row_cluster.insert((id, cell_id), offset + local);
+                        }
+                    }
+                }
+            }
+        }
         for view in views {
             let Some(cell_id) = view.cell_id else {
                 continue;
@@ -1646,11 +1736,89 @@ impl WidthLawCalibration {
         floor_monotone(&mut law);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
+        // Fanout stage (the third law): the GLOBAL analogue of the fine-depth
+        // walk. Rank each query against the union of every cell's fine
+        // centroids and count its top-k rows at their global cluster's
+        // nearest-centroid rank; the coverage crossing is the smallest fanout
+        // that covers the top-k at the target. Capped at the `width × fine`
+        // prior — a crossing beyond it means GFC needs more clusters than the
+        // grid, so it loses here and the point stays `0`. This is the exact
+        // fanout the centroid-graph router must select; no graph is built (the
+        // HNSW is only the query-time acceleration of this same selection, and
+        // `ef` is its separate breadth knob).
+        let mut fanout_law = [0u32; WIDTH_LAW_KS.len()];
+        let global = self
+            .global_fanout
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        let stride = self.dim * 4;
+        let n_global = global.centroid_bytes.len().checked_div(stride).unwrap_or(0);
+        if n_global > 0 {
+            let cap = fanout_prior_for_k(&law, &fine_law, n_global.min(u32::MAX as usize) as u32);
+            let cap_max = cap.iter().copied().max().unwrap_or(0) as usize;
+            if cap_max > 0 {
+                let mut fanout_sums: Vec<Vec<f64>> = vec![vec![0f64; cap_max]; WIDTH_LAW_KS.len()];
+                let mut rank_of_global = vec![u32::MAX; n_global];
+                for (qi, cand) in tops.iter().enumerate() {
+                    let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
+                    // Exact global centroid ranking (top `cap_max`) — the SAME
+                    // kernel the router's query-time selection uses.
+                    let ranked = nearest_k_centroids_bytes(
+                        self.metric,
+                        q,
+                        &global.centroid_bytes,
+                        n_global,
+                        self.dim,
+                        cap_max,
+                    );
+                    rank_of_global.iter_mut().for_each(|r| *r = u32::MAX);
+                    for (rank, (c, _)) in ranked.iter().enumerate() {
+                        rank_of_global[*c as usize] = rank as u32;
+                    }
+                    let mut sorted = cand.clone();
+                    sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                    for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
+                        if sorted.len() < k {
+                            continue;
+                        }
+                        let mut per_rank = vec![0u32; cap_max];
+                        for (_, cell, id, _) in &sorted[..k] {
+                            // The row's global cluster (its surviving copy's
+                            // cell), then that cluster's per-query rank. A
+                            // missing entry (partial observation) or a rank
+                            // beyond the cap counts as uncovered — conservative.
+                            if let Some(&gc) = global.row_cluster.get(&(*id, *cell)) {
+                                let r = rank_of_global[gc as usize] as usize;
+                                if r < cap_max {
+                                    per_rank[r] += 1;
+                                }
+                            }
+                        }
+                        let mut covered = 0u32;
+                        for (rank, count) in per_rank.iter().enumerate() {
+                            covered += count;
+                            fanout_sums[ki][rank] += f64::from(covered) / k as f64;
+                        }
+                    }
+                }
+                for (ki, sums) in fanout_sums.iter().enumerate() {
+                    if support[ki] == 0 || cap[ki] == 0 {
+                        continue;
+                    }
+                    let stage_target = self.target_recall * support[ki] as f64;
+                    let limit = (cap[ki] as usize).min(cap_max);
+                    let crossing = sums[..limit].iter().position(|&s| s >= stage_target);
+                    fanout_law[ki] = cap_fanout(crossing, cap[ki]);
+                }
+            }
+        }
+        floor_monotone(&mut fanout_law);
         (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
             width_for_k: law,
             fine_for_k: fine_law,
             rerank_for_k: rerank_law,
             pool_cells: self.pool_cells as u32,
+            fanout_for_k: fanout_law,
         })
     }
 }
@@ -2011,6 +2179,87 @@ mod tests {
             "top-10 coverage needs the rank-2 cluster"
         );
         assert_eq!(&laws.fine_for_k[2..], &[0, 0], "unsupported points stay 0");
+        // Fanout stage: with a single cell the global fine-centroid set IS the
+        // cell's, so the calibrated fanout equals the fine depth (fanout N
+        // covers the top-k, N-1 does not), within the W×F cap.
+        assert_eq!(
+            &laws.fanout_for_k[..2],
+            &[2, 3],
+            "single-cell fanout tracks the fine depth (global == within-cell)"
+        );
+        assert_eq!(
+            &laws.fanout_for_k[2..],
+            &[0, 0],
+            "unsupported points stay 0"
+        );
+    }
+
+    /// The fanout stage measures GLOBAL cluster coverage, not per-cell. A GT row
+    /// whose cell the grid routes to in ONE probe can still rank 2nd globally,
+    /// behind a nearer cluster in another cell — so the centroid-graph selection
+    /// needs more clusters than the grid's `W × F`, and the stage stamps the
+    /// "GFC loses" sentinel (`0`).
+    #[test]
+    fn fanout_stage_stamps_sentinel_when_grid_beats_global_selection() {
+        const DIM: usize = 4;
+        // Cell 0 nearest the e0 query, cell 1 far.
+        let grid = ClusterCentroids::from_fp32(
+            2,
+            DIM as u32,
+            &[
+                1.0, 0.0, 0.0, 0.0, // cell 0 (near)
+                0.0, 1.0, 0.0, 0.0, // cell 1 (far)
+            ],
+            vec![1, 1],
+        );
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // One GT top-1 row (id 1) in cell 0.
+        let mut acc = Vec::new();
+        merge_candidates(
+            &mut acc,
+            vec![(0.01f32, 0u32, 1i128, f32::NEG_INFINITY)],
+            WIDTH_LAW_MAX_K,
+        );
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+
+        // Cell 0's one fine cluster (the GT row's) sits slightly off the query;
+        // cell 1 carries a distractor cluster EXACTLY on the query — nearer
+        // globally than cell 0's, so the row's cluster is only 2nd globally.
+        let mut cell0_members = HashMap::new();
+        cell0_members.insert(1i128, 0u32);
+        let cell0 = CellFineCalibrationView {
+            cell_id: Some(0),
+            dim: DIM,
+            n_fine: 1,
+            fine_centroids_bytes: fp32_le_bytes(&[0.9, 0.4359, 0.0, 0.0]),
+            cluster_of_stable: cell0_members,
+        };
+        let cell1 = CellFineCalibrationView {
+            cell_id: Some(1),
+            dim: DIM,
+            n_fine: 1,
+            fine_centroids_bytes: fp32_le_bytes(&[1.0, 0.0, 0.0, 0.0]),
+            cluster_of_stable: HashMap::new(),
+        };
+        cal.observe_shard_views(&[cell0, cell1]);
+
+        let laws = cal.finish(&grid).expect("laws");
+        assert_eq!(
+            laws.width_for_k[0], 1,
+            "the grid routes the row in one cell"
+        );
+        assert_eq!(laws.fine_for_k[0], 1, "the row's cell has one fine cluster");
+        assert_eq!(
+            laws.fanout_for_k[0], 0,
+            "GFC needs a 2nd global cluster (a nearer distractor in cell 1) but \
+             the grid's W×F is 1 — GFC loses, sentinel 0"
+        );
     }
 
     /// A stamped width beyond the calibration pool clears the rerank

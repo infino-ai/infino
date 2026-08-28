@@ -4393,12 +4393,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             running_clusters = clusters_back;
         }
         let width_law_ref = width_law.as_ref();
-        // Total fine clusters across every packed cell, summed as the depth-law
-        // observation opens each shard (one calibration view per cell carries
-        // its fine-cluster count). It bounds the centroid-graph fanout prior
-        // stamped below. Only populated when calibration runs — which is
-        // exactly when the width/fine laws it clamps are measured.
-        let total_fine_clusters = std::sync::atomic::AtomicU64::new(0);
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
             &hidden_inner.options.writer_pool,
             &shard_sources,
@@ -4455,9 +4449,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 .vec()
                                 .and_then(|v| v.cell_fine_calibration_views(&vector_config.column))
                             {
-                                let shard_fine: u64 = views.iter().map(|v| v.n_fine as u64).sum();
-                                total_fine_clusters
-                                    .fetch_add(shard_fine, std::sync::atomic::Ordering::Relaxed);
                                 cal.observe_shard_views(&views);
                             }
                         }
@@ -4645,25 +4636,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 &mut routing.rerank_for_k,
                 &routing.rerank_pool_cells,
             );
-            // Stamp the centroid-graph router fanout prior (width × fine per k,
-            // clamped to the table's total fine clusters) from the just-merged
-            // laws, so the router reads a per-table fanout instead of the
-            // scale-blind constant. The read side re-clamps to the live cluster
-            // count, so a partial total (a cache-attached shard that skipped
-            // observation) only under-estimates the belt clamp, never misroutes.
-            let total_fine = total_fine_clusters
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .min(u32::MAX as u64) as u32;
-            routing.fanout_for_k =
-                opann::fanout_prior_for_k(&routing.width_for_k, &routing.fine_for_k, total_fine);
+            // Stamp the CALIBRATED centroid-graph router fanout — the third
+            // calibration stage's measured knee, capped at the `width × fine`
+            // prior (a `0` means GFC needs ≈ the prior/full set, i.e. it does
+            // not beat the grid here). Max-merged like width/fine: an
+            // incremental drain sees only the tail (a partial global centroid
+            // set), which can only under-estimate the fanout, so it may widen
+            // the prior stamp but never narrow it; a full rebuild recalibrates.
+            for (slot, measured) in routing.fanout_for_k.iter_mut().zip(laws.fanout_for_k) {
+                *slot = (*slot).max(measured);
+            }
             info!(
-                "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
+                "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}; fanout measured {:?} stamped {:?}",
                 laws.width_for_k,
                 routing.width_for_k,
                 laws.fine_for_k,
                 routing.fine_for_k,
                 laws.rerank_for_k,
-                routing.rerank_for_k
+                routing.rerank_for_k,
+                laws.fanout_for_k,
+                routing.fanout_for_k
             );
         }
         let mut list_metadata = CommitListMetadata {
@@ -7996,6 +7988,11 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         // deeper value is recall-safe at bounded cost. A measured `0`
         // (unsupported point) keeps the previous value under both rules.
         for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+            *slot = (*slot).max(measured);
+        }
+        // Centroid-graph fanout: MAX-merge like fine depth (a partial global
+        // centroid set under-measures the fanout; keep the deeper stamp).
+        for (slot, measured) in routing.fanout_for_k.iter_mut().zip(laws.fanout_for_k) {
             *slot = (*slot).max(measured);
         }
         // Same per-knot merge + provenance as the drain stamp.
