@@ -197,9 +197,9 @@ fn pipelined_commit_surfaces_shard_put_fault_and_recovers() {
         .vector_search("emb", &query, VECTOR_ROWS, Default::default(), None, None)
         .expect("vector search after recovery");
     let found: usize = hits.iter().map(|b| b.num_rows()).sum();
-    assert!(
-        found > 0,
-        "rows from the retried commit must be searchable, found {found}"
+    assert_eq!(
+        found, VECTOR_ROWS,
+        "the retry must restore every row, not merely some of them"
     );
 }
 
@@ -236,11 +236,15 @@ fn optimize_survives_a_storage_fault_without_losing_rows() {
     let reader = st.reader().expect("reader");
     let mut query = vec![0.0f32; VECTOR_DIM];
     query[0] = 1.0;
+    let expected = VECTOR_ROWS * OPTIMIZE_FAULT_COMMITS;
     let hits = reader
-        .vector_search("emb", &query, VECTOR_ROWS, Default::default(), None, None)
+        .vector_search("emb", &query, expected, Default::default(), None, None)
         .expect("search after a faulted optimize");
     let found: usize = hits.iter().map(|b| b.num_rows()).sum();
-    assert!(found > 0, "rows survive a faulted maintenance pass");
+    assert_eq!(
+        found, expected,
+        "every committed row survives a faulted maintenance pass"
+    );
     st.optimize(&OptimizeOptions::default())
         .expect("maintenance completes once the fault clears");
 }
@@ -294,7 +298,10 @@ fn drain_surfaces_a_hidden_index_put_fault_and_re_runs() {
         .vector_search("emb", &query, VECTOR_ROWS, Default::default(), None, None)
         .expect("post-drain vector search");
     let found: usize = hits.iter().map(|b| b.num_rows()).sum();
-    assert!(found > 0, "the re-run drain serves its rows, found {found}");
+    assert_eq!(
+        found, VECTOR_ROWS,
+        "the re-run drain serves every row, not a partial rebuild"
+    );
 }
 
 #[test]
