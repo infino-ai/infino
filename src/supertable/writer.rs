@@ -3666,6 +3666,10 @@ async fn materialized_user_rows_for_drain(
 /// window where it is drained out of the user arm but not yet in the graph —
 /// invisible to both. Recall-quality overlays belong in B, where lagging only
 /// costs a temporarily wider serving law, never a missing row. Origin: OPANN #422.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "drain", skip_all)
+)]
 pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     user_inner: Arc<SupertableInner>,
     hidden_inner: Arc<SupertableInner>,
@@ -8357,6 +8361,10 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// already durable), then a list+pointer etag-CAS stamp with refresh-and-retry
 /// on contention — so a lost race rebuilds the blob from the winning
 /// membership, never stamping stale state.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "refresh_vector_state", skip_all)
+)]
 pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {

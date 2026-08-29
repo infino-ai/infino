@@ -1134,6 +1134,10 @@ impl Supertable {
     /// `Supertable::open`/`create` and again on every `optimize()` call.
     /// Not public API: exposed only as a manual hook for in-crate tests
     /// that need custom grace windows via `wal::gc::run_sweep` directly.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "wal_gc", skip_all, fields(role = self.role().as_str()))
+    )]
     pub(crate) async fn run_gc_sweep_once(&self) -> Result<gc::GcReport, gc::GcError> {
         gc::run_sweep(
             self,
