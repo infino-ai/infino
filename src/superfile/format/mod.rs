@@ -482,6 +482,18 @@ pub mod kv {
     /// `inf.vec.layout = multi_cell_ivf`.
     pub const VEC_CELLS: &str = "inf.vec.cells";
 
+    /// Optional: byte offset of the raw stable-id sidecar — a packed
+    /// little-endian `i128` array, one entry per local doc id (Parquet row
+    /// order), mirroring the `_id` column. Lets a hit → `_id` resolve read a
+    /// fixed-width slice instead of decompressing the Parquet id pages.
+    /// Absent on superfiles written before the sidecar existed; readers fall
+    /// back to the Parquet id column when it is missing.
+    pub const IDS_OFFSET: &str = "inf.ids.offset";
+
+    /// Present iff the stable-id sidecar is present: its byte length
+    /// (`16 * n_docs`).
+    pub const IDS_LENGTH: &str = "inf.ids.length";
+
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
 
@@ -493,6 +505,9 @@ pub mod kv {
 
     /// All vector-related keys (presence is all-or-none).
     pub const VEC_KEYS: &[&str] = &[VEC_OFFSET, VEC_LENGTH, VEC_COLUMNS];
+
+    /// Stable-id sidecar keys (presence is all-or-none).
+    pub const IDS_KEYS: &[&str] = &[IDS_OFFSET, IDS_LENGTH];
 
     /// All known keys (for diagnostics only).
     pub const ALL: &[&str] = &[
@@ -509,8 +524,15 @@ pub mod kv {
         VEC_COLUMNS,
         VEC_LAYOUT,
         VEC_CELLS,
+        IDS_OFFSET,
+        IDS_LENGTH,
     ];
 }
+
+/// Width of one stable-id sidecar entry (`inf.ids.*`): a `Decimal128` id
+/// packed as a little-endian `i128`. The sidecar is `n_docs` of these, in
+/// local doc id order.
+pub(crate) const ID_SIDECAR_ENTRY_BYTES: usize = size_of::<i128>();
 
 /// Reserved column-name prefix; user FTS column / vector index names must not
 /// start with this string. Defensive — keeps the user's namespace and our

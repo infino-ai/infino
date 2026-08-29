@@ -240,6 +240,31 @@ pub struct BuilderOptions {
 /// walks), not page decode volume.
 pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 
+/// Materialize the stable-id sidecar from the accumulated batches: one
+/// little-endian `i128` per row, in Parquet row order — which is local doc
+/// id order, since rows are appended in `add_batch` order and both the FTS
+/// and vector indices number local doc ids the same way. The sidecar mirrors
+/// the `_id` column so a hit → `_id` resolve reads a fixed-width slice
+/// instead of decompressing the Parquet id pages. Returns an empty vec when
+/// the id column is absent or not `Decimal128` (the reader then falls back to
+/// the Parquet id column), so callers can pass the result through unchecked.
+fn stable_id_sidecar_bytes(batches: &[RecordBatch], id_column: &str) -> Vec<u8> {
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let mut out = Vec::with_capacity(total_rows * format::ID_SIDECAR_ENTRY_BYTES);
+    for batch in batches {
+        let Ok(idx) = batch.schema().index_of(id_column) else {
+            return Vec::new();
+        };
+        let Some(col) = batch.column(idx).as_any().downcast_ref::<Decimal128Array>() else {
+            return Vec::new();
+        };
+        for i in 0..col.len() {
+            out.extend_from_slice(&col.value(i).to_le_bytes());
+        }
+    }
+    out
+}
+
 impl BuilderOptions {
     /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
     ///
@@ -1446,6 +1471,8 @@ impl SuperfileBuilder {
                 fts_length: 0,
                 vec_offset: 0,
                 vec_length: 0,
+                ids_offset: 0,
+                ids_length: 0,
             });
         }
         let n_docs = self.next_local_doc_id as u64;
@@ -1517,7 +1544,8 @@ impl SuperfileBuilder {
             let (fts_file, vec_file) = blobs_res?;
             (body_res?, fts_file, vec_file)
         };
-        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
+        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
+        splice_body_and_blobs_to(body, fts_file, vec_file, &ids_bytes, &kvs, output)
     }
 
     /// Finish the build with a Parquet body the caller **already encoded** —
@@ -1548,7 +1576,11 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
         )?;
-        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
+        // The merge streams input row groups straight into `body` and drops
+        // them, so the id column is never held here to build a sidecar from.
+        // These superfiles resolve `_id` through the Parquet id column; a
+        // later pass can stream the sidecar from the merge inputs.
+        splice_body_and_blobs_to(body, fts_file, vec_file, &[], &kvs, output)
     }
 
     /// Finish the build and return the assembled superfile bytes.
@@ -1623,12 +1655,15 @@ impl SuperfileBuilder {
         vector_file
             .seek(SeekFrom::Start(0))
             .map_err(BuildError::Io)?;
+        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
         splice_index_streams_to(
             body,
             BufReader::new(Cursor::new(Vec::<u8>::new())),
             0,
             BufReader::new(vector_file),
             vector_length,
+            Cursor::new(&ids_bytes),
+            ids_bytes.len() as u64,
             &kvs,
             &mut output,
         )?;
@@ -1811,6 +1846,7 @@ fn splice_body_and_blobs_to<W: Write>(
     body: EncodedBody,
     fts_file: NamedTempFile,
     vec_file: NamedTempFile,
+    ids_bytes: &[u8],
     kvs: &[(String, String)],
     output: W,
 ) -> Result<ParquetLayout, BuildError> {
@@ -1822,6 +1858,8 @@ fn splice_body_and_blobs_to<W: Write>(
         fts_length,
         BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
         vec_length,
+        Cursor::new(ids_bytes),
+        ids_bytes.len() as u64,
         kvs,
         output,
     )?;
