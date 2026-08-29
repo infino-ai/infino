@@ -3009,6 +3009,40 @@ mod tests {
         assert!(matches!(err, ReadError::MalformedKv(_)));
     }
 
+    #[test]
+    fn open_rejects_partial_ids_keys() {
+        // Only one of the all-or-none inf.ids.* sidecar keys present.
+        let mut kvs = required_kv();
+        kvs.push((kv::IDS_OFFSET.into(), "0".into()));
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[test]
+    fn open_rejects_ids_sidecar_length_mismatch() {
+        // Sidecar length that isn't 16 x n_docs (n_docs = 1 here) is rejected
+        // rather than trusted into an out-of-range slice later.
+        let mut kvs = required_kv();
+        kvs.push((kv::IDS_OFFSET.into(), "0".into()));
+        kvs.push((kv::IDS_LENGTH.into(), "32".into()));
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[test]
+    fn open_rejects_ids_sidecar_out_of_bounds() {
+        // Correct length (16 x 1) but an offset past EOF must be caught at open,
+        // not panic on a later slice.
+        let mut kvs = required_kv();
+        kvs.push((kv::IDS_OFFSET.into(), u64::MAX.to_string()));
+        kvs.push((kv::IDS_LENGTH.into(), "16".into()));
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
     #[tokio::test]
     async fn open_lazy_rejects_malformed_kvs() {
         // Same crafted-KV bytes, wrapped in a lazy source, must exercise
