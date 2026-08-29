@@ -43,9 +43,6 @@ use crate::superfile::{
 pub(super) struct TermMeta {
     /// Document frequency — number of docs containing the term.
     pub(super) df: u64,
-    /// Byte length of the term's whole region (header + skip table +
-    /// blocks), relative to the term's `metadata_offset`.
-    pub(super) postings_length: usize,
     /// Number of PFOR blocks (= number of skip-table entries).
     pub(super) num_blocks: usize,
     /// Absolute offset (within the postings region) of the first
@@ -178,7 +175,6 @@ impl TermMeta {
         let coarse_start = metadata_offset + blocks_end_in_term;
         Ok(Self {
             df,
-            postings_length,
             num_blocks,
             skip_start,
             positions_offset,
