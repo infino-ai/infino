@@ -332,6 +332,86 @@ async fn oracle_common_heavy_or_matches_brute_force_at_depth() {
     }
 }
 
+#[tokio::test]
+async fn oracle_common_heavy_or_matches_brute_force_at_seed_scale() {
+    // The same common-heavy MaxScore path as `..._at_depth`, but at ~40k docs
+    // (~300+ blocks per term) so the MaxScore leftmost-essential block skip —
+    // which bounds the other terms by their per-block `block_max_in_range` —
+    // and the essential/non-essential partition both run at scale against
+    // ground-truth BM25. The tie-free top-5 anchors keep the head ordered.
+    let corp = common_heavy_corpus(40_000);
+    let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&corp_refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
+    for k in [10usize, 100, 1000] {
+        assert_top_k_head_agrees(&infino, &oracle, "alpha beta gamma delta", 5, k).await;
+    }
+}
+
+/// Single-term ranked at a scale that ACTUALLY ENGAGES the block-max
+/// optimizations the small oracles never reach: a term present in every one
+/// of ~35 000 docs spans ~273 posting blocks, past the threshold-first
+/// seed's `MIN_BLOCKS = 256` gate and across ~9 coarse spans (`COARSE_
+/// BLOCK_MAX_SPAN = 32`). So this exercises the seed, the multi-span coarse
+/// skip, the per-block BMW skip, and the exact-f32 block-max bound together
+/// — the paths that decide the ranked results order, at the size where they
+/// fire. Every doc has the SAME length (padded with the unqueried token
+/// `pad`), so BM25 length-norm is 1 and the score is strictly monotonic in
+/// the term frequency: nine anchors with tf 20..12 form a **tie-free**,
+/// strictly-ordered top-9 far above the tf=1 bulk.
+fn seed_scale_single_term_corpus() -> Vec<(u64, String)> {
+    const N: u64 = 35_000;
+    const DL: usize = 20; // uniform doc length ⇒ length-norm 1 for every doc
+    const ANCHORS: usize = 9;
+    let mk = |tf: usize| -> String {
+        let mut toks = vec!["common"; tf];
+        toks.extend(std::iter::repeat_n("pad", DL - tf));
+        toks.join(" ")
+    };
+    let mut docs = Vec::with_capacity(N as usize);
+    // Anchors 0..9: tf = 20,19,...,12 ⇒ strictly-decreasing distinct scores.
+    for i in 0..ANCHORS as u64 {
+        docs.push((i, mk(DL - i as usize)));
+    }
+    // Bulk: tf = 1, same length ⇒ the lowest, tied score.
+    for i in ANCHORS as u64..N {
+        docs.push((i, mk(1)));
+    }
+    docs
+}
+
+#[tokio::test]
+async fn oracle_single_term_seed_scale_matches_brute_force() {
+    let corp = seed_scale_single_term_corpus();
+    let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&corp_refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
+    // The tie-free top-8 must match brute force *in order* at every depth —
+    // a seed/coarse/skip that dropped or reordered any anchor would diverge.
+    // Anchors are ids 0..8 in exactly that order (tf 20 > 19 > ... > 12).
+    let expected: Vec<u64> = (0..8).collect();
+    for k in [10usize, 100, 1000] {
+        let infino_head: Vec<u64> = infino_top_k(&infino, "common", k)
+            .await
+            .into_iter()
+            .take(8)
+            .collect();
+        let oracle_head: Vec<u64> = oracle
+            .top_k("common", k, tok.as_ref())
+            .into_iter()
+            .map(|(d, _)| d)
+            .take(8)
+            .collect();
+        assert_eq!(infino_head, expected, "k={k}: infino top-8 order wrong");
+        assert_eq!(
+            infino_head, oracle_head,
+            "k={k}: infino vs brute-force top-8 order diverged"
+        );
+    }
+}
+
 /// Corpus where a common non-essential ("hot") has a high block-max only in a
 /// *mid-range* block. Five anchors in block 10 (ids 1281..1289) carry `lead` +
 /// `hot`×{10,9,8,7,6} — strictly-decreasing scores far above the bulk (bulk hot
