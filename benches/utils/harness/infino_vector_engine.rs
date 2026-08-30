@@ -44,6 +44,23 @@ fn build_superfile(
     id_base: usize,
 ) -> Vec<u8> {
     let n_docs = vectors.len() / dim;
+    let ids: Vec<u64> = (id_base as u64..(id_base + n_docs) as u64).collect();
+    build_superfile_with_ids(column, vectors, dim, metric, &ids)
+}
+
+/// [`build_superfile`] with explicit per-row `_id`s — the engine's own
+/// stable-id mechanism (the `_id` column every superfile carries), used by
+/// the insert/remove rebuilds so surviving rows keep the ids the caller
+/// already holds instead of being renumbered positionally.
+fn build_superfile_with_ids(
+    column: &str,
+    vectors: &[f32],
+    dim: usize,
+    metric: VectorMetric,
+    row_ids: &[u64],
+) -> Vec<u8> {
+    let n_docs = vectors.len() / dim;
+    assert_eq!(row_ids.len(), n_docs, "one _id per row");
     let metric = map_metric(metric);
     let schema = Arc::new(Schema::new(vec![Field::new(
         ID_COLUMN,
@@ -68,8 +85,9 @@ fn build_superfile(
     let mut offset = 0;
     while offset < n_docs {
         let len = WRITE_CHUNK.min(n_docs - offset);
-        let ids: Decimal128Array = ((id_base + offset) as u64..(id_base + offset + len) as u64)
-            .map(|i| Some(i as i128))
+        let ids: Decimal128Array = row_ids[offset..offset + len]
+            .iter()
+            .map(|&i| Some(i as i128))
             .collect::<Decimal128Array>()
             .with_precision_and_scale(38, 0)
             .expect("decimal128 precision/scale");
@@ -80,6 +98,24 @@ fn build_superfile(
         offset += len;
     }
     builder.finish().expect("SuperfileBuilder::finish")
+}
+
+/// Every row's stable `_id`, in local-doc order, read from the artifact's
+/// own id column — the same local→stable resolution the supertable layer
+/// performs (`take_by_local_doc_ids` on the id column). The superfile IS
+/// the id map; no side state to drift.
+fn stable_ids_of(reader: &SuperfileReader) -> Vec<u64> {
+    let n_docs = reader.n_docs() as u32;
+    let locals: Vec<u32> = (0..n_docs).collect();
+    let batch = reader
+        .take_by_local_doc_ids(&locals, &[reader.id_column()])
+        .expect("read the _id column");
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("_id column is Decimal128");
+    (0..ids.len()).map(|i| ids.value(i) as u64).collect()
 }
 
 pub struct InfinoVectorEngine;
@@ -98,6 +134,12 @@ pub struct InfinoVectorIndex {
     /// shipping caller would pay; `load` deliberately leaves this `None`
     /// since a loaded index has no fp32 source to reconstruct from.
     source_vectors: Option<Vec<f32>>,
+    /// Whether insert/remove ever ran. A freshly written artifact has
+    /// dense `_id`s equal to local ids, so `read` skips the id resolve on
+    /// the unmutated path and its timing is unchanged; after a mutation,
+    /// hits resolve through the artifact's id column like any caller's
+    /// would.
+    mutated: bool,
 }
 
 impl InfinoVectorIndex {
@@ -142,6 +184,7 @@ impl VectorEngine for InfinoVectorEngine {
             bytes: None,
             reader: None,
             source_vectors: None,
+            mutated: false,
         }
     }
 
@@ -199,9 +242,35 @@ impl VectorEngine for InfinoVectorEngine {
                 .vector_hits_async(&index.column, query, k, opts),
         )
         .expect("vector_search");
+        if !index.mutated {
+            // Freshly written artifacts have `_id == local` by
+            // construction; skip the resolve so the mainline cells'
+            // timing is byte-identical to before mutations existed.
+            return hits
+                .into_iter()
+                .map(|(doc_id, distance)| VectorHit {
+                    doc_id: u64::from(doc_id),
+                    distance,
+                })
+                .collect();
+        }
+        // After a mutation, locals are renumbered by the rebuild; resolve
+        // to stable `_id`s through the artifact's own id column, the same
+        // resolution any caller's hits go through.
+        let locals: Vec<u32> = hits.iter().map(|(doc_id, _)| *doc_id).collect();
+        let batch = index
+            .reader()
+            .take_by_local_doc_ids(&locals, &[index.reader().id_column()])
+            .expect("resolve hit _ids");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id column is Decimal128");
         hits.into_iter()
-            .map(|(doc_id, distance)| VectorHit {
-                doc_id: u64::from(doc_id),
+            .enumerate()
+            .map(|(i, (_, distance))| VectorHit {
+                doc_id: ids.value(i) as u64,
                 distance,
             })
             .collect()
@@ -230,31 +299,38 @@ impl VectorEngine for InfinoVectorEngine {
             .source_vectors
             .as_ref()
             .expect("insert requires InfinoVectorIndex::source_vectors retained from write()");
-        // Ids are always 0..n_docs by construction (see `build_superfile`'s
-        // `id_base`), so `next_id` is validated rather than threaded
-        // through — this reference impl does not support inserting at an
-        // arbitrary sparse id.
-        let expected_next_id = (existing.len() / index.dim) as u64;
-        assert_eq!(
-            next_id, expected_next_id,
-            "InfinoVectorEngine::insert only supports appending at the current doc count"
+        // The artifact's own `_id` column is the id authority: new rows get
+        // `next_id..`, survivors keep the ids they already carry, and the
+        // trait's uniqueness contract is checked against the real ids
+        // rather than assumed from a positional count.
+        let mut row_ids = stable_ids_of(index.reader());
+        let max_id = row_ids.iter().copied().max().unwrap_or(0);
+        assert!(
+            row_ids.is_empty() || next_id > max_id,
+            "InfinoVectorEngine::insert: next_id {next_id} must exceed the max stored _id {max_id}"
         );
+        let added = vectors.len() / index.dim;
+        row_ids.extend(next_id..next_id + added as u64);
         let mut combined = existing.clone();
         combined.extend_from_slice(vectors);
-        let rebuilt = build_superfile(&index.column, &combined, index.dim, index.metric, 0);
+        let rebuilt =
+            build_superfile_with_ids(&index.column, &combined, index.dim, index.metric, &row_ids);
         index.reader = Some(
             SuperfileReader::open(Bytes::from(rebuilt.clone())).expect("open SuperfileReader"),
         );
         index.bytes = Some(rebuilt);
         index.source_vectors = Some(combined);
+        index.mutated = true;
         true
     }
 
     /// Same honesty caveat as `insert`: no remove-by-id exists at the
-    /// superfile tier. This filters the retained source vectors by id and
+    /// superfile tier. This filters the retained source vectors and
     /// rebuilds — a full rebuild minus the removed rows, not an in-place
-    /// tombstone. `ids` are the `0..n_docs` positional ids `write`/`insert`
-    /// assign, so this filters by index position directly.
+    /// tombstone. `ids` name stable `_id`s (the artifact's own id column),
+    /// and survivors KEEP their ids across the rebuild, so a later
+    /// insert/remove/search still means the rows the caller thinks it
+    /// means.
     fn remove(index: &mut Self::Index, ids: &[u64]) -> bool {
         let existing = index
             .source_vectors
@@ -262,19 +338,24 @@ impl VectorEngine for InfinoVectorEngine {
             .expect("remove requires InfinoVectorIndex::source_vectors retained from write()");
         let dim = index.dim;
         let drop_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let row_ids = stable_ids_of(index.reader());
         let n_docs = existing.len() / dim;
+        assert_eq!(row_ids.len(), n_docs, "source vectors track the artifact");
         let mut kept = Vec::with_capacity(existing.len());
-        for doc in 0..n_docs {
-            if !drop_set.contains(&(doc as u64)) {
+        let mut kept_ids = Vec::with_capacity(row_ids.len());
+        for (doc, &stable) in row_ids.iter().enumerate() {
+            if !drop_set.contains(&stable) {
                 kept.extend_from_slice(&existing[doc * dim..(doc + 1) * dim]);
+                kept_ids.push(stable);
             }
         }
-        let rebuilt = build_superfile(&index.column, &kept, dim, index.metric, 0);
+        let rebuilt = build_superfile_with_ids(&index.column, &kept, dim, index.metric, &kept_ids);
         index.reader = Some(
             SuperfileReader::open(Bytes::from(rebuilt.clone())).expect("open SuperfileReader"),
         );
         index.bytes = Some(rebuilt);
         index.source_vectors = Some(kept);
+        index.mutated = true;
         true
     }
 
@@ -298,6 +379,88 @@ impl VectorEngine for InfinoVectorEngine {
             bytes: Some(owned.to_vec()),
             reader: Some(reader),
             source_vectors: None,
+            mutated: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows planted on distinct axes so nearest-neighbor identity is exact.
+    const TEST_DIM: usize = 16;
+    /// Enough rows that removing two from the middle genuinely renumbers
+    /// the locals behind them.
+    const TEST_ROWS: usize = 8;
+
+    fn axis_rows(n: usize) -> Vec<f32> {
+        let mut flat = vec![0.0f32; n * TEST_DIM];
+        for row in 0..n {
+            flat[row * TEST_DIM + row % TEST_DIM] = 1.0;
+        }
+        flat
+    }
+
+    fn query_for(row: usize) -> Vec<f32> {
+        let mut q = vec![0.0f32; TEST_DIM];
+        q[row % TEST_DIM] = 1.0;
+        q
+    }
+
+    fn top1(index: &InfinoVectorIndex, row: usize) -> u64 {
+        InfinoVectorEngine::read(
+            index,
+            &query_for(row),
+            1,
+            VectorSearch {
+                nprobe: usize::MAX,
+                rerank_mult: 4,
+            },
+        )
+        .first()
+        .expect("one hit")
+        .doc_id
+    }
+
+    /// The regression the id column exists to prevent: removing middle
+    /// rows renumbers locals, but hits and later mutations must keep
+    /// speaking stable `_id`s. Before the fix, removing {2, 5} made row 7
+    /// answer as 5, and a follow-up remove would have deleted the wrong
+    /// rows.
+    #[test]
+    fn remove_preserves_surviving_ids_and_insert_continues_them() {
+        let mut index = InfinoVectorEngine::create("emb", TEST_DIM, VectorMetric::Cosine);
+        InfinoVectorEngine::write(&mut index, &axis_rows(TEST_ROWS));
+        assert_eq!(top1(&index, 7), 7, "fresh artifact: local == stable");
+
+        assert!(InfinoVectorEngine::remove(&mut index, &[2, 5]));
+        assert_eq!(
+            top1(&index, 7),
+            7,
+            "row 7 keeps _id 7 though its local id shrank by two"
+        );
+        assert_eq!(top1(&index, 3), 3, "row 3 keeps _id 3 behind one removal");
+
+        // The trait's running-counter contract: the caller hands the next
+        // unused id, and it lands verbatim.
+        let mut extra = vec![0.0f32; TEST_DIM];
+        extra[TEST_DIM - 1] = 1.0;
+        assert!(InfinoVectorEngine::insert(
+            &mut index,
+            &extra,
+            TEST_ROWS as u64
+        ));
+        assert_eq!(
+            top1(&index, TEST_DIM - 1),
+            TEST_ROWS as u64,
+            "inserted row answers with the caller-assigned id"
+        );
+
+        // Removing by a STABLE id after the renumbering removes the right
+        // row: _id 7 (now at a shifted local position) disappears, and the
+        // axis-7 query falls to some other row, never a phantom 7.
+        assert!(InfinoVectorEngine::remove(&mut index, &[7]));
+        assert_ne!(top1(&index, 7), 7, "_id 7 is gone, not renumbered onto");
     }
 }
