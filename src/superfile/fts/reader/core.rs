@@ -1083,12 +1083,19 @@ impl FtsReader {
         }
         let mut dict_ranges = 0u64;
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
-        for term in terms {
-            let mut cursors = self
-                .build_term_cursors(column_id, &[term], global_idf, false)
+        // All bare terms in one FST open + one parallel postings fan-out
+        // (arity-preserving: each term maps to its own slot, `None` when
+        // absent), rather than a serial per-term build that re-fetched the
+        // dictionary and issued a separate range wave for each. One planned
+        // dictionary range for the whole batch.
+        if !terms.is_empty() {
+            let term_cursors = self
+                .build_term_cursors_opt(column_id, terms, global_idf, false)
                 .await?;
             dict_ranges += 1;
-            out.push(cursors.pop().map(AnyCursor::Term));
+            for cursor in term_cursors {
+                out.push(cursor.map(AnyCursor::Term));
+            }
         }
         for phrase in phrases {
             let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
