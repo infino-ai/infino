@@ -621,6 +621,11 @@ pub fn build_local_for_serving(
     let st = Supertable::create(options_for(Modality::Vector, Some(Arc::clone(&storage))))
         .expect("create local supertable");
     let schema = schema_for(Modality::Vector);
+    // A zero-doc build is a caller bug, named here rather than surfacing
+    // as `step_by(0)`'s opaque panic; an empty table also has nothing for
+    // `optimize()` to calibrate, so tolerating it would return a handle
+    // that serves no mode meaningfully.
+    assert!(n_docs > 0, "build_local_for_serving needs at least one row");
     let commits = n_commits();
     let chunk_size = n_docs.div_ceil(commits);
     let mut w = st.writer().expect("writer");

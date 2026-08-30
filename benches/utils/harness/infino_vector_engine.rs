@@ -319,6 +319,9 @@ impl VectorEngine for InfinoVectorEngine {
             index.dim
         );
         let added = vectors.len() / index.dim;
+        // A `next_id` near u64::MAX would make this range wrap EMPTY (not
+        // duplicate ids), and the builder's one-`_id`-per-row assert then
+        // fails loudly on the length mismatch — no silent state exists.
         row_ids.extend(next_id..next_id + added as u64);
         let mut combined = existing.clone();
         combined.extend_from_slice(vectors);

@@ -1614,6 +1614,21 @@ pub mod vector {
             let rank = (pct * sorted.len()).div_ceil(100);
             sorted[rank.saturating_sub(1).min(sorted.len() - 1)].as_nanos() as f64
         };
+        // Enforced, not just documented: a measurement helper must fail
+        // fast on malformed inputs rather than publish skewed numbers —
+        // zip would silently drop unmatched rows while the division still
+        // used the full count, and clipping a shallow oracle row would
+        // inflate recall at the deep knots.
+        assert_eq!(
+            queries.len(),
+            truth_deep.len(),
+            "one ground-truth row per query"
+        );
+        let max_k = ks.iter().copied().max().unwrap_or(0);
+        assert!(
+            truth_deep.iter().all(|truth| truth.len() >= max_k),
+            "every ground-truth row must be at least as deep as the largest k ({max_k})"
+        );
         ks.iter()
             .map(|&k| {
                 let mut latencies = Vec::with_capacity(queries.len());
@@ -1622,7 +1637,7 @@ pub mod vector {
                     let started = Instant::now();
                     let hits = search(query, k);
                     latencies.push(started.elapsed());
-                    recall_sum += corpus::recall_at_k(&hits, &truth[..k.min(truth.len())]);
+                    recall_sum += corpus::recall_at_k(&hits, &truth[..k]);
                 }
                 latencies.sort_unstable();
                 PerKCell {
@@ -1633,6 +1648,48 @@ pub mod vector {
                 }
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    mod per_k_sweep_tests {
+        use super::*;
+
+        /// Queries carry their own index in coordinate 0, so the closure
+        /// can answer each from its matching truth row: an ideal engine,
+        /// which must grade exactly 1.0 at every knot.
+        #[test]
+        fn an_ideal_engine_grades_one_at_every_knot() {
+            let queries: Vec<Vec<f32>> = (0..3).map(|q| vec![q as f32; 4]).collect();
+            let truth: Vec<Vec<u32>> = (0..3u32).map(|q| (q * 10..q * 10 + 10).collect()).collect();
+            let truth_for_closure = truth.clone();
+            let cells = per_k_sweep(&queries, &truth, &[1, 10], |query, k| {
+                let row = &truth_for_closure[query[0] as usize];
+                row[..k].iter().map(|&id| (id, 0.0)).collect()
+            });
+            assert_eq!(cells.len(), 2);
+            for cell in &cells {
+                assert_eq!(cell.recall, 1.0, "ideal engine at k={}", cell.k);
+            }
+        }
+
+        /// The enforced input contract: a ground-truth row shallower than
+        /// the deepest knot must fail fast, never inflate recall.
+        #[test]
+        #[should_panic(expected = "at least as deep")]
+        fn a_shallow_oracle_row_fails_fast() {
+            let queries = vec![vec![0.0f32; 4]];
+            let truth = vec![vec![0u32; 5]];
+            per_k_sweep(&queries, &truth, &[10], |_, _| Vec::new());
+        }
+
+        /// One truth row per query, enforced.
+        #[test]
+        #[should_panic(expected = "one ground-truth row per query")]
+        fn mismatched_lengths_fail_fast() {
+            let queries = vec![vec![0.0f32; 4]; 2];
+            let truth = vec![vec![0u32; 10]];
+            per_k_sweep(&queries, &truth, &[10], |_, _| Vec::new());
+        }
     }
 
     impl VectorRead for SuperfileReader {
