@@ -1233,7 +1233,7 @@ impl ManifestSnapshot {
     /// or `None` on manifests written before it existed or above the
     /// data-graph scale ceiling. Consumers fall back to the lazy build /
     /// scan path when absent.
-    pub(crate) fn slow_vector_state_graphs_blob(&self) -> Option<&RoutingRef> {
+    pub(crate) fn resident_vector_index_blob(&self) -> Option<&RoutingRef> {
         self.list.as_ref()?.slow_vector_state_graphs.as_ref()
     }
 

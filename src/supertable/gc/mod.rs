@@ -86,7 +86,7 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
         live.insert(centroids.uri.clone());
     }
-    if let Some(graphs) = manifest.slow_vector_state_graphs_blob() {
+    if let Some(graphs) = manifest.resident_vector_index_blob() {
         live.insert(graphs.uri.clone());
     }
 

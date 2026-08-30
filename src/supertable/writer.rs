@@ -149,6 +149,7 @@ use crate::{
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow, transcode_clamped_components},
             distance::Metric,
+            hnsw::PayloadKind,
             ivf_merge::{
                 MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
             },
@@ -177,7 +178,7 @@ use crate::{
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
-            vector::stable_ids_by_local_for_routing,
+            vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
@@ -4786,8 +4787,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // serve ivf. Gating here (not inside
         // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
         // build step.
-        let building_graph =
-            crate::config::global().vector.search_mode == crate::config::VectorSearchMode::HnswIvf;
+        // Which resident index this drain builds, if any. One manifest slot
+        // carries whichever it is, and the envelope states its kind, so adding
+        // a kind here does not widen the manifest.
+        let index_mode = crate::config::global().vector.search_mode;
+        let building_graph = index_mode == crate::config::VectorSearchMode::HnswIvf;
+        let building_flat = index_mode == crate::config::VectorSearchMode::FlatIvf;
         // Warm the DISK CACHE with the just-drained cell bytes — already
         // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
         // full re-read of these same cells is served from the local cache
@@ -4810,6 +4815,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         let graph_ref = if building_graph {
             build_hnsw_graph_ref(storage.as_ref(), &prospective).await
+        } else if building_flat {
+            build_flat_index_ref(storage.as_ref(), &prospective).await
         } else {
             None
         };
@@ -8411,7 +8418,7 @@ async fn previous_centroid_section(
 /// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
 /// correctness — the copy-flip and query-time doc-id dedup are the
 /// correctness guards.
-fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
+fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
     let entries = manifest.get_all_superfiles();
     let count: u64 = entries.iter().map(|e| e.n_docs).sum();
     let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
@@ -8434,27 +8441,35 @@ fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
     h
 }
 
-/// Encode + PUT a data bundle as a graph section, logging the outcome.
-async fn publish_hnsw_blob(
+/// Encode + PUT a data bundle as the generation's resident index section,
+/// logging the outcome under the kind actually published.
+///
+/// The kind is in the message because this function serves both index types:
+/// a flat publish logging as a graph publish is the same class of confusion
+/// the reasoned declines exist to remove — the log saying the mode you did not
+/// ask for.
+async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
+    kind: PayloadKind,
     data_bundle: &[u8],
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
-    let blob = crate::superfile::vector::hnsw::encode_graph_bundle(
+    let blob = crate::superfile::vector::hnsw::encode_resident_envelope(
         population_key,
         high_water,
         &[],
-        Some(data_bundle),
+        Some((kind, data_bundle)),
     );
     let blob_mib = blob.len() / (1024 * 1024);
-    match slow_vector_state::write_graph_section(storage, blob).await {
+    let label = kind.label();
+    match slow_vector_state::write_resident_index_blob(storage, blob).await {
         Ok(reference) => {
-            tracing::debug!(uri = %reference.uri, blob_mib, "hnsw: published graph section");
+            tracing::debug!(uri = %reference.uri, blob_mib, "{label}: published resident index");
             Some(reference)
         }
         Err(error) => {
-            tracing::warn!("hnsw: publish failed: {error}");
+            tracing::warn!("{label}: publish failed: {error}");
             None
         }
     }
@@ -8483,6 +8498,69 @@ async fn publish_hnsw_blob(
 /// build step — directly callable in tests without touching global config. The
 /// scale-free **centroid** graph is not yet built here — the bundle carries an
 /// empty centroid section.
+/// Build and publish the resident flat 4-bit index, returning the routing ref
+/// the manifest stamps. `None` means no index — the query serves `ivf`.
+///
+/// Peer of [`build_hnsw_graph_ref`], and shorter for two reasons that are worth
+/// stating rather than inferring from the absence of code.
+///
+/// There is no incremental arm. Extending a flat index would mean appending
+/// rows to a plane whose ruler was fitted over the previous population, which
+/// is exactly the first-input-ruler rule the graph's walk plane follows — but
+/// there it buys consistency with neighbour lists that already exist, and a
+/// scan has no neighbour lists. A rebuild is simply the correct answer, and it
+/// costs one pass over the corpus.
+///
+/// There is no calibration arm either: [`assemble_flat_sections`] owns the doc
+/// ceiling and the register gate, because both are decisions about the fitted
+/// plane rather than about publication.
+async fn build_flat_index_ref(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let column = manifest
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())?;
+    let population_key = resident_index_population_key(manifest);
+    let high_water_now = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.id_max)
+        .max()
+        .unwrap_or(0);
+    let t0 = std::time::Instant::now();
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_flat_sections(manifest, &column, &None)
+            .await
+        {
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("flat build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
+            Err(error) => {
+                tracing::warn!("flat build: assemble failed: {error}");
+                return None;
+            }
+        };
+    tracing::debug!(
+        data_bundle_mib = data_bundle.len() / (1024 * 1024),
+        wall_s = t0.elapsed().as_secs_f64(),
+        "flat: built index"
+    );
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Flat,
+        &data_bundle,
+    )
+    .await
+}
+
 async fn build_hnsw_graph_ref(
     storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
@@ -8513,7 +8591,7 @@ async fn build_hnsw_graph_ref(
         );
         return None;
     }
-    let population_key = graph_population_key(manifest);
+    let population_key = resident_index_population_key(manifest);
     let high_water_now = manifest
         .get_all_superfiles()
         .iter()
@@ -8524,14 +8602,17 @@ async fn build_hnsw_graph_ref(
 
     // Incremental append: extend the prior persisted graph with only the new
     // rows, cloning it (fetch + decode) rather than mutating a serving graph.
-    if let Some(prior_ref) = manifest.slow_vector_state_graphs_blob()
-        && let Ok(sections) = slow_vector_state::fetch_graph_sections(
+    if let Some(prior_ref) = manifest.resident_vector_index_blob()
+        && let Ok(sections) = slow_vector_state::hydrate_resident_index(
             storage,
             prior_ref,
-            slow_vector_state::GraphWalkRequest::AsStored,
+            slow_vector_state::WalkPlaneRequest::AsStored,
         )
         .await
-        && let Some(prior_data) = sections.data
+        && let Some(prior_data) = sections.data.and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
     {
         let prior_count = prior_data.doc_ids.len();
         match crate::supertable::query::vector::assemble_hnsw_incremental(
@@ -8543,7 +8624,7 @@ async fn build_hnsw_graph_ref(
         )
         .await
         {
-            Ok(Some((data_bundle, new_high_water, inserted))) => {
+            Ok(IndexOutcome::Ready((data_bundle, new_high_water, inserted))) => {
                 tracing::debug!(
                     inserted,
                     nodes = prior_count + inserted,
@@ -8551,13 +8632,17 @@ async fn build_hnsw_graph_ref(
                     wall_s = t0.elapsed().as_secs_f64(),
                     "hnsw: incremental insert into prior graph"
                 );
-                return publish_hnsw_blob(storage, population_key, new_high_water, &data_bundle)
-                    .await;
+                return publish_resident_index(
+                    storage,
+                    population_key,
+                    new_high_water,
+                    PayloadKind::Graph,
+                    &data_bundle,
+                )
+                .await;
             }
-            Ok(None) => {
-                tracing::debug!(
-                    "hnsw: incremental not applicable (not a pure append); full rebuild"
-                );
+            Ok(IndexOutcome::Unavailable(reason)) => {
+                tracing::debug!("hnsw incremental: not applicable ({reason}); full rebuild");
             }
             Err(error) => {
                 tracing::debug!("hnsw: incremental error ({error}); full rebuild");
@@ -8566,31 +8651,35 @@ async fn build_hnsw_graph_ref(
     }
 
     // Full rebuild.
-    let data_bundle = match crate::supertable::query::vector::assemble_hnsw_sections(
-        manifest, &column, &None,
-    )
-    .await
-    {
-        Ok(Some(bundle)) => bundle,
-        Ok(None) => {
-            tracing::debug!(
-                column,
-                "hnsw: build skipped — no Sq16 rows assembled (column absent, not sq16, or empty)"
-            );
-            return None;
-        }
-        Err(error) => {
-            tracing::warn!("hnsw: build skipped — assemble error: {error}");
-            return None;
-        }
-    };
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_hnsw_sections(manifest, &column, &None)
+            .await
+        {
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("hnsw build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
+            Err(error) => {
+                tracing::warn!("hnsw build: assemble failed: {error}");
+                return None;
+            }
+        };
     tracing::debug!(
         total_docs,
         data_bundle_mib = data_bundle.len() / (1024 * 1024),
         wall_s = t0.elapsed().as_secs_f64(),
         "hnsw: built graph (full)"
     );
-    publish_hnsw_blob(storage, population_key, high_water_now, &data_bundle).await
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Graph,
+        &data_bundle,
+    )
+    .await
 }
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
@@ -8666,14 +8755,14 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         // commit — a lag between the watermark and the graph is a window where a
         // just-drained row is invisible to both arms, the exact visibility gap
         // the atomic-drain stamp closes.
-        let graphs_ref = old.slow_vector_state_graphs_blob().cloned();
+        let graphs_ref = old.resident_vector_index_blob().cloned();
         // No-op only when NOTHING changed — routing blob, centroid section,
         // and the resolved graph ref all already stamped.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
-            && old.slow_vector_state_graphs_blob() == graphs_ref.as_ref()
+            && old.resident_vector_index_blob() == graphs_ref.as_ref()
         {
             return Ok(());
         }
@@ -9725,6 +9814,7 @@ mod tests {
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer as tok,
+            distinct_unit_vectors,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
@@ -9742,7 +9832,7 @@ mod tests {
     /// default `ivf` mode no longer exercises (the caller now gates the build).
     /// Drives the caller-gated build step directly on the drained cells
     /// (`build_hnsw_graph_ref` → the full `assemble_hnsw_sections` build +
-    /// `publish_hnsw_blob` internally), fetches the published graph back, and
+    /// `publish_resident_index` internally), fetches the published graph back, and
     /// asserts it actually SERVES — a query on the batch's axis finds its exact
     /// row through the fetched graph. Behavioral coverage, not a
     /// build-and-forget stub: it would catch a wrong node→id map or a build
@@ -9794,18 +9884,138 @@ mod tests {
         let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
             .await
             .expect("full build registers a graph");
-        let prior = slow_vector_state::fetch_graph_sections(
+        let prior = slow_vector_state::hydrate_resident_index(
             storage.as_ref(),
             &ref1,
-            slow_vector_state::GraphWalkRequest::AsStored,
+            slow_vector_state::WalkPlaneRequest::AsStored,
         )
         .await
         .expect("fetch built graph")
         .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
         .expect("data graph present after full build");
         assert!(
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"
+        );
+    }
+
+    /// Rows in the flat drain-build fixture — enough that the register gate's
+    /// held-out queries rank against a real corpus.
+    const FLAT_DRAIN_ROWS: usize = 512;
+    /// Dimension for the flat drain-build fixture.
+    const FLAT_DRAIN_DIM: usize = 32;
+    /// Seed for the fixture corpus, fixed so a failure reproduces.
+    const FLAT_DRAIN_SEED: u64 = 0x51A7_1DEA;
+    /// Separation the probe row must win its own query by, on the scan's
+    /// `-dot` scale. Random unit directions at this dimension sit well below
+    /// it, so a smaller margin would mean the scan found the wrong row.
+    const FLAT_DRAIN_MIN_MARGIN: f32 = 0.2;
+
+    /// A batch of [`distinct_unit_vectors`], returned alongside the vectors
+    /// themselves so one row can be replayed as a query.
+    ///
+    /// Not [`build_axis_vector_batch_range`]: the flat index's register gate
+    /// grades its scan against an exhaustive Sq16 one, and one-hot rows put a
+    /// block of exact ties at the head of every ground-truth list.
+    fn build_distinct_vector_batch(n: usize, dim: usize, seed: u64) -> (RecordBatch, Vec<f32>) {
+        let vectors = distinct_unit_vectors(n, dim, seed);
+        let titles =
+            LargeStringArray::from((0..n).map(|i| format!("doc {i} beta")).collect::<Vec<_>>());
+        let values = Arc::new(Float32Array::from(vectors.clone()));
+        let list = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            values,
+            None,
+        )
+        .expect("fixed-size list");
+        let batch = RecordBatch::try_new(
+            schema_id_title_emb(dim),
+            vec![Arc::new(titles), Arc::new(list)],
+        )
+        .expect("vector batch");
+        (batch, vectors)
+    }
+
+    /// End-to-end coverage of the opt-in `flat` drain-build path, the peer of
+    /// [`hnsw_drain_full_build_serves_its_rows`]. Drives the caller-gated
+    /// build step on the drained cells (`build_flat_index_ref` → the register
+    /// gate → `publish_resident_index` with [`PayloadKind::Flat`]), hydrates
+    /// the published blob back, and asserts it SERVES: a query replaying a
+    /// corpus row finds that row and wins by a margin.
+    ///
+    /// Behavioral, not build-and-forget. A build that published a plane whose
+    /// node→id map was misaligned, or an envelope whose kind tag said graph,
+    /// would still produce bytes and a plausible top-k.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flat_drain_build_publishes_an_index_that_serves() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_sq16(FLAT_DRAIN_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+        let (batch, vectors) =
+            build_distinct_vector_batch(FLAT_DRAIN_ROWS, FLAT_DRAIN_DIM, FLAT_DRAIN_SEED);
+        {
+            let mut writer = table.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("drain");
+
+        let reader = hidden.reader().expect("hidden reader");
+        let reference = build_flat_index_ref(storage.as_ref(), reader.manifest())
+            .await
+            .expect("a drained Sq16 corpus must register a flat index");
+        let index = slow_vector_state::hydrate_resident_index(
+            storage.as_ref(),
+            &reference,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        .expect("fetch the published index")
+        .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Flat(f) => Some(f),
+            slow_vector_state::ResidentIndexKind::Graph(_) => None,
+        })
+        .expect("the envelope must state Flat, and the payload decode as one");
+
+        assert_eq!(
+            index.len(),
+            FLAT_DRAIN_ROWS,
+            "the plane holds one node per drained row"
+        );
+        assert_eq!(index.dim(), FLAT_DRAIN_DIM);
+        assert_eq!(index.column(), "emb");
+
+        let probe = &vectors[..FLAT_DRAIN_DIM];
+        let top = index.search(probe, 2);
+        assert_eq!(top.len(), 2, "an exhaustive scan fills k");
+        assert!(
+            index.doc_id(top[0].0).is_some(),
+            "the nearest node must resolve to a stable id"
+        );
+        assert!(
+            top[0].1 + FLAT_DRAIN_MIN_MARGIN < top[1].1,
+            "a row queried with its own vector must win by a clear margin, \
+             got {} against runner-up {}",
+            top[0].1,
+            top[1].1
         );
     }
 

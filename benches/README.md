@@ -46,6 +46,11 @@ Omitted tokens mean "all".
 | `INFINO_BENCH_KEEP_TABLE` | unset | keep object-store prefix after the run |
 | `INFINO_BENCH_UPDATE_README` | unset | rewrite the marked sections below |
 
+Logging is quiet by default (warnings and errors only — engine declines still
+surface; the measured tables are unaffected). Pass `--debug` for the full
+engine diagnostics (`info,infino=debug`); an explicit `RUST_LOG` overrides
+both.
+
 Synthetic FTS corpus: seed `1`, 200 Zipfian tokens/doc, 10K vocab.
 Synthetic vectors: cosine, **1024-d**, seed `1` (archived tables below used 384-d).
 

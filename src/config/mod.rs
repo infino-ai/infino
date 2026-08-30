@@ -62,10 +62,18 @@ const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 /// would otherwise be handed that default back with nothing to indicate their
 /// setting had stopped applying — resident memory and per-open cost changing
 /// under them on an upgrade. Failing the load is the loud version.
-const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[(
-    "vector.hnsw_sq8_walk",
-    "vector.hnsw_plane — `sq8` is the old `true`, `sq16` the old `false`",
-)];
+const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
+    (
+        "vector.hnsw_recall_slack",
+        "vector.hnsw_register_floor — state the floor directly instead of a \
+         shortfall below target_recall; the old default pair (0.99 - 0.01) is \
+         a floor of 0.98",
+    ),
+    (
+        "vector.hnsw_sq8_walk",
+        "vector.hnsw_plane — `sq8` is the old `true`, `sq16` the old `false`",
+    ),
+];
 
 /// Engine default connection budget when none is configured; used by both
 /// [`MemorySettings`] and the connect path. `0` is the deliberate measure-only
@@ -329,12 +337,21 @@ const DEFAULT_VECTOR_HNSW_M0: usize = 0;
 /// the ivf stamping law — one point per table, engine-agnostic). The graph
 /// aims to hit this recall *faster* than ivf; if it can't, ivf serves it.
 const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
-/// How far below `target_recall` the drain calibrator still registers the
-/// graph (accepting the shortfall for the latency win) before giving up and
-/// serving ivf. The register floor is `target_recall - this`. Widen it to keep
-/// more hard high-dim tables on the graph; tighten it to demand near-target
-/// recall from the graph or step aside to ivf.
-const DEFAULT_VECTOR_HNSW_RECALL_SLACK: f64 = 0.01;
+/// Default register floor for the graph index: the value the shipped
+/// `target_recall - hnsw_recall_slack` pair produced (0.99 - 0.01), so
+/// behaviour is unchanged by stating it directly.
+const DEFAULT_VECTOR_HNSW_REGISTER_FLOOR: f64 = 0.98;
+
+/// Default register floor for the flat index: a broken-plane tripwire, not a
+/// quality bar.
+///
+/// Deliberately NOT the graph's 0.98. The graph can reach that; a 4-bit plane
+/// structurally cannot — 16 levels per coordinate measures ~0.93 recall@10 on
+/// dbpedia-1536 — so a 0.98 default would leave the mode unable to register
+/// without the operator lowering the floor first, a mode dead on arrival. A
+/// healthy bare plane sits well above 0.80; a broken one (degenerate ruler,
+/// mis-sliced section) collapses toward random and lands far below it.
+const DEFAULT_VECTOR_FLAT_REGISTER_FLOOR: f64 = 0.80;
 /// Default for `hnsw_refine_k`: re-rank the SQ8 walk's top 256 on full Sq16.
 /// The knee for k ≤ 100 — recall matches the Sq16 walk and saturates here, so
 /// a wider refine only adds tail cost.
@@ -351,6 +368,19 @@ pub const HNSW_EF_CANDIDATES: &[usize] = &[128, 256, 512, 1024, 2048];
 /// falls back to the scan path. 10M rows of Sq16 codes at 768d is ~15 GiB
 /// resident — the practical single-host ceiling.
 const DEFAULT_VECTOR_HNSW_MAX_DOCS: u64 = 10_000_000;
+
+/// Default for `flat_max_docs`: the corpus size past which an exhaustive
+/// 4-bit scan stops being the right trade.
+///
+/// Not a memory bound — the plane is 0.5 B/dim, so 10M x 1536 would still fit
+/// a single host at ~7.7 GiB. It is a LATENCY bound, and a ceiling rather
+/// than a recommendation: measured on dbpedia-1536, the scan is ~1.6 ms at
+/// 100K and ~20 ms at 1M (linear, as an exhaustive scan must be), while a
+/// warm routed read at 1M serves ~2 ms at higher recall. What the scan keeps
+/// at any scale is a pinned, cache-independent footprint and a
+/// width-invariant worst case; the latency trade favors it up to a few
+/// hundred thousand rows and has clearly turned by this ceiling.
+const DEFAULT_VECTOR_FLAT_MAX_DOCS: u64 = 1_000_000;
 /// Row cap for the cheap calibration *probe*. On a corpus larger than this,
 /// the calibrator first builds + calibrates on a bounded subsample of this
 /// many rows before committing to the expensive full-corpus build. Subsample
@@ -493,6 +523,23 @@ pub enum VectorSearchMode {
     /// or a different column) always serves `ivf`. Search walks the graph at
     /// the `k`-scaled `ef` law.
     HnswIvf,
+    /// OPT-IN (`flat_ivf`): scan a resident 4-bit plane exhaustively and
+    /// return the codes' own ranking. No grid, no cells, no graph — and no
+    /// resident Sq16 plane, which is the point: 0.5 bytes/dim, against 2.0 for
+    /// every other mode. The codec sets the recall ceiling: 16 levels per
+    /// coordinate measures ~0.93 recall@10 on dbpedia-1536, a declared trade,
+    /// not a defect. (The persisted form carries a codec tag, so a finer or
+    /// coarser plane is a future variant, not a format change.)
+    ///
+    /// Per-query work is linear in the corpus, so this is the embedded-scale
+    /// trade: lowest resident footprint at a declared recall, bounded by
+    /// `flat_max_docs`. Above that ceiling — or pre-drain, or on a filtered
+    /// query, or for a column the plane was not built for — queries serve
+    /// `ivf`, exactly as they do when a graph is absent. The `_ivf` suffix
+    /// names that fallback, as it does for [`Self::HnswIvf`]: a mode is
+    /// spelled as the chain it actually serves, so nothing about where a query
+    /// lands is hidden in the name.
+    FlatIvf,
 }
 
 /// Cluster router for `search_mode = ivf`: how a query selects which cells or
@@ -620,9 +667,32 @@ pub struct VectorSettings {
     /// bounded by `hnsw_max_docs`. The upper-layer degree stays fixed (cheap) —
     /// only the base layer moves recall.
     pub hnsw_m0: usize,
-    /// Recall shortfall below `target_recall` the hnsw graph is still accepted
-    /// at before the drain gives up and serves ivf (`floor = target - this`).
-    pub hnsw_recall_slack: f64,
+    /// Register floor for the GRAPH index: the recall its calibrated `(m0, ef)`
+    /// must reach before the drain publishes it. Below this the graph is not
+    /// registered and queries serve `ivf`.
+    ///
+    /// Stated as a number rather than derived from `target_recall`. One derived
+    /// value used to gate both index types, which meant the only way to accept
+    /// a deliberately coarse flat plane was to lower `target_recall` — a
+    /// table-wide knob that also detunes the ivf width laws answering filtered
+    /// queries. Measured cost of that coupling: filtered recall@10 fell to
+    /// 0.792 against the bench's 0.80 floor purely as a side effect of testing
+    /// a coarse plane.
+    pub hnsw_register_floor: f64,
+    /// Register floor for the FLAT index, same contract, its own number.
+    ///
+    /// Separate because the two floors answer different questions. The graph is
+    /// a latency optimization over a correct scan, so its floor is a quality
+    /// bar: a graph that cannot match the table's target has no reason to
+    /// exist. A flat plane is a memory trade the operator chose, and its
+    /// recall ceiling is set by the codec — 16 levels per coordinate measures
+    /// ~0.93 recall@10 on dbpedia-1536 — so a quality-bar default would leave
+    /// the mode unable to register at all. This floor's job is narrower: catch
+    /// a plane that is BROKEN (degenerate ruler, mis-sliced section, recall
+    /// collapsed toward random) rather than one that is merely coarse. The
+    /// default is a tripwire well below any healthy plane; an operator who
+    /// wants a bar raises it.
+    pub flat_register_floor: f64,
 
     /// For `search_mode = hnsw_ivf` with a lossy [`Self::hnsw_plane`]: how many
     /// of the walk's nearest candidates to re-rank on full Sq16 before
@@ -638,6 +708,16 @@ pub struct VectorSettings {
     /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
     pub hnsw_max_docs: u64,
+    /// For `search_mode = flat_ivf`: scale ceiling for the resident 4-bit plane.
+    /// Built at drain and persisted only when the table's doc count ≤ this;
+    /// above it queries fall back to `ivf`.
+    ///
+    /// Deliberately far below [`Self::hnsw_max_docs`], and for a different
+    /// reason. The graph's ceiling is a RAM bound — the graph fits or it does
+    /// not. A flat scan's cost is linear in the corpus, so its ceiling is a
+    /// LATENCY bound: it is the point past which touching every row stops
+    /// being the right trade, regardless of whether the plane still fits.
+    pub flat_max_docs: u64,
     /// For `search_mode = hnsw_ivf`: row cap for the cheap calibration *probe*. On
     /// a larger corpus, calibrate on a subsample of this many rows first; a
     /// probe that cannot register (optimistic subsample recall) skips the
@@ -723,9 +803,11 @@ impl Default for VectorSettings {
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: DEFAULT_VECTOR_HNSW_EF_SEARCH,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
-            hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
+            hnsw_register_floor: DEFAULT_VECTOR_HNSW_REGISTER_FLOOR,
+            flat_register_floor: DEFAULT_VECTOR_FLAT_REGISTER_FLOOR,
             hnsw_refine_k: DEFAULT_VECTOR_HNSW_REFINE_K,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
+            flat_max_docs: DEFAULT_VECTOR_FLAT_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
@@ -1102,21 +1184,35 @@ impl Config {
                 v.target_recall
             )));
         }
-        if !(0.0..=1.0).contains(&v.hnsw_recall_slack) {
-            return Err(ConfigError::Invalid(format!(
-                "vector.hnsw_recall_slack must be in [0.0, 1.0], got {}",
-                v.hnsw_recall_slack
-            )));
-        }
-        // The register floor is `target_recall - hnsw_recall_slack`. Slack at
-        // or above the target collapses that floor to <= 0, so ANY graph with
-        // recall > 0 registers and the recall bar stops meaning anything.
-        if v.hnsw_recall_slack >= v.target_recall {
-            return Err(ConfigError::Invalid(format!(
-                "vector.hnsw_recall_slack ({}) must be < vector.target_recall ({}) — \
-                 otherwise the register floor collapses to zero and every graph registers",
-                v.hnsw_recall_slack, v.target_recall
-            )));
+        for (name, floor) in [
+            ("vector.hnsw_register_floor", v.hnsw_register_floor),
+            ("vector.flat_register_floor", v.flat_register_floor),
+        ] {
+            if !(0.0..=1.0).contains(&floor) {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} must be in [0.0, 1.0], got {floor}"
+                )));
+            }
+            // Warn, not reject: a floor above `target_recall` is a legal thing
+            // to want (hold the resident index to a higher bar than the ivf
+            // laws). It is warned because it is also what an unnoticed
+            // MIGRATION looks like. The floors used to be derived as
+            // `target_recall - hnsw_recall_slack`; a config that lowered
+            // `target_recall` and never set the slack key carries nothing
+            // retired, so the load succeeds and the floor silently snaps from
+            // (say) 0.94 to the 0.98 default — after which an index that
+            // calibrates at 0.96 de-registers at the next drain and the table
+            // quietly serves ivf. Said once at load, where both numbers are in
+            // hand, rather than at the drain that acts on it.
+            if floor > v.target_recall {
+                tracing::warn!(
+                    "{name} = {floor} is above vector.target_recall = {}: an index that \
+                     clears the target will still de-register, and the table will serve \
+                     ivf. If you lowered target_recall and expected the floor to follow, \
+                     set {name} explicitly — it is no longer derived from target_recall.",
+                    v.target_recall
+                );
+            }
         }
         // An explicit base degree far above `ef_construction` is pure sentinel
         // padding: a build discovers at most ~`ef_construction` neighbors per
@@ -1234,6 +1330,34 @@ mod tests {
                 "the error must name both the retired key and its replacement: {message}"
             );
         }
+        // Every entry in the table, not just the first: the generic scan covers
+        // both today, but a refactor of `reject_retired_keys` could break
+        // detection for an untested key with the suite green — handing an
+        // operator's `hnsw_recall_slack: 0.02` a silent 0.98 floor, which is
+        // the exact drift the retirement mechanism exists to prevent.
+        for (retired, replacement) in RETIRED_CONFIG_KEYS {
+            let key = retired
+                .strip_prefix("vector.")
+                .expect("every retired key is under `vector.` today");
+            let fig =
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Serialized::defaults(serde_json::json!({
+                        "vector": { key: 0.02 }
+                    })));
+            let err = Config::from_figment(fig).expect_err("a retired key must fail the load");
+            let ConfigError::Invalid(message) = &err else {
+                panic!("expected a validation error for `{retired}`, got {err:?}");
+            };
+            let named = replacement
+                .split_whitespace()
+                .next()
+                .expect("a replacement names a key");
+            assert!(
+                message.contains(retired) && message.contains(named),
+                "the error must name both `{retired}` and `{named}`: {message}"
+            );
+        }
         // The shipped default must not itself trip the check.
         Config::defaults().expect("embedded default carries no retired key");
         Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)))
@@ -1268,7 +1392,8 @@ mod tests {
         // A ceiling below the smallest ef candidate empties the sweep grid.
         invalid(json!({ "vector": { "hnsw_ef_ceil": 64 } }));
         // Slack >= target collapses the register floor to zero.
-        invalid(json!({ "vector": { "target_recall": 0.9, "hnsw_recall_slack": 0.95 } }));
+        invalid(json!({ "vector": { "hnsw_register_floor": 1.5 } }));
+        invalid(json!({ "vector": { "flat_register_floor": -0.1 } }));
         // An explicit m0 far above ef_construction is sentinel padding.
         invalid(json!({ "vector": { "hnsw_m0": 1024, "hnsw_ef_construction": 200 } }));
         // A 0 probe cap divides by zero when the probe strides the corpus.

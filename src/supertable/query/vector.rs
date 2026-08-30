@@ -71,7 +71,7 @@ use std::{
     future::Future,
     mem,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{self, AtomicU64},
     },
     time::Instant,
@@ -108,6 +108,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
+            flat::Sq4FlatIndex,
             hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{ProbeTally, ScanCandidate, ScanOutcome},
@@ -125,8 +126,8 @@ use crate::{
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
         slow_vector_state::{
-            CentroidSection, GraphWalkRequest, ResidentGraphSections, fetch_centroid_section,
-            fetch_graph_sections,
+            CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
+            fetch_centroid_section, hydrate_resident_index,
         },
         tombstones::SidecarCache,
     },
@@ -1643,42 +1644,6 @@ fn score_cell_fp32(
     true
 }
 
-/// Warn that `search_mode = hnsw_ivf` is set but this query fell through to the
-/// ivf scan, with the diagnosis the situation actually warrants:
-///   - `has_graph_ref = false`: the table carries no resident graph at all —
-///     pre-drain, or the corpus exceeds `hnsw_max_docs`.
-///   - `has_graph_ref = true`: a graph exists but not for THIS column (a
-///     second same-dim vector column carries it, or a dim/emptiness mismatch).
-///
-/// The `_id` results are still correct; only the fast path is off. Deduped
-/// per `(diagnosis, column)` so a miss on one column never suppresses the
-/// warning another column would legitimately raise.
-fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
-    static WARNED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
-    > = std::sync::OnceLock::new();
-    let warned = WARNED.get_or_init(Default::default);
-    {
-        let mut set = warned.lock().expect("hnsw warn dedup set");
-        if !set.insert((has_graph_ref, column.to_string())) {
-            return;
-        }
-    }
-    if has_graph_ref {
-        tracing::warn!(
-            column,
-            "search_mode=hnsw_ivf but no resident graph for this column (another column \
-             carries the graph, or a dim/emptiness mismatch); serving via ivf scan"
-        );
-    } else {
-        tracing::warn!(
-            column,
-            "search_mode=hnsw_ivf but no resident graph (pre-drain or corpus > hnsw_max_docs); \
-             serving via ivf scan"
-        );
-    }
-}
-
 /// Assemble the persisted `hnsw` data bundle at drain time: walk
 /// every superfile's materialized Sq16 rows for `column`, pool the
 /// node-ordered code plane and the stable-doc-id map, build the HNSW over
@@ -1791,27 +1756,496 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
     Ok(n)
 }
 
-pub(crate) async fn assemble_hnsw_sections(
+/// Why a resident vector index is not available — the graph's or the flat
+/// plane's, at build time or at serve time.
+///
+/// Returned rather than logged, and returned rather than collapsed into `None`.
+/// A sentinel `None` makes the CALLER decide what to say, which in practice
+/// means it says nothing: a table configured for one index quietly serves
+/// another, and the only way to tell is that the numbers look like the mode you
+/// did not ask for. Carrying the reason means the fallback is still automatic
+/// but never silent, and the reason survives whether or not a subscriber is
+/// installed to print it.
+#[derive(Debug)]
+pub(crate) enum IndexUnavailable {
+    /// The manifest declares no such vector column.
+    NoSuchColumn {
+        queried: String,
+        declared: Vec<String>,
+    },
+    /// The column stores a rerank codec the index cannot be fitted from.
+    CodecUnsupported { column: String, codec: &'static str },
+    /// The column's metric is not the one these scorers rank under.
+    MetricUnsupported { column: String, metric: Metric },
+    /// No rows materialized for the column.
+    NoRows { column: String },
+    /// The corpus is past the index's document ceiling.
+    OverDocCeiling {
+        rows: usize,
+        ceiling: u64,
+        knob: &'static str,
+    },
+    /// The built index did not clear its per-index-type register floor.
+    BelowRegisterFloor { recall: f64, floor: f64 },
+    /// The row gather returned nothing despite a non-zero pre-count.
+    GatherEmpty { column: String, pre_count: usize },
+    /// The decoded plane's row count disagrees with the doc-id count.
+    PlaneRowMismatch { doc_ids: usize, decoded: usize },
+    /// No index is hydrated for this generation.
+    NotHydrated,
+    /// An index is hydrated, but of the other kind.
+    WrongKind { wanted: &'static str },
+    /// The hydrated index was built for a different column.
+    ColumnMismatch { queried: String, index: String },
+    /// The hydrated index was built at a different dimensionality.
+    DimMismatch { queried: usize, index: usize },
+    /// The hydrated index holds no rows.
+    IndexEmpty,
+    /// An incremental extend does not apply: the delta is not a pure append.
+    NotPureAppend {
+        prior: usize,
+        delta: usize,
+        current: usize,
+    },
+    /// An incremental extend does not apply: there are no new rows.
+    NoNewRows,
+    /// The codec names a plane that is not resident, so an extend would drop it.
+    PlaneNotResident { codec: &'static str },
+}
+
+impl std::fmt::Display for IndexUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndexUnavailable::NoSuchColumn { queried, declared } => write!(
+                f,
+                "no vector column `{queried}` on this manifest (declared: {declared:?})"
+            ),
+            IndexUnavailable::CodecUnsupported { column, codec } => write!(
+                f,
+                "column `{column}` stores rerank codec {codec}, which this index \
+                 cannot be fitted from"
+            ),
+            IndexUnavailable::MetricUnsupported { column, metric } => write!(
+                f,
+                "column `{column}` uses metric {metric:?}; the resident scorers rank \
+                 by inner product, which orders neighbours correctly only under Cosine"
+            ),
+            IndexUnavailable::NoRows { column } => {
+                write!(f, "no rows materialized for column `{column}`")
+            }
+            IndexUnavailable::OverDocCeiling {
+                rows,
+                ceiling,
+                knob,
+            } => write!(f, "{rows} rows exceeds {knob} = {ceiling}"),
+            IndexUnavailable::BelowRegisterFloor { recall, floor } => write!(
+                f,
+                "measured recall {recall:.4} is below the register floor {floor:.4}"
+            ),
+            IndexUnavailable::GatherEmpty { column, pre_count } => write!(
+                f,
+                "the row gather for `{column}` returned nothing despite a pre-count \
+                 of {pre_count}"
+            ),
+            IndexUnavailable::PlaneRowMismatch { doc_ids, decoded } => write!(
+                f,
+                "decoded plane has {decoded} rows against {doc_ids} doc-ids \
+                 (transient read fault?)"
+            ),
+            IndexUnavailable::NotHydrated => {
+                write!(f, "no resident index for this generation")
+            }
+            IndexUnavailable::WrongKind { wanted } => write!(
+                f,
+                "the resident index is not a {wanted} index (built under a different \
+                 search_mode)"
+            ),
+            IndexUnavailable::ColumnMismatch { queried, index } => write!(
+                f,
+                "the resident index was built for column `{index}`, not `{queried}`"
+            ),
+            IndexUnavailable::DimMismatch { queried, index } => write!(
+                f,
+                "the resident index has dim {index}, the query has dim {queried}"
+            ),
+            IndexUnavailable::IndexEmpty => write!(f, "the resident index holds no rows"),
+            IndexUnavailable::NotPureAppend {
+                prior,
+                delta,
+                current,
+            } => write!(
+                f,
+                "not a pure append: {prior} prior + {delta} new != {current} current rows"
+            ),
+            IndexUnavailable::NoNewRows => write!(f, "no rows past the prior high water"),
+            IndexUnavailable::PlaneNotResident { codec } => write!(
+                f,
+                "the stored codec names a {codec} plane that is not resident, so an \
+                 extend would drop it"
+            ),
+        }
+    }
+}
+
+/// Outcome of building or serving a resident vector index.
+///
+/// [`Self::Unavailable`] is not an error: the caller falls back to the ivf scan.
+/// It is separate from `Err` precisely so the two cannot be confused — a
+/// storage fault and "this table is too big for a linear scan" call for
+/// different reactions, and collapsing both into `None` is how the second one
+/// became invisible.
+pub(crate) enum IndexOutcome<T> {
+    Ready(T),
+    Unavailable(IndexUnavailable),
+}
+
+impl<T> IndexOutcome<T> {
+    /// Log the reason at warn and yield `None`, or yield the value.
+    ///
+    /// One place decides how a decline is reported, so no path can decline
+    /// quietly by forgetting to.
+    ///
+    /// Deduped on the rendered message: a serving decline is per QUERY, and a
+    /// table whose config asks for an index it will never have would otherwise
+    /// warn on every one. The set is keyed by the message rather than by the
+    /// variant so two columns declining for the same reason each get said once
+    /// — and it stays small because a serving decline's reasons carry only
+    /// column names and dimensions. (A build decline can carry a measured
+    /// recall, but that path runs once per drain, not per query.)
+    pub(crate) fn or_warn(self, what: &str) -> Option<T> {
+        match self {
+            IndexOutcome::Ready(v) => Some(v),
+            IndexOutcome::Unavailable(reason) => {
+                let message = format!("{what}: serving ivf — {reason}");
+                if warn_once(&message) {
+                    tracing::warn!("{message}");
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Nodes a resident index must fetch to return `k` DISTINCT rows.
+///
+/// When `drain_replica_target_factor > 1` a user row is replicated across
+/// hidden cells and occupies several nodes carrying the SAME `stable_id`;
+/// `top_k_ascending` collapses them by id, so a plain top-`k` fetch would
+/// return fewer than `k` distinct rows on a delete-free table. The ivf arm
+/// over-fetches by the same factor.
+///
+/// Shared by both resident arms because both are built from the same gathered
+/// rows and so carry the same replication. The graph arm had it and the flat
+/// arm did not, which is the kind of divergence that only shows up as "a
+/// query asked for 10 and got 8".
+///
+/// Caveat: this reads the CURRENT config, but replica duplication is a
+/// build-time property baked into the persisted index. Lowering
+/// `drain_replica_target_factor` below the value the resident index was built
+/// at under-counts its replicas and can re-open an under-`k` window until the
+/// next full rebuild restamps it.
+fn replica_fetch_width(k: usize) -> usize {
+    let factor = config::global().vector.drain_replica_target_factor.max(1.0);
+    ((k as f32) * factor).ceil() as usize
+}
+
+/// Decline unless `column`'s metric is one the resident scorers rank under.
+///
+/// Both resident index types score `−dot` and both map the result onto the
+/// `1 − dot` cosine scale. That ordering is the column's own ordering only
+/// under [`Metric::Cosine`]: under `L2Sq` it is a different ranking entirely
+/// (`‖a−b‖² = ‖a‖² + ‖b‖² − 2a·b` agrees with `−dot` only when the norms are
+/// equal), and under `NegDot` the order is right but the published score
+/// carries a meaningless `+1`.
+///
+/// The register gate cannot catch this on its own: `probe_recall` grades a
+/// `−dot` scan against a `−dot` exhaustive scan, so a mis-metriced index
+/// measures perfect recall against a ground truth that is wrong the same way,
+/// clears its floor, registers, and serves wrong neighbours at the right
+/// latency. The centroid-graph router gates on `Cosine` for the same reason.
+fn metric_supported(manifest: &ManifestSnapshot, column: &str) -> Option<IndexUnavailable> {
+    let metric = manifest
+        .options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+        .map(|vc| vc.metric)?;
+    (!matches!(metric, Metric::Cosine)).then(|| IndexUnavailable::MetricUnsupported {
+        column: column.to_string(),
+        metric,
+    })
+}
+
+/// `true` the first time this exact message is offered, `false` after.
+fn warn_once(message: &str) -> bool {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("index decline warn-dedup set")
+        .insert(message.to_string())
+}
+
+/// Read every superfile's materialized Sq16 rows for `column` ONCE and return
+/// the node-ordered `(stable doc ids, carried code plane)`.
+///
+/// `None` when the column yields no rows at all (absent, not Sq16, or empty).
+///
+/// `probe_step` selects what the second return value carries, because the two
+/// callers want different amounts of the plane and neither can afford a second
+/// decode pass:
+///
+/// - `Some(step)` keeps every `step`-th row — a bounded strided sample. The
+///   graph's calibrator probes on that before deciding whether the full plane
+///   is worth materializing, which on a large drain is the difference between
+///   fitting in RAM and OOM.
+/// - `None` carries the FULL plane, for a caller that will build from it
+///   directly.
+///
+/// The doc-ids are always complete regardless: they are 16 B/row, and both
+/// callers need the whole map to answer a hit.
+///
+/// Shared rather than copied. The iteration order, the superseded-cell
+/// exclusion, and the local→stable id resolution together define what node
+/// index N *means*; two callers computing that separately would eventually
+/// disagree, and the failure would be silently wrong ids rather than an error.
+async fn gather_sq16_rows(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    dim: usize,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    n: usize,
+    probe_step: Option<usize>,
+) -> Result<Option<(Vec<i128>, Vec<u8>)>, QueryError> {
+    let stride = dim * 2;
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+
+    let mut doc_ids: Vec<i128> = Vec::with_capacity(n);
+    let mut carried_codes: Vec<u8> = Vec::new();
+    let mut gi: usize = 0;
+    for entry in manifest.get_all_superfiles() {
+        let reader =
+            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                .await?;
+        let Some(vr) = reader.vec() else { continue };
+        let Some(rows) = vr
+            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .await
+        else {
+            continue;
+        };
+        let ids =
+            stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
+        for row in rows {
+            if row.encoded.codes.len() != stride {
+                return Err(QueryError::Execute(format!(
+                    "vector index: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
+                    row.encoded.codes.len()
+                )));
+            }
+            let local = row.local_doc_id as usize;
+            let stable_id = *ids.get(local).ok_or_else(|| {
+                QueryError::Execute(format!(
+                    "vector index: local_doc_id {local} out of range ({} ids) on `{column}`",
+                    ids.len()
+                ))
+            })?;
+            doc_ids.push(stable_id);
+            match probe_step {
+                Some(step) if gi.is_multiple_of(step) => {
+                    carried_codes.extend_from_slice(&row.encoded.codes);
+                }
+                Some(_) => {}
+                None => carried_codes.extend_from_slice(&row.encoded.codes),
+            }
+            gi += 1;
+        }
+    }
+    // The cheap pre-count must equal the decoded row count, or a strided step
+    // was sized against the wrong total and the sample would not be the one
+    // the caller asked for.
+    debug_assert_eq!(
+        doc_ids.len(),
+        n,
+        "vector index pre-count vs decoded row count mismatch"
+    );
+    if doc_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((doc_ids, carried_codes)))
+}
+
+/// Build and encode the flat 4-bit index for `column` — the drain path for
+/// `search_mode = flat_ivf`.
+///
+/// `Ok(None)` means "do not register one", and every reason is a legitimate
+/// fall-through to `ivf` rather than an error: the column is absent or not
+/// Sq16, the table has no rows, it exceeds `flat_max_docs`, or the fitted plane
+/// does not clear the register floor.
+///
+/// Mirrors [`assemble_hnsw_sections`] and shares its row gather, so both
+/// indexes agree on what node index N means. What it does NOT share is the
+/// calibration: there is no `(m0, ef)` to sweep for a scan that visits every
+/// row, so this fits the plane once and then GATES on it. The gate is the part
+/// that matters — a plane too coarse for its corpus would otherwise serve
+/// silently below the table's bar at exactly the right latency.
+pub(crate) async fn assemble_flat_sections(
     manifest: &ManifestSnapshot,
     column: &str,
     op_stats: &Option<Arc<OpStatsCollector>>,
-) -> Result<Option<Vec<u8>>, QueryError> {
+) -> Result<IndexOutcome<Vec<u8>>, QueryError> {
     let Some(vc) = manifest
         .options
         .vector_columns
         .iter()
         .find(|vc| vc.column == column)
     else {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn {
+            queried: column.to_string(),
+            declared: manifest
+                .options
+                .vector_columns
+                .iter()
+                .map(|vc| vc.column.clone())
+                .collect(),
+        }));
+    };
+    // The plane is a re-quantization of the stored Sq16 reconstruction, so a
+    // column stored under another rerank codec has nothing to fit from.
+    if !vc.rerank_codec.is_sq16() {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::CodecUnsupported {
+                column: column.to_string(),
+                codec: vc.rerank_codec.name(),
+            },
+        ));
+    }
+    if let Some(reason) = metric_supported(manifest, column) {
+        return Ok(IndexOutcome::Unavailable(reason));
+    }
+    let dim = vc.dim;
+    let vcfg = &config::global().vector;
+    let n = count_hnsw_rows(manifest, column).await?;
+    if n == 0 {
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoRows {
+            column: column.to_string(),
+        }));
+    }
+    if n > vcfg.flat_max_docs as usize {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::OverDocCeiling {
+                rows: n,
+                ceiling: vcfg.flat_max_docs,
+                knob: "vector.flat_max_docs",
+            },
+        ));
+    }
+    // `None`: a flat build wants the WHOLE plane, not a strided sample. There
+    // is no cheap-probe stage to skip a build with, because the expensive part
+    // of a graph build - the calibration sweep - does not exist here; the fit
+    // is one pass, and the gate below runs against the real plane rather than
+    // a subsample whose recall would be optimistic.
+    let Some((doc_ids, sq16_codes)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, None).await?
+    else {
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
+            column: column.to_string(),
+            pre_count: n,
+        }));
+    };
+    // The bare 4-bit plane, always. The 1.0 B/dim residual rung was carved out
+    // pending a matched-bytes comparison against a single 8-bit plane — the
+    // Sq16-vs-Sq8Residual theorem says a uniform plane beats coarse+residual
+    // at equal bytes, and shipping a default that comparison may retire is a
+    // migration for nothing. The scorer and the persisted form keep the codec
+    // seam (the bundle's codec tag), so a future rung is a config variant, not
+    // a format change.
+    let with_residual = false;
+    let floor = vcfg.flat_register_floor;
+    let column_owned = column.to_string();
+    // Fitting the plane is a moment pass plus a rotation per row, and the gate
+    // scans the whole corpus once per probe query. Both are pure CPU and belong
+    // on the reader pool, not inline on a tokio worker.
+    let (index, recall) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "flat build + gate: reader pool dropped result",
+        move || {
+            let index = Sq4FlatIndex::from_sq16_plane(
+                &sq16_codes,
+                doc_ids,
+                &column_owned,
+                dim,
+                with_residual,
+                HNSW_PLANE_ROT_SEED,
+            );
+            // Graded against the Sq16 plane the codes were fitted from - the
+            // reference, never the plane itself.
+            let reference = Sq16Scorer::from_codes(sq16_codes, dim, n);
+            let recall = index.probe_recall(
+                &reference,
+                HNSW_CALIB_RECALL_K,
+                HNSW_CALIB_QUERIES,
+                HNSW_CALIB_SEED,
+            );
+            (index, recall)
+        },
+    )
+    .await
+    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    if recall < floor {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::BelowRegisterFloor { recall, floor },
+        ));
+    }
+    tracing::debug!(
+        column,
+        recall,
+        rows = n,
+        residual = with_residual,
+        resident_mib = index.resident_bytes() / (1024 * 1024),
+        "flat: registered"
+    );
+    Ok(IndexOutcome::Ready(index.encode()))
+}
+
+pub(crate) async fn assemble_hnsw_sections(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<IndexOutcome<Vec<u8>>, QueryError> {
+    let Some(vc) = manifest
+        .options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+    else {
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn {
+            queried: column.to_string(),
+            declared: manifest
+                .options
+                .vector_columns
+                .iter()
+                .map(|vc| vc.column.clone())
+                .collect(),
+        }));
     };
     if !vc.rerank_codec.is_sq16() {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::CodecUnsupported {
+                column: column.to_string(),
+                codec: vc.rerank_codec.name(),
+            },
+        ));
+    }
+    if let Some(reason) = metric_supported(manifest, column) {
+        return Ok(IndexOutcome::Unavailable(reason));
     }
     let dim = vc.dim;
     let stride = dim * 2;
-    let store = Arc::clone(&manifest.options.store);
-    let disk_cache = manifest.options.disk_cache.clone();
-    let storage = manifest.options.storage.clone();
 
     // Gather the stable doc-ids (cheap: 16 B/row) and the row count first. The
     // Sq16 code plane itself (dim*2 B/row — GBs at scale) is gathered LATER: a
@@ -1819,8 +2253,7 @@ pub(crate) async fn assemble_hnsw_sections(
     // passes. A graph-hostile corpus therefore never materializes the whole
     // plane just to decline (which, on a large drain, is the difference between
     // fitting in RAM and OOM).
-    let empty_superseded = BTreeMap::new();
-    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+    //
     // Cheap metadata pre-count (NO code decode): the row total lets us size the
     // probe's strided step before touching any code plane, so the stable
     // doc-ids and the strided probe sample can both come out of ONE decode pass
@@ -1828,7 +2261,9 @@ pub(crate) async fn assemble_hnsw_sections(
     // a strided-sample decode).
     let n = count_hnsw_rows(manifest, column).await?;
     if n == 0 {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoRows {
+            column: column.to_string(),
+        }));
     }
     let vcfg = &config::global().vector;
     // (m0, ef) candidate grid for the calibrator. An explicit `hnsw_m0`
@@ -1856,71 +2291,14 @@ pub(crate) async fn assemble_hnsw_sections(
     // the sample is ~probe_cap rows. `None` = small corpus, no probe.
     let probe_step: Option<usize> = (n > probe_cap).then(|| (n / probe_cap).max(1));
 
-    // Single decode pass over every superfile: read/decode each superfile's
-    // rows ONCE and, in that same loop, (a) push the stable doc-id (same
-    // superfile iteration order, same superseded-cell exclusion, so `doc_ids`
-    // is identical to before) and (b) on the probe path, append the row's codes
-    // to the strided sample when its global index is on the step (byte-identical
-    // to the old `collect_hnsw_codes(.., Some(step))`). The full plane is still
-    // read (below) only when the probe registers.
-    let mut doc_ids: Vec<i128> = Vec::with_capacity(n);
-    // On the probe path this carries only the strided probe sample; on the
-    // small-corpus path (no probe) it carries the FULL decoded plane so the
-    // full build below reuses it instead of re-reading + re-decoding every
-    // superfile a second time. The two modes are mutually exclusive, so one
-    // buffer serves both and peak memory is unchanged.
-    let mut carried_codes: Vec<u8> = Vec::new();
-    let mut gi: usize = 0;
-    for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
-        let Some(vr) = reader.vec() else { continue };
-        let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
-            .await
-        else {
-            continue;
-        };
-        let ids =
-            stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
-        for row in rows {
-            if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
-                    "hnsw: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
-                    row.encoded.codes.len()
-                )));
-            }
-            let local = row.local_doc_id as usize;
-            let stable_id = *ids.get(local).ok_or_else(|| {
-                QueryError::Execute(format!(
-                    "hnsw: local_doc_id {local} out of range ({} ids) on `{column}`",
-                    ids.len()
-                ))
-            })?;
-            doc_ids.push(stable_id);
-            match probe_step {
-                // Probe path: keep only every `step`-th row for the sample.
-                Some(step) if gi.is_multiple_of(step) => {
-                    carried_codes.extend_from_slice(&row.encoded.codes);
-                }
-                Some(_) => {}
-                // Small corpus (no probe): carry the whole plane for the build.
-                None => carried_codes.extend_from_slice(&row.encoded.codes),
-            }
-            gi += 1;
-        }
-    }
-    // The cheap pre-count must equal the decoded row count, or the strided step
-    // was sized wrong and the probe sample would diverge from the old code.
-    debug_assert_eq!(
-        doc_ids.len(),
-        n,
-        "hnsw pre-count vs decoded row count mismatch"
-    );
-    if doc_ids.is_empty() {
-        return Ok(None);
-    }
+    let Some((doc_ids, mut carried_codes)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, probe_step).await?
+    else {
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
+            column: column.to_string(),
+            pre_count: n,
+        }));
+    };
 
     if probe_step.is_some() {
         // Reuse the strided sample gathered in the merged pass above — no second
@@ -1932,9 +2310,9 @@ pub(crate) async fn assemble_hnsw_sections(
         // global rayon pool, and not inline on the tokio worker) per the
         // concurrency contract. The candidate grids are tiny, so clone them
         // into the closure; the full-corpus pass below still owns the originals.
-        let (target_recall, recall_slack, ef_construction) = (
+        let (target_recall, register_floor, ef_construction) = (
             vcfg.target_recall,
-            vcfg.hnsw_recall_slack,
+            vcfg.hnsw_register_floor,
             vcfg.hnsw_ef_construction,
         );
         let (pm0, pef) = (m0_cands.clone(), ef_cands.clone());
@@ -1950,7 +2328,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     &pm0,
                     &pef,
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
@@ -1970,10 +2348,15 @@ pub(crate) async fn assemble_hnsw_sections(
                 sampled = pn,
                 recall = pchoice.recall,
                 target = vcfg.target_recall,
-                "hnsw probe: best recall below floor — graph-hostile, serving ivf \
-                 (full build skipped)"
+                "hnsw probe: best recall below floor — graph-hostile distribution, \
+                 skipping the full build"
             );
-            return Ok(None);
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::BelowRegisterFloor {
+                    recall: pchoice.recall,
+                    floor: vcfg.hnsw_register_floor,
+                },
+            ));
         }
         tracing::debug!(
             column,
@@ -2014,10 +2397,14 @@ pub(crate) async fn assemble_hnsw_sections(
             column,
             doc_ids = doc_ids.len(),
             decoded_rows,
-            "hnsw: decoded plane row count != doc-id count (transient read fault?); \
-             skipping graph build, serving ivf"
+            "hnsw: decoded plane row count != doc-id count (transient read fault?)"
         );
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::PlaneRowMismatch {
+                doc_ids: doc_ids.len(),
+                decoded: decoded_rows,
+            },
+        ));
     }
     let scorer = Sq16Scorer::from_codes(codes, dim, decoded_rows);
     // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
@@ -2038,9 +2425,9 @@ pub(crate) async fn assemble_hnsw_sections(
     // the existing None→fallback, with no separate safety mechanism. Grading
     // against the walk plane itself could not do that: the ground truth would
     // carry the same error it is meant to detect.
-    let (target_recall, recall_slack, ef_construction) = (
+    let (target_recall, register_floor, ef_construction) = (
         vcfg.target_recall,
-        vcfg.hnsw_recall_slack,
+        vcfg.hnsw_register_floor,
         vcfg.hnsw_ef_construction,
     );
     let walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
@@ -2074,7 +2461,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     &m0_cands,
                     &ef_cands,
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
@@ -2090,7 +2477,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     &m0_cands,
                     &ef_cands,
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
@@ -2110,9 +2497,14 @@ pub(crate) async fn assemble_hnsw_sections(
             n,
             recall = choice.recall,
             target = vcfg.target_recall,
-            "hnsw calibrate: best recall below floor — graph NOT registered, serving ivf"
+            "hnsw calibrate: best recall below floor — graph NOT registered"
         );
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::BelowRegisterFloor {
+                recall: choice.recall,
+                floor: vcfg.hnsw_register_floor,
+            },
+        ));
     }
     tracing::info!(
         column,
@@ -2127,7 +2519,7 @@ pub(crate) async fn assemble_hnsw_sections(
         "hnsw calibrate: graph registered"
     );
     let graph = graph.expect("registered choice carries its pruned graph");
-    Ok(Some(encode_hnsw(
+    Ok(IndexOutcome::Ready(encode_hnsw(
         scorer.codes(),
         &doc_ids,
         &graph,
@@ -2159,18 +2551,37 @@ pub(crate) async fn assemble_hnsw_incremental(
     op_stats: &Option<Arc<OpStatsCollector>>,
     prior: crate::superfile::vector::hnsw::HnswIndex,
     prior_high_water: i128,
-) -> Result<Option<(Vec<u8>, i128, usize)>, QueryError> {
+) -> Result<IndexOutcome<(Vec<u8>, i128, usize)>, QueryError> {
     let Some(vc) = manifest
         .options
         .vector_columns
         .iter()
         .find(|vc| vc.column == column)
     else {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn {
+            queried: column.to_string(),
+            declared: manifest
+                .options
+                .vector_columns
+                .iter()
+                .map(|vc| vc.column.clone())
+                .collect(),
+        }));
     };
     let dim = prior.dim;
-    if !vc.rerank_codec.is_sq16() || vc.dim != dim {
-        return Ok(None);
+    if !vc.rerank_codec.is_sq16() {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::CodecUnsupported {
+                column: column.to_string(),
+                codec: vc.rerank_codec.name(),
+            },
+        ));
+    }
+    if vc.dim != dim {
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::DimMismatch {
+            queried: vc.dim,
+            index: dim,
+        }));
     }
     let stride = dim * 2;
     let store = Arc::clone(&manifest.options.store);
@@ -2216,7 +2627,7 @@ pub(crate) async fn assemble_hnsw_incremental(
         }
     }
     if new_doc_ids.is_empty() {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoNewRows));
     }
     // Pure-append guard: prior population + delta must equal the current row
     // count. Otherwise rows were removed (or ids are not a clean monotonic
@@ -2227,7 +2638,11 @@ pub(crate) async fn assemble_hnsw_incremental(
         .map(|e| e.n_docs as usize)
         .sum();
     if prior.doc_ids.len() + new_doc_ids.len() != current_total {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NotPureAppend {
+            prior: prior.doc_ids.len(),
+            delta: new_doc_ids.len(),
+            current: current_total,
+        }));
     }
 
     let inserted = new_doc_ids.len();
@@ -2253,7 +2668,9 @@ pub(crate) async fn assemble_hnsw_incremental(
     // extend it. Full rebuild instead of writing a bundle that silently drops
     // it: a rebuild is expensive but correct, and it re-fits the ruler.
     if inherited_walk.is_sq4() && prior.sq4.is_none() {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::PlaneNotResident { codec: "4-bit" },
+        ));
     }
     // The k→ef curve is inherited for the same reason and on the same terms: a
     // pure append does not recalibrate, so it carries forward the beam widths
@@ -2303,7 +2720,13 @@ pub(crate) async fn assemble_hnsw_incremental(
                 (None, None) => None,
                 // A prior bundle cannot disagree with a delta it derived:
                 // `from_sq16_plane` was told the prior's residual-ness.
-                _ => return Ok(None),
+                _ => {
+                    return Ok(IndexOutcome::Unavailable(
+                        IndexUnavailable::PlaneNotResident {
+                            codec: "4-bit residual",
+                        },
+                    ));
+                }
             };
             let offset = offset.to_vec();
             let step = step.to_vec();
@@ -2318,18 +2741,28 @@ pub(crate) async fn assemble_hnsw_incremental(
             ) {
                 Some(sc) => Some(sc),
                 // Shape mismatch means a corrupt prior plane: full rebuild.
-                None => return Ok(None),
+                None => {
+                    return Ok(IndexOutcome::Unavailable(
+                        IndexUnavailable::PlaneRowMismatch {
+                            doc_ids: total,
+                            decoded: 0,
+                        },
+                    ));
+                }
             }
         }
     };
     let vcfg = &config::global().vector;
-    let (target_recall, recall_slack, ef_construction, probe_cap) = (
+    let (target_recall, register_floor, ef_construction, probe_cap) = (
         vcfg.target_recall,
-        vcfg.hnsw_recall_slack,
+        vcfg.hnsw_register_floor,
         vcfg.hnsw_ef_construction,
         vcfg.hnsw_probe_max_docs as usize,
     );
-    let floor = (target_recall - recall_slack).max(0.0);
+    // The incremental extend re-checks the grown graph against the GRAPH's own
+    // floor -- the same bar the full build had to clear, so an append cannot
+    // quietly lower the standard the resident graph was registered at.
+    let floor = register_floor;
     let prior_graph = prior.graph;
     // The extend fans the new-node inserts across rayon, and the recall
     // recheck is pure CPU; both belong on the reader pool, not inline on the
@@ -2382,7 +2815,7 @@ pub(crate) async fn assemble_hnsw_incremental(
                     &[inherited_m0],
                     &[inherited_ef],
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
@@ -2419,10 +2852,12 @@ pub(crate) async fn assemble_hnsw_incremental(
     .await
     .map_err(|e| QueryError::Execute(e.to_string()))?;
     if recall < floor {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::BelowRegisterFloor { recall, floor },
+        ));
     }
     let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
-    Ok(Some((
+    Ok(IndexOutcome::Ready((
         encode_hnsw(
             scorer.codes(),
             &doc_ids,
@@ -2458,42 +2893,164 @@ impl SupertableReader {
     /// match the cosine distance the ivf/scan arm emits — the two arms merge on
     /// raw score, so they MUST share one scale (an undrained user-arm hit and a
     /// drained graph hit are compared directly).
+    /// Serve top-`k` from the resident flat 4-bit index. `None` when there is
+    /// no such index for this column, so the caller falls through to the ivf
+    /// scan.
+    ///
+    /// Peer of [`Self::hnsw_search`]. It has no beam, no `ef`, and no refine
+    /// width: the scan visits every row and the codes' own ranking IS the
+    /// answer.
+    ///
+    /// It does over-fetch for boundary replicas, exactly as the graph arm
+    /// does, and for the same reason. This index is built from the same
+    /// gathered rows, so under `drain_replica_target_factor > 1` one user row
+    /// occupies several NODES carrying one `stable_id`; `top_k_ascending`
+    /// then collapses them, and a scan of width `k` would return fewer than
+    /// `k` distinct rows. The collapse is why the width has to grow, not a
+    /// reason it can stay at `k`.
+    async fn flat_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<IndexOutcome<Vec<SuperfileHit>>, QueryError> {
+        if k == 0 {
+            return Ok(IndexOutcome::Ready(Vec::new()));
+        }
+        let Some(sections) = self.resident_vector_index().await else {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::NotHydrated));
+        };
+        // This arm serves the flat index only; a generation that published a
+        // graph is a different index, not a broken one.
+        let Some(index) = sections.data.as_ref().and_then(ResidentIndexKind::flat) else {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::WrongKind {
+                wanted: "flat",
+            }));
+        };
+        // Built for exactly one column. A table can carry several same-dim
+        // vector columns, so a dim match alone is not enough — a query on a
+        // DIFFERENT column must fall back to ivf rather than be answered from
+        // this column's rows.
+        if index.column() != column {
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::ColumnMismatch {
+                    queried: column.to_string(),
+                    index: index.column().to_string(),
+                },
+            ));
+        }
+        if index.dim() != query.len() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::DimMismatch {
+                queried: query.len(),
+                index: index.dim(),
+            }));
+        }
+        if index.is_empty() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
+        }
+        let manifest = self.manifest();
+        // Also checked at build, so a plane published by this binary can never
+        // reach here on a non-cosine column. Re-checked because a plane
+        // published by an EARLIER binary can, and it would rank by inner
+        // product under a metric that does not agree with it.
+        if let Some(reason) = metric_supported(manifest, column) {
+            return Ok(IndexOutcome::Unavailable(reason));
+        }
+        let sections_for_scan = Arc::clone(&sections);
+        let query_owned = query.to_vec();
+        // Over-fetch to absorb boundary replicas, matching the graph arm's
+        // `k_fetch`. See this method's doc comment: the id-collapse in
+        // `top_k_ascending` is what makes the widening necessary.
+        let k_fetch = replica_fetch_width(k);
+        // The scan is a pure CPU wave over the whole resident plane: it belongs
+        // on the reader pool, not inline on a tokio worker, which would block
+        // that worker's I/O for the scan's full duration.
+        let hits: Vec<SuperfileHit> = run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "flat serving scan: reader pool dropped result",
+            move || {
+                let index = sections_for_scan
+                    .data
+                    .as_ref()
+                    .and_then(ResidentIndexKind::flat)
+                    .expect("flat index present: checked before dispatch");
+                index
+                    .search(&query_owned, k_fetch)
+                    .into_iter()
+                    .filter_map(|(node, dist)| {
+                        // Shift the scan's `−dot` onto the ivf arm's `1 − dot`
+                        // cosine scale so a cross-arm merge compares like with
+                        // like. Monotonic in `dist`, so intra-arm order is
+                        // unchanged and the public `score` stays non-negative.
+                        Some(SuperfileHit {
+                            superfile: SuperfileUri(Uuid::nil()),
+                            local_doc_id: 0,
+                            score: 1.0 + dist,
+                            stable_id: Some(index.doc_id(node)?),
+                        })
+                    })
+                    .collect()
+            },
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
+    }
+
     async fn hnsw_search(
         &self,
         column: &str,
         query: &[f32],
         k: usize,
-    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+    ) -> Result<IndexOutcome<Vec<SuperfileHit>>, QueryError> {
         if k == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(IndexOutcome::Ready(Vec::new()));
         }
-        let Some(sections) = self.persisted_graph_sections().await else {
-            return Ok(None);
+        let Some(sections) = self.resident_vector_index().await else {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::NotHydrated));
         };
-        let Some(data) = sections.data.as_ref() else {
-            return Ok(None);
+        // This arm serves the graph only. A generation that published a flat
+        // index instead is not a failure — it is a different index, and the
+        // flat arm reaches it — so fall through rather than treating the
+        // absent graph as a missing one.
+        let Some(data) = sections.data.as_ref().and_then(ResidentIndexKind::graph) else {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::WrongKind {
+                wanted: "hnsw",
+            }));
         };
         // The persisted graph is built for exactly one column. A table can
         // carry several same-dim vector columns, so a dim match alone is not
         // enough — a query on a DIFFERENT column must fall back to ivf rather
         // than be answered from this column's neighbors.
-        if data.column != column || data.dim != query.len() || data.doc_ids.is_empty() {
-            return Ok(None);
-        }
-        // Over-fetch to absorb boundary replicas. When
-        // `drain_replica_target_factor > 1`, a user row is replicated across
-        // hidden cells and appears as several graph nodes with the SAME stable
-        // id; `top_k_ascending` collapses them by id, so a plain top-`k` walk
-        // would return fewer than `k` distinct rows on a delete-free table. The
-        // ivf arm over-fetches by the same factor (`k_fetch = k + overhead`).
         //
-        // Caveat: this reads the CURRENT config, but replica duplication is a
-        // build-time property baked into the persisted graph. Lowering
-        // `drain_replica_target_factor` below the value the resident graph was
-        // built at under-counts its replicas and can re-open an under-`k`
-        // window until the next full rebuild restamps the graph.
-        let replica_factor = config::global().vector.drain_replica_target_factor.max(1.0);
-        let k_fetch = ((k as f32) * replica_factor).ceil() as usize;
+        // Three separate reasons, not one `||`: they call for different
+        // reactions (fix the query, fix the config, wait for a drain) and
+        // collapsing them left an operator with "no resident graph for this
+        // column" covering all three at once.
+        if data.column != column {
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::ColumnMismatch {
+                    queried: column.to_string(),
+                    index: data.column.clone(),
+                },
+            ));
+        }
+        if data.dim != query.len() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::DimMismatch {
+                queried: query.len(),
+                index: data.dim,
+            }));
+        }
+        if data.doc_ids.is_empty() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
+        }
+        // A graph published before the build-side metric gate existed can still
+        // be resident, and it ranks by inner product regardless of what the
+        // column's metric says.
+        if let Some(reason) = metric_supported(self.manifest(), column) {
+            return Ok(IndexOutcome::Unavailable(reason));
+        }
+        let k_fetch = replica_fetch_width(k);
         // The calibrated per-`k` beam from the stamped k→ef curve drives the
         // walk, never below the (over-)fetch width. Indexed by the ACTUAL
         // requested `k` (not the replica-inflated `k_fetch`), so a large `k`
@@ -2529,7 +3086,8 @@ impl SupertableReader {
                 let data = sections_for_walk
                     .data
                     .as_ref()
-                    .expect("data present: checked before dispatch");
+                    .and_then(ResidentIndexKind::graph)
+                    .expect("graph present: checked before dispatch");
                 // One dispatch per query, not per candidate: pick the walk
                 // plane the bundle carries and hand the concrete scorer to the
                 // monomorphized walk. A coarse plane re-ranks its beam on Sq16
@@ -2562,7 +3120,7 @@ impl SupertableReader {
         )
         .await
         .map_err(|e| QueryError::Execute(e.to_string()))?;
-        Ok(Some(top_k_ascending(vec![hits], k)))
+        Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
     }
 
     /// Hydrate (or reuse) the persisted `hnsw` graph sections for
@@ -2572,10 +3130,10 @@ impl SupertableReader {
     /// ref (older generation / above the scale ceiling) or the fetch failed
     /// — `hnsw_search` then returns `None` and the caller falls through to
     /// the ivf scan.
-    async fn persisted_graph_sections(&self) -> Option<Arc<ResidentGraphSections>> {
+    async fn resident_vector_index(&self) -> Option<Arc<ResidentVectorIndex>> {
         let manifest = self.manifest();
-        let slot = Arc::clone(&manifest.options.graph_sections_cache);
-        let Some(reference) = manifest.slow_vector_state_graphs_blob().cloned() else {
+        let slot = Arc::clone(&manifest.options.resident_index_cache);
+        let Some(reference) = manifest.resident_vector_index_blob().cloned() else {
             // No graph ref for this generation (a drain declined the graph, or
             // the corpus crossed the scale ceiling). Drop any previously
             // hydrated sections so their multi-GiB plane is not pinned for the
@@ -2596,7 +3154,7 @@ impl SupertableReader {
                 return Some(Arc::clone(sections));
             }
         }
-        // Single-flight hydration. `fetch_graph_sections` blake3-hashes and
+        // Single-flight hydration. `hydrate_resident_index` blake3-hashes and
         // copies a multi-GiB bundle; without a gate every racing first-touch
         // query would run its own download (N duplicate fetches and a transient
         // N×-plane RSS spike that can OOM). The first miss takes THIS gate and
@@ -2613,20 +3171,23 @@ impl SupertableReader {
                 return Some(Arc::clone(sections));
             }
         }
-        let sections =
-            match fetch_graph_sections(storage.as_ref(), &reference, GraphWalkRequest::Configured)
-                .await
-            {
-                Ok(sections) => Arc::new(sections),
-                Err(error) => {
-                    tracing::warn!(
-                        "hnsw graph sections {} unavailable ({error}); falling back to \
+        let sections = match hydrate_resident_index(
+            storage.as_ref(),
+            &reference,
+            WalkPlaneRequest::Configured,
+        )
+        .await
+        {
+            Ok(sections) => Arc::new(sections),
+            Err(error) => {
+                tracing::warn!(
+                    "hnsw graph sections {} unavailable ({error}); falling back to \
                      the ivf scan",
-                        reference.uri
-                    );
-                    return None;
-                }
-            };
+                    reference.uri
+                );
+                return None;
+            }
+        };
         // Publish under the cache lock. The gate makes this the only in-flight
         // hydration, so it installs the uri it just fetched.
         {
@@ -3055,14 +3616,32 @@ impl SupertableReader {
         // exists (dim-matches, right column, non-empty); if the drain skipped
         // it because the corpus exceeds `hnsw_max_docs`, or the query targets
         // a different column, fall through to the ivf scan (the `_ivf` in the
-        // mode name).
-        if !filtered && hidden_vector_index && vcfg.search_mode == config::VectorSearchMode::HnswIvf
+        // mode name) — with the reason named, not inferred.
+        if !filtered
+            && hidden_vector_index
+            && vcfg.search_mode == config::VectorSearchMode::HnswIvf
+            && let Some(hits) = self
+                .hnsw_search(column, query, k)
+                .await?
+                .or_warn("hnsw search")
         {
-            if let Some(hits) = self.hnsw_search(column, query, k).await? {
-                return Ok(hits);
-            }
-            warn_hnsw_no_resident_graph(column, manifest.slow_vector_state_graphs_blob().is_some());
-            // fall through to the ivf scan below
+            return Ok(hits);
+        }
+        // Flat search mode (`vector.search_mode = flat_ivf`): scan the resident
+        // 4-bit plane exhaustively. Same shape of gate as the graph arm above,
+        // and for the same reasons — the hidden (drained) arm only, unfiltered
+        // only, and only when a valid index for THIS column is resident. The
+        // drain declines to build one above `flat_max_docs` or below the
+        // register floor, and either way the query serves ivf.
+        if !filtered
+            && hidden_vector_index
+            && vcfg.search_mode == config::VectorSearchMode::FlatIvf
+            && let Some(hits) = self
+                .flat_search(column, query, k)
+                .await?
+                .or_warn("flat search")
+        {
+            return Ok(hits);
         }
         // The centroid router ranks by cosine (unit-normalized centroids, a
         // -dot scorer), so it is only correct for a Cosine column. A NegDot or
@@ -5731,6 +6310,9 @@ mod tests {
     };
 
     use arrow::array::Array;
+    use bytes::Bytes;
+
+    use super::IndexOutcome;
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
@@ -5750,13 +6332,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
-        VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        calibrated_query_for, cells_ranked_by_fine_score, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, hidden_hits_user_ids,
-        id_score_projection_indices, is_hidden_vector_manifest, law_floor_serve_selection,
-        postings_by_cell_from_summaries, rerank_mult_from_law, score_fine_candidates,
-        select_global_shortlist, union_cell_selection, vector_read_query_error,
+        IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate,
+        VectorFilter, VectorSearchOptions, admit_extension_round, admit_shortlist_window,
+        apply_width_pin, assemble_flat_sections, assemble_hnsw_sections, calibrated_query_for,
+        cells_ranked_by_fine_score, free_column_slot, free_columns_unambiguous,
+        gate_fine_candidates_by_fragment, hidden_hits_user_ids, id_score_projection_indices,
+        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
+        vector_read_query_error,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -5765,7 +6348,12 @@ mod tests {
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             error::{ReadError, VectorError},
             fts::reader::Bm25Stats,
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{
+                distance::Metric,
+                flat::Sq4FlatIndex,
+                hnsw::{PayloadKind, encode_resident_envelope},
+                rerank_codec::RerankCodec,
+            },
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -5774,9 +6362,10 @@ mod tests {
                 ClusterCentroids, ManifestSnapshot,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
             writer::{recalibrate_probe_laws, split_overflow_cell},
         },
-        test_helpers::default_tokenizer as tok,
+        test_helpers::{default_tokenizer as tok, distinct_unit_vectors},
     };
 
     /// Drive an async future to completion on a throwaway current-thread
@@ -8353,9 +8942,14 @@ mod tests {
         let assemble_ids = |hidden: &Arc<Supertable>| -> Vec<i128> {
             let reader = hidden.reader().expect("hidden reader");
             let manifest = reader.manifest();
-            let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
+            let bundle = match block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
                 .expect("assemble ok")
-                .expect("sq16 rows must assemble into a graph");
+            {
+                IndexOutcome::Ready(bytes) => bytes,
+                IndexOutcome::Unavailable(reason) => {
+                    panic!("sq16 rows must assemble into a graph, got: {reason}")
+                }
+            };
             let decoded = crate::superfile::vector::hnsw::decode_hnsw(
                 &bytes::Bytes::from(bundle),
                 Some(crate::superfile::vector::hnsw::WalkCodec::Sq8),
@@ -8674,6 +9268,10 @@ mod tests {
     /// Single vector column (`emb`), Sq16 rerank codec — so the drain builds
     /// and persists the resident per-row graph the hnsw serving path walks.
     fn options_one_col_sq16(dim: usize) -> SupertableOptions {
+        options_one_col_sq16_metric(dim, Metric::Cosine)
+    }
+
+    fn options_one_col_sq16_metric(dim: usize, metric: Metric) -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -8690,7 +9288,7 @@ mod tests {
                 column: "emb".into(),
                 dim,
                 rot_seed: 7,
-                metric: Metric::Cosine,
+                metric,
                 rerank_codec: RerankCodec::Sq16,
                 provided_centroids: None,
             }],
@@ -8782,6 +9380,688 @@ mod tests {
         assert!(
             format!("{err}").contains("unknown vector column"),
             "expected an unknown-column error, got {err}"
+        );
+    }
+
+    // ---- Flat 4-bit index: build, publish, serve --------------------
+    //
+    // `search_mode` is read from the process-wide config, which a unit test
+    // cannot set, so these drive the flat path the same way the graph tests
+    // drive theirs: the drain's build step and the reader's serve arm are
+    // called directly on a drained table.
+
+    /// Rows in the flat-index fixtures. Enough that the register gate's
+    /// held-out queries rank against a real corpus, small enough that an
+    /// exhaustive scan per probe query stays cheap in a unit test.
+    const FLAT_FIXTURE_ROWS: usize = 512;
+    /// Dimension for the flat-index fixtures.
+    const FLAT_FIXTURE_DIM: usize = 32;
+    /// Seed for the fixture corpus, fixed so a failure reproduces.
+    const FLAT_FIXTURE_SEED: u64 = 0x51A7_1DEA;
+    /// The row whose own vector is replayed as the query. Any row works; a
+    /// fixed one keeps every run comparing the two arms on the same thing.
+    const FLAT_FIXTURE_PROBE_ROW: usize = 17;
+    /// Coordinates a bare 4-bit code packs per byte — the plane's rate is
+    /// `dim / 2` bytes per row.
+    const FLAT_COORDS_PER_BYTE: usize = 2;
+    /// Bytes per `f32` ruler entry. The ruler is `O(dim)` (one offset and one
+    /// step per rotated coordinate), so it is subtracted out before the
+    /// per-row rate is compared against the codec's.
+    const FLAT_RULER_ENTRY_BYTES: usize = 4;
+    /// Bytes per dimension an Sq16 plane costs. Named to state what retaining
+    /// one alongside the nibble plane would do to the per-row rate.
+    const SQ16_BYTES_PER_DIM: usize = 2;
+
+    /// A corpus of [`distinct_unit_vectors`], returned alongside the vectors
+    /// themselves so a caller can replay one row as a query.
+    ///
+    /// Deliberately not [`build_vector_batch`]'s one-hot rows: the flat
+    /// index's register gate grades its scan against an exhaustive Sq16 one,
+    /// and one-hot rows put a block of exact ties at the head of every
+    /// ground-truth list, so the tie count rather than the codec would decide
+    /// whether an index is registered at all.
+    fn build_distinct_vector_batch(
+        n: usize,
+        dim: usize,
+        seed: u64,
+        schema: Arc<Schema>,
+    ) -> (RecordBatch, Vec<f32>) {
+        let vectors = distinct_unit_vectors(n, dim, seed);
+        let titles = LargeStringArray::from((0..n).map(|i| format!("doc {i}")).collect::<Vec<_>>());
+        let values = Float32Array::from(vectors.clone());
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(values) as Arc<dyn Array>,
+            None,
+        )
+        .expect("FSL");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)]).expect("batch");
+        (batch, vectors)
+    }
+
+    /// A drained Sq16 table over [`build_distinct_vector_batch`], the temp dir
+    /// backing it, and the probe row's own vector as a query.
+    fn drained_flat_fixture() -> (Supertable, TempDir, Vec<f32>) {
+        let schema = schema_with_vector(FLAT_FIXTURE_DIM);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_col_sq16(FLAT_FIXTURE_DIM).with_storage(storage))
+            .expect("create");
+        let (batch, vectors) = build_distinct_vector_batch(
+            FLAT_FIXTURE_ROWS,
+            FLAT_FIXTURE_DIM,
+            FLAT_FIXTURE_SEED,
+            schema,
+        );
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+        let lo = FLAT_FIXTURE_PROBE_ROW * FLAT_FIXTURE_DIM;
+        (st, dir, vectors[lo..lo + FLAT_FIXTURE_DIM].to_vec())
+    }
+
+    /// The hidden (drained) index table behind a user table.
+    fn hidden_index_of(st: &Supertable) -> Arc<Supertable> {
+        st.reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone()
+    }
+
+    /// The stable `_id` the INDEPENDENT ivf arm ranks first for `query`.
+    ///
+    /// The oracle for the flat arm's answer. Ids are generator-assigned, so
+    /// asserting on a computed id would be asserting on ingest timing; asking
+    /// the other arm the same question is both id-agnostic and a stronger
+    /// claim — two paths that share no scoring code agree on the row.
+    fn ivf_top_id(st: &Supertable, query: &[f32]) -> i128 {
+        let batches = st
+            .vector_search(
+                "emb",
+                query,
+                1,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id"]),
+            )
+            .expect("ivf vector_search");
+        let batch = batches.first().expect("the ivf arm must return a batch");
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is Decimal128")
+            .value(0)
+    }
+
+    /// Unwrap a build outcome, reporting the decline reason on failure —
+    /// which is the whole point of carrying one.
+    fn expect_ready<T>(outcome: IndexOutcome<T>, what: &str) -> T {
+        match outcome {
+            IndexOutcome::Ready(value) => value,
+            IndexOutcome::Unavailable(reason) => panic!("{what} must be available: {reason}"),
+        }
+    }
+
+    /// The flat index assembles off the drained cells, clears its register
+    /// floor, and the plane it publishes is the nibble plane and nothing else.
+    ///
+    /// The residency assertion is the load-bearing one: this index exists to
+    /// hold 1 byte/dim where every other rerank codec holds 2, and retaining
+    /// the Sq16 codes it was fitted from would leave the ranking assertions
+    /// green while doubling the footprint the index was chosen for.
+    #[test]
+    fn flat_index_assembles_off_the_drained_cells() {
+        let (st, _dir, query) = drained_flat_fixture();
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+        let bundle = expect_ready(
+            block_on(assemble_flat_sections(reader.manifest(), "emb", &None)).expect("assemble ok"),
+            "a drained Sq16 corpus",
+        );
+        let index = Sq4FlatIndex::decode(&Bytes::from(bundle)).expect("decode the published plane");
+
+        assert_eq!(index.len(), FLAT_FIXTURE_ROWS, "one node per drained row");
+        assert!(!index.is_empty());
+        assert_eq!(index.dim(), FLAT_FIXTURE_DIM);
+        assert_eq!(
+            index.column(),
+            "emb",
+            "the plane names the column it serves"
+        );
+        assert!(
+            !index.has_residual(),
+            "the drain builds the bare 4-bit plane — the residual rung is \
+             carved out pending the matched-bytes comparison against sq8"
+        );
+        let ruler = FLAT_FIXTURE_DIM * 2 * FLAT_RULER_ENTRY_BYTES;
+        let per_row = (index.resident_bytes() - ruler) / FLAT_FIXTURE_ROWS;
+        assert_eq!(
+            per_row,
+            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE,
+            "residency must be the nibble plane alone — retaining the Sq16 plane \
+             these codes were fitted from would show as {} bytes/row",
+            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE + FLAT_FIXTURE_DIM * SQ16_BYTES_PER_DIM
+        );
+
+        // The scan answers the query the ivf arm answers, through a node map
+        // built by a different pass over the same cells.
+        let top = index.search(&query, 1);
+        let node = top.first().expect("an exhaustive scan returns a nearest").0;
+        assert_eq!(
+            index.doc_id(node),
+            Some(ivf_top_id(&st, &query)),
+            "the flat scan and the ivf arm must agree on the nearest row"
+        );
+    }
+
+    /// Every build decline names its reason rather than vanishing as a bare
+    /// `None`. A table configured for one index quietly serving another is
+    /// invisible from the outside — the only symptom is numbers that look
+    /// like the mode you did not ask for.
+    #[test]
+    fn flat_build_declines_name_their_reason() {
+        let (st, _dir, _query) = drained_flat_fixture();
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+
+        match block_on(assemble_flat_sections(reader.manifest(), "nope", &None)).expect("ok") {
+            IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn { queried, declared }) => {
+                assert_eq!(queried, "nope");
+                assert!(
+                    declared.iter().any(|c| c == "emb"),
+                    "the reason must name what IS declared, got {declared:?}"
+                );
+            }
+            other => panic!("expected NoSuchColumn, got {}", describe(other)),
+        }
+
+        // A column stored under another rerank codec has no Sq16 plane to be
+        // re-quantized from, so there is nothing to fit. Declined before any
+        // row is read, hence no drain here.
+        let fp32_dir = TempDir::new().expect("tempdir");
+        let fp32_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(fp32_dir.path()).expect("storage"));
+        let fp32 = Supertable::create(
+            options_one_superfile_per_commit(FLAT_FIXTURE_DIM).with_storage(fp32_storage),
+        )
+        .expect("create fp32 table");
+        let fp32_reader = fp32.reader().expect("reader");
+        match block_on(assemble_flat_sections(fp32_reader.manifest(), "emb", &None)).expect("ok") {
+            IndexOutcome::Unavailable(IndexUnavailable::CodecUnsupported { column, codec }) => {
+                assert_eq!(column, "emb");
+                assert_eq!(codec, RerankCodec::Fp32.name());
+            }
+            other => panic!("expected CodecUnsupported, got {}", describe(other)),
+        }
+
+        // A non-cosine column. Both resident index types rank by `-dot`, which
+        // is the column's own ordering only under Cosine — and the register
+        // gate cannot catch it, because `probe_recall` grades a `-dot` scan
+        // against a `-dot` exhaustive scan and so measures a mis-metriced
+        // index as perfect. Declined at build, for BOTH arms.
+        for metric in [Metric::L2Sq, Metric::NegDot] {
+            let metric_dir = TempDir::new().expect("tempdir");
+            let metric_storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(metric_dir.path()).expect("storage"));
+            let table = Supertable::create(
+                options_one_col_sq16_metric(FLAT_FIXTURE_DIM, metric).with_storage(metric_storage),
+            )
+            .expect("create non-cosine table");
+            let reader = table.reader().expect("reader");
+            for (arm, outcome) in [
+                (
+                    "flat",
+                    block_on(assemble_flat_sections(reader.manifest(), "emb", &None)),
+                ),
+                (
+                    "hnsw",
+                    block_on(assemble_hnsw_sections(reader.manifest(), "emb", &None)),
+                ),
+            ] {
+                match outcome.expect("ok") {
+                    IndexOutcome::Unavailable(IndexUnavailable::MetricUnsupported {
+                        column,
+                        metric: named,
+                    }) => {
+                        assert_eq!(column, "emb");
+                        assert_eq!(named, metric);
+                    }
+                    other => panic!(
+                        "the {arm} arm must decline {metric:?} as MetricUnsupported, got {}",
+                        describe(other)
+                    ),
+                }
+            }
+        }
+
+        // An Sq16 table with nothing drained into it yet.
+        let empty_dir = TempDir::new().expect("tempdir");
+        let empty_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(empty_dir.path()).expect("storage"));
+        let empty =
+            Supertable::create(options_one_col_sq16(FLAT_FIXTURE_DIM).with_storage(empty_storage))
+                .expect("create empty table");
+        let empty_reader = empty.reader().expect("reader");
+        match block_on(assemble_flat_sections(
+            empty_reader.manifest(),
+            "emb",
+            &None,
+        ))
+        .expect("ok")
+        {
+            IndexOutcome::Unavailable(IndexUnavailable::NoRows { column }) => {
+                assert_eq!(column, "emb");
+            }
+            other => panic!("expected NoRows, got {}", describe(other)),
+        }
+    }
+
+    /// The fetch width both resident arms use. Identity at the shipped
+    /// `drain_replica_target_factor: 1.0`; the widened case is what a
+    /// replicating table needs so `top_k_ascending`'s id-collapse cannot
+    /// return fewer than `k` distinct rows.
+    ///
+    /// The factor is process-global config, so the widened behaviour is not
+    /// reachable from a test — same seam as `search_mode`. What is pinned here
+    /// is that the width is a shared function of `k` rather than two arms each
+    /// deciding for themselves, which is how the flat arm came to use a bare
+    /// `k` while the graph arm widened.
+    #[test]
+    fn replica_fetch_width_is_identity_at_the_shipped_factor() {
+        for k in [1usize, 10, 100] {
+            assert_eq!(super::replica_fetch_width(k), k);
+        }
+    }
+
+    /// Render a build outcome for a failure message.
+    fn describe<T>(outcome: IndexOutcome<T>) -> String {
+        match outcome {
+            IndexOutcome::Ready(_) => "Ready".to_string(),
+            IndexOutcome::Unavailable(reason) => reason.to_string(),
+        }
+    }
+
+    /// Publish a flat index for the hidden table's current generation and
+    /// stamp it, exactly as the drain's membership commit does — the blob
+    /// through the resident envelope, the ref onto the manifest.
+    fn publish_flat_index(hidden: &Arc<Supertable>) {
+        let reader = hidden.reader().expect("hidden reader");
+        let manifest = reader.manifest();
+        let bundle = expect_ready(
+            block_on(assemble_flat_sections(manifest, "emb", &None)).expect("assemble ok"),
+            "a drained Sq16 corpus",
+        );
+        let storage = manifest
+            .options
+            .storage
+            .clone()
+            .expect("the fixture attaches storage");
+        let high_water = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.id_max)
+            .max()
+            .unwrap_or(0);
+        let blob = encode_resident_envelope(0, high_water, &[], Some((PayloadKind::Flat, &bundle)));
+        let reference =
+            block_on(write_resident_index_blob(storage.as_ref(), blob)).expect("publish the blob");
+        let stamped = manifest.with_slow_vector_state_graphs(Some(reference));
+        drop(reader);
+        hidden.inner().manifest.store(Arc::new(stamped));
+    }
+
+    /// The serve arm answers from the hydrated plane, on the ivf arm's score
+    /// scale, and every refusal to serve names itself.
+    ///
+    /// The score scale matters because the two arms merge on raw score: the
+    /// scan ranks on `-dot` internally, and leaking that would rank a drained
+    /// non-match above an exact match and surface a negative public distance.
+    #[test]
+    fn flat_search_serves_the_resident_plane_and_names_its_declines() {
+        let (st, _dir, query) = drained_flat_fixture();
+        let hidden = hidden_index_of(&st);
+
+        // Nothing published yet: both arms say so rather than erroring.
+        let bare = hidden.reader().expect("hidden reader");
+        assert!(
+            matches!(
+                block_on(bare.flat_search("emb", &query, 5)).expect("flat search"),
+                IndexOutcome::Unavailable(IndexUnavailable::NotHydrated)
+            ),
+            "an unpublished generation must decline as NotHydrated"
+        );
+        assert!(
+            matches!(
+                block_on(bare.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+                IndexOutcome::Unavailable(IndexUnavailable::NotHydrated)
+            ),
+            "the graph arm must decline an unpublished generation the same way"
+        );
+        drop(bare);
+
+        publish_flat_index(&hidden);
+        let served = hidden.reader().expect("hidden reader after publish");
+        let hits = expect_ready(
+            block_on(served.flat_search("emb", &query, 5)).expect("flat search"),
+            "the published flat index",
+        );
+        assert_eq!(hits.len(), 5, "an exhaustive scan fills k");
+        assert_eq!(
+            hits[0].stable_id,
+            Some(ivf_top_id(&st, &query)),
+            "the served flat hit must be the row the ivf arm ranks first"
+        );
+        assert!(
+            hits[0].score >= 0.0,
+            "cosine distance is non-negative; a negative score means the scan's \
+             internal -dot leaked into the public scale: {}",
+            hits[0].score
+        );
+        assert!(
+            hits[0].score < 0.05,
+            "a row queried with its own vector is distance ~0, got {}",
+            hits[0].score
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].score <= w[1].score),
+            "hits must be ascending by distance"
+        );
+
+        assert!(
+            matches!(
+                block_on(served.flat_search("emb", &query, 0)).expect("k=0"),
+                IndexOutcome::Ready(ref hits) if hits.is_empty()
+            ),
+            "k=0 is an empty answer, not a decline"
+        );
+        // A same-dim sibling column must not be answered from this column's
+        // rows: a dim match alone is not identity.
+        match block_on(served.flat_search("sibling", &query, 5)).expect("column mismatch") {
+            IndexOutcome::Unavailable(IndexUnavailable::ColumnMismatch { queried, index }) => {
+                assert_eq!(queried, "sibling");
+                assert_eq!(index, "emb");
+            }
+            other => panic!("expected ColumnMismatch, got {}", describe(other)),
+        }
+        match block_on(served.flat_search("emb", &query[..FLAT_FIXTURE_DIM - 1], 5))
+            .expect("dim mismatch")
+        {
+            IndexOutcome::Unavailable(IndexUnavailable::DimMismatch { queried, index }) => {
+                assert_eq!(queried, FLAT_FIXTURE_DIM - 1);
+                assert_eq!(index, FLAT_FIXTURE_DIM);
+            }
+            other => panic!("expected DimMismatch, got {}", describe(other)),
+        }
+        // The mirror of `flat_search_declines_a_generation_that_published_a
+        // _graph`: neither arm may answer from the other's index.
+        match block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search") {
+            IndexOutcome::Unavailable(IndexUnavailable::WrongKind { wanted }) => {
+                assert_eq!(wanted, "hnsw");
+            }
+            other => panic!("expected WrongKind, got {}", describe(other)),
+        }
+    }
+
+    /// Dimension for the graph fixtures — the shape the other graph-assembly
+    /// tests in this module already register at.
+    const GRAPH_FIXTURE_DIM: usize = 16;
+    /// Rows for the graph fixtures.
+    const GRAPH_FIXTURE_ROWS: usize = 256;
+
+    /// A drained Sq16 table with a GRAPH published and stamped, plus a query
+    /// on one of its planted directions.
+    ///
+    /// One-hot rows here, unlike the flat fixtures: this corpus only has to
+    /// assemble into a registered graph, which it does at this shape (the
+    /// other graph tests in this module rely on the same), and the assertions
+    /// are about which arm answers rather than about recall.
+    fn drained_graph_fixture() -> (Supertable, TempDir, Arc<Supertable>, Vec<f32>) {
+        let schema = schema_with_vector(GRAPH_FIXTURE_DIM);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_col_sq16(GRAPH_FIXTURE_DIM).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(
+            0,
+            GRAPH_FIXTURE_ROWS,
+            GRAPH_FIXTURE_DIM,
+            schema,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+        let manifest = reader.manifest();
+        let graph = expect_ready(
+            block_on(assemble_hnsw_sections(manifest, "emb", &None)).expect("assemble ok"),
+            "a drained Sq16 corpus",
+        );
+        let storage = manifest.options.storage.clone().expect("storage");
+        let blob = encode_resident_envelope(0, 0, &[], Some((PayloadKind::Graph, &graph)));
+        let reference =
+            block_on(write_resident_index_blob(storage.as_ref(), blob)).expect("publish");
+        let stamped = manifest.with_slow_vector_state_graphs(Some(reference));
+        drop(reader);
+        hidden.inner().manifest.store(Arc::new(stamped));
+
+        let mut query = vec![0.0f32; GRAPH_FIXTURE_DIM];
+        query[0] = 1.0;
+        (st, dir, hidden, query)
+    }
+
+    /// A generation that published a GRAPH is a different index, not a broken
+    /// one: the flat arm declines and the query serves ivf. Without the
+    /// envelope's kind tag this is where a reader would try to slice a graph
+    /// bundle as a nibble plane.
+    #[test]
+    fn flat_search_declines_a_generation_that_published_a_graph() {
+        let (_st, _dir, hidden, query) = drained_graph_fixture();
+        let served = hidden.reader().expect("hidden reader after publish");
+        let resident = block_on(served.resident_vector_index()).expect("the ref must hydrate");
+        assert!(
+            resident
+                .data
+                .as_ref()
+                .and_then(ResidentIndexKind::graph)
+                .is_some(),
+            "the fixture must publish a decodable graph for the flat arm to decline"
+        );
+        assert!(
+            resident
+                .data
+                .as_ref()
+                .and_then(ResidentIndexKind::flat)
+                .is_none(),
+            "one generation carries one index, not both"
+        );
+        match block_on(served.flat_search("emb", &query, 5)).expect("flat search") {
+            IndexOutcome::Unavailable(IndexUnavailable::WrongKind { wanted }) => {
+                assert_eq!(wanted, "flat");
+            }
+            other => panic!("expected WrongKind, got {}", describe(other)),
+        }
+    }
+
+    /// The graph arm serves its own generation, and every refusal names
+    /// itself — the same contract the flat arm holds to.
+    ///
+    /// The three that used to share one `return` are the point: a wrong
+    /// column, a wrong dimensionality and an empty index call for different
+    /// reactions (fix the query, fix the config, wait for a drain), and one
+    /// message covering all three left an operator guessing which it was.
+    #[test]
+    fn hnsw_search_serves_the_graph_and_names_its_declines() {
+        let (_st, _dir, hidden, query) = drained_graph_fixture();
+        let served = hidden.reader().expect("hidden reader after publish");
+
+        let hits = expect_ready(
+            block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+            "the published graph",
+        );
+        assert!(!hits.is_empty(), "the graph must answer its own generation");
+        assert!(
+            hits[0].score >= 0.0,
+            "cosine distance is non-negative; a negative score means the walk's \
+             internal -dot leaked into the public scale: {}",
+            hits[0].score
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].score <= w[1].score),
+            "hits must be ascending by distance"
+        );
+
+        assert!(
+            matches!(
+                block_on(served.hnsw_search("emb", &query, 0)).expect("k=0"),
+                IndexOutcome::Ready(ref hits) if hits.is_empty()
+            ),
+            "k=0 is an empty answer, not a decline"
+        );
+        match block_on(served.hnsw_search("sibling", &query, 5)).expect("column mismatch") {
+            IndexOutcome::Unavailable(IndexUnavailable::ColumnMismatch { queried, index }) => {
+                assert_eq!(queried, "sibling");
+                assert_eq!(index, "emb");
+            }
+            other => panic!("expected ColumnMismatch, got {}", describe(other)),
+        }
+        match block_on(served.hnsw_search("emb", &query[..GRAPH_FIXTURE_DIM - 1], 5))
+            .expect("dim mismatch")
+        {
+            IndexOutcome::Unavailable(IndexUnavailable::DimMismatch { queried, index }) => {
+                assert_eq!(queried, GRAPH_FIXTURE_DIM - 1);
+                assert_eq!(index, GRAPH_FIXTURE_DIM);
+            }
+            other => panic!("expected DimMismatch, got {}", describe(other)),
+        }
+    }
+
+    /// Every decline reason renders, and `or_warn` is the one place a decline
+    /// turns into a fallback.
+    ///
+    /// A reason that formatted as a bare discriminant would leave an operator
+    /// with "serving ivf" and no way to tell a too-large corpus from a
+    /// misconfigured column, so each message names the value that decided it.
+    #[test]
+    fn every_index_decline_reason_renders_its_cause() {
+        let reasons = [
+            (
+                IndexUnavailable::NoSuchColumn {
+                    queried: "emb".into(),
+                    declared: vec!["other".into()],
+                },
+                vec!["emb", "other"],
+            ),
+            (
+                IndexUnavailable::CodecUnsupported {
+                    column: "emb".into(),
+                    codec: "fp32",
+                },
+                vec!["emb", "fp32"],
+            ),
+            (
+                IndexUnavailable::NoRows {
+                    column: "emb".into(),
+                },
+                vec!["emb"],
+            ),
+            (
+                IndexUnavailable::OverDocCeiling {
+                    rows: 2_000_000,
+                    ceiling: 1_000_000,
+                    knob: "vector.flat_max_docs",
+                },
+                vec!["2000000", "1000000", "vector.flat_max_docs"],
+            ),
+            (
+                IndexUnavailable::BelowRegisterFloor {
+                    recall: 0.9371,
+                    floor: 0.98,
+                },
+                vec!["0.9371", "0.9800"],
+            ),
+            (
+                IndexUnavailable::GatherEmpty {
+                    column: "emb".into(),
+                    pre_count: 7,
+                },
+                vec!["emb", "7"],
+            ),
+            (
+                IndexUnavailable::PlaneRowMismatch {
+                    doc_ids: 9,
+                    decoded: 8,
+                },
+                vec!["9", "8"],
+            ),
+            (IndexUnavailable::NotHydrated, vec!["resident"]),
+            (IndexUnavailable::WrongKind { wanted: "flat" }, vec!["flat"]),
+            (
+                IndexUnavailable::ColumnMismatch {
+                    queried: "emb".into(),
+                    index: "other".into(),
+                },
+                vec!["emb", "other"],
+            ),
+            (
+                IndexUnavailable::DimMismatch {
+                    queried: 16,
+                    index: 32,
+                },
+                vec!["16", "32"],
+            ),
+            (IndexUnavailable::IndexEmpty, vec!["no rows"]),
+            (
+                IndexUnavailable::NotPureAppend {
+                    prior: 10,
+                    delta: 3,
+                    current: 14,
+                },
+                vec!["10", "3", "14"],
+            ),
+            (IndexUnavailable::NoNewRows, vec!["high water"]),
+            (
+                IndexUnavailable::PlaneNotResident { codec: "sq4" },
+                vec!["sq4"],
+            ),
+        ];
+        for (reason, wanted) in reasons {
+            let rendered = reason.to_string();
+            for needle in wanted {
+                assert!(
+                    rendered.contains(needle),
+                    "a decline must name what decided it — `{needle}` missing from `{rendered}`"
+                );
+            }
+            // The two shapes the engine actually declines in: a build (bytes)
+            // and a serve (hits).
+            assert!(
+                IndexOutcome::<Vec<u8>>::Unavailable(reason)
+                    .or_warn("test")
+                    .is_none(),
+                "a decline yields no value"
+            );
+        }
+        let hits: Vec<SuperfileHit> = Vec::new();
+        assert!(
+            IndexOutcome::Ready(hits).or_warn("test").is_some(),
+            "a ready outcome yields its value"
+        );
+        assert!(
+            IndexOutcome::<Vec<SuperfileHit>>::Unavailable(IndexUnavailable::NotHydrated)
+                .or_warn("test")
+                .is_none()
         );
     }
 

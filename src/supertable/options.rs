@@ -73,7 +73,7 @@ use crate::{
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
-        slow_vector_state::{CentroidSection, ResidentGraphSections},
+        slow_vector_state::{CentroidSection, ResidentVectorIndex},
     },
 };
 
@@ -407,8 +407,8 @@ pub struct SupertableOptions {
     /// snapshot of this handle and keyed by the section's content-addressed
     /// URI. Serves the resident graph walk without rebuilding at query time;
     /// a new drain generation publishes a new URI and replaces it.
-    pub(crate) graph_sections_cache: Arc<TokioMutex<Option<Arc<ResidentGraphSections>>>>,
-    /// Single-flight gate for [`graph_sections_cache`] hydration. The graph
+    pub(crate) resident_index_cache: Arc<TokioMutex<Option<Arc<ResidentVectorIndex>>>>,
+    /// Single-flight gate for [`resident_index_cache`] hydration. The graph
     /// bundle is multi-GiB, so a first-touch miss holds THIS gate (never the
     /// cache mutex) across the download: exactly one query fetches while
     /// concurrent misses park here and then find the cache already published.
@@ -748,7 +748,7 @@ impl SupertableOptions {
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
-            graph_sections_cache: Arc::new(TokioMutex::new(None)),
+            resident_index_cache: Arc::new(TokioMutex::new(None)),
             graph_hydration_lock: Arc::new(TokioMutex::new(())),
             centroid_router_cache: Arc::new(tokio::sync::OnceCell::new()),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),

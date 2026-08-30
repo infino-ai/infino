@@ -14,6 +14,7 @@
 pub mod builder;
 pub mod cell_posting;
 pub mod distance;
+pub(crate) mod flat;
 pub(crate) mod hnsw;
 pub mod ivf_merge;
 pub mod kmeans;

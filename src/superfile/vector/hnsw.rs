@@ -98,7 +98,7 @@ pub(crate) trait NodeScorer {
 ///
 /// The mapped variant keeps its backing `Bytes` alive: when the bundle is
 /// served via `mmap` (the default for local backends, see
-/// `slow_vector_state::fetch_graph_section`), the Sq16 and SQ8 planes are
+/// `slow_vector_state::fetch_resident_index_blob`), the Sq16 and SQ8 planes are
 /// `slice_ref` views of that one mapping — one physical page-cache copy shared
 /// across every process, and no per-open heap copy of the multi-GiB planes.
 pub(crate) enum Plane {
@@ -1197,7 +1197,7 @@ pub(crate) struct CalibChoice {
 /// Exhaustive top-`k` node ids under `scorer` for one query — the calibration
 /// ground truth. Sq16-exhaustive matches served fp32 recall to within the
 /// codec's own exhaustive ceiling, so it needs no fp32 plane.
-fn exhaustive_topk<S: NodeScorer>(scorer: &S, query: &[f32], k: usize) -> Vec<u32> {
+pub(crate) fn exhaustive_topk<S: NodeScorer>(scorer: &S, query: &[f32], k: usize) -> Vec<u32> {
     let prepared = scorer.prepare(query);
     let mut all: Vec<Scored> = (0..scorer.len() as u32)
         .map(|node| Scored {
@@ -1227,7 +1227,11 @@ const HNSW_CALIB_K_ANCHORS: [usize; 4] = [1, 10, 50, 100];
 /// Held-out, perturbed (off-node) calibration queries drawn from the plane —
 /// evenly spread source nodes, each jittered off its exact position and
 /// renormalized. Shared by the calibrator and the incremental recall re-check.
-fn calibration_queries(scorer: &Sq16Scorer, n_queries: usize, seed: u64) -> Vec<Vec<f32>> {
+pub(crate) fn calibration_queries(
+    scorer: &Sq16Scorer,
+    n_queries: usize,
+    seed: u64,
+) -> Vec<Vec<f32>> {
     let n = scorer.len();
     let dim = scorer.dim();
     let stride = dim * 2;
@@ -1410,7 +1414,7 @@ fn calibrate_ef_curve<S: NodeScorer>(
 /// and returns the **fastest** clearing pair (min `ef`, then min `m0` — latency
 /// is the graph's whole point). If none clears within the candidates, returns
 /// the best achieved with `registered` gated by the `target_recall −
-/// recall_slack` graceful floor. Queries are held-out, perturbed (off-node) so
+/// `register_floor` graceful bar. Queries are held-out, perturbed (off-node) so
 /// recall is realistic.
 ///
 /// `want_curve` gates the per-`k` calibration: callers that only need the
@@ -1424,14 +1428,14 @@ pub(crate) fn calibrate_graph<S: NodeScorer + Sync>(
     m0_candidates: &[usize],
     ef_candidates: &[usize],
     target_recall: f64,
-    recall_slack: f64,
+    register_floor: f64,
     ef_construction: usize,
     n_queries: usize,
     k: usize,
     seed: u64,
     want_curve: bool,
 ) -> (CalibChoice, Vec<(u32, u32)>, Option<Hnsw>) {
-    let register_floor = (target_recall - recall_slack).max(0.0);
+    let register_floor = register_floor.clamp(0.0, 1.0);
     let n = serving.len();
     let fallback = CalibChoice {
         m0: *m0_candidates.iter().min().unwrap_or(&32),
@@ -1568,16 +1572,16 @@ const HNSW_GRAPH_MAGIC: &[u8; 8] = b"INFHNSW1";
 // A little cursor over a byte slice: every read is bounds-checked and
 // returns `None` on underrun, so a truncated or corrupt section decodes to
 // `None` and the caller falls back rather than panicking.
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
         let s = self.buf.get(self.pos..end)?;
         self.pos = end;
@@ -1585,22 +1589,22 @@ impl<'a> Cursor<'a> {
     }
     /// Bytes left unread — used to bound wire-driven allocations before
     /// reserving, so a corrupt length word can't request a huge `Vec`.
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
     }
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
-    fn i128(&mut self) -> Option<i128> {
+    pub(crate) fn i128(&mut self) -> Option<i128> {
         Some(i128::from_le_bytes(self.take(16)?.try_into().ok()?))
     }
 }
@@ -1839,7 +1843,7 @@ impl WalkCodec {
     }
 
     /// Wire tag stored in the `v04` header.
-    fn tag(self) -> u8 {
+    pub(crate) fn tag(self) -> u8 {
         match self {
             WalkCodec::Sq16 => 0,
             WalkCodec::Sq8 => 1,
@@ -1850,7 +1854,7 @@ impl WalkCodec {
 
     /// Inverse of [`Self::tag`]; `None` for a tag written by a newer build,
     /// which decodes to `None` and serves ivf rather than misreading a plane.
-    fn from_tag(tag: u8) -> Option<Self> {
+    pub(crate) fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0 => Some(WalkCodec::Sq16),
             1 => Some(WalkCodec::Sq8),
@@ -2274,7 +2278,7 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
 /// Parse a little-endian `f32` vector from raw bytes. The caller bounds the
 /// read first, so a short slice is a caller bug rather than a corrupt-input
 /// path.
-fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -2454,7 +2458,7 @@ pub(crate) const GRAPH_BUNDLE_HEADER_BYTES: usize = GRAPH_BUNDLE_MAGIC.len() + 8
 /// resolve each hit's stable id to its live `(superfile, local)` through
 /// the engine's existing id→placement resolver, so no per-node physical
 /// provenance is baked in (which would go stale on a compaction repack).
-pub(crate) struct GraphBundle {
+pub(crate) struct ResidentIndexEnvelope {
     /// One `u64` digest of the covered doc-id population (opaque here; the
     /// supertable layer defines it).
     pub population_key: u64,
@@ -2466,14 +2470,14 @@ pub(crate) struct GraphBundle {
     /// multi-GiB data section with no heap copy — the open-time transient the
     /// mmap serving path removes; [`decode_hnsw`] then slices the Sq16 and SQ8
     /// planes straight out of it.
-    pub data_bundle: Option<Bytes>,
+    pub data_bundle: Option<(PayloadKind, Bytes)>,
 }
 
 /// Read the `(population_key, high_water_id)` header from a bundle's first
 /// [`GRAPH_BUNDLE_HEADER_BYTES`] bytes. `None` on a bad magic or a short
 /// read. Lets the settle path key on the covered population — and find the
 /// append boundary — via a tiny range GET instead of the whole object.
-pub(crate) fn graph_bundle_header(header: &[u8]) -> Option<(u64, i128)> {
+pub(crate) fn resident_envelope_header(header: &[u8]) -> Option<(u64, i128)> {
     if header.len() < GRAPH_BUNDLE_HEADER_BYTES
         || &header[..GRAPH_BUNDLE_MAGIC.len()] != GRAPH_BUNDLE_MAGIC
     {
@@ -2493,10 +2497,50 @@ pub(crate) fn graph_bundle_header(header: &[u8]) -> Option<(u64, i128)> {
 }
 
 /// Length-prefixed opaque section (`0` len flag when absent).
-fn put_opt_section(out: &mut Vec<u8>, section: Option<&[u8]>) {
+/// Which index the envelope's payload section holds.
+///
+/// The envelope STATES this rather than leaving a reader to sniff the payload's
+/// magic. Sniffing works but inverts the responsibility: every reader would
+/// have to try each format in turn and treat "none matched" as corruption,
+/// which gets worse with each kind and is silent when it guesses wrong.
+///
+/// The tag lives in the section's existing presence byte — `0` was already
+/// "absent" and `1` "present", and `1` has only ever meant a graph — so an
+/// envelope written before this tag existed reads back as [`Self::Graph`],
+/// which is what it is. A binary that predates a kind sees a present section,
+/// fails to decode it as a graph, and serves the ivf scan: a downgrade, not a
+/// mis-parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadKind {
+    /// An `encode_hnsw` payload: graph + Sq16 plane + walk plane.
+    Graph = 1,
+    /// A flat 4-bit index payload: nibble plane + ruler, no graph, no Sq16.
+    Flat = 2,
+}
+
+impl PayloadKind {
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(PayloadKind::Graph),
+            2 => Some(PayloadKind::Flat),
+            _ => None,
+        }
+    }
+
+    /// The kind's name for a log line, so a message about a published or
+    /// hydrated section says which index it was.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PayloadKind::Graph => "hnsw",
+            PayloadKind::Flat => "flat",
+        }
+    }
+}
+
+fn put_opt_section(out: &mut Vec<u8>, section: Option<(PayloadKind, &[u8])>) {
     match section {
-        Some(bytes) => {
-            out.push(1);
+        Some((kind, bytes)) => {
+            out.push(kind as u8);
             out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
             out.extend_from_slice(bytes);
         }
@@ -2508,11 +2552,11 @@ fn put_opt_section(out: &mut Vec<u8>, section: Option<&[u8]>) {
 /// `(high_water_id, count)` watermark into the fixed-offset header. The
 /// data bundle and its provenance are omitted (a `0` flag) above the
 /// data-graph scale ceiling.
-pub(crate) fn encode_graph_bundle(
+pub(crate) fn encode_resident_envelope(
     population_key: u64,
     high_water_id: i128,
     centroid_graph: &[u8],
-    data_bundle: Option<&[u8]>,
+    payload: Option<(PayloadKind, &[u8])>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(GRAPH_BUNDLE_HEADER_BYTES + 16 + centroid_graph.len());
     out.extend_from_slice(GRAPH_BUNDLE_MAGIC);
@@ -2520,11 +2564,11 @@ pub(crate) fn encode_graph_bundle(
     out.extend_from_slice(&high_water_id.to_le_bytes());
     out.extend_from_slice(&(centroid_graph.len() as u64).to_le_bytes());
     out.extend_from_slice(centroid_graph);
-    put_opt_section(&mut out, data_bundle);
+    put_opt_section(&mut out, payload);
     out
 }
 
-/// Parse an [`encode_graph_bundle`] blob into its raw sections + header.
+/// Parse an [`encode_resident_envelope`] blob into its raw sections + header.
 /// `None` on a bad magic or truncation, so a corrupt bundle degrades to a
 /// fallback.
 ///
@@ -2539,7 +2583,10 @@ pub(crate) fn encode_graph_bundle(
 ///
 /// The small `centroid_graph` (present at every scale, modest size) is always
 /// copied out into owned heap.
-pub(crate) fn decode_graph_bundle(raw: &Bytes, mmap_backed: bool) -> Option<GraphBundle> {
+pub(crate) fn decode_resident_envelope(
+    raw: &Bytes,
+    mmap_backed: bool,
+) -> Option<ResidentIndexEnvelope> {
     let bytes: &[u8] = raw.as_ref();
     let mut c = Cursor::new(bytes);
     if c.take(GRAPH_BUNDLE_MAGIC.len())? != GRAPH_BUNDLE_MAGIC {
@@ -2553,18 +2600,26 @@ pub(crate) fn decode_graph_bundle(raw: &Bytes, mmap_backed: bool) -> Option<Grap
     // yields a subslice of `bytes` (= `raw`): on the mmap path `slice_ref`
     // shares that mapping zero-copy; on the heap path we copy it out so `raw`
     // (the full striped blob) frees.
-    let data_bundle = if c.take(1)?[0] == 0 {
+    let tag = c.take(1)?[0];
+    let data_bundle = if tag == 0 {
         None
     } else {
+        // An unknown kind is a payload written by a newer build. Decline the
+        // SECTION rather than the whole envelope: the centroid graph above it
+        // is still valid and still worth serving.
+        let kind = PayloadKind::from_tag(tag);
         let len = c.u64()? as usize;
         let section = c.take(len)?;
-        Some(if mmap_backed {
-            raw.slice_ref(section)
-        } else {
-            Bytes::copy_from_slice(section)
+        kind.map(|kind| {
+            let bytes = if mmap_backed {
+                raw.slice_ref(section)
+            } else {
+                Bytes::copy_from_slice(section)
+            };
+            (kind, bytes)
         })
     };
-    Some(GraphBundle {
+    Some(ResidentIndexEnvelope {
         population_key,
         high_water_id,
         centroid_graph,
@@ -4336,41 +4391,105 @@ mod tests {
         // Full bundle: centroid graph + data bundle + population key + high water.
         let centroid = vec![1u8, 2, 3, 4, 5];
         let data = vec![9u8; 300];
-        let blob = encode_graph_bundle(0xDEAD_BEEF_1234, 987_654_321, &centroid, Some(&data));
+        let blob = encode_resident_envelope(
+            0xDEAD_BEEF_1234,
+            987_654_321,
+            &centroid,
+            Some((PayloadKind::Graph, &data)),
+        );
         // Both modes recover identical sections; only the data-section backing
         // differs (zero-copy slice of `raw` vs an owned copy).
         for mmap_backed in [true, false] {
             let raw = Bytes::from(blob.clone());
-            let got = decode_graph_bundle(&raw, mmap_backed).expect("decode full");
+            let got = decode_resident_envelope(&raw, mmap_backed).expect("decode full");
             assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
             assert_eq!(got.high_water_id, 987_654_321);
             assert_eq!(got.centroid_graph, centroid);
-            assert_eq!(got.data_bundle.as_deref(), Some(&data[..]));
+            let (kind, bytes) = got.data_bundle.as_ref().expect("data present");
+            assert_eq!(
+                *kind,
+                PayloadKind::Graph,
+                "the envelope must report the kind it was written with"
+            );
+            assert_eq!(&bytes[..], &data[..]);
             // On the heap path the data section must be an independent copy, not
             // a view into `raw`, so `raw` can be freed.
             if !mmap_backed {
-                let db = got.data_bundle.as_ref().expect("data present");
                 assert!(
-                    !raw.as_ref().as_ptr_range().contains(&db.as_ptr()),
-                    "heap-path data_bundle must not alias raw"
+                    !raw.as_ref().as_ptr_range().contains(&bytes.as_ptr()),
+                    "heap-path payload must not alias raw"
                 );
             }
         }
         // The header reads from the fixed-offset prefix alone (a tiny range
         // GET at settle time — no need for the multi-GiB body).
         assert_eq!(
-            graph_bundle_header(&blob[..GRAPH_BUNDLE_HEADER_BYTES]),
+            resident_envelope_header(&blob[..GRAPH_BUNDLE_HEADER_BYTES]),
             Some((0xDEAD_BEEF_1234, 987_654_321))
         );
 
         // Data-less bundle (above the scale ceiling): empty centroid, no data.
-        let blob = encode_graph_bundle(0, 0, &[], None);
-        let got = decode_graph_bundle(&Bytes::from(blob), true).expect("decode empty");
+        let blob = encode_resident_envelope(0, 0, &[], None);
+        let got = decode_resident_envelope(&Bytes::from(blob), true).expect("decode empty");
         assert!(got.centroid_graph.is_empty());
         assert!(got.data_bundle.is_none());
 
-        assert!(decode_graph_bundle(&Bytes::from_static(b"bad"), true).is_none());
-        assert!(graph_bundle_header(b"short").is_none());
+        assert!(decode_resident_envelope(&Bytes::from_static(b"bad"), true).is_none());
+        assert!(resident_envelope_header(b"short").is_none());
+    }
+
+    /// The kind tag round-trips for BOTH kinds, and an unknown one declines
+    /// the section without taking the envelope down with it.
+    ///
+    /// The compat story was asserted only for `Graph`, which is the arm that
+    /// cannot regress: `1` is what the presence byte has always meant. `Flat`
+    /// is the arm a future edit to `put_opt_section` or the decode cursor
+    /// would break, and it would break silently — every flat table falls back
+    /// to ivf and every test stays green, because nothing else pins it.
+    #[test]
+    fn envelope_kind_tag_round_trips_and_declines_the_unknown() {
+        let centroid = vec![7u8; 40];
+        let data = vec![3u8; 128];
+        for kind in [PayloadKind::Graph, PayloadKind::Flat] {
+            for mmap_backed in [true, false] {
+                let blob = encode_resident_envelope(11, 22, &centroid, Some((kind, &data)));
+                let got = decode_resident_envelope(&Bytes::from(blob), mmap_backed)
+                    .expect("decode a tagged envelope");
+                let (got_kind, bytes) = got.data_bundle.as_ref().expect("payload present");
+                assert_eq!(*got_kind, kind, "the tag must survive the round trip");
+                assert_eq!(&bytes[..], &data[..]);
+                assert_eq!(got.centroid_graph, centroid);
+            }
+        }
+
+        // A payload written by a NEWER build. The section is declined and the
+        // centroid graph — which this reader still understands — survives. The
+        // cursor must consume the payload's length prefix and body even though
+        // the kind is unknown, or everything after it mis-slices.
+        let mut blob =
+            encode_resident_envelope(11, 22, &centroid, Some((PayloadKind::Flat, &data)));
+        // Header (magic + population key + high water), then the centroid
+        // section's own u64 length prefix, then its bytes, then the kind tag.
+        let tag_at = GRAPH_BUNDLE_HEADER_BYTES + size_of::<u64>() + centroid.len();
+        assert_eq!(
+            blob[tag_at],
+            PayloadKind::Flat as u8,
+            "the tag sits directly after the centroid section"
+        );
+        for unknown in [3u8, 9, u8::MAX] {
+            blob[tag_at] = unknown;
+            let got = decode_resident_envelope(&Bytes::from(blob.clone()), true)
+                .expect("an unknown kind must decline the SECTION, not the envelope");
+            assert!(
+                got.data_bundle.is_none(),
+                "tag {unknown} is not a kind this build can serve"
+            );
+            assert_eq!(
+                got.centroid_graph, centroid,
+                "the centroid graph must survive a payload this reader cannot decode"
+            );
+            assert_eq!((got.population_key, got.high_water_id), (11, 22));
+        }
     }
 
     /// Empty and singleton graphs don't panic and answer sanely.

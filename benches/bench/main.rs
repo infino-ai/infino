@@ -492,17 +492,29 @@ fn parse_args() -> Selection {
 }
 
 fn main() {
-    // Every bench run installs a subscriber, unconditionally
-    // `RUST_LOG` overrides; unset, default to `infino=debug` so the engine's
-    // own diagnostics always surface in CI without a caller having to know
-    // the right directive.
+    // Every bench run installs a subscriber, unconditionally — but QUIET by
+    // default: warnings and errors only, so the engine's declines (an index
+    // refusing to register, a query falling back to ivf) still surface while
+    // the per-query DEBUG chatter stays out of bench logs. The measured
+    // tables are println-based and unaffected either way.
+    //
+    // `--debug` restores the full engine diagnostics (`info,infino=debug`).
+    // An explicit `RUST_LOG` beats both — an operator who states a directive
+    // gets that directive.
     //
     // Span-timing diagnosis: with a `--features detailed-tracing` build,
     // `INFINO_TRACE_SPANS=1` additionally prints every instrumented span's
     // busy time on close — per-stage attribution for query-path latency
     // without touching engine code.
-    let env_filter = || {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,infino=debug"))
+    let debug_flag = std::env::args().any(|a| a == "--debug");
+    let env_filter = move || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(if debug_flag {
+                "info,infino=debug"
+            } else {
+                "warn"
+            })
+        })
     };
     if std::env::var("INFINO_TRACE_SPANS").is_ok() {
         tracing_subscriber::fmt()
