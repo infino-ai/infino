@@ -1237,6 +1237,17 @@ impl ManifestSnapshot {
         self.list.as_ref()?.slow_vector_state_graphs.as_ref()
     }
 
+    test_visible! {
+        /// Bench/test introspection for the published resident vector-index
+        /// blob (the flat plane or graph bundle the drain persisted): its
+        /// storage ref, so a bench can `head()` the object and report the
+        /// engine's own serialized size instead of re-deriving plane
+        /// arithmetic from internals.
+        fn resident_vector_index_blob_ref(&self) -> Option<RoutingRef> {
+            self.resident_vector_index_blob().cloned()
+        }
+    }
+
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
     /// bytes in the manifest list. Bumps `manifest_id` like a normal commit
     /// without touching superfiles or parts.
