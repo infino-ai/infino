@@ -73,14 +73,22 @@ pub mod fts {
 
     /// The version new code writes: everything `V4` allows (positions region
     /// iff positional, `V3` sub-index for positional terms, bitset blocks
-    /// self-describing per block) **plus** a per-term **coarse block-max
-    /// table** at the tail of each PFOR term's postings region — one
-    /// fixed-point `u32` per [`COARSE_BLOCK_MAX_SPAN`] blocks, the span's max
-    /// of the per-block bounds — giving the ranked walk a second, coarser
-    /// skip level. The header + region layout is otherwise identical to
-    /// `V2`–`V4`. Readers accept `V1`–`V5`; `V1`–`V4` blobs carry **no** coarse
-    /// table (the reader gates on the version), so existing indices read
-    /// unchanged and need no reindex.
+    /// self-describing per block) **plus** two block-max changes:
+    ///
+    /// 1. Each skip-table entry stores the per-block max BM25 as an **exact
+    ///    little-endian `f32`** (the 4-byte slot that held `V1`–`V4`'s
+    ///    `ceil`-quantised fixed-point `u32`). It equals the reader's per-doc
+    ///    score for the block's max doc (same quantized-length scoring), so it
+    ///    is an exact upper bound with none of the fixed-point `ceil` slack.
+    /// 2. A per-term **coarse block-max table** at the tail of each PFOR
+    ///    term's postings region — one `f32` per [`COARSE_BLOCK_MAX_SPAN`]
+    ///    blocks, the span's max of the per-block maxes — giving the ranked
+    ///    walk a second, coarser skip level.
+    ///
+    /// The header + region layout is otherwise identical to `V2`–`V4`.
+    /// Readers accept `V1`–`V5` and gate the block-max decode on the version:
+    /// `V1`–`V4` blobs decode the fixed-point `u32` (and carry no coarse
+    /// table), so existing indices read unchanged and need no reindex.
     pub const VERSION_V5: u32 = 5;
 
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
@@ -105,17 +113,25 @@ pub mod fts {
     /// write and read paths share one scale.
     pub const AVGDL_FIXED_POINT_SCALE: f32 = 1000.0;
 
-    /// Fixed-point scale for a posting block's max-BM25 upper bound.
-    /// The builder stores `round(max_bm25 × 1000)` in each skip-table
-    /// entry (`max_bm25_x1000`); the reader recovers the `f32` bound
-    /// by dividing by this. Drives WAND / block-max skip decisions, so
-    /// write and read must agree on the scale.
+    /// **Legacy** fixed-point scale for a posting block's max-BM25 upper
+    /// bound, used only by `V1`–`V4` blobs. Those store `ceil(max_bm25 ×
+    /// this)` as a `u32` in each skip-table entry; the reader recovers the
+    /// bound by dividing by this and adding one step (a safety margin for
+    /// files written before the encode-side `ceil`).
+    ///
+    /// `V5` no longer uses a fixed-point scale at all — it stores the block
+    /// max as an **exact `f32`** (see [`VERSION_V5`]). The `ceil`-to-`u32`
+    /// quantization at scale 1000 rounded the bound *up* by up to ~0.002,
+    /// which for a low-idf term like "the" (BM25 ~0.1–0.3) is a large
+    /// *relative* inflation that blocks skips a tight bound would allow.
+    /// Storing the exact `f32` (same 4 bytes, matching the reader's per-doc
+    /// scoring — IResearch keeps a float bound too) removes that slack.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
     /// Number of consecutive posting blocks summarised by one entry of
-    /// a term's coarse block-max table. The table sits at the tail of a
-    /// PFOR term's postings region: `ceil(num_blocks / this)` fixed-point
-    /// `u32`s, each the max of its span's per-block `max_bm25_x1000`.
+    /// a term's coarse block-max table (V5 only). The table sits at the tail
+    /// of a PFOR term's postings region: `ceil(num_blocks / this)` `f32`s,
+    /// each the max of its span's per-block max BM25.
     ///
     /// It gives the ranked single-term walk a second, coarser skip level:
     /// when the running k-th-best score already dominates a whole span's
@@ -237,7 +253,8 @@ pub mod fts {
         pub const LAST_DOC_ID_OFF: usize = 0;
         /// `[4..8]` byte offset to the encoded PFOR block (`u32` LE).
         pub const BLOCK_OFFSET_OFF: usize = 4;
-        /// `[8..12]` fixed-point block-max BM25 bound (`u32` LE).
+        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5,
+        /// fixed-point `u32` (`ceil(max × scale)`) on legacy `V1`-`V4`. LE.
         pub const MAX_BM25_OFF: usize = 8;
         /// `[12..16]` block's position-runs offset, relative to the
         /// term's `positions_offset` (`u32` LE). Zero on positionless

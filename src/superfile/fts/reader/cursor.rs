@@ -186,16 +186,35 @@ impl TermMeta {
         })
     }
 
+    /// Decode a 4-byte block-max slot (a per-block skip entry's field or a
+    /// coarse-table entry) into a guaranteed upper bound on the BM25 score.
+    /// V5 stores the exact `f32` bits; legacy `V1`-`V4` store
+    /// `ceil(max × scale)` as fixed-point. Both return a value at or above
+    /// the true max:
+    /// - V5 nudges the exact stored max up one `f32` ULP. The stored value
+    ///   equals the reader's per-doc score for the block's max doc, so for
+    ///   local scoring it is already an exact bound; the ULP guards the
+    ///   cross-superfile idf-rescale multiply, whose f32 rounding could
+    ///   otherwise dip a hair below a score-tied doc and drop tied hits.
+    /// - Legacy adds one fixed-point step, covering both the `x1000 / scale`
+    ///   division rounding and files written before the encode-side `ceil`.
+    #[inline]
+    fn decode_block_max(&self, raw: u32) -> f32 {
+        if self.has_coarse {
+            f32::from_bits(raw).next_up()
+        } else {
+            raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
+        }
+    }
+
     /// Decode coarse block-max entry `g` into a guaranteed upper bound
     /// on the BM25 score of every block in span `g` (blocks
-    /// `[g*SPAN .. (g+1)*SPAN)`). Same fixed-point decode as
-    /// [`Self::skip_entry`]'s `block_max_bm25`, including the +1 step
-    /// that keeps the decoded value at or above the true span max.
+    /// `[g*SPAN .. (g+1)*SPAN)`). Coarse entries exist only on V5, where
+    /// they are `f32` bits.
     #[inline]
     pub(super) fn coarse_entry(&self, postings: &[u8], g: usize) -> f32 {
         let at = self.coarse_start + g * U32_BYTES;
-        let x1000 = read_u32_le(&postings[at..at + U32_BYTES]);
-        x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
+        self.decode_block_max(read_u32_le(&postings[at..at + U32_BYTES]))
     }
 
     /// For a `VERSION_V3` positional term, the run offset of the nearest
@@ -240,25 +259,20 @@ impl TermMeta {
             &postings[entry_off + skip_entry::BLOCK_OFFSET_OFF
                 ..entry_off + skip_entry::BLOCK_OFFSET_OFF + U32_BYTES],
         ) as usize;
-        let max_bm25_x1000 = read_u32_le(
+        let block_max_raw = read_u32_le(
             &postings[entry_off + skip_entry::MAX_BM25_OFF
                 ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
         );
-        // Decode to a guaranteed upper bound on the block's BM25. The
-        // builder ceil()s on encode, but `x1000 as f32 / SCALE` can still
-        // round a hair below the true max (f32 division), and superfiles
-        // written before the encode-side ceil truncated outright. Add one
-        // fixed-point step before unscaling so the decoded bound is always
-        // >= the true block max. This matters for the cross-superfile
-        // floor: block-skip compares `block_max <= floor`, and a bound
-        // that dips below a score-tied block's true max would let a rising
-        // floor skip that block, dropping tied hits by completion order
-        // (nondeterministic top-k). The +1 step costs ~1/SCALE of pruning
-        // tightness — negligible — and keeps the top-k deterministic.
+        // Decode to a guaranteed upper bound on the block's BM25 (V5 exact
+        // f32 + one ULP; legacy fixed-point + one step). The upper-bound
+        // guarantee matters for the cross-superfile floor: block-skip
+        // compares `block_max <= floor`, and a bound that dips below a
+        // score-tied block's true max would let a rising floor skip it,
+        // dropping tied hits by completion order (nondeterministic top-k).
         (
             last_doc_id,
             block_offset,
-            max_bm25_x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+            self.decode_block_max(block_max_raw),
         )
     }
 

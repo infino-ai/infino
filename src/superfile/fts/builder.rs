@@ -3731,9 +3731,9 @@ fn encode_and_emit_term<W: Write>(
             None => 0,
         };
         // Coarse block-max table at the tail of the term region: one
-        // fixed-point u32 per `COARSE_BLOCK_MAX_SPAN` blocks (the span's
-        // max block-max), giving the ranked walk a second skip level.
-        // Appended last so no existing block offset moves.
+        // `f32` per `COARSE_BLOCK_MAX_SPAN` blocks (the span's max block-max),
+        // giving the ranked walk a second skip level. Appended last so no
+        // existing block offset moves.
         let num_coarse = match write_coarse {
             true => (num_blocks as usize).div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN),
             false => 0,
@@ -3824,29 +3824,33 @@ fn encode_and_emit_term<W: Write>(
         // Blocks follow the meta, the skip table, and the (V3-only)
         // position sub-index, so their offsets start past all three.
         let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
-        // Coarse span-maxes, filled alongside the per-block skip entries
-        // and appended after the blocks below. Each entry is the max of
-        // its span's `max_bm25_x1000`, so it is a true upper bound over
-        // the span (a max of already-`ceil`-quantised block bounds).
+        // Coarse span-maxes (V5 only), filled alongside the per-block skip
+        // entries and appended after the blocks below. Each entry is the
+        // span's max of the per-block `f32` maxes, stored as `f32` bits — a
+        // true upper bound over the span.
         let mut coarse_maxes: Vec<u32> = Vec::with_capacity(num_coarse);
-        let mut span_max: u32 = 0;
+        let mut span_max: f32 = 0.0;
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
             let max_bm25 = block_ub_per_block[i];
-            // ceil(): the stored fixed-point value must stay a true
-            // UPPER bound after quantization — truncation would round
-            // it below the real block max and let BMW / floor skips
-            // drop blocks that still hold qualifying docs. (The reader
-            // additionally adds one step on decode to cover files
-            // written before this rounding fix.)
-            let max_bm25_x1000 = (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
-                .ceil()
-                .max(0.0)
-                .min(u32::MAX as f32) as u32;
+            // The 4-byte block-max slot. V5 stores the exact `f32` bits: it
+            // equals the reader's per-doc score for the block's max doc (same
+            // quantized-length scoring), so it is an exact upper bound with no
+            // fixed-point slack. Legacy V1-V4 store `ceil(max_bm25 × scale)`
+            // as a `u32`; `ceil` keeps it a true upper bound after truncation
+            // (the reader adds one more step on decode).
+            let block_max_encoded: u32 = if write_coarse {
+                max_bm25.to_bits()
+            } else {
+                (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
+                    .ceil()
+                    .max(0.0)
+                    .min(u32::MAX as f32) as u32
+            };
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
             term_buf.extend_from_slice(&block_offset.to_le_bytes());
-            term_buf.extend_from_slice(&max_bm25_x1000.to_le_bytes());
+            term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
             // Positionless columns keep writing zero here —
             // byte-identical to the field's reserved era.
             let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
@@ -3854,10 +3858,11 @@ fn encode_and_emit_term<W: Write>(
             block_offset += blk.bytes.len() as u32;
 
             if write_coarse {
-                span_max = span_max.max(max_bm25_x1000);
+                // Coarse (V5) tracks the float max, stored as f32 bits.
+                span_max = span_max.max(max_bm25);
                 if (i + 1).is_multiple_of(coarse_span) || i + 1 == encoded_blocks.len() {
-                    coarse_maxes.push(span_max);
-                    span_max = 0;
+                    coarse_maxes.push(span_max.to_bits());
+                    span_max = 0.0;
                 }
             }
         }
