@@ -1362,7 +1362,11 @@ pub mod fts {
 }
 
 pub mod vector {
-    use std::{collections::HashMap, hint::black_box};
+    use std::{
+        collections::HashMap,
+        hint::black_box,
+        time::{Duration, Instant},
+    };
 
     use infino::{
         storage::io_counters,
@@ -1373,8 +1377,6 @@ pub mod vector {
     };
 
     use super::*;
-    use std::time::{Duration, Instant};
-
     use crate::{
         corpus::{self, Calibrated},
         cpu,
