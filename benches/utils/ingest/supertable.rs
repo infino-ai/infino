@@ -645,13 +645,23 @@ pub fn build_local_for_serving(
 /// arithmetic re-derived in bench code. `None` when no resident index
 /// was published (ivf mode, above the scale ceiling, or a declined
 /// register probe).
-pub fn served_index_blob_bytes(st: &Supertable, storage: &Arc<dyn StorageProvider>) -> Option<u64> {
+pub fn served_index_blob_bytes(st: &Supertable) -> Option<u64> {
     let hidden = st.vector_index_table()?;
     let reference = hidden
         .pinned_reader()
         .manifest()
         .resident_vector_index_blob_ref()?;
-    let meta = tiers::block_on(storage.head(&reference.uri)).ok()?;
+    // The ref's URI is relative to the HIDDEN table's (prefixed) provider,
+    // so head through that handle — heading the user-root provider turns
+    // "blob exists" into NotFound. A manifest that names a blob the store
+    // cannot head is corruption, not absence: fail loudly, never `None`.
+    let storage = hidden
+        .options()
+        .storage
+        .as_ref()
+        .expect("hidden table with a published blob has storage attached");
+    let meta = tiers::block_on(storage.head(&reference.uri))
+        .expect("head the resident-index blob the hidden manifest references");
     Some(meta.size)
 }
 
