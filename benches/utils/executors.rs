@@ -1603,6 +1603,12 @@ pub mod vector {
         mut search: impl FnMut(&[f32], usize) -> Vec<corpus::Hit>,
     ) -> Vec<PerKCell> {
         let percentile = |sorted: &[Duration], pct: usize| -> f64 {
+            // Empty input yields 0 rather than an underflowing index: the
+            // recall side already tolerates an empty query set, and a
+            // helper must not have a narrower domain than its caller.
+            if sorted.is_empty() {
+                return 0.0;
+            }
             let rank = (pct * sorted.len()).div_ceil(100);
             sorted[rank.saturating_sub(1).min(sorted.len() - 1)].as_nanos() as f64
         };
