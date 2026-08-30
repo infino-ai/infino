@@ -124,8 +124,8 @@ pub mod fts {
     /// quantization at scale 1000 rounded the bound *up* by up to ~0.002,
     /// which for a low-idf term like "the" (BM25 ~0.1–0.3) is a large
     /// *relative* inflation that blocks skips a tight bound would allow.
-    /// Storing the exact `f32` (same 4 bytes, matching the reader's per-doc
-    /// scoring — IResearch keeps a float bound too) removes that slack.
+    /// Storing the exact `f32` (same 4 bytes, matching the precision of the
+    /// reader's per-doc scoring) removes that slack.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
     /// Number of consecutive posting blocks summarised by one entry of
