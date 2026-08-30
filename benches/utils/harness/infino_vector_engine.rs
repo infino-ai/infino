@@ -295,10 +295,13 @@ impl VectorEngine for InfinoVectorEngine {
     /// (and for infino, much heavier) question than "insert latency"
     /// implies for a mutable-index engine.
     fn insert(index: &mut Self::Index, vectors: &[f32], next_id: u64) -> bool {
-        let existing = index
-            .source_vectors
-            .as_ref()
-            .expect("insert requires InfinoVectorIndex::source_vectors retained from write()");
+        // A LOADED index retains no fp32 source, so the rebuild that
+        // implements mutation here is impossible for it. Static
+        // capabilities cannot express state-dependent support; `false` is
+        // the trait's channel for it, and callers assert on the return.
+        let Some(existing) = index.source_vectors.as_ref() else {
+            return false;
+        };
         // The artifact's own `_id` column is the id authority: new rows get
         // `next_id..`, survivors keep the ids they already carry, and the
         // trait's uniqueness contract is checked against the real ids
@@ -308,6 +311,12 @@ impl VectorEngine for InfinoVectorEngine {
         assert!(
             row_ids.is_empty() || next_id > max_id,
             "InfinoVectorEngine::insert: next_id {next_id} must exceed the max stored _id {max_id}"
+        );
+        assert!(
+            vectors.len().is_multiple_of(index.dim),
+            "insert buffer must be whole rows: {} floats at dim {}",
+            vectors.len(),
+            index.dim
         );
         let added = vectors.len() / index.dim;
         row_ids.extend(next_id..next_id + added as u64);
@@ -332,10 +341,11 @@ impl VectorEngine for InfinoVectorEngine {
     /// insert/remove/search still means the rows the caller thinks it
     /// means.
     fn remove(index: &mut Self::Index, ids: &[u64]) -> bool {
-        let existing = index
-            .source_vectors
-            .as_ref()
-            .expect("remove requires InfinoVectorIndex::source_vectors retained from write()");
+        // Same state-dependent unsupport as `insert`: no retained source,
+        // no rebuild.
+        let Some(existing) = index.source_vectors.as_ref() else {
+            return false;
+        };
         let dim = index.dim;
         let drop_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
         let row_ids = stable_ids_of(index.reader());
@@ -379,7 +389,13 @@ impl VectorEngine for InfinoVectorEngine {
             bytes: Some(owned.to_vec()),
             reader: Some(reader),
             source_vectors: None,
-            mutated: false,
+            // Forced on: these bytes may have been saved AFTER an
+            // insert/remove, so their `_id`s need not equal locals, and
+            // density cannot be checked without an O(n) id-column scan
+            // inside the timed load. Resolving hits through the id column
+            // is also what production reads do — the identity fast path is
+            // provably safe only for artifacts this process built fresh.
+            mutated: true,
         })
     }
 }
@@ -462,5 +478,34 @@ mod tests {
         // axis-7 query falls to some other row, never a phantom 7.
         assert!(InfinoVectorEngine::remove(&mut index, &[7]));
         assert_ne!(top1(&index, 7), 7, "_id 7 is gone, not renumbered onto");
+    }
+
+    /// A save/load round trip after mutations must keep answering with
+    /// stable `_id`s (the saved bytes carry non-dense ids), and mutating
+    /// the loaded index — which retains no fp32 source — must report
+    /// unsupported instead of panicking.
+    #[test]
+    fn loaded_index_resolves_saved_ids_and_declines_mutation() {
+        let mut index = InfinoVectorEngine::create("emb", TEST_DIM, VectorMetric::Cosine);
+        InfinoVectorEngine::write(&mut index, &axis_rows(TEST_ROWS));
+        assert!(InfinoVectorEngine::remove(&mut index, &[2, 5]));
+        let saved = InfinoVectorEngine::save(&index).expect("superfile bytes");
+
+        let mut loaded = InfinoVectorEngine::load("emb", TEST_DIM, VectorMetric::Cosine, &saved)
+            .expect("reopen saved bytes");
+        assert_eq!(
+            top1(&loaded, 7),
+            7,
+            "the loaded artifact's non-dense _ids resolve, not its locals"
+        );
+        let extra = vec![0.0f32; TEST_DIM];
+        assert!(
+            !InfinoVectorEngine::insert(&mut loaded, &extra, TEST_ROWS as u64),
+            "no retained source: insert reports unsupported"
+        );
+        assert!(
+            !InfinoVectorEngine::remove(&mut loaded, &[7]),
+            "no retained source: remove reports unsupported"
+        );
     }
 }
