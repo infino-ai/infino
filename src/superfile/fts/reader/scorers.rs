@@ -1274,16 +1274,25 @@ impl FtsReader {
             // block. This is what makes BMM competitive with WAND+BMW
             // on dominant-term queries; without it MaxScore scans
             // every doc in the dominant term's posting list.
-            let leftmost_term_ub = cursors[leftmost_essential].term_max_bm25;
             let leftmost_block_ub = cursors[leftmost_essential].current_block_max_bm25();
-            // others_ub = sum of OTHER cursors' term UBs (essential + non-essential).
-            // We use term-level UBs for the others as a conservative bound; using
-            // their per-block UBs would tighten further but require keeping them
-            // synced with the candidate, which we only do lazily in the
-            // non-essential probe below.
-            let others_ub = total_term_ub - leftmost_term_ub;
+            let last_in_block = cursors[leftmost_essential].current_block_last_doc_id();
+            // Bound every OTHER cursor's contribution over the leftmost block's
+            // doc range `[candidate, last_in_block]` by its per-block max across
+            // that range (`block_max_in_range`, amortized O(1) via the monotonic
+            // inspect-block hint), not by its global term-max. This is the
+            // Block-Max-WAND pivot bound: far tighter than the term-level sum, so
+            // the block skip fires on many more blocks. `block_max_in_range` is a
+            // safe upper bound over the whole range (single-block lookups
+            // underestimate when the range spans several cursor blocks), so the
+            // skip stays correct.
+            let mut others_ub = 0.0f32;
+            for (i, c) in cursors.iter_mut().enumerate() {
+                if i == leftmost_essential {
+                    continue;
+                }
+                others_ub += c.block_max_in_range(candidate, last_in_block);
+            }
             if leftmost_block_ub + others_ub <= threshold {
-                let last_in_block = cursors[leftmost_essential].current_block_last_doc_id();
                 cursors[leftmost_essential].skip_to(last_in_block.saturating_add(1));
                 continue;
             }
