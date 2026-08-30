@@ -1508,21 +1508,20 @@ impl FtsReader {
                     }
                     let pos = c.pos;
                     if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
-                        let doc_ids = [
-                            c.block_doc_ids[pos],
-                            c.block_doc_ids[pos + 1],
-                            c.block_doc_ids[pos + 2],
-                            c.block_doc_ids[pos + 3],
-                        ];
+                        // Bind the 4-wide window as one subslice per array:
+                        // the guard proves `pos + LANES <= block_n <= len`,
+                        // so this is a single range check and the lane reads
+                        // off the fixed-length-4 slice carry none — replacing
+                        // the eight separate element bounds checks the direct
+                        // `block_doc_ids[pos+i]` / `block_tfs[pos+i]` indexing
+                        // emitted in this per-block SIMD group.
+                        let dids = &c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
+                        let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
                         if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
+                            let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
                             let contributions = bm25::score_one_term_x4(
                                 c.idf_x_k1p1,
-                                [
-                                    c.block_tfs[pos],
-                                    c.block_tfs[pos + 1],
-                                    c.block_tfs[pos + 2],
-                                    c.block_tfs[pos + 3],
-                                ],
+                                [tfs[0], tfs[1], tfs[2], tfs[3]],
                                 [
                                     dl_norm_k1.get(doc_ids[0]),
                                     dl_norm_k1.get(doc_ids[1]),
@@ -1823,21 +1822,20 @@ impl FtsReader {
                     }
                     let pos = c.pos;
                     if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
-                        let doc_ids = [
-                            c.block_doc_ids[pos],
-                            c.block_doc_ids[pos + 1],
-                            c.block_doc_ids[pos + 2],
-                            c.block_doc_ids[pos + 3],
-                        ];
+                        // Bind the 4-wide window as one subslice per array:
+                        // the guard proves `pos + LANES <= block_n <= len`,
+                        // so this is a single range check and the lane reads
+                        // off the fixed-length-4 slice carry none — replacing
+                        // the eight separate element bounds checks the direct
+                        // `block_doc_ids[pos+i]` / `block_tfs[pos+i]` indexing
+                        // emitted in this per-block SIMD group.
+                        let dids = &c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
+                        let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
                         if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
+                            let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
                             let contributions = bm25::score_one_term_x4(
                                 c.idf_x_k1p1,
-                                [
-                                    c.block_tfs[pos],
-                                    c.block_tfs[pos + 1],
-                                    c.block_tfs[pos + 2],
-                                    c.block_tfs[pos + 3],
-                                ],
+                                [tfs[0], tfs[1], tfs[2], tfs[3]],
                                 [
                                     dl_norm_k1.get(doc_ids[0]),
                                     dl_norm_k1.get(doc_ids[1]),

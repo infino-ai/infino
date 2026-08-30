@@ -878,8 +878,12 @@ impl FtsReader {
         // that makes `peek()` the current kth-best score.
         let mut heap: BinaryHeap<TopKEntry> =
             BinaryHeap::with_capacity(k.min(term_meta.num_blocks * BLOCK_LEN).max(1));
-        let mut buf_d = vec![0u32; BLOCK_LEN];
-        let mut buf_t = vec![0u32; BLOCK_LEN];
+        // Stack-resident decode scratch: `BLOCK_LEN` is a compile-time
+        // const and these never cross an await (the whole scoring walk
+        // below is synchronous), so they stay off the heap — no per-query
+        // malloc/free on the most common query shape.
+        let mut buf_d = [0u32; BLOCK_LEN];
+        let mut buf_t = [0u32; BLOCK_LEN];
 
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         // The coarse block-max table exists only on V5 blobs; on V1–V4 the

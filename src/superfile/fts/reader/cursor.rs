@@ -719,8 +719,10 @@ impl TermCursor {
         // Decode this block's tf array once (doc order), reused across a run of
         // candidates in the same block; the doc ids are never expanded.
         if self.tf_decoded_block != self.current_block {
-            let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
-            posting::decode_block_tfs(bytes, &mut self.block_tfs);
+            // Reuse `raw` (still borrowing this block's bytes, disjoint from
+            // the `&mut self.block_tfs` decode target) rather than recomputing
+            // the same subslice and its bounds check.
+            posting::decode_block_tfs(raw, &mut self.block_tfs);
             self.tf_decoded_block = self.current_block;
         }
         Some(self.block_tfs[rank as usize])
@@ -742,9 +744,16 @@ impl TermCursor {
 
     #[inline(always)]
     pub(super) fn current_doc_id(&self) -> u32 {
-        if self.is_exhausted() || self.pos >= self.block_n {
+        if self.is_exhausted() {
             u32::MAX
         } else {
+            // A live cursor always has `pos < block_n` — every mutator
+            // (`next`, `advance_by`, `skip_to`, `advance_block`) restores it
+            // or marks the cursor exhausted (see the `pos` field doc). The
+            // extra `pos >= block_n` guard was dead on this hot walk
+            // primitive; the debug tripwire fires if a future change breaks
+            // the invariant.
+            debug_assert!(self.pos < self.block_n);
             self.block_doc_ids[self.pos]
         }
     }
