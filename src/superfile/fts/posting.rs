@@ -54,21 +54,11 @@
 //!   `assert!` preconditions plus the caller's contract carry safety
 //!   in production.
 
-use std::sync::LazyLock;
-
 use bitpacking::{BitPacker, BitPacker4x};
 
 /// Number of `(doc_id, tf)` pairs per encoded block. Fixed at 128 to
 /// match `BitPacker4x::BLOCK_LEN`.
 pub const BLOCK_LEN: usize = BitPacker4x::BLOCK_LEN;
-
-/// Process-wide bit-unpacking dispatcher, built once. `BitPacker4x::new()`
-/// runs a runtime SIMD-feature probe and is not `#[inline]`, so calling it
-/// per block was an out-of-line call on every decode — twice per full
-/// scoring decode (doc ids + tfs), in the hottest read path. The selected
-/// instruction set is process-invariant, so resolve it a single time and
-/// reuse the (one-byte, `Copy`) dispatcher.
-static BITPACKER: LazyLock<BitPacker4x> = LazyLock::new(BitPacker4x::new);
 
 /// Header size in bytes (doc_count + delta_bits + tf_bits + encoding +
 /// base_doc_id).
@@ -266,7 +256,7 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
         HEADER_SIZE + tfs_size
     );
     let tfs_start = bytes.len() - tfs_size;
-    BITPACKER.decompress(
+    BitPacker4x::new().decompress(
         &bytes[tfs_start..tfs_start + tfs_size],
         &mut dest_tfs[..BLOCK_LEN],
         tf_bits,
@@ -294,7 +284,7 @@ pub fn decode_block_tfs(bytes: &[u8], dest_tfs: &mut [u32]) {
         "decode_block_tfs: bytes shorter than header+tfs"
     );
     let tfs_start = bytes.len() - tfs_size;
-    BITPACKER.decompress(
+    BitPacker4x::new().decompress(
         &bytes[tfs_start..tfs_start + tfs_size],
         &mut dest_tfs[..BLOCK_LEN],
         tf_bits,
@@ -379,7 +369,7 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest_doc_ids: &mut [u32]) -> usize {
         HEADER_SIZE + deltas_size
     );
 
-    BITPACKER.decompress_sorted(
+    BitPacker4x::new().decompress_sorted(
         base_doc_id,
         &bytes[HEADER_SIZE..HEADER_SIZE + deltas_size],
         &mut dest_doc_ids[..BLOCK_LEN],
