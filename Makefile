@@ -236,20 +236,14 @@ python-examples-test:
 	grep -v 'infino' infino-python/examples/langchain/requirements.txt \
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
 	infino-python/.venv/bin/pip install -q --no-deps langchain-infino
-	# The crewai examples add crewai-infino the same way: strip every infino line,
-	# install the rest, then add crewai-infino --no-deps so it links against the
-	# from-source build instead of pulling its own infino.
-	grep -v 'infino' infino-python/examples/crewai/requirements.txt \
-		| infino-python/.venv/bin/pip install -q -r /dev/stdin
-	infino-python/.venv/bin/pip install -q --no-deps "crewai-infino>=0.1.0"
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
 	# Warm the shared embedding model so parallel workers don't race the download.
 	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
 		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
-	# Run the example notebooks. The langchain/ and crewai/ suites go through the
-	# published integration packages; a breaking infino API change can land before
-	# those packages ship a compatible release, so each is gated on a compat probe
-	# and skipped (with a note) rather than hard-failing when it isn't ready yet.
+	# Run the example notebooks. The langchain/ suite goes through the published
+	# integration package; a breaking infino API change can land before that
+	# package ships a compatible release, so it is gated on a compat probe and
+	# skipped (with a note) rather than hard-failing when it isn't ready yet.
 	# Direct-infino examples always run; LLM notebooks degrade to a note w/o a key.
 	@PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
 		infino-python/examples/_shared/select_example_notebooks.py | \
