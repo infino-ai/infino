@@ -235,20 +235,22 @@ fn block_max_and_bound(
 }
 
 /// Route a ranked AND to the membership walk ([`FtsReader::and_membership_scored`])
-/// instead of the block flat-merge. True only for v4 blobs — where a common
-/// term's blocks are bitset-encoded, so [`TermCursor::contains`] is an O(1)
-/// bit-test — with **≥3 terms** and a **very sparse rarest term**: driving the
-/// rarest doc-by-doc is then cheap and bit-testing the common others beats
-/// decoding their blocks to align them.
+/// instead of the block flat-merge. True only for v4/v5 blobs — where a common
+/// term's blocks are bitset-encoded, so a membership probe is an O(1) bit-test
+/// (plus a popcount-rank for the tf) with no doc-id decode — with **≥3 terms**
+/// and a **sparse rarest term**: driving the rarest doc-by-doc is then cheap and
+/// bit-testing the common others beats decoding their blocks to align them.
 ///
-/// Two guards keep it off the shapes where it regressed the ranked tail:
+/// Two guards keep it off the shapes where the flat-merge is cheaper:
 /// - **≥3 terms**: a 2-term AND keeps the specialized `and_flat_merge_2term`
 ///   (two-pointer merge over the decoded blocks), which the membership walk was
 ///   losing to.
-/// - **rarest < 1/`AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR`**: the walk gives up the
-///   flat-merge's heap-bar block skip, so it only pays when the rarest list is
-///   genuinely short. A looser bound regressed p99 where the bar-skip was
-///   working.
+/// - **rarest < 1/`AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR`**: the walk drives the
+///   rarest term's whole list, so it only pays when that list is short relative
+///   to the corpus. The walk now carries the flat-merge's Block-Max-AND heap-bar
+///   skip itself, so this gate can sit at `1/16` (a discriminating term plus
+///   stopwords) without the p99 regression a skip-less walk had; an all-dense
+///   AND stays above the gate on the flat-merge.
 fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> bool {
     if !has_bitset_blocks || cursors.len() < 3 {
         return false;
@@ -582,22 +584,28 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
-    /// Ranked AND via the same rarest-driven membership walk that the unranked
-    /// count path uses ([`count_and_intersect_membership`]), but scoring the
-    /// matches. Iterate the rarest term; for each of its docs, probe the others
-    /// with [`TermCursor::contains`] — a **bitset bit-test with no block decode**
-    /// — short-circuiting on the first miss. Only a doc present in *every* term
-    /// is materialized (decoded + positioned via [`TermCursor::materialize_at`])
-    /// and scored. This skips the flat-merge's per-leader-doc `skip_to` that
-    /// fully decodes a common term's 128-doc block to read one doc — the profiled
-    /// cost on n≥3-term AND with a common term. Score is `Σ` per-term BM25 at the
-    /// doc, identical to the flat-merge; emitted through the generic sink, so the
-    /// walk is written against any [`AndSink`]. Only the pure-AND path
-    /// ([`run_and_intersect`](Self::run_and_intersect), a `ScoreSink`) routes here
-    /// today; must+should keeps the flat-merge so its should-clause scoring stays
-    /// in one place. Gated to the v4 bitset case with a sparse rarest term (see
-    /// [`and_prefer_membership`]); the flat-merge stays for v1–v3 and the
-    /// all-dense case.
+    /// Ranked AND via a rarest-driven membership walk. Iterate the rarest term;
+    /// for each of its docs, probe every other term with
+    /// [`TermCursor::bitset_probe_tf`] — a **bitset bit-test that also reads the
+    /// matching tf by popcount-rank, with no doc-id block decode** — short-
+    /// circuiting on the first miss. A doc present in *every* term is scored by
+    /// `Σ` per-term BM25 (identical to the flat-merge) and emitted through the
+    /// generic sink. This skips the flat-merge's per-leader-doc `skip_to` that
+    /// fully decodes a common term's 128-doc block just to align it — the
+    /// profiled cost on an n≥3-term AND with a common term.
+    ///
+    /// Unlike a plain membership walk, this keeps the flat-merge's **Block-Max-AND
+    /// heap-bar skip**: at each driver doc the driver's block-max plus each
+    /// other's block-max at that doc (read off the inspect pointer, no decode)
+    /// bound the window's best possible score; if it can't beat the kth-best,
+    /// the driver skips the whole window. That's what lets a moderately-sparse
+    /// rarest term (not just an extremely sparse one) route here without
+    /// forfeiting the pruning that protects the ranked tail — see
+    /// [`and_prefer_membership`]. Only the pure-AND path
+    /// ([`run_and_intersect`](Self::run_and_intersect), a `ScoreSink`) routes
+    /// here; must+should keeps the flat-merge so its should-clause scoring stays
+    /// in one place. Gated to the v4/v5 bitset case; the flat-merge stays for
+    /// v1–v3 and the all-dense case.
     fn and_membership_scored<S: AndSink>(
         &self,
         mut cursors: Vec<TermCursor>,
@@ -612,21 +620,53 @@ impl FtsReader {
             .unwrap_or(0);
         let mut driver = cursors.swap_remove(driver_idx);
         let mut others = cursors;
+        let need_score = sink.needs_score();
         while !driver.is_exhausted() {
             let doc = driver.current_doc_id();
-            if others.iter_mut().all(|o| o.contains(doc)) {
-                let score = if sink.needs_score() {
-                    let norm = dl_norm_k1.get(doc);
-                    let mut s =
-                        bm25::score_with_dl_norm_k1(driver.idf_x_k1p1, driver.current_tf(), norm);
-                    for o in others.iter_mut() {
-                        o.materialize_at(doc);
-                        s += bm25::score_with_dl_norm_k1(o.idf_x_k1p1, o.current_tf(), norm);
+
+            // Block-Max-AND pruning over [doc, window_end]: the driver's
+            // block-max plus each other term's block-max at `doc` (inspect
+            // pointer, no decode) upper-bounds every score in the window. If it
+            // can't beat the heap bar, skip the driver past the window. Same
+            // bound the flat-merge uses, so the walk keeps its heap-bar skip.
+            let bar = sink.bar();
+            if bar > f32::NEG_INFINITY {
+                let (ub, window_end) = block_max_and_bound(
+                    driver.current_block_max_bm25(),
+                    driver.current_block_last_doc_id(),
+                    &mut others,
+                    doc,
+                );
+                if ub <= bar {
+                    driver.skip_to(window_end.saturating_add(1));
+                    continue;
+                }
+            }
+
+            // Probe each other term: a bitset bit-test that also reads the tf by
+            // popcount-rank, never expanding the block's doc ids. Any miss drops
+            // the doc from the intersection; short-circuit on it.
+            let norm = dl_norm_k1.get(doc);
+            let mut score = if need_score {
+                bm25::score_with_dl_norm_k1(driver.idf_x_k1p1, driver.current_tf(), norm)
+            } else {
+                0.0
+            };
+            let mut all_match = true;
+            for o in others.iter_mut() {
+                match o.bitset_probe_tf(doc) {
+                    Some(tf) => {
+                        if need_score {
+                            score += bm25::score_with_dl_norm_k1(o.idf_x_k1p1, tf, norm);
+                        }
                     }
-                    s
-                } else {
-                    0.0
-                };
+                    None => {
+                        all_match = false;
+                        break;
+                    }
+                }
+            }
+            if all_match {
                 sink.emit(doc, score);
             }
             driver.next();

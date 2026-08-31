@@ -329,13 +329,17 @@ pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
 /// Rarest-term sparsity gate for the ranked-AND membership walk
 /// (`FtsReader::and_membership_scored`): route there only when the rarest term
 /// covers less than `1/N` of the doc-id space. The membership walk drives the
-/// rarest term's *entire* list (bit-testing the others) and gives up the
-/// flat-merge's block-max heap-bar skip, so it only pays when that list is
-/// genuinely short. A looser `1/16` (the count path's divisor) let moderately
-/// sparse rarest terms through and regressed the ranked tail (p99), where the
-/// bar-skip was doing real work; `1/64` restricts it to the clearly-rare∧common
-/// shape the walk targets. Bench-calibrated against the ranked-AND tail.
-pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 64;
+/// rarest term's *entire* list, bit-testing the others, so it only pays when
+/// that list is genuinely short relative to the corpus. It previously *also*
+/// gave up the flat-merge's block-max heap-bar skip, which forced a strict
+/// `1/64` gate — a looser `1/16` let moderately sparse rarest terms through and
+/// regressed the ranked tail (p99) where the bar-skip was doing real work. The
+/// walk now carries that same Block-Max-AND skip itself, so a moderately-sparse
+/// rarest term (rare∧common — one discriminating term plus stopwords, the
+/// common multi-term shape) can route here and still skip windows the bar rules
+/// out. Set to the count path's `1/16`; the all-dense case (every term a
+/// stopword) stays above the gate and keeps the flat-merge.
+pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 16;
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
