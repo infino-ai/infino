@@ -634,6 +634,13 @@ impl FtsReader {
     /// `ScoreSink`) routes here; must+should keeps the flat-merge so its
     /// should-clause scoring stays in one place. Gated to the v4/v5 bitset case;
     /// the flat-merge stays for v1–v3 and the all-dense case.
+    ///
+    /// `#[cold]` places this out of line, so growing it doesn't shift the layout
+    /// of the flat-merge scorers it shares this module with. The flat-merge AND
+    /// path is measurably sensitive to its own instruction placement, and moving
+    /// this walk aside kept an all-dense conjunction (which never routes here)
+    /// off the regression this code's size would otherwise have caused it.
+    #[cold]
     fn and_membership_scored<S: AndSink>(
         &self,
         mut cursors: Vec<TermCursor>,
