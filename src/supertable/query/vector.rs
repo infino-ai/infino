@@ -105,7 +105,8 @@ use crate::{
         error::ReadError,
         fts::reader::BoolMode,
         vector::{
-            distance::{Metric, distance, normalize, relative_score_window},
+            cell_posting::MaterializedIvfRow,
+            distance::{Metric, dequantize_sq16_into, distance, normalize, relative_score_window},
             hnsw::{self, HnswParams, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{ProbeTally, ScanCandidate, ScanOutcome},
@@ -119,7 +120,7 @@ use crate::{
             ManifestSnapshot, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
             RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitQuery, SuperfileEntry, SuperfileUri,
             VectorSummary,
-            list::{CellRoutingParams, PartitionStrategy},
+            list::{CellRoutingParams, PartitionStrategy, WIDTH_LAW_KS},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
@@ -1142,33 +1143,667 @@ fn decode_centroid_router_section(
     })
 }
 
-/// Build the centroid-router section bytes for the settled generation: open
-/// readers over `entries`, build the router for `column`/`dim` from the freshly
-/// published centroid `section`, and serialize it. `None` when membership is
-/// empty or the build fails — the settle then stamps no ref and queries
-/// reconstruct in memory. The caller has already resolved `column`/`dim` via
-/// [`select_eager_router_column`], so this does not re-gate. Called from the
-/// drain/compaction settle so the graph is published once per generation,
-/// `mmap`-loaded identically on every node and after a restart.
-pub(crate) async fn compose_centroid_router_section(
+/// Build the centroid-router section bytes AND measure the router's per-`k`
+/// fanout for the settled generation, opening readers and building the router
+/// graph exactly ONCE and sharing both across the two steps: open readers over
+/// `entries`, build the router for `column`/`dim` from the freshly published
+/// centroid `section`, serialize it, then calibrate the fanout by real recall
+/// against the same readers + graph. Returns `(section bytes, fanout law)` —
+/// either `None` when membership is empty or that step fails (the settle then
+/// stamps no ref / carries the prior fanout forward). The caller has already
+/// resolved `column`/`dim` via [`select_eager_router_column`], so this does not
+/// re-gate. Called from the drain/compaction settle so the graph is published
+/// once per generation, `mmap`-loaded identically on every node and after a
+/// restart, and the fanout is re-measured for the current membership.
+pub(crate) async fn compose_centroid_router_section_and_fanout(
     options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     section: &crate::supertable::slow_vector_state::CentroidSection,
     column: &str,
     dim: usize,
-) -> Option<Vec<u8>> {
+) -> (Option<Vec<u8>>, Option<[u32; WIDTH_LAW_KS.len()]>) {
     if entries.is_empty() {
+        return (None, None);
+    }
+    let Some(metric) = column_metric(&options.vector_columns, column) else {
+        return (None, None);
+    };
+    let readers = match open_readers_from_options(options, entries).await {
+        Ok(readers) => readers,
+        Err(error) => {
+            tracing::warn!(%error, "centroid-router publish: reader open failed");
+            return (None, None);
+        }
+    };
+    let router = match build_centroid_router(entries, &readers, column, section, dim, metric) {
+        Ok(router) => router,
+        Err(error) => {
+            tracing::warn!(%error, "centroid-router publish: build failed");
+            return (None, None);
+        }
+    };
+    let bytes = encode_centroid_router_section(&router, entries, dim);
+    // Reuse the same opened readers + built graph for the recall calibration.
+    let fanout =
+        calibrate_centroid_router_fanout(manifest, entries, &readers, &router, column, dim, metric)
+            .await;
+    (Some(bytes), fanout)
+}
+
+/// Held-out query sample size for the centroid-router fanout calibration.
+/// Fewer than the HNSW `ef` calibrator's 200: each router probe is a real
+/// per-cluster scan (reads + reranks), far heavier than the HNSW calibrator's
+/// in-memory graph walk, so the sample is smaller while staying large enough
+/// for a stable recall estimate at each ladder rung.
+const ROUTER_FANOUT_CALIB_QUERIES: usize = 128;
+/// Fixed seed for the fanout calibration's held-out query draw, so a
+/// re-settled identical membership measures the same recall ladder.
+const ROUTER_FANOUT_CALIB_SEED: u64 = 0x_FA_11_00_07_CA_11_B0_00;
+
+/// Ascending candidate fanouts to measure recall at, seeded around the grid's
+/// `width × fine` prior but NOT capped by it — a doubling ladder from 1 up to
+/// (and including) `total_fine`, with the prior and its neighbours injected for
+/// resolution near the expected knee. `total_fine` (full fanout — read every
+/// global fine cluster) is always the last rung: it is the recall ceiling the
+/// path can reach, so if it does not clear the target the calibration stamps
+/// the sentinel. Reading more fine clusters than the grid's `W × F` is still
+/// cheaper than the grid's whole-cell reads, so the ladder deliberately climbs
+/// past the prior (the old proxy's cap under-stamped exactly here).
+fn router_fanout_ladder(prior_max: usize, total_fine: usize) -> Vec<usize> {
+    let total = total_fine.max(1);
+    let mut rungs: Vec<usize> = Vec::new();
+    let mut f = 1usize;
+    while f < total {
+        rungs.push(f);
+        f = f.saturating_mul(2);
+    }
+    rungs.push(total);
+    for extra in [prior_max / 2, prior_max, prior_max.saturating_mul(2)] {
+        if (1..=total).contains(&extra) {
+            rungs.push(extra);
+        }
+    }
+    rungs.sort_unstable();
+    rungs.dedup();
+    rungs.retain(|&r| (1..=total).contains(&r));
+    rungs
+}
+
+/// One held-out router query run at a fixed `fanout`, mirroring the reader's
+/// centroid-graph path ([`Supertable::global_fine_fanout`]) so the calibration
+/// measures the SAME selection → per-cluster scan → shortlist → rerank the
+/// query serves — the scoring primitives are the reader's own
+/// (`search_clusters_scan_async`, [`select_global_shortlist`],
+/// `vector_rerank_selected`, [`top_k_ascending`]); only the op-stats folding and
+/// the cached-router lookup are dropped (calibration passes the freshly built
+/// graph in directly and does not meter). Returns the top-`k` hits with their
+/// stable ids attached, so the caller can score recall against exact ground
+/// truth in stable-id space — the same space production serves.
+#[allow(clippy::too_many_arguments)]
+async fn centroid_router_topk_for_calibration(
+    readers: &[Arc<SuperfileReader>],
+    superfiles: &[Arc<SuperfileEntry>],
+    router: &CentroidRouterGraph,
+    column: &str,
+    query: &[f32],
+    k: usize,
+    fanout: usize,
+    rerank_mult: usize,
+    graph_ef: usize,
+    coalesce: bool,
+    pool: &Arc<rayon::ThreadPool>,
+    budget: &Arc<crate::memory::ConnectionMemoryBudget>,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    // Phase 1: select the top-`fanout` global fine clusters via the graph, in
+    // the router's own metric space — identical to the reader's selection.
+    let by_sf: HashMap<usize, Vec<u32>> = {
+        let mut q = query.to_vec();
+        gfc_prepare_for_metric(router.metric, &mut q);
+        let fc = fanout.clamp(1, router.node_map.len().max(1));
+        let ef = if graph_ef > 0 {
+            graph_ef
+        } else {
+            fc.saturating_mul(2)
+        }
+        .max(fc);
+        let hits = router.graph.search(&router.scorer, &q, fc, ef);
+        let mut m: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (node, _) in hits {
+            if let Some(&(si, flat)) = router.node_map.get(node as usize) {
+                m.entry(si).or_default().push(flat);
+            }
+        }
+        m
+    };
+    if by_sf.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Phase 2: deferred per-cell scan on the selected clusters, concurrent
+    // across superfiles and bounded to the reader-pool width, exactly as the
+    // reader's fan-out runs it.
+    let scan_width = pool.current_num_threads().max(1);
+    let mut scan_futs = Vec::new();
+    for (si, flats) in by_sf {
+        let Some(vr) = readers[si].as_ref().vec() else {
+            continue;
+        };
+        let pool = Arc::clone(pool);
+        let budget = Arc::clone(budget);
+        scan_futs.push(async move {
+            let flats = if coalesce {
+                vr.coalesce_flats_to_cell_spans(&flats)
+            } else {
+                flats
+            };
+            let scan = vr
+                .search_clusters_scan_async(
+                    column,
+                    query,
+                    k,
+                    &flats,
+                    rerank_mult,
+                    rerank_mult,
+                    None,
+                    None,
+                    Some(pool),
+                    Some(budget),
+                )
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            Ok::<_, QueryError>((si, scan))
+        });
+    }
+    let scans: Vec<(usize, ScanOutcome)> = stream::iter(scan_futs)
+        .buffer_unordered(scan_width)
+        .try_collect()
+        .await?;
+    let mut per_superfile: Vec<Vec<SuperfileHit>> = Vec::new();
+    let mut pooled: Vec<(usize, ScanCandidate)> = Vec::new();
+    for (si, scan) in scans {
+        let entry = &superfiles[si];
+        let reader = readers[si].as_ref();
+        if !scan.hits.is_empty() {
+            let mut tagged = dispatch::tag_hits(entry, scan.hits);
+            dispatch::attach_stable_ids(reader, entry, &mut tagged, false, &None).await?;
+            per_superfile.push(tagged);
+        }
+        for c in scan.candidates {
+            pooled.push((si, c));
+        }
+    }
+    // Phase C: one global exact rerank of the pooled warm survivors.
+    if !pooled.is_empty() {
+        let shortlist_limit = k.saturating_mul(rerank_mult);
+        let winners = select_global_shortlist(pooled, shortlist_limit, 0);
+        let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+        for (si, c) in winners {
+            by_seg.entry(si).or_default().push(c);
+        }
+        for (si, selected) in by_seg {
+            let entry = &superfiles[si];
+            let reader = readers[si].as_ref();
+            let (hits, _rerank_ns) = reader
+                .vector_rerank_selected(column, query, k, selected, None)
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let mut tagged = dispatch::tag_hits(entry, hits);
+            dispatch::attach_stable_ids(reader, entry, &mut tagged, false, &None).await?;
+            per_superfile.push(tagged);
+        }
+    }
+    Ok(top_k_ascending(per_superfile, k))
+}
+
+/// Uniform additive jitter applied to a sampled corpus row when it becomes a
+/// held-out calibration query, so measured recall reflects true off-node search
+/// rather than a row's trivial self-hit (matching the HNSW calibrator's own
+/// perturbation fraction).
+const ROUTER_CALIB_QUERY_JITTER: f32 = 0.05;
+
+/// Headroom over `k` for the per-query ground-truth candidate heap. Boundary
+/// replicas of one neighbour share a stable id AND a distance, so the heap can
+/// briefly hold several copies of one top-k id; keeping `k × this` nearest
+/// candidates by distance guarantees the k DISTINCT nearest survive the
+/// per-superfile merge before the final stable-id dedup (the drain replica
+/// factor is well under this multiple).
+const GT_CAND_HEADROOM: usize = 4;
+
+/// Small, fast splitmix64 step for the calibration's reservoir + jitter draws —
+/// deterministic across processes so a re-settled identical membership samples
+/// the same queries and stamps the same fanout.
+fn router_calib_rand(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A ground-truth candidate in the bounded per-query heap: ordered by distance
+/// (smaller is nearer for every metric), so a max-heap [`BinaryHeap`] keeps its
+/// FARTHEST candidate on top and evicts it first when the heap is full. The
+/// stable-id leg only breaks ties deterministically. `total_cmp` gives a total
+/// order over the f32 distance (NaN-safe).
+#[derive(Clone, Copy)]
+struct GtCand {
+    dist: f32,
+    sid: i128,
+}
+impl PartialEq for GtCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for GtCand {}
+impl PartialOrd for GtCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for GtCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then(self.sid.cmp(&other.sid))
+    }
+}
+
+/// Push `cand` into a bounded max-heap that keeps the `cap` NEAREST candidates:
+/// grow until full, then replace the current farthest only when `cand` is nearer.
+fn gt_push(heap: &mut BinaryHeap<GtCand>, cand: GtCand, cap: usize) {
+    if heap.len() < cap {
+        heap.push(cand);
+    } else if let Some(top) = heap.peek()
+        && cand.dist < top.dist
+    {
+        heap.pop();
+        heap.push(cand);
+    }
+}
+
+/// Score one superfile's resident rows against every (metric-prepared) query,
+/// returning each query's `cap` nearest candidates from THIS superfile. Pure +
+/// self-contained so it runs on the reader pool (the scan is heavy CPU); the
+/// row plane is consumed here and dropped, so peak memory stays at ONE
+/// superfile's Sq16 rows — never the whole corpus. Rows are dequantized to fp32
+/// and prepared in the column metric's space (unit-normalized for `Cosine`, raw
+/// otherwise), matching how the query was prepared, so `distance` ranks them
+/// exactly as the reader's own scorer would.
+fn gt_score_rows(
+    rows: Vec<MaterializedIvfRow>,
+    ids: Vec<i128>,
+    queries_prepared: &[Vec<f32>],
+    metric: Metric,
+    dim: usize,
+    cap: usize,
+) -> Vec<Vec<GtCand>> {
+    let mut heaps: Vec<BinaryHeap<GtCand>> = (0..queries_prepared.len())
+        .map(|_| BinaryHeap::with_capacity(cap + 1))
+        .collect();
+    let stride = dim * 2;
+    let mut scratch = vec![0f32; dim];
+    for row in &rows {
+        if row.encoded.codes.len() != stride {
+            continue;
+        }
+        let Some(&sid) = ids.get(row.local_doc_id as usize) else {
+            continue;
+        };
+        dequantize_sq16_into(&row.encoded.codes, &mut scratch);
+        gfc_prepare_for_metric(metric, &mut scratch);
+        for (qi, q) in queries_prepared.iter().enumerate() {
+            let dist = distance(metric, q, &scratch);
+            gt_push(&mut heaps[qi], GtCand { dist, sid }, cap);
+        }
+    }
+    heaps.into_iter().map(BinaryHeap::into_vec).collect()
+}
+
+/// Collapse a per-query candidate heap to the top-`k` DISTINCT stable ids
+/// (best-scored copy per id), matching the served path's stable-id dedup
+/// ([`top_k_ascending`] collapses boundary replicas): a replicated neighbour
+/// must fill exactly ONE ground-truth slot, or it would evict a distinct
+/// neighbour and bias the measured recall (and the stamped fanout).
+fn gt_finalize(heap: BinaryHeap<GtCand>, k: usize) -> Vec<i128> {
+    let mut best: HashMap<i128, f32> = HashMap::new();
+    for c in heap.into_vec() {
+        best.entry(c.sid)
+            .and_modify(|d| {
+                if c.dist < *d {
+                    *d = c.dist;
+                }
+            })
+            .or_insert(c.dist);
+    }
+    let mut ranked: Vec<(f32, i128)> = best.into_iter().map(|(sid, d)| (d, sid)).collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    ranked.into_iter().take(k).map(|(_, sid)| sid).collect()
+}
+
+/// Reservoir-sample `nq` corpus rows (spread uniformly across every superfile)
+/// as held-out calibration queries, returning the RAW (dequantized + jittered)
+/// query vectors plus the total row count. Streaming + memory-bounded: peak is
+/// one superfile's rows plus the `nq`-row reservoir, never the whole corpus.
+/// Queries are kept RAW (un-normalized) — the reader's scan prepares the metric
+/// space itself, exactly as the served query path passes a raw vector in.
+async fn sample_router_calibration_queries(
+    manifest: &ManifestSnapshot,
+    entries: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    dim: usize,
+    nq: usize,
+    seed: u64,
+) -> Result<(Vec<Vec<f32>>, usize), QueryError> {
+    let stride = dim * 2;
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+    let mut reservoir: Vec<Vec<u8>> = Vec::with_capacity(nq);
+    let mut seen: usize = 0;
+    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+    for (entry, reader) in entries.iter().zip(readers.iter()) {
+        let Some(vr) = reader.vec() else { continue };
+        let Some(rows) = vr
+            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .await
+        else {
+            continue;
+        };
+        for row in rows {
+            if row.encoded.codes.len() != stride {
+                continue;
+            }
+            if reservoir.len() < nq {
+                reservoir.push(row.encoded.codes);
+            } else {
+                let j = (router_calib_rand(&mut rng) % (seen as u64 + 1)) as usize;
+                if j < nq {
+                    reservoir[j] = row.encoded.codes;
+                }
+            }
+            seen += 1;
+        }
+    }
+    let mut jrng = seed ^ 0xD1B5_4A32_D192_ED03;
+    let queries = reservoir
+        .iter()
+        .map(|code| {
+            let mut v = vec![0f32; dim];
+            dequantize_sq16_into(code, &mut v);
+            for x in &mut v {
+                // Uniform [0,1) → [-1,1) scaled by the jitter fraction.
+                let u = (router_calib_rand(&mut jrng) >> 40) as f32 / (1u64 << 24) as f32;
+                *x += (u * 2.0 - 1.0) * ROUTER_CALIB_QUERY_JITTER;
+            }
+            v
+        })
+        .collect();
+    Ok((queries, seen))
+}
+
+/// Exact top-`k` DISTINCT ground truth per query, in stable-id space (the space
+/// the reader's hits carry), computed by STREAMING the resident Sq16 planes
+/// superfile-by-superfile and scoring in the column metric — never allocating
+/// the whole `n × dim × 2` corpus plane (peak is one superfile's rows). Each
+/// superfile's scan runs on the reader pool; the bounded per-query heaps merge
+/// on the async task, then dedup to k distinct ids.
+async fn exact_topk_streaming(
+    manifest: &ManifestSnapshot,
+    entries: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    dim: usize,
+    metric: Metric,
+    queries_raw: &[Vec<f32>],
+    k: usize,
+    pool: &Arc<rayon::ThreadPool>,
+) -> Result<Vec<Vec<i128>>, QueryError> {
+    let nq = queries_raw.len();
+    let cap = k.saturating_mul(GT_CAND_HEADROOM).max(k).max(1);
+    // Prepare each query in the column metric's space (normalize only for
+    // Cosine), so the ground-truth scoring ranks exactly as the router does.
+    let queries_prepared: Arc<Vec<Vec<f32>>> = Arc::new(
+        queries_raw
+            .iter()
+            .map(|q| {
+                let mut v = q.clone();
+                gfc_prepare_for_metric(metric, &mut v);
+                v
+            })
+            .collect(),
+    );
+    let mut heaps: Vec<BinaryHeap<GtCand>> = (0..nq).map(|_| BinaryHeap::new()).collect();
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+    for (entry, reader) in entries.iter().zip(readers.iter()) {
+        let Some(vr) = reader.vec() else { continue };
+        let Some(rows) = vr
+            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .await
+        else {
+            continue;
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let ids = stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), &None).await?;
+        let qp = Arc::clone(&queries_prepared);
+        let contrib = run_on_pool(
+            Some(pool),
+            "router fanout calibrate: ground truth scan",
+            move || gt_score_rows(rows, ids, &qp, metric, dim, cap),
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        for (qi, cands) in contrib.into_iter().enumerate() {
+            for c in cands {
+                gt_push(&mut heaps[qi], c, cap);
+            }
+        }
+    }
+    Ok(heaps.into_iter().map(|h| gt_finalize(h, k)).collect())
+}
+
+/// Measure the centroid-graph router's per-`k` fanout by REAL recall at the
+/// post-commit build stage, returning the knee to stamp into
+/// [`CellRoutingParams::fanout_for_k`] (or `None` when the router is off, no
+/// column is eligible, the corpus is empty, or any step fails — the settle then
+/// carries the prior fanout forward). This is the measured-recall replacement
+/// for the old centroid-coverage proxy, which upper-bounded recall (ignoring
+/// the within-cluster Sq16 + shortlist + rerank loss) and so under-stamped the
+/// fanout, and whose `width × fine` cap wrongly treated "needs more clusters
+/// than the grid" as a loss.
+///
+/// Shape mirrors [`hnsw::calibrate_graph`]: build the structure once (the
+/// centroid-router graph over the resident fp32 fine centroids), sample
+/// held-out queries from the corpus, brute-force their exact top-`k` ground
+/// truth over the resident Sq16 plane, then sweep the fanout ASCENDING —
+/// running the reader's own selection → scan → shortlist → rerank at each rung
+/// — and stamp the smallest fanout clearing `target_recall − recall_slack`,
+/// else the sentinel (see
+/// [`crate::supertable::opann::fanout_knee_from_recalls`]).
+///
+/// The sweep runs on the reader pool and hits the freshly committed (resident)
+/// per-cluster codes, so it is heavier than the HNSW `ef` calibration; the
+/// centroid-graph router is opt-in, so this cost is only paid where it is on.
+/// The already-built `router` and opened `readers` are threaded in from the
+/// section-publish step (built once per settle), not rebuilt/reopened here.
+///
+/// Ground truth is computed by STREAMING the resident planes
+/// ([`exact_topk_streaming`]), so peak memory stays at one superfile's rows —
+/// this router targets 10M–100M corpora, where materializing the whole
+/// `n × dim × 2` plane would OOM.
+pub(crate) async fn calibrate_centroid_router_fanout(
+    manifest: &ManifestSnapshot,
+    entries: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    router: &CentroidRouterGraph,
+    column: &str,
+    dim: usize,
+    metric: Metric,
+) -> Option<[u32; WIDTH_LAW_KS.len()]> {
+    let vcfg = &config::global().vector;
+    let total_fine = router.node_map.len();
+    if entries.is_empty() || total_fine == 0 {
         return None;
     }
-    let metric = column_metric(&options.vector_columns, column)?;
-    let readers = open_readers_from_options(options, entries)
-        .await
-        .map_err(|error| tracing::warn!(%error, "centroid-router publish: reader open failed"))
-        .ok()?;
-    let router = build_centroid_router(entries, &readers, column, section, dim, metric)
-        .map_err(|error| tracing::warn!(%error, "centroid-router publish: build failed"))
-        .ok()?;
-    Some(encode_centroid_router_section(&router, entries, dim))
+    let pool = Arc::clone(&manifest.options.reader_pool);
+    // Held-out queries reservoir-sampled across the corpus (raw vectors), plus
+    // the total row count — both from one streaming pass, memory-bounded.
+    let (queries, n) = sample_router_calibration_queries(
+        manifest,
+        entries,
+        readers,
+        column,
+        dim,
+        ROUTER_FANOUT_CALIB_QUERIES,
+        ROUTER_FANOUT_CALIB_SEED,
+    )
+    .await
+    .map_err(|error| tracing::warn!(%error, "router fanout calibrate: query sample failed"))
+    .ok()?;
+    if queries.is_empty() || n == 0 {
+        return None;
+    }
+    // The deepest anchor the corpus can support; anchors above it stay 0
+    // (unsupported → sentinel), like the width/fine laws' unsupported points.
+    let calib_k = WIDTH_LAW_KS
+        .iter()
+        .copied()
+        .filter(|&k| k <= n)
+        .max()
+        .unwrap_or(0);
+    if calib_k == 0 {
+        return None;
+    }
+    // Exact top-`calib_k` DISTINCT ids per query, in stable-id space; each
+    // anchor scores against its own top-`k` prefix (a deeper `gt` than `k` is
+    // fine — only the prefix is compared), like the HNSW calibrator's reuse of
+    // one gt list. Deduped by stable id so replicas match the served dedup.
+    let gt = exact_topk_streaming(
+        manifest, entries, readers, column, dim, metric, &queries, calib_k, &pool,
+    )
+    .await
+    .map_err(|error| tracing::warn!(%error, "router fanout calibrate: ground truth failed"))
+    .ok()?;
+
+    // Seed the ladder around the grid's `width × fine` prior (a start, not a
+    // cap): read the routing width/fine laws stamped by the drain.
+    let routing = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell { routing, .. } => routing,
+        _ => CellRoutingParams::default(),
+    };
+    let prior = crate::supertable::opann::fanout_prior_for_k(
+        &routing.width_for_k,
+        &routing.fine_for_k,
+        total_fine.min(u32::MAX as usize) as u32,
+    );
+    let prior_max = prior.iter().copied().max().unwrap_or(0) as usize;
+    let ladder_fanouts = router_fanout_ladder(prior_max, total_fine);
+
+    let rerank_mult = vcfg.global_fine_rerank_mult;
+    let graph_ef = vcfg.global_fine_graph_ef;
+    let coalesce = vcfg.global_fine_coalesce;
+    let budget = Arc::clone(&manifest.options.connection_memory_budget);
+
+    // Ascending sweep: measure recall@anchor at each rung, stopping once every
+    // supported anchor has cleared the graceful floor (the smallest clearing
+    // fanout — the knee — is already recorded for each). Recall is
+    // near-monotone in fanout (reading more clusters never loses a covered
+    // neighbour), so an anchor that has not cleared by the full-fanout rung
+    // (the last, `total_fine`) never will → the policy stamps its sentinel.
+    // A single probe that fails on a transient read is SKIPPED (its query drops
+    // from that rung's average), never aborting the whole calibration — one
+    // flaky Blob read must not discard every completed rung.
+    let floor = (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0);
+    let mut ladder: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = Vec::new();
+    for &fanout in &ladder_fanouts {
+        let mut sum_recall = [0f64; WIDTH_LAW_KS.len()];
+        let mut counted = [0usize; WIDTH_LAW_KS.len()];
+        let mut probes_ok = 0usize;
+        for (qi, q) in queries.iter().enumerate() {
+            let hits = match centroid_router_topk_for_calibration(
+                readers,
+                entries,
+                router,
+                column,
+                q,
+                calib_k,
+                fanout,
+                rerank_mult,
+                graph_ef,
+                coalesce,
+                &pool,
+                &budget,
+            )
+            .await
+            {
+                Ok(hits) => hits,
+                Err(error) => {
+                    tracing::warn!(%error, fanout, qi, "router fanout calibrate: probe skipped");
+                    continue;
+                }
+            };
+            probes_ok += 1;
+            let got: Vec<i128> = hits.iter().filter_map(|h| h.stable_id).collect();
+            for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
+                if k > calib_k {
+                    continue;
+                }
+                let truth = &gt[qi][..k.min(gt[qi].len())];
+                if truth.is_empty() {
+                    continue;
+                }
+                let got_k: HashSet<i128> = got.iter().copied().take(k).collect();
+                let hit = truth.iter().filter(|t| got_k.contains(t)).count();
+                sum_recall[ki] += hit as f64 / truth.len() as f64;
+                counted[ki] += 1;
+            }
+        }
+        // Whole rung failed transiently — skip it, keep the completed rungs.
+        if probes_ok == 0 {
+            continue;
+        }
+        let mut recall_by_k = [0f64; WIDTH_LAW_KS.len()];
+        for ki in 0..WIDTH_LAW_KS.len() {
+            if counted[ki] > 0 {
+                recall_by_k[ki] = sum_recall[ki] / counted[ki] as f64;
+            }
+        }
+        ladder.push((fanout as u32, recall_by_k));
+        // Every supported anchor (with observations) cleared? Knee is fixed.
+        let all_cleared = WIDTH_LAW_KS
+            .iter()
+            .enumerate()
+            .filter(|&(ki, &k)| k <= calib_k && counted[ki] > 0)
+            .all(|(ki, _)| recall_by_k[ki] >= floor);
+        if all_cleared {
+            break;
+        }
+    }
+    // Nothing measured (every rung failed transiently) → carry the prior fanout
+    // forward rather than stamping a spurious all-zero sentinel.
+    if ladder.is_empty() {
+        return None;
+    }
+    let knee = crate::supertable::opann::fanout_knee_from_recalls(
+        &ladder,
+        vcfg.target_recall,
+        vcfg.hnsw_recall_slack,
+    );
+    tracing::info!(
+        column,
+        n,
+        total_fine,
+        calib_k,
+        target = vcfg.target_recall,
+        prior = ?prior,
+        rungs = ?ladder.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+        knee = ?knee,
+        "router fanout calibrate: measured-recall knee stamped"
+    );
+    Some(knee)
 }
 
 /// Open a [`SuperfileReader`] per entry through a table's store + caches,
@@ -6240,6 +6875,22 @@ mod tests {
             auto_router_choice(Some(100), 0, 12_000_000, RATIO, FLOOR),
             IvfRouter::Stamped,
         );
+        // Sentinel fanout: a table where the measured-recall calibrator could
+        // not clear the target stamps `fanout_for_k = 0`, which resolves to
+        // `fanout_for_k_at` == `None` == `stamped_fanout` of `None` here — no
+        // concentration signal, so `auto` picks stamped even at scale. This is
+        // the "GFC can't hit target → serve stamped" contract.
+        assert_eq!(
+            auto_router_choice(None, 4000, 12_000_000, RATIO, FLOOR),
+            IvfRouter::Stamped,
+            "a sentinel fanout (fanout_for_k_at → None) must route to stamped",
+        );
+        // A concentrated positive fanout at the same scale DOES pick the graph —
+        // proving the sentinel above is what flips the decision, not the scale.
+        assert_eq!(
+            auto_router_choice(Some(200), 4000, 12_000_000, RATIO, FLOOR),
+            IvfRouter::CentroidGraph,
+        );
 
         // Explicit modes ignore the gate entirely — the closure never runs.
         assert_eq!(
@@ -7712,8 +8363,10 @@ mod tests {
     /// configured metric, not always cosine.
     #[test]
     fn centroid_router_selects_metric_nearest_centroids() {
-        use crate::superfile::vector::distance::distance;
-        use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+        use crate::superfile::vector::{
+            distance::distance,
+            hnsw::{Fp32Scorer, Hnsw, HnswParams},
+        };
 
         let dim = 8usize;
         // Well-separated centroids with varied magnitudes and directions, so the
@@ -7826,7 +8479,7 @@ mod tests {
             for metric in [Metric::Cosine, Metric::NegDot, Metric::L2Sq] {
                 let built =
                     build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim, metric)
-                        .unwrap();
+                        .expect("build_centroid_router");
                 assert!(!built.node_map.is_empty(), "fixture must produce a router");
 
                 // Real storage round trip: serialize -> PUT -> fetch+mmap -> decode.
@@ -7918,7 +8571,7 @@ mod tests {
                 dim,
                 Metric::Cosine,
             )
-            .unwrap();
+            .expect("build_centroid_router");
             let bytes = encode_centroid_router_section(&built, &entries, dim);
 
             // Decode against the REVERSED superfile + reader arrays (lockstep),

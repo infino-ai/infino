@@ -4636,27 +4636,19 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 &mut routing.rerank_for_k,
                 &routing.rerank_pool_cells,
             );
-            // Stamp the CALIBRATED centroid-graph router fanout — the third
-            // stage's measured knee, capped at the `width × fine` prior (a `0`
-            // means uncalibrated OR "GFC loses"). OVERWRITTEN, not max-merged,
-            // and only on a FULL observation: a global fanout is meaningful only
-            // when the whole centroid set was seen, so an incremental/partial
-            // pass leaves the prior stamp untouched (never latches an
-            // under-measured value), while a full recalibration replaces it in
-            // either direction — clearing a stale win or a stale loss.
-            if laws.fanout_complete {
-                routing.fanout_for_k = laws.fanout_for_k;
-            }
+            // The centroid-graph router fanout is NOT stamped here. It is
+            // measured by real recall at the router's post-commit build stage
+            // (the settle's `refresh_slow_vector_state`), where the graph and
+            // the resident per-cluster codes both exist, and carried forward on
+            // this membership commit untouched.
             info!(
-                "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}; fanout measured {:?} stamped {:?}",
+                "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
                 laws.width_for_k,
                 routing.width_for_k,
                 laws.fine_for_k,
                 routing.fine_for_k,
                 laws.rerank_for_k,
                 routing.rerank_for_k,
-                laws.fanout_for_k,
-                routing.fanout_for_k
             );
         }
         let mut list_metadata = CommitListMetadata {
@@ -7991,13 +7983,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
             *slot = (*slot).max(measured);
         }
-        // Centroid-graph fanout: OVERWRITE on a full observation only (a global
-        // fanout can't be measured from a partial cell set), so a full
-        // recalibration clears a stale win or loss in either direction and a
-        // partial pass carries the prior forward. Never max-merged.
-        if laws.fanout_complete {
-            routing.fanout_for_k = laws.fanout_for_k;
-        }
+        // The centroid-graph router fanout is NOT stamped here — it is measured
+        // by real recall at the router's post-commit build stage (the settle's
+        // `refresh_slow_vector_state`) and carried forward here untouched.
         // Same per-knot merge + provenance as the drain stamp.
         opann::merge_rerank_with_pools(
             &mut routing.rerank_for_k,
@@ -8152,55 +8140,79 @@ pub(in crate::supertable) async fn refresh_slow_vector_state(
     stamp_slow_vector_state(inner, None).await
 }
 
-/// Build + PUT the centroid-router section for the settled generation and
-/// return its ref, or `None` when the `centroid_graph` router is off, no
-/// column is eligible, or any step fails. Best-effort: the settle stamps
-/// whatever this returns, and an absent ref just means queries reconstruct the
-/// router in memory. The router graph indexes the fp32 fine centroids, so it is
-/// built from the freshly published centroid section (fetched here) — no
-/// centroid duplication in the section itself.
+/// Build + PUT the centroid-router section for the settled generation AND
+/// measure the router's per-`k` fanout by real recall, returning
+/// `(section ref, fanout law)`. Either is `None` when the `centroid_graph`
+/// router is off, no column is eligible, or that step fails. Best-effort: the
+/// settle stamps whatever this returns — an absent section ref just means
+/// queries reconstruct the router in memory, and an absent fanout leaves the
+/// prior `CellRoutingParams::fanout_for_k` carried forward. The router graph
+/// indexes the fp32 fine centroids, so it is built from the freshly published
+/// centroid section (fetched here) — no centroid duplication in the section
+/// itself — and the same fetched section feeds the fanout measurement.
 async fn build_and_publish_centroid_router_section(
     inner: &SupertableInner,
     storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     centroids_ref: &crate::supertable::manifest::list::RoutingRef,
-) -> Option<crate::supertable::manifest::list::RoutingRef> {
+) -> (
+    Option<crate::supertable::manifest::list::RoutingRef>,
+    Option<[u32; crate::supertable::manifest::list::WIDTH_LAW_KS.len()]>,
+) {
     // Cheap gate first (resolving the column once, reused below), so a
     // router-off table never fetches the centroid section.
     let vcfg = &crate::config::global().vector;
-    let column = crate::supertable::query::vector::select_eager_router_column(
+    let Some(column) = crate::supertable::query::vector::select_eager_router_column(
         vcfg.search_mode,
         vcfg.ivf_router,
         vcfg.global_fine_fanout,
         &inner.options.vector_columns,
-    )?;
-    let dim = inner
+    ) else {
+        return (None, None);
+    };
+    let Some(dim) = inner
         .options
         .vector_columns
         .iter()
         .find(|vc| vc.column == column)
-        .map(|vc| vc.dim)?;
-    let section = fetch_centroid_section(storage, centroids_ref, entries)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "centroid-router publish: centroid section fetch failed")
-        })
-        .ok()?;
-    let bytes = crate::supertable::query::vector::compose_centroid_router_section(
-        &inner.options,
-        entries,
-        &section,
-        &column,
-        dim,
-    )
-    .await?;
-    slow_vector_state::write_graph_section(storage, bytes)
-        .await
-        .inspect(|reference| {
-            tracing::debug!(uri = %reference.uri, "centroid-router: published section");
-        })
-        .map_err(|error| tracing::warn!(%error, "centroid-router publish: section write failed"))
-        .ok()
+        .map(|vc| vc.dim)
+    else {
+        return (None, None);
+    };
+    let section = match fetch_centroid_section(storage, centroids_ref, entries).await {
+        Ok(section) => section,
+        Err(error) => {
+            tracing::warn!(%error, "centroid-router publish: centroid section fetch failed");
+            return (None, None);
+        }
+    };
+    // Build the router graph + open readers ONCE, shared across the section
+    // encode and the fanout recall calibration (measured against the same
+    // graph). Best-effort: a `None` fanout just carries the prior forward.
+    let (bytes, fanout) =
+        crate::supertable::query::vector::compose_centroid_router_section_and_fanout(
+            &inner.options,
+            manifest,
+            entries,
+            &section,
+            &column,
+            dim,
+        )
+        .await;
+    let section_ref = match bytes {
+        Some(bytes) => slow_vector_state::write_graph_section(storage, bytes)
+            .await
+            .inspect(|reference| {
+                tracing::debug!(uri = %reference.uri, "centroid-router: published section");
+            })
+            .map_err(
+                |error| tracing::warn!(%error, "centroid-router publish: section write failed"),
+            )
+            .ok(),
+        None => None,
+    };
+    (section_ref, fanout)
 }
 
 /// The PREVIOUS generation's centroid section for `manifest`, through the
@@ -8449,15 +8461,20 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     };
     let max_retries = inner.options.max_commit_retries.max(1);
     let mut next_id_floor: u64 = 0;
-    // Cache the built centroid-router ref across CAS retries, keyed by the
-    // published centroid-section URI (a content hash over this membership +
-    // centroids). Reuse it while that key is unchanged; if a retry reloads a
-    // manifest whose membership moved, the key differs and the section is
-    // rebuilt for the new membership. The inner `Option` is the resolved ref
-    // (absent when the router is off or the build failed).
+    // Cache the built centroid-router ref AND the measured router fanout across
+    // CAS retries, keyed by the published centroid-section URI (a content hash
+    // over this membership + centroids). Reuse it while that key is unchanged;
+    // if a retry reloads a manifest whose membership moved, the key differs and
+    // the section is rebuilt (and the fanout re-measured) for the new
+    // membership. Caching the fanout matters: its measurement is a full
+    // recall sweep over the resident codes — far too costly to repeat per CAS
+    // retry. Both inner `Option`s are absent when the router is off or a step
+    // failed.
+    #[allow(clippy::type_complexity)]
     let mut centroid_graph_ref: Option<(
         String,
         Option<crate::supertable::manifest::list::RoutingRef>,
+        Option<[u32; crate::supertable::manifest::list::WIDTH_LAW_KS.len()]>,
     )> = None;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
@@ -8519,23 +8536,30 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         // covered THIS membership — reuse it; absent means build it now. Gated
         // on the router being enabled and best-effort: a `None` just leaves the
         // ref unstamped and queries reconstruct the router in memory.
-        let centroid_graph = match &centroid_graph_ref {
-            Some((key, resolved)) if *key == published.centroids.uri => resolved.clone(),
+        let (centroid_graph, measured_fanout) = match &centroid_graph_ref {
+            Some((key, resolved, fanout)) if *key == published.centroids.uri => {
+                (resolved.clone(), *fanout)
+            }
             _ => {
-                let resolved = match old.slow_vector_state_centroid_graph_blob() {
-                    Some(existing) => Some(existing.clone()),
+                let (resolved, fanout) = match old.slow_vector_state_centroid_graph_blob() {
+                    // A present ref means a prior no-op settle already built the
+                    // router (and stamped its fanout) for THIS membership —
+                    // reuse it, re-measure nothing.
+                    Some(existing) => (Some(existing.clone()), None),
                     None => {
                         build_and_publish_centroid_router_section(
                             inner,
                             storage.as_ref(),
+                            &old,
                             entries,
                             &published.centroids,
                         )
                         .await
                     }
                 };
-                centroid_graph_ref = Some((published.centroids.uri.clone(), resolved.clone()));
-                resolved
+                centroid_graph_ref =
+                    Some((published.centroids.uri.clone(), resolved.clone(), fanout));
+                (resolved, fanout)
             }
         };
         // No-op only when NOTHING changed — routing blob, centroid section, the
@@ -8556,6 +8580,30 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             graphs_ref,
             centroid_graph,
         );
+        // Stamp the measured-recall router fanout into this same settle commit,
+        // beside the centroid-router section it was measured against. Only a
+        // fresh section build produces `Some` (a reused ref carried its fanout
+        // forward), so this rewrites `CellRoutingParams::fanout_for_k` exactly
+        // when the router was (re)built for this membership — the sanctioned
+        // second manifest update for a value only measurable post-commit.
+        let new_manifest = match measured_fanout {
+            Some(fanout) => match new_manifest.get_partition_strategy() {
+                PartitionStrategy::VectorCell {
+                    column,
+                    clusters,
+                    mut routing,
+                } => {
+                    routing.fanout_for_k = fanout;
+                    new_manifest.with_partition_strategy(PartitionStrategy::VectorCell {
+                        column,
+                        clusters,
+                        routing,
+                    })
+                }
+                _ => new_manifest,
+            },
+            None => new_manifest,
+        };
         let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await

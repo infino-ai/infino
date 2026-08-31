@@ -28,7 +28,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
@@ -774,16 +774,19 @@ pub(crate) fn rerank_pool_hint(width_for_k: &[u32; WIDTH_LAW_KS.len()], n_cent: 
         .min(n_cent.max(1))
 }
 
-/// First-order centroid-graph router fanout prior, per `k`. The stamped grid
-/// path reads `width_for_k` cells at `fine_for_k` fine runs each to cover the
-/// exact top-k, so `width × fine` fine clusters is the natural starting point
-/// for how many the global centroid-graph selection should read; it is stamped
-/// as the router's per-table fanout in place of the scale-blind
-/// `vector.global_fine_fanout` constant. Clamped to `total_fine_clusters`
-/// (selecting more clusters than exist is a full scan — the exact failure at
-/// ~1M where the constant already exceeds the table's cluster count). A `k`
-/// with an uncalibrated width or fine point (`0`), or a table with no fine
-/// clusters, stays `0` so the reader falls back to the constant there.
+/// First-order centroid-graph router fanout prior, per `k` — a STARTING point
+/// for the measured-recall sweep, NOT a cap. The stamped grid path reads
+/// `width_for_k` cells at `fine_for_k` fine runs each to cover the exact top-k,
+/// so `width × fine` fine clusters is a natural anchor for how many the global
+/// centroid-graph selection reads. The recall calibrator seeds its ascending
+/// ladder around this value and is free to climb well PAST it (reading more
+/// fine clusters than the grid's `W × F` is still cheaper than the grid's
+/// whole-cell reads, so exceeding the prior is not a loss — the old cap that
+/// treated it as one under-stamped the fanout). Clamped to
+/// `total_fine_clusters` (selecting more clusters than exist is a full scan). A
+/// `k` with an uncalibrated width or fine point (`0`), or a table with no fine
+/// clusters, yields `0`, and the sweep falls back to a scale-derived ladder
+/// there.
 pub(crate) fn fanout_prior_for_k(
     width_for_k: &[u32; WIDTH_LAW_KS.len()],
     fine_for_k: &[u32; WIDTH_LAW_KS.len()],
@@ -806,18 +809,61 @@ pub(crate) fn fanout_prior_for_k(
     out
 }
 
-/// Apply the `width × fine` cap to a measured fanout crossing (the `rank`
-/// position where a query's top-k coverage first meets the target): the fanout
-/// `rank + 1` when it is within the `cap`, else `0` — the "GFC loses" sentinel.
-/// A crossing beyond the prior means the centroid-graph selection needs more
-/// clusters than the grid's `W × F` to hit the same recall, so it cannot beat
-/// the grid here; `0` makes the reader fall back to the constant and the `auto`
-/// gate to `stamped`. `None` (no crossing within the cap) is also a loss.
-fn cap_fanout(crossing: Option<usize>, cap: u32) -> u32 {
-    match crossing {
-        Some(rank) if cap > 0 && (rank as u64) < u64::from(cap) => rank as u32 + 1,
-        _ => 0,
+/// Pick the per-`k` router fanout from a MEASURED-recall ladder — the third
+/// calibration stage's core policy, mirroring the HNSW `ef` calibrator's knee
+/// rule (`hnsw::calibrate_ef_curve`). `ladder` is a set of `(fanout, recall@k
+/// per [`WIDTH_LAW_KS`] anchor)` observations, each `recall_by_k[ki]` the real
+/// measured recall@`WIDTH_LAW_KS[ki]` of the router reading that many global
+/// fine clusters (the actual selection → scan → shortlist → rerank the reader
+/// serves, so within-path loss is captured — unlike the old centroid-coverage
+/// proxy). For each `k` this stamps the SMALLEST fanout whose measured recall
+/// clears `target_recall − recall_slack`. When no observed fanout clears it —
+/// the recall PLATEAUS below target even at the widest (full-fanout) rung — the
+/// point stays `0`, the "GFC can't reach target here" sentinel, which resolves
+/// to `None` in [`CellRoutingParams::fanout_for_k_at`] so the reader falls back
+/// to the constant and `auto` picks stamped. The result is floored monotone in
+/// `k` (a larger `k` never asks for a narrower fanout than a smaller one —
+/// measurement noise near the target can otherwise invert two adjacent
+/// anchors). The ladder is expected ASCENDING in fanout; it is sorted defensively.
+///
+/// [`CellRoutingParams::fanout_for_k_at`]: crate::supertable::manifest::list::CellRoutingParams::fanout_for_k_at
+pub(crate) fn fanout_knee_from_recalls(
+    ladder: &[(u32, [f64; WIDTH_LAW_KS.len()])],
+    target_recall: f64,
+    recall_slack: f64,
+) -> [u32; WIDTH_LAW_KS.len()] {
+    let floor = (target_recall - recall_slack).max(0.0);
+    let mut rungs: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder.to_vec();
+    rungs.sort_by_key(|(f, _)| *f);
+    let mut out = [0u32; WIDTH_LAW_KS.len()];
+    for (ki, slot) in out.iter_mut().enumerate() {
+        // An anchor with no positive measured recall at ANY rung is
+        // corpus-unsupported (k > the calibrated corpus, or every probe missed)
+        // — it must stay the sentinel `0`, never take a spurious fanout. This
+        // also guards the degenerate `floor <= 0` config (target ≤ slack) below,
+        // where every rung would otherwise "clear" a 0-recall anchor.
+        let best = rungs
+            .iter()
+            .map(|(_, recall_by_k)| recall_by_k[ki])
+            .fold(f64::MIN, f64::max);
+        if best <= 0.0 {
+            *slot = 0;
+            continue;
+        }
+        // Smallest fanout whose measured recall@k clears the graceful floor.
+        // A finite floor of 0 (target ≤ slack) is cleared by the first rung.
+        if floor <= 0.0 {
+            *slot = rungs.first().map(|(f, _)| *f).unwrap_or(0);
+            continue;
+        }
+        *slot = rungs
+            .iter()
+            .find(|(_, recall_by_k)| recall_by_k[ki] >= floor)
+            .map(|(f, _)| *f)
+            .unwrap_or(0);
     }
+    floor_monotone(&mut out);
+    out
 }
 
 /// Rerank-law estimate histogram resolution: per-query counts of pool-row
@@ -912,31 +958,6 @@ pub(crate) struct WidthLawCalibration {
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
-    /// Fanout-stage state: the GLOBAL fine-centroid set (union across cells)
-    /// plus each GT candidate row's global cluster index — the inputs to the
-    /// third calibration stage, which measures how many nearest global fine
-    /// centroids a query must select to cover its exact top-k (the global
-    /// analogue of the per-cell fine-depth stage). Filled in the same
-    /// [`Self::observe_shard_views`] pass that measures the fine ranks.
-    global_fanout: Mutex<GlobalFanoutState>,
-}
-
-/// Accumulated inputs for the global fanout stage (see
-/// [`WidthLawCalibration::global_fanout`]).
-#[derive(Default)]
-struct GlobalFanoutState {
-    /// Row-major fp32-le fine centroids, one contiguous block per observed
-    /// cell (the union is what `ivf_router = centroid_graph` scores at query
-    /// time). Global cluster index = block offset + within-cell cluster.
-    centroid_bytes: Vec<u8>,
-    /// GT candidate row `(stable id, surviving cell)` -> its global cluster
-    /// index into `centroid_bytes`.
-    row_cluster: HashMap<(i128, u32), u32>,
-    /// Grid cells whose fine centroids were unioned in. Used to tell a FULL
-    /// observation (every non-empty cell packed this pass) from an incremental
-    /// one (only the new tail): a partial global set can't measure a global
-    /// fanout, so only a full observation stamps or clears it.
-    observed_cells: HashSet<u32>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -989,35 +1010,6 @@ pub(crate) struct CalibratedLaws {
     /// against — the stamp records it so a later, wider law knows
     /// whether the budget's evidence still covers it.
     pub(crate) pool_cells: u32,
-    /// Centroid-graph router fanout: the smallest number of nearest GLOBAL
-    /// fine centroids that covers the exact top-k at the target, capped at the
-    /// `width × fine` prior. `0` = "no fanout at this k" — EITHER uncalibrated
-    /// OR "GFC loses" (the crossing needs more than the prior). The two are
-    /// read-identical (both make the reader fall back to the constant and
-    /// `auto` pick stamped); they differ only in the stamp merge, disambiguated
-    /// by [`Self::fanout_complete`], not by the value.
-    pub(crate) fanout_for_k: [u32; WIDTH_LAW_KS.len()],
-    /// Whether this calibration observed the FULL global fine-centroid set
-    /// (every non-empty grid cell packed this pass). Only a full observation
-    /// can measure a GLOBAL fanout, so the stamp OVERWRITES `fanout_for_k`
-    /// (clearing a stale win or a stale loss in either direction) only when
-    /// this is `true`; an incremental/partial pass (`false`) leaves the prior
-    /// fanout untouched rather than latching an under-measured value.
-    pub(crate) fanout_complete: bool,
-}
-
-/// Unit-normalize in place — the transform `ivf_router = centroid_graph`
-/// applies to fine centroids and the query for `Cosine` before scoring (fine
-/// centroids are means of unit vectors, not themselves unit). The fanout stage
-/// applies the SAME transform so it ranks centroids exactly as the reader does.
-fn unit_normalize(v: &mut [f32]) {
-    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if n > 0.0 {
-        let inv = 1.0 / n;
-        for x in v.iter_mut() {
-            *x *= inv;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1075,21 +1067,96 @@ mod pool_hint_tests {
         );
     }
 
-    /// The `width × fine` cap: a crossing within the cap stamps `rank + 1`; a
-    /// crossing at or beyond the cap (GFC needs more than the grid), no
-    /// crossing, or a zero cap all stamp `0` — the "GFC loses" sentinel.
+    /// The measured-recall knee: for each `k`, the SMALLEST ladder fanout whose
+    /// real recall@k clears `target − slack`; `0` when nothing clears (plateau
+    /// below target); floored monotone in `k`.
     #[test]
-    fn cap_fanout_stamps_within_cap_else_sentinel() {
-        // rank 0 covered, cap 4 → fanout 1.
-        assert_eq!(cap_fanout(Some(0), 4), 1);
-        // rank 3 covered, cap 4 → fanout 4 (== cap, still within).
-        assert_eq!(cap_fanout(Some(3), 4), 4);
-        // rank 4 covered, cap 4 → fanout 5 > cap → GFC loses.
-        assert_eq!(cap_fanout(Some(4), 4), 0);
-        // No crossing at all → GFC loses.
-        assert_eq!(cap_fanout(None, 8), 0);
-        // Zero cap (uncalibrated width/fine) → 0.
-        assert_eq!(cap_fanout(Some(0), 0), 0);
+    fn fanout_knee_picks_smallest_clearing_rung() {
+        // Recall climbs with fanout; target 0.99, slack 0.01 → floor 0.98.
+        // The knee is the first rung at/above 0.98 for each anchor.
+        let ladder = [
+            (16u32, [0.90, 0.85, 0.70, 0.50]),
+            (64, [0.99, 0.95, 0.88, 0.75]),
+            (256, [0.995, 0.985, 0.95, 0.90]),
+            (1024, [0.999, 0.995, 0.985, 0.97]),
+        ];
+        // k=1 clears at 64 (0.99≥0.98); k=10 at 256 (0.985); k=100 at 1024
+        // (0.985); k=1000 never clears (max 0.97 < 0.98) → sentinel 0. The
+        // monotone floor then lifts nothing (0 stays 0; the sequence is
+        // already non-decreasing 64,256,1024).
+        assert_eq!(
+            fanout_knee_from_recalls(&ladder, 0.99, 0.01),
+            [64, 256, 1024, 0]
+        );
+    }
+
+    /// A ladder whose recall plateaus below the floor at every anchor — even at
+    /// the widest (full-fanout) rung — stamps the all-zero sentinel: GFC cannot
+    /// reach the target here, so the reader falls back to the constant and
+    /// `auto` picks stamped.
+    #[test]
+    fn fanout_knee_plateau_below_target_is_sentinel() {
+        let ladder = [
+            (32u32, [0.80, 0.70, 0.60, 0.40]),
+            (128, [0.90, 0.85, 0.75, 0.55]),
+            // Widest rung still short of floor 0.98 at every anchor.
+            (512, [0.94, 0.92, 0.88, 0.70]),
+        ];
+        assert_eq!(fanout_knee_from_recalls(&ladder, 0.99, 0.01), [0, 0, 0, 0]);
+    }
+
+    /// The stamped knee may EXCEED the old `width × fine` prior — reading more
+    /// fine clusters than the grid's `W × F` is still cheaper than the grid's
+    /// whole-cell reads, so the sweep is free to climb past the prior. Here the
+    /// W×F prior for k=10 would have been 32, but real recall only clears at
+    /// fanout 512.
+    #[test]
+    fn fanout_knee_may_exceed_width_times_fine_prior() {
+        let prior = fanout_prior_for_k(&[1, 8, 30, 40], &[1, 4, 8, 8], 4000);
+        assert_eq!(prior[1], 32, "the old W×F cap for k=10");
+        let ladder = [
+            (32u32, [0.99, 0.90, 0.80, 0.70]),
+            (512, [0.999, 0.99, 0.95, 0.90]),
+        ];
+        let knee = fanout_knee_from_recalls(&ladder, 0.99, 0.01);
+        assert_eq!(knee[1], 512, "measured recall pushes k=10 well past W×F=32");
+        assert!(
+            knee[1] > prior[1],
+            "the calibrated fanout is allowed to exceed the old cap"
+        );
+    }
+
+    /// Measurement noise can invert two adjacent anchors' knees; the monotone
+    /// floor lifts a later `k` to at least the earlier one so a larger `k`
+    /// never asks for a narrower fanout.
+    #[test]
+    fn fanout_knee_is_floored_monotone_in_k() {
+        // k=10 clears only at 256 while k=100 (noisily) clears at 64 — inverted.
+        let ladder = [
+            (64u32, [0.99, 0.97, 0.99, 0.60]),
+            (256, [0.999, 0.99, 0.995, 0.75]),
+        ];
+        let knee = fanout_knee_from_recalls(&ladder, 0.99, 0.01);
+        // k=1→64, k=10→256, k=100 measured 64 but floored up to 256, k=1000→0.
+        assert_eq!(knee, [64, 256, 256, 0]);
+    }
+
+    /// An anchor the corpus can't support (recall stays 0 at every rung) must
+    /// stay the sentinel `0`, even under a degenerate `target ≤ slack` config
+    /// where the floor collapses to 0 — a 0-recall anchor must never be handed
+    /// the first rung's fanout, or the reader would route a `k` GFC cannot serve.
+    #[test]
+    fn fanout_knee_unsupported_anchor_stays_sentinel_at_zero_floor() {
+        // k=1 and k=10 are measured; k=100 and k=1000 were never observed (0).
+        let ladder = [
+            (16u32, [0.90, 0.80, 0.0, 0.0]),
+            (64, [0.999, 0.99, 0.0, 0.0]),
+        ];
+        // Degenerate floor: target 0.5, slack 0.6 → floor clamps to 0.
+        let knee = fanout_knee_from_recalls(&ladder, 0.5, 0.6);
+        // Supported anchors clear at the first rung (floor 0); unsupported ones
+        // (all-zero recall) stay 0 despite the collapsed floor.
+        assert_eq!(knee, [16, 16, 0, 0]);
     }
 }
 
@@ -1193,7 +1260,6 @@ impl WidthLawCalibration {
             pool_cells: RERANK_LAW_POOL_CELLS,
             target_recall,
             rerank: None,
-            global_fanout: Mutex::new(GlobalFanoutState::default()),
         }
     }
 
@@ -1486,39 +1552,6 @@ impl WidthLawCalibration {
             }
             map
         };
-        // Fanout stage: union EVERY cell's fine centroids into the global set
-        // (a query's true neighbors can sit in any cell, and the centroid-graph
-        // router scores against all of them), and record each GT candidate
-        // row's global cluster. One lock for the whole shard.
-        {
-            let stride = self.dim * 4;
-            let mut g = self
-                .global_fanout
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for view in views {
-                let Some(cell_id) = view.cell_id else {
-                    continue;
-                };
-                if view.n_fine == 0
-                    || view.dim != self.dim
-                    || view.fine_centroids_bytes.len() != view.n_fine * stride
-                {
-                    continue;
-                }
-                let offset = (g.centroid_bytes.len() / stride) as u32;
-                g.centroid_bytes
-                    .extend_from_slice(&view.fine_centroids_bytes);
-                g.observed_cells.insert(cell_id);
-                if let Some(cands) = per_cell.get(&cell_id) {
-                    for &(_, id) in cands {
-                        if let Some(&local) = view.cluster_of_stable.get(&id) {
-                            g.row_cluster.insert((id, cell_id), offset + local);
-                        }
-                    }
-                }
-            }
-        }
         for view in views {
             let Some(cell_id) = view.cell_id else {
                 continue;
@@ -1765,119 +1798,20 @@ impl WidthLawCalibration {
         floor_monotone(&mut law);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
-        // Fanout stage (the third law): the GLOBAL analogue of the fine-depth
-        // walk. Rank each query against the union of every cell's fine
-        // centroids and count its top-k rows at their global cluster's
-        // nearest-centroid rank; the coverage crossing is the smallest fanout
-        // that covers the top-k at the target. Capped at the `width × fine`
-        // prior — a crossing beyond it means GFC needs more clusters than the
-        // grid, so it loses here and the point stays `0`. This is the exact
-        // fanout the centroid-graph router must select; no graph is built (the
-        // HNSW is only the query-time acceleration of this same selection, and
-        // `ef` is its separate breadth knob).
-        let mut fanout_law = [0u32; WIDTH_LAW_KS.len()];
-        let global = self
-            .global_fanout
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
-        let stride = self.dim * 4;
-        let n_global = global.centroid_bytes.len().checked_div(stride).unwrap_or(0);
-        // Full observation iff every non-empty grid cell was packed + unioned
-        // this pass (a full drain/rebuild); an incremental pass sees only the
-        // new tail, whose partial global set can't measure a GLOBAL fanout.
-        let non_empty_cells = grid.counts.iter().filter(|&&c| c > 0).count();
-        let fanout_complete = non_empty_cells > 0 && global.observed_cells.len() >= non_empty_cells;
-        // The router normalizes fine centroids AND the query for Cosine before
-        // scoring (means of unit vectors aren't unit); rank against the SAME
-        // transform so the calibrated ordering is the one the reader uses.
-        // NegDot / L2Sq score raw magnitudes — no transform.
-        let scored_bytes = if self.metric == Metric::Cosine {
-            let mut normalized = global.centroid_bytes.clone();
-            for chunk in normalized.chunks_exact_mut(stride) {
-                let mut v: Vec<f32> = chunk
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-                unit_normalize(&mut v);
-                for (dst, s) in chunk.chunks_exact_mut(4).zip(v) {
-                    dst.copy_from_slice(&s.to_le_bytes());
-                }
-            }
-            normalized
-        } else {
-            global.centroid_bytes.clone()
-        };
-        if fanout_complete && n_global > 0 {
-            let cap = fanout_prior_for_k(&law, &fine_law, n_global.min(u32::MAX as usize) as u32);
-            let cap_max = cap.iter().copied().max().unwrap_or(0) as usize;
-            if cap_max > 0 {
-                let mut fanout_sums: Vec<Vec<f64>> = vec![vec![0f64; cap_max]; WIDTH_LAW_KS.len()];
-                let mut rank_of_global = vec![u32::MAX; n_global];
-                let mut q_scratch = vec![0f32; self.dim];
-                for (qi, cand) in tops.iter().enumerate() {
-                    q_scratch.copy_from_slice(&frozen.queries[qi * self.dim..(qi + 1) * self.dim]);
-                    if self.metric == Metric::Cosine {
-                        unit_normalize(&mut q_scratch);
-                    }
-                    // Exact global centroid ranking (top `cap_max`) — the SAME
-                    // kernel + transform the router's query-time selection uses.
-                    let ranked = nearest_k_centroids_bytes(
-                        self.metric,
-                        &q_scratch,
-                        &scored_bytes,
-                        n_global,
-                        self.dim,
-                        cap_max,
-                    );
-                    rank_of_global.iter_mut().for_each(|r| *r = u32::MAX);
-                    for (rank, (c, _)) in ranked.iter().enumerate() {
-                        rank_of_global[*c as usize] = rank as u32;
-                    }
-                    let mut sorted = cand.clone();
-                    sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-                    for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
-                        if sorted.len() < k {
-                            continue;
-                        }
-                        let mut per_rank = vec![0u32; cap_max];
-                        for (_, cell, id, _) in &sorted[..k] {
-                            // The row's global cluster (its surviving copy's
-                            // cell), then that cluster's per-query rank. A
-                            // missing entry (partial observation) or a rank
-                            // beyond the cap counts as uncovered — conservative.
-                            if let Some(&gc) = global.row_cluster.get(&(*id, *cell)) {
-                                let r = rank_of_global[gc as usize] as usize;
-                                if r < cap_max {
-                                    per_rank[r] += 1;
-                                }
-                            }
-                        }
-                        let mut covered = 0u32;
-                        for (rank, count) in per_rank.iter().enumerate() {
-                            covered += count;
-                            fanout_sums[ki][rank] += f64::from(covered) / k as f64;
-                        }
-                    }
-                }
-                for (ki, sums) in fanout_sums.iter().enumerate() {
-                    if support[ki] == 0 || cap[ki] == 0 {
-                        continue;
-                    }
-                    let stage_target = self.target_recall * support[ki] as f64;
-                    let limit = (cap[ki] as usize).min(cap_max);
-                    let crossing = sums[..limit].iter().position(|&s| s >= stage_target);
-                    fanout_law[ki] = cap_fanout(crossing, cap[ki]);
-                }
-            }
-        }
-        floor_monotone(&mut fanout_law);
+        // The centroid-graph router fanout is NOT calibrated here. Its coverage
+        // proxy (home-cluster within the top-fanout centroids) is an upper bound
+        // on real recall — it ignores the within-cluster Sq16 + shortlist +
+        // rerank loss — so it under-stamps the fanout. The fanout is now measured
+        // by real recall at the router's post-commit build stage (see
+        // `crate::supertable::query::vector::calibrate_centroid_router_fanout`),
+        // which runs the actual selection → per-cluster scan → shortlist →
+        // rerank the reader serves and stamps the knee into
+        // `CellRoutingParams::fanout_for_k`.
         (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
             width_for_k: law,
             fine_for_k: fine_law,
             rerank_for_k: rerank_law,
             pool_cells: self.pool_cells as u32,
-            fanout_for_k: fanout_law,
-            fanout_complete,
         })
     }
 }
@@ -2238,214 +2172,6 @@ mod tests {
             "top-10 coverage needs the rank-2 cluster"
         );
         assert_eq!(&laws.fine_for_k[2..], &[0, 0], "unsupported points stay 0");
-        // Fanout stage: with a single cell the global fine-centroid set IS the
-        // cell's, so the calibrated fanout equals the fine depth (fanout N
-        // covers the top-k, N-1 does not), within the W×F cap.
-        assert_eq!(
-            &laws.fanout_for_k[..2],
-            &[2, 3],
-            "single-cell fanout tracks the fine depth (global == within-cell)"
-        );
-        assert_eq!(
-            &laws.fanout_for_k[2..],
-            &[0, 0],
-            "unsupported points stay 0"
-        );
-    }
-
-    /// The fanout stage measures GLOBAL cluster coverage, not per-cell. A GT row
-    /// whose cell the grid routes to in ONE probe can still rank 2nd globally,
-    /// behind a nearer cluster in another cell — so the centroid-graph selection
-    /// needs more clusters than the grid's `W × F`, and the stage stamps the
-    /// "GFC loses" sentinel (`0`).
-    #[test]
-    fn fanout_stage_stamps_sentinel_when_grid_beats_global_selection() {
-        const DIM: usize = 4;
-        // Cell 0 nearest the e0 query, cell 1 far.
-        let grid = ClusterCentroids::from_fp32(
-            2,
-            DIM as u32,
-            &[
-                1.0, 0.0, 0.0, 0.0, // cell 0 (near)
-                0.0, 1.0, 0.0, 0.0, // cell 1 (far)
-            ],
-            vec![1, 1],
-        );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
-        let mut query = vec![0.0f32; DIM];
-        query[0] = 1.0;
-        cal.frozen = Some(WidthLawQueries {
-            queries: query,
-            ids: vec![999],
-        });
-        // One GT top-1 row (id 1) in cell 0.
-        let mut acc = Vec::new();
-        merge_candidates(
-            &mut acc,
-            vec![(0.01f32, 0u32, 1i128, f32::NEG_INFINITY)],
-            WIDTH_LAW_MAX_K,
-        );
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
-
-        // Cell 0's one fine cluster (the GT row's) sits slightly off the query;
-        // cell 1 carries a distractor cluster EXACTLY on the query — nearer
-        // globally than cell 0's, so the row's cluster is only 2nd globally.
-        let mut cell0_members = HashMap::new();
-        cell0_members.insert(1i128, 0u32);
-        let cell0 = CellFineCalibrationView {
-            cell_id: Some(0),
-            dim: DIM,
-            n_fine: 1,
-            fine_centroids_bytes: fp32_le_bytes(&[0.9, 0.4359, 0.0, 0.0]),
-            cluster_of_stable: cell0_members,
-        };
-        let cell1 = CellFineCalibrationView {
-            cell_id: Some(1),
-            dim: DIM,
-            n_fine: 1,
-            fine_centroids_bytes: fp32_le_bytes(&[1.0, 0.0, 0.0, 0.0]),
-            cluster_of_stable: HashMap::new(),
-        };
-        cal.observe_shard_views(&[cell0, cell1]);
-
-        let laws = cal.finish(&grid).expect("laws");
-        assert_eq!(
-            laws.width_for_k[0], 1,
-            "the grid routes the row in one cell"
-        );
-        assert_eq!(laws.fine_for_k[0], 1, "the row's cell has one fine cluster");
-        assert_eq!(
-            laws.fanout_for_k[0], 0,
-            "GFC needs a 2nd global cluster (a nearer distractor in cell 1) but \
-             the grid's W×F is 1 — GFC loses, sentinel 0"
-        );
-    }
-
-    /// The fanout stage ranks global centroids the way the Cosine router does —
-    /// unit-normalizing centroids AND the query — not raw `-dot`. A GT row's
-    /// cluster that a higher-MAGNITUDE distractor beats on raw dot but not on
-    /// cosine must rank first, so the calibrated fanout matches the reader.
-    #[test]
-    fn fanout_stage_ranks_by_cosine_not_raw_dot() {
-        const DIM: usize = 4;
-        let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1]);
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
-        let mut query = vec![0.0f32; DIM];
-        query[0] = 1.0;
-        cal.frozen = Some(WidthLawQueries {
-            queries: query,
-            ids: vec![999],
-        });
-        // One GT top-1 row (id 1) in the on-axis cluster 0.
-        let mut acc = Vec::new();
-        merge_candidates(
-            &mut acc,
-            vec![(0.01f32, 0u32, 1i128, f32::NEG_INFINITY)],
-            WIDTH_LAW_MAX_K,
-        );
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
-
-        // Cluster 0 = the query's exact direction (unit). Cluster 1 = a
-        // higher-magnitude off-axis vector: raw dot(e0, c1)=1.5 > dot(e0,c0)=1
-        // (raw ranks c1 first), but cosine dot(e0, c1_norm)=0.83 < 1 (cosine
-        // ranks c0 first). The GT row is in c0.
-        let mut members = HashMap::new();
-        members.insert(1i128, 0u32);
-        let view = CellFineCalibrationView {
-            cell_id: Some(0),
-            dim: DIM,
-            n_fine: 2,
-            fine_centroids_bytes: fp32_le_bytes(&[
-                1.0, 0.0, 0.0, 0.0, // cluster 0 (unit, on-axis)
-                1.5, 1.0, 0.0, 0.0, // cluster 1 (bigger magnitude, off-axis)
-            ]),
-            cluster_of_stable: members,
-        };
-        cal.observe_shard_views(&[view]);
-
-        let laws = cal.finish(&grid).expect("laws");
-        // The fine stage ranks by raw dot (the stamped path), so c0 sits at
-        // raw rank 1 → fine depth 2.
-        assert_eq!(
-            laws.fine_for_k[0], 2,
-            "raw-dot fine rank puts the higher-magnitude cluster first"
-        );
-        // The fanout stage normalizes (cosine), so c0 is the nearest cluster →
-        // fanout 1. If it scored raw dot, this would be 2 (matching fine).
-        assert_eq!(
-            laws.fanout_for_k[0], 1,
-            "cosine-normalized ranking puts the on-axis cluster first → fanout 1"
-        );
-    }
-
-    /// The fanout stage stamps only on a FULL observation — every non-empty
-    /// grid cell packed this pass. An incremental pass that sees a subset
-    /// reports `fanout_complete = false` and measures no fanout, so the writer
-    /// leaves the prior stamp untouched rather than latching a partial value.
-    #[test]
-    fn fanout_complete_requires_every_non_empty_cell() {
-        const DIM: usize = 4;
-        // Two non-empty grid cells.
-        let grid = ClusterCentroids::from_fp32(
-            2,
-            DIM as u32,
-            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            vec![1, 1],
-        );
-        let build = |observe_both: bool| {
-            let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, shipped_target_recall());
-            let mut query = vec![0.0f32; DIM];
-            query[0] = 1.0;
-            cal.frozen = Some(WidthLawQueries {
-                queries: query,
-                ids: vec![999],
-            });
-            let mut acc = Vec::new();
-            merge_candidates(
-                &mut acc,
-                vec![(0.01f32, 0u32, 1i128, f32::NEG_INFINITY)],
-                WIDTH_LAW_MAX_K,
-            );
-            *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
-            let mut members = HashMap::new();
-            members.insert(1i128, 0u32);
-            let cell0 = CellFineCalibrationView {
-                cell_id: Some(0),
-                dim: DIM,
-                n_fine: 1,
-                fine_centroids_bytes: fp32_le_bytes(&[1.0, 0.0, 0.0, 0.0]),
-                cluster_of_stable: members,
-            };
-            if observe_both {
-                let cell1 = CellFineCalibrationView {
-                    cell_id: Some(1),
-                    dim: DIM,
-                    n_fine: 1,
-                    fine_centroids_bytes: fp32_le_bytes(&[0.0, 1.0, 0.0, 0.0]),
-                    cluster_of_stable: HashMap::new(),
-                };
-                cal.observe_shard_views(&[cell0, cell1]);
-            } else {
-                cal.observe_shard_views(&[cell0]);
-            }
-            cal.finish(&grid).expect("laws")
-        };
-
-        // Partial (only cell 0): incomplete, no fanout measured.
-        let partial = build(false);
-        assert!(!partial.fanout_complete, "one of two cells is not complete");
-        assert_eq!(
-            partial.fanout_for_k,
-            [0; WIDTH_LAW_KS.len()],
-            "a partial pass measures no fanout"
-        );
-        // Full (both cells): complete, fanout measured.
-        let full = build(true);
-        assert!(full.fanout_complete, "both non-empty cells observed");
-        assert!(
-            full.fanout_for_k[0] > 0,
-            "a full pass measures a positive fanout for the supported k"
-        );
     }
 
     /// A stamped width beyond the calibration pool clears the rerank
