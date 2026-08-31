@@ -816,6 +816,98 @@ async fn oracle_and_membership_rejects_partial_matches() {
 }
 
 #[tokio::test]
+async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
+    // The middle routing tier: a *moderately*-sparse rarest term (df in
+    // [max_doc/64, max_doc/16)) reaches `and_membership_scored` only because the
+    // other terms are collectively >= 8x denser — the `+the +book +of +life`
+    // shape, a route the very-sparse membership oracles above never take. Its
+    // intersection also spans many posting blocks, so the walk's amortized
+    // Block-Max-AND window skip has to cross blocks correctly: the very-sparse
+    // oracles prune over a <=9-doc intersection, so a window-skip that
+    // miscomputed its end (dropping a valid top-k doc) would show up here, not
+    // there.
+    const N: u64 = 4000; // ~32 posting blocks of 128
+    // `common` and `also` are in every doc: dense, bitset-encoded, df = N each.
+    // `mid` (every 20th doc, df 200) is the rarest: above N/64 = 62 (so not the
+    // always-take tier) and below N/16 = 250, with others' df (2N) >= 8 * 200, so
+    // the density-gated middle tier routes it to the walk.
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let mut s = String::from("common also");
+            if i % 20 == 0 {
+                s.push_str(" mid");
+            }
+            // Vary doc length so BM25 dl-norm (and thus scores) differ across the
+            // intersection, giving the truncated top-k something to rank.
+            (i, format!("{s} f{}", i % 13))
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    let terms = ["common".to_string(), "also".to_string(), "mid".to_string()];
+
+    // Full match set (k exceeds the 200-doc intersection): exact intersection + scores.
+    let k_full = 300usize;
+    let got: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common also mid", k_full, BoolMode::And)
+        .await
+        .expect("AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let want_set: HashSet<u64> = (0..N).filter(|i| i % 20 == 0).collect();
+    let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
+    assert_eq!(
+        got_set, want_set,
+        "middle-tier membership AND must return exactly the intersection (docs divisible by 20)"
+    );
+    assert!(
+        want_set.len() > 128,
+        "intersection ({}) must span multiple posting blocks to exercise cross-block pruning",
+        want_set.len()
+    );
+    let want: HashMap<u64, f32> = oracle.top_k_terms_and(&terms, k_full).into_iter().collect();
+    for (d, s) in &got {
+        assert!(
+            (s - want[d]).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "middle-tier score mismatch on doc {d}: infino={s} oracle={}",
+            want[d]
+        );
+    }
+
+    // Truncated top-k, k << intersection: the heap fills, the bar rises, and the
+    // Block-Max-AND window skip fires repeatedly across blocks. It must still keep
+    // the k highest-scoring matches. Compare score multisets so a tie at the k-th
+    // place isn't flaky.
+    let k_trunc = 5usize;
+    let got_trunc: Vec<f32> = infino
+        .bm25_hits_async("title", "common also mid", k_trunc, BoolMode::And)
+        .await
+        .expect("truncated AND search")
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(
+        got_trunc.len(),
+        k_trunc,
+        "truncated AND must return exactly k"
+    );
+    let want_trunc: Vec<f32> = oracle
+        .top_k_terms_and(&terms, k_trunc)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    for (g, w) in got_trunc.iter().zip(want_trunc.iter()) {
+        assert!(
+            (g - w).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "middle-tier truncated score mismatch: infino={g} oracle={w}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
