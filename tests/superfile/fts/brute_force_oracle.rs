@@ -412,6 +412,30 @@ async fn oracle_single_term_seed_scale_matches_brute_force() {
     }
 }
 
+#[tokio::test]
+async fn oracle_single_term_seed_scale_unbounded_k_does_not_overflow() {
+    // Regression: the threshold-first seed heap preallocated `with_capacity(k)`
+    // with no clamp. An unbounded request — `k == usize::MAX`, the "return
+    // everything" sentinel a brute-force comparison passes — then asked for a
+    // `usize::MAX`-capacity heap and panicked with "capacity overflow". The
+    // seed path only fires past its `MIN_BLOCKS = 256` gate, so the small
+    // oracles never reached it; this 35k-doc corpus puts `common` in every doc
+    // (~273 blocks), so the seed runs. With the capacity clamped to the corpus
+    // size the search must complete and return every matching doc.
+    let corp = seed_scale_single_term_corpus();
+    let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&corp_refs);
+    let hits = infino
+        .bm25_hits_async("title", "common", usize::MAX, BoolMode::Or)
+        .await
+        .expect("unbounded-k BM25 search must not panic");
+    assert_eq!(
+        hits.len(),
+        corp.len(),
+        "unbounded-k search must return every doc containing the term"
+    );
+}
+
 /// Corpus where a common non-essential ("hot") has a high block-max only in a
 /// *mid-range* block. Five anchors in block 10 (ids 1281..1289) carry `lead` +
 /// `hot`×{10,9,8,7,6} — strictly-decreasing scores far above the bulk (bulk hot

@@ -936,8 +936,13 @@ impl FtsReader {
             }
             let m = m_want.min(cand.len());
             cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
-            // Decode those blocks, score, keep a k-sized seed heap.
-            let mut seed_heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(k);
+            // Decode those blocks, score, keep a k-sized seed heap. Clamp the
+            // preallocation to the corpus size: `k` is caller-controlled and may
+            // be `usize::MAX` (an unbounded "return everything" request), which
+            // would overflow `with_capacity`. The heap never holds more than the
+            // docs in scope anyway.
+            let mut seed_heap: BinaryHeap<TopKEntry> =
+                BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
             for &(_, bi) in &cand[..m] {
                 let (_, off, _) = term_meta.skip_entry(postings, bi);
                 let end = term_meta.block_end_in_term(postings, bi);
