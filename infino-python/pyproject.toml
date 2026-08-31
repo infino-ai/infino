@@ -47,6 +47,10 @@ Repository = "https://github.com/infino-ai/infino"
 Issues = "https://github.com/infino-ai/infino/issues"
 Changelog = "https://github.com/infino-ai/infino/releases"
 
+# EXPERIMENTAL benchmark serve mode (raw-TCP) — not a production server.
+[project.scripts]
+infino-bench-serve = "infino._bench_serve:main"
+
 [tool.mypy]
 strict = true
 
