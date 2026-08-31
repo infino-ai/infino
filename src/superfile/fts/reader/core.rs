@@ -326,20 +326,47 @@ pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 8;
 /// `total_df >= max_doc / N`.
 pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
 
-/// Rarest-term sparsity gate for the ranked-AND membership walk
-/// (`FtsReader::and_membership_scored`): route there only when the rarest term
-/// covers less than `1/N` of the doc-id space. The membership walk drives the
-/// rarest term's *entire* list, bit-testing the others, so it only pays when
-/// that list is genuinely short relative to the corpus. It previously *also*
-/// gave up the flat-merge's block-max heap-bar skip, which forced a strict
-/// `1/64` gate — a looser `1/16` let moderately sparse rarest terms through and
-/// regressed the ranked tail (p99) where the bar-skip was doing real work. The
-/// walk now carries that same Block-Max-AND skip itself, so a moderately-sparse
-/// rarest term (rare∧common — one discriminating term plus stopwords, the
-/// common multi-term shape) can route here and still skip windows the bar rules
-/// out. Set to the count path's `1/16`; the all-dense case (every term a
-/// stopword) stays above the gate and keeps the flat-merge.
+/// Ranked-AND membership-walk routing (`FtsReader::and_membership_scored`) uses
+/// two sparsity tiers for the rarest term, plus a density check on the middle
+/// tier. All thresholds are `1/N` fractions of the doc-id space.
+///
+/// - **Rarest < `1/AND_MEMBERSHIP_ALWAYS_DIVISOR`** (very sparse): always route
+///   to the walk. Driving so short a list, bit-testing the others, is cheaper
+///   than the flat-merge regardless of the others' density — this is the tier
+///   the walk always served.
+/// - **Rarest in `[1/ALWAYS, 1/AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR)`**
+///   (moderately sparse): route only when the others are collectively dense
+///   enough (see [`AND_MEMBERSHIP_OTHERS_DENSITY_MULT`]). This is the band the
+///   walk newly reaches — a discriminating term plus common ones — and the one
+///   that needs the density guard, because a moderately-sparse rarest with only
+///   moderately-common companions is handled better by the flat-merge's block
+///   decode + block-max skip.
+/// - **Rarest ≥ `1/RAREST_SPARSE_DIVISOR`**: never; the all-dense case (every
+///   term common) keeps the flat-merge.
+///
+/// The walk now carries the flat-merge's own Block-Max-AND heap-bar skip, so the
+/// middle tier no longer regresses the ranked tail (p99) the way a skip-less
+/// walk did when this was a flat `1/16` gate.
+pub(super) const AND_MEMBERSHIP_ALWAYS_DIVISOR: u64 = 64;
+
+/// Upper sparsity bound for the density-gated middle routing tier — see
+/// [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]. A rarest term denser than `1/16` of the
+/// corpus never routes to the membership walk.
 pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 16;
+
+/// Density guard for the middle routing tier: the *other* terms must be
+/// collectively at least this many times denser than the driver (their combined
+/// df ≥ `MULT` × the rarest df). The walk's win is skipping the flat-merge's
+/// decode of the common terms' blocks; that only outweighs iterating the whole
+/// driver list when those others are much denser than the driver. When they are
+/// only moderately denser (e.g. three mid-frequency terms), the flat-merge's
+/// block decode is already cheap and its block-max skip prunes the driver, so it
+/// wins — routing such a query to the walk regressed it. Sparsity alone can't
+/// tell the two apart (same rarest term, different companions), so this ratio is
+/// the discriminator. Calibrated on the ranked-AND intersection set: middle-tier
+/// wins sit at ≥ ~38× and the one regression at ~4.5×, so `8` separates them
+/// with margin on both sides. (The very-sparse tier skips this check.)
+pub(super) const AND_MEMBERSHIP_OTHERS_DENSITY_MULT: u64 = 8;
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
