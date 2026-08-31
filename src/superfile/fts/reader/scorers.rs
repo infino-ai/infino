@@ -616,7 +616,8 @@ impl FtsReader {
     ///   most driver docs, and a miss can come after several common terms have
     ///   already matched. Membership is checked with [`TermCursor::contains`]
     ///   (a bitset bit-test) across all others first; only on a *full* match are
-    ///   the tfs read with [`TermCursor::bitset_probe_tf`] and the score summed.
+    ///   the tfs read with [`TermCursor::tf_at_contained`] (reusing the block
+    ///   position `contains` left, no re-probe) and the score summed.
     ///   Reading the tf eagerly per matching term instead — a popcount-rank plus
     ///   a one-time tf-array decode — is wasted whenever a later term misses, and
     ///   on 5–7-term ANDs that waste dominated.
@@ -702,7 +703,7 @@ impl FtsReader {
                         // no doc-id decode). `contains` already positioned each
                         // cursor on `d`'s block, so this doesn't re-seek.
                         for o in others.iter_mut() {
-                            let tf = o.bitset_probe_tf(d).unwrap_or(0);
+                            let tf = o.tf_at_contained(d);
                             s += bm25::score_with_dl_norm_k1(o.idf_x_k1p1, tf, norm);
                         }
                         s
