@@ -600,46 +600,33 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
-    /// Ranked AND via a rarest-driven membership walk. Iterate the rarest term;
-    /// for each of its docs, probe every other term with
-    /// [`TermCursor::bitset_probe_tf`] — a **bitset bit-test that also reads the
-    /// matching tf by popcount-rank, with no doc-id block decode** — short-
-    /// circuiting on the first miss. Only a doc present in *every* term is scored
-    /// (`Σ` per-term BM25, identical to the flat-merge) and emitted through the
-    /// generic sink. This skips the flat-merge's per-leader-doc `skip_to` that
-    /// fully decodes a common term's 128-doc block just to align it — the
-    /// profiled cost on an n≥3-term AND with a common term.
+    /// Ranked AND via a rarest-driven membership walk, for the rare∧common shape the
+    /// gate ([`and_prefer_membership`]) routes here. Example: `+the +book +of +life`
+    /// — drive `book` (the rarest term) and, for each of its docs, bit-test the
+    /// common terms (`the`, `of`, `life`) for presence. This avoids the flat-merge's
+    /// per-doc `skip_to`, which fully decodes a common term's 128-doc posting block
+    /// just to align it — the profiled cost when a rare term is AND-ed with common ones.
     ///
-    /// Two properties keep it competitive across the sparsity range the gate
-    /// ([`and_prefer_membership`]) admits:
-    /// - **Presence is tested before any tf is read.** A selective AND misses on
-    ///   most driver docs, and a miss can come after several common terms have
-    ///   already matched. Membership is checked with [`TermCursor::contains`]
-    ///   (a bitset bit-test) across all others first; only on a *full* match are
-    ///   the tfs read with [`TermCursor::tf_at_contained`] (reusing the block
-    ///   position `contains` left, no re-probe) and the score summed.
-    ///   Reading the tf eagerly per matching term instead — a popcount-rank plus
-    ///   a one-time tf-array decode — is wasted whenever a later term misses, and
-    ///   on 5–7-term ANDs that waste dominated.
-    /// - **It keeps the flat-merge's Block-Max-AND heap-bar skip**, amortized
-    ///   over a window: the driver's block-max plus each other's block-max at the
-    ///   driver doc (inspect pointer, no decode) bound every score in
-    ///   `[doc, window_end]` (the smallest block boundary across the cursors); if
-    ///   that can't beat the kth-best the driver skips the whole window. Without
-    ///   it a moderately-sparse rarest term with a large intersection (small-`k`)
-    ///   would score every match; with it the walk keeps the tail protection that
-    ///   let the routing gate loosen.
+    /// Per driver doc: [`TermCursor::contains`] each other term (an O(1) bitset
+    /// bit-test), short-circuiting on the first miss. Only a doc present in *every*
+    /// term is scored — `Σ` per-term BM25, the same score the flat-merge computes —
+    /// and emitted through the sink.
     ///
-    /// Only the pure-AND path ([`run_and_intersect`](Self::run_and_intersect), a
-    /// `ScoreSink`) routes here; must+should keeps the flat-merge so its
-    /// should-clause scoring stays in one place. Gated to the v4/v5 bitset case;
-    /// the flat-merge stays for v1–v3 and the all-dense case.
+    /// Two details make it pay off:
+    /// - **tf is read only on a full match**, via [`TermCursor::tf_at_contained`]
+    ///   (reusing the block position `contains` just left). Reading it during the
+    ///   presence probe instead wastes a popcount-rank whenever a later term misses —
+    ///   which dominated on 5–7-term ANDs.
+    /// - **the flat-merge's Block-Max-AND heap-bar skip is kept**, amortized per block
+    ///   window: if the driver's block-max plus each other's block-max at the driver
+    ///   doc can't beat the k-th best score, the driver skips the whole window.
+    ///   Without it a large intersection at small `k` would score every match.
     ///
-    /// `#[cold]` places this out of line, so growing it doesn't shift the layout
-    /// of the flat-merge scorers it shares this module with. The flat-merge AND
-    /// path is measurably sensitive to its own instruction placement, and moving
-    /// this walk aside kept an all-dense conjunction (which never routes here)
-    /// off the regression this code's size would otherwise have caused it.
+    /// Only [`run_and_intersect`](Self::run_and_intersect) (pure AND, a `ScoreSink`)
+    /// routes here; must+should stays on the flat-merge. `#[cold]` keeps this out of
+    /// line: the flat-merge shares this module and is sensitive to its own
+    /// instruction placement, so growing this walk must not shift it (an all-dense
+    /// conjunction that never routes here regressed purely from the code shift).
     #[cold]
     fn and_membership_scored<S: AndSink>(
         &self,
