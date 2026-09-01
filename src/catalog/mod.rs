@@ -194,6 +194,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
             usage_meter: UsageMeter::new(),
+            gcs_credential: None,
         }),
     })
 }
