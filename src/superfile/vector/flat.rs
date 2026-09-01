@@ -60,6 +60,18 @@ use crate::superfile::vector::{
 /// decline the bytes outright instead of mis-slicing them.
 const FLAT_MAGIC_V1: &[u8; 8] = b"INFDFL01";
 
+/// Magic for the persisted form that adds the per-row correction norms.
+///
+/// The V1 layout scored the codes' raw dot, which is biased low by each
+/// row's reconstruction shrinkage — unevenly across rows, which is what
+/// costs ranking. V2 inserts one f32 per row (`1/‖x̂‖` of the rotated
+/// reconstruction) between the ruler and the code plane; scoring multiplies
+/// the accumulated dot by it, unbiasing the estimate at one multiply per
+/// candidate. V1 bundles still decode (norms absent, correction skipped):
+/// an existing table keeps serving its registered plane uncorrected until
+/// its next drain rewrites it as V2.
+const FLAT_MAGIC_V2: &[u8; 8] = b"INFDFL02";
+
 /// Byte size of the fixed frame: magic(8) + n(u64) + dim(u32) + codec(u8)
 /// + col_len(u32) + rot_seed(u64). The doc-id map, ruler, and nibble planes
 /// are added on top; naming it keeps the encode capacity hint exact so the
@@ -72,6 +84,11 @@ const COORDS_PER_BYTE: usize = 2;
 /// Bytes per `f32` ruler entry (offset and step each store one per
 /// rotated coordinate).
 const RULER_ENTRY_BYTES: usize = 4;
+/// Bytes per `f32` correction-norm entry (one per row). Counted in
+/// [`Sq4FlatIndex::resident_bytes`]: the norms are codec payload the scan
+/// reads per candidate, exactly like a competing codec's stored
+/// per-vector scalar, so excluding them would understate the footprint.
+const NORM_ENTRY_BYTES: usize = 4;
 /// Minimum rows a rayon task claims. Large enough that per-task setup
 /// and the fold's heap allocation stay negligible against the scan, small
 /// enough that the tail does not idle threads at the corpus sizes a flat
@@ -123,6 +140,10 @@ impl PartialOrd for Candidate {
 /// `node -> stable doc id` map the serving path resolves through.
 pub(crate) struct Sq4FlatIndex {
     scorer: Sq4Scorer,
+    /// Per-row `1/‖x̂‖` of the rotated reconstruction, multiplied into each
+    /// candidate's accumulated dot. `None` only for a V1-decoded bundle,
+    /// which serves uncorrected rather than declining.
+    inv_norms: Option<Vec<f32>>,
     /// `node_index -> stable doc id`, in node order. Present so a hit can
     /// be answered without touching a superfile: the scan's node index is
     /// meaningless outside this plane.
@@ -157,8 +178,10 @@ impl Sq4FlatIndex {
         debug_assert_eq!(sq16_codes.len(), len * dim * 2);
         let scorer =
             Sq4Scorer::from_sq16_plane(sq16_codes, dim, len, with_residual, rot_seed, None);
+        let inv_norms = Some(reconstruction_inv_norms(&scorer, dim, len));
         Self {
             scorer,
+            inv_norms,
             doc_ids,
             column: column.to_string(),
             dim,
@@ -246,6 +269,10 @@ impl Sq4FlatIndex {
         codes.len()
             + residual.map_or(0, <[u8]>::len)
             + (offset.len() + step.len()) * RULER_ENTRY_BYTES
+            + self
+                .inv_norms
+                .as_ref()
+                .map_or(0, |n| n.len() * NORM_ENTRY_BYTES)
     }
 
     /// The byte floor for these codes, recomputed from `dim` and the
@@ -259,7 +286,7 @@ impl Sq4FlatIndex {
     fn minimum_bytes(&self) -> usize {
         let (_, residual, _, _) = self.scorer.parts();
         let planes = if residual.is_some() { 2 } else { 1 };
-        let per_row = self.dim.div_ceil(COORDS_PER_BYTE) * planes;
+        let per_row = self.dim.div_ceil(COORDS_PER_BYTE) * planes + NORM_ENTRY_BYTES;
         per_row * self.len + self.dim * COORDS_PER_BYTE * RULER_ENTRY_BYTES
     }
 
@@ -295,10 +322,15 @@ impl Sq4FlatIndex {
                 + col.len()
                 + self.len * 16
                 + self.dim * 2 * RULER_ENTRY_BYTES
+                + self.len * NORM_ENTRY_BYTES
                 + codes.len()
                 + residual.map_or(0, <[u8]>::len),
         );
-        out.extend_from_slice(FLAT_MAGIC_V1);
+        let inv_norms = self
+            .inv_norms
+            .as_ref()
+            .expect("encode is a drain-path call and drains always compute norms");
+        out.extend_from_slice(FLAT_MAGIC_V2);
         out.extend_from_slice(&(self.len as u64).to_le_bytes());
         out.extend_from_slice(&(self.dim as u32).to_le_bytes());
         out.push(codec.tag());
@@ -309,6 +341,9 @@ impl Sq4FlatIndex {
         }
         out.extend_from_slice(&self.scorer.rot_seed().to_le_bytes());
         for v in offset.iter().chain(step) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in inv_norms {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out.extend_from_slice(codes);
@@ -329,9 +364,14 @@ impl Sq4FlatIndex {
     pub(crate) fn decode(bundle: &Bytes) -> Option<Self> {
         let bytes: &[u8] = bundle.as_ref();
         let mut c = Cursor::new(bytes);
-        if c.take(FLAT_MAGIC_V1.len())? != FLAT_MAGIC_V1 {
+        let magic = c.take(FLAT_MAGIC_V1.len())?;
+        let with_norms = if magic == FLAT_MAGIC_V2 {
+            true
+        } else if magic == FLAT_MAGIC_V1 {
+            false
+        } else {
             return None;
-        }
+        };
         let len = c.u64()? as usize;
         let dim = c.u32()? as usize;
         if dim == 0 {
@@ -364,6 +404,20 @@ impl Sq4FlatIndex {
         }
         let offset = read_f32_le(c.take(dim.checked_mul(RULER_ENTRY_BYTES)?)?);
         let step = read_f32_le(c.take(dim.checked_mul(RULER_ENTRY_BYTES)?)?);
+        let inv_norms = if with_norms {
+            if len.checked_mul(NORM_ENTRY_BYTES)? > c.remaining() {
+                return None;
+            }
+            let norms = read_f32_le(c.take(len.checked_mul(NORM_ENTRY_BYTES)?)?);
+            // A non-finite or non-positive multiplier is not a correction,
+            // it is corruption: decline, and the serving path falls back.
+            if norms.iter().any(|n| !n.is_finite() || *n <= 0.0) {
+                return None;
+            }
+            Some(norms)
+        } else {
+            None
+        };
         let stride = dim.div_ceil(COORDS_PER_BYTE);
         let plane_len = len.checked_mul(stride)?;
         let codes = bundle.slice_ref(c.take(plane_len)?);
@@ -383,6 +437,7 @@ impl Sq4FlatIndex {
         )?;
         Some(Self {
             scorer,
+            inv_norms,
             doc_ids,
             column,
             dim,
@@ -404,6 +459,17 @@ impl Sq4FlatIndex {
             return Vec::new();
         }
         let prepared = self.scorer.prepare(query);
+        // Per-row estimator correction: multiply the signed NegDot score by
+        // the row's `1/‖x̂‖` (positive), which unbiases the dot estimate
+        // without bending the kernel's linear code→value map. V1-decoded
+        // bundles carry no norms and scan uncorrected.
+        let inv = self.inv_norms.as_deref();
+        let correct = |node: u32, score: f32| -> f32 {
+            match inv {
+                Some(n) => score * n[node as usize],
+                None => score,
+            }
+        };
         // Parallel over rows either way (rayon for the CPU wave, as the
         // engine's own scan does; a single-threaded per-node loop measures
         // the loop rather than the codec).
@@ -430,8 +496,9 @@ impl Sq4FlatIndex {
                     let first = (b * block) as u32;
                     let mut scores = [0.0f32; SQ4_ROW_BLOCK];
                     self.scorer.score_rows(&prepared, first, &mut scores);
-                    for (r, &score) in scores.iter().enumerate() {
+                    for (r, &raw) in scores.iter().enumerate() {
                         let node = first + r as u32;
+                        let score = correct(node, raw);
                         // The root is the worst kept candidate, so a
                         // bounded push/pop keeps the k nearest without
                         // sorting N.
@@ -451,7 +518,7 @@ impl Sq4FlatIndex {
                     || BinaryHeap::<Candidate>::with_capacity(k + 1),
                     |mut heap, node| {
                         let node = node as u32;
-                        let score = self.scorer.score(&prepared, node);
+                        let score = correct(node, self.scorer.score(&prepared, node));
                         if heap.len() < k {
                             heap.push(Candidate { score, node });
                         } else if heap.peek().is_some_and(|worst| score < worst.score) {
@@ -521,6 +588,27 @@ impl Sq4FlatIndex {
     }
 }
 
+/// Per-row `1/‖x̂‖` over the rotated reconstructions — the drain-time pass
+/// behind the estimator correction. A quantized row reconstructs slightly
+/// short of the unit vector it encodes, by a row-dependent factor; dividing
+/// each dot by the reconstruction's own norm removes exactly that factor.
+/// A degenerate reconstruction (all-zero row) keeps 1.0: no correction is
+/// better than an infinite one.
+fn reconstruction_inv_norms(scorer: &Sq4Scorer, dim: usize, len: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(len);
+    let mut row = vec![0.0f32; dim];
+    for node in 0..len {
+        scorer.decode_rotated_into(node as u32, &mut row);
+        let sumsq: f32 = row.iter().map(|x| x * x).sum();
+        out.push(if sumsq.is_finite() && sumsq > 0.0 {
+            1.0 / sumsq.sqrt()
+        } else {
+            1.0
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,8 +651,9 @@ mod tests {
                 let index = Sq4FlatIndex::build(&vectors, dim, TEST_ROT_SEED, with_residual);
                 let query = planted(dim, 1, 0x9ABC_DEF0);
                 let prepared = index.scorer.prepare(&query);
+                let inv = index.inv_norms.as_ref().expect("built indexes carry norms");
                 let want: Vec<f32> = (0..rows)
-                    .map(|n| index.scorer.score(&prepared, n as u32))
+                    .map(|n| index.scorer.score(&prepared, n as u32) * inv[n])
                     .collect();
                 let got = index.search(&query, rows);
                 assert_eq!(
@@ -617,9 +706,10 @@ mod tests {
                 );
                 let bytes = built.encode();
                 assert_eq!(
-                    &bytes[..FLAT_MAGIC_V1.len()],
-                    FLAT_MAGIC_V1,
-                    "flat encode must stamp its own magic, not a graph bundle's"
+                    &bytes[..FLAT_MAGIC_V2.len()],
+                    FLAT_MAGIC_V2,
+                    "flat encode must stamp the norm-carrying magic, not a \
+                     graph bundle's and not the pre-correction V1"
                 );
                 let decoded =
                     Sq4FlatIndex::decode(&Bytes::from(bytes.clone())).expect("decode flat index");
@@ -667,13 +757,15 @@ mod tests {
         assert_eq!(
             size_of::<Sq4FlatIndex>(),
             size_of::<Sq4Scorer>()
+                + size_of::<Option<Vec<f32>>>()
                 + size_of::<Vec<i128>>()
                 + size_of::<String>()
                 + 2 * size_of::<usize>(),
-            "Sq4FlatIndex has gained a field. If it owns a buffer, \
-             `resident_bytes` does not count it and the residency assertions \
+            "Sq4FlatIndex has gained a field beyond the correction norms. \
+             If it owns a buffer, `resident_bytes` must count it (the norms \
+             are counted; see NORM_ENTRY_BYTES) or the residency assertions \
              are measuring the wrong thing — this index exists to hold the \
-             nibble plane and nothing else."
+             nibble plane, its ruler, and its norms, and nothing else."
         );
     }
 
@@ -700,7 +792,7 @@ mod tests {
             // converges on the codec's rate.
             let ruler = dim * 2 * RULER_ENTRY_BYTES;
             let per_row = (index.resident_bytes() - ruler) as f64 / rows as f64;
-            let want = dim as f64 * bytes_per_dim;
+            let want = dim as f64 * bytes_per_dim + NORM_ENTRY_BYTES as f64;
             assert!(
                 (per_row - want).abs() <= 1.0,
                 "residual={with_residual}: {per_row} bytes/row against the \
@@ -780,5 +872,53 @@ mod tests {
             Sq4FlatIndex::decode(&Bytes::from(huge_n)).is_none(),
             "an implausible row count must decline before reserving"
         );
+        // A non-finite correction norm is corruption, not a correction.
+        let norms_off = FLAT_FIXED_BYTES + rows * 16 + dim * 2 * RULER_ENTRY_BYTES;
+        let mut bad_norm = good.clone();
+        bad_norm[norms_off..norms_off + NORM_ENTRY_BYTES].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(
+            Sq4FlatIndex::decode(&Bytes::from(bad_norm)).is_none(),
+            "a NaN correction norm must decline, not scale scores by NaN"
+        );
+    }
+
+    /// A pre-correction V1 bundle still decodes and serves — uncorrected,
+    /// scoring exactly the codes' raw ranking — so an existing table keeps
+    /// its registered plane until the next drain rewrites it as V2.
+    #[test]
+    fn v1_bundle_decodes_and_serves_uncorrected() {
+        let dim = 128;
+        let rows = 40;
+        let vectors = planted(dim, rows, 0x0F1A_0001);
+        let index = Sq4FlatIndex::build(&vectors, dim, TEST_ROT_SEED, false);
+        // Hand-assemble the V1 layout from the built index's parts: the V2
+        // encoding minus the norms section, under the V1 magic.
+        let (codes, _residual, offset, step) = index.scorer.parts();
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(FLAT_MAGIC_V1);
+        v1.extend_from_slice(&(rows as u64).to_le_bytes());
+        v1.extend_from_slice(&(dim as u32).to_le_bytes());
+        v1.push(WalkCodec::Sq4.tag());
+        v1.extend_from_slice(&0u32.to_le_bytes()); // empty column name
+        for &id in &index.doc_ids {
+            v1.extend_from_slice(&id.to_le_bytes());
+        }
+        v1.extend_from_slice(&index.scorer.rot_seed().to_le_bytes());
+        for v in offset.iter().chain(step) {
+            v1.extend_from_slice(&v.to_le_bytes());
+        }
+        v1.extend_from_slice(codes);
+
+        let decoded = Sq4FlatIndex::decode(&Bytes::from(v1)).expect("V1 must still decode");
+        assert!(decoded.inv_norms.is_none(), "V1 carries no norms");
+        let query = planted(dim, 1, 0xD1CE);
+        let prepared = decoded.scorer.prepare(&query);
+        for (node, score) in decoded.search(&query, rows) {
+            let raw = decoded.scorer.score(&prepared, node);
+            assert!(
+                (raw - score).abs() <= 1e-6 * raw.abs().max(1.0),
+                "V1 serving must be the codes' raw ranking, uncorrected"
+            );
+        }
     }
 }

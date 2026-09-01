@@ -9408,6 +9408,9 @@ mod tests {
     /// step per rotated coordinate), so it is subtracted out before the
     /// per-row rate is compared against the codec's.
     const FLAT_RULER_ENTRY_BYTES: usize = 4;
+    /// Bytes per `f32` correction norm — one per row, part of the codec's
+    /// per-row rate since the V2 plane (the scan reads it per candidate).
+    const FLAT_NORM_ENTRY_BYTES: usize = 4;
     /// Bytes per dimension an Sq16 plane costs. Named to state what retaining
     /// one alongside the nibble plane would do to the per-row rate.
     const SQ16_BYTES_PER_DIM: usize = 2;
@@ -9544,10 +9547,13 @@ mod tests {
         let per_row = (index.resident_bytes() - ruler) / FLAT_FIXTURE_ROWS;
         assert_eq!(
             per_row,
-            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE,
-            "residency must be the nibble plane alone — retaining the Sq16 plane \
-             these codes were fitted from would show as {} bytes/row",
-            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE + FLAT_FIXTURE_DIM * SQ16_BYTES_PER_DIM
+            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE + FLAT_NORM_ENTRY_BYTES,
+            "residency must be the nibble plane plus its per-row correction \
+             norm and nothing else — retaining the Sq16 plane these codes \
+             were fitted from would show as {} bytes/row",
+            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE
+                + FLAT_NORM_ENTRY_BYTES
+                + FLAT_FIXTURE_DIM * SQ16_BYTES_PER_DIM
         );
 
         // The scan answers the query the ivf arm answers, through a node map

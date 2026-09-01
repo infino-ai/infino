@@ -584,8 +584,10 @@ impl Sq4Scorer {
     }
 
     /// Reconstruct one node in ROTATED (padded) space — build- and
-    /// calibration-time only; the walk never decodes a candidate.
-    fn decode_rotated_into(&self, node: u32, out: &mut [f32]) {
+    /// calibration-time only; the walk never decodes a candidate. Also the
+    /// flat index's norm pass: correcting the estimator needs each row's
+    /// reconstruction norm, computed once at drain from these decodes.
+    pub(crate) fn decode_rotated_into(&self, node: u32, out: &mut [f32]) {
         let row = Self::row(self.codes.bytes(), self.padded, node);
         let res = self.residual.as_ref().map(Plane::bytes);
         for (d, o) in out.iter_mut().enumerate().take(self.padded) {
