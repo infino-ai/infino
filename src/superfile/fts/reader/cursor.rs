@@ -1026,6 +1026,25 @@ impl TermCursor {
             self.block_tfs[pos]
         }
     }
+
+    /// Whether this term's postings are stored in the dense **bitset** encoding,
+    /// sampled from the first block's encoding byte (a dense term's blocks are
+    /// uniformly bitset). When true, [`Self::contains`] answers by an O(1)
+    /// bit-test instead of a block decode — the signal a 2-term AND uses to
+    /// decide the membership walk beats the flat-merge's block expansion.
+    pub(super) fn is_bitset_dense(&self) -> bool {
+        if self.bytes.is_empty() {
+            return false; // inline df=1 cursor: no postings bytes
+        }
+        match self.blocks.first() {
+            Some(block) => {
+                self.bytes
+                    .get(block.block_byte_offset + posting::ENCODING_OFF)
+                    == Some(&posting::ENCODING_BITSET)
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]

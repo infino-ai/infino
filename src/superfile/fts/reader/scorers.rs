@@ -242,9 +242,12 @@ fn block_max_and_bound(
 /// bit-testing the common others beats decoding their blocks to align them.
 ///
 /// Guards keep it off the shapes where the flat-merge is cheaper:
-/// - **≥3 terms**: a 2-term AND keeps the specialized `and_flat_merge_2term`
-///   (two-pointer merge over the decoded blocks), which the membership walk was
-///   losing to.
+/// - **2-term**: routes only when the common (denser) term is bitset-encoded
+///   ([`TermCursor::is_bitset_dense`]) and the rarer one is not — then `contains`
+///   bit-tests the common term instead of the specialized `and_flat_merge_2term`
+///   expanding its blocks (the ranked cost on `+the +X`). A PFOR common term
+///   keeps that two-pointer merge, which the walk doesn't beat when the probe
+///   must still decode. The sparsity tiers below are for **≥3 terms** only.
 /// - **rarest-term sparsity, in two tiers** (see [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]):
 ///   a very sparse rarest (`< 1/64`) always routes here — driving so short a list
 ///   beats the flat-merge whatever the others' density. A moderately-sparse
@@ -256,7 +259,7 @@ fn block_max_and_bound(
 ///   on the flat-merge. The walk carries the flat-merge's own Block-Max-AND
 ///   heap-bar skip, so the middle tier doesn't regress the ranked tail (p99).
 fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> bool {
-    if !has_bitset_blocks || cursors.len() < 3 {
+    if !has_bitset_blocks || cursors.len() < 2 {
         return false;
     }
     let max_doc = cursors
@@ -265,6 +268,20 @@ fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> boo
         .map(|b| b.last_doc_id)
         .max()
         .unwrap_or(0);
+    if cursors.len() == 2 {
+        // 2-term: route only when the common (denser) term is bitset-encoded, so
+        // `contains` bit-tests it instead of the flat-merge expanding its blocks —
+        // the ranked cost on `+the +X`. A PFOR common (e.g. `+american +funds`)
+        // keeps the specialized 2-term two-pointer merge, which the walk doesn't
+        // beat when the probe must still decode. The rarer term must not itself be
+        // bitset-dense: an all-dense 2-term is left to the flat-merge/count kernels.
+        let (rare, common) = if cursors[0].df <= cursors[1].df {
+            (&cursors[0], &cursors[1])
+        } else {
+            (&cursors[1], &cursors[0])
+        };
+        return common.is_bitset_dense() && !rare.is_bitset_dense();
+    }
     let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
     // Very sparse rarest term: always cheaper to drive it, whatever the others.
     if min_df.saturating_mul(AND_MEMBERSHIP_ALWAYS_DIVISOR) < u64::from(max_doc) {
