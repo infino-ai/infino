@@ -625,6 +625,8 @@ impl Connection {
         true
     }
 
+    /// Open an existing table by name, returning the public [`Supertable`] wrapper. Fails with
+    /// [`InfinoError::NotFound`] if no such table is registered.
     pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
         #[cfg(feature = "remote")]
         if let CatalogStore::Remote(c) = &self.inner.store {
