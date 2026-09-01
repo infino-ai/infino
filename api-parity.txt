@@ -12,7 +12,7 @@ Connection::drop_table	covered	(&self, &str, bool) -> Result<(), InfinoError>
 Connection::list_tables	covered	(&self) -> Result<Vec<String>, InfinoError>
 Connection::open_table	covered	(&self, &str) -> Result<Supertable, InfinoError>
 Connection::query_sql	covered	(&self, &str) -> Result<Vec<RecordBatch>, InfinoError>
-Connection::update_storage_credentials	covered	(&self, &[(String, String)]) -> bool
+Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface.
 Supertable::append	covered	(&self, &RecordBatch) -> Result<(), InfinoError>
 Supertable::bm25_search	covered	(&self, &str, &str, usize, Bm25SearchOptions, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::count	covered	(&self, &str, &str, BoolMode) -> Result<u64, InfinoError>
