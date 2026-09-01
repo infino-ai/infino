@@ -658,6 +658,28 @@ impl TermCursor {
     /// (the doc ids must be decoded to locate the doc), so it falls back to
     /// `skip_to` + `current_tf`. Like [`Self::contains`] it advances
     /// `current_block`, so a cursor probed this way must not also be iterated.
+    /// Rank of the doc at in-block position `bit` among a bitset block's presence
+    /// bits — the count of set bits before `bit`, i.e. that doc's index into the
+    /// block's doc-order tf array. `word` is the presence word already loaded at
+    /// `bit`'s position; `bitset_end` is the end of the presence bitmap (start of
+    /// the tf array). Shared by [`Self::bitset_probe_tf`] (which first checks the
+    /// bit is set) and [`Self::tf_at_contained`] (which knows it is).
+    #[inline]
+    fn bitset_tf_rank(raw: &[u8], bit: usize, word: u64, bitset_end: usize) -> u32 {
+        let word_idx = bit / 64;
+        let presence = &raw[posting::HEADER_SIZE..bitset_end];
+        let mut rank: u32 = 0;
+        for w in presence[..word_idx * 8].chunks_exact(8) {
+            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
+        }
+        let below = if bit.is_multiple_of(64) {
+            0u64
+        } else {
+            (1u64 << (bit % 64)) - 1
+        };
+        rank + (word & below).count_ones()
+    }
+
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -702,20 +724,8 @@ impl TermCursor {
         if (word >> (bit % 64)) & 1 == 0 {
             return None; // doc not present in this block
         }
-        // Present. `rank` = number of set bits before `bit` = popcount of the
-        // whole presence words ahead of this one + popcount of this word below
-        // `bit`. The r-th set bit (doc) maps to the r-th tf in doc order.
-        let presence = &raw[posting::HEADER_SIZE..bitset_end];
-        let mut rank: u32 = 0;
-        for w in presence[..word_idx * 8].chunks_exact(8) {
-            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
-        }
-        let below = if bit.is_multiple_of(64) {
-            0u64
-        } else {
-            (1u64 << (bit % 64)) - 1
-        };
-        rank += (word & below).count_ones();
+        // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
+        let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
         // Decode this block's tf array once (doc order), reused across a run of
         // candidates in the same block; the doc ids are never expanded.
         if self.tf_decoded_block != self.current_block {
@@ -971,6 +981,72 @@ impl TermCursor {
             if self.current_block < self.blocks.len() {
                 self.decode_current_block();
             }
+        }
+    }
+
+    /// Tf for `doc` on a cursor a preceding [`Self::contains(doc)`] just confirmed
+    /// present. `contains` already advanced `current_block` to `doc`'s block (and,
+    /// on a PACKED block, decoded it), so this skips the block-advance and the
+    /// presence bit-test that [`Self::bitset_probe_tf`] repeats, doing only the tf
+    /// lookup: a popcount-rank into the tf array on a bitset block, or a binary
+    /// search over the decoded doc ids on a PACKED one. Only valid immediately
+    /// after `contains(doc)` returned `true` with no intervening advance.
+    ///
+    /// Kept at the end of the impl, past the doc-cursor hot methods
+    /// (`skip_to`, `next`, `decode_current_block`, `current_doc_id`), so adding
+    /// it doesn't shift their code offsets — those methods drive the flat-merge
+    /// AND path, which is measurably sensitive to its own instruction layout.
+    pub(super) fn tf_at_contained(&mut self, doc: u32) -> u32 {
+        // Inline (df=1) cursor: single pre-decoded posting.
+        if self.bytes.is_empty() {
+            return self.block_tfs[0];
+        }
+        let block = self.blocks[self.current_block];
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        if raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET {
+            let base = read_u32_le(&raw[4..8]);
+            let bit = (doc - base) as usize;
+            let tf_bits = raw[2] as usize;
+            let tfs_size = BLOCK_LEN * tf_bits / 8;
+            let bitset_end = raw.len() - tfs_size;
+            let word_idx = bit / 64;
+            let word_at = posting::HEADER_SIZE + word_idx * 8;
+            let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+            let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
+            if self.tf_decoded_block != self.current_block {
+                posting::decode_block_tfs(raw, &mut self.block_tfs);
+                self.tf_decoded_block = self.current_block;
+            }
+            self.block_tfs[rank as usize]
+        } else {
+            // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
+            let pos = self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .expect("contains(doc) confirmed presence");
+            self.block_tfs[pos]
+        }
+    }
+
+    /// Whether this term's postings are stored in the dense **bitset** encoding,
+    /// sampled from the first block's encoding byte (a dense term's blocks are
+    /// uniformly bitset). When true, [`Self::contains`] answers by an O(1)
+    /// bit-test instead of a block decode — the signal a 2-term AND uses to
+    /// decide the membership walk beats the flat-merge's block expansion.
+    ///
+    /// `#[cold]`: called once per query at dispatch, not in a per-doc loop —
+    /// out-of-line so it stays clear of the hot doc-cursor methods' layout.
+    #[cold]
+    pub(super) fn is_bitset_dense(&self) -> bool {
+        if self.bytes.is_empty() {
+            return false; // inline df=1 cursor: no postings bytes
+        }
+        match self.blocks.first() {
+            Some(block) => {
+                self.bytes
+                    .get(block.block_byte_offset + posting::ENCODING_OFF)
+                    == Some(&posting::ENCODING_BITSET)
+            }
+            None => false,
         }
     }
 }

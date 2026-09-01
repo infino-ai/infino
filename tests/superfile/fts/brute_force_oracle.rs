@@ -816,6 +816,201 @@ async fn oracle_and_membership_rejects_partial_matches() {
 }
 
 #[tokio::test]
+async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
+    // The middle routing tier: a *moderately*-sparse rarest term (df in
+    // [max_doc/64, max_doc/16)) reaches `and_membership_scored` only because the
+    // other terms are collectively >= 8x denser — the `+the +book +of +life`
+    // shape, a route the very-sparse membership oracles above never take. Its
+    // 200-doc intersection is spread across the whole doc-id range, so the walk's
+    // amortized Block-Max-AND window skip re-bounds across the common terms' ~32
+    // posting blocks (the very-sparse oracles prune over a <=9-doc intersection).
+    //
+    // To make the skip's correctness observable, 13 of the intersecting docs are
+    // "winners" with DISTINCT short lengths, placed at scattered doc ids; the rest
+    // are longer, uniformly lower-scoring fillers. Distinct lengths give distinct
+    // scores, so a small-k top-k has a well-defined answer; scattering the winners
+    // means the walk must fill the heap (bar rises, skip fires) yet still reach
+    // every winner — a skip that jumped past a winner's block would return the
+    // wrong doc-id SET, which the exact set check below catches.
+    //
+    // Lengths are kept < `bm25::LEN_QUANT_EXACT_MAX` (16): in that region infino's
+    // one-byte length norm is lossless, so winner scores equal textbook BM25
+    // exactly. Filler lengths sit above it (byte-quantized, ~6% error), so their
+    // scores are intentionally not compared to the exact-length oracle.
+    const N: u64 = 4000; // common/also span ~32 posting blocks of 128
+    const WINNERS: u64 = 13; // 13 distinct lengths fit the lossless region (dl 3..=15)
+    // `common`/`also`: every doc, dense bitset lists, df = N. `mid`: every 20th doc
+    // (df 200) — above N/64 = 62 (not the always tier) and below N/16 = 250, with
+    // others' df (2N) >= 8 * 200, so the density-gated middle tier routes here.
+    // Winner at every 15th mid doc (j = i/20 in 15,30,..,195): a distinct length
+    // 3..=15 assigned by a permutation (5 coprime to 13) so score order is shuffled
+    // relative to doc id. Every other mid doc is a filler (dl 40).
+    let winner_pad = |j: u64| -> Option<usize> {
+        if j >= 15 && j.is_multiple_of(15) && j / 15 <= WINNERS {
+            Some((((j / 15 - 1) * 5) % 13) as usize) // 0..12 ⇒ dl 3..=15, distinct, lossless
+        } else {
+            None
+        }
+    };
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let mut s = String::from("common also");
+            if i % 20 == 0 {
+                s.push_str(" mid");
+                let pad = winner_pad(i / 20).unwrap_or(37); // filler ⇒ dl 40 (quantized, low)
+                for _ in 0..pad {
+                    s.push_str(" pad");
+                }
+            } else {
+                s.push_str(&format!(" f{}", i % 13));
+            }
+            (i, s)
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    let terms = ["common".to_string(), "also".to_string(), "mid".to_string()];
+
+    // Full match set (k exceeds the 200-doc intersection): the walk must return
+    // exactly the intersection, regardless of scores.
+    let k_full = 300usize;
+    let got: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common also mid", k_full, BoolMode::And)
+        .await
+        .expect("AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let want_set: HashSet<u64> = (0..N).filter(|i| i % 20 == 0).collect();
+    let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
+    assert_eq!(
+        got_set, want_set,
+        "middle-tier membership AND must return exactly the intersection (docs divisible by 20)"
+    );
+    assert!(
+        want_set.len() > 128,
+        "intersection ({}) must span multiple posting blocks to exercise cross-block pruning",
+        want_set.len()
+    );
+
+    // The winners are in the lossless length region, so their scores must match
+    // textbook BM25 exactly (fillers' quantized scores are not checked).
+    let infino_score: HashMap<u64, f32> = got.iter().copied().collect();
+    let oracle_score: HashMap<u64, f32> =
+        oracle.top_k_terms_and(&terms, k_full).into_iter().collect();
+    let winners: Vec<u64> = (0..N)
+        .filter(|&i| i % 20 == 0 && winner_pad(i / 20).is_some())
+        .collect();
+    assert_eq!(
+        winners.len(),
+        WINNERS as usize,
+        "expected {WINNERS} winners"
+    );
+    for d in &winners {
+        let (inf, orc) = (infino_score[d], oracle_score[d]);
+        assert!(
+            (inf - orc).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "middle-tier winner score mismatch on doc {d}: infino={inf} oracle={orc}"
+        );
+    }
+
+    // Truncated top-k, k < WINNERS < intersection: the heap fills, the bar rises,
+    // and the Block-Max-AND window skip fires across the range. The winners are the
+    // only distinct-score docs and outscore every filler, so the top-k is exactly
+    // the k highest winners — assert that doc-id SET against textbook. A skip that
+    // dropped a scattered winner would return the wrong set.
+    let k = 10usize;
+    let got_topk: HashSet<u64> = infino
+        .bm25_hits_async("title", "common also mid", k, BoolMode::And)
+        .await
+        .expect("truncated AND search")
+        .into_iter()
+        .map(|(d, _)| d as u64)
+        .collect();
+    let want_topk: HashSet<u64> = oracle
+        .top_k_terms_and(&terms, k)
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    assert_eq!(got_topk.len(), k, "truncated AND must return exactly k");
+    assert_eq!(
+        got_topk, want_topk,
+        "middle-tier truncated top-{k} must return the exact highest-scoring doc set"
+    );
+}
+
+#[tokio::test]
+async fn oracle_and_membership_reads_tf_above_one() {
+    // `tf_at_contained` reads a matched *non-leader* term's tf on a full match —
+    // by popcount-rank on a bitset block, or binary-search on a PACKED block. The
+    // other membership oracles plant each term once per doc (tf = 1), so a read
+    // that ignored the tf array and returned a constant would pass them. Here the
+    // two non-leader terms appear a *varying* number of times in the matched docs,
+    // so a wrong tf read gives a wrong BM25 score. `common` (df = N, fully dense ⇒
+    // bitset blocks) exercises the rank path; `mid` (df ≈ N/4 ⇒ PFOR blocks) the
+    // binary-search path. `rare` is the sparse leader (df 10 < N/64 ⇒ membership).
+    const N: u64 = 1000; // multi-block; `common` forms bitset blocks
+    let common_tf = |g: u64| 1 + g % 4; // 1..4 across the 10 matched docs
+    let mid_tf = |g: u64| 1 + g % 3; // 1..3 across the 10 matched docs
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let g = i / 100;
+            let mut s = String::new();
+            for _ in 0..common_tf(g) {
+                s.push_str("common ");
+            }
+            if i % 4 == 0 {
+                for _ in 0..mid_tf(g) {
+                    s.push_str("mid ");
+                }
+            }
+            if i % 100 == 0 {
+                s.push_str("rare ");
+            }
+            // Keep doc length < `bm25::LEN_QUANT_EXACT_MAX` (16) so the length norm
+            // is lossless and infino's scores equal textbook BM25 exactly.
+            s.push_str(&format!("f{}", i % 7));
+            (i, s)
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    let terms = ["common".to_string(), "mid".to_string(), "rare".to_string()];
+
+    let k = 64usize; // > intersection (10) ⇒ whole match set, checkable exactly
+    let got: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common mid rare", k, BoolMode::And)
+        .await
+        .expect("AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    // rare docs (i % 100 == 0) also carry common and mid (i % 100 == 0 ⇒ i % 4 ==
+    // 0), so the intersection is exactly the 10 rare docs.
+    let want_set: HashSet<u64> = (0..N).filter(|i| i % 100 == 0).collect();
+    let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
+    assert_eq!(got_set, want_set, "intersection must be the 10 rare docs");
+    // At least one matched doc has a non-leader tf > 1 — otherwise the test would
+    // not exercise the tf read at all (guards against a future corpus change).
+    assert!(
+        (0..N).any(|i| i % 100 == 0 && (common_tf(i / 100) > 1 || mid_tf(i / 100) > 1)),
+        "corpus must plant tf > 1 on a matched non-leader term"
+    );
+    let want: HashMap<u64, f32> = oracle.top_k_terms_and(&terms, k).into_iter().collect();
+    for (d, s) in &got {
+        assert!(
+            (s - want[d]).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "membership tf>1 score mismatch on doc {d}: infino={s} oracle={}",
+            want[d]
+        );
+    }
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
