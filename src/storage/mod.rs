@@ -590,6 +590,11 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     fn local_path(&self, _uri: &str) -> Option<PathBuf> {
         None
     }
+
+    /// Rotate the credential in place from `opts`; `false` if unsupported and the caller must reopen.
+    fn update_credentials(&self, _opts: &StorageOptions) -> Result<bool, StorageError> {
+        Ok(false)
+    }
 }
 
 /// Convert an object-store LIST result back into the provider-relative key

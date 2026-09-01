@@ -13,12 +13,13 @@
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{
-    ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload, ObjectMeta as OsMeta,
-    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, StaticCredentialProvider,
+    ClientOptions, CredentialProvider, Error as ObjError, GetOptions, GetRange, MultipartUpload,
+    ObjectMeta as OsMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
     UpdateVersion,
     gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
     path::Path as ObjPath,
@@ -49,7 +50,34 @@ const GCS_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// `object_store` config-key, so it is applied programmatically through the
 /// client's credential provider. When present it is consumed here rather than
 /// folded on as a `google_*` config key (which would be rejected as unknown).
-const GCS_BEARER_TOKEN_OPTION: &str = "google_bearer_token";
+pub(crate) const GCS_BEARER_TOKEN_OPTION: &str = "google_bearer_token";
+
+/// A GCS bearer credential the client reads per request, so a rotation swaps the token in place.
+#[derive(Debug)]
+pub struct SwappableGcpCredential {
+    current: ArcSwap<GcpCredential>,
+}
+
+impl SwappableGcpCredential {
+    pub fn new(bearer: String) -> Arc<Self> {
+        Arc::new(Self {
+            current: ArcSwap::from_pointee(GcpCredential { bearer }),
+        })
+    }
+
+    pub fn set_bearer(&self, bearer: String) {
+        self.current.store(Arc::new(GcpCredential { bearer }));
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for SwappableGcpCredential {
+    type Credential = GcpCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<GcpCredential>> {
+        Ok(self.current.load_full())
+    }
+}
 
 /// GCS-backed `StorageProvider`. Cheap to clone; the inner
 /// `GoogleCloudStorage` shares its HTTP client across clones.
@@ -58,6 +86,7 @@ pub struct GcsStorageProvider {
     bucket: String,
     prefix: String,
     store: Arc<GoogleCloudStorage>,
+    credential: Option<Arc<SwappableGcpCredential>>,
     meter: Arc<UsageMeter>,
 }
 
@@ -79,20 +108,30 @@ impl GcsStorageProvider {
         prefix: impl Into<String>,
         opts: &StorageOptions,
     ) -> Result<Self, StorageError> {
+        Self::new_with_shared_credential(bucket, prefix, opts, None)
+    }
+
+    /// Like [`Self::new_with_prefix`] but shares a caller-owned rotatable credential when supplied.
+    pub fn new_with_shared_credential(
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        opts: &StorageOptions,
+        shared: Option<Arc<SwappableGcpCredential>>,
+    ) -> Result<Self, StorageError> {
         let bucket = bucket.into();
         let uri = format!("gs://{bucket}");
         let mut builder = GoogleCloudStorageBuilder::new()
             .with_bucket_name(&bucket)
             .with_client_options(tuned_client_options())
             .with_retry(retry::config());
-        // A bearer token has no object_store config-key, so pull it out and set
-        // it on the client's credential provider; the rest fold on as config keys.
         let mut config_opts = opts.clone();
-        if let Some(bearer) = config_opts.remove(GCS_BEARER_TOKEN_OPTION) {
-            builder =
-                builder.with_credentials(Arc::new(StaticCredentialProvider::new(GcpCredential {
-                    bearer,
-                })));
+        let bearer = config_opts.remove(GCS_BEARER_TOKEN_OPTION);
+        let credential = match shared {
+            Some(shared) => Some(shared),
+            None => bearer.map(SwappableGcpCredential::new),
+        };
+        if let Some(credential) = &credential {
+            builder = builder.with_credentials(Arc::clone(credential) as Arc<_>);
         }
         let builder = apply::<GoogleConfigKey, _>(builder, &config_opts, &uri, |b, key, value| {
             b.with_config(key, value)
@@ -105,6 +144,7 @@ impl GcsStorageProvider {
             bucket,
             prefix: normalize_prefix(prefix),
             store: Arc::new(store),
+            credential,
             meter: UsageMeter::process_default(),
         })
     }
@@ -116,8 +156,14 @@ impl GcsStorageProvider {
             bucket: bucket.into(),
             prefix: String::new(),
             store: Arc::new(store),
+            credential: None,
             meter: UsageMeter::process_default(),
         }
+    }
+
+    /// The swappable credential this provider fetches with, if any.
+    pub fn shared_credential(&self) -> Option<Arc<SwappableGcpCredential>> {
+        self.credential.clone()
     }
 
     /// Replace the usage meter (connection-scoped ledger).
@@ -426,6 +472,16 @@ impl StorageProvider for GcsStorageProvider {
     fn usage_meter(&self) -> Arc<UsageMeter> {
         Arc::clone(&self.meter)
     }
+
+    fn update_credentials(&self, opts: &StorageOptions) -> Result<bool, StorageError> {
+        let (Some(credential), Some(bearer)) =
+            (&self.credential, opts.get(GCS_BEARER_TOKEN_OPTION))
+        else {
+            return Ok(false);
+        };
+        credential.set_bearer(bearer.clone());
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +536,82 @@ mod tests {
         let provider = GcsStorageProvider::new_with_prefix("test-bucket", "", &opts)
             .expect("bearer token and config keys coexist");
         assert_eq!(provider.bucket, "test-bucket");
+    }
+
+    #[tokio::test]
+    async fn swappable_credential_swaps_the_bearer_in_place() {
+        let cred = SwappableGcpCredential::new("t0".to_string());
+        assert_eq!(
+            cred.get_credential().await.expect("credential").bearer,
+            "t0"
+        );
+        cred.set_bearer("t1".to_string());
+        assert_eq!(
+            cred.get_credential().await.expect("credential").bearer,
+            "t1"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_with_bearer_updates_credential_in_place() {
+        let opts = StorageOptions::from([(GCS_BEARER_TOKEN_OPTION.to_string(), "t0".to_string())]);
+        let provider = GcsStorageProvider::new_with_prefix("b", "", &opts).expect("build");
+        let cred = provider.shared_credential().expect("swappable present");
+        assert_eq!(
+            cred.get_credential().await.expect("credential").bearer,
+            "t0"
+        );
+
+        let rotated =
+            StorageOptions::from([(GCS_BEARER_TOKEN_OPTION.to_string(), "t1".to_string())]);
+        assert!(provider.update_credentials(&rotated).expect("swap ok"));
+        assert_eq!(
+            cred.get_credential().await.expect("credential").bearer,
+            "t1"
+        );
+    }
+
+    #[test]
+    fn provider_without_bearer_has_no_swappable_and_update_is_false() {
+        let provider =
+            GcsStorageProvider::new_with_prefix("b", "", &StorageOptions::new()).expect("build");
+        assert!(provider.shared_credential().is_none());
+        let rotated =
+            StorageOptions::from([(GCS_BEARER_TOKEN_OPTION.to_string(), "t1".to_string())]);
+        assert!(!provider.update_credentials(&rotated).expect("no swap"));
+    }
+
+    #[tokio::test]
+    async fn providers_sharing_a_credential_rotate_together() {
+        let cred = SwappableGcpCredential::new("t0".to_string());
+        let opts = StorageOptions::new();
+        let p1 = GcsStorageProvider::new_with_shared_credential(
+            "b",
+            "one",
+            &opts,
+            Some(Arc::clone(&cred)),
+        )
+        .expect("p1");
+        let p2 = GcsStorageProvider::new_with_shared_credential(
+            "b",
+            "two",
+            &opts,
+            Some(Arc::clone(&cred)),
+        )
+        .expect("p2");
+        assert!(Arc::ptr_eq(&p1.shared_credential().expect("c1"), &cred));
+        assert!(Arc::ptr_eq(&p2.shared_credential().expect("c2"), &cred));
+
+        cred.set_bearer("t1".to_string());
+        assert_eq!(
+            p1.shared_credential()
+                .expect("c1")
+                .get_credential()
+                .await
+                .expect("credential")
+                .bearer,
+            "t1"
+        );
     }
 
     #[test]

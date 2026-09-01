@@ -60,6 +60,7 @@ use crate::{
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageError, StorageProvider,
+        gcs::{GCS_BEARER_TOKEN_OPTION, SwappableGcpCredential},
     },
     superfile::{
         builder::FtsConfig,
@@ -115,11 +116,23 @@ pub fn connect_with(
         return connect_remote(backend, options);
     }
     let usage_meter = UsageMeter::new();
+    let gcs_credential = match &backend {
+        Backend::Gcs { .. } => options
+            .storage_options
+            .get(GCS_BEARER_TOKEN_OPTION)
+            .map(|bearer| SwappableGcpCredential::new(bearer.clone())),
+        _ => None,
+    };
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
         _ => {
-            let root = backend_to_provider(&backend, &options, Arc::clone(&usage_meter))?
-                .expect("non-memory backend yields a storage provider");
+            let root = backend_to_provider(
+                &backend,
+                &options,
+                Arc::clone(&usage_meter),
+                gcs_credential.as_ref(),
+            )?
+            .expect("non-memory backend yields a storage provider");
             // Opt-in probe: fail at connect on bad credentials, not first use.
             if options.validate {
                 bridge_sync_to_async(read_catalog(root.as_ref()))?;
@@ -149,6 +162,7 @@ pub fn connect_with(
             store,
             connection_memory_budget,
             usage_meter,
+            gcs_credential,
         }),
     })
 }
@@ -211,6 +225,8 @@ struct ConnectionInner {
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
+    /// Swappable GCS credential shared by every provider on this connection.
+    gcs_credential: Option<Arc<SwappableGcpCredential>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -394,6 +410,7 @@ impl Connection {
                     &self.inner.backend.join(&location),
                     &self.inner.options,
                     Arc::clone(&self.inner.usage_meter),
+                    self.inner.gcs_credential.as_ref(),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?
                 .expect("non-memory backend yields a storage provider");
@@ -536,6 +553,7 @@ impl Connection {
                     &self.inner.backend.join(&entry.location),
                     &self.inner.options,
                     Arc::clone(&self.inner.usage_meter),
+                    self.inner.gcs_credential.as_ref(),
                 )
                 .map_err(|e| e.with_context("open_table", Some(name)))?
                 .expect("non-memory backend yields a storage provider");
@@ -591,6 +609,21 @@ impl Connection {
     /// # let _ = posts;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    /// Rotate the object-store credential in place; `false` if unsupported and the caller should reopen.
+    pub fn update_storage_credentials(&self, storage_options: &[(String, String)]) -> bool {
+        let Some(credential) = &self.inner.gcs_credential else {
+            return false;
+        };
+        let Some((_, bearer)) = storage_options
+            .iter()
+            .find(|(key, _)| key == GCS_BEARER_TOKEN_OPTION)
+        else {
+            return false;
+        };
+        credential.set_bearer(bearer.clone());
+        true
+    }
+
     pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
         #[cfg(feature = "remote")]
         if let CatalogStore::Remote(c) = &self.inner.store {
@@ -961,6 +994,7 @@ fn backend_to_provider(
     backend: &Backend,
     options: &ConnectOptions,
     usage_meter: Arc<UsageMeter>,
+    gcs_credential: Option<&Arc<SwappableGcpCredential>>,
 ) -> Result<Option<Arc<dyn StorageProvider>>, InfinoError> {
     let provider: Option<Arc<dyn StorageProvider>> = match backend {
         Backend::Memory => None,
@@ -977,8 +1011,13 @@ fn backend_to_provider(
                 .with_usage_meter(usage_meter),
         )),
         Backend::Gcs { bucket, prefix } => Some(Arc::new(
-            GcsStorageProvider::new_with_prefix(bucket, prefix, &options.storage_options)?
-                .with_usage_meter(usage_meter),
+            GcsStorageProvider::new_with_shared_credential(
+                bucket,
+                prefix,
+                &options.storage_options,
+                gcs_credential.cloned(),
+            )?
+            .with_usage_meter(usage_meter),
         )),
         // A remote (hosted) connection forwards operations over the wire and
         // never opens a local storage provider; `connect_with` routes it away
@@ -2819,6 +2858,17 @@ mod tests {
             .downcast_ref::<LargeStringArray>()
             .expect("MIN(title) is LargeUtf8");
         assert_eq!(lo.value(0), "alpha");
+    }
+
+    #[test]
+    fn update_storage_credentials_is_false_without_a_gcs_backend() {
+        let conn = connect("memory://").expect("connect");
+        assert!(
+            !conn.update_storage_credentials(&[(
+                "google_bearer_token".to_string(),
+                "t1".to_string()
+            )])
+        );
     }
 
     /// Cross-table join whose key is a viewed string column: the join key comes
