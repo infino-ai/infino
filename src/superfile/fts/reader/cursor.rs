@@ -658,6 +658,28 @@ impl TermCursor {
     /// (the doc ids must be decoded to locate the doc), so it falls back to
     /// `skip_to` + `current_tf`. Like [`Self::contains`] it advances
     /// `current_block`, so a cursor probed this way must not also be iterated.
+    /// Rank of the doc at in-block position `bit` among a bitset block's presence
+    /// bits — the count of set bits before `bit`, i.e. that doc's index into the
+    /// block's doc-order tf array. `word` is the presence word already loaded at
+    /// `bit`'s position; `bitset_end` is the end of the presence bitmap (start of
+    /// the tf array). Shared by [`Self::bitset_probe_tf`] (which first checks the
+    /// bit is set) and [`Self::tf_at_contained`] (which knows it is).
+    #[inline]
+    fn bitset_tf_rank(raw: &[u8], bit: usize, word: u64, bitset_end: usize) -> u32 {
+        let word_idx = bit / 64;
+        let presence = &raw[posting::HEADER_SIZE..bitset_end];
+        let mut rank: u32 = 0;
+        for w in presence[..word_idx * 8].chunks_exact(8) {
+            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
+        }
+        let below = if bit.is_multiple_of(64) {
+            0u64
+        } else {
+            (1u64 << (bit % 64)) - 1
+        };
+        rank + (word & below).count_ones()
+    }
+
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -702,20 +724,8 @@ impl TermCursor {
         if (word >> (bit % 64)) & 1 == 0 {
             return None; // doc not present in this block
         }
-        // Present. `rank` = number of set bits before `bit` = popcount of the
-        // whole presence words ahead of this one + popcount of this word below
-        // `bit`. The r-th set bit (doc) maps to the r-th tf in doc order.
-        let presence = &raw[posting::HEADER_SIZE..bitset_end];
-        let mut rank: u32 = 0;
-        for w in presence[..word_idx * 8].chunks_exact(8) {
-            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
-        }
-        let below = if bit.is_multiple_of(64) {
-            0u64
-        } else {
-            (1u64 << (bit % 64)) - 1
-        };
-        rank += (word & below).count_ones();
+        // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
+        let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
         // Decode this block's tf array once (doc order), reused across a run of
         // candidates in the same block; the doc ids are never expanded.
         if self.tf_decoded_block != self.current_block {
@@ -1002,17 +1012,7 @@ impl TermCursor {
             let word_idx = bit / 64;
             let word_at = posting::HEADER_SIZE + word_idx * 8;
             let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
-            let presence = &raw[posting::HEADER_SIZE..bitset_end];
-            let mut rank: u32 = 0;
-            for w in presence[..word_idx * 8].chunks_exact(8) {
-                rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
-            }
-            let below = if bit.is_multiple_of(64) {
-                0u64
-            } else {
-                (1u64 << (bit % 64)) - 1
-            };
-            rank += (word & below).count_ones();
+            let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
             if self.tf_decoded_block != self.current_block {
                 posting::decode_block_tfs(raw, &mut self.block_tfs);
                 self.tf_decoded_block = self.current_block;
