@@ -846,7 +846,7 @@ async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
     // 3..=15 assigned by a permutation (5 coprime to 13) so score order is shuffled
     // relative to doc id. Every other mid doc is a filler (dl 40).
     let winner_pad = |j: u64| -> Option<usize> {
-        if j >= 15 && j % 15 == 0 && j / 15 <= WINNERS {
+        if j >= 15 && j.is_multiple_of(15) && j / 15 <= WINNERS {
             Some((((j / 15 - 1) * 5) % 13) as usize) // 0..12 ⇒ dl 3..=15, distinct, lossless
         } else {
             None
