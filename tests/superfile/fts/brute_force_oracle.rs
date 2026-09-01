@@ -942,6 +942,75 @@ async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
 }
 
 #[tokio::test]
+async fn oracle_and_membership_reads_tf_above_one() {
+    // `tf_at_contained` reads a matched *non-leader* term's tf on a full match —
+    // by popcount-rank on a bitset block, or binary-search on a PACKED block. The
+    // other membership oracles plant each term once per doc (tf = 1), so a read
+    // that ignored the tf array and returned a constant would pass them. Here the
+    // two non-leader terms appear a *varying* number of times in the matched docs,
+    // so a wrong tf read gives a wrong BM25 score. `common` (df = N, fully dense ⇒
+    // bitset blocks) exercises the rank path; `mid` (df ≈ N/4 ⇒ PFOR blocks) the
+    // binary-search path. `rare` is the sparse leader (df 10 < N/64 ⇒ membership).
+    const N: u64 = 1000; // multi-block; `common` forms bitset blocks
+    let common_tf = |g: u64| 1 + g % 4; // 1..4 across the 10 matched docs
+    let mid_tf = |g: u64| 1 + g % 3; // 1..3 across the 10 matched docs
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let g = i / 100;
+            let mut s = String::new();
+            for _ in 0..common_tf(g) {
+                s.push_str("common ");
+            }
+            if i % 4 == 0 {
+                for _ in 0..mid_tf(g) {
+                    s.push_str("mid ");
+                }
+            }
+            if i % 100 == 0 {
+                s.push_str("rare ");
+            }
+            // Keep doc length < `bm25::LEN_QUANT_EXACT_MAX` (16) so the length norm
+            // is lossless and infino's scores equal textbook BM25 exactly.
+            s.push_str(&format!("f{}", i % 7));
+            (i, s)
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    let terms = ["common".to_string(), "mid".to_string(), "rare".to_string()];
+
+    let k = 64usize; // > intersection (10) ⇒ whole match set, checkable exactly
+    let got: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common mid rare", k, BoolMode::And)
+        .await
+        .expect("AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    // rare docs (i % 100 == 0) also carry common and mid (i % 100 == 0 ⇒ i % 4 ==
+    // 0), so the intersection is exactly the 10 rare docs.
+    let want_set: HashSet<u64> = (0..N).filter(|i| i % 100 == 0).collect();
+    let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
+    assert_eq!(got_set, want_set, "intersection must be the 10 rare docs");
+    // At least one matched doc has a non-leader tf > 1 — otherwise the test would
+    // not exercise the tf read at all (guards against a future corpus change).
+    assert!(
+        (0..N).any(|i| i % 100 == 0 && (common_tf(i / 100) > 1 || mid_tf(i / 100) > 1)),
+        "corpus must plant tf > 1 on a matched non-leader term"
+    );
+    let want: HashMap<u64, f32> = oracle.top_k_terms_and(&terms, k).into_iter().collect();
+    for (d, s) in &got {
+        assert!(
+            (s - want[d]).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "membership tf>1 score mismatch on doc {d}: infino={s} oracle={}",
+            want[d]
+        );
+    }
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
