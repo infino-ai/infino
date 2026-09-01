@@ -171,6 +171,13 @@ fn count_and_intersect_membership(mut cursors: Vec<TermCursor>) -> u64 {
         .unwrap_or(0);
     let mut driver = cursors.swap_remove(driver_idx);
     let mut others = cursors;
+    // Probe the most selective term first: `all(contains)` short-circuits on the
+    // first miss, so ordering the others rarest-first (ascending df, i.e. lowest
+    // presence probability) rejects a non-matching driver doc in the fewest
+    // probes — and, crucially, avoids touching a very common term's large
+    // presence structure (e.g. `the`) for the majority of driver docs that a
+    // rarer companion already excludes.
+    others.sort_by_key(|c| c.df);
     let mut n = 0u64;
     while !driver.is_exhausted() {
         let doc = driver.current_doc_id();
@@ -663,6 +670,12 @@ impl FtsReader {
             .unwrap_or(0);
         let mut driver = cursors.swap_remove(driver_idx);
         let mut others = cursors;
+        // Presence pass short-circuits on the first miss, so probe the most
+        // selective term first: rarest-first (ascending df) rejects a
+        // non-matching driver doc in the fewest bit-tests and avoids touching a
+        // very common term's large presence structure for docs a rarer companion
+        // already excludes. Order is irrelevant to the score (Σ is commutative).
+        others.sort_by_key(|c| c.df);
         let need_score = sink.needs_score();
         while !driver.is_exhausted() {
             let doc = driver.current_doc_id();
