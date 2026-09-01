@@ -1011,6 +1011,43 @@ async fn oracle_and_membership_reads_tf_above_one() {
 }
 
 #[tokio::test]
+async fn dedup_repeated_query_term_scores_as_weighted() {
+    // A repeated query term is collapsed to one cursor with a query-term-frequency
+    // weight folded into its idf. BM25 is linear in that weight, so `+common
+    // +common` must score exactly 2x `+common` and return the same docs in the
+    // same order — dedup changes cost, never results. (Also checks the single-term
+    // fast path defers to the weighted path when the lone term is repeated.)
+    const N: u64 = 500;
+    let owned: Vec<(u64, String)> = (0..N).map(|i| (i, format!("common f{}", i % 7))).collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+
+    let single: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "+common", 10, BoolMode::And)
+        .await
+        .expect("single-term AND")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let dup: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "+common +common", 10, BoolMode::And)
+        .await
+        .expect("repeated-term AND")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    assert_eq!(single.len(), dup.len(), "dedup changed the result count");
+    assert!(!single.is_empty(), "expected hits");
+    for ((d1, s1), (d2, s2)) in single.iter().zip(dup.iter()) {
+        assert_eq!(d1, d2, "dedup changed the doc order/set");
+        assert!(
+            (s2 - 2.0 * s1).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "repeated-term score {s2} != 2x single-term score {s1} on doc {d1}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
