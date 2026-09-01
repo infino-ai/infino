@@ -20,11 +20,12 @@ use std::time::Duration;
 
 use arrow::compute::concat_batches;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use arrow_array::RecordBatch;
+use arrow_array::{Array, Decimal128Array, RecordBatch};
 use arrow_schema::Schema;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
+use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -38,6 +39,8 @@ use infino::{
 // the engine's public API and reachable only under `infino/test-helpers`.
 #[cfg(feature = "diagnostics")]
 use infino::VectorSearchOptions;
+
+mod bench_serve;
 
 // Typed exception surface for the bindings. `InfinoError` is the base for every
 // infino error, so a caller can catch the whole family with one `except` or
@@ -535,7 +538,11 @@ impl Table {
         filter_mode: Option<&str>,
         projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let filter = parse_filter(filter_column.as_deref(), filter_query.as_deref(), filter_mode)?;
+        let filter = parse_filter(
+            filter_column.as_deref(),
+            filter_query.as_deref(),
+            filter_mode,
+        )?;
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
@@ -544,6 +551,40 @@ impl Table {
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
+    }
+
+    /// Lean search: return only the top-k `_id`s as a numpy `uint8[k, 16]`
+    /// (big-endian decimal128 keys). The search runs GIL-free (`detach`); the
+    /// only GIL-held step is creating one numpy array — no pyarrow Table, no
+    /// per-row Python objects — so the per-query GIL-serialized marshalling is
+    /// minimized for high-concurrency serving.
+    #[pyo3(signature = (column, query, k))]
+    fn vector_search_ids<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        query: Vec<f32>,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batches = py
+            .detach(|| self.inner.vector_search(column, &query, k, None, None))
+            .map_err(py_err)?;
+        let mut bytes: Vec<u8> = Vec::with_capacity(k * 16);
+        for b in &batches {
+            let col = b
+                .column_by_name("_id")
+                .ok_or_else(|| PyRuntimeError::new_err("vector_search result missing _id"))?;
+            let dec = col
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| PyRuntimeError::new_err("_id column is not decimal128"))?;
+            for i in 0..dec.len() {
+                bytes.extend_from_slice(&dec.value(i).to_be_bytes());
+            }
+        }
+        let rows = bytes.len() / 16;
+        let arr = bytes.into_pyarray(py).reshape([rows, 16])?;
+        Ok(arr.into_any())
     }
 
     /// Diagnostic build only: `nprobe` / `rerank_mult` overrides for
@@ -572,12 +613,22 @@ impl Table {
         if let Some(n) = rerank_mult {
             opts = opts.with_rerank_mult(n);
         }
-        let filter = parse_filter(filter_column.as_deref(), filter_query.as_deref(), filter_mode)?;
+        let filter = parse_filter(
+            filter_column.as_deref(),
+            filter_query.as_deref(),
+            filter_mode,
+        )?;
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner
-                    .vector_search_with_options(column, &query, k, opts, filter, names.as_deref())
+                self.inner.vector_search_with_options(
+                    column,
+                    &query,
+                    k,
+                    opts,
+                    filter,
+                    names.as_deref(),
+                )
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -965,6 +1016,7 @@ fn coerce_to_record_batch(
 #[pyo3(name = "_infino")]
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_function(wrap_pyfunction!(bench_serve::bench_serve_tcp, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<Table>()?;
     m.add_class::<IndexSpec>()?;
