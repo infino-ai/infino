@@ -83,6 +83,10 @@ const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
 
+/// Filename suffix (appended after `.blocks`) for the persisted filled-block
+/// index sidecar.
+const BLOCKS_IDX_SUFFIX: &str = ".idx";
+
 /// How old an in-flight tempfile must be before the open-time scan reclaims it. A live cold
 /// fetch's tempfile is seconds old, so one this stale can only be a crashed fetch's leftover;
 /// deleting a live one would fail the owner's rename and cost it a retried fetch.
@@ -1127,8 +1131,7 @@ impl DiskCacheStore {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with(BLOCKS_FILE_SUFFIX) {
-                let _ = fs::remove_file(&path);
+            if name.ends_with(BLOCKS_IDX_SUFFIX) || name.ends_with(BLOCKS_FILE_SUFFIX) {
                 continue;
             }
 
@@ -1193,10 +1196,11 @@ impl DiskCacheStore {
     ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
         let path = self.cache_path(uri);
         let Ok(meta) = fs::metadata(&path) else {
-            // A counted file that is gone (deleted outside the engine) must stop counting now:
-            // left in place, its record double-counts against the fetched replacement and a later
-            // eviction of it would unlink the replacement's file.
-            self.discard_cache_file(uri);
+            // No whole-file copy; decrement a vanished counted one but leave any block cache intact.
+            if let Some((_, file)) = self.unindexed.remove(uri) {
+                self.current_bytes
+                    .fetch_sub(file.size_bytes, Ordering::Release);
+            }
             return Ok(None);
         };
 
@@ -1254,6 +1258,7 @@ impl DiskCacheStore {
 
         let _ = fs::remove_file(self.cache_path(uri));
         let _ = fs::remove_file(self.blocks_path(uri));
+        let _ = fs::remove_file(self.blocks_idx_path(uri));
     }
 
     /// Delete never-opened files, oldest first, until `bytes_needed` is freed. Returns the bytes
@@ -1302,6 +1307,20 @@ impl DiskCacheStore {
         self.config
             .cache_root
             .join(format!("{}{BLOCKS_FILE_SUFFIX}", uri.cache_filename()))
+    }
+
+    /// Path of the persisted filled-block index
+    fn blocks_idx_path(&self, uri: &SuperfileUri) -> PathBuf {
+        self.config.cache_root.join(format!(
+            "{}{BLOCKS_FILE_SUFFIX}{BLOCKS_IDX_SUFFIX}",
+            uri.cache_filename()
+        ))
+    }
+
+    /// Account bytes for an adopted block cache whose data is already on disk; a
+    /// later reservation evicts if this pushes the store over budget.
+    pub(super) fn account_adopted_bytes(&self, bytes: u64) {
+        self.current_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     /// Build a per-URI tempfile path (sparse destination
@@ -2082,6 +2101,8 @@ impl DiskCacheStore {
             if let Some((_, entry)) = self.cached.remove(&uri) {
                 let path = self.cache_path(&uri);
                 let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(self.blocks_path(&uri));
+                let _ = fs::remove_file(self.blocks_idx_path(&uri));
                 self.release_entry_accounting(&entry);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
             }
@@ -2112,6 +2133,7 @@ impl DiskCacheStore {
         self.coordinators.remove(uri);
         let _ = fs::remove_file(self.cache_path(uri));
         let _ = fs::remove_file(self.blocks_path(uri));
+        let _ = fs::remove_file(self.blocks_idx_path(uri));
         if present {
             self.n_gc_drops.fetch_add(1, Ordering::AcqRel);
         }
@@ -2712,6 +2734,7 @@ async fn lazy_background_fill(
             }
         };
 
+        let block_source_retained = block_source.is_some();
         match store.cached.entry(uri) {
             Entry::Occupied(mut occupied) => {
                 *occupied.get_mut() = Arc::new(CachedEntry {
@@ -2724,6 +2747,10 @@ async fn lazy_background_fill(
                     fill_spawned: AtomicBool::new(true),
                     last_access_us: AtomicU64::new(store.now_us()),
                 });
+                if !block_source_retained {
+                    let _ = fs::remove_file(store.blocks_path(&uri));
+                    let _ = fs::remove_file(store.blocks_idx_path(&uri));
+                }
             }
             Entry::Vacant(_) => {
                 let _ = fs::remove_file(&final_path);
@@ -3354,6 +3381,38 @@ mod tests {
             "orphan file still unlinked"
         );
         assert_eq!(store.stats().n_gc_drops, 0);
+    }
+
+    #[tokio::test]
+    async fn erase_superfile_local_copy_unlinks_block_index() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        fs::write(store.blocks_path(&uri), b"blocks").expect("blocks");
+        fs::write(store.blocks_idx_path(&uri), b"idx").expect("idx");
+
+        store.erase_superfile_local_copy(&uri);
+
+        assert!(!store.blocks_path(&uri).exists());
+        assert!(!store.blocks_idx_path(&uri).exists());
+    }
+
+    #[tokio::test]
+    async fn restart_scan_preserves_block_cache_and_index() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        fs::write(store.blocks_path(&uri), b"sparse block bytes").expect("blocks");
+        fs::write(store.blocks_idx_path(&uri), b"index bytes").expect("idx");
+
+        let reopened = reopen_store(&store, |_| {});
+
+        assert!(
+            reopened.blocks_path(&uri).exists(),
+            "restart keeps the .blocks file for adoption"
+        );
+        assert!(
+            reopened.blocks_idx_path(&uri).exists(),
+            "restart keeps the .blocks.idx sidecar"
+        );
     }
 
     // ----- lazy open: cost scales with the working set, not the directory -----
