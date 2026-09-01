@@ -1032,6 +1032,10 @@ impl TermCursor {
     /// uniformly bitset). When true, [`Self::contains`] answers by an O(1)
     /// bit-test instead of a block decode — the signal a 2-term AND uses to
     /// decide the membership walk beats the flat-merge's block expansion.
+    ///
+    /// `#[cold]`: called once per query at dispatch, not in a per-doc loop —
+    /// out-of-line so it stays clear of the hot doc-cursor methods' layout.
+    #[cold]
     pub(super) fn is_bitset_dense(&self) -> bool {
         if self.bytes.is_empty() {
             return false; // inline df=1 cursor: no postings bytes

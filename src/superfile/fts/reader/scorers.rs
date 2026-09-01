@@ -258,6 +258,10 @@ fn block_max_and_bound(
 ///   the flat-merge. A rarest denser than `1/16` (the all-dense AND) also stays
 ///   on the flat-merge. The walk carries the flat-merge's own Block-Max-AND
 ///   heap-bar skip, so the middle tier doesn't regress the ranked tail (p99).
+// `#[cold]`: this is a once-per-query dispatch decision, not per-doc hot code, so
+// place it out of line — keeping its size (and edits to it) from shifting the
+// layout of the flat-merge/membership scorers it shares this module with.
+#[cold]
 fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> bool {
     if !has_bitset_blocks || cursors.len() < 2 {
         return false;
