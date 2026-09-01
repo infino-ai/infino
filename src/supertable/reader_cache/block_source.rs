@@ -26,13 +26,15 @@
 //! land — so eviction sees a lazy entry's true footprint. On budget
 //! exhaustion, or once this source's cache entry has been replaced (eviction
 //! / mmap promotion), reads degrade to plain uncached passthrough instead of
-//! failing. The source releases its accounted bytes and unlinks its file on
-//! `Drop` (i.e. when the last in-flight reader over it goes away).
+//! failing. The source releases its accounted bytes on `Drop` (i.e. when the
+//! last in-flight reader over it goes away); the sparse file and its persisted
+//! index stay on disk so a later generation can adopt them.
 
 use std::{
     fs,
     os::unix::fs::FileExt,
     path::PathBuf,
+    process,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
@@ -57,7 +59,9 @@ use crate::{
 /// ~55K). Post-drain vector queries read ~0.25–2 MiB scan ranges, so
 /// 512 KiB keeps first-touch overshoot well under 2× while still
 /// coalescing a multi-MiB scan into a handful of blocks.
-const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
+pub(super) const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
+
+static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Lazily-initialized sparse backing file. Created on the first cached read
 /// (the object size may only be known after the open-time `tail()` on
@@ -210,17 +214,16 @@ impl BlockCachedSource {
             return None;
         }
         let idx_bytes = fs::read(self.idx_path()).ok()?;
-        let bitmap = RoaringBitmap::deserialize_from(idx_bytes.as_slice()).ok()?;
+        let (bitmap, adopted_bytes) = indexed_filled_bytes(size, &idx_bytes)?;
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&self.path)
             .ok()?;
-        let adopted_bytes: u64 = bitmap.iter().map(|b| Self::block_len(size, b)).sum();
         if self.owns_accounting
             && let Some(store) = self.store.upgrade()
         {
-            store.account_adopted_bytes(adopted_bytes);
+            store.account_adopted_bytes(&self.uri, adopted_bytes);
         }
         self.filled_bytes.store(adopted_bytes, Ordering::Release);
         *self.filled.lock().expect("filled bitmap mutex poisoned") = bitmap;
@@ -234,14 +237,18 @@ impl BlockCachedSource {
     /// Persist the filled-block bitmap, always after the blocks it describes so
     /// the index never claims a block that was not written.
     fn persist_idx(&self) {
-        let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
-        let mut buf = Vec::with_capacity(filled.serialized_size());
-        if filled.serialize_into(&mut buf).is_err() {
-            return;
-        }
+        let buf = {
+            let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
+            let mut buf = Vec::with_capacity(filled.serialized_size());
+            if filled.serialize_into(&mut buf).is_err() {
+                return;
+            }
+            buf
+        };
         let idx = self.idx_path();
+        let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut tmp = idx.clone().into_os_string();
-        tmp.push(".tmp");
+        tmp.push(format!(".tmp.{}.{seq}", process::id()));
         let tmp = PathBuf::from(tmp);
         if fs::write(&tmp, &buf).is_ok() {
             let _ = fs::rename(&tmp, &idx);
@@ -384,11 +391,24 @@ impl BlockCachedSource {
                 store.release_block_bytes(run_len - newly);
             }
         }
-        if filled_any {
+        if filled_any && bf.file.sync_data().is_ok() {
             self.persist_idx();
         }
         Ok(true)
     }
+}
+
+pub(super) fn indexed_filled_bytes(size: u64, idx_bytes: &[u8]) -> Option<(RoaringBitmap, u64)> {
+    let bitmap = RoaringBitmap::deserialize_from(idx_bytes).ok()?;
+    let n_blocks = size.div_ceil(CACHE_BLOCK_BYTES);
+    if bitmap.max().is_some_and(|m| u64::from(m) >= n_blocks) {
+        return None;
+    }
+    let filled = bitmap
+        .iter()
+        .map(|b| BlockCachedSource::block_len(size, b))
+        .sum();
+    Some((bitmap, filled))
 }
 
 impl Drop for BlockCachedSource {
@@ -759,6 +779,28 @@ mod tests {
             1,
             "no index means fresh fetch, not stale reuse"
         );
+    }
+
+    #[test]
+    fn indexed_filled_bytes_rejects_a_block_id_past_the_file() {
+        let size = 2 * CACHE_BLOCK_BYTES;
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(2);
+        let mut buf = Vec::new();
+        bitmap.serialize_into(&mut buf).expect("serialize");
+        assert!(indexed_filled_bytes(size, &buf).is_none());
+    }
+
+    #[test]
+    fn indexed_filled_bytes_sums_in_range_blocks() {
+        let size = 2 * CACHE_BLOCK_BYTES + 100;
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0);
+        bitmap.insert(2);
+        let mut buf = Vec::new();
+        bitmap.serialize_into(&mut buf).expect("serialize");
+        let (_, filled) = indexed_filled_bytes(size, &buf).expect("valid index");
+        assert_eq!(filled, CACHE_BLOCK_BYTES + 100);
     }
 
     /// Regression for the transient `Required field type_ is missing` decode

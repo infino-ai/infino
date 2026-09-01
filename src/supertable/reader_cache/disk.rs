@@ -36,7 +36,7 @@ use tokio::{
 use tracing::{Instrument, debug_span};
 
 use super::{
-    block_source::BlockCachedSource,
+    block_source::{BlockCachedSource, indexed_filled_bytes},
     config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate},
 };
 use crate::{
@@ -281,6 +281,7 @@ pub struct DiskCacheStore {
     coordinators: DashMap<SuperfileUri, Coordinator>,
     /// Files on disk that no read has opened yet. Filled by `scan_cache_root`, drained by reuse or eviction.
     unindexed: DashMap<SuperfileUri, UnindexedFile>,
+    block_files: DashMap<SuperfileUri, UnindexedFile>,
     current_bytes: AtomicU64,
     /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
     /// An engine-managed (auto-sized) budget is raised — never lowered —
@@ -367,6 +368,7 @@ impl DiskCacheStore {
             cached: DashMap::new(),
             coordinators: DashMap::new(),
             unindexed: DashMap::new(),
+            block_files: DashMap::new(),
             current_bytes: AtomicU64::new(0),
             budget_bytes: AtomicU64::new(configured_budget),
             budget_auto_sized: AtomicBool::new(false),
@@ -1131,7 +1133,15 @@ impl DiskCacheStore {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with(BLOCKS_IDX_SUFFIX) || name.ends_with(BLOCKS_FILE_SUFFIX) {
+            if name.ends_with(BLOCKS_IDX_SUFFIX) {
+                continue;
+            }
+            if let Some(body) = name.strip_suffix(BLOCKS_FILE_SUFFIX) {
+                if let Some(uri) = SuperfileUri::from_cache_filename(body)
+                    && let Some(bytes) = self.scan_block_file(&path, &uri)
+                {
+                    total += bytes;
+                }
                 continue;
             }
 
@@ -1176,6 +1186,27 @@ impl DiskCacheStore {
         }
 
         self.current_bytes.fetch_add(total, Ordering::Release);
+    }
+
+    fn scan_block_file(&self, path: &Path, uri: &SuperfileUri) -> Option<u64> {
+        let meta = fs::metadata(path).ok()?;
+        let size = meta.len();
+        if size == 0 {
+            return None;
+        }
+        let idx_bytes = fs::read(self.blocks_idx_path(uri)).ok()?;
+        let (_, filled) = indexed_filled_bytes(size, &idx_bytes)?;
+        if filled == 0 {
+            return None;
+        }
+        self.block_files.insert(
+            *uri,
+            UnindexedFile {
+                size_bytes: filled,
+                mtime_us: file_mtime_us(&meta),
+            },
+        );
+        Some(filled)
     }
 
     /// Serve `uri` from an existing cache file instead of fetching from storage. Runs before every
@@ -1241,7 +1272,7 @@ impl DiskCacheStore {
                     self.current_bytes.fetch_sub(size, Ordering::Release);
                 }
                 let _ = fs::remove_file(&path);
-                let _ = fs::remove_file(self.blocks_path(uri));
+                self.drop_block_file(uri);
                 Ok(None)
             }
         }
@@ -1257,6 +1288,14 @@ impl DiskCacheStore {
         }
 
         let _ = fs::remove_file(self.cache_path(uri));
+        self.drop_block_file(uri);
+    }
+
+    fn drop_block_file(&self, uri: &SuperfileUri) {
+        if let Some((_, file)) = self.block_files.remove(uri) {
+            self.current_bytes
+                .fetch_sub(file.size_bytes, Ordering::Release);
+        }
         let _ = fs::remove_file(self.blocks_path(uri));
         let _ = fs::remove_file(self.blocks_idx_path(uri));
     }
@@ -1287,7 +1326,38 @@ impl DiskCacheStore {
             // cannot double-count.
             if self.unindexed.remove(&uri).is_some() {
                 let _ = fs::remove_file(self.cache_path(&uri));
+                self.drop_block_file(&uri);
+                self.current_bytes.fetch_sub(size, Ordering::Release);
+                self.n_evictions.fetch_add(1, Ordering::AcqRel);
+                freed += size;
+            }
+        }
+
+        freed
+    }
+
+    fn evict_block_files(&self, bytes_needed: u64) -> u64 {
+        if self.block_files.is_empty() {
+            return 0;
+        }
+
+        let mut candidates: Vec<(SuperfileUri, u64, u64)> = self
+            .block_files
+            .iter()
+            .map(|e| (*e.key(), e.value().size_bytes, e.value().mtime_us))
+            .collect();
+
+        candidates.sort_by_key(|(_, _, mtime_us)| *mtime_us);
+
+        let mut freed: u64 = 0;
+        for (uri, size, _) in candidates {
+            if freed >= bytes_needed {
+                break;
+            }
+
+            if self.block_files.remove(&uri).is_some() {
                 let _ = fs::remove_file(self.blocks_path(&uri));
+                let _ = fs::remove_file(self.blocks_idx_path(&uri));
                 self.current_bytes.fetch_sub(size, Ordering::Release);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
                 freed += size;
@@ -1318,8 +1388,13 @@ impl DiskCacheStore {
     }
 
     /// Account bytes for an adopted block cache whose data is already on disk; a
-    /// later reservation evicts if this pushes the store over budget.
-    pub(super) fn account_adopted_bytes(&self, bytes: u64) {
+    /// later reservation evicts if this pushes the store over budget. Bytes a
+    /// restart scan already counted for this file are released first.
+    pub(super) fn account_adopted_bytes(&self, uri: &SuperfileUri, bytes: u64) {
+        if let Some((_, prior)) = self.block_files.remove(uri) {
+            self.current_bytes
+                .fetch_sub(prior.size_bytes, Ordering::Release);
+        }
         self.current_bytes.fetch_add(bytes, Ordering::Release);
     }
 
@@ -2054,7 +2129,10 @@ impl DiskCacheStore {
     async fn evict_at_least(&self, bytes_needed: u64) -> Result<(), DiskCacheError> {
         // Never-opened files go first; freeing one cannot hurt a live reader.
         let freed = self.evict_unindexed(bytes_needed);
-
+        if freed >= bytes_needed {
+            return Ok(());
+        }
+        let freed = freed + self.evict_block_files(bytes_needed - freed);
         if freed >= bytes_needed {
             return Ok(());
         }
@@ -2132,8 +2210,7 @@ impl DiskCacheStore {
 
         self.coordinators.remove(uri);
         let _ = fs::remove_file(self.cache_path(uri));
-        let _ = fs::remove_file(self.blocks_path(uri));
-        let _ = fs::remove_file(self.blocks_idx_path(uri));
+        self.drop_block_file(uri);
         if present {
             self.n_gc_drops.fetch_add(1, Ordering::AcqRel);
         }
@@ -2930,15 +3007,45 @@ mod tests {
 
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use roaring::RoaringBitmap;
     use tempfile::TempDir;
     use tokio::{spawn, task::yield_now, time::timeout};
 
-    use super::*;
+    use super::{super::block_source::CACHE_BLOCK_BYTES, *};
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::builder::{BuilderOptions, SuperfileBuilder},
         test_helpers::{decimal128_id_field, decimal128_ids},
     };
+
+    fn seed_valid_block_file(
+        store: &Arc<DiskCacheStore>,
+        uri: &SuperfileUri,
+        size: u64,
+        blocks: &[u32],
+    ) -> u64 {
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(store.blocks_path(uri))
+            .expect("blocks");
+        f.set_len(size).expect("set_len");
+        let mut bitmap = RoaringBitmap::new();
+        for &b in blocks {
+            bitmap.insert(b);
+        }
+        let mut buf = Vec::new();
+        bitmap.serialize_into(&mut buf).expect("serialize");
+        fs::write(store.blocks_idx_path(uri), &buf).expect("idx");
+        blocks
+            .iter()
+            .map(|&b| {
+                let start = u64::from(b) * CACHE_BLOCK_BYTES;
+                (size - start).min(CACHE_BLOCK_BYTES)
+            })
+            .sum()
+    }
 
     /// Local-filesystem background promotion should finish well within this.
     const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3413,6 +3520,83 @@ mod tests {
             reopened.blocks_idx_path(&uri).exists(),
             "restart keeps the .blocks.idx sidecar"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_scan_counts_retained_block_files() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let size = 3 * CACHE_BLOCK_BYTES + 1000;
+        let filled = seed_valid_block_file(&store, &uri, size, &[0, 1, 3]);
+
+        let reopened = reopen_store(&store, |_| {});
+        assert_eq!(
+            reopened.stats().current_bytes,
+            filled,
+            "scan counts the retained block bytes against the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_skips_a_block_file_without_an_index() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(store.blocks_path(&uri))
+            .expect("blocks");
+        f.set_len(4 * CACHE_BLOCK_BYTES).expect("set_len");
+
+        let reopened = reopen_store(&store, |_| {});
+        assert_eq!(
+            reopened.stats().current_bytes,
+            0,
+            "a block file with no index is not counted"
+        );
+        assert!(
+            reopened.blocks_path(&uri).exists(),
+            "the un-adoptable block file is left in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopting_a_scanned_block_file_does_not_double_count() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let size = 2 * CACHE_BLOCK_BYTES + 500;
+        let filled = seed_valid_block_file(&store, &uri, size, &[0, 1]);
+
+        let reopened = reopen_store(&store, |_| {});
+        assert_eq!(reopened.stats().current_bytes, filled);
+
+        reopened.account_adopted_bytes(&uri, filled);
+        assert_eq!(
+            reopened.stats().current_bytes,
+            filled,
+            "adopt claims the scanned bytes rather than adding them again"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_block_files_are_evicted_under_budget_pressure() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let size = 3 * CACHE_BLOCK_BYTES;
+        let filled = seed_valid_block_file(&store, &uri, size, &[0, 1, 2]);
+
+        let reopened = reopen_store(&store, |cfg| cfg.disk_budget_bytes = filled);
+        assert_eq!(reopened.stats().current_bytes, filled);
+
+        reopened.evict_at_least(filled).await.expect("evict");
+        assert_eq!(
+            reopened.stats().current_bytes,
+            0,
+            "the retained block file is evicted to reclaim budget"
+        );
+        assert!(!reopened.blocks_path(&uri).exists());
+        assert!(!reopened.blocks_idx_path(&uri).exists());
     }
 
     // ----- lazy open: cost scales with the working set, not the directory -----
