@@ -25,7 +25,7 @@ use crate::superfile::{
     vector::{
         builder::{
             IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
-            fixed_sq8_quantizer, write_ivf_cluster_blocks,
+            effective_cell_n_cent, fixed_sq8_quantizer, write_ivf_cluster_blocks,
         },
         cell_posting::{EncodedCellRow, sq8_quant_params_equal},
         distance::{
@@ -77,6 +77,18 @@ pub(crate) fn fine_run_target_n_cent(
         rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + size_of::<f32>();
     let rows_per_run = (FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
     n_rows.div_ceil(rows_per_run).clamp(1, n_rows.max(1))
+}
+
+/// The fine-cluster `n_cent` a merged or rebuilt cell of `n_rows` (dimension
+/// `dim`, codec `rerank_codec`) will actually store: the fine-run byte target
+/// from [`fine_run_target_n_cent`] passed through the same cap the build
+/// applies ([`effective_cell_n_cent`]). The merge splice-gate compares against
+/// THIS, not the raw byte target — otherwise a cell whose byte target sits
+/// above the small-cell cap while its rows stay under the consolidated
+/// threshold never satisfies the gate, and every compaction rebuilds it only to
+/// re-derive the same capped count.
+pub(crate) fn effective_fine_n_cent(dim: usize, rerank_codec: RerankCodec, n_rows: usize) -> usize {
+    effective_cell_n_cent(fine_run_target_n_cent(dim, rerank_codec, n_rows), n_rows)
 }
 
 /// One input superfile column for byte-splice merge.
@@ -986,6 +998,46 @@ mod tests {
                 "n_cent shrank as rows grew: {n} -> {cur} < {prev}"
             );
             prev = cur;
+        }
+    }
+
+    /// The splice-gate sizing passes the byte target through the small-cell cap
+    /// the build actually applies. A cell whose raw byte target exceeds the cap
+    /// (64) but whose rows stay under the consolidated threshold (80,000) is
+    /// sized at the cap, matching what the build stores — so a same-shape merge
+    /// that stays in that band satisfies the gate instead of rebuilding every
+    /// compaction. Above the threshold the byte target applies uncapped.
+    #[test]
+    fn effective_fine_n_cent_applies_the_small_cell_cap() {
+        // dim 1024 / Sq8Residual puts the ~61K–80K row band above the 64 cap:
+        // 70,000 rows -> byte target 74 -> stored 64 after the small-cell cap.
+        let dim = 1024;
+        let codec = RerankCodec::Sq8Residual;
+        let banded_rows = 70_000;
+        assert!(
+            fine_run_target_n_cent(dim, codec, banded_rows) > 64,
+            "precondition: the raw byte target must exceed the small-cell cap"
+        );
+        assert_eq!(
+            effective_fine_n_cent(dim, codec, banded_rows),
+            64,
+            "a sub-threshold cell is stored at the capped count, so the gate \
+             accepts a same-shape splice against a cell already at 64"
+        );
+
+        // Just above the consolidated threshold the byte target is uncapped.
+        let consolidated_rows = 90_000;
+        let raw = fine_run_target_n_cent(dim, codec, consolidated_rows);
+        assert!(raw > 64, "precondition: consolidated cell exceeds the cap");
+        assert_eq!(
+            effective_fine_n_cent(dim, codec, consolidated_rows),
+            raw,
+            "a consolidated cell keeps the uncapped byte-target count"
+        );
+
+        // The effective count never exceeds the raw byte target at any size.
+        for n in [1, 1_000, banded_rows, consolidated_rows, 200_000] {
+            assert!(effective_fine_n_cent(dim, codec, n) <= fine_run_target_n_cent(dim, codec, n));
         }
     }
 

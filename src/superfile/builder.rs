@@ -109,7 +109,7 @@ use crate::superfile::{
         cell_posting::{CellPostingBuilder, MaterializedIvfRow},
         distance::Metric,
         ivf_merge::{
-            MergedIvfSubsection, Sq8IvfMergeInput, fine_run_target_n_cent,
+            MergedIvfSubsection, Sq8IvfMergeInput, effective_fine_n_cent,
             merge_sq8_ivf_subsections, merge_sq8_ivf_subsections_from_parsed,
             stable_ids_in_merged_local_order,
         },
@@ -1009,7 +1009,7 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-                let n_cent = fine_run_target_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
+                let n_cent = effective_fine_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
                 let merged = build_merged_subsection_from_materialized(
                     vec_cfg.clone(),
                     n_cent.max(1),
@@ -1060,14 +1060,18 @@ impl SuperfileBuilder {
                 // center of mass, and cell routing misranks (recall caps, cold
                 // reads balloon). Take the fast splice only when the union still
                 // fits the source width; otherwise fall through to the rebuild
-                // path, which re-clusters to the re-derived width.
+                // path, which re-clusters to the re-derived width. Compare
+                // against the EFFECTIVE count the build would store (byte target
+                // passed through the small-cell cap), not the raw byte target —
+                // a sub-threshold cell whose byte target exceeds the cap stores
+                // the capped count, so a raw-target gate would reject the splice
+                // and rebuild it on every compaction only to re-derive that same
+                // capped count.
                 let merged_docs: usize =
                     sources.iter().map(|(_, _, inp)| inp.n_docs as usize).sum();
-                let fits_target = fine_run_target_n_cent(
-                    sources[0].2.dim,
-                    sources[0].2.rerank_codec,
-                    merged_docs,
-                ) <= sources[0].2.n_cent;
+                let fits_target =
+                    effective_fine_n_cent(sources[0].2.dim, sources[0].2.rerank_codec, merged_docs)
+                        <= sources[0].2.n_cent;
                 if same_shape && fits_target {
                     let mut inputs: Vec<Sq8IvfMergeInput> =
                         sources.into_iter().map(|(_, _, inp)| inp).collect();
@@ -1107,7 +1111,7 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-                let n_cent = fine_run_target_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
+                let n_cent = effective_fine_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
                 let merged = build_merged_subsection_from_materialized(
                     vec_cfg.clone(),
                     n_cent.max(1),
@@ -4669,13 +4673,15 @@ mod tests {
         // Largest row count that still fits one fine run, then a union that
         // spans several runs.
         let rows_per_run = (1..)
-            .find(|&n| fine_run_target_n_cent(dim, codec, n) > 1)
+            .find(|&n| effective_fine_n_cent(dim, codec, n) > 1)
             .expect("threshold")
             - 1;
         let left_rows = rows_per_run + rows_per_run / 2;
         let right_rows = rows_per_run + rows_per_run / 2;
         let total = left_rows + right_rows;
-        let expected_n_cent = fine_run_target_n_cent(dim, codec, total);
+        // The stored width is the byte target passed through the small-cell cap;
+        // at this corpus size the target is well under the cap, so they agree.
+        let expected_n_cent = effective_fine_n_cent(dim, codec, total);
         assert!(
             expected_n_cent > 1,
             "test corpus must exceed one fine run (rows_per_run={rows_per_run})"
