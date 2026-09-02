@@ -1048,6 +1048,91 @@ async fn dedup_repeated_query_term_scores_as_weighted() {
 }
 
 #[tokio::test]
+async fn dedup_repeated_should_term_scores_as_weighted() {
+    // Dedup is applied to the should (union) side too, through a separate
+    // query-term-frequency path from the must side. `common common` (OR) must
+    // score exactly 2x `common` (OR) on the same docs — a should-side qtf bug
+    // (e.g. reusing the must weights, or a wrong index mapping) would slip past
+    // the AND-only test above.
+    const N: u64 = 500;
+    let owned: Vec<(u64, String)> = (0..N).map(|i| (i, format!("common f{}", i % 7))).collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+
+    let single: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common", 10, BoolMode::Or)
+        .await
+        .expect("single-term OR")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let dup: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common common", 10, BoolMode::Or)
+        .await
+        .expect("repeated-term OR")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    assert_eq!(single.len(), dup.len(), "dedup changed the OR result count");
+    assert!(!single.is_empty(), "expected hits");
+    for ((d1, s1), (d2, s2)) in single.iter().zip(dup.iter()) {
+        assert_eq!(d1, d2, "dedup changed the OR doc order/set");
+        assert!(
+            (s2 - 2.0 * s1).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "repeated should-term score {s2} != 2x single {s1} on doc {d1}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dedup_partial_repeat_preserves_matches_and_weights_one_term() {
+    // Non-degenerate dedup: a repeat that is *not* the whole query. `+common
+    // +common +f0` must (a) match exactly the docs `+common +f0` does — the
+    // intersection is unchanged by the repeat — and (b) add, per doc, one more
+    // `common` contribution than `+common +f0`, i.e. the single-term `+common`
+    // score for that doc. This gates the order-preserving dedup keeping the
+    // distinct `f0` and assigning per-term qtf ([common:2, f0:1]) correctly,
+    // which the all-same-term test cannot.
+    const N: u64 = 500;
+    let owned: Vec<(u64, String)> = (0..N).map(|i| (i, format!("common f{}", i % 7))).collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+
+    async fn and_hits(r: &SuperfileReader, q: &str, k: usize) -> Vec<(u64, f32)> {
+        r.bm25_hits_async("title", q, k, BoolMode::And)
+            .await
+            .expect("AND search")
+            .into_iter()
+            .map(|(d, s)| (d as u64, s))
+            .collect()
+    }
+
+    let base = and_hits(&infino, "+common +f0", 100).await;
+    let dup = and_hits(&infino, "+common +common +f0", 100).await;
+    // Per-doc single-`common` contribution (same tf and dl as in the queries
+    // above, so the `common` term contributes an identical amount in each).
+    let common_score: HashMap<u64, f32> = and_hits(&infino, "+common", N as usize)
+        .await
+        .into_iter()
+        .collect();
+
+    assert!(!base.is_empty(), "expected +common +f0 to match some docs");
+    let base_set: HashSet<u64> = base.iter().map(|(d, _)| *d).collect();
+    let dup_set: HashSet<u64> = dup.iter().map(|(d, _)| *d).collect();
+    assert_eq!(base_set, dup_set, "repeat changed the AND match set");
+
+    let base_by_doc: HashMap<u64, f32> = base.into_iter().collect();
+    for (d, s_dup) in dup {
+        let s_base = base_by_doc[&d];
+        let c = common_score[&d];
+        assert!(
+            (s_dup - s_base - c).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "doc {d}: (dup {s_dup} - base {s_base}) != single-common {c}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
