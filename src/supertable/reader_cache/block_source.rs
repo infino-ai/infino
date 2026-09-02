@@ -243,22 +243,27 @@ impl BlockCachedSource {
         })
     }
 
-    /// Persist the filled-block bitmap, always after the blocks it describes so
-    /// the index never claims a block that was not written.
-    fn persist_idx(&self) {
+    /// Serialize the filled-block bitmap for persistence. Taken before the
+    /// `sync_data()` barrier so the persisted index only ever names blocks whose
+    /// writes the fsync already flushed — a concurrent fill that marks a new
+    /// block after this snapshot is simply absent (a safe undercount), never a
+    /// durably-claimed hole.
+    fn snapshot_index(&self) -> Vec<u8> {
+        let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
+        serialize_index(&filled)
+    }
+
+    /// Write a pre-serialized index snapshot, only after its blocks are durable.
+    fn persist_idx(&self, snapshot: &[u8]) {
         if !self.path.exists() {
             return;
         }
-        let buf = {
-            let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
-            serialize_index(&filled)
-        };
         let idx = self.idx_path();
         let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut tmp = idx.clone().into_os_string();
         tmp.push(format!(".tmp.{}.{seq}", process::id()));
         let tmp = PathBuf::from(tmp);
-        if fs::write(&tmp, &buf).is_ok() {
+        if fs::write(&tmp, snapshot).is_ok() {
             let _ = fs::rename(&tmp, &idx);
         }
     }
@@ -402,9 +407,12 @@ impl BlockCachedSource {
         if filled_any {
             let filled = self.filled_bytes.load(Ordering::Acquire);
             let unpersisted = filled.saturating_sub(self.persisted_bytes.load(Ordering::Acquire));
-            if unpersisted >= PERSIST_BYTES_THRESHOLD && bf.file.sync_data().is_ok() {
-                self.persist_idx();
-                self.persisted_bytes.store(filled, Ordering::Release);
+            if unpersisted >= PERSIST_BYTES_THRESHOLD {
+                let snapshot = self.snapshot_index();
+                if bf.file.sync_data().is_ok() {
+                    self.persist_idx(&snapshot);
+                    self.persisted_bytes.store(filled, Ordering::Release);
+                }
             }
         }
         Ok(true)
@@ -436,9 +444,11 @@ impl Drop for BlockCachedSource {
     fn drop(&mut self) {
         if let Some(Some(bf)) = self.state.get() {
             let filled = self.filled_bytes.load(Ordering::Acquire);
-            if filled > self.persisted_bytes.load(Ordering::Acquire) && bf.file.sync_data().is_ok()
-            {
-                self.persist_idx();
+            if filled > self.persisted_bytes.load(Ordering::Acquire) {
+                let snapshot = self.snapshot_index();
+                if bf.file.sync_data().is_ok() {
+                    self.persist_idx(&snapshot);
+                }
             }
         }
         // Release accounted bytes only; the file and index persist for adoption.

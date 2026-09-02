@@ -1201,6 +1201,25 @@ impl DiskCacheStore {
         }
 
         self.current_bytes.fetch_add(total, Ordering::Release);
+        self.trim_cold_to_budget();
+    }
+
+    /// Evict never-opened files (whole-file copies, then retained block files) to
+    /// bring `current_bytes` back under budget. Only cold candidates are freed;
+    /// live cached entries are left to the async reservation path. Runs on paths
+    /// that add already-on-disk bytes without a reservation (restart scan, block
+    /// adoption), so a read-only reopen still self-corrects to budget.
+    fn trim_cold_to_budget(&self) {
+        let budget = self.disk_budget_bytes();
+        let cur = self.current_bytes.load(Ordering::Acquire);
+        if cur <= budget {
+            return;
+        }
+        let over = cur - budget;
+        let freed = self.evict_unindexed(over);
+        if freed < over {
+            self.evict_block_files(over - freed);
+        }
     }
 
     fn scan_block_file(&self, path: &Path, uri: &SuperfileUri) -> Option<u64> {
@@ -1409,12 +1428,15 @@ impl DiskCacheStore {
         }
     }
 
-    /// Account bytes for an adopted block cache whose data is already on disk; a
-    /// later reservation evicts if this pushes the store over budget. Bytes a
-    /// restart scan already counted for this file are released first.
+    /// Account bytes for an adopted block cache whose data is already on disk.
+    /// Bytes a restart scan already counted for this file are released first (so
+    /// a scanned-then-adopted file nets to zero), then any excess over budget is
+    /// trimmed from cold candidates rather than left for a reservation that a
+    /// read-only table never issues.
     pub(super) fn account_adopted_bytes(&self, uri: &SuperfileUri, bytes: u64) {
         self.release_scanned_block_file(uri);
         self.current_bytes.fetch_add(bytes, Ordering::Release);
+        self.trim_cold_to_budget();
     }
 
     /// Build a per-URI tempfile path (sparse destination
@@ -3667,6 +3689,24 @@ mod tests {
         );
         assert!(!reopened.blocks_path(&uri).exists());
         assert!(!reopened.blocks_idx_path(&uri).exists());
+    }
+
+    #[tokio::test]
+    async fn reopen_trims_retained_block_files_to_budget() {
+        let (_dir, store) = test_store();
+        let mut total = 0;
+        for _ in 0..4 {
+            let uri = SuperfileUri::new_v4();
+            total += seed_valid_block_file(&store, &uri, 3 * CACHE_BLOCK_BYTES, &[0, 1, 2]);
+        }
+
+        let budget = total / 2;
+        let reopened = reopen_store(&store, |cfg| cfg.disk_budget_bytes = budget);
+        assert!(
+            reopened.stats().current_bytes <= budget,
+            "a read-only reopen trims retained blocks to budget at scan, current={} budget={budget}",
+            reopened.stats().current_bytes
+        );
     }
 
     // ----- lazy open: cost scales with the working set, not the directory -----
