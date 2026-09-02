@@ -87,6 +87,8 @@ const BLOCKS_FILE_SUFFIX: &str = ".blocks";
 /// index sidecar.
 const BLOCKS_IDX_SUFFIX: &str = ".idx";
 
+const BLOCKS_IDX_TMP_INFIX: &str = ".idx.tmp.";
+
 /// How old an in-flight tempfile must be before the open-time scan reclaims it. A live cold
 /// fetch's tempfile is seconds old, so one this stale can only be a crashed fetch's leftover;
 /// deleting a live one would fail the owner's rename and cost it a retried fetch.
@@ -1133,14 +1135,27 @@ impl DiskCacheStore {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            if name.contains(BLOCKS_IDX_TMP_INFIX) {
+                let stale = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| SystemTime::now().duration_since(t).ok())
+                    .is_some_and(|age| age >= TMP_RECLAIM_AGE);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            }
             if name.ends_with(BLOCKS_IDX_SUFFIX) {
                 continue;
             }
             if let Some(body) = name.strip_suffix(BLOCKS_FILE_SUFFIX) {
-                if let Some(uri) = SuperfileUri::from_cache_filename(body)
-                    && let Some(bytes) = self.scan_block_file(&path, &uri)
-                {
-                    total += bytes;
+                if let Some(uri) = SuperfileUri::from_cache_filename(body) {
+                    match self.scan_block_file(&path, &uri) {
+                        Some(bytes) => total += bytes,
+                        None => self.drop_block_file(&uri),
+                    }
                 }
                 continue;
             }
@@ -1387,14 +1402,18 @@ impl DiskCacheStore {
         ))
     }
 
-    /// Account bytes for an adopted block cache whose data is already on disk; a
-    /// later reservation evicts if this pushes the store over budget. Bytes a
-    /// restart scan already counted for this file are released first.
-    pub(super) fn account_adopted_bytes(&self, uri: &SuperfileUri, bytes: u64) {
+    pub(super) fn release_scanned_block_file(&self, uri: &SuperfileUri) {
         if let Some((_, prior)) = self.block_files.remove(uri) {
             self.current_bytes
                 .fetch_sub(prior.size_bytes, Ordering::Release);
         }
+    }
+
+    /// Account bytes for an adopted block cache whose data is already on disk; a
+    /// later reservation evicts if this pushes the store over budget. Bytes a
+    /// restart scan already counted for this file are released first.
+    pub(super) fn account_adopted_bytes(&self, uri: &SuperfileUri, bytes: u64) {
+        self.release_scanned_block_file(uri);
         self.current_bytes.fetch_add(bytes, Ordering::Release);
     }
 
@@ -2825,8 +2844,7 @@ async fn lazy_background_fill(
                     last_access_us: AtomicU64::new(store.now_us()),
                 });
                 if !block_source_retained {
-                    let _ = fs::remove_file(store.blocks_path(&uri));
-                    let _ = fs::remove_file(store.blocks_idx_path(&uri));
+                    store.drop_block_file(&uri);
                 }
             }
             Entry::Vacant(_) => {
@@ -3011,7 +3029,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::{spawn, task::yield_now, time::timeout};
 
-    use super::{super::block_source::CACHE_BLOCK_BYTES, *};
+    use super::{
+        super::block_source::{CACHE_BLOCK_BYTES, serialize_index},
+        *,
+    };
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::builder::{BuilderOptions, SuperfileBuilder},
@@ -3035,9 +3056,7 @@ mod tests {
         for &b in blocks {
             bitmap.insert(b);
         }
-        let mut buf = Vec::new();
-        bitmap.serialize_into(&mut buf).expect("serialize");
-        fs::write(store.blocks_idx_path(uri), &buf).expect("idx");
+        fs::write(store.blocks_idx_path(uri), serialize_index(&bitmap)).expect("idx");
         blocks
             .iter()
             .map(|&b| {
@@ -3507,8 +3526,7 @@ mod tests {
     async fn restart_scan_preserves_block_cache_and_index() {
         let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
-        fs::write(store.blocks_path(&uri), b"sparse block bytes").expect("blocks");
-        fs::write(store.blocks_idx_path(&uri), b"index bytes").expect("idx");
+        seed_valid_block_file(&store, &uri, 2 * CACHE_BLOCK_BYTES, &[0, 1]);
 
         let reopened = reopen_store(&store, |_| {});
 
@@ -3520,6 +3538,45 @@ mod tests {
             reopened.blocks_idx_path(&uri).exists(),
             "restart keeps the .blocks.idx sidecar"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_scan_deletes_a_block_file_with_an_invalid_index() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        fs::write(store.blocks_path(&uri), b"sparse block bytes").expect("blocks");
+        fs::write(store.blocks_idx_path(&uri), b"not a valid index").expect("idx");
+
+        let reopened = reopen_store(&store, |_| {});
+
+        assert!(
+            !reopened.blocks_path(&uri).exists(),
+            "an un-adoptable block file is reclaimed, not leaked"
+        );
+        assert!(!reopened.blocks_idx_path(&uri).exists());
+        assert_eq!(reopened.stats().current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn restart_scan_sweeps_stale_index_tempfiles_and_spares_fresh_ones() {
+        let (_dir, store) = test_store();
+        let idx = store.blocks_idx_path(&SuperfileUri::new_v4());
+        let stale = idx.with_extension("idx.tmp.4242.0");
+        let fresh = idx.with_extension("idx.tmp.4242.1");
+        let now = SystemTime::now();
+        for (path, mtime) in [(&stale, now - TMP_RECLAIM_AGE * 2), (&fresh, now)] {
+            fs::write(path, b"partial").expect("seed tmp");
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open tmp")
+                .set_modified(mtime)
+                .expect("set mtime");
+        }
+
+        let _opened = reopen_store(&store, |_| {});
+        assert!(!stale.exists(), "stale index tempfile reclaimed");
+        assert!(fresh.exists(), "fresh index tempfile left for its owner");
     }
 
     #[tokio::test]
@@ -3538,7 +3595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_skips_a_block_file_without_an_index() {
+    async fn scan_reclaims_a_block_file_without_an_index() {
         let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
         let f = fs::OpenOptions::new()
@@ -3550,14 +3607,27 @@ mod tests {
         f.set_len(4 * CACHE_BLOCK_BYTES).expect("set_len");
 
         let reopened = reopen_store(&store, |_| {});
+        assert_eq!(reopened.stats().current_bytes, 0);
+        assert!(
+            !reopened.blocks_path(&uri).exists(),
+            "a block file with no index cannot be adopted, so it is reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_owning_adopt_releases_the_scanned_block_bytes() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let filled = seed_valid_block_file(&store, &uri, 2 * CACHE_BLOCK_BYTES, &[0, 1]);
+
+        let reopened = reopen_store(&store, |_| {});
+        assert_eq!(reopened.stats().current_bytes, filled);
+
+        reopened.release_scanned_block_file(&uri);
         assert_eq!(
             reopened.stats().current_bytes,
             0,
-            "a block file with no index is not counted"
-        );
-        assert!(
-            reopened.blocks_path(&uri).exists(),
-            "the un-adoptable block file is left in place"
+            "a promotion-path adopt drops the scan-counted bytes instead of double-counting"
         );
     }
 

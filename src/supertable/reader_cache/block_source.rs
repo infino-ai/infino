@@ -61,6 +61,10 @@ use crate::{
 /// coalescing a multi-MiB scan into a handful of blocks.
 pub(super) const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
 
+const IDX_HEADER: [u8; 8] = CACHE_BLOCK_BYTES.to_le_bytes();
+
+const PERSIST_BYTES_THRESHOLD: u64 = 32 * 1024 * 1024;
+
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Lazily-initialized sparse backing file. Created on the first cached read
@@ -102,6 +106,7 @@ pub(crate) struct BlockCachedSource {
     /// `size_bytes`, so eviction candidates report a lazy entry's real
     /// footprint as it grows.
     filled_bytes: Arc<AtomicU64>,
+    persisted_bytes: AtomicU64,
 }
 
 impl BlockCachedSource {
@@ -147,6 +152,7 @@ impl BlockCachedSource {
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
+            persisted_bytes: AtomicU64::new(0),
         })
     }
 
@@ -220,12 +226,15 @@ impl BlockCachedSource {
             .write(true)
             .open(&self.path)
             .ok()?;
-        if self.owns_accounting
-            && let Some(store) = self.store.upgrade()
-        {
-            store.account_adopted_bytes(&self.uri, adopted_bytes);
+        if let Some(store) = self.store.upgrade() {
+            if self.owns_accounting {
+                store.account_adopted_bytes(&self.uri, adopted_bytes);
+            } else {
+                store.release_scanned_block_file(&self.uri);
+            }
         }
         self.filled_bytes.store(adopted_bytes, Ordering::Release);
+        self.persisted_bytes.store(adopted_bytes, Ordering::Release);
         *self.filled.lock().expect("filled bitmap mutex poisoned") = bitmap;
         Some(BlockFile {
             file,
@@ -237,13 +246,12 @@ impl BlockCachedSource {
     /// Persist the filled-block bitmap, always after the blocks it describes so
     /// the index never claims a block that was not written.
     fn persist_idx(&self) {
+        if !self.path.exists() {
+            return;
+        }
         let buf = {
             let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
-            let mut buf = Vec::with_capacity(filled.serialized_size());
-            if filled.serialize_into(&mut buf).is_err() {
-                return;
-            }
-            buf
+            serialize_index(&filled)
         };
         let idx = self.idx_path();
         let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -391,15 +399,28 @@ impl BlockCachedSource {
                 store.release_block_bytes(run_len - newly);
             }
         }
-        if filled_any && bf.file.sync_data().is_ok() {
-            self.persist_idx();
+        if filled_any {
+            let filled = self.filled_bytes.load(Ordering::Acquire);
+            let unpersisted = filled.saturating_sub(self.persisted_bytes.load(Ordering::Acquire));
+            if unpersisted >= PERSIST_BYTES_THRESHOLD && bf.file.sync_data().is_ok() {
+                self.persist_idx();
+                self.persisted_bytes.store(filled, Ordering::Release);
+            }
         }
         Ok(true)
     }
 }
 
+pub(super) fn serialize_index(bitmap: &RoaringBitmap) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(IDX_HEADER.len() + bitmap.serialized_size());
+    buf.extend_from_slice(&IDX_HEADER);
+    let _ = bitmap.serialize_into(&mut buf);
+    buf
+}
+
 pub(super) fn indexed_filled_bytes(size: u64, idx_bytes: &[u8]) -> Option<(RoaringBitmap, u64)> {
-    let bitmap = RoaringBitmap::deserialize_from(idx_bytes).ok()?;
+    let body = idx_bytes.strip_prefix(&IDX_HEADER)?;
+    let bitmap = RoaringBitmap::deserialize_from(body).ok()?;
     let n_blocks = size.div_ceil(CACHE_BLOCK_BYTES);
     if bitmap.max().is_some_and(|m| u64::from(m) >= n_blocks) {
         return None;
@@ -413,6 +434,13 @@ pub(super) fn indexed_filled_bytes(size: u64, idx_bytes: &[u8]) -> Option<(Roari
 
 impl Drop for BlockCachedSource {
     fn drop(&mut self) {
+        if let Some(Some(bf)) = self.state.get() {
+            let filled = self.filled_bytes.load(Ordering::Acquire);
+            if filled > self.persisted_bytes.load(Ordering::Acquire) && bf.file.sync_data().is_ok()
+            {
+                self.persist_idx();
+            }
+        }
         // Release accounted bytes only; the file and index persist for adoption.
         if self.owns_accounting
             && let Some(store) = self.store.upgrade()
@@ -786,9 +814,7 @@ mod tests {
         let size = 2 * CACHE_BLOCK_BYTES;
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert(2);
-        let mut buf = Vec::new();
-        bitmap.serialize_into(&mut buf).expect("serialize");
-        assert!(indexed_filled_bytes(size, &buf).is_none());
+        assert!(indexed_filled_bytes(size, &serialize_index(&bitmap)).is_none());
     }
 
     #[test]
@@ -797,10 +823,19 @@ mod tests {
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert(0);
         bitmap.insert(2);
-        let mut buf = Vec::new();
-        bitmap.serialize_into(&mut buf).expect("serialize");
-        let (_, filled) = indexed_filled_bytes(size, &buf).expect("valid index");
+        let (_, filled) =
+            indexed_filled_bytes(size, &serialize_index(&bitmap)).expect("valid index");
         assert_eq!(filled, CACHE_BLOCK_BYTES + 100);
+    }
+
+    #[test]
+    fn indexed_filled_bytes_rejects_a_mismatched_header() {
+        let size = 2 * CACHE_BLOCK_BYTES;
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0);
+        let mut bytes = serialize_index(&bitmap);
+        bytes[0] ^= 0xFF;
+        assert!(indexed_filled_bytes(size, &bytes).is_none());
     }
 
     /// Regression for the transient `Required field type_ is missing` decode
