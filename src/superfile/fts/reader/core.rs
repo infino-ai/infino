@@ -1121,7 +1121,7 @@ impl FtsReader {
         // dictionary range for the whole batch.
         if !terms.is_empty() {
             let term_cursors = self
-                .build_term_cursors_opt(column_id, terms, global_idf, false)
+                .build_term_cursors_opt(column_id, terms, global_idf, false, None)
                 .await?;
             dict_ranges += 1;
             for cursor in term_cursors {
@@ -1135,7 +1135,7 @@ impl FtsReader {
             // per-member rescale ratio cancels out of the phrase's tf/length
             // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, global_idf, false)
+                .build_term_cursors(column_id, &member_refs, global_idf, false, None)
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1329,6 +1329,7 @@ impl FtsReader {
                         n_docs,
                         positional,
                         None,
+                        1,
                         false,
                         false,
                         self.has_coarse_block_max,

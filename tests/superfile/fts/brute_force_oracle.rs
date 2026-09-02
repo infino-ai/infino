@@ -1011,6 +1011,238 @@ async fn oracle_and_membership_reads_tf_above_one() {
 }
 
 #[tokio::test]
+async fn dedup_repeated_query_term_scores_as_weighted() {
+    // A repeated query term is collapsed to one cursor with a query-term-frequency
+    // weight folded into its idf. BM25 is linear in that weight, so `+common
+    // +common` must score exactly 2x `+common` and return the same docs in the
+    // same order — dedup changes cost, never results. (Also checks the single-term
+    // fast path defers to the weighted path when the lone term is repeated.)
+    const N: u64 = 500;
+    let owned: Vec<(u64, String)> = (0..N).map(|i| (i, format!("common f{}", i % 7))).collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+
+    let single: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "+common", 10, BoolMode::And)
+        .await
+        .expect("single-term AND")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let dup: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "+common +common", 10, BoolMode::And)
+        .await
+        .expect("repeated-term AND")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    assert_eq!(single.len(), dup.len(), "dedup changed the result count");
+    assert!(!single.is_empty(), "expected hits");
+    for ((d1, s1), (d2, s2)) in single.iter().zip(dup.iter()) {
+        assert_eq!(d1, d2, "dedup changed the doc order/set");
+        assert!(
+            (s2 - 2.0 * s1).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "repeated-term score {s2} != 2x single-term score {s1} on doc {d1}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dedup_repeated_should_term_scores_as_weighted() {
+    // Dedup is applied to the should (union) side too, through a separate
+    // query-term-frequency path from the must side. `common common` (OR) must
+    // score exactly 2x `common` (OR) on the same docs — a should-side qtf bug
+    // (e.g. reusing the must weights, or a wrong index mapping) would slip past
+    // the AND-only test above.
+    const N: u64 = 500;
+    let owned: Vec<(u64, String)> = (0..N).map(|i| (i, format!("common f{}", i % 7))).collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+
+    let single: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common", 10, BoolMode::Or)
+        .await
+        .expect("single-term OR")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let dup: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "common common", 10, BoolMode::Or)
+        .await
+        .expect("repeated-term OR")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    assert_eq!(single.len(), dup.len(), "dedup changed the OR result count");
+    assert!(!single.is_empty(), "expected hits");
+    for ((d1, s1), (d2, s2)) in single.iter().zip(dup.iter()) {
+        assert_eq!(d1, d2, "dedup changed the OR doc order/set");
+        assert!(
+            (s2 - 2.0 * s1).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "repeated should-term score {s2} != 2x single {s1} on doc {d1}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dedup_partial_repeat_preserves_matches_and_weights_one_term() {
+    // Non-degenerate dedup: a repeat that is *not* the whole query. `+common
+    // +common +f0` must (a) match exactly the docs `+common +f0` does — the
+    // intersection is unchanged by the repeat — and (b) add, per doc, one more
+    // `common` contribution than `+common +f0`, i.e. the single-term `+common`
+    // score for that doc. This gates the order-preserving dedup keeping the
+    // distinct `f0` and assigning per-term qtf ([common:2, f0:1]) correctly,
+    // which the all-same-term test cannot.
+    const N: u64 = 500;
+    let owned: Vec<(u64, String)> = (0..N).map(|i| (i, format!("common f{}", i % 7))).collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let infino = build_infino_superfile(&refs);
+
+    async fn and_hits(r: &SuperfileReader, q: &str, k: usize) -> Vec<(u64, f32)> {
+        r.bm25_hits_async("title", q, k, BoolMode::And)
+            .await
+            .expect("AND search")
+            .into_iter()
+            .map(|(d, s)| (d as u64, s))
+            .collect()
+    }
+
+    let base = and_hits(&infino, "+common +f0", 100).await;
+    let dup = and_hits(&infino, "+common +common +f0", 100).await;
+    // Per-doc single-`common` contribution (same tf and dl as in the queries
+    // above, so the `common` term contributes an identical amount in each).
+    let common_score: HashMap<u64, f32> = and_hits(&infino, "+common", N as usize)
+        .await
+        .into_iter()
+        .collect();
+
+    assert!(!base.is_empty(), "expected +common +f0 to match some docs");
+    let base_set: HashSet<u64> = base.iter().map(|(d, _)| *d).collect();
+    let dup_set: HashSet<u64> = dup.iter().map(|(d, _)| *d).collect();
+    assert_eq!(base_set, dup_set, "repeat changed the AND match set");
+
+    let base_by_doc: HashMap<u64, f32> = base.into_iter().collect();
+    for (d, s_dup) in dup {
+        let s_base = base_by_doc[&d];
+        let c = common_score[&d];
+        assert!(
+            (s_dup - s_base - c).abs() < BM25_SCORE_ABS_TOLERANCE,
+            "doc {d}: (dup {s_dup} - base {s_base}) != single-common {c}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn oracle_dedup_repeated_terms_match_brute_force() {
+    // Anchor dedup against ground-truth BM25, not just its internal 2x linearity:
+    // the brute-force oracle sums per query *token*, so a repeat counts twice —
+    // infino's qtf-fold must reproduce the same absolute scores and the same
+    // ordering. This catches future divergence in either scorer or in the dedup
+    // weighting that the self-consistency tests (which only compare infino to
+    // itself) cannot.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+
+    // Repeated-term AND: "rust" ∧ "framework" is a single doc, so scores compare
+    // directly with no rank ambiguity. The oracle counts "rust" twice.
+    let mut and_terms: Vec<String> = Vec::new();
+    tok.tokenize_each("rust rust framework", &mut |t| and_terms.push(t.to_owned()));
+    let infino_and: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "+rust +rust +framework", 10, BoolMode::And)
+        .await
+        .expect("repeated-AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let oracle_and = oracle.top_k_terms_and(&and_terms, 10);
+    assert_eq!(
+        infino_and.len(),
+        oracle_and.len(),
+        "repeated-AND hit counts disagree: infino={infino_and:?} oracle={oracle_and:?}"
+    );
+    assert!(!infino_and.is_empty(), "expected repeated-AND hits");
+    for ((i_doc, i_score), (o_doc, o_score)) in infino_and.iter().zip(oracle_and.iter()) {
+        assert_eq!(*i_doc, *o_doc, "repeated-AND doc-id mismatch");
+        let delta = (i_score - o_score).abs();
+        assert!(
+            delta < BM25_SCORE_ABS_TOLERANCE,
+            "repeated-AND score divergence on doc {i_doc}: infino={i_score} oracle={o_score} delta={delta}"
+        );
+    }
+
+    // Repeated should term in a multi-doc union: exercises the windowed-maxscore
+    // kernel with a weighted should, compared against ground-truth ordering
+    // across k. The common-heavy corpus's top-5 head is tie-free.
+    let heavy = common_heavy_corpus(4_000);
+    let heavy_refs: Vec<(u64, &str)> = heavy.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino_h = build_infino_superfile(&heavy_refs);
+    let oracle_h = BruteForceBm25::index(&heavy_refs, tok.as_ref());
+    for k in [10usize, 100] {
+        assert_top_k_head_agrees(&infino_h, &oracle_h, "alpha beta beta gamma", 5, k).await;
+    }
+}
+
+#[tokio::test]
+async fn oracle_dedup_repeated_term_block_max_skip_matches_brute_force() {
+    // A repeated query term is deduped to one cursor with a query-term-frequency
+    // weight folded into its idf, which scales the *score*. The per-block
+    // BlockMaxWAND skip ceilings (`block_max_bm25`/`term_max_bm25`) are baked
+    // from the unweighted idf, so they MUST be scaled by the same weight — a
+    // block's true max score is `weight x` its stored ceiling. If only the score
+    // is scaled, a later block reads half its real ceiling, BMW skips it, and
+    // the true top-doc is dropped.
+    //
+    // Plant the highest-tf doc in a *later* posting block, behind a threshold set
+    // by a moderate earlier-block doc, and query at k=1 where the skip is most
+    // aggressive. Every doc is padded to the same token length so length-norm is
+    // uniform and term frequency alone decides the ranking.
+    const N: u64 = 200; // > 128 zebra-docs => the term spans two 128-doc blocks
+    const LEN: usize = 12; // uniform doc length => uniform length normalization
+    const MODERATE_ID: u64 = 5; // block 0: sets the k=1 threshold
+    const TOP_ID: u64 = 150; // block 1: highest tf, the true top-1
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let tf: usize = match i {
+                MODERATE_ID => 3,
+                TOP_ID => 10,
+                _ => 1,
+            };
+            let text = format!("{}{}", "zebra ".repeat(tf), "flr ".repeat(LEN - tf));
+            (i, text.trim_end().to_string())
+        })
+        .collect();
+    let corp: Vec<(u64, &str)> = owned.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+
+    // Ground truth: the repeat counts "zebra" twice, so the highest-tf doc is the
+    // unambiguous top-1.
+    let oracle_top1 = oracle.top_k("zebra zebra", 1, tok.as_ref());
+    assert_eq!(
+        oracle_top1.first().map(|(d, _)| *d),
+        Some(TOP_ID),
+        "oracle sanity: repeated-term top-1 should be the highest-tf doc"
+    );
+
+    let infino_top1: Vec<u64> = infino
+        .bm25_hits_async("title", "zebra zebra", 1, BoolMode::Or)
+        .await
+        .expect("repeated-term OR search")
+        .into_iter()
+        .map(|(d, _)| d as u64)
+        .collect();
+    assert_eq!(
+        infino_top1,
+        vec![TOP_ID],
+        "repeated-term top-1 dropped by an under-scaled block-max skip: the qtf \
+         weight must scale block_max_bm25/term_max_bm25, not just the score"
+    );
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).

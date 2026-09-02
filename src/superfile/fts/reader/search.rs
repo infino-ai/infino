@@ -365,6 +365,25 @@ impl FtsReader {
     /// finishes here since it's cheap; the phrase-atom shape also
     /// finishes here, but only because it isn't wired to the reader
     /// pool yet, not because it's cheap.
+    /// Collapse repeated clause terms into distinct terms plus a per-term repeat
+    /// count (query-term-frequency). Order-preserving; O(n²) over the handful of
+    /// query terms (the same shape the count path already dedups with). Returns
+    /// each term with count 1 — a no-op — for a distinct-term query.
+    fn dedup_terms_with_qtf<'a>(terms: &[&'a str]) -> (Vec<&'a str>, Vec<u32>) {
+        let mut distinct: Vec<&str> = Vec::with_capacity(terms.len());
+        let mut qtf: Vec<u32> = Vec::with_capacity(terms.len());
+        for &t in terms {
+            match distinct.iter().position(|&d| d == t) {
+                Some(i) => qtf[i] += 1,
+                None => {
+                    distinct.push(t);
+                    qtf.push(1);
+                }
+            }
+        }
+        (distinct, qtf)
+    }
+
     pub(crate) async fn prepare_clauses(
         &self,
         column: &str,
@@ -459,7 +478,7 @@ impl FtsReader {
             // Negatives are a hard exclusion filter, not scored, so their
             // idf is irrelevant — always build them with local stats.
             _ => Some(ExcludeFilter::new(
-                self.build_term_cursors(column_id, lists.negatives, None, false)
+                self.build_term_cursors(column_id, lists.negatives, None, false, None)
                     .await?,
             )),
         };
@@ -467,6 +486,16 @@ impl FtsReader {
         // `build_term_cursors` call (the dictionary fetch is a real
         // byte-source range on every query, warm or cold).
         let mut dict_ranges = u64::from(neg_filter.is_some());
+
+        // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
+        // repeat count becomes a query-term-frequency multiplier on the term's
+        // idf. BM25 is linear in `idf_x_k1p1`, so this scores identically to N
+        // duplicate cursors at 1/N the cursor + scan cost — e.g. `+to +be +or
+        // +not +to +be` builds 4 cursors, not 6. A no-op for distinct-term
+        // queries. The single-term fast path below gates on the pre-dedup count,
+        // so a repeated lone term (`+to +to`) routes through the weighted path.
+        let (musts, must_qtf) = Self::dedup_terms_with_qtf(lists.musts);
+        let (shoulds, should_qtf) = Self::dedup_terms_with_qtf(lists.shoulds);
 
         // Single-atom fast path: BlockMaxWAND-driven block skipping.
         // One term scores identically whichever clause list it sits
@@ -498,9 +527,15 @@ impl FtsReader {
             });
         }
 
-        if lists.musts.is_empty() {
+        if musts.is_empty() {
             let cursors = self
-                .build_term_cursors(column_id, lists.shoulds, lists.global_idf, false)
+                .build_term_cursors(
+                    column_id,
+                    &shoulds,
+                    lists.global_idf,
+                    false,
+                    Some(&should_qtf),
+                )
                 .await?;
             dict_ranges += 1;
             if cursors.is_empty() {
@@ -526,10 +561,10 @@ impl FtsReader {
         // Build must cursors; if any must is missing, the
         // intersection is empty.
         let must_cursors = self
-            .build_term_cursors(column_id, lists.musts, lists.global_idf, false)
+            .build_term_cursors(column_id, &musts, lists.global_idf, false, Some(&must_qtf))
             .await?;
         dict_ranges += 1;
-        if must_cursors.len() != lists.musts.len() {
+        if must_cursors.len() != musts.len() {
             let postings_bytes = term_cursor_bytes(&must_cursors)
                 + neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
             let planned_ranges = term_cursor_ranges(&must_cursors)
@@ -542,7 +577,7 @@ impl FtsReader {
                 kernel_cpu_ns: 0,
             });
         }
-        if lists.shoulds.is_empty() {
+        if shoulds.is_empty() {
             return Ok(PreparedClauses::Must {
                 column_id,
                 must_cursors,
@@ -555,7 +590,13 @@ impl FtsReader {
         // Shoulds absent from this superfile contribute nothing;
         // when none survive, the walk is a plain must intersection.
         let should_cursors = self
-            .build_term_cursors(column_id, lists.shoulds, lists.global_idf, false)
+            .build_term_cursors(
+                column_id,
+                &shoulds,
+                lists.global_idf,
+                false,
+                Some(&should_qtf),
+            )
             .await?;
         dict_ranges += 1;
         if should_cursors.is_empty() {
@@ -698,7 +739,7 @@ impl FtsReader {
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(column_id, terms, global_idf, false)
+            self.build_term_cursors(column_id, terms, global_idf, false, None)
                 .await?
         };
         Ok(OrCursorSet { column_id, cursors })
@@ -1104,9 +1145,10 @@ impl FtsReader {
         terms: &[&str],
         global_idf: Option<&GlobalTermIdf>,
         count_only: bool,
+        qtf: Option<&[u32]>,
     ) -> Result<Vec<TermCursor>, FtsError> {
         Ok(self
-            .build_term_cursors_opt(column_id, terms, global_idf, count_only)
+            .build_term_cursors_opt(column_id, terms, global_idf, count_only, qtf)
             .await?
             .into_iter()
             .flatten()
@@ -1119,12 +1161,18 @@ impl FtsReader {
     /// fan-out for the whole batch — so a multi-term build costs a single
     /// dictionary fetch and a single overlapped range wave, not one of each
     /// per term.
+    /// `qtf`, when present, is a per-term query-term-frequency weight (parallel to
+    /// `terms`): each built cursor folds its weight into the effective idf, which
+    /// scales both the score and the BlockMaxWAND skip ceilings, so a deduplicated
+    /// repeated term ranks identically to the duplicates it replaced (BM25 is
+    /// linear in idf). `None` leaves idf unweighted.
     pub(super) async fn build_term_cursors_opt(
         &self,
         column_id: u32,
         terms: &[&str],
         global_idf: Option<&GlobalTermIdf>,
         count_only: bool,
+        qtf: Option<&[u32]>,
     ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
@@ -1189,7 +1237,9 @@ impl FtsReader {
         let mut pfor_iter = pfor_bytes.into_iter();
 
         let mut cursors: Vec<Option<TermCursor>> = Vec::with_capacity(resolved.len());
-        for r in resolved {
+        for (i, r) in resolved.into_iter().enumerate() {
+            // Per-term query-term-frequency weight (1 when unweighted).
+            let weight = qtf.map_or(1, |w| w[i]);
             match r {
                 None => cursors.push(None),
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
@@ -1204,28 +1254,32 @@ impl FtsReader {
                         false => tf,
                     };
                     let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                    cursors.push(Some(TermCursor::new_inline(
+                    let cursor = TermCursor::new_inline(
                         doc_id,
                         tf,
                         self.n_docs as u64,
                         dl_norm_k1,
                         gidf,
-                    )));
+                        weight,
+                    );
+                    cursors.push(Some(cursor));
                 }
                 Some(Resolved::Pfor {
                     gidf,
                     header_probed,
                 }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    cursors.push(Some(TermCursor::new(
+                    let cursor = TermCursor::new(
                         term_bytes,
                         self.n_docs as u64,
                         col_meta.positions,
                         gidf,
+                        weight,
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
-                    )?));
+                    )?;
+                    cursors.push(Some(cursor));
                 }
             }
         }

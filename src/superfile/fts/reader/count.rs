@@ -243,7 +243,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true)
+            .build_term_cursors(column_id, tokens, None, true, None)
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -283,7 +283,7 @@ impl FtsReader {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true)
+            .build_term_cursors(column_id, tokens, None, true, None)
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += 1;
@@ -676,7 +676,7 @@ mod tests {
         // Prove `mix` really has both encodings — else the test silently checks
         // nothing about the transition.
         let cursors = r
-            .build_term_cursors(0, &["mix"], None, true)
+            .build_term_cursors(0, &["mix"], None, true, None)
             .await
             .expect("build cursors");
         let mix = &cursors[0];
