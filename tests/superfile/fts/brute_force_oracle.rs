@@ -1133,6 +1133,58 @@ async fn dedup_partial_repeat_preserves_matches_and_weights_one_term() {
 }
 
 #[tokio::test]
+async fn oracle_dedup_repeated_terms_match_brute_force() {
+    // Anchor dedup against ground-truth BM25, not just its internal 2x linearity:
+    // the brute-force oracle sums per query *token*, so a repeat counts twice —
+    // infino's qtf-fold must reproduce the same absolute scores and the same
+    // ordering. This catches future divergence in either scorer or in the dedup
+    // weighting that the self-consistency tests (which only compare infino to
+    // itself) cannot.
+    let corp = corpus();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+
+    // Repeated-term AND: "rust" ∧ "framework" is a single doc, so scores compare
+    // directly with no rank ambiguity. The oracle counts "rust" twice.
+    let mut and_terms: Vec<String> = Vec::new();
+    tok.tokenize_each("rust rust framework", &mut |t| and_terms.push(t.to_owned()));
+    let infino_and: Vec<(u64, f32)> = infino
+        .bm25_hits_async("title", "+rust +rust +framework", 10, BoolMode::And)
+        .await
+        .expect("repeated-AND search")
+        .into_iter()
+        .map(|(d, s)| (d as u64, s))
+        .collect();
+    let oracle_and = oracle.top_k_terms_and(&and_terms, 10);
+    assert_eq!(
+        infino_and.len(),
+        oracle_and.len(),
+        "repeated-AND hit counts disagree: infino={infino_and:?} oracle={oracle_and:?}"
+    );
+    assert!(!infino_and.is_empty(), "expected repeated-AND hits");
+    for ((i_doc, i_score), (o_doc, o_score)) in infino_and.iter().zip(oracle_and.iter()) {
+        assert_eq!(*i_doc, *o_doc, "repeated-AND doc-id mismatch");
+        let delta = (i_score - o_score).abs();
+        assert!(
+            delta < BM25_SCORE_ABS_TOLERANCE,
+            "repeated-AND score divergence on doc {i_doc}: infino={i_score} oracle={o_score} delta={delta}"
+        );
+    }
+
+    // Repeated should term in a multi-doc union: exercises the windowed-maxscore
+    // kernel with a weighted should, compared against ground-truth ordering
+    // across k. The common-heavy corpus's top-5 head is tie-free.
+    let heavy = common_heavy_corpus(4_000);
+    let heavy_refs: Vec<(u64, &str)> = heavy.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino_h = build_infino_superfile(&heavy_refs);
+    let oracle_h = BruteForceBm25::index(&heavy_refs, tok.as_ref());
+    for k in [10usize, 100] {
+        assert_top_k_head_agrees(&infino_h, &oracle_h, "alpha beta beta gamma", 5, k).await;
+    }
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
