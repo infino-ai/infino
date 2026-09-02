@@ -237,6 +237,13 @@ vector:
   # at large N (measured win at 10M+, loss at 1M). Documented starting point.
   centroid_graph_scale_floor_docs: 10000000
 
+  # Ceiling on the fanout the router's recall calibration considers: the widest
+  # number of global fine clusters the calibration selects + scores per query,
+  # and thus the deepest fanout it can stamp. Bounds calibration cost regardless
+  # of corpus size (total fine clusters grow with N); the width x fine prior
+  # stays the sweep's lower seed. Default 4096 (~= 512 * sqrt(N/1e6) at 100M).
+  centroid_graph_max_fanout: 4096
+
   # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table
   # ef into the persisted graph bundle; that stamped value drives every query.

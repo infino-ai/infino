@@ -301,6 +301,7 @@ const DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO: f64 = 0.5;
 /// 10M docs, where the selected clusters coalesce into a cold-read win (the
 /// graph measured a win at 10M+, a loss at 1M). A documented starting point.
 const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 10_000_000;
+const DEFAULT_CENTROID_GRAPH_MAX_FANOUT: usize = 4096;
 /// Default upper bound on the `hnsw` calibration ef grid. High-dimensional
 /// cosine tables need a wide beam to reach the recall bar (e.g. glove-100
 /// clears ~0.99 only at ef=1024), so the ceiling allows that; the stamped
@@ -576,6 +577,16 @@ pub struct VectorSettings {
     /// coalesce. Documented starting point, tunable; final value from a
     /// real-corpus sweep.
     pub centroid_graph_scale_floor_docs: u64,
+    /// Ceiling on the fanout the router's recall calibration considers — the
+    /// widest number of global fine clusters the calibration sweep selects and
+    /// scores per query, and thus the deepest fanout it can stamp. It bounds the
+    /// calibration cost regardless of corpus size (the total fine-cluster count
+    /// grows with N): the sweep never selects more than this many clusters, so
+    /// the single per-query cluster read the calibrator relies on stays bounded.
+    /// The grid's `width × fine` prior remains the sweep's lower seed. Reads at
+    /// query time are still governed by the stamped per-`k` fanout, which this
+    /// only caps. Default 4096 (≈ `512 · √(N/1e6)` at 100M).
+    pub centroid_graph_max_fanout: usize,
     /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
     /// the winning `ef` per table into the persisted bundle. Must be at least
@@ -711,6 +722,7 @@ impl Default for VectorSettings {
             global_fine_graph_ef: 0,
             centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
             centroid_graph_scale_floor_docs: DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
+            centroid_graph_max_fanout: DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: DEFAULT_VECTOR_HNSW_EF_SEARCH,
