@@ -427,6 +427,7 @@ impl TermCursor {
         n_docs: u64,
         positional: bool,
         global_idf: Option<f32>,
+        weight: u32,
         header_probed: bool,
         count_only: bool,
         has_coarse: bool,
@@ -440,19 +441,21 @@ impl TermCursor {
         // table, not at `postings_length`.
         let term_meta = TermMeta::parse(postings, metadata_offset, positional, false, has_coarse)?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
-        let idf = global_idf.unwrap_or(local_idf);
-        // Stored per-block BMW upper bounds bake in the LOCAL idf. Only a
-        // global-idf override needs to rescale them by global/local:
-        // block_max = local_idf_x_k1p1 × (an idf-independent tf-factor),
-        // so the linear rescale is exact and keeps the BMW skip UBs
-        // consistent with the global-idf scores computed from
-        // `idf_x_k1p1` below. `None` (the default per-superfile path, and
-        // the case where a gathered global idf happens to equal the
-        // local one) leaves the stored value untouched — the block loop
-        // does no extra work, matching the per-superfile scorer exactly.
-        let idf_rescale = match global_idf {
-            Some(_) if local_idf > 0.0 && idf != local_idf => Some(idf / local_idf),
-            _ => None,
+        // Effective idf folds in the query-term-frequency `weight` (> 1 only for a
+        // deduplicated repeated term) on top of any global-idf override.
+        let idf = global_idf.unwrap_or(local_idf) * weight as f32;
+        // Stored per-block BMW upper bounds bake in the LOCAL idf, so any factor
+        // that scales the score away from it — a global-idf override and/or a qtf
+        // `weight` — must rescale them by the same ratio: block_max =
+        // local_idf_x_k1p1 × (an idf-independent tf-factor), so the linear rescale
+        // is exact and keeps the BMW skip UBs consistent with the scores computed
+        // from `idf_x_k1p1` below. When `idf == local_idf` (the default
+        // per-superfile path with weight 1) the ratio is 1 and the block loop does
+        // no extra work, matching the per-superfile scorer exactly.
+        let idf_rescale = if local_idf > 0.0 && idf != local_idf {
+            Some(idf / local_idf)
+        } else {
+            None
         };
 
         // Collect straight into the `Arc` allocation: `0..num_blocks` is
@@ -517,8 +520,11 @@ impl TermCursor {
         n_docs: u64,
         dl_norm_k1: f32,
         global_idf: Option<f32>,
+        weight: u32,
     ) -> Self {
-        let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1));
+        // Fold the qtf `weight` into the effective idf so the single-doc block-max
+        // (computed below from `idf_x_k1p1`) scales together with the score.
+        let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 

@@ -1329,6 +1329,7 @@ impl FtsReader {
                         n_docs,
                         positional,
                         None,
+                        1,
                         false,
                         false,
                         self.has_coarse_block_max,

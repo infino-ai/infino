@@ -1162,9 +1162,10 @@ impl FtsReader {
     /// dictionary fetch and a single overlapped range wave, not one of each
     /// per term.
     /// `qtf`, when present, is a per-term query-term-frequency weight (parallel to
-    /// `terms`): each built cursor's `idf_x_k1p1` is multiplied by its weight, so a
-    /// deduplicated repeated term scores identically to the duplicates it replaced
-    /// (BM25 is linear in `idf_x_k1p1`). `None` leaves idf unweighted.
+    /// `terms`): each built cursor folds its weight into the effective idf, which
+    /// scales both the score and the BlockMaxWAND skip ceilings, so a deduplicated
+    /// repeated term ranks identically to the duplicates it replaced (BM25 is
+    /// linear in idf). `None` leaves idf unweighted.
     pub(super) async fn build_term_cursors_opt(
         &self,
         column_id: u32,
@@ -1253,11 +1254,14 @@ impl FtsReader {
                         false => tf,
                     };
                     let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                    let mut cursor =
-                        TermCursor::new_inline(doc_id, tf, self.n_docs as u64, dl_norm_k1, gidf);
-                    if weight > 1 {
-                        cursor.idf_x_k1p1 *= weight as f32;
-                    }
+                    let cursor = TermCursor::new_inline(
+                        doc_id,
+                        tf,
+                        self.n_docs as u64,
+                        dl_norm_k1,
+                        gidf,
+                        weight,
+                    );
                     cursors.push(Some(cursor));
                 }
                 Some(Resolved::Pfor {
@@ -1265,18 +1269,16 @@ impl FtsReader {
                     header_probed,
                 }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    let mut cursor = TermCursor::new(
+                    let cursor = TermCursor::new(
                         term_bytes,
                         self.n_docs as u64,
                         col_meta.positions,
                         gidf,
+                        weight,
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
                     )?;
-                    if weight > 1 {
-                        cursor.idf_x_k1p1 *= weight as f32;
-                    }
                     cursors.push(Some(cursor));
                 }
             }

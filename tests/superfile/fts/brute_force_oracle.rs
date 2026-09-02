@@ -1185,6 +1185,64 @@ async fn oracle_dedup_repeated_terms_match_brute_force() {
 }
 
 #[tokio::test]
+async fn oracle_dedup_repeated_term_block_max_skip_matches_brute_force() {
+    // A repeated query term is deduped to one cursor with a query-term-frequency
+    // weight folded into its idf, which scales the *score*. The per-block
+    // BlockMaxWAND skip ceilings (`block_max_bm25`/`term_max_bm25`) are baked
+    // from the unweighted idf, so they MUST be scaled by the same weight — a
+    // block's true max score is `weight x` its stored ceiling. If only the score
+    // is scaled, a later block reads half its real ceiling, BMW skips it, and
+    // the true top-doc is dropped.
+    //
+    // Plant the highest-tf doc in a *later* posting block, behind a threshold set
+    // by a moderate earlier-block doc, and query at k=1 where the skip is most
+    // aggressive. Every doc is padded to the same token length so length-norm is
+    // uniform and term frequency alone decides the ranking.
+    const N: u64 = 200; // > 128 zebra-docs => the term spans two 128-doc blocks
+    const LEN: usize = 12; // uniform doc length => uniform length normalization
+    const MODERATE_ID: u64 = 5; // block 0: sets the k=1 threshold
+    const TOP_ID: u64 = 150; // block 1: highest tf, the true top-1
+    let owned: Vec<(u64, String)> = (0..N)
+        .map(|i| {
+            let tf: usize = match i {
+                MODERATE_ID => 3,
+                TOP_ID => 10,
+                _ => 1,
+            };
+            let text = format!("{}{}", "zebra ".repeat(tf), "flr ".repeat(LEN - tf));
+            (i, text.trim_end().to_string())
+        })
+        .collect();
+    let corp: Vec<(u64, &str)> = owned.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+
+    // Ground truth: the repeat counts "zebra" twice, so the highest-tf doc is the
+    // unambiguous top-1.
+    let oracle_top1 = oracle.top_k("zebra zebra", 1, tok.as_ref());
+    assert_eq!(
+        oracle_top1.first().map(|(d, _)| *d),
+        Some(TOP_ID),
+        "oracle sanity: repeated-term top-1 should be the highest-tf doc"
+    );
+
+    let infino_top1: Vec<u64> = infino
+        .bm25_hits_async("title", "zebra zebra", 1, BoolMode::Or)
+        .await
+        .expect("repeated-term OR search")
+        .into_iter()
+        .map(|(d, _)| d as u64)
+        .collect();
+    assert_eq!(
+        infino_top1,
+        vec![TOP_ID],
+        "repeated-term top-1 dropped by an under-scaled block-max skip: the qtf \
+         weight must scale block_max_bm25/term_max_bm25, not just the score"
+    );
+}
+
+#[tokio::test]
 async fn oracle_and_single_term_routed_consistently() {
     // BoolMode::And with a single term must route the same as
     // BoolMode::Or (both fall through to the single-term BMW path).
