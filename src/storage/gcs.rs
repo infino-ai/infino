@@ -11,7 +11,7 @@
 //! the generation in [`ObjectMeta::etag`] (an opaque version token) and
 //! returns it through `UpdateVersion::version`.
 
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{fmt, ops::Range, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -53,9 +53,16 @@ const GCS_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const GCS_BEARER_TOKEN_OPTION: &str = "google_bearer_token";
 
 /// A GCS bearer credential the client reads per request, so a rotation swaps the token in place.
-#[derive(Debug)]
 pub struct SwappableGcpCredential {
     current: ArcSwap<GcpCredential>,
+}
+
+impl fmt::Debug for SwappableGcpCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwappableGcpCredential")
+            .field("bearer", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SwappableGcpCredential {
@@ -81,13 +88,25 @@ impl CredentialProvider for SwappableGcpCredential {
 
 /// GCS-backed `StorageProvider`. Cheap to clone; the inner
 /// `GoogleCloudStorage` shares its HTTP client across clones.
-#[derive(Debug)]
 pub struct GcsStorageProvider {
     bucket: String,
     prefix: String,
     store: Arc<GoogleCloudStorage>,
     credential: Option<Arc<SwappableGcpCredential>>,
     meter: Arc<UsageMeter>,
+}
+
+impl fmt::Debug for GcsStorageProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsStorageProvider")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl GcsStorageProvider {
@@ -111,7 +130,10 @@ impl GcsStorageProvider {
         Self::new_with_shared_credential(bucket, prefix, opts, None)
     }
 
-    /// Like [`Self::new_with_prefix`] but shares a caller-owned rotatable credential when supplied.
+    /// Like [`Self::new_with_prefix`] but shares a caller-owned rotatable
+    /// credential when supplied. When `shared` is `Some` it is authoritative:
+    /// any bearer token in `opts` is ignored, so a later provider built from the
+    /// same options cannot reset a credential that has since been rotated.
     pub fn new_with_shared_credential(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -472,16 +494,6 @@ impl StorageProvider for GcsStorageProvider {
     fn usage_meter(&self) -> Arc<UsageMeter> {
         Arc::clone(&self.meter)
     }
-
-    fn update_credentials(&self, opts: &StorageOptions) -> Result<bool, StorageError> {
-        let (Some(credential), Some(bearer)) =
-            (&self.credential, opts.get(GCS_BEARER_TOKEN_OPTION))
-        else {
-            return Ok(false);
-        };
-        credential.set_bearer(bearer.clone());
-        Ok(true)
-    }
 }
 
 #[cfg(test)]
@@ -553,7 +565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_with_bearer_updates_credential_in_place() {
+    async fn provider_with_bearer_exposes_a_swappable_credential() {
         let opts = StorageOptions::from([(GCS_BEARER_TOKEN_OPTION.to_string(), "t0".to_string())]);
         let provider = GcsStorageProvider::new_with_prefix("b", "", &opts).expect("build");
         let cred = provider.shared_credential().expect("swappable present");
@@ -562,9 +574,7 @@ mod tests {
             "t0"
         );
 
-        let rotated =
-            StorageOptions::from([(GCS_BEARER_TOKEN_OPTION.to_string(), "t1".to_string())]);
-        assert!(provider.update_credentials(&rotated).expect("swap ok"));
+        cred.set_bearer("t1".to_string());
         assert_eq!(
             cred.get_credential().await.expect("credential").bearer,
             "t1"
@@ -572,13 +582,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_without_bearer_has_no_swappable_and_update_is_false() {
+    fn provider_without_bearer_has_no_swappable() {
         let provider =
             GcsStorageProvider::new_with_prefix("b", "", &StorageOptions::new()).expect("build");
         assert!(provider.shared_credential().is_none());
-        let rotated =
-            StorageOptions::from([(GCS_BEARER_TOKEN_OPTION.to_string(), "t1".to_string())]);
-        assert!(!provider.update_credentials(&rotated).expect("no swap"));
+    }
+
+    #[test]
+    fn debug_output_redacts_the_bearer_token() {
+        let secret = "super-secret-token-value";
+        let opts =
+            StorageOptions::from([(GCS_BEARER_TOKEN_OPTION.to_string(), secret.to_string())]);
+        let provider = GcsStorageProvider::new_with_prefix("b", "", &opts).expect("build");
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains(secret), "provider Debug leaks the token");
+
+        let cred = provider.shared_credential().expect("swappable present");
+        assert!(
+            !format!("{cred:?}").contains(secret),
+            "credential Debug leaks the token"
+        );
     }
 
     #[tokio::test]

@@ -610,7 +610,20 @@ impl Connection {
     /// # let _ = posts;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    /// Rotate the object-store credential in place; `false` if unsupported and the caller should reopen.
+    pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c.open_table(name);
+        }
+        Ok(Supertable::from_local(self.open_table_handle(name)?))
+    }
+
+    /// Rotate the GCS bearer token in place, returning `true` when it was
+    /// swapped. Only the bearer (`google_bearer_token`) is honored; any other
+    /// key in `storage_options` is ignored on this path. Returns `false` when
+    /// the connection has no in-place-rotatable credential (a non-GCS backend)
+    /// or no bearer key was supplied — in both cases the caller should reopen,
+    /// which applies the full `storage_options`.
     pub fn update_storage_credentials(&self, storage_options: &[(String, String)]) -> bool {
         let Some(credential) = &self.inner.gcs_credential else {
             return false;
@@ -623,16 +636,6 @@ impl Connection {
         };
         credential.set_bearer(bearer.clone());
         true
-    }
-
-    /// Open an existing table by name, returning the public [`Supertable`] wrapper. Fails with
-    /// [`InfinoError::NotFound`] if no such table is registered.
-    pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
-        #[cfg(feature = "remote")]
-        if let CatalogStore::Remote(c) = &self.inner.store {
-            return c.open_table(name);
-        }
-        Ok(Supertable::from_local(self.open_table_handle(name)?))
     }
 
     /// Remove a table from the catalog. **Idempotent**: dropping a table that
