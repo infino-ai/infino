@@ -63,15 +63,47 @@ pub enum IdParseError {
 macro_rules! define_id_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy)]
+        // Cap the field alignment at 8. `i128` is 16-byte aligned on x86, and an
+        // `i128` carried through a large `async` state machine can land on an
+        // 8-aligned frame slot that the compiler then writes with a 16-byte
+        // *aligned* SSE move (`movaps`) — a general-protection fault, seen only on
+        // x86_64-apple-darwin. Capping alignment at 8 makes the compiler use
+        // unaligned moves instead, so the value moves correctly at any offset.
+        // The id stays 128 bits and the hex wire form is unchanged.
+        #[repr(C, packed(8))]
         pub struct $name(pub i128);
+
+        // `#[derive]` for these traits borrows the field (`&self.0`), which is
+        // illegal on a packed struct; hand-write them reading a *copy* instead.
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                let a = self.0;
+                let b = other.0;
+                a == b
+            }
+        }
+        impl Eq for $name {}
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                let v = self.0;
+                v.hash(state);
+            }
+        }
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let v = self.0;
+                write!(f, "{}({})", stringify!($name), v)
+            }
+        }
 
         impl $name {
             /// 32-char zero-padded lowercase hex of `self.0.to_be_bytes()`.
             /// Stable across releases — JSON payload format, so any
             /// change here is a wire-format change.
             pub fn to_hex(self) -> String {
-                let bytes = self.0.to_be_bytes();
+                let v = self.0;
+                let bytes = v.to_be_bytes();
                 let mut out = String::with_capacity(ID_HEX_LEN);
                 for b in bytes {
                     // `{:02x}` always emits two lowercase hex digits.
