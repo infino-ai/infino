@@ -109,8 +109,9 @@ use crate::superfile::{
         cell_posting::{CellPostingBuilder, MaterializedIvfRow},
         distance::Metric,
         ivf_merge::{
-            MergedIvfSubsection, Sq8IvfMergeInput, merge_sq8_ivf_subsections,
-            merge_sq8_ivf_subsections_from_parsed, stable_ids_in_merged_local_order,
+            MergedIvfSubsection, Sq8IvfMergeInput, fine_run_target_n_cent,
+            merge_sq8_ivf_subsections, merge_sq8_ivf_subsections_from_parsed,
+            stable_ids_in_merged_local_order,
         },
         layout::VectorLayout,
         reader::{ColumnReader, VectorReader},
@@ -970,9 +971,10 @@ impl SuperfileBuilder {
 
         if any_tombstones {
             // Materialize → filter by file-local tombstone id → rebuild per cell.
-            // Also track the max fine-cluster count seen per cell so rebuilds
-            // keep the source IVF width (empty clusters stay empty).
-            let mut by_cell: HashMap<u32, (usize, Vec<MaterializedIvfRow>)> = HashMap::new();
+            // The fine-cluster count is re-derived from the surviving row count at
+            // rebuild time (see the build loop) so a merged cell is re-clustered
+            // to the fine-run byte target rather than inheriting a source width.
+            let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
             for (reader_idx, (reader, deleted)) in readers.iter().enumerate() {
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
                 let superseded = superseded_per_reader.get(reader_idx);
@@ -995,20 +997,19 @@ impl SuperfileBuilder {
                     if rows.is_empty() {
                         continue;
                     }
-                    let entry = by_cell.entry(cell_id).or_insert_with(|| (0, Vec::new()));
-                    entry.0 = entry.0.max(col.n_cent as usize);
-                    entry.1.extend(rows);
+                    by_cell.entry(cell_id).or_default().extend(rows);
                 }
             }
 
             let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
             cell_ids.sort_unstable();
             for cell_id in cell_ids {
-                let (n_cent, mut rows) = by_cell.remove(&cell_id).expect("cell present");
+                let mut rows = by_cell.remove(&cell_id).expect("cell present");
                 for (i, row) in rows.iter_mut().enumerate() {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+                let n_cent = fine_run_target_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
                 let merged = build_merged_subsection_from_materialized(
                     vec_cfg.clone(),
                     n_cent.max(1),
@@ -1051,7 +1052,23 @@ impl SuperfileBuilder {
                 let same_shape = sources
                     .windows(2)
                     .all(|pair| pair[0].2.n_cent == pair[1].2.n_cent);
-                if same_shape {
+                // Byte-splice concatenates cluster-i with cluster-i positionally,
+                // so it emits the SOURCE fine-cluster count. That stays near the
+                // fine-run byte target only while the merged union still fits that
+                // many clusters; once the union crosses the target the spliced
+                // clusters fatten, their summary centroids drift to the blob's
+                // center of mass, and cell routing misranks (recall caps, cold
+                // reads balloon). Take the fast splice only when the union still
+                // fits the source width; otherwise fall through to the rebuild
+                // path, which re-clusters to the re-derived width.
+                let merged_docs: usize =
+                    sources.iter().map(|(_, _, inp)| inp.n_docs as usize).sum();
+                let fits_target = fine_run_target_n_cent(
+                    sources[0].2.dim,
+                    sources[0].2.rerank_codec,
+                    merged_docs,
+                ) <= sources[0].2.n_cent;
+                if same_shape && fits_target {
                     let mut inputs: Vec<Sq8IvfMergeInput> =
                         sources.into_iter().map(|(_, _, inp)| inp).collect();
                     let mut doc_base = 0u32;
@@ -1072,15 +1089,12 @@ impl SuperfileBuilder {
                     packed_cells.push((cell_id, merged));
                     continue;
                 }
-                // Same cell, different fine `n_cent` (a small delta drain
-                // merging into a larger base): byte-splice is positional per
-                // cluster, so rebuild this cell from materialized rows at the
-                // widest source width — same path the tombstone branch uses.
-                let n_cent = sources
-                    .iter()
-                    .map(|(_, _, inp)| inp.n_cent)
-                    .max()
-                    .unwrap_or(1);
+                // Reached when the sources disagree on fine `n_cent` (a small
+                // delta drain merging into a larger base) OR agree but their
+                // union no longer fits that width. Byte-splice is positional per
+                // cluster, so rebuild this cell from materialized rows and
+                // re-cluster to the fine-run byte target re-derived from the
+                // merged row count — same path the tombstone branch uses.
                 let mut rows: Vec<MaterializedIvfRow> = Vec::new();
                 for (reader_idx, ci, _) in sources {
                     let v = readers[reader_idx]
@@ -1093,6 +1107,7 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+                let n_cent = fine_run_target_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
                 let merged = build_merged_subsection_from_materialized(
                     vec_cfg.clone(),
                     n_cent.max(1),
@@ -4389,12 +4404,20 @@ mod tests {
         cells: &[(u32, usize, usize)],
         rerank_codec: RerankCodec,
     ) -> Arc<SuperfileReader> {
+        pack_cells_superfile_with_codec_dim(id_base, cells, rerank_codec, 16)
+    }
+
+    fn pack_cells_superfile_with_codec_dim(
+        id_base: i128,
+        cells: &[(u32, usize, usize)],
+        rerank_codec: RerankCodec,
+        dim: usize,
+    ) -> Arc<SuperfileReader> {
         use crate::superfile::vector::{
             builder::build_merged_subsection_from_materialized,
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
         };
 
-        let dim = 16usize;
         let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
             let (scale, offset): (Arc<[f32]>, Arc<[f32]>) =
                 if rerank_codec == RerankCodec::Sq8FixedResidual {
@@ -4603,7 +4626,10 @@ mod tests {
     /// Base drain and a small delta drain legitimately pack the same global
     /// cell at different fine widths (fine `n_cent` is sized by packed bytes).
     /// The merge must rebuild such cells from materialized rows instead of
-    /// failing the byte-splice `n_cent` equality check.
+    /// failing the byte-splice `n_cent` equality check — and it re-derives the
+    /// fine width from the merged row count, not the widest source, so a small
+    /// merged cell collapses to a single fine run (8 rows fit far inside one
+    /// fine-run byte target) instead of inheriting the source's 4.
     #[test]
     fn multi_cell_merge_rebuilds_cells_with_mismatched_fine_width() {
         // Cell 0 disagrees on width (4 vs 1); cell 1 agrees (splice path).
@@ -4620,10 +4646,60 @@ mod tests {
         let v = merged.vec().expect("vec");
         assert_eq!(v.packed_cell_ids(), &[0, 1]);
         let cols: Vec<_> = v.vector_columns_config().collect();
-        assert_eq!(cols[0].n_docs, 8); // 6 + 2 rebuilt at the widest width
-        assert_eq!(cols[0].n_cent, 4);
-        assert_eq!(cols[1].n_docs, 5); // 2 + 3 byte-spliced
+        assert_eq!(cols[0].n_docs, 8); // 6 + 2 rebuilt from materialized rows
+        assert_eq!(cols[0].n_cent, 1); // re-derived to the byte target, not max(4,1)
+        assert_eq!(cols[1].n_docs, 5); // 2 + 3 byte-spliced (union fits width 2)
         assert_eq!(cols[1].n_cent, 2);
+    }
+
+    /// Regression: two fragments of the SAME cell that agree on fine `n_cent`
+    /// take the byte-splice path, which concatenates cluster-i with cluster-i
+    /// and emits the *source* fine-cluster count. When their union outgrows the
+    /// fine-run byte target the merge must instead re-cluster to the re-derived
+    /// width — otherwise the merged cell keeps a too-coarse count, its summary
+    /// centroids drift, and cell routing scans far more of the corpus than it
+    /// should. Before the fix this byte-spliced to the source width (1) for a
+    /// union that needs several fine runs.
+    #[test]
+    fn multi_cell_merge_resplits_when_union_exceeds_fine_run_target() {
+        // A wide vector inflates the per-row stride so a small, fast corpus
+        // still crosses the real fine-run byte target.
+        let dim = 512usize;
+        let codec = RerankCodec::Sq8Residual;
+        // Largest row count that still fits one fine run, then a union that
+        // spans several runs.
+        let rows_per_run = (1..)
+            .find(|&n| fine_run_target_n_cent(dim, codec, n) > 1)
+            .expect("threshold")
+            - 1;
+        let left_rows = rows_per_run + rows_per_run / 2;
+        let right_rows = rows_per_run + rows_per_run / 2;
+        let total = left_rows + right_rows;
+        let expected_n_cent = fine_run_target_n_cent(dim, codec, total);
+        assert!(
+            expected_n_cent > 1,
+            "test corpus must exceed one fine run (rows_per_run={rows_per_run})"
+        );
+
+        // Both fragments pack cell 0 at fine width 1 → same_shape → byte-splice
+        // candidate; the union exceeds one run and must be re-clustered.
+        let a = pack_cells_superfile_with_codec_dim(1_000, &[(0, left_rows, 1)], codec, dim);
+        let b = pack_cells_superfile_with_codec_dim(9_000, &[(0, right_rows, 1)], codec, dim);
+
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)], &[])
+                .expect("merge over-target same-shape cell");
+        assert_eq!(stats.n_docs as usize, total);
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let v = merged.vec().expect("vec");
+        let cols: Vec<_> = v.vector_columns_config().collect();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].n_docs as usize, total);
+        assert_eq!(
+            cols[0].n_cent as usize, expected_n_cent,
+            "merged cell must re-cluster to the byte-target width, not the source width 1"
+        );
     }
 
     #[test]
