@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.5.13"
+version = "0.5.14"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "infino-node"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "arrow",
  "arrow-array",
