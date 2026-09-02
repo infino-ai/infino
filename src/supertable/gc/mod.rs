@@ -110,6 +110,10 @@ impl Supertable {
         bridge_on_runtime(self.gc_async(safety_gap), &self.inner().query_runtime())
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "gc", skip_all, fields(role = self.role().as_str()))
+    )]
     pub(crate) async fn gc_async(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         gc_storage_sweep_for_inner(self.inner(), safety_gap).await
     }

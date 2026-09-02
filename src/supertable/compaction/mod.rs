@@ -254,6 +254,10 @@ impl Supertable {
         bridge_on_runtime(self.compact_async(cfg), &self.inner().query_runtime())
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
+    )]
     pub(crate) async fn compact_async(
         &self,
         cfg: &CompactionSettings,
@@ -280,6 +284,10 @@ impl Supertable {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "compact_table", skip_all, fields(role = table.role().as_str()))
+    )]
     pub(crate) async fn compact_one_table(
         table: &Supertable,
         cfg: &CompactionSettings,
