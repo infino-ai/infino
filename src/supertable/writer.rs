@@ -135,9 +135,9 @@ use crate::{
             fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
-                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, DOC_ID_BYTES,
-                OUTER_HEADER_SIZE, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry,
-                dir_entry, outer_hdr, sub_hdr,
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
+                STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry, dir_entry, outer_hdr,
+                sub_hdr,
             },
         },
         reader::vector_layout_from_kv,
@@ -151,7 +151,8 @@ use crate::{
             distance::Metric,
             hnsw::PayloadKind,
             ivf_merge::{
-                MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
+                MergedIvfSubsection, fine_run_target_n_cent, merge_fragment_subsections,
+                route_clusters_into_cells,
             },
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -188,11 +189,6 @@ use crate::{
         },
     },
 };
-
-/// Target bytes per fine IVF run inside one global cell. Fine-centroid count
-/// is derived from this target; it is not copied from the outer/global grid or
-/// repeated as a fixed count for every small commit delta.
-const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 
 /// Multipart chunk size for large superfile uploads.
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
@@ -5558,28 +5554,19 @@ fn assign_cells<'a>(
     Ok(out)
 }
 
-/// Size one cell's fine IVF so one run is approximately
-/// [`DRAIN_FINE_RUN_TARGET_BYTES`]. The stride counts every per-row byte in
-/// the packed IVF: RaBitQ estimate code, local id, Sq8+epsilon rerank bytes,
-/// inline stable id, and the conservative norm word.
 /// Per-cell drain config plus the centroid count derived for that cell. The
-/// count sizes each fine run to ~`DRAIN_FINE_RUN_TARGET_BYTES` of encoded
-/// rows against the cell's row count (independent of any caller knob), and is
-/// passed alongside the config into the cell-pack build.
+/// count sizes each fine run to the fine-run byte target of encoded rows against
+/// the cell's row count (independent of any caller knob), via the shared
+/// [`fine_run_target_n_cent`] — the same sizing merge re-applies, so a cell's
+/// fine runs stay near target through drains and compactions alike.
 fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig, usize) {
     debug_assert!(n_rows > 0);
-    let dim = cfg.dim;
     let rerank_codec = if cfg.rerank_codec.is_ivf_mergeable() {
         cfg.rerank_codec
     } else {
         RerankCodec::Sq8Residual
     };
-    let rabitq_bytes = dim.div_ceil(u8::BITS as usize);
-    let rerank_bytes = rerank_codec.per_vector_bytes(dim);
-    let row_stride =
-        rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
-    let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
-    let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
+    let n_cent = fine_run_target_n_cent(cfg.dim, rerank_codec, n_rows);
     let cell_cfg = VectorConfig {
         rerank_codec,
         provided_centroids: None,

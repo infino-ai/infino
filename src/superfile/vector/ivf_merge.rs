@@ -25,7 +25,7 @@ use crate::superfile::{
     vector::{
         builder::{
             IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
-            fixed_sq8_quantizer, write_ivf_cluster_blocks,
+            effective_cell_n_cent, fixed_sq8_quantizer, write_ivf_cluster_blocks,
         },
         cell_posting::{EncodedCellRow, sq8_quant_params_equal},
         distance::{
@@ -50,6 +50,45 @@ fn stable_id_at(sids: &[i128], src_local: u32) -> Result<i128, BuildError> {
             "cell fragment doc-id out of range for stable-id table".into(),
         )
     })
+}
+
+/// Target encoded-byte size for one fine run (a sub-IVF cluster's rows). The
+/// fine-cluster count is derived from this so each run holds roughly this many
+/// bytes of encoded rows. Held identical at drain time (per fragment) and at
+/// merge time (per merged cell) so a cell's fine clusters stay near target as
+/// it grows through drains and compactions, instead of fattening past it.
+pub(crate) const FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
+
+/// The fine-cluster count (`n_cent`) that keeps each run near
+/// [`FINE_RUN_TARGET_BYTES`] of encoded rows for `n_rows` vectors of `dim`
+/// under `rerank_codec`. Re-derived from the *current* row count at every drain
+/// and every merge, so compaction re-clusters to fit instead of carrying a
+/// stale, too-coarse source count forward. `row_stride` mirrors the encoded
+/// per-row layout: 1-bit RaBitQ code + doc id + rerank code + stable id + the
+/// per-row f32 norm.
+pub(crate) fn fine_run_target_n_cent(
+    dim: usize,
+    rerank_codec: RerankCodec,
+    n_rows: usize,
+) -> usize {
+    let rabitq_bytes = dim.div_ceil(u8::BITS as usize);
+    let rerank_bytes = rerank_codec.per_vector_bytes(dim);
+    let row_stride =
+        rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + size_of::<f32>();
+    let rows_per_run = (FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
+    n_rows.div_ceil(rows_per_run).clamp(1, n_rows.max(1))
+}
+
+/// The fine-cluster `n_cent` a merged or rebuilt cell of `n_rows` (dimension
+/// `dim`, codec `rerank_codec`) will actually store: the fine-run byte target
+/// from [`fine_run_target_n_cent`] passed through the same cap the build
+/// applies ([`effective_cell_n_cent`]). The merge splice-gate compares against
+/// THIS, not the raw byte target — otherwise a cell whose byte target sits
+/// above the small-cell cap while its rows stay under the consolidated
+/// threshold never satisfies the gate, and every compaction rebuilds it only to
+/// re-derive the same capped count.
+pub(crate) fn effective_fine_n_cent(dim: usize, rerank_codec: RerankCodec, n_rows: usize) -> usize {
+    effective_cell_n_cent(fine_run_target_n_cent(dim, rerank_codec, n_rows), n_rows)
 }
 
 /// One input superfile column for byte-splice merge.
@@ -908,6 +947,99 @@ mod tests {
     const N_CENT: usize = 4;
     /// Rows per merge input.
     const ROWS: usize = 6;
+
+    /// Fine-run sizing is re-derived from the current row count: under one run's
+    /// worth of rows yields a single fine cluster, and crossing the byte target
+    /// adds runs as `ceil(rows / rows_per_run)`. This is the single contract both
+    /// drain and merge apply, so a merge can never carry a stale, too-coarse
+    /// count forward.
+    #[test]
+    fn fine_run_target_n_cent_tracks_row_count() {
+        let dim = 512;
+        let codec = RerankCodec::Sq8Residual;
+        assert_eq!(
+            fine_run_target_n_cent(dim, codec, 0),
+            1,
+            "never zero clusters"
+        );
+        assert_eq!(fine_run_target_n_cent(dim, codec, 1), 1);
+        let rows_per_run = (1..)
+            .find(|&n| fine_run_target_n_cent(dim, codec, n) > 1)
+            .expect("threshold")
+            - 1;
+        assert!(rows_per_run > 1, "a wide vector fits many rows per run");
+        assert_eq!(
+            fine_run_target_n_cent(dim, codec, rows_per_run),
+            1,
+            "exactly one run at the boundary"
+        );
+        assert_eq!(
+            fine_run_target_n_cent(dim, codec, rows_per_run + 1),
+            2,
+            "one past the boundary needs a second run"
+        );
+        assert_eq!(
+            fine_run_target_n_cent(dim, codec, rows_per_run * 3),
+            3,
+            "three runs' worth of rows needs three clusters"
+        );
+        // Monotonic non-decreasing as the row count grows.
+        let mut prev = 0;
+        for n in [
+            1,
+            rows_per_run,
+            rows_per_run + 1,
+            rows_per_run * 5,
+            rows_per_run * 50,
+        ] {
+            let cur = fine_run_target_n_cent(dim, codec, n);
+            assert!(
+                cur >= prev,
+                "n_cent shrank as rows grew: {n} -> {cur} < {prev}"
+            );
+            prev = cur;
+        }
+    }
+
+    /// The splice-gate sizing passes the byte target through the small-cell cap
+    /// the build actually applies. A cell whose raw byte target exceeds the cap
+    /// (64) but whose rows stay under the consolidated threshold (80,000) is
+    /// sized at the cap, matching what the build stores — so a same-shape merge
+    /// that stays in that band satisfies the gate instead of rebuilding every
+    /// compaction. Above the threshold the byte target applies uncapped.
+    #[test]
+    fn effective_fine_n_cent_applies_the_small_cell_cap() {
+        // dim 1024 / Sq8Residual puts the ~61K–80K row band above the 64 cap:
+        // 70,000 rows -> byte target 74 -> stored 64 after the small-cell cap.
+        let dim = 1024;
+        let codec = RerankCodec::Sq8Residual;
+        let banded_rows = 70_000;
+        assert!(
+            fine_run_target_n_cent(dim, codec, banded_rows) > 64,
+            "precondition: the raw byte target must exceed the small-cell cap"
+        );
+        assert_eq!(
+            effective_fine_n_cent(dim, codec, banded_rows),
+            64,
+            "a sub-threshold cell is stored at the capped count, so the gate \
+             accepts a same-shape splice against a cell already at 64"
+        );
+
+        // Just above the consolidated threshold the byte target is uncapped.
+        let consolidated_rows = 90_000;
+        let raw = fine_run_target_n_cent(dim, codec, consolidated_rows);
+        assert!(raw > 64, "precondition: consolidated cell exceeds the cap");
+        assert_eq!(
+            effective_fine_n_cent(dim, codec, consolidated_rows),
+            raw,
+            "a consolidated cell keeps the uncapped byte-target count"
+        );
+
+        // The effective count never exceeds the raw byte target at any size.
+        for n in [1, 1_000, banded_rows, consolidated_rows, 200_000] {
+            assert!(effective_fine_n_cent(dim, codec, n) <= fine_run_target_n_cent(dim, codec, n));
+        }
+    }
 
     /// Build one fixed-codec cell subsection whose rows all land in cluster 0
     /// of a provided 4-centroid grid, leaving clusters 1..3 empty (count 0)

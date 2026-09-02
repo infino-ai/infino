@@ -167,6 +167,25 @@ fn n_cent_row_count_cap(n_docs: usize) -> usize {
     }
 }
 
+/// The fine-cluster `n_cent` a cell pack actually stores for `requested_n_cent`
+/// at `n_docs` rows. The cap switches at the consolidated-cell boundary (see
+/// [`CONSOLIDATED_CELL_ROWS_THRESHOLD`]): consolidated cells keep the byte-target
+/// count uncapped; smaller cells clamp to the banded [`n_cent_row_count_cap`]
+/// the measured 1M/10M cold-GET layout depends on. Both build clamp sites and
+/// the merge splice-gate ([`effective_fine_n_cent`]) route through this one
+/// function, so the gate can never target a count the build will not store —
+/// which would otherwise rebuild a sub-threshold, above-cap cell on every
+/// compaction only to land back on the same capped count.
+pub(crate) fn effective_cell_n_cent(requested_n_cent: usize, n_docs: usize) -> usize {
+    let base = requested_n_cent.max(1);
+    let capped = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
+        base
+    } else {
+        base.min(n_cent_row_count_cap(n_docs))
+    };
+    capped.min(n_docs.max(1))
+}
+
 /// Target rows per IVF cluster for a STREAMING user-superfile build.
 /// Matches the layout the banded cap produces at its design points
 /// (1M rows / 1024 clusters = 976; the drain's fine-cluster p50 sits
@@ -1239,15 +1258,7 @@ fn materialized_centroids(
     // measured shape. Oversized fine-run splitting always runs — the
     // cap alone does not stop Lloyd from parking 2×-skewed runs that
     // flatten fine-first p=1 recall below 0.99.
-    let consolidated = n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD;
-    let requested = if consolidated {
-        requested_n_cent.max(1).min(n_docs.max(1))
-    } else {
-        requested_n_cent
-            .max(1)
-            .min(n_cent_row_count_cap(n_docs))
-            .min(n_docs.max(1))
-    };
+    let requested = effective_cell_n_cent(requested_n_cent, n_docs);
     // Keep the final Lloyd assignments — `split_oversized_fine_runs`
     // consumes them for the first bound check so a balanced pack (the
     // common commit-cell case) does not pay a redundant full sample
@@ -2204,17 +2215,9 @@ pub(crate) fn build_cell_subsection_from_source(
             }
         }
     }
-    // Mirrors the `materialized_centroids` `n_cent` cap switch so the
-    // sample is sized for the runs actually trained: consolidated cells
-    // uncapped, sub-threshold cells under the legacy row-count cap.
-    let effective_n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
-        requested_n_cent.max(1).min(n_docs)
-    } else {
-        requested_n_cent
-            .max(1)
-            .min(n_cent_row_count_cap(n_docs))
-            .min(n_docs)
-    };
+    // Sample is sized for the runs actually trained; the cap switch lives in
+    // the shared `effective_cell_n_cent`.
+    let effective_n_cent = effective_cell_n_cent(requested_n_cent, n_docs);
     let sample_size = if cfg.provided_centroids.is_some() {
         0
     } else {
