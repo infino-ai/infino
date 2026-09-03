@@ -377,6 +377,14 @@ impl Connection {
                 handles,
                 building,
             } => {
+                let (existing, _) =
+                    bridge_on_runtime(read_catalog(root.as_ref()), &shared_io_runtime())
+                        .map_err(|e| e.with_context("create_table", Some(name)))?;
+                if existing.tables.contains_key(name) {
+                    return Err(InfinoError::AlreadyExists(name.to_string())
+                        .with_context("create_table", Some(name)));
+                }
+
                 // Record what was actually used to build the table, so
                 // `open_table` reconstructs matching options (the
                 // supertable's options-hash check then validates them).
@@ -2548,6 +2556,37 @@ mod tests {
             files_under_location(dir.path(), "docs-"),
             0,
             "purge must delete every object under the dropped table's location"
+        );
+    }
+
+    #[test]
+    fn duplicate_create_on_storage_leaks_no_subtree() {
+        // Top-level physical roots for the table are its unique
+        // `<name>-...` location directories under the catalog root.
+        fn location_dirs(dir: &Path, prefix: &str) -> usize {
+            fs::read_dir(dir)
+                .expect("read catalog root")
+                .flatten()
+                .filter(|e| {
+                    e.path().is_dir() && e.file_name().to_string_lossy().starts_with(prefix)
+                })
+                .count()
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("first create");
+        assert_eq!(location_dirs(dir.path(), "docs-"), 1);
+
+        let again = conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"));
+        assert!(matches!(again, Err(InfinoError::AlreadyExists(_))));
+        assert_eq!(
+            location_dirs(dir.path(), "docs-"),
+            1,
+            "a rejected re-create must not leave an orphaned location"
         );
     }
 
