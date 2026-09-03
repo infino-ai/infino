@@ -28,7 +28,7 @@ use futures::{
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::time;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -428,7 +428,20 @@ impl Supertable {
             None => vec![stats],
         };
         for stats in &stat_groups {
-            for job in select(stats, cfg) {
+            let jobs = select(stats, cfg);
+            info!(
+                role = table.role().as_str(),
+                jobs = jobs.len(),
+                "compaction jobs planned"
+            );
+            for job in jobs {
+                info!(
+                    role = table.role().as_str(),
+                    inputs = job.inputs.len(),
+                    partition_key = ?job.partition_key,
+                    estimated_output_bytes = job.estimated_output_bytes,
+                    "running compaction job"
+                );
                 table.run_compaction_job(job, stale_seal_timeout).await?;
                 table
                     .refresh()
@@ -500,9 +513,11 @@ impl Supertable {
             .try_reserve(estimated_bytes)
             .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
 
+        info!(inputs = superfiles.len(), "opening compaction inputs");
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
             let open_fut = async {
+                info!(superfile_id = %entry.superfile_id, "opening compaction input");
                 let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
                     .await;
                 (entry.superfile_id, r)
@@ -788,6 +803,12 @@ impl Supertable {
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                    info!(
+                        superfile_id = %merged_superfile_id,
+                        attempt,
+                        max_retries,
+                        "compaction commit lost race, retrying"
+                    );
                     if let Err(e) = self.refresh().await {
                         unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Refresh(e.to_string()));
