@@ -220,8 +220,11 @@ impl CandidatePlan {
                     Ok((Some(docs.into_iter().collect()), work))
                 }
                 CandidatePlan::TermsAny { column, terms } => {
-                    // No qualifying term in this superfile ⇒ no row; the
-                    // match returns the empty set for an empty term list.
+                    // No qualifying term in this superfile ⇒ no row, decided
+                    // here rather than left to the match's empty-input rule.
+                    if terms.is_empty() {
+                        return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
+                    }
                     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
                     let (docs, work) = reader.token_match(column, &refs, BoolMode::Or).await?;
                     Ok((Some(docs.into_iter().collect()), work))
@@ -536,21 +539,21 @@ async fn expand_like(
     column: &str,
     tokens: &[LikeToken],
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
-    let mut parts = Vec::with_capacity(tokens.len());
-    let mut work = MatchWork::default();
-    for token in tokens {
-        let (terms, expand_work) = reader
-            .expand_terms(column, token.pattern(), LIKE_MAX_TERMS)
-            .await?;
-        work.merge(expand_work);
-        parts.push(match terms {
+    // One dictionary pass widens every token of the leaf.
+    let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
+    let (expansions, work) = reader
+        .expand_terms(column, &patterns, LIKE_MAX_TERMS)
+        .await?;
+    let parts = expansions
+        .into_iter()
+        .map(|terms| match terms {
             Some(terms) => CandidatePlan::TermsAny {
                 column: column.to_owned(),
                 terms,
             },
             None => CandidatePlan::Unbounded,
-        });
-    }
+        })
+        .collect();
     Ok((and_combine(parts), work))
 }
 

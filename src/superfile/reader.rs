@@ -1200,19 +1200,20 @@ impl SuperfileReader {
         Ok(fts.token_match(column, tokens, mode).await?)
     }
 
-    /// Widen one `LIKE` fragment token to the indexed terms of `column`
-    /// it covers (`None` when more than `max_terms` qualify). Delegates to
+    /// Widen the tokens of one `LIKE` leaf to the indexed terms of
+    /// `column` each covers, in one dictionary pass (a slot is `None` when
+    /// more than `max_terms` qualify). Delegates to
     /// [`FtsReader::expand_terms`].
     pub(crate) async fn expand_terms(
         &self,
         column: &str,
-        pattern: TermPattern<'_>,
+        patterns: &[TermPattern<'_>],
         max_terms: usize,
-    ) -> Result<(Option<Vec<String>>, MatchWork), ReadError> {
+    ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.expand_terms(column, pattern, max_terms).await?)
+        Ok(fts.expand_terms(column, patterns, max_terms).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s
