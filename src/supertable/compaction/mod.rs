@@ -28,7 +28,11 @@ use futures::{
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::time;
-use tracing::warn;
+#[cfg(not(feature = "detailed-tracing"))]
+use tracing::Span;
+#[cfg(feature = "detailed-tracing")]
+use tracing::info_span;
+use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -428,7 +432,13 @@ impl Supertable {
             None => vec![stats],
         };
         for stats in &stat_groups {
-            for job in select(stats, cfg) {
+            let jobs = select(stats, cfg);
+            info!(
+                role = table.role().as_str(),
+                jobs = jobs.len(),
+                "compaction jobs planned"
+            );
+            for job in jobs {
                 table.run_compaction_job(job, stale_seal_timeout).await?;
                 table
                     .refresh()
@@ -475,6 +485,10 @@ impl Supertable {
     }
 
     /// Merges the given superfiles into one
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "merge_superfiles", skip_all, fields(inputs = superfiles.len()))
+    )]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -502,11 +516,16 @@ impl Supertable {
 
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
+            #[cfg(feature = "detailed-tracing")]
+            let span = info_span!("compaction_input", superfile_id = %entry.superfile_id);
+            #[cfg(not(feature = "detailed-tracing"))]
+            let span = Span::none();
             let open_fut = async {
                 let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
                     .await;
                 (entry.superfile_id, r)
-            };
+            }
+            .instrument(span);
             superfile_readers_fut.push(open_fut);
         }
         let readers = join_all(superfile_readers_fut).await;
@@ -608,6 +627,19 @@ impl Supertable {
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "run_compaction_job",
+            skip_all,
+            fields(
+                role = self.role().as_str(),
+                inputs = job.inputs.len(),
+                partition_key = ?job.partition_key,
+                estimated_output_bytes = job.estimated_output_bytes,
+            )
+        )
+    )]
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
@@ -788,6 +820,12 @@ impl Supertable {
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                    warn!(
+                        superfile_id = %merged_superfile_id,
+                        attempt,
+                        max_retries,
+                        "compaction commit lost race, retrying"
+                    );
                     if let Err(e) = self.refresh().await {
                         unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Refresh(e.to_string()));
