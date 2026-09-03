@@ -104,7 +104,10 @@ tails, or sits inside) — with the exact predicate re-checked over the
 candidate rows. The default `ascii_lower` analyzer drops any token
 holding a non-ASCII byte, so under it only tokens the pattern closes on
 both sides can be required; the `standard` analyzer supports prefix,
-suffix, and substring patterns. `NOT LIKE` and `ILIKE` scan. Search is
+suffix, and substring patterns. `ILIKE` is bounded the same way for
+ASCII tokens, comparing dictionary terms with the two letters Unicode
+case folding widens past lowercasing (`ſ` as `s`, `K` as `k`) folded
+back; non-ASCII tokens under `ILIKE`, and `NOT LIKE`, scan. Search is
 also reachable from SQL through table-valued functions, so a query can
 filter, project, join, and order search results alongside scalar
 columns:

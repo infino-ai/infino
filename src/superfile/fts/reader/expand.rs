@@ -7,10 +7,25 @@
 //! instead of a column scan. Its own `impl FtsReader` block, split from
 //! the reader `core`.
 
-use std::str;
+use std::{borrow::Cow, str};
 
 use super::{core::*, work::MatchWork};
 use crate::superfile::{error::FtsError, fts::dict::make_key};
+
+/// The ASCII letter whose Unicode case-folding class holds a character
+/// `to_lowercase` keeps as itself: `s`, folded together with the long s
+/// [`LONG_S`]. An `ILIKE` token holding it may be spelled with `ſ` in a
+/// matching row's indexed term, so only a dictionary walk can find it.
+pub(crate) const LONG_S_ASCII: char = 's';
+
+/// Long s (U+017F). Simple case folding puts it in `s`'s class;
+/// `to_lowercase` leaves it, so an indexed term can carry it.
+const LONG_S: char = 'ſ';
+
+/// Kelvin sign (U+212A), folded with `k`. `to_lowercase` maps it to `k`
+/// before indexing, so a term never carries it; folded here anyway so the
+/// comparison does not depend on that.
+const KELVIN_SIGN: char = 'K';
 
 /// How one `LIKE` fragment token constrains an indexed term. The text is
 /// already the column tokenizer's output (lowercased, split), so it
@@ -29,15 +44,44 @@ pub(crate) enum TermPattern<'a> {
     Contains(&'a str),
 }
 
+/// How much of the dictionary a pattern has to see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// The token is its own expansion.
+    None,
+    /// Only the keys sharing the token's prefix.
+    Subtree,
+    /// Every key of the column: the walk shared by all such patterns.
+    Full,
+}
+
 impl TermPattern<'_> {
-    /// A pattern whose start may sit mid-term. It cannot be bounded to a
-    /// dictionary subtree, so it is tested against every key of the
-    /// column's range — one shared walk serves all such patterns.
-    fn is_open_left(&self) -> bool {
-        matches!(self, TermPattern::Suffix(_) | TermPattern::Contains(_))
+    fn text(&self) -> &str {
+        match self {
+            TermPattern::Exact(text)
+            | TermPattern::Prefix(text)
+            | TermPattern::Suffix(text)
+            | TermPattern::Contains(text) => text,
+        }
     }
 
-    /// Whether an indexed `term` is covered by this pattern.
+    /// Which walk resolves this pattern. Under `fold` (`ILIKE`) an exact
+    /// or prefix token holding `s` may be spelled with `ſ`, which sorts
+    /// elsewhere in the dictionary, so its subtree bound is lost and it
+    /// joins the full walk.
+    fn walk(&self, fold: bool) -> Walk {
+        let long_s = fold && self.text().contains(LONG_S_ASCII);
+        match self {
+            TermPattern::Exact(_) if long_s => Walk::Full,
+            TermPattern::Exact(_) => Walk::None,
+            TermPattern::Prefix(_) if long_s => Walk::Full,
+            TermPattern::Prefix(_) => Walk::Subtree,
+            TermPattern::Suffix(_) | TermPattern::Contains(_) => Walk::Full,
+        }
+    }
+
+    /// Whether `term` (already folded when the leaf is an `ILIKE`) is
+    /// covered by this pattern.
     fn covers(&self, term: &str) -> bool {
         match self {
             TermPattern::Exact(text) => term == *text,
@@ -45,6 +89,25 @@ impl TermPattern<'_> {
             TermPattern::Suffix(text) => term.ends_with(text),
             TermPattern::Contains(text) => term.contains(text),
         }
+    }
+}
+
+/// A dictionary term with `ſ` and `K` folded to the ASCII members of
+/// their case-folding classes — the view an `ILIKE` token is compared
+/// against. Borrowed when nothing folds.
+fn fold_term(term: &str) -> Cow<'_, str> {
+    if term.contains([LONG_S, KELVIN_SIGN]) {
+        Cow::Owned(
+            term.chars()
+                .map(|c| match c {
+                    LONG_S => 's',
+                    KELVIN_SIGN => 'k',
+                    other => other,
+                })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(term)
     }
 }
 
@@ -91,8 +154,11 @@ impl FtsReader {
     /// token walks only its own subtree. Every suffix or infix token is
     /// tested against each key of one shared walk over the column's whole
     /// range, so a multi-fragment `LIKE` pays for the vocabulary once, not
-    /// once per token. The FST is fetched once when any pattern needs it
-    /// (one planned range, like a match's build).
+    /// once per token. Under `fold` (`ILIKE`) terms are compared with `ſ`
+    /// and `K` folded to `s` and `k`, and an exact or prefix token holding
+    /// an `s` joins the shared walk (its `ſ` spelling sorts elsewhere).
+    /// The FST is fetched once when any pattern needs it (one planned
+    /// range, like a match's build).
     ///
     /// Errors with `FtsError::UnknownColumn` when `column` is not
     /// FTS-indexed in this superfile, like [`Self::token_match`].
@@ -100,12 +166,14 @@ impl FtsReader {
         &self,
         column: &str,
         patterns: &[TermPattern<'_>],
+        fold: bool,
         max_terms: usize,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), FtsError> {
         self.resolve_column_id(column)?;
+        let walks: Vec<Walk> = patterns.iter().map(|p| p.walk(fold)).collect();
         let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
         let mut work = MatchWork::default();
-        if patterns.iter().any(|p| !matches!(p, TermPattern::Exact(_))) {
+        if walks.iter().any(|w| *w != Walk::None) {
             let fst_bytes = self.dict_bytes_async().await?;
             let dict = Self::open_dict(&fst_bytes)?;
             work.planned_ranges += 1;
@@ -114,9 +182,9 @@ impl FtsReader {
             // output, so the conversion holds by construction; a key that
             // fails it is skipped rather than trusted.
             let term_start = make_key(column, "").len();
-            for (slot, pattern) in collected.iter_mut().zip(patterns) {
-                if let TermPattern::Prefix(text) = pattern {
-                    dict.for_each_prefix(&make_key(column, text), |key, _| {
+            for ((slot, pattern), walk) in collected.iter_mut().zip(patterns).zip(&walks) {
+                if *walk == Walk::Subtree {
+                    dict.for_each_prefix(&make_key(column, pattern.text()), |key, _| {
                         match str::from_utf8(&key[term_start..]) {
                             Ok(term) => slot.admit(term, max_terms),
                             Err(_) => true,
@@ -124,26 +192,31 @@ impl FtsReader {
                     });
                 }
             }
-            let mut open_left: Vec<usize> = (0..patterns.len())
-                .filter(|&i| patterns[i].is_open_left())
+            let mut full: Vec<usize> = (0..patterns.len())
+                .filter(|&i| walks[i] == Walk::Full)
                 .collect();
-            if !open_left.is_empty() {
+            if !full.is_empty() {
                 dict.for_each_prefix(&make_key(column, ""), |key, _| {
                     if let Ok(term) = str::from_utf8(&key[term_start..]) {
-                        open_left.retain(|&i| {
-                            !patterns[i].covers(term) || collected[i].admit(term, max_terms)
+                        let view = if fold {
+                            fold_term(term)
+                        } else {
+                            Cow::Borrowed(term)
+                        };
+                        full.retain(|&i| {
+                            !patterns[i].covers(&view) || collected[i].admit(term, max_terms)
                         });
                     }
-                    // Stop once every open-left pattern has hit its cap.
-                    !open_left.is_empty()
+                    // Stop once every full-walk pattern has hit its cap.
+                    !full.is_empty()
                 });
             }
         }
         let mut out = Vec::with_capacity(patterns.len());
-        for (slot, pattern) in collected.into_iter().zip(patterns) {
-            out.push(match pattern {
-                TermPattern::Exact(term) => Some(vec![(*term).to_owned()]),
-                _ => slot.finish(),
+        for ((slot, pattern), walk) in collected.into_iter().zip(patterns).zip(&walks) {
+            out.push(match walk {
+                Walk::None => Some(vec![pattern.text().to_owned()]),
+                Walk::Subtree | Walk::Full => slot.finish(),
             });
         }
         Ok((out, work))
@@ -152,7 +225,10 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::test_util::build_blob, *};
+    use super::{
+        super::test_util::{build_blob, build_standard_fold_blob},
+        *,
+    };
 
     /// Generous cap so a test never trips the too-many fallback by accident.
     const MAX_TERMS: usize = 64;
@@ -160,15 +236,20 @@ mod tests {
     fn expand_all(
         r: &FtsReader,
         patterns: &[TermPattern<'_>],
+        fold: bool,
         max_terms: usize,
     ) -> (Vec<Option<Vec<String>>>, MatchWork) {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(r.expand_terms("body", patterns, max_terms))
+        rt.block_on(r.expand_terms("body", patterns, fold, max_terms))
             .expect("expand_terms")
     }
 
     fn expand(r: &FtsReader, pattern: TermPattern<'_>, max_terms: usize) -> Option<Vec<String>> {
-        expand_all(r, &[pattern], max_terms).0.remove(0)
+        expand_all(r, &[pattern], false, max_terms).0.remove(0)
+    }
+
+    fn expand_fold(r: &FtsReader, pattern: TermPattern<'_>) -> Option<Vec<String>> {
+        expand_all(r, &[pattern], true, MAX_TERMS).0.remove(0)
     }
 
     fn owned(terms: &[&str]) -> Option<Vec<String>> {
@@ -219,6 +300,7 @@ mod tests {
                 TermPattern::Exact("rust"),
                 TermPattern::Prefix("ja"),
             ],
+            false,
             MAX_TERMS,
         );
         assert_eq!(
@@ -231,6 +313,56 @@ mod tests {
             ]
         );
         assert_eq!(work.planned_ranges, 1, "one FST fetch for the whole leaf");
+    }
+
+    #[test]
+    fn folding_finds_the_long_s_spellings_a_case_insensitive_match_admits() {
+        // Terms: k, kelvin, riſe, rise, set, sun, sunset, ſun (lex order
+        // puts `ſ…` after every ASCII-initial term).
+        let (blob, json) = build_standard_fold_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // Case-sensitive: byte-exact, the long-s spellings are not covered
+        // (`ſun` shares the bytes `un`, not `su`).
+        assert_eq!(
+            expand(&r, TermPattern::Prefix("su"), MAX_TERMS),
+            owned(&["sun", "sunset"])
+        );
+        assert_eq!(
+            expand(&r, TermPattern::Contains("su"), MAX_TERMS),
+            owned(&["sun", "sunset"])
+        );
+        assert_eq!(
+            expand(&r, TermPattern::Exact("sun"), MAX_TERMS),
+            owned(&["sun"])
+        );
+        // Folded: every shape sees `ſ` as `s`.
+        assert_eq!(
+            expand_fold(&r, TermPattern::Exact("sun")),
+            owned(&["sun", "ſun"]),
+            "an exact token holding `s` walks for its `ſ` spelling"
+        );
+        assert_eq!(
+            expand_fold(&r, TermPattern::Prefix("su")),
+            owned(&["sun", "sunset", "ſun"])
+        );
+        assert_eq!(
+            expand_fold(&r, TermPattern::Suffix("se")),
+            owned(&["rise", "riſe"])
+        );
+        assert_eq!(
+            expand_fold(&r, TermPattern::Contains("su")),
+            owned(&["sun", "sunset", "ſun"])
+        );
+        // The Kelvin sign was lowercased to `k` at index time, so a folded
+        // token without an `s` needs no walk at all.
+        let (out, work) = expand_all(&r, &[TermPattern::Exact("kelvin")], true, MAX_TERMS);
+        assert_eq!(out, vec![owned(&["kelvin"])]);
+        assert_eq!(work.planned_ranges, 0);
+        assert_eq!(
+            expand_fold(&r, TermPattern::Suffix("k")),
+            owned(&["k"]),
+            "the indexed term is already `k`"
+        );
     }
 
     #[test]
@@ -250,6 +382,7 @@ mod tests {
         let (out, _) = expand_all(
             &r,
             &[TermPattern::Contains(""), TermPattern::Contains("zz")],
+            false,
             2,
         );
         assert_eq!(out, vec![None, Some(Vec::new())]);
@@ -259,9 +392,9 @@ mod tests {
     fn a_dictionary_walk_reports_its_fetch_but_an_exact_token_does_not() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
-        let (_, walked) = expand_all(&r, &[TermPattern::Prefix("ru")], MAX_TERMS);
+        let (_, walked) = expand_all(&r, &[TermPattern::Prefix("ru")], false, MAX_TERMS);
         assert_eq!(walked.planned_ranges, 1, "one FST fetch per walk");
-        let (_, exact) = expand_all(&r, &[TermPattern::Exact("rust")], MAX_TERMS);
+        let (_, exact) = expand_all(&r, &[TermPattern::Exact("rust")], false, MAX_TERMS);
         assert_eq!(exact.planned_ranges, 0, "no dictionary needed");
     }
 
@@ -271,7 +404,7 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let err = rt
-            .block_on(r.expand_terms("nope", &[TermPattern::Prefix("ru")], MAX_TERMS))
+            .block_on(r.expand_terms("nope", &[TermPattern::Prefix("ru")], false, MAX_TERMS))
             .expect_err("unknown column");
         assert!(matches!(err, FtsError::UnknownColumn(_)));
     }

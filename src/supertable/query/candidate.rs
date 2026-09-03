@@ -47,8 +47,12 @@
 //! head or tail of a longer indexed term and is widened, per superfile,
 //! to every term that starts with / ends with / contains it. Which edges
 //! count as closed, and which open tokens can be used at all, depends on
-//! the analyzer — see `Analyzer`. `NOT LIKE` and `ILIKE` stay
-//! `Unbounded`.
+//! the analyzer — see `Analyzer`. `ILIKE` is bounded the same way for
+//! ASCII tokens: Arrow folds case under Unicode simple case folding, so
+//! a matching row may spell `s` as `ſ` and `k` as `K`, and the expansion
+//! compares dictionary terms with those folded back (`fold_term`). Tokens
+//! with non-ASCII characters are not bounded under `ILIKE`. `NOT LIKE`
+//! stays `Unbounded`.
 
 use std::{collections::HashSet, mem, sync::Arc};
 
@@ -66,7 +70,7 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         fts::{
-            reader::{BoolMode, MatchWork, TermPattern},
+            reader::{BoolMode, LONG_S_ASCII, MatchWork, TermPattern},
             tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER, Tokenizer},
         },
     },
@@ -106,6 +110,13 @@ const WORD_JOINERS: &[char] = &['\'', '"', '.', ':', ',', ';', '_'];
 /// lowercasing.
 const FINAL_SIGMA: char = 'ς';
 
+/// ASCII letters whose Unicode simple case-folding class has a non-ASCII
+/// member: `s` folds together with `ſ` (U+017F) and `k` with the Kelvin
+/// sign `K` (U+212A). Under `ILIKE` a matching row may hold those forms;
+/// the `ascii_lower` analyzer drops the run holding one, so a token with
+/// either letter cannot be required of it.
+const FOLD_TO_ASCII: &[char] = &['s', 'k'];
+
 /// A superfile-independent boolean plan over FTS term retrievals, lowered
 /// once from a SQL `WHERE` clause and [`evaluate`](CandidatePlan::evaluate)d
 /// per superfile to a superset of the rows satisfying the FTS-resolvable
@@ -133,10 +144,13 @@ pub(crate) enum CandidatePlan {
     /// an open-edged one as some term it is the head / tail / infix of.
     /// [`expand`](Self::expand) turns it into an `And` of `TermsAny` per
     /// superfile; `evaluate` / `estimate` do the same inline when handed
-    /// the unexpanded leaf.
+    /// the unexpanded leaf. `fold` marks an `ILIKE`: dictionary terms are
+    /// compared with `ſ` / `K` folded back to `s` / `k`, the two ASCII
+    /// letters whose case-folding class Arrow widens past lowercasing.
     TermsLike {
         column: String,
         tokens: Vec<LikeToken>,
+        fold: bool,
     },
     /// Intersection of children (logical `AND`).
     And(Vec<CandidatePlan>),
@@ -229,8 +243,12 @@ impl CandidatePlan {
                     let (docs, work) = reader.token_match(column, &refs, BoolMode::Or).await?;
                     Ok((Some(docs.into_iter().collect()), work))
                 }
-                CandidatePlan::TermsLike { column, tokens } => {
-                    let (expanded, mut work) = expand_like(reader, column, tokens).await?;
+                CandidatePlan::TermsLike {
+                    column,
+                    tokens,
+                    fold,
+                } => {
+                    let (expanded, mut work) = expand_like(reader, column, tokens, *fold).await?;
                     let (docs, eval_work) = expanded.evaluate(reader).await?;
                     work.merge(eval_work);
                     Ok((docs, work))
@@ -363,14 +381,23 @@ impl CandidatePlan {
                 }
                 true
             }
-            CandidatePlan::TermsLike { column, tokens } => {
+            CandidatePlan::TermsLike {
+                column,
+                tokens,
+                fold,
+            } => {
                 // A complete token must be present as itself → term bloom;
                 // a token open only on the right must head some term → lex
                 // term-range overlap. A token open on the left bounds no
-                // manifest summary.
+                // manifest summary. Under `ILIKE` a token holding `s` may
+                // be spelled with `ſ` in the dictionary, so neither summary
+                // can be asked about it (`k` is safe: `K` lowercases to
+                // `k` before indexing).
+                let summarizable = |t: &&LikeToken| !*fold || !t.text.contains(LONG_S_ASCII);
                 let complete: Vec<String> = tokens
                     .iter()
                     .filter(|t| t.is_complete())
+                    .filter(summarizable)
                     .map(|t| t.text.clone())
                     .collect();
                 if !complete.is_empty() {
@@ -380,7 +407,11 @@ impl CandidatePlan {
                         mode: BoolMode::And,
                     });
                 }
-                for token in tokens.iter().filter(|t| !t.open_left && t.open_right) {
+                for token in tokens
+                    .iter()
+                    .filter(|t| !t.open_left && t.open_right)
+                    .filter(summarizable)
+                {
                     leaves.push(PruneLeaf::Prefix {
                         column: column.clone(),
                         prefix: token.text.as_bytes().to_vec(),
@@ -438,8 +469,12 @@ impl CandidatePlan {
                     let sum = dfs.into_iter().fold(0u64, u64::saturating_add);
                     Ok((sum.min(n_docs), work))
                 }
-                CandidatePlan::TermsLike { column, tokens } => {
-                    let (expanded, mut work) = expand_like(reader, column, tokens).await?;
+                CandidatePlan::TermsLike {
+                    column,
+                    tokens,
+                    fold,
+                } => {
+                    let (expanded, mut work) = expand_like(reader, column, tokens, *fold).await?;
                     let (rows, est_work) = expanded.estimate(reader).await?;
                     work.merge(est_work);
                     Ok((rows, work))
@@ -498,9 +533,11 @@ impl CandidatePlan {
     ) -> BoxFuture<'a, Result<(CandidatePlan, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
-                CandidatePlan::TermsLike { column, tokens } => {
-                    expand_like(reader, column, tokens).await
-                }
+                CandidatePlan::TermsLike {
+                    column,
+                    tokens,
+                    fold,
+                } => expand_like(reader, column, tokens, *fold).await,
                 CandidatePlan::And(children) => {
                     let (expanded, work) = expand_children(reader, children).await?;
                     Ok((and_combine(expanded), work))
@@ -533,16 +570,18 @@ async fn expand_children(
 /// Bind one `TermsLike` leaf to a superfile: the `AND` of each token's
 /// expansion. A token widening past [`LIKE_MAX_TERMS`] contributes no
 /// constraint (`Unbounded`, which `and_combine` drops); every token too
-/// wide ⇒ the leaf is `Unbounded` and the superfile scans.
+/// wide ⇒ the leaf is `Unbounded` and the superfile scans. `fold` is the
+/// leaf's `ILIKE` flag.
 async fn expand_like(
     reader: &SuperfileReader,
     column: &str,
     tokens: &[LikeToken],
+    fold: bool,
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
     // One dictionary pass widens every token of the leaf.
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
     let (expansions, work) = reader
-        .expand_terms(column, &patterns, LIKE_MAX_TERMS)
+        .expand_terms(column, &patterns, fold, LIKE_MAX_TERMS)
         .await?;
     let parts = expansions
         .into_iter()
@@ -620,26 +659,29 @@ fn in_list_leaf(
     or_combine(branches)
 }
 
-/// Lower `col LIKE 'pattern'` on an FTS column. The pattern's literal
-/// fragments are tokenized with the column's analyzer; every token the
-/// analyzer can bound soundly becomes a constraint (see `Analyzer::admits`).
-/// All-complete tokens are the same term-AND an equality lowers to;
-/// otherwise the leaf waits for a superfile's dictionary. `Unbounded` for
-/// `NOT LIKE`, `ILIKE`, a non-column or non-literal operand, a non-FTS
-/// column, an escape other than `\`, or a pattern with no usable token.
+/// Lower `col LIKE 'pattern'` / `col ILIKE 'pattern'` on an FTS column.
+/// The pattern's literal fragments are tokenized with the column's
+/// analyzer; every token the analyzer can bound soundly becomes a
+/// constraint (see `Analyzer::admits`). All-complete tokens are the same
+/// term-AND an equality lowers to, unless an `ILIKE` token holds an `s`
+/// (its `ſ` spelling needs the dictionary); otherwise the leaf waits for
+/// a superfile's dictionary. `Unbounded` for `NOT LIKE`, a non-column or
+/// non-literal operand, a non-FTS column, an escape other than `\`, or a
+/// pattern with no usable token.
 fn like_leaf(
     like: &Like,
     fts_cols: &HashSet<&str>,
     resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
 ) -> CandidatePlan {
-    // `NOT LIKE` excludes rows — no term set bounds an exclusion. `ILIKE`
-    // matches under Unicode simple case folding, which is wider than the
-    // analyzers' lowercasing (`ſ` folds to `s`; `to_lowercase` keeps it),
-    // so a folded match could hide behind a term the pattern's lowercased
-    // token never reaches.
-    if like.negated || like.case_insensitive {
+    // `NOT LIKE` excludes rows — no term set bounds an exclusion.
+    if like.negated {
         return CandidatePlan::Unbounded;
     }
+    // `ILIKE`: Arrow compares under Unicode simple case folding (ASCII
+    // fast paths aside), so the analyzers' lowercasing does not reproduce
+    // every match — `fold` carries that to the token rules and the
+    // expansion.
+    let fold = like.case_insensitive;
     // Arrow's kernel reads `\` as the escape; the executor rejects others.
     if like.escape_char.is_some_and(|c| c != LIKE_ESCAPE) {
         return CandidatePlan::Unbounded;
@@ -662,12 +704,16 @@ fn like_leaf(
     };
     let tokens: Vec<LikeToken> = fragments
         .iter()
-        .flat_map(|fragment| fragment.tokens(tok.as_ref(), analyzer))
+        .flat_map(|fragment| fragment.tokens(tok.as_ref(), analyzer, fold))
         .collect();
     if tokens.is_empty() {
         return CandidatePlan::Unbounded;
     }
-    if tokens.iter().all(LikeToken::is_complete) {
+    // Complete tokens are exact terms — unless `ILIKE` may have spelled
+    // an `s` as `ſ`, which only the dictionary walk can find.
+    let exact_terms = tokens.iter().all(LikeToken::is_complete)
+        && !(fold && tokens.iter().any(|t| t.text.contains(LONG_S_ASCII)));
+    if exact_terms {
         return CandidatePlan::TermsAll {
             column: c.name.clone(),
             tokens: tokens.into_iter().map(|t| t.text).collect(),
@@ -676,6 +722,7 @@ fn like_leaf(
     CandidatePlan::TermsLike {
         column: c.name.clone(),
         tokens,
+        fold,
     }
 }
 
@@ -697,8 +744,9 @@ impl Fragment {
     /// is a hard separator (the token began after it); the last token
     /// likewise on the right. Any other edge may continue into the text a
     /// wildcard stands for. Tokens the analyzer cannot bound soundly are
-    /// dropped — a dropped constraint keeps a superset.
-    fn tokens(&self, tok: &dyn Tokenizer, analyzer: Analyzer) -> Vec<LikeToken> {
+    /// dropped — a dropped constraint keeps a superset. `fold` is the
+    /// `ILIKE` flag.
+    fn tokens(&self, tok: &dyn Tokenizer, analyzer: Analyzer, fold: bool) -> Vec<LikeToken> {
         let texts: Vec<String> = tok.tokenize(&self.text).collect();
         let n = texts.len();
         let left_closed = self.at_start
@@ -717,11 +765,14 @@ impl Fragment {
             .into_iter()
             .enumerate()
             .filter_map(|(i, text)| {
-                analyzer.admits(LikeToken {
-                    text,
-                    open_left: i == 0 && !left_closed,
-                    open_right: i + 1 == n && !right_closed,
-                })
+                analyzer.admits(
+                    LikeToken {
+                        text,
+                        open_left: i == 0 && !left_closed,
+                        open_right: i + 1 == n && !right_closed,
+                    },
+                    fold,
+                )
             })
             .collect()
     }
@@ -799,14 +850,26 @@ impl Analyzer {
         }
     }
 
-    /// Whether the index can soundly require `token` of a matching row.
-    fn admits(self, token: LikeToken) -> Option<LikeToken> {
+    /// Whether the index can soundly require `token` of a matching row;
+    /// `fold` is the `ILIKE` flag.
+    fn admits(self, token: LikeToken, fold: bool) -> Option<LikeToken> {
+        // Under `ILIKE`, Arrow folds case with Unicode simple case folding
+        // (through a regex whenever the column or the pattern is not pure
+        // ASCII). A non-ASCII token then matches spellings `to_lowercase`
+        // never produces (`ς` for a medial `σ`, `ϐ` for `β`), so only an
+        // ASCII token can be required.
+        if fold && !token.text.is_ascii() {
+            return None;
+        }
         match self {
             // A run holding any non-ASCII byte is dropped whole, so a term
             // that merely *contains* a fragment token may not exist
             // (`Firefox—the` indexes nothing). Only a token the fragment
             // closes on both sides is guaranteed indexed as itself.
             Analyzer::AsciiLower if !token.is_complete() => None,
+            // …and under `ILIKE` a row may spell `s` as `ſ` or `k` as `K`
+            // — non-ASCII bytes that drop the whole run.
+            Analyzer::AsciiLower if fold && token.text.contains(FOLD_TO_ASCII) => None,
             // `to_lowercase` spells a word-final `Σ` as `ς` and a medial
             // one as `σ`, so a token whose end may sit mid-word has two
             // possible spellings in the dictionary.
@@ -1147,6 +1210,15 @@ mod tests {
         CandidatePlan::TermsLike {
             column: "title".into(),
             tokens,
+            fold: false,
+        }
+    }
+
+    fn terms_ilike(tokens: Vec<LikeToken>) -> CandidatePlan {
+        CandidatePlan::TermsLike {
+            column: "title".into(),
+            tokens,
+            fold: true,
         }
     }
 
@@ -1286,15 +1358,95 @@ mod tests {
     }
 
     #[test]
-    fn negated_and_case_insensitive_like_are_unbounded() {
+    fn negated_like_is_unbounded() {
         assert_eq!(
             standard_plan(col("title").not_like(lit("rust%"))),
             CandidatePlan::Unbounded
         );
         assert_eq!(
-            standard_plan(col("title").ilike(lit("rust%"))),
+            standard_plan(col("title").not_ilike(lit("rust%"))),
             CandidatePlan::Unbounded
         );
+    }
+
+    #[test]
+    fn ilike_lowers_like_like_with_the_fold_flag() {
+        // The pattern's own case is irrelevant (the analyzer lowercases);
+        // the leaf carries `fold` so the dictionary walk folds `ſ`.
+        assert_eq!(
+            standard_plan(col("title").ilike(lit("%FoX%"))),
+            terms_ilike(vec![like_token("fox", true, true)])
+        );
+        // Complete tokens without an `s` are exact terms, as under LIKE.
+        assert_eq!(
+            standard_plan(col("title").ilike(lit("% Quick Fox %"))),
+            terms_all(&["quick", "fox"])
+        );
+        // A complete token holding an `s` may be spelled `ſ` in a matching
+        // row's term, so it needs the dictionary even though it is complete.
+        assert_eq!(
+            standard_plan(col("title").ilike(lit("% rust %"))),
+            terms_ilike(vec![like_token("rust", false, false)])
+        );
+    }
+
+    #[test]
+    fn ilike_bounds_only_ascii_tokens() {
+        // Arrow's fold widens non-ASCII letters past `to_lowercase`
+        // (medial `σ` matches `ς`), so the token cannot be required.
+        assert_eq!(
+            standard_plan(col("title").ilike(lit("%ΟΔΟΣ%"))),
+            CandidatePlan::Unbounded
+        );
+        // A mixed pattern keeps the ASCII token and drops the other.
+        assert_eq!(
+            standard_plan(col("title").ilike(lit("%fox%süd%"))),
+            terms_ilike(vec![like_token("fox", true, true)])
+        );
+    }
+
+    #[test]
+    fn ilike_under_ascii_lower_excludes_tokens_that_can_fold_to_non_ascii() {
+        // `ſ` / `K` in a matching row are non-ASCII bytes, which drop the
+        // run under `ascii_lower`; a complete token holding `s` or `k` is
+        // therefore not guaranteed indexed. Others still are.
+        assert_eq!(
+            plan(col("title").ilike(lit("% rust %"))),
+            CandidatePlan::Unbounded
+        );
+        assert_eq!(
+            plan(col("title").ilike(lit("% quick %"))),
+            CandidatePlan::Unbounded
+        );
+        assert_eq!(
+            plan(col("title").ilike(lit("% fox %"))),
+            terms_all(&["fox"])
+        );
+        assert_eq!(
+            plan(col("title").ilike(lit("%fox%"))),
+            CandidatePlan::Unbounded
+        );
+    }
+
+    #[test]
+    fn ilike_prune_leaves_skip_tokens_that_may_be_spelled_with_a_long_s() {
+        // `fox` is a safe bloom term; `rust`'s dictionary spelling may be
+        // `ruſt`, so no summary is asked about it; `quic` prefix is safe.
+        let leaves = like_prune_leaves(
+            &[col("title").ilike(lit("quic% rust fox %"))],
+            &fts_cols(),
+            &standard_resolver,
+        );
+        assert_eq!(leaves.len(), 2);
+        assert!(matches!(
+            &leaves[0],
+            PruneLeaf::TermPresence { terms, mode: BoolMode::And, .. }
+                if *terms == ["fox".to_owned()]
+        ));
+        assert!(matches!(
+            &leaves[1],
+            PruneLeaf::Prefix { prefix, .. } if prefix == b"quic"
+        ));
     }
 
     #[test]

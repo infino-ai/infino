@@ -22,7 +22,7 @@ mod work;
 
 pub use core::*;
 
-pub(crate) use expand::TermPattern;
+pub(crate) use expand::{LONG_S_ASCII, TermPattern};
 pub use metadata::OpenOptions;
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub use work::MatchWork;

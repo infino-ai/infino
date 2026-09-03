@@ -555,6 +555,7 @@ mod tests {
         RecordBatch, StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::{datasource::MemTable, prelude::SessionContext};
 
     use crate::{
         memory::ConnectionMemoryBudget,
@@ -620,6 +621,65 @@ mod tests {
         "%(fox)%",
         "%100%",
     ];
+
+    /// Titles whose case-folding is where `ILIKE` and lowercasing part
+    /// ways: a long s (`ſun riſe`, which Arrow matches against `sun`), a
+    /// Kelvin sign (`Kelvin K`, matched against `k`), and Greek with a
+    /// final sigma, beside plain mixed case.
+    const FOLD_TITLES: &[&str] = &[
+        "sun set",
+        "SUN RISE",
+        "ſun riſe",
+        "Kelvin K",
+        "sunset boulevard",
+        "a sun",
+        "Peter Parker",
+        "PETER PARKER",
+        "nothing here",
+        "ΟΔΟΣ ΟΔΟΣΑ",
+        "οδος",
+    ];
+
+    /// `(operator, pattern)` pairs judged against DataFusion itself.
+    const FOLD_PATTERNS: &[(&str, &str)] = &[
+        ("LIKE", "sun%"),
+        ("LIKE", "%K"),
+        ("ILIKE", "sun%"),
+        ("ILIKE", "%sun%"),
+        ("ILIKE", "%sun"),
+        ("ILIKE", "sun set"),
+        ("ILIKE", "% sun %"),
+        ("ILIKE", "%SUN RISE"),
+        ("ILIKE", "k %"),
+        ("ILIKE", "%kelvin%"),
+        ("ILIKE", "%k"),
+        ("ILIKE", "peter %"),
+        ("ILIKE", "%parker"),
+        ("ILIKE", "%PARKER"),
+        ("ILIKE", "%ri_e"),
+        ("ILIKE", "%riſe"),
+        ("ILIKE", "%οδος%"),
+        ("ILIKE", "ΟΔΟΣ%"),
+        ("ILIKE", "%"),
+        ("ILIKE", "%zzq%"),
+    ];
+
+    /// The `title` values across `batches`, as a set.
+    fn title_set(batches: &[RecordBatch]) -> HashSet<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let titles = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title column");
+                (0..titles.len())
+                    .map(|i| titles.value(i).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
 
     /// Textbook `LIKE`: `%` any run, `_` one character, everything else
     /// byte-exact (the fixture patterns carry no escapes). Deliberately
@@ -1696,21 +1756,46 @@ mod tests {
                         "SELECT title FROM supertable WHERE title LIKE '{quoted}'"
                     ))
                     .expect("query");
-                let got: Vec<String> = batches
-                    .iter()
-                    .flat_map(|b| {
-                        let titles = b
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<LargeStringArray>()
-                            .expect("title column");
-                        (0..titles.len())
-                            .map(|i| titles.value(i).to_owned())
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
+                let got = title_set(&batches);
                 let got: HashSet<&str> = got.iter().map(String::as_str).collect();
                 assert_eq!(got, expected, "LIKE {pattern:?} under {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn query_sql_like_and_ilike_match_datafusion_on_a_memtable() {
+        // The oracle here is DataFusion itself over the same rows in a
+        // plain in-memory table: whatever Arrow's `LIKE` / `ILIKE` kernels
+        // decide — including the long s and the Kelvin sign that Unicode
+        // case folding matches against `s` and `k` — the index-bounded
+        // plan must return exactly that, under both analyzers.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let analyzers: [Arc<dyn Tokenizer>; 2] = [tok(), Arc::new(StandardTokenizer)];
+        for tokenizer in analyzers {
+            let name = tokenizer.name();
+            let cats: Vec<&str> = FOLD_TITLES.iter().map(|_| "x").collect();
+            let batch = build_cat_batch(0, &cats, FOLD_TITLES);
+
+            let st = Supertable::create(options_id_cat_title_with(tokenizer)).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+
+            let ctx = SessionContext::new();
+            let mem = MemTable::try_new(schema_id_cat_title(), vec![vec![batch]]).expect("mem");
+            ctx.register_table("supertable", Arc::new(mem))
+                .expect("register");
+
+            for (op, pattern) in FOLD_PATTERNS {
+                let quoted = pattern.replace('\'', "''");
+                let sql = format!("SELECT title FROM supertable WHERE title {op} '{quoted}'");
+                let expected = title_set(
+                    &rt.block_on(async { ctx.sql(&sql).await?.collect().await })
+                        .expect("datafusion oracle"),
+                );
+                let got = title_set(&st.reader().expect("reader").query_sql(&sql).expect("query"));
+                assert_eq!(got, expected, "{op} {pattern:?} under {name}");
             }
         }
     }
