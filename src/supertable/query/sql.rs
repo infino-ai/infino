@@ -548,11 +548,11 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
-        RecordBatch, StringArray, StringViewArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
 
@@ -691,6 +691,88 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("count column is Int64");
         n.value(0)
+    }
+
+    /// Value `i` of a string column of whichever Arrow string width
+    /// DataFusion chose for it (EXPLAIN's columns are not coerced the way
+    /// user columns are).
+    fn string_at(column: &ArrayRef, i: usize) -> String {
+        let any = column.as_any();
+        if let Some(a) = any.downcast_ref::<StringArray>() {
+            a.value(i).to_owned()
+        } else if let Some(a) = any.downcast_ref::<LargeStringArray>() {
+            a.value(i).to_owned()
+        } else if let Some(a) = any.downcast_ref::<StringViewArray>() {
+            a.value(i).to_owned()
+        } else {
+            panic!("not a string column: {:?}", column.data_type());
+        }
+    }
+
+    /// The physical plan DataFusion prints for `sql`.
+    fn explain_physical(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain");
+        for batch in &batches {
+            for i in 0..batch.num_rows() {
+                if string_at(batch.column(0), i) == "physical_plan" {
+                    return string_at(batch.column(1), i);
+                }
+            }
+        }
+        panic!("no physical plan in EXPLAIN output");
+    }
+
+    #[test]
+    fn query_sql_row_filter_carries_the_predicate_once() {
+        // A predicate the index cannot bound (a scalar column) runs as a
+        // Parquet row filter: DataFusion's filter pushdown offers the
+        // `FilterExec` predicate to the scan, the scan accepts it, and the
+        // node is dropped. The provider used to attach its own copy of the
+        // same conjunction first, so the row filter read `p AND p` and
+        // evaluated the predicate twice. The scan line must carry exactly
+        // one `predicate=` with no self-conjunction, and the `FilterExec`
+        // must be gone.
+        let st = seeded(&["x", "y", "y"], &["alpha", "beta", "gamma"]);
+        let plan = explain_physical(&st, "SELECT title FROM supertable WHERE category = 'y'");
+        let scan = plan
+            .lines()
+            .find(|l| l.contains("DataSourceExec"))
+            .expect("a DataSourceExec in the physical plan");
+        assert!(!plan.contains("FilterExec"), "{plan}");
+        // The row-filter predicate prints as `, predicate=<expr>`, ahead of
+        // the statistics `pruning_predicate=` DataFusion derives from it.
+        let predicate = scan
+            .split_once(", predicate=")
+            .map(|(_, rest)| rest.split(", pruning_predicate=").next().unwrap_or(rest))
+            .expect("a predicate on the scan");
+        assert!(
+            predicate.starts_with("category@")
+                && predicate.ends_with("= y")
+                && !predicate.contains(" AND "),
+            "{scan}"
+        );
+        // The single-copy row filter still returns exactly the matching
+        // rows. (A `COUNT(*)` would not do here: the covered-aggregate
+        // rewrite answers it from manifest value counts without a scan.)
+        let rows: HashSet<String> = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable WHERE category = 'y'")
+            .expect("query")
+            .iter()
+            .flat_map(|b| (0..b.num_rows()).map(|i| string_at(b.column(0), i)))
+            .collect();
+        assert_eq!(rows, HashSet::from(["beta".to_owned(), "gamma".to_owned()]));
+
+        // Control: an index-bounded predicate keeps the `FilterExec` and
+        // the scan gets no row filter of ours; the `predicate=` DataFusion
+        // stores there is for statistics pruning only.
+        let bounded = explain_physical(&st, "SELECT title FROM supertable WHERE title = 'beta'");
+        assert!(bounded.contains("FilterExec"), "{bounded}");
     }
 
     /// `extract_id_column` collects non-null Decimal128 `_id`s from single-column
@@ -949,20 +1031,9 @@ mod tests {
             .expect("count is Int64");
         // DataFusion may materialize the GROUP BY key as Utf8,
         // LargeUtf8, or StringView depending on hash-aggregate
-        // type promotion; accept all three.
-        let extract = |i: usize| -> String {
-            if let Some(a) = cat_col.as_any().downcast_ref::<LargeStringArray>() {
-                a.value(i).to_string()
-            } else if let Some(a) = cat_col.as_any().downcast_ref::<StringArray>() {
-                a.value(i).to_string()
-            } else if let Some(a) = cat_col.as_any().downcast_ref::<StringViewArray>() {
-                a.value(i).to_string()
-            } else {
-                panic!("unexpected category column type: {:?}", cat_col.data_type())
-            }
-        };
+        // type promotion; `string_at` accepts all three.
         let mut got: Vec<(String, i64)> = (0..cat_col.len())
-            .map(|i| (extract(i), counts.value(i)))
+            .map(|i| (string_at(cat_col, i), counts.value(i)))
             .collect();
         got.sort();
         assert_eq!(
