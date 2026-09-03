@@ -9,8 +9,13 @@
 
 use std::{borrow::Cow, str};
 
+use rayon::ThreadPool;
+
 use super::{core::*, work::MatchWork};
-use crate::superfile::{error::FtsError, fts::dict::make_key};
+use crate::{
+    runtime_bridge::run_on_pool,
+    superfile::{error::FtsError, fts::dict::make_key},
+};
 
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;
 /// `to_lowercase` leaves it, so an indexed term can carry it.
@@ -106,6 +111,38 @@ impl TermPattern<'_> {
     }
 }
 
+/// A [`TermPattern`] with its text owned, so a leaf's patterns can move
+/// onto the reader pool with the dictionary walk.
+#[derive(Debug, Clone)]
+enum OwnedPattern {
+    Exact(String),
+    Prefix(String),
+    Suffix(String),
+    Contains(String),
+}
+
+impl OwnedPattern {
+    fn borrow(&self) -> TermPattern<'_> {
+        match self {
+            OwnedPattern::Exact(text) => TermPattern::Exact(text),
+            OwnedPattern::Prefix(text) => TermPattern::Prefix(text),
+            OwnedPattern::Suffix(text) => TermPattern::Suffix(text),
+            OwnedPattern::Contains(text) => TermPattern::Contains(text),
+        }
+    }
+}
+
+impl TermPattern<'_> {
+    fn into_owned(self) -> OwnedPattern {
+        match self {
+            TermPattern::Exact(text) => OwnedPattern::Exact(text.to_owned()),
+            TermPattern::Prefix(text) => OwnedPattern::Prefix(text.to_owned()),
+            TermPattern::Suffix(text) => OwnedPattern::Suffix(text.to_owned()),
+            TermPattern::Contains(text) => OwnedPattern::Contains(text.to_owned()),
+        }
+    }
+}
+
 /// A dictionary term with `ſ` and `K` folded to the ASCII members of
 /// their case-folding classes — the view an `ILIKE` token is compared
 /// against. Borrowed when nothing folds.
@@ -174,6 +211,11 @@ impl FtsReader {
     /// The FST is fetched once when any pattern needs it (one planned
     /// range, like a match's build).
     ///
+    /// The FST fetch is I/O and stays on the calling runtime; the walk
+    /// itself is CPU — up to the column's whole vocabulary — and runs on
+    /// `pool` (the configured reader pool, or rayon's global pool when
+    /// `None`) behind a oneshot, so no tokio worker sits under it.
+    ///
     /// Errors with `FtsError::UnknownColumn` when `column` is not
     /// FTS-indexed in this superfile, like [`Self::token_match`].
     pub(crate) async fn expand_terms(
@@ -183,53 +225,36 @@ impl FtsReader {
         fold: bool,
         max_terms: usize,
         allow_full_walk: bool,
+        pool: Option<&ThreadPool>,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), FtsError> {
         self.resolve_column_id(column)?;
         let walks: Vec<Walk> = patterns.iter().map(|p| p.walk(fold)).collect();
-        let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
         let mut work = MatchWork::default();
         let needs_dict = walks
             .iter()
             .any(|w| *w == Walk::Subtree || (*w == Walk::Full && allow_full_walk));
-        if needs_dict {
+        let collected = if needs_dict {
             let fst_bytes = self.dict_bytes_async().await?;
-            let dict = Self::open_dict(&fst_bytes)?;
             work.planned_ranges += 1;
-            // Every key in the column's range starts with `<column>\x1F`;
-            // the term is what follows. Keys are the tokenizer's UTF-8
-            // output, so the conversion holds by construction; a key that
-            // fails it is skipped rather than trusted.
-            let term_start = make_key(column, "").len();
-            for ((slot, pattern), walk) in collected.iter_mut().zip(patterns).zip(&walks) {
-                if *walk == Walk::Subtree {
-                    dict.for_each_prefix(&make_key(column, pattern.text()), |key, _| {
-                        match str::from_utf8(&key[term_start..]) {
-                            Ok(term) => slot.admit(term, max_terms),
-                            Err(_) => true,
-                        }
-                    });
-                }
-            }
-            let mut full: Vec<usize> = (0..patterns.len())
-                .filter(|&i| walks[i] == Walk::Full && allow_full_walk)
-                .collect();
-            if !full.is_empty() {
-                dict.for_each_prefix(&make_key(column, ""), |key, _| {
-                    if let Ok(term) = str::from_utf8(&key[term_start..]) {
-                        let view = if fold {
-                            fold_term(term)
-                        } else {
-                            Cow::Borrowed(term)
-                        };
-                        full.retain(|&i| {
-                            !patterns[i].covers(&view) || collected[i].admit(term, max_terms)
-                        });
-                    }
-                    // Stop once every full-walk pattern has hit its cap.
-                    !full.is_empty()
-                });
-            }
-        }
+            let column = column.to_owned();
+            let owned: Vec<OwnedPattern> = patterns.iter().map(|p| p.into_owned()).collect();
+            let walks = walks.clone();
+            run_on_pool(pool, "like expansion", move || {
+                walk_dictionary(
+                    &fst_bytes,
+                    &column,
+                    &owned,
+                    &walks,
+                    fold,
+                    max_terms,
+                    allow_full_walk,
+                )
+            })
+            .await
+            .map_err(|_| FtsError::TaskDropped("like expansion"))??
+        } else {
+            patterns.iter().map(|_| Collected::new()).collect()
+        };
         let mut out = Vec::with_capacity(patterns.len());
         for ((slot, pattern), walk) in collected.into_iter().zip(patterns).zip(&walks) {
             out.push(match walk {
@@ -240,6 +265,85 @@ impl FtsReader {
         }
         Ok((out, work))
     }
+
+    /// Every indexed term of `column` that begins with `term_prefix` (the
+    /// prefix as it appears in the FST — the caller lowercases it for the
+    /// column's analyzer), in lex order, without the column key prefix.
+    /// The prefix search's expansion. The FST fetch stays on the calling
+    /// runtime; the subtree walk runs on `pool` behind a oneshot, like
+    /// [`Self::expand_terms`]. Empty when `column` is not FTS-indexed here
+    /// or no term matches.
+    pub(crate) async fn terms_with_prefix(
+        &self,
+        column: &str,
+        term_prefix: &[u8],
+        pool: Option<&ThreadPool>,
+    ) -> Result<Vec<Vec<u8>>, FtsError> {
+        if !self.has_column(column) {
+            return Ok(Vec::new());
+        }
+        let fst_bytes = self.dict_bytes_async().await?;
+        let column = column.to_owned();
+        let term_prefix = term_prefix.to_vec();
+        run_on_pool(pool, "prefix expansion", move || {
+            collect_terms_with_prefix(&fst_bytes, &column, &term_prefix)
+        })
+        .await
+        .map_err(|_| FtsError::TaskDropped("prefix expansion"))?
+    }
+}
+
+/// The CPU half of [`FtsReader::expand_terms`]: one pass over the fetched
+/// dictionary that fills every pattern's collector. Runs on the reader
+/// pool, so it takes owned inputs.
+fn walk_dictionary(
+    fst_bytes: &[u8],
+    column: &str,
+    patterns: &[OwnedPattern],
+    walks: &[Walk],
+    fold: bool,
+    max_terms: usize,
+    allow_full_walk: bool,
+) -> Result<Vec<Collected>, FtsError> {
+    let dict = FtsReader::open_dict(fst_bytes)?;
+    let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
+    // Every key in the column's range starts with `<column>\x1F`; the
+    // term is what follows. `for_each_prefix` only visits keys carrying
+    // the prefix it was given, and every prefix below begins with that
+    // column key, so the slice never runs past a key. Keys are the
+    // tokenizer's UTF-8 output, so the conversion holds by construction; a
+    // key that fails it is skipped rather than trusted.
+    let term_start = make_key(column, "").len();
+    for ((slot, pattern), walk) in collected.iter_mut().zip(patterns).zip(walks) {
+        if *walk == Walk::Subtree {
+            dict.for_each_prefix(&make_key(column, pattern.borrow().text()), |key, _| {
+                match str::from_utf8(&key[term_start..]) {
+                    Ok(term) => slot.admit(term, max_terms),
+                    Err(_) => true,
+                }
+            });
+        }
+    }
+    let mut full: Vec<usize> = (0..patterns.len())
+        .filter(|&i| walks[i] == Walk::Full && allow_full_walk)
+        .collect();
+    if !full.is_empty() {
+        dict.for_each_prefix(&make_key(column, ""), |key, _| {
+            if let Ok(term) = str::from_utf8(&key[term_start..]) {
+                let view = if fold {
+                    fold_term(term)
+                } else {
+                    Cow::Borrowed(term)
+                };
+                full.retain(|&i| {
+                    !patterns[i].borrow().covers(&view) || collected[i].admit(term, max_terms)
+                });
+            }
+            // Stop once every full-walk pattern has hit its cap.
+            !full.is_empty()
+        });
+    }
+    Ok(collected)
 }
 
 #[cfg(test)]
@@ -261,7 +365,7 @@ mod tests {
         max_terms: usize,
     ) -> (Vec<Option<Vec<String>>>, MatchWork) {
         let rt = Runtime::new().expect("runtime");
-        rt.block_on(r.expand_terms("body", patterns, fold, max_terms, true))
+        rt.block_on(r.expand_terms("body", patterns, fold, max_terms, true, None))
             .expect("expand_terms")
     }
 
@@ -357,6 +461,7 @@ mod tests {
                 false,
                 MAX_TERMS,
                 false,
+                None,
             ))
             .expect("expand_terms");
         assert_eq!(out, vec![None, None, owned(&["java"]), owned(&["rust"])]);
@@ -369,6 +474,7 @@ mod tests {
                 false,
                 MAX_TERMS,
                 false,
+                None,
             ))
             .expect("expand_terms");
         assert_eq!(out, vec![None]);
@@ -464,7 +570,14 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = Runtime::new().expect("runtime");
         let err = rt
-            .block_on(r.expand_terms("nope", &[TermPattern::Prefix("ru")], false, MAX_TERMS, true))
+            .block_on(r.expand_terms(
+                "nope",
+                &[TermPattern::Prefix("ru")],
+                false,
+                MAX_TERMS,
+                true,
+                None,
+            ))
             .expect_err("unknown column");
         assert!(matches!(err, FtsError::UnknownColumn(_)));
     }

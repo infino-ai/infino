@@ -71,7 +71,7 @@ async fn assert_prefix_matches_oracle(
     k: usize,
 ) {
     let got = reader
-        .bm25_search_prefix("title", prefix, k)
+        .bm25_search_prefix("title", prefix, k, None)
         .await
         .expect("prefix search")
         .0;
@@ -121,12 +121,12 @@ async fn prefix_uppercase_is_normalized() {
     let corp = prefix_corpus();
     let reader = build_infino_superfile(&corp);
     let upper = reader
-        .bm25_search_prefix("title", "RU", K_ALL)
+        .bm25_search_prefix("title", "RU", K_ALL, None)
         .await
         .expect("upper")
         .0;
     let lower = reader
-        .bm25_search_prefix("title", "ru", K_ALL)
+        .bm25_search_prefix("title", "ru", K_ALL, None)
         .await
         .expect("lower")
         .0;
@@ -139,7 +139,7 @@ async fn prefix_no_match_returns_empty() {
     let corp = prefix_corpus();
     let reader = build_infino_superfile(&corp);
     let hits = reader
-        .bm25_search_prefix("title", "zzz", K_ALL)
+        .bm25_search_prefix("title", "zzz", K_ALL, None)
         .await
         .expect("prefix search")
         .0;

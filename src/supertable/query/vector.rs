@@ -5581,12 +5581,16 @@ impl SupertableReader {
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
         let op_stats = self.op_stats.clone();
+        // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
+        // pool, not on the tokio worker driving this fan-out.
+        let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
             let plan = Arc::clone(&plan_arc);
             let op_stats = op_stats.clone();
+            let reader_pool = Arc::clone(&reader_pool);
             async move {
                 let (bitmap, work) = plan
-                    .evaluate(r.as_ref())
+                    .evaluate(r.as_ref(), Some(&reader_pool))
                     .await
                     .map_err(|e| QueryError::Parquet(e.to_string()))?;
                 // The SQL predicate's posting walks, summed across the

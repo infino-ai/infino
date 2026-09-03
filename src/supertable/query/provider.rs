@@ -92,6 +92,7 @@ use parquet::{
     errors,
     file::metadata::ParquetMetaData,
 };
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -916,6 +917,10 @@ impl TableProvider for SupertableProvider {
         // below; a superfile the selectivity gate sends to a scan is not
         // counted (see there).
         let mut any_plan_unbounded = matches!(candidate_plan, CandidatePlan::Unbounded);
+        // The plan's dictionary walks (a `LIKE` leaf's expansion) are CPU
+        // work and run on the reader pool behind a oneshot; only their FST
+        // fetches stay on this runtime.
+        let reader_pool: &ThreadPool = &self.manifest.options.reader_pool;
 
         for (entry, prepared) in survivors.iter().zip(prepared_files) {
             // Pass 1 (per superfile): resolve candidate rows from the
@@ -953,7 +958,7 @@ impl TableProvider for SupertableProvider {
                     full_walk_pays(terms, bytes)
                 };
                 let (plan, expand_work) = candidate_plan
-                    .expand(prepared.reader.as_ref(), &full_walk_pays)
+                    .expand(prepared.reader.as_ref(), &full_walk_pays, Some(reader_pool))
                     .await
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 predicate_work.merge(expand_work);
@@ -964,7 +969,7 @@ impl TableProvider for SupertableProvider {
             };
             any_plan_unbounded |= matches!(plan, CandidatePlan::Unbounded);
             let (est, est_work) = plan
-                .estimate(prepared.reader.as_ref())
+                .estimate(prepared.reader.as_ref(), Some(reader_pool))
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             predicate_work.merge(est_work);
@@ -975,7 +980,7 @@ impl TableProvider for SupertableProvider {
                 None
             } else {
                 let (bitmap, eval_work) = plan
-                    .evaluate(prepared.reader.as_ref())
+                    .evaluate(prepared.reader.as_ref(), Some(reader_pool))
                     .await
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 predicate_work.merge(eval_work);

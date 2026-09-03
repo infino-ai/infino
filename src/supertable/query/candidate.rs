@@ -64,6 +64,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::future::BoxFuture;
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 
 use crate::{
@@ -213,10 +214,12 @@ impl CandidatePlan {
     /// `token_match(.., And)`; `And`/`Or` intersect/union children.
     /// The second element sums the posting-walk work of every `TermsAll`
     /// leaf the evaluation touched (an early-out keeps the work already
-    /// done), so the caller can flush it per superfile.
+    /// done), so the caller can flush it per superfile. `pool` is the
+    /// reader pool a `LIKE` leaf's dictionary walk runs on.
     pub(crate) fn evaluate<'a>(
         &'a self,
         reader: &'a SuperfileReader,
+        pool: Option<&'a ThreadPool>,
     ) -> BoxFuture<'a, Result<(Option<RoaringBitmap>, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
@@ -242,8 +245,8 @@ impl CandidatePlan {
                     fold,
                 } => {
                     let (expanded, mut work) =
-                        expand_like(reader, column, tokens, *fold, true).await?;
-                    let (docs, eval_work) = expanded.evaluate(reader).await?;
+                        expand_like(reader, column, tokens, *fold, true, pool).await?;
+                    let (docs, eval_work) = expanded.evaluate(reader, pool).await?;
                     work.merge(eval_work);
                     Ok((docs, work))
                 }
@@ -251,7 +254,7 @@ impl CandidatePlan {
                     let mut acc: Option<RoaringBitmap> = None;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader).await?;
+                        let (child, child_work) = c.evaluate(reader, pool).await?;
                         work.merge(child_work);
                         if let Some(bm) = child {
                             acc = Some(match acc {
@@ -270,7 +273,7 @@ impl CandidatePlan {
                     let mut acc = RoaringBitmap::new();
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader).await?;
+                        let (child, child_work) = c.evaluate(reader, pool).await?;
                         work.merge(child_work);
                         match child {
                             Some(bm) => acc |= bm,
@@ -436,6 +439,7 @@ impl CandidatePlan {
     pub(crate) fn estimate<'a>(
         &'a self,
         reader: &'a SuperfileReader,
+        pool: Option<&'a ThreadPool>,
     ) -> BoxFuture<'a, Result<(u64, MatchWork), ReadError>> {
         Box::pin(async move {
             let n_docs = reader.n_docs();
@@ -469,8 +473,8 @@ impl CandidatePlan {
                     fold,
                 } => {
                     let (expanded, mut work) =
-                        expand_like(reader, column, tokens, *fold, true).await?;
-                    let (rows, est_work) = expanded.estimate(reader).await?;
+                        expand_like(reader, column, tokens, *fold, true, pool).await?;
+                    let (rows, est_work) = expanded.estimate(reader, pool).await?;
                     work.merge(est_work);
                     Ok((rows, work))
                 }
@@ -478,7 +482,7 @@ impl CandidatePlan {
                     let mut m = n_docs;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader).await?;
+                        let (child, child_work) = c.estimate(reader, pool).await?;
                         work.merge(child_work);
                         m = m.min(child);
                     }
@@ -488,7 +492,7 @@ impl CandidatePlan {
                     let mut sum: u64 = 0;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader).await?;
+                        let (child, child_work) = c.estimate(reader, pool).await?;
                         work.merge(child_work);
                         sum = sum.saturating_add(child);
                     }
@@ -528,6 +532,7 @@ impl CandidatePlan {
         &'a self,
         reader: &'a SuperfileReader,
         full_walk_pays: &'a (dyn Fn(&str) -> bool + Sync),
+        pool: Option<&'a ThreadPool>,
     ) -> BoxFuture<'a, Result<(CandidatePlan, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
@@ -535,15 +540,15 @@ impl CandidatePlan {
                     column,
                     tokens,
                     fold,
-                } => expand_like(reader, column, tokens, *fold, full_walk_pays(column)).await,
+                } => expand_like(reader, column, tokens, *fold, full_walk_pays(column), pool).await,
                 CandidatePlan::And(children) => {
                     let (expanded, work) =
-                        expand_children(reader, children, full_walk_pays).await?;
+                        expand_children(reader, children, full_walk_pays, pool).await?;
                     Ok((and_combine(expanded), work))
                 }
                 CandidatePlan::Or(children) => {
                     let (expanded, work) =
-                        expand_children(reader, children, full_walk_pays).await?;
+                        expand_children(reader, children, full_walk_pays, pool).await?;
                     Ok((or_combine(expanded), work))
                 }
                 leaf => Ok((leaf.clone(), MatchWork::default())),
@@ -557,11 +562,12 @@ async fn expand_children(
     reader: &SuperfileReader,
     children: &[CandidatePlan],
     full_walk_pays: &(dyn Fn(&str) -> bool + Sync),
+    pool: Option<&ThreadPool>,
 ) -> Result<(Vec<CandidatePlan>, MatchWork), ReadError> {
     let mut expanded = Vec::with_capacity(children.len());
     let mut work = MatchWork::default();
     for child in children {
-        let (plan, child_work) = child.expand(reader, full_walk_pays).await?;
+        let (plan, child_work) = child.expand(reader, full_walk_pays, pool).await?;
         work.merge(child_work);
         expanded.push(plan);
     }
@@ -573,18 +579,26 @@ async fn expand_children(
 /// the whole dictionary walked while `allow_full_walk` is off, contributes
 /// no constraint (`Unbounded`, which `and_combine` drops); every token
 /// unanswered ⇒ the leaf is `Unbounded` and the superfile scans. `fold`
-/// is the leaf's `ILIKE` flag.
+/// is the leaf's `ILIKE` flag; the dictionary walk runs on `pool`.
 async fn expand_like(
     reader: &SuperfileReader,
     column: &str,
     tokens: &[LikeToken],
     fold: bool,
     allow_full_walk: bool,
+    pool: Option<&ThreadPool>,
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
     // One dictionary pass widens every token of the leaf.
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
     let (expansions, work) = reader
-        .expand_terms(column, &patterns, fold, LIKE_MAX_TERMS, allow_full_walk)
+        .expand_terms(
+            column,
+            &patterns,
+            fold,
+            LIKE_MAX_TERMS,
+            allow_full_walk,
+            pool,
+        )
         .await?;
     let parts = expansions
         .into_iter()

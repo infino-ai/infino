@@ -1212,12 +1212,13 @@ impl SuperfileReader {
         fold: bool,
         max_terms: usize,
         allow_full_walk: bool,
+        pool: Option<&ThreadPool>,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .expand_terms(column, patterns, fold, max_terms, allow_full_walk)
+            .expand_terms(column, patterns, fold, max_terms, allow_full_walk, pool)
             .await?)
     }
 
@@ -1433,6 +1434,7 @@ impl SuperfileReader {
         column: &str,
         prefix: &str,
         k: usize,
+        pool: Option<&ThreadPool>,
     ) -> Result<(Vec<(u32, f32)>, MatchWork), ReadError> {
         let fts = self
             .fts()
@@ -1441,7 +1443,11 @@ impl SuperfileReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
+        // The dictionary walk is CPU work and runs on the reader pool; the
+        // FST fetch it needs stays on this runtime.
+        let term_bytes = fts
+            .terms_with_prefix(column, lowered.as_bytes(), pool)
+            .await?;
         if term_bytes.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
@@ -1541,12 +1547,15 @@ impl SuperfileReader {
         &self,
         column: &str,
         prefix: &str,
+        pool: Option<&ThreadPool>,
     ) -> Result<OrCursorSet, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
+        let term_bytes = fts
+            .terms_with_prefix(column, lowered.as_bytes(), pool)
+            .await?;
         // FST keys are valid UTF-8 by construction (AsciiLower
         // tokenizer only emits ASCII bytes); the from_utf8 below
         // is a typed pass-through, not a re-validation cost.
@@ -1589,11 +1598,12 @@ impl SuperfileReader {
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
+        pool: Option<&ThreadPool>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         if k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
-        let set = self.bm25_prefix_cursor_set(column, prefix).await?;
+        let set = self.bm25_prefix_cursor_set(column, prefix, pool).await?;
         self.bm25_search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, f32::NEG_INFINITY)
     }
 
@@ -2767,7 +2777,7 @@ mod tests {
         let r = SuperfileReader::open(bytes).expect("open");
         // "rust" is a prefix of "rust" (docs 0,2); "ru" expands to it too.
         let (hits, work) = r
-            .bm25_search_prefix("title", "ru", 5)
+            .bm25_search_prefix("title", "ru", 5, None)
             .await
             .expect("prefix search");
         assert!(
@@ -2779,7 +2789,7 @@ mod tests {
         assert!(ids.contains(&2));
         // No indexed term begins with "zz".
         assert!(
-            r.bm25_search_prefix("title", "zz", 5)
+            r.bm25_search_prefix("title", "zz", 5, None)
                 .await
                 .expect("prefix")
                 .0
@@ -2787,7 +2797,7 @@ mod tests {
         );
         // k == 0 short-circuits.
         assert!(
-            r.bm25_search_prefix("title", "ru", 0)
+            r.bm25_search_prefix("title", "ru", 0, None)
                 .await
                 .expect("zero k")
                 .0
@@ -2834,7 +2844,7 @@ mod tests {
         let r = SuperfileReader::open(bytes).expect("open");
         // "ru" expands to "rust" (docs 0,2); restrict to [0,2) ⇒ doc 0.
         let hits = r
-            .bm25_search_prefix_range("title", "ru", 10, 0, 2)
+            .bm25_search_prefix_range("title", "ru", 10, 0, 2, None)
             .await
             .expect("prefix range");
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -2842,13 +2852,13 @@ mod tests {
         assert!(!ids.contains(&2));
         // Degenerate range / k short-circuits.
         assert!(
-            r.bm25_search_prefix_range("title", "ru", 0, 0, 2)
+            r.bm25_search_prefix_range("title", "ru", 0, 0, 2, None)
                 .await
                 .expect("zero k")
                 .is_empty()
         );
         assert!(
-            r.bm25_search_prefix_range("title", "ru", 10, 2, 2)
+            r.bm25_search_prefix_range("title", "ru", 10, 2, 2, None)
                 .await
                 .expect("empty range")
                 .is_empty()
@@ -3145,7 +3155,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         let hits = r
-            .bm25_search_prefix_range("title", "zz", 10, 0, 4)
+            .bm25_search_prefix_range("title", "zz", 10, 0, 4, None)
             .await
             .expect("prefix range");
         assert!(hits.is_empty());
