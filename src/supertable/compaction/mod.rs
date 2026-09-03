@@ -803,7 +803,7 @@ impl Supertable {
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                    info!(
+                    warn!(
                         superfile_id = %merged_superfile_id,
                         attempt,
                         max_retries,
