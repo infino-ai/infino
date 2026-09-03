@@ -94,9 +94,20 @@ is verified against the raw string — so it never scans the whole
 column. Tokenization is used only to prune; the match itself is a
 raw-string comparison. Also unranked.
 - **SQL.** A SQL query over the table's scalar and full-text columns,
-returning the matching rows. Search is also reachable from SQL
-through table-valued functions, so a query can filter, project, join,
-and order search results alongside scalar columns:
+returning the matching rows. A `WHERE` clause on a full-text column is
+answered from the inverted index wherever the index can bound it
+soundly — equality and `IN` through the literal's terms, `LIKE` through
+the term dictionary (each literal fragment of the pattern is tokenized;
+a token the fragment closes on both sides is required as itself, and a
+token bordering a wildcard is widened to the indexed terms it heads,
+tails, or sits inside) — with the exact predicate re-checked over the
+candidate rows. The default `ascii_lower` analyzer drops any token
+holding a non-ASCII byte, so under it only tokens the pattern closes on
+both sides can be required; the `standard` analyzer supports prefix,
+suffix, and substring patterns. `NOT LIKE` and `ILIKE` scan. Search is
+also reachable from SQL through table-valued functions, so a query can
+filter, project, join, and order search results alongside scalar
+columns:
   - `vector_search(column, query, k)` — vector kNN as a relation.
   - `bm25_search(column, query, k)` and
   `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.

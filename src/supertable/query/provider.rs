@@ -100,7 +100,7 @@ use crate::{
     superfile::{
         SuperfileReader,
         fts::{
-            reader::BoolMode,
+            reader::{BoolMode, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
     },
@@ -109,7 +109,7 @@ use crate::{
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
-            candidate::CandidatePlan,
+            candidate::{CandidatePlan, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
             exec::metered_exec::MeteredExec,
             prune::{PruneLeaf, select_superfiles},
@@ -429,6 +429,12 @@ impl SupertableProvider {
             &self.fts_cols_set(),
             &|col| opts.fts_tokenizer_for(col),
         ));
+
+        // `LIKE` on an FTS column: a term bloom for the pattern's complete
+        // tokens and a lex-range check for a prefix token.
+        leaves.extend(like_prune_leaves(filters, &self.fts_cols_set(), &|col| {
+            opts.fts_tokenizer_for(col)
+        }));
 
         leaves.extend(exprs_to_null_leaves(filters, &self.schema));
 
@@ -852,6 +858,9 @@ impl TableProvider for SupertableProvider {
         let candidate_plan = CandidatePlan::from_filters(filters, &self.fts_cols_set(), &|col| {
             opts.fts_tokenizer_for(col)
         });
+        // A `LIKE` leaf is bound to each superfile's dictionary once, up
+        // front, so the estimate and the evaluation below share one walk.
+        let needs_expansion = candidate_plan.has_like();
         let prepared_files =
             try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry))).await?;
 
@@ -878,18 +887,31 @@ impl TableProvider for SupertableProvider {
             // overhead. The floor keeps the pushdown active on small
             // superfiles; the density cap binds even under the floor so
             // an all-matching predicate never takes the index path.
-            let (est, est_work) = candidate_plan
+            let mut predicate_work = MatchWork::default();
+            let expanded;
+            let plan = if needs_expansion {
+                let (plan, expand_work) = candidate_plan
+                    .expand(prepared.reader.as_ref())
+                    .await
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                predicate_work.merge(expand_work);
+                expanded = plan;
+                &expanded
+            } else {
+                &candidate_plan
+            };
+            let (est, est_work) = plan
                 .estimate(prepared.reader.as_ref())
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            predicate_work.merge(est_work);
             let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64)
                 .max(PUSHDOWN_MIN_ROWS);
             let density_cap = (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
-            let mut predicate_work = est_work;
             let candidates = if est > gate || est >= density_cap {
                 None
             } else {
-                let (bitmap, eval_work) = candidate_plan
+                let (bitmap, eval_work) = plan
                     .evaluate(prepared.reader.as_ref())
                     .await
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -951,21 +973,23 @@ impl TableProvider for SupertableProvider {
 
         // Tier 2 - DataFusion-owned row-group / page pruning + row-level
         // filter pushdown, used **only when the index could not bound the
-        // rows** (`Unbounded` candidate plan). In that fallback the
+        // rows** of some superfile: an `Unbounded` candidate plan, a `LIKE`
+        // token too wide for that superfile's dictionary, or a superfile
+        // the selectivity gate sent to a scan. In that fallback the
         // predicate becomes a Parquet `RowFilter` (`with_pushdown_filters`)
         // so the predicate columns are decoded first and only surviving
         // rows materialize.
         //
-        // When the index *did* bound the rows, the per-superfile access plan
+        // When the index bounded *every* superfile, each access plan
         // already selects exactly the candidate rows and the `FilterExec`
         // above (filters are `Inexact`) verifies the exact predicate over
-        // that tiny set. So we attach the pushdown predicate only on the
-        // unbounded path.
-        let index_bounded = !matches!(candidate_plan, CandidatePlan::Unbounded);
-        let predicate = if !index_bounded {
-            row_group_predicate(state, filters, &self.schema)
-        } else {
+        // that tiny set. So we attach the pushdown predicate only when some
+        // superfile scans.
+        let all_bounded = superfiles.iter().all(|seg| seg.candidates.is_some());
+        let predicate = if all_bounded {
             None
+        } else {
+            row_group_predicate(state, filters, &self.schema)
         };
 
         // Only push the LIMIT into the scan when there are no filters:
@@ -2267,13 +2291,13 @@ mod tests {
         .expect("batch")
     }
 
-    #[test]
-    fn superfile_prune_index_helps_vs_does_not() {
+    /// Three superfiles whose `title` lexicographic ranges all span
+    /// "mango" — so scalar min/max prunes none of them — while only the
+    /// middle one actually holds the token. Returns the provider and a
+    /// runtime to drive its async surface.
+    fn provider_over_mango_superfiles() -> (SupertableProvider, runtime::Runtime) {
         let st = Supertable::create(cat_title_opts()).expect("create");
         let mut w = st.writer().expect("writer");
-        // Three superfiles. Every superfile's `title` lexicographic range
-        // spans "mango", so scalar min/max can prune none of them — but
-        // only the middle superfile actually holds the token.
         w.append(&cat_title_batch(&["lang", "lang"], &["aardvark", "zebra"]))
             .expect("a1");
         w.commit().expect("c1");
@@ -2297,6 +2321,12 @@ mod tests {
             .enable_all()
             .build()
             .expect("rt");
+        (provider, rt)
+    }
+
+    #[test]
+    fn superfile_prune_index_helps_vs_does_not() {
+        let (provider, rt) = provider_over_mango_superfiles();
 
         // Index HELPS: the term bloom prunes the two wide-range superfiles
         // that min/max could not, leaving only the real holder.
@@ -2320,6 +2350,34 @@ mod tests {
             rt.block_on(provider.surviving_superfile_count(&[col("category").eq(lit("lang"))])),
             3,
             "non-FTS predicate matching all superfiles prunes nothing"
+        );
+    }
+
+    #[test]
+    fn superfile_prune_bounds_like_by_its_complete_tokens() {
+        let (provider, rt) = provider_over_mango_superfiles();
+
+        // A `LIKE` whose only token the pattern closes on both sides is a
+        // term the bloom can test: the two superfiles without `mango` are
+        // pruned before any byte is read.
+        assert_eq!(
+            rt.block_on(provider.surviving_superfile_count(&[col("title").like(lit("% mango %"))])),
+            1,
+            "a complete LIKE token prunes through the term bloom"
+        );
+        // A wildcard-free pattern is the equality case and prunes the same.
+        assert_eq!(
+            rt.block_on(provider.surviving_superfile_count(&[col("title").like(lit("mango"))])),
+            1,
+            "a wildcard-free LIKE prunes like the equality"
+        );
+        // Under the default `ascii_lower` analyzer an open-edged token
+        // cannot be required (a run holding a non-ASCII byte is dropped
+        // whole), so a substring pattern keeps every superfile.
+        assert_eq!(
+            rt.block_on(provider.surviving_superfile_count(&[col("title").like(lit("%mango%"))])),
+            3,
+            "an open-edged LIKE token under ascii_lower prunes nothing"
         );
     }
 

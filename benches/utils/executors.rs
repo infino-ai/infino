@@ -2805,6 +2805,10 @@ pub mod sql {
     pub fn scan_battery(sample_key: &str, sample_title: &str) -> Vec<(&'static str, String)> {
         let k = sample_key.replace('\'', "''");
         let t = sample_title.replace('\'', "''");
+        // Titles are `doc{id:07} term… term…`: the leading doc token is
+        // unique per row and space-delimited, so a `LIKE 'doc… %'` pattern
+        // names one complete term the index can resolve directly.
+        let doc_token = t.split(' ').next().unwrap_or(t.as_str());
         vec![
             (
                 "WHERE key = ? (point lookup, unsorted col)",
@@ -2817,6 +2821,23 @@ pub mod sql {
             (
                 BULK_RANGE_SCAN,
                 "SELECT title, rating FROM supertable WHERE rating < 10".to_string(),
+            ),
+            (
+                // The pattern's only token is closed on both sides (pattern
+                // start, then a space), so it is answered from the index
+                // under any analyzer — one row, no column scan.
+                "WHERE title LIKE 'doc… %' (leading complete token, index-bounded)",
+                format!("SELECT key, rating FROM supertable WHERE title LIKE '{doc_token} %'"),
+            ),
+            (
+                // An open-edged token under the default `ascii_lower`
+                // analyzer cannot be bounded (a run holding a non-ASCII byte
+                // is dropped whole), so this stays a DataFusion column scan;
+                // `term09999` sits at the Zipf tail (the FTS battery's
+                // `single_rare` term), so the result stays small and the
+                // cost is the scan itself.
+                "WHERE title LIKE '%term…%' (substring, ascii_lower ⇒ scan)",
+                "SELECT key, rating FROM supertable WHERE title LIKE '%term09999%'".to_string(),
             ),
         ]
     }

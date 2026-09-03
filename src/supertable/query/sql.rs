@@ -548,7 +548,7 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
@@ -561,6 +561,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::tokenize::{StandardTokenizer, Tokenizer},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -572,6 +573,69 @@ mod tests {
     /// One more than the manifest's exact-value cardinality cap.
     const HIGH_CARDINALITY_ROWS: usize = 257;
 
+    /// Titles for the `LIKE` oracle, chosen so the index superset and the
+    /// exact match differ: `fox` as a whole word, as a head (`foxes`), a
+    /// tail (`firefox`), an infix (`outfoxed`), glued to punctuation the
+    /// analyzers treat differently (`a.fox.b`, `don't`), capitalised
+    /// (`LIKE` is case-sensitive, the index is not), inside a run the
+    /// default analyzer drops (`Firefox—the`), and a Greek word whose final
+    /// sigma lowercases by position.
+    const LIKE_TITLES: &[&str] = &[
+        "firefox browser",
+        "the fox jumped",
+        "foxes are quick",
+        "Firefox—the browser",
+        "fox",
+        "outfoxed again",
+        "a.fox.b",
+        "don't stop",
+        "100% sure",
+        "quick brown fox",
+        "nothing here",
+        "ΟΔΟΣ ΟΔΟΣΑ",
+    ];
+
+    /// Patterns for the `LIKE` oracle: prefix, suffix, infix, case, an
+    /// interior complete token, `_`, joiner punctuation, no match, match
+    /// all, no wildcard, Greek, two fragments, and parenthesised.
+    const LIKE_PATTERNS: &[&str] = &[
+        "fox%",
+        "%fox",
+        "%fox%",
+        "%Fox%",
+        "% fox %",
+        "%fox jumped",
+        "fo_ %",
+        "%foxe_%",
+        "%don'%",
+        "%.fox.%",
+        "%zzq%",
+        "%",
+        "fox",
+        "%ΟΔΟΣ%",
+        "%ΟΔΟΣ",
+        "%brown%fox%",
+        "%(fox)%",
+        "%100%",
+    ];
+
+    /// Textbook `LIKE`: `%` any run, `_` one character, everything else
+    /// byte-exact (the fixture patterns carry no escapes). Deliberately
+    /// shares nothing with the engine's lowering.
+    fn like_oracle(value: &str, pattern: &str) -> bool {
+        fn go(v: &[char], p: &[char]) -> bool {
+            match p.split_first() {
+                None => v.is_empty(),
+                Some(('%', rest)) => (0..=v.len()).any(|i| go(&v[i..], rest)),
+                Some(('_', rest)) => !v.is_empty() && go(&v[1..], rest),
+                Some((c, rest)) => v.first() == Some(c) && go(&v[1..], rest),
+            }
+        }
+        let v: Vec<char> = value.chars().collect();
+        let p: Vec<char> = pattern.chars().collect();
+        go(&v, &p)
+    }
+
     /// Schema with id + scalar + FTS column. No vector; query_sql
     /// is scalar-only by design.
     fn schema_id_cat_title() -> Arc<Schema> {
@@ -582,6 +646,11 @@ mod tests {
     }
 
     fn options_id_cat_title() -> SupertableOptions {
+        options_id_cat_title_with(tok())
+    }
+
+    /// [`options_id_cat_title`] with `title` analyzed by `tokenizer`.
+    fn options_id_cat_title_with(tokenizer: Arc<dyn Tokenizer>) -> SupertableOptions {
         // Single-threaded writer pool so each commit produces
         // exactly one superfile — keeps assertions on per-superfile
         // counts deterministic.
@@ -598,7 +667,7 @@ mod tests {
                 positions: false,
             }],
             vec![],
-            Some(tok()),
+            Some(tokenizer),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -1592,6 +1661,56 @@ mod tests {
             ),
             2,
         );
+    }
+
+    #[test]
+    fn query_sql_like_matches_a_brute_force_oracle_under_both_analyzers() {
+        // The index bounds a LIKE differently per analyzer (the default
+        // one only through complete tokens, `standard` through prefix /
+        // suffix / infix expansion), and every bound is a superset the
+        // FilterExec narrows. Whatever the plan, the rows must be exactly
+        // the textbook LIKE matches — checked against an independent
+        // oracle for every pattern under both analyzers.
+        let analyzers: [Arc<dyn Tokenizer>; 2] = [tok(), Arc::new(StandardTokenizer)];
+        for tokenizer in analyzers {
+            let name = tokenizer.name();
+            let st = Supertable::create(options_id_cat_title_with(tokenizer)).expect("create");
+            let mut w = st.writer().expect("writer");
+            let cats: Vec<&str> = LIKE_TITLES.iter().map(|_| "x").collect();
+            w.append(&build_cat_batch(0, &cats, LIKE_TITLES))
+                .expect("append");
+            w.commit().expect("commit");
+            for pattern in LIKE_PATTERNS {
+                let expected: HashSet<&str> = LIKE_TITLES
+                    .iter()
+                    .copied()
+                    .filter(|title| like_oracle(title, pattern))
+                    .collect();
+                let quoted = pattern.replace('\'', "''");
+                let batches = st
+                    .reader()
+                    .expect("reader")
+                    .query_sql(&format!(
+                        "SELECT title FROM supertable WHERE title LIKE '{quoted}'"
+                    ))
+                    .expect("query");
+                let got: Vec<String> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        let titles = b
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<LargeStringArray>()
+                            .expect("title column");
+                        (0..titles.len())
+                            .map(|i| titles.value(i).to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                let got: HashSet<&str> = got.iter().map(String::as_str).collect();
+                assert_eq!(got, expected, "LIKE {pattern:?} under {name}");
+            }
+        }
     }
 
     #[test]

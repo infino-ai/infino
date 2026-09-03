@@ -935,6 +935,16 @@ impl FtsReader {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
     }
 
+    /// Open the term dictionary over fetched FST bytes, mapping an FST
+    /// parse failure to the reader's malformed-blob error.
+    pub(super) fn open_dict(fst_bytes: &[u8]) -> Result<DictReader<'_>, FtsError> {
+        DictReader::open(fst_bytes).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
+        })
+    }
+
     /// Async FST-dictionary fetch for the query path. Resolves
     /// zero-copy for in-memory / warm sources; for a cold `Lazy`
     /// source it `await`s the object-store range on the caller's
@@ -1410,11 +1420,7 @@ impl FtsReader {
         let fst_bytes = self
             .dict_bytes()
             .expect("FST bytes must be available for term iteration");
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let pairs = dict.iter_prefix(&full_prefix);
         Ok(pairs
             .into_iter()

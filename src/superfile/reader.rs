@@ -54,7 +54,7 @@ use crate::{
         fts::{
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
-                PreparedClauses,
+                PreparedClauses, TermPattern,
             },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
@@ -1198,6 +1198,21 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.token_match(column, tokens, mode).await?)
+    }
+
+    /// Widen one `LIKE` fragment token to the indexed terms of `column`
+    /// it covers (`None` when more than `max_terms` qualify). Delegates to
+    /// [`FtsReader::expand_terms`].
+    pub(crate) async fn expand_terms(
+        &self,
+        column: &str,
+        pattern: TermPattern<'_>,
+        max_terms: usize,
+    ) -> Result<(Option<Vec<String>>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.expand_terms(column, pattern, max_terms).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s

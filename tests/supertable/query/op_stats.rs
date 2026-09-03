@@ -23,7 +23,10 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::{
+            reader::{Bm25Stats, BoolMode},
+            tokenize::STANDARD_TOKENIZER,
+        },
         vector::rerank_codec::RerankCodec,
     },
     supertable::{
@@ -850,6 +853,125 @@ fn scoped_sql_stats(db: &Connection, sql: &str) -> OpStats {
     let (batches, stats) = with_op_stats(|| db.query_sql(sql).expect("query_sql"));
     assert!(!batches.is_empty(), "fixture SQL {sql:?} must return");
     stats
+}
+
+/// Rows in the `LIKE` fixture. Large enough that every writer shard holds
+/// at least two needle rows: a term with df = 1 in a superfile is stored
+/// inline in the dictionary with no posting bytes, which would make the
+/// posting-work assertion vacuous.
+const LIKE_ROWS: usize = 512;
+/// Every this-many-th row of the `LIKE` fixture carries the needle.
+const LIKE_NEEDLE_STRIDE: usize = 4;
+
+/// A `standard`-analyzer table for the `LIKE` pushdown: the substring
+/// `nimble` occurs only inside the term `nimblefox`, planted in every
+/// [`LIKE_NEEDLE_STRIDE`]-th row.
+fn sql_like_fixture(dir: &TempDir) -> Connection {
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("rating", DataType::Int64, false),
+    ]));
+    let docs = db
+        .create_table(
+            "docs",
+            schema.clone(),
+            IndexSpec::new().fts_with_analyzer("title", STANDARD_TOKENIZER),
+        )
+        .expect("create_table");
+    let titles: Vec<String> = (0..LIKE_ROWS)
+        .map(|i| {
+            if i % LIKE_NEEDLE_STRIDE == 0 {
+                format!("filler{i} nimblefox")
+            } else {
+                format!("filler{i} rust")
+            }
+        })
+        .collect();
+    let title_arr: ArrayRef = Arc::new(LargeStringArray::from(
+        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    let ratings: ArrayRef = Arc::new(Int64Array::from((0..LIKE_ROWS as i64).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
+    docs.append(&batch).expect("append");
+    db
+}
+
+#[test]
+fn a_like_predicate_is_answered_from_the_index() {
+    // `%nimble%` widens through each superfile's dictionary to the one
+    // term containing it and the scan decodes only that term's rows —
+    // FTS work the counters must show. The same query used to decode
+    // every row of `title` to test the substring.
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir);
+    let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
+    assert!(
+        stats.fts_postings_bytes > 0,
+        "the LIKE resolves through posting lists; got 0"
+    );
+    assert_eq!(
+        stats.rows_materialized,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64,
+        "only the candidate rows decode"
+    );
+
+    // A prefix pattern widens through the dictionary too. No stored value
+    // starts with `nimble` (they all start with `filler`), so the answer is
+    // empty — but the index still hands the scan the rows holding a term
+    // that starts with it, and only the FilterExec rejects them. Decoding
+    // exactly those candidates is the signature of the index path: a plain
+    // scan with the row filter inside it would decode none.
+    let (batches, prefix) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title LIKE 'nimble%'")
+            .expect("query_sql")
+    });
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert!(
+        prefix.fts_postings_bytes > 0,
+        "the prefix expansion resolves through posting lists; got 0"
+    );
+    assert_eq!(
+        prefix.rows_materialized,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64,
+        "the candidate rows decode before the exact check rejects them"
+    );
+
+    // A substring no indexed term contains expands to nothing: every
+    // superfile's access plan selects no row, so no data page is read.
+    let (batches, none) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title LIKE '%zzq%'")
+            .expect("query_sql")
+    });
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert_eq!(
+        none.sql_page_bytes, 0,
+        "an empty expansion reads no Parquet pages"
+    );
+    assert_eq!(
+        none.rows_materialized, 0,
+        "an empty expansion decodes nothing"
+    );
+}
+
+#[test]
+fn an_open_edged_like_under_the_default_analyzer_still_scans() {
+    // `ascii_lower` drops any run holding a non-ASCII byte, so a term that
+    // merely contains `rust` may not exist for a row that does — the
+    // index cannot bound `%rust%` there and the column scans instead.
+    // Control for the test above: no posting work, same answer.
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%rust%'");
+    assert_eq!(
+        stats.fts_postings_bytes, 0,
+        "no index bound under ascii_lower; got {}",
+        stats.fts_postings_bytes
+    );
+    assert!(
+        stats.sql_page_bytes > 0,
+        "the scan reads the column's pages"
+    );
 }
 
 #[test]
