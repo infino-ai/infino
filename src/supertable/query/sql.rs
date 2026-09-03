@@ -548,7 +548,7 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, iter::repeat_n, sync::Arc};
+    use std::{collections::HashSet, sync::Arc};
 
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
@@ -625,13 +625,18 @@ mod tests {
 
     /// Titles whose case-folding is where `ILIKE` and lowercasing part
     /// ways: a long s (`ſun riſe`, which Arrow matches against `sun`), a
-    /// Kelvin sign (`Kelvin K`, matched against `k`), and Greek with a
-    /// final sigma, beside plain mixed case.
+    /// Kelvin sign U+212A (written as an escape — the glyph passes for an
+    /// ASCII `K`, which would make every Kelvin case here vacuous: `Kelvin
+    /// K`, matched against `k`; `K b`, whose only `k` is the sign — under
+    /// `ascii_lower` that run is dropped and only `b` is indexed, so
+    /// requiring `k` of the row would lose it), and Greek with a final
+    /// sigma, beside plain mixed case.
     const FOLD_TITLES: &[&str] = &[
         "sun set",
         "SUN RISE",
         "ſun riſe",
-        "Kelvin K",
+        "Kelvin \u{212A}",
+        "\u{212A} b",
         "sunset boulevard",
         "a sun",
         "Peter Parker",
@@ -641,14 +646,35 @@ mod tests {
         "οδος",
     ];
 
+    /// The row committed as a second superfile of the `ILIKE` oracle:
+    /// `ſun ſet`, spelled only in forms an ASCII token never names. Every
+    /// term of the file sorts after `sun`, so a term-range leaf asked
+    /// about `sun` would prune the file, and a bloom asked for `sun` or
+    /// `set` finds neither — either unsound leaf loses a row Arrow
+    /// matches. Nothing here may put a term below `sun` into the file's
+    /// range, which is why `K b` sits in [`FOLD_TITLES`] instead.
+    const FOLD_TITLES_APART: &[&str] = &["ſun ſet"];
+
+    /// Filler words for that second superfile (see [`filler_rows`]): each
+    /// sorts after every probed ASCII prefix and holds neither `s` nor
+    /// `k`, so the rows keep the file's whole term range clear of `sun`
+    /// while still letting its dictionary walk pay.
+    const FOLD_FILLER_WORDS: &[&str] = &[
+        "tango", "tempo", "tiger", "timber", "toga", "torch", "total", "tower", "trade", "treaty",
+        "trophy", "tulip", "tundra", "tunnel", "turbo", "ultra", "umbra", "uncle", "under",
+        "union", "unity", "upper", "urban", "utter", "valley", "vapor", "velvet", "venue",
+        "verdant", "vertex", "violet", "viper",
+    ];
+
     /// `(operator, pattern)` pairs judged against DataFusion itself.
     const FOLD_PATTERNS: &[(&str, &str)] = &[
         ("LIKE", "sun%"),
-        ("LIKE", "%K"),
+        ("LIKE", "%\u{212A}"),
         ("ILIKE", "sun%"),
         ("ILIKE", "%sun%"),
         ("ILIKE", "%sun"),
         ("ILIKE", "sun set"),
+        ("ILIKE", "SUN SET"),
         ("ILIKE", "% sun %"),
         ("ILIKE", "%SUN RISE"),
         ("ILIKE", "k %"),
@@ -659,7 +685,10 @@ mod tests {
         ("ILIKE", "%PARKER"),
         ("ILIKE", "%ri_e"),
         ("ILIKE", "%riſe"),
+        ("ILIKE", "%ſet"),
+        ("LIKE", "ſun%"),
         ("ILIKE", "%οδος%"),
+        ("ILIKE", "%οδοσ%"),
         ("ILIKE", "ΟΔΟΣ%"),
         ("ILIKE", "%"),
         ("ILIKE", "%zzq%"),
@@ -1781,14 +1810,25 @@ mod tests {
             let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
             let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
             let batch = build_cat_batch(0, &cats, &title_refs);
+            let apart = with_filler_rows(FOLD_TITLES_APART, FOLD_FILLER_WORDS);
+            let apart_refs: Vec<&str> = apart.iter().map(String::as_str).collect();
+            let apart_cats: Vec<&str> = apart_refs.iter().map(|_| "x").collect();
+            let apart_batch = build_cat_batch(0, &apart_cats, &apart_refs);
 
+            // Two superfiles: the second holds only rows whose every
+            // spelling an ASCII token misses, so an unsound term-bloom or
+            // term-range leaf would prune it whole and lose its rows.
             let st = Supertable::create(options_id_cat_title_with(tokenizer)).expect("create");
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
+            w.append(&apart_batch).expect("append apart");
+            w.commit().expect("commit apart");
+            assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
 
             let ctx = SessionContext::new();
-            let mem = MemTable::try_new(schema_id_cat_title(), vec![vec![batch]]).expect("mem");
+            let mem = MemTable::try_new(schema_id_cat_title(), vec![vec![batch, apart_batch]])
+                .expect("mem");
             ctx.register_table("supertable", Arc::new(mem))
                 .expect("register");
 
@@ -1809,31 +1849,85 @@ mod tests {
     /// terms containing `zz` than a LIKE token may widen to.
     const OVER_CAP_ROWS: usize = LIKE_MAX_TERMS + 76;
 
-    /// Prose appended to every wide-superfile title, and standing alone
-    /// as the filler rows of [`with_walk_filler`], so a superfile's stored
+    /// Prose words appended to every wide-superfile title, and making up
+    /// the filler rows of [`with_walk_filler`], so a superfile's stored
     /// text dwarfs its vocabulary and a suffix or substring token takes
     /// the whole-dictionary walk (the walk-vs-scan gate compares the two;
     /// a handful of short titles on their own sit far under it and would
     /// only ever exercise the scan).
-    const WALK_FILLER: &str = " lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
-                                eiusmod tempor incididunt ut labore et dolore magna aliqua \
-                                lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
-                                eiusmod tempor incididunt ut labore et dolore magna aliqua";
+    const WALK_FILLER_WORDS: &[&str] = &[
+        "lorem",
+        "ipsum",
+        "dolor",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "eiusmod",
+        "tempor",
+        "incididunt",
+        "labore",
+        "dolore",
+        "magna",
+        "aliqua",
+        "enim",
+        "minim",
+        "veniam",
+        "quis",
+        "nostrud",
+        "exercitation",
+        "ullamco",
+        "laboris",
+        "nisi",
+        "aliquip",
+        "commodo",
+        "consequat",
+        "duis",
+        "aute",
+        "irure",
+        "reprehenderit",
+        "voluptate",
+        "velit",
+    ];
 
-    /// Filler rows [`with_walk_filler`] adds: enough copies of
-    /// [`WALK_FILLER`] to hold well over the gate's bytes-per-term floor
-    /// against the fixture titles' vocabulary.
+    /// Filler rows [`filler_rows`] builds: enough to hold well over the
+    /// gate's bytes-per-term floor against the fixture titles' vocabulary.
+    /// Twice the word count, so every row is a distinct ordering.
     const WALK_FILLER_ROWS: usize = 64;
 
-    /// `titles` followed by [`WALK_FILLER_ROWS`] rows of [`WALK_FILLER`].
-    /// The oracles judge the filler rows like any other, so they may add
-    /// to a pattern's expected set (`%` matches them all).
-    fn with_walk_filler(titles: &[&str]) -> Vec<String> {
+    /// [`WALK_FILLER_ROWS`] rows over `words`, each a different ordering
+    /// (the rotations, then the reversed rotations). The rows must differ:
+    /// Parquet dictionary-encodes a repeated string as one entry and the
+    /// gate reads the column's encoded size, so identical rows would
+    /// weigh as one. Real prose rows are distinct; these are too.
+    fn filler_rows(words: &[&str]) -> Vec<String> {
+        assert!(WALK_FILLER_ROWS <= 2 * words.len(), "orderings run out");
+        (0..WALK_FILLER_ROWS)
+            .map(|i| {
+                let mut row = words.to_vec();
+                row.rotate_left(i % words.len());
+                if i >= words.len() {
+                    row.reverse();
+                }
+                row.join(" ")
+            })
+            .collect()
+    }
+
+    /// `titles` followed by the [`filler_rows`] over `words`. The oracles
+    /// judge the filler rows like any other, so they may add to a
+    /// pattern's expected set (`%` matches them all).
+    fn with_filler_rows(titles: &[&str], words: &[&str]) -> Vec<String> {
         titles
             .iter()
             .map(|t| (*t).to_owned())
-            .chain(repeat_n(WALK_FILLER.trim().to_owned(), WALK_FILLER_ROWS))
+            .chain(filler_rows(words))
             .collect()
+    }
+
+    /// [`with_filler_rows`] over the [`WALK_FILLER_WORDS`] prose.
+    fn with_walk_filler(titles: &[&str]) -> Vec<String> {
+        with_filler_rows(titles, WALK_FILLER_WORDS)
     }
 
     /// Two superfiles under the `standard` analyzer: a wide one whose
@@ -1844,8 +1938,9 @@ mod tests {
         let st = Supertable::create(options_id_cat_title_with(Arc::new(StandardTokenizer)))
             .expect("create");
         let mut w = st.writer().expect("writer");
+        let filler = WALK_FILLER_WORDS.join(" ");
         let wide: Vec<String> = (0..OVER_CAP_ROWS)
-            .map(|i| format!("q{i}zz{WALK_FILLER}"))
+            .map(|i| format!("q{i}zz {filler}"))
             .collect();
         let wide_refs: Vec<&str> = wide.iter().map(String::as_str).collect();
         let cats: Vec<&str> = wide_refs.iter().map(|_| "x").collect();

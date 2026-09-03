@@ -70,7 +70,7 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         fts::{
-            reader::{BoolMode, LONG_S_ASCII, MatchWork, TermPattern},
+            reader::{BoolMode, LONG_S_ASCII, MatchWork, TermPattern, has_fold_partner},
             tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER, Tokenizer},
         },
     },
@@ -109,13 +109,6 @@ const WORD_JOINERS: &[char] = &['\'', '"', '.', ':', ',', ';', '_'];
 /// and a medial one `σ` — the one context-sensitive mapping in Unicode
 /// lowercasing.
 const FINAL_SIGMA: char = 'ς';
-
-/// ASCII letters whose Unicode simple case-folding class has a non-ASCII
-/// member: `s` folds together with `ſ` (U+017F) and `k` with the Kelvin
-/// sign `K` (U+212A). Under `ILIKE` a matching row may hold those forms;
-/// the `ascii_lower` analyzer drops the run holding one, so a token with
-/// either letter cannot be required of it.
-const FOLD_TO_ASCII: &[char] = &['s', 'k'];
 
 /// A superfile-independent boolean plan over FTS term retrievals, lowered
 /// once from a SQL `WHERE` clause and [`evaluate`](CandidatePlan::evaluate)d
@@ -879,7 +872,7 @@ impl Analyzer {
             Analyzer::AsciiLower if !token.is_complete() => None,
             // …and under `ILIKE` a row may spell `s` as `ſ` or `k` as `K`
             // — non-ASCII bytes that drop the whole run.
-            Analyzer::AsciiLower if fold && token.text.contains(FOLD_TO_ASCII) => None,
+            Analyzer::AsciiLower if fold && token.text.chars().any(has_fold_partner) => None,
             // `to_lowercase` spells a word-final `Σ` as `ς` and a medial
             // one as `σ`, so a token whose end may sit mid-word has two
             // possible spellings in the dictionary.
@@ -1432,6 +1425,12 @@ mod tests {
             plan(col("title").ilike(lit("% fox %"))),
             terms_all(&["fox"])
         );
+        // The drop is per token: a sibling without `s` or `k` stays
+        // required, so the leaf narrows instead of vanishing.
+        assert_eq!(
+            plan(col("title").ilike(lit("% rust fox %"))),
+            terms_all(&["fox"])
+        );
         assert_eq!(
             plan(col("title").ilike(lit("%fox%"))),
             CandidatePlan::Unbounded
@@ -1456,6 +1455,20 @@ mod tests {
         assert!(matches!(
             &leaves[1],
             PruneLeaf::Prefix { prefix, .. } if prefix == b"quic"
+        ));
+        // An open-right token holding `s` loses its term-range leaf too:
+        // its `ſ` spelling sorts nowhere near the prefix. Only the safe
+        // complete token is left to ask about.
+        let leaves = like_prune_leaves(
+            &[col("title").ilike(lit("sun% fox %"))],
+            &fts_cols(),
+            &standard_resolver,
+        );
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            PruneLeaf::TermPresence { terms, mode: BoolMode::And, .. }
+                if *terms == ["fox".to_owned()]
         ));
     }
 

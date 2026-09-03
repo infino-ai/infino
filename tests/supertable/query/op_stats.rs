@@ -926,6 +926,19 @@ fn a_like_predicate_is_answered_from_the_index() {
         "only the candidate rows decode"
     );
 
+    // `ILIKE` takes the same path: the token is compared folded against
+    // every dictionary key, and the needle rows are all that decode.
+    let folded = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title ILIKE '%NIMBLE%'");
+    assert!(
+        folded.fts_postings_bytes > 0,
+        "the ILIKE resolves through posting lists; got 0"
+    );
+    assert_eq!(
+        folded.rows_materialized,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64,
+        "only the candidate rows decode under ILIKE"
+    );
+
     // A prefix pattern widens through the dictionary too. No stored value
     // starts with `nimble` (they all start with `filler`), so the answer is
     // empty — but the index still hands the scan the rows holding a term

@@ -110,7 +110,7 @@ stored text is large against its vocabulary; otherwise that token is
 left to the scan. `ILIKE` is bounded the same way for ASCII tokens,
 comparing dictionary terms with the two non-ASCII characters Unicode
 case folding places in an ASCII letter's class (the long s `ſ` with
-`s`, the Kelvin sign `K` with `k`) folded to that letter; non-ASCII
+`s`, the Kelvin sign U+212A with `k`) folded to that letter; non-ASCII
 tokens under `ILIKE`, and `NOT LIKE`, scan. Search is
 also reachable from SQL through table-valued functions, so a query can
 filter, project, join, and order search results alongside scalar

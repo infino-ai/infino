@@ -12,20 +12,34 @@ use std::{borrow::Cow, str};
 use super::{core::*, work::MatchWork};
 use crate::superfile::{error::FtsError, fts::dict::make_key};
 
-/// The ASCII letter whose Unicode case-folding class holds a character
-/// `to_lowercase` keeps as itself: `s`, folded together with the long s
-/// [`LONG_S`]. An `ILIKE` token holding it may be spelled with `ſ` in a
-/// matching row's indexed term, so only a dictionary walk can find it.
-pub(crate) const LONG_S_ASCII: char = 's';
-
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;
 /// `to_lowercase` leaves it, so an indexed term can carry it.
 const LONG_S: char = 'ſ';
 
 /// Kelvin sign (U+212A), folded with `k`. `to_lowercase` maps it to `k`
 /// before indexing, so a term never carries it; folded here anyway so the
-/// comparison does not depend on that.
-const KELVIN_SIGN: char = 'K';
+/// comparison does not depend on that. Written as an escape: the glyph is
+/// indistinguishable from an ASCII `K` in most fonts, and an ASCII `K`
+/// here would make the fold a no-op without any test noticing.
+const KELVIN_SIGN: char = '\u{212A}';
+
+/// Every non-ASCII character Unicode simple case folding puts in an ASCII
+/// letter's class, paired with that letter. These are the only spellings
+/// an `ILIKE` on an ASCII token can match that `to_lowercase` of ASCII
+/// text never produces; every fold rule in the crate derives from this
+/// table so the pairs are written once.
+pub(crate) const FOLD_PAIRS: &[(char, char)] = &[(LONG_S, 's'), (KELVIN_SIGN, 'k')];
+
+/// The ASCII letter whose fold partner an indexed term can actually
+/// carry: `s` (the long s survives `to_lowercase`; the Kelvin sign does
+/// not). An `ILIKE` token holding it may be spelled with `ſ` in a
+/// matching row's term, so only a dictionary walk can find it.
+pub(crate) const LONG_S_ASCII: char = FOLD_PAIRS[0].1;
+
+/// Whether `c` is an ASCII letter with a non-ASCII fold partner.
+pub(crate) fn has_fold_partner(c: char) -> bool {
+    FOLD_PAIRS.iter().any(|&(_, ascii)| ascii == c)
+}
 
 /// How one `LIKE` fragment token constrains an indexed term. The text is
 /// already the column tokenizer's output (lowercased, split), so it
@@ -96,16 +110,14 @@ impl TermPattern<'_> {
 /// their case-folding classes — the view an `ILIKE` token is compared
 /// against. Borrowed when nothing folds.
 fn fold_term(term: &str) -> Cow<'_, str> {
-    if term.contains([LONG_S, KELVIN_SIGN]) {
-        Cow::Owned(
-            term.chars()
-                .map(|c| match c {
-                    LONG_S => 's',
-                    KELVIN_SIGN => 'k',
-                    other => other,
-                })
-                .collect(),
-        )
+    let fold = |c: char| {
+        FOLD_PAIRS
+            .iter()
+            .find(|&&(from, _)| from == c)
+            .map(|&(_, to)| to)
+    };
+    if term.chars().any(|c| fold(c).is_some()) {
+        Cow::Owned(term.chars().map(|c| fold(c).unwrap_or(c)).collect())
     } else {
         Cow::Borrowed(term)
     }
