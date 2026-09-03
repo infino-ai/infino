@@ -27,13 +27,13 @@ use futures::{
 };
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
-use tokio::time;
+use tokio::{task::spawn_blocking, time};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     config::CompactionSettings,
-    runtime_bridge::bridge_on_runtime,
+    runtime_bridge::{bridge_on_runtime, carry_span},
     superfile::{
         builder::SuperfileBuilder,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
@@ -540,16 +540,17 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
-        let (merged_bytes, superfile_stats): (Bytes, _) = {
-            let first_vec = readers_with_tombstones
-                .first()
-                .and_then(|(reader, _)| reader.vec());
-            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
-            let sq8_merge = first_vec.and_then(|v| {
-                v.vector_columns_config()
-                    .next()
-                    .map(|c| c.rerank_codec.is_ivf_mergeable())
-            });
+        let first_vec = readers_with_tombstones
+            .first()
+            .and_then(|(reader, _)| reader.vec());
+        let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
+        let sq8_merge = first_vec.and_then(|v| {
+            v.vector_columns_config()
+                .next()
+                .map(|c| c.rerank_codec.is_ivf_mergeable())
+        });
+        let has_vector = first_vec.is_some();
+        let (merged_bytes, superfile_stats) = spawn_blocking(carry_span(move || {
             // Every merge kind streams its output to a temp file and mmaps it
             // back, so the corpus-sized merge output is never held as an anon
             // Vec — the allocation that OOMs compaction on a memory-tight host.
@@ -571,7 +572,7 @@ impl Supertable {
                         &readers_with_tombstones,
                         &mut writer,
                     )?
-                } else if first_vec.is_none() {
+                } else if !has_vector {
                     // FTS/scalar inputs (no vector index): carry each input's
                     // already-built posting lists across instead of
                     // re-tokenizing the whole corpus.
@@ -592,8 +593,10 @@ impl Supertable {
             };
             let bytes = mmap_readonly_bytes(output.path())
                 .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
-            (bytes, stats)
-        };
+            Ok::<(Bytes, _), BuildError>((bytes, stats))
+        }))
+        .await
+        .map_err(|e| BuildError::Store(format!("merge build join: {e}")))??;
 
         let shard = ShardOutput::new_with_params(
             merged_bytes,
