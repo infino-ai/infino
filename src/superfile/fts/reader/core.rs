@@ -1179,11 +1179,7 @@ impl FtsReader {
                     true => {
                         dict_ranges += 1;
                         let fst_bytes = self.dict_bytes_async().await?;
-                        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-                            FtsError::Read(ReadError::MalformedVersion(format!(
-                                "FST parse failed: {e}"
-                            )))
-                        })?;
+                        let dict = Self::open_dict(&fst_bytes)?;
                         let key = make_key(&col_meta.name, term);
                         let packed = dict
                             .lookup(&key)
@@ -1253,11 +1249,7 @@ impl FtsReader {
         let positions_region = self.positions_range.clone();
 
         let fst_bytes = self.dict_bytes()?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
 
         // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
         // `iter_prefix` yields `(key, packed_value)` in lex term order, so we

@@ -311,7 +311,11 @@ impl CandidatePlan {
         }
     }
 
-    /// Append one `OR` branch as a single conjunctive leaf group.
+    /// Append one `OR` branch as a single conjunctive leaf group. A branch
+    /// that yields no leaf at all (a `LIKE` whose tokens are all open on
+    /// the left — no summary bounds a suffix or infix) constrains no
+    /// superfile, so the whole disjunction has no gate: `false`, not an
+    /// empty group, which the caller would read as "nothing survives".
     fn collect_survival_or_branch(&self, groups: &mut Vec<Vec<PruneLeaf>>) -> bool {
         match self {
             CandidatePlan::Unbounded => false,
@@ -320,7 +324,7 @@ impl CandidatePlan {
                 .all(|child| child.collect_survival_or_branch(groups)),
             other => {
                 let mut leaves = Vec::new();
-                if !other.append_prune_leaves(&mut leaves) {
+                if !other.append_prune_leaves(&mut leaves) || leaves.is_empty() {
                     return false;
                 }
                 groups.push(leaves);
@@ -1338,6 +1342,32 @@ mod tests {
             PruneLeaf::TermPresence { terms, mode: BoolMode::And, .. }
                 if *terms == ["quick".to_owned(), "fox".to_owned()]
         ));
+    }
+
+    #[test]
+    fn a_like_with_only_open_left_tokens_has_no_survival_gate() {
+        // `%fox%` bounds no manifest summary (no bloom term, no prefix), so
+        // the plan must report "no gate" — an empty leaf group would read as
+        // "no superfile survives" and silently drop every match.
+        let contains = terms_like(vec![like_token("fox", true, true)]);
+        let mut groups = Vec::new();
+        assert!(!contains.collect_survival_or_groups(&mut groups));
+        assert!(groups.is_empty());
+        // The same leaf under an OR disables the whole disjunction's gate.
+        let mut groups = Vec::new();
+        assert!(
+            !CandidatePlan::Or(vec![terms_all(&["alpha"]), contains.clone()])
+                .collect_survival_or_groups(&mut groups)
+        );
+        // Under an AND, the sibling's leaf still gates (a superset stays
+        // sound: every match has `alpha`).
+        let mut groups = Vec::new();
+        assert!(
+            CandidatePlan::And(vec![terms_all(&["alpha"]), contains])
+                .collect_survival_or_groups(&mut groups)
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
     }
 
     #[test]

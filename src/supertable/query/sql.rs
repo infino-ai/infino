@@ -565,7 +565,9 @@ mod tests {
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
-            Supertable, SupertableOptions, error::QueryError, query::sql::build_sql_schemas,
+            Supertable, SupertableOptions,
+            error::QueryError,
+            query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -1711,6 +1713,60 @@ mod tests {
                 assert_eq!(got, expected, "LIKE {pattern:?} under {name}");
             }
         }
+    }
+
+    #[test]
+    fn query_sql_like_mixes_bounded_and_unbounded_superfiles() {
+        // Two superfiles under the `standard` analyzer. The first holds
+        // more distinct terms containing `zz` than a LIKE token may widen
+        // to, so `%zz%` is unbounded there and that superfile scans with
+        // the row filter; the second holds two such terms and is bounded.
+        // One query spans both paths and must still be exact. A prefix
+        // pattern flips the roles: bounded in the first, empty in the
+        // second (no term starts with `q1`), which skips it outright.
+        const OVER_CAP_ROWS: usize = LIKE_MAX_TERMS + 76;
+        let st = Supertable::create(options_id_cat_title_with(Arc::new(StandardTokenizer)))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        let wide: Vec<String> = (0..OVER_CAP_ROWS).map(|i| format!("q{i}zz")).collect();
+        let wide_refs: Vec<&str> = wide.iter().map(String::as_str).collect();
+        let cats: Vec<&str> = wide_refs.iter().map(|_| "x").collect();
+        w.append(&build_cat_batch(0, &cats, &wide_refs))
+            .expect("append wide");
+        w.commit().expect("commit wide");
+        w.append(&build_cat_batch(
+            0,
+            &["y", "y", "y"],
+            &["buzz lightyear", "fizz", "plain"],
+        ))
+        .expect("append narrow");
+        w.commit().expect("commit narrow");
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
+
+        // Contains: unbounded in the wide superfile, bounded in the narrow.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title LIKE '%zz%'"
+            ),
+            (OVER_CAP_ROWS + 2) as i64,
+        );
+        // Prefix: `q1`, `q10`..`q19`, `q100`..`q199`, `q1000`..`q1099`.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title LIKE 'q1%'"
+            ),
+            1 + 10 + 100 + 100,
+        );
+        // Both, with a scalar conjunct the index cannot bound.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title LIKE '%zz%' AND category = 'y'"
+            ),
+            2,
+        );
     }
 
     #[test]

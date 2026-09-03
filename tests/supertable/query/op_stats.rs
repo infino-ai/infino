@@ -855,10 +855,11 @@ fn scoped_sql_stats(db: &Connection, sql: &str) -> OpStats {
     stats
 }
 
-/// Rows in the `LIKE` fixture. Large enough that every writer shard holds
-/// at least two needle rows: a term with df = 1 in a superfile is stored
-/// inline in the dictionary with no posting bytes, which would make the
-/// posting-work assertion vacuous.
+/// Rows in the `LIKE` fixture. The needle term must reach df ≥ 2 in its
+/// superfile: a df = 1 term is stored inline in the dictionary with no
+/// posting bytes, which would make the posting-work assertion vacuous.
+/// One batch this small commits as a single superfile, so the stride
+/// below gives the needle a df well clear of that.
 const LIKE_ROWS: usize = 512;
 /// Every this-many-th row of the `LIKE` fixture carries the needle.
 const LIKE_NEEDLE_STRIDE: usize = 4;
@@ -955,11 +956,66 @@ fn a_like_predicate_is_answered_from_the_index() {
 }
 
 #[test]
+fn a_like_inside_a_boolean_tree_keeps_its_bound() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir);
+    let needle_rows = (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64;
+
+    // Two fragments: `filler1` names the rows whose filler term starts
+    // with 1 (1, 10..19, 100..199), `nimble` the needle rows. The
+    // expansions must intersect — a union would decode 212 rows, either
+    // token alone 111 or 128.
+    let filler1_rows: u64 = (0..LIKE_ROWS)
+        .filter(|i| i.to_string().starts_with('1'))
+        .count() as u64;
+    let both: u64 = (0..LIKE_ROWS)
+        .filter(|i| i.to_string().starts_with('1') && i % LIKE_NEEDLE_STRIDE == 0)
+        .count() as u64;
+    let stats = scoped_sql_stats(
+        &db,
+        "SELECT title FROM docs WHERE title LIKE '%filler1%nimble%'",
+    );
+    assert!(both < filler1_rows && both < needle_rows);
+    assert_eq!(
+        stats.rows_materialized, both,
+        "the two tokens' expansions intersect"
+    );
+
+    // AND with a scalar conjunct the index cannot bound: the LIKE still
+    // bounds the candidates (every needle row decodes), and the rating
+    // check is verified above the scan.
+    let (batches, and_stats) = with_op_stats(|| {
+        db.query_sql(&format!(
+            "SELECT title FROM docs WHERE title LIKE '%nimble%' AND rating >= {}",
+            LIKE_ROWS / 2
+        ))
+        .expect("query_sql")
+    });
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        LIKE_ROWS / 2 / LIKE_NEEDLE_STRIDE
+    );
+    assert_eq!(and_stats.rows_materialized, needle_rows);
+
+    // OR with an equality: both branches bound, the candidates are their
+    // union (the prefix `nimble%` matches no value but its expansion still
+    // names the needle rows), and one row survives the exact check.
+    let (batches, or_stats) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title LIKE 'nimble%' OR title = 'filler3 rust'")
+            .expect("query_sql")
+    });
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(or_stats.rows_materialized, needle_rows + 1);
+}
+
+#[test]
 fn an_open_edged_like_under_the_default_analyzer_still_scans() {
-    // `ascii_lower` drops any run holding a non-ASCII byte, so a term that
-    // merely contains `rust` may not exist for a row that does — the
-    // index cannot bound `%rust%` there and the column scans instead.
-    // Control for the test above: no posting work, same answer.
+    // Under `ascii_lower` an open-edged token is never required, whatever
+    // the data: the analyzer drops any run holding a non-ASCII byte whole,
+    // so in general a term merely containing `rust` may not exist for a
+    // row that matches. `%rust%` therefore scans here even though this
+    // corpus is pure ASCII. Control for the tests above: no posting work,
+    // same answer.
     let dir = TempDir::new().expect("tempdir");
     let db = sql_fixture(&dir);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%rust%'");

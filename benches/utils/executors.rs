@@ -2646,14 +2646,19 @@ pub mod sql {
     /// family split can never drift apart.
     pub const BULK_RANGE_SCAN: &str = "WHERE rating < N (range scan, returns rows)";
     pub const BULK_TOKEN_MATCH_ALL: &str = "token_match (all rows)";
+    /// A substring `LIKE` the default `ascii_lower` analyzer cannot bound:
+    /// a full column scan whose cost is the scan, not the rows it returns.
+    /// Classified with the bulk shapes so it never averages into the
+    /// point-lookup family the serving cost model prices per row.
+    pub const BULK_LIKE_SCAN: &str = "WHERE title LIKE '%term…%' (substring scan, ascii_lower)";
 
-    /// The one classification of a bulk row-set shape by name. Both the
-    /// warm/cold query table (this module) and the serving-cost family
+    /// The one classification of a bulk / scan-priced shape by name. Both
+    /// the warm/cold query table (this module) and the serving-cost family
     /// split (`supertable.rs`) call this rather than each re-deriving the
-    /// same `name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL` check,
-    /// so the two tables can never classify the same shape differently.
+    /// same name check, so the two tables can never classify the same shape
+    /// differently.
     pub fn is_bulk_shape(name: &str) -> bool {
-        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL
+        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL || name == BULK_LIKE_SCAN
     }
 
     /// Scan-backed aggregates — realistic analytics shapes that provably
@@ -2836,7 +2841,7 @@ pub mod sql {
                 // `term09999` sits at the Zipf tail (the FTS battery's
                 // `single_rare` term), so the result stays small and the
                 // cost is the scan itself.
-                "WHERE title LIKE '%term…%' (substring, ascii_lower ⇒ scan)",
+                BULK_LIKE_SCAN,
                 "SELECT key, rating FROM supertable WHERE title LIKE '%term09999%'".to_string(),
             ),
         ]

@@ -19,11 +19,7 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{
-            builder::TERM_META_SIZE,
-            dict::{DictReader, make_key},
-            fst_value::FstValue,
-        },
+        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue},
     },
 };
 
@@ -324,11 +320,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory FST lookups. Absent and inline

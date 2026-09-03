@@ -5567,9 +5567,13 @@ impl SupertableReader {
     /// them. Tombstoned rows are dropped by the shared `fanout` (a deleted
     /// row must never be a kNN candidate).
     ///
-    /// The caller passes only a bounded plan, so `evaluate` returns
-    /// `Some(bitmap)` per superfile; a defensive `None` (unbounded) is
-    /// treated as the empty set, skipping that superfile.
+    /// The caller passes a plan that is bounded as lowered, but a `LIKE`
+    /// leaf is bound per superfile: a token that widens past the
+    /// dictionary cap in *this* superfile makes `evaluate` return `None`
+    /// there. `None` means the index constrains nothing for that
+    /// superfile, so every one of its rows stays a kNN candidate — the
+    /// `FilterExec` above the TVF re-applies the exact predicate. Treating
+    /// it as the empty set would drop matching rows.
     async fn candidate_bitmaps_from_plan(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -5592,11 +5596,11 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                bitmap.ok_or_else(|| {
-                    QueryError::Execute(
-                        "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
-                    )
-                })
+                Ok(bitmap.unwrap_or_else(|| {
+                    let mut all = RoaringBitmap::new();
+                    all.insert_range(0..r.n_docs() as u32);
+                    all
+                }))
             }
         })
         .await

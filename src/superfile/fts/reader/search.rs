@@ -28,12 +28,11 @@ use crate::{
         op_stats::{metering_active, timed_section},
     },
     superfile::{
-        ReadError,
         error::FtsError,
         format,
         fts::{
             bm25,
-            dict::{DictReader, make_key},
+            dict::make_key,
             fst_value::FstValue,
             posting::{BLOCK_LEN, decode_block},
         },
@@ -836,11 +835,7 @@ impl FtsReader {
         floor_eff: f32,
     ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
         let key = make_key(&col_meta.name, term);
         let Some(packed) = dict.lookup(&key) else {
@@ -1175,11 +1170,7 @@ impl FtsReader {
         qtf: Option<&[u32]>,
     ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // Resolve each term to an inline (df=1) value, a PFOR metadata
