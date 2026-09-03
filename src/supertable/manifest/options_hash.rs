@@ -109,13 +109,13 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
     //     superfiles are tokenized differently, so the options identity
     //     must differ too).
     if opts
-        .fts_tokenizers
+        .fts_columns
         .iter()
-        .any(|t| t.name() != ASCII_LOWER_TOKENIZER)
+        .any(|c| c.analyzer != ASCII_LOWER_TOKENIZER)
     {
         push_tag(&mut buf, b"fts_analyzers");
-        for t in &opts.fts_tokenizers {
-            push_str(&mut buf, t.name());
+        for c in &opts.fts_columns {
+            push_str(&mut buf, &c.analyzer);
         }
     }
     // 3d. stored flags — same only-when-non-default rule: an all-stored
@@ -272,14 +272,12 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
             manifest::{ClusterCentroids, list::PartitionStrategy, part::ContentHash},
             options::SupertableOptions,
         },
-        test_helpers::default_tokenizer,
     };
 
     fn schema_title_only() -> Arc<Schema> {
@@ -300,15 +298,14 @@ mod tests {
     }
 
     fn fts_opts() -> SupertableOptions {
+        fts_opts_analyzer(ASCII_LOWER_TOKENIZER)
+    }
+
+    fn fts_opts_analyzer(analyzer: &str) -> SupertableOptions {
         SupertableOptions::new(
             schema_title_only(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title").analyzer(analyzer)],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts")
     }
@@ -344,13 +341,8 @@ mod tests {
                 DataType::LargeUtf8,
                 false,
             )])),
-            vec![FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("body")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -370,13 +362,8 @@ mod tests {
                 DataType::LargeUtf8,
                 true, // nullable
             )])),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -397,20 +384,8 @@ mod tests {
         ]));
         let opts_b = SupertableOptions::new(
             schema_two,
-            vec![
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                    stored: true,
-                },
-                FtsConfig {
-                    column: "subtitle".into(),
-                    positions: false,
-                    stored: true,
-                },
-            ],
+            vec![FtsConfig::new("title"), FtsConfig::new("subtitle")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -430,38 +405,14 @@ mod tests {
         ]));
         let opts_a = SupertableOptions::new(
             schema_two.clone(),
-            vec![
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                    stored: true,
-                },
-                FtsConfig {
-                    column: "subtitle".into(),
-                    positions: false,
-                    stored: true,
-                },
-            ],
+            vec![FtsConfig::new("title"), FtsConfig::new("subtitle")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let opts_b = SupertableOptions::new(
             schema_two,
-            vec![
-                FtsConfig {
-                    column: "subtitle".into(),
-                    positions: false,
-                    stored: true,
-                },
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                    stored: true,
-                },
-            ],
+            vec![FtsConfig::new("subtitle"), FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -488,19 +439,10 @@ mod tests {
             SupertableOptions::new(
                 schema_two.clone(),
                 vec![
-                    FtsConfig {
-                        column: "title".into(),
-                        positions: title_pos,
-                        stored: true,
-                    },
-                    FtsConfig {
-                        column: "subtitle".into(),
-                        positions: subtitle_pos,
-                        stored: true,
-                    },
+                    FtsConfig::new("title").positions(title_pos),
+                    FtsConfig::new("subtitle").positions(subtitle_pos),
                 ],
                 vec![],
-                Some(default_tokenizer()),
             )
             .expect("opts")
         };
@@ -533,19 +475,14 @@ mod tests {
             SupertableOptions::new(
                 schema_two.clone(),
                 vec![
-                    FtsConfig {
-                        column: "title".into(),
-                        positions: false,
-                        stored: title_stored,
-                    },
-                    FtsConfig {
-                        column: "subtitle".into(),
-                        positions: false,
-                        stored: subtitle_stored,
-                    },
+                    FtsConfig::new("title")
+                        .positions(false)
+                        .stored(title_stored),
+                    FtsConfig::new("subtitle")
+                        .positions(false)
+                        .stored(subtitle_stored),
                 ],
                 vec![],
-                Some(default_tokenizer()),
             )
             .expect("opts")
         };
@@ -576,19 +513,13 @@ mod tests {
 
         // The standard analyzer changes the hash: its superfiles are
         // tokenized differently, so the options identity must differ.
-        let standard = compute_options_hash(
-            &fts_opts().with_fts_tokenizers(vec![Arc::new(StandardTokenizer)]),
-            &strat,
-        );
+        let standard = compute_options_hash(&fts_opts_analyzer("standard"), &strat);
         assert_ne!(ascii.0, standard.0, "analyzer choice must change the hash");
 
         // Explicit ascii_lower equals the default: the analyzer block is
         // emitted only for a non-ascii_lower analyzer, so all-ascii_lower
         // tables keep the pre-analyzer hash (see ALL_FALSE_GOLDEN_HEX).
-        let ascii_explicit = compute_options_hash(
-            &fts_opts().with_fts_tokenizers(vec![Arc::new(AsciiLowerTokenizer)]),
-            &strat,
-        );
+        let ascii_explicit = compute_options_hash(&fts_opts_analyzer("ascii_lower"), &strat);
         assert_eq!(
             ascii.0, ascii_explicit.0,
             "all-ascii_lower hash must be unchanged"
@@ -603,11 +534,7 @@ mod tests {
         let opts_a = fts_opts();
         let opts_b = SupertableOptions::new(
             schema_title_emb(16),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim: 16,
@@ -616,7 +543,6 @@ mod tests {
                 rerank_codec: RerankCodec::default(),
                 provided_centroids: None,
             }],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -642,7 +568,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                Some(default_tokenizer()),
             )
             .expect("opts")
         };
@@ -665,7 +590,6 @@ mod tests {
                     rerank_codec,
                     provided_centroids: None,
                 }],
-                Some(default_tokenizer()),
             )
             .expect("opts")
         };

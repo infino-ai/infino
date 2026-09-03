@@ -26,7 +26,7 @@ use infino::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
     },
-    test_helpers::{decimal128_ids, default_tokenizer},
+    test_helpers::decimal128_ids,
 };
 
 /// Decimal128 precision / scale for the `doc_id` column.
@@ -65,20 +65,8 @@ fn build_test_superfile() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            },
-        ],
+        vec![FtsConfig::new("title"), FtsConfig::new("body")],
         Vec::new(),
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     // Force the spill + streaming-FST finish path. 1024 docs at

@@ -56,7 +56,7 @@ use infino::{
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::LocalFsStorageProvider,
     },
-    test_helpers::{decimal128_id_field, decimal128_ids, default_tokenizer},
+    test_helpers::{decimal128_id_field, decimal128_ids},
 };
 use tempfile::TempDir;
 
@@ -113,19 +113,10 @@ fn options_title_only() -> SupertableOptions {
         DataType::LargeUtf8,
         false,
     )]));
-    SupertableOptions::new(
-        schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    )
-    .expect("valid options")
-    .with_writer_pool(Arc::clone(&pool))
-    .with_reader_pool(pool)
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![])
+        .expect("valid options")
+        .with_writer_pool(Arc::clone(&pool))
+        .with_reader_pool(pool)
 }
 
 /// Commit `seg` gets `docs_per_commit()` docs: every title contains
@@ -229,13 +220,8 @@ fn build_one_superfile() -> SuperfileReader {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let n = docs_per_commit();

@@ -29,9 +29,7 @@ use infino::{
         options::Consistency,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
     },
-    test_helpers::{
-        build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
-    },
+    test_helpers::{build_title_batch, default_supertable_options, default_vector_config},
 };
 use tempfile::TempDir;
 
@@ -70,13 +68,8 @@ fn vector_schema() -> Arc<Schema> {
 fn vector_options() -> SupertableOptions {
     SupertableOptions::new(
         vector_schema(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }

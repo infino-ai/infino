@@ -130,13 +130,8 @@ fn build_infino_superfile_with(corpus: &[(u64, &str)], positions: bool) -> Super
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title").positions(positions)],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let ids = decimal128_ids(corpus.iter().map(|(i, _)| *i));

@@ -574,7 +574,6 @@ mod tests {
             Supertable, SupertableOptions, manifest::ManifestSnapshot,
             query::candidate::LIKE_MAX_TERMS,
         },
-        test_helpers::default_tokenizer as tok,
     };
 
     /// Moves manifest id ranges away from every real generated id.
@@ -590,15 +589,12 @@ mod tests {
     }
 
     fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
-        options_one_superfile_per_commit_with(dim, tok())
+        options_one_superfile_per_commit_with(dim, ASCII_LOWER_TOKENIZER)
     }
 
-    /// [`options_one_superfile_per_commit`] with `title` analyzed by
-    /// `tokenizer`.
-    fn options_one_superfile_per_commit_with(
-        dim: usize,
-        tokenizer: Arc<dyn Tokenizer>,
-    ) -> SupertableOptions {
+    /// [`options_one_superfile_per_commit`] with `title` analyzed by the
+    /// named analyzer.
+    fn options_one_superfile_per_commit_with(dim: usize, analyzer: &str) -> SupertableOptions {
         let pool = Arc::new(
             ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -611,11 +607,7 @@ mod tests {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title").analyzer(analyzer)],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -624,7 +616,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tokenizer),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -673,20 +664,16 @@ mod tests {
         let titles: Vec<String> = (0..n)
             .map(|i| if i < n_common { "common" } else { "rare" }.to_owned())
             .collect();
-        supertable_ranked_by_index(dim, &titles, tok())
+        supertable_ranked_by_index(dim, &titles, ASCII_LOWER_TOKENIZER)
     }
 
     /// Single-superfile table where doc `i` carries `titles[i]` and the
     /// vector `[1, i, 0, …]`, so distance to the query `[1, 0, …]` ranks by
     /// index (see [`supertable_for_pushdown`]). `title` is analyzed with
     /// `tokenizer`. Requires `dim >= 2`.
-    fn supertable_ranked_by_index(
-        dim: usize,
-        titles: &[String],
-        tokenizer: Arc<dyn Tokenizer>,
-    ) -> Supertable {
+    fn supertable_ranked_by_index(dim: usize, titles: &[String], analyzer: &str) -> Supertable {
         let n = titles.len();
-        let st = Supertable::create(options_one_superfile_per_commit_with(dim, tokenizer))
+        let st = Supertable::create(options_one_superfile_per_commit_with(dim, analyzer))
             .expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
@@ -1003,7 +990,7 @@ mod tests {
         .iter()
         .map(|t| (*t).to_owned())
         .collect();
-        let st = supertable_ranked_by_index(dim, &titles, Arc::new(StandardTokenizer));
+        let st = supertable_ranked_by_index(dim, &titles, STANDARD_TOKENIZER);
         let q = csv_one_hot(dim, 0);
         let filtered = st
             .reader()
@@ -1029,7 +1016,7 @@ mod tests {
         let dim = 16;
         let k = 3;
         let titles: Vec<String> = (0..LIKE_MAX_TERMS + 8).map(|i| format!("w{i}zz")).collect();
-        let st = supertable_ranked_by_index(dim, &titles, Arc::new(StandardTokenizer));
+        let st = supertable_ranked_by_index(dim, &titles, STANDARD_TOKENIZER);
         let q = csv_one_hot(dim, 0);
         // Contains: no manifest gate at all.
         let contains = st

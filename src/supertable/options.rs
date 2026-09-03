@@ -66,7 +66,7 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        fts::tokenize::{AsciiLowerTokenizer, Tokenizer, tokenizer_for_name},
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -311,14 +311,6 @@ pub struct SupertableOptions {
     /// `FixedSizeList<Float32, dim>` with matching `list_size`.
     /// May be empty.
     pub vector_columns: Vec<VectorConfig>,
-    /// Default tokenizer, required iff `fts_columns` is non-empty. Used
-    /// as the per-column default when `fts_tokenizers` is not overridden.
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    /// Per-column tokenizers, aligned to `fts_columns` (one per FTS
-    /// column). Defaults in [`Self::new`] to `tokenizer` applied to
-    /// every column; [`Self::with_fts_tokenizers`] sets per-column
-    /// analyzers (per-field analysis).
-    pub fts_tokenizers: Vec<Arc<dyn Tokenizer>>,
     /// Pool used by reader fan-out (skip + per-superfile fan-out +
     /// top-k merge). Default: every logical core.
     pub reader_pool: Arc<ThreadPool>,
@@ -621,7 +613,6 @@ impl SupertableOptions {
         schema: Arc<Schema>,
         fts_columns: Vec<FtsConfig>,
         vector_columns: Vec<VectorConfig>,
-        tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Result<Self, BuildError> {
         let id_column = default_id_column();
 
@@ -711,9 +702,16 @@ impl SupertableOptions {
             }
         }
 
-        // 5. FTS columns require a tokenizer.
-        if !fts_columns.is_empty() && tokenizer.is_none() {
-            return Err(BuildError::MissingTokenizer);
+        // 5. Each FTS column's analyzer name must resolve. Validating
+        //    here surfaces a typo at construction with a typed error,
+        //    instead of at the first commit's builder construction.
+        for fc in &fts_columns {
+            if tokenizer_for_name(&fc.analyzer).is_none() {
+                return Err(BuildError::UnknownAnalyzer {
+                    column: fc.column.clone(),
+                    analyzer: fc.analyzer.clone(),
+                });
+            }
         }
 
         // 6. Shared thread pools + a fresh store.
@@ -721,21 +719,11 @@ impl SupertableOptions {
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
-        // Default per-column tokenizers: the single tokenizer applied to
-        // every FTS column. `with_fts_tokenizers` overrides for per-field
-        // analyzers.
-        let fts_tokenizers = match &tokenizer {
-            Some(t) => fts_columns.iter().map(|_| Arc::clone(t)).collect(),
-            None => Vec::new(),
-        };
-
         Ok(Self {
             schema,
             id_column,
             fts_columns,
             vector_columns,
-            tokenizer,
-            fts_tokenizers,
             reader_pool,
             writer_pool,
             store,
@@ -875,26 +863,18 @@ impl SupertableOptions {
         self
     }
 
-    /// Override the per-column FTS tokenizers (per-field analysis). The
-    /// vec must be aligned to `fts_columns` (one tokenizer per FTS
-    /// column, declaration order). Passing a differently-sized vec is a
-    /// caller bug; the builder indexes each column with its own entry.
-    pub fn with_fts_tokenizers(mut self, tokenizers: Vec<Arc<dyn Tokenizer>>) -> Self {
-        self.fts_tokenizers = tokenizers;
-        self
-    }
-
     /// Tokenizer configured for `column`, or `None` when `column` carries
-    /// no full-text index. `fts_tokenizers` is aligned to `fts_columns` (one
-    /// per column), so a hit on the column always yields its tokenizer — a
-    /// `None` return is exactly the "column is not full-text-indexed" signal,
-    /// which lets a search path reject up front instead of failing deep in
-    /// the scan. The lookup is a single pass over `fts_columns`.
+    /// no full-text index — a `None` return is exactly the "column is not
+    /// full-text-indexed" signal, which lets a search path reject up front
+    /// instead of failing deep in the scan. Resolves the column's analyzer
+    /// name from its `FtsConfig` (validated at construction, so the
+    /// resolution cannot fail for a registered column). The lookup is a
+    /// single pass over `fts_columns`.
     pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
         self.fts_columns
             .iter()
-            .position(|c| c.column == column)
-            .and_then(|i| self.fts_tokenizers.get(i).cloned())
+            .find(|c| c.column == column)
+            .and_then(|c| tokenizer_for_name(&c.analyzer))
     }
 
     /// Tokenizer configured for `column`, for tokenizing query text so
@@ -1276,9 +1256,7 @@ impl SupertableOptions {
             self.id_column.clone(),
             self.fts_columns.clone(),
             self.vector_columns.clone(),
-            self.tokenizer.clone(),
         )
-        .with_fts_tokenizers(self.fts_tokenizers.clone())
         .with_vector_layout(self.vector_layout)
     }
 
@@ -1355,7 +1333,6 @@ impl fmt::Debug for SupertableOptions {
             .field("id_column", &self.id_column)
             .field("n_fts_columns", &self.fts_columns.len())
             .field("n_vector_columns", &self.vector_columns.len())
-            .field("has_tokenizer", &self.tokenizer.is_some())
             .finish()
     }
 }
@@ -1415,19 +1392,13 @@ mod tests {
     }
 
     fn fc(name: &str) -> FtsConfig {
-        FtsConfig {
-            column: name.into(),
-            positions: false,
-            stored: true,
-        }
+        FtsConfig::new(name)
     }
-
-    use crate::test_helpers::default_tokenizer as tok;
 
     #[test]
     fn valid_options_with_fts_and_vector_succeeds() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options should succeed");
         assert_eq!(opts.id_column, "_id");
         assert_eq!(opts.fts_columns.len(), 1);
@@ -1446,16 +1417,16 @@ mod tests {
             Field::new("_id", DataType::UInt64, false),
             Field::new("emb", fixed_list_f32(16), false),
         ]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "_id"));
     }
 
     #[test]
     fn fts_column_missing_from_schema_rejected() {
         let s = schema_with_vector(16);
-        let err = SupertableOptions::new(s, vec![fc("absent")], vec![], Some(tok()))
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![fc("absent")], vec![]).expect_err("expected error");
         assert!(matches!(err, BuildError::FtsColumnMissing { column } if column == "absent"));
     }
 
@@ -1463,8 +1434,7 @@ mod tests {
     fn fts_column_wrong_type_rejected() {
         // `body` is Utf8 not LargeUtf8 — must reject.
         let s = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
-        let err = SupertableOptions::new(s, vec![fc("body")], vec![], Some(tok()))
-            .expect_err("expected error");
+        let err = SupertableOptions::new(s, vec![fc("body")], vec![]).expect_err("expected error");
         assert!(
             matches!(err, BuildError::FtsColumnMustBeLargeUtf8 { column, .. } if column == "body")
         );
@@ -1477,8 +1447,8 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::VectorColumnMissing { column } if column == "emb"));
     }
 
@@ -1490,8 +1460,8 @@ mod tests {
             DataType::Float32,
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorColumnNotFixedSizeList { column, .. } if column == "emb"
@@ -1506,8 +1476,8 @@ mod tests {
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 16),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorColumnNotFixedSizeList { column, .. } if column == "emb"
@@ -1522,8 +1492,8 @@ mod tests {
             fixed_list_f32(8),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorColumnDimMismatch { expected: 16, actual: 8, column } if column == "emb"
@@ -1537,8 +1507,8 @@ mod tests {
             fixed_list_f32(8),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 8)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 8)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorDimOutOfRange { column, dim: 8 } if column == "emb"
@@ -1552,8 +1522,8 @@ mod tests {
             fixed_list_f32(8192),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 8192)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 8192)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorDimOutOfRange { column, dim: 8192 } if column == "emb"
@@ -1568,9 +1538,8 @@ mod tests {
         ]));
         // Duplicate `emb` between two vector_columns entries —
         // hits the cross-list dedup check.
-        let err =
-            SupertableOptions::new(s.clone(), vec![], vec![vc("emb", 16), vc("emb", 16)], None)
-                .expect_err("expected error");
+        let err = SupertableOptions::new(s.clone(), vec![], vec![vc("emb", 16), vc("emb", 16)])
+            .expect_err("expected error");
         assert!(matches!(err, BuildError::DuplicateLogicalName(n) if n == "emb"));
     }
 
@@ -1581,8 +1550,8 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![fc("ti\u{1F}tle")], vec![], Some(tok()))
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![fc("ti\u{1F}tle")], vec![]).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedSeparatorInColumnName(_)));
     }
 
@@ -1593,21 +1562,21 @@ mod tests {
             fixed_list_f32(16),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("inf.emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("inf.emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
     }
 
     #[test]
-    fn fts_columns_without_tokenizer_rejected() {
+    fn fts_column_with_unknown_analyzer_rejected() {
         let s = Arc::new(Schema::new(vec![Field::new(
             "title",
             DataType::LargeUtf8,
             false,
         )]));
-        let err =
-            SupertableOptions::new(s, vec![fc("title")], vec![], None).expect_err("expected error");
-        assert!(matches!(err, BuildError::MissingTokenizer));
+        let err = SupertableOptions::new(s, vec![fc("title").analyzer("nonesuch")], vec![])
+            .expect_err("expected error");
+        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
     }
 
     #[test]
@@ -1619,13 +1588,13 @@ mod tests {
         )]));
         // No FTS, no vectors, no tokenizer — the supertable becomes
         // a thin wrapper over scalar Parquet data. Must succeed.
-        SupertableOptions::new(s, vec![], vec![], None).expect("empty fts + vector should succeed");
+        SupertableOptions::new(s, vec![], vec![]).expect("empty fts + vector should succeed");
     }
 
     #[test]
     fn scalar_schema_drops_vector_columns_and_prepends_id() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let scalar = opts.scalar_schema();
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
@@ -1645,8 +1614,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![], Some(tok()))
-            .expect("valid options");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![]).expect("valid options");
         let scalar = opts.scalar_schema();
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title"]);
@@ -1655,7 +1623,7 @@ mod tests {
     #[test]
     fn effective_schema_prepends_id_keeps_vector_columns() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let eff = opts.effective_schema();
         let names: Vec<_> = eff.fields().iter().map(|f| f.name().as_str()).collect();
@@ -1665,13 +1633,8 @@ mod tests {
     #[test]
     fn user_schema_returns_input_schema_unchanged() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            Arc::clone(&s),
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(Arc::clone(&s), vec![fc("title")], vec![vc("emb", 16)])
+            .expect("valid options");
         let us = opts.user_schema();
         assert_eq!(us.fields().len(), s.fields().len());
         for (a, b) in us.fields().iter().zip(s.fields().iter()) {
@@ -1682,7 +1645,7 @@ mod tests {
     #[test]
     fn with_id_column_overrides_default() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options")
             .with_id_column("row_id")
             .expect("override accepted");
@@ -1695,7 +1658,7 @@ mod tests {
     #[test]
     fn with_id_column_rejects_name_that_collides_with_user_schema() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let err = opts.with_id_column("title").expect_err("collision");
         assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "title"));
@@ -1718,7 +1681,7 @@ supertable:
             Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
 
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options")
             .apply_config(&cfg)
             .expect("apply_config");
@@ -1758,7 +1721,7 @@ supertable:
         let cfg = Config::defaults().expect("embedded default");
 
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options")
             .apply_config(&cfg)
             .expect("apply_config");
@@ -1774,7 +1737,7 @@ supertable:
     #[test]
     fn debug_format_doesnt_explode() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let s = format!("{:?}", opts);
         assert!(s.contains("SupertableOptions"));
@@ -1789,7 +1752,7 @@ supertable:
             DataType::Utf8,
             false,
         )]));
-        SupertableOptions::new(s, vec![], vec![], None).expect("valid options")
+        SupertableOptions::new(s, vec![], vec![]).expect("valid options")
     }
 
     #[test]
@@ -1939,7 +1902,7 @@ supertable:
     #[test]
     fn builder_options_use_scalar_schema_and_id_column() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let bo = opts.builder_options();
         // builder_options carries the scalar-only schema (vectors

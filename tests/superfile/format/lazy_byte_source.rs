@@ -58,7 +58,7 @@ use infino::{
         StorageRangeSource,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
-    test_helpers::{decimal128_ids, default_tokenizer},
+    test_helpers::decimal128_ids,
 };
 use tempfile::TempDir;
 
@@ -78,13 +78,8 @@ fn build_test_bytes() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("builder");
     let ids = decimal128_ids(vec![1u64, 2, 3, 4]);
@@ -143,13 +138,8 @@ fn build_positional_test_bytes() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: true,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title").positions(true)],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("builder");
     let ids = decimal128_ids(vec![1u64, 2, 3, 4]);
@@ -401,13 +391,8 @@ fn build_vec_plus_fts_bytes() -> Bytes {
     let opts = BuilderOptions::new(
         schema,
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", LAZY_VEC_ROT_SEED)],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("builder");
     b.add_batch(&batch, &[flat.as_slice()]).expect("add_batch");

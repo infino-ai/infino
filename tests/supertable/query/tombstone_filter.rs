@@ -414,16 +414,11 @@ async fn vector_query_excludes_tombstoned_row() {
             .build()
             .expect("rayon writer"),
     );
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
+    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
     let opts = SupertableOptions::new(
         schema_with_vec(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("embedding", VECTOR_ROT_SEED)],
-        Some(tk),
     )
     .expect("opts")
     .with_reader_pool(pool)
@@ -601,18 +596,13 @@ async fn vector_query_backfills_across_superfiles_after_deletes() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
+    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
     // Default writer pool — the realistic path that shards the commit.
     let st = Supertable::create(
         SupertableOptions::new(
             schema(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("embedding", VECTOR_ROT_SEED)],
-            Some(tk),
         )
         .expect("opts")
         .with_storage(Arc::clone(&storage)),

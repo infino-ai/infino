@@ -112,7 +112,6 @@ use infino::{
         reader_cache::DiskCacheStore,
         storage::{S3StorageProvider, StorageProvider},
     },
-    test_helpers::default_tokenizer,
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -235,11 +234,7 @@ fn build_superfile_bytes() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         ID_COLUMN,
-        vec![FtsConfig {
-            column: FTS_COLUMN.into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new(FTS_COLUMN)],
         vec![VectorConfig {
             provided_centroids: None,
             column: VEC_COLUMN.into(),
@@ -248,7 +243,6 @@ fn build_superfile_bytes() -> Bytes {
             metric: Metric::Cosine,
             rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
         }],
-        Some(default_tokenizer()),
     );
     let mut builder = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -1865,11 +1859,7 @@ pub(crate) mod diag {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig {
-                column: FTS_COLUMN.into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new(FTS_COLUMN)],
             vec![VectorConfig {
                 provided_centroids: None,
                 column: VEC_COLUMN.into(),
@@ -1878,7 +1868,6 @@ pub(crate) mod diag {
                 metric: Metric::Cosine,
                 rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
             }],
-            Some(default_tokenizer()),
         )
         .expect("real S3 supertable options")
     }

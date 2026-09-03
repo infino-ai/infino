@@ -24,7 +24,7 @@ use infino::{
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
     test_helpers::{
-        build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
+        build_title_batch, default_supertable_options, default_vector_config,
         fault_storage::{FaultKind, FaultOp, FaultStorage},
         schema_id_title,
     },
@@ -79,19 +79,10 @@ fn options_with_pool_width(n_threads: usize) -> SupertableOptions {
             .build()
             .expect("writer pool"),
     );
-    SupertableOptions::new(
-        schema_id_title(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
-        Vec::new(),
-        Some(default_tokenizer()),
-    )
-    .expect("valid options")
-    .with_writer_pool(pool)
-    .with_superfile_buffer_split_mb(WIDTH_TEST_SPLIT_MB)
+    SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], Vec::new())
+        .expect("valid options")
+        .with_writer_pool(pool)
+        .with_superfile_buffer_split_mb(WIDTH_TEST_SPLIT_MB)
 }
 
 /// The width-test corpus: same titles every call, so every width builds
@@ -270,13 +261,8 @@ fn a_vector_append_pins_exact_payload_bytes() {
     ]));
     let options = SupertableOptions::new(
         Arc::clone(&schema),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options");
 
@@ -502,13 +488,8 @@ fn the_fts_leg_is_a_strict_subset_when_a_column_is_unindexed() {
 
     let options = SupertableOptions::new(
         Arc::clone(&schema),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         Vec::new(),
-        Some(default_tokenizer()),
     )
     .expect("valid options");
     let st = Supertable::create(options).expect("create");

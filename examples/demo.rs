@@ -30,9 +30,7 @@ use infino::{
         vector::distance::{Metric, normalize},
     },
     supertable::Supertable,
-    test_helpers::{
-        build_title_batch, decimal128_ids, default_supertable_options, default_tokenizer,
-    },
+    test_helpers::{build_title_batch, decimal128_ids, default_supertable_options},
 };
 use tempfile::NamedTempFile;
 
@@ -81,18 +79,13 @@ fn demo_superfile() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![VectorConfig::new(
             "emb".into(),
             EMB_DIM,
             DEMO_ROT_SEED,
             Metric::Cosine,
         )],
-        Some(default_tokenizer()),
     );
 
     let mut builder = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");

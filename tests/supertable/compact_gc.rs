@@ -37,9 +37,7 @@ use infino::{
             },
         },
     },
-    test_helpers::{
-        build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
-    },
+    test_helpers::{build_title_batch, default_supertable_options, default_vector_config},
 };
 use tempfile::TempDir;
 
@@ -509,17 +507,8 @@ fn hidden_vector_options() -> SupertableOptions {
     // production path writes.
     let mut vector_config = default_vector_config("emb", HIDDEN_ROT_SEED);
     vector_config.rerank_codec = RerankCodec::default();
-    SupertableOptions::new(
-        schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
-        vec![vector_config],
-        Some(default_tokenizer()),
-    )
-    .expect("valid options")
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![vector_config])
+        .expect("valid options")
 }
 
 /// One-hot rows: doc `i` points at dim `i`, so every round lands in the same

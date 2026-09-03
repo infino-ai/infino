@@ -175,17 +175,15 @@ impl IndexSpec {
 
     /// Lower to the internal `(FtsConfig, VectorConfig)` lists the
     /// supertable options take. `rot_seed` / `rerank_codec` are not part
-    /// of the public spec — defaults are applied here. The analyzer
-    /// choice rides on the options' shared tokenizer (resolved by
-    /// `table_tokenizer`), not on `FtsConfig`.
+    /// of the public spec — defaults are applied here.
     pub(crate) fn to_configs(&self) -> (Vec<FtsConfig>, Vec<VectorConfig>) {
         let fts = self
             .fts
             .iter()
-            .map(|f| FtsConfig {
-                column: f.column.clone(),
-                positions: false,
-                stored: f.stored,
+            .map(|f| {
+                FtsConfig::new(f.column.clone())
+                    .analyzer(f.analyzer.clone())
+                    .stored(f.stored)
             })
             .collect();
         let vectors = self

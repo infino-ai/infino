@@ -33,6 +33,12 @@ pub enum BuildError {
     #[error("duplicate column name {0:?}")]
     DuplicateColumnName(String),
 
+    #[error(
+        "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
+         \"ascii_lower\", \"standard\")"
+    )]
+    UnknownAnalyzer { column: String, analyzer: String },
+
     #[error("logical name {0:?} duplicated across fts_columns and vector_columns")]
     DuplicateLogicalName(String),
 

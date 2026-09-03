@@ -44,7 +44,7 @@ fn options_cat_rating() -> SupertableOptions {
         Field::new("category", DataType::LargeUtf8, false),
         Field::new("rating", DataType::Int64, false),
     ]));
-    SupertableOptions::new(schema, vec![], vec![], None).expect("valid options")
+    SupertableOptions::new(schema, vec![], vec![]).expect("valid options")
 }
 
 /// Commit `idx`: ratings `idx*1000 .. idx*1000 + ROWS_PER_COMMIT`.
@@ -534,7 +534,7 @@ fn narrow_numeric_avg_survives_the_peeled_cast() {
         false,
     )]));
     let options =
-        SupertableOptions::new(Arc::clone(&schema), vec![], vec![], None).expect("valid options");
+        SupertableOptions::new(Arc::clone(&schema), vec![], vec![]).expect("valid options");
     let st = Supertable::create(options).expect("create");
     let mut w = st.writer().expect("writer");
     for idx in 0..COMMITS {

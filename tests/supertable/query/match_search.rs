@@ -37,7 +37,7 @@ use infino::{
             vector::{VectorFilter, VectorSearchOptions},
         },
     },
-    test_helpers::{default_tokenizer, default_vector_config},
+    test_helpers::default_vector_config,
 };
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
@@ -104,13 +104,8 @@ fn options_title_emb() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
     .with_writer_pool(writer_pool)

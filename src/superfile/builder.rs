@@ -97,7 +97,7 @@ use crate::superfile::{
     },
     fts::{
         builder::FtsBuilder,
-        tokenize::{AsciiLowerTokenizer, Tokenizer},
+        tokenize::{ASCII_LOWER_TOKENIZER, AsciiLowerTokenizer, tokenizer_for_name},
     },
     stats::SuperfileStats,
     vector::{
@@ -119,10 +119,21 @@ use crate::superfile::{
 };
 
 /// Per-column FTS configuration. The `column` must exist in
-/// `BuilderOptions.schema` and be `LargeUtf8`.
-#[derive(Clone)]
+/// `BuilderOptions.schema` and be `LargeUtf8` (an unstored column may
+/// be absent — the merge-source shape).
+///
+/// Built with [`FtsConfig::new`] plus the chained setters; this is the
+/// single in-memory record of a column's FTS options, mirroring the
+/// per-column entry persisted in the `inf.fts.columns` KV metadata.
+#[derive(Debug, Clone)]
 pub struct FtsConfig {
     pub column: String,
+    /// Analyzer (tokenizer) name applied to this column —
+    /// `"ascii_lower"` (the default) or `"standard"`. Resolved to a
+    /// tokenizer instance once, at builder construction; an unknown
+    /// name is a build error. Per column: each FTS column is tokenized
+    /// with its own analyzer, so columns in one table may differ.
+    pub analyzer: String,
     /// Record token positions for this column, enabling exact phrase
     /// queries against it. Off by default: positions roughly double
     /// the column's FTS index footprint, so the cost is a per-column
@@ -142,6 +153,37 @@ pub struct FtsConfig {
     /// existing superfile the column is legitimately absent from the
     /// stored schema and its postings are carried across instead.
     pub stored: bool,
+}
+
+impl FtsConfig {
+    /// Configuration with the defaults: `ascii_lower` analyzer, no
+    /// positions, text stored.
+    pub fn new(column: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            analyzer: ASCII_LOWER_TOKENIZER.to_string(),
+            positions: false,
+            stored: true,
+        }
+    }
+
+    /// Set the analyzer name (see the field docs).
+    pub fn analyzer(mut self, name: impl Into<String>) -> Self {
+        self.analyzer = name.into();
+        self
+    }
+
+    /// Record token positions (see the field docs).
+    pub fn positions(mut self, positions: bool) -> Self {
+        self.positions = positions;
+        self
+    }
+
+    /// Keep the raw text in the Parquet body (see the field docs).
+    pub fn stored(mut self, stored: bool) -> Self {
+        self.stored = stored;
+        self
+    }
 }
 
 // `VectorConfig` (the per-column vector config used by
@@ -218,13 +260,6 @@ pub struct BuilderOptions {
     /// fuses results from `bm25_search(text_col, ...)` and
     /// `vector_search(emb_col, ...)`.
     pub vector_columns: Vec<VectorConfig>,
-    /// Default tokenizer, required iff `fts_columns` is non-empty. Seeds
-    /// the per-column default for `fts_tokenizers`.
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    /// Per-column tokenizers, aligned to `fts_columns`. Defaults in
-    /// [`Self::new`] to `tokenizer` applied to every column;
-    /// [`Self::with_fts_tokenizers`] overrides for per-field analysis.
-    pub fts_tokenizers: Vec<Arc<dyn Tokenizer>>,
     /// Parquet target row-group size (number of rows).
     pub row_group_size: usize,
     /// Parquet column-chunk compression.
@@ -307,22 +342,12 @@ impl BuilderOptions {
         id_column: impl Into<String>,
         fts_columns: Vec<FtsConfig>,
         vector_columns: Vec<VectorConfig>,
-        tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Self {
-        // Default per-column tokenizers: the single tokenizer applied to
-        // every FTS column (`with_fts_tokenizers` overrides for per-field
-        // analyzers).
-        let fts_tokenizers = match &tokenizer {
-            Some(t) => fts_columns.iter().map(|_| Arc::clone(t)).collect(),
-            None => Vec::new(),
-        };
         Self {
             schema,
             id_column: id_column.into(),
             fts_columns,
             vector_columns,
-            tokenizer,
-            fts_tokenizers,
             row_group_size: 65_536,
             compression: Compression::ZSTD(
                 ZstdLevel::try_new(3).expect("zstd level 3 is in the valid 1..=22 range"),
@@ -334,14 +359,6 @@ impl BuilderOptions {
 
     pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
         self.vector_layout = layout;
-        self
-    }
-
-    /// Override the per-column FTS tokenizers (per-field analysis). Must
-    /// be aligned to `fts_columns` (one per FTS column, declaration
-    /// order).
-    pub(crate) fn with_fts_tokenizers(mut self, tokenizers: Vec<Arc<dyn Tokenizer>>) -> Self {
-        self.fts_tokenizers = tokenizers;
         self
     }
 
@@ -360,33 +377,21 @@ impl BuilderOptions {
     }
 
     pub fn new_from_reader(reader: &SuperfileReader) -> Self {
-        // Recover each FTS column's tokenizer from the source reader so a
-        // rebuild (compaction) re-indexes with the same analyzer it was
-        // built with, instead of defaulting to ASCII.
-        let (fts_columns, fts_tokenizers): (Vec<FtsConfig>, Vec<Arc<dyn Tokenizer>>) =
-            if let Some(fts) = &reader.fts() {
-                fts.fts_columns_config()
-                    .map(|c| {
-                        (
-                            FtsConfig {
-                                column: c.name.clone(),
-                                positions: c.positions,
-                                stored: c.stored,
-                            },
-                            Arc::clone(&c.tokenizer),
-                        )
-                    })
-                    .unzip()
-            } else {
-                (Vec::new(), Vec::new())
-            };
-        // Seed the single-tokenizer field with the first column's analyzer
-        // (ASCII default when there are no FTS columns); `fts_tokenizers`
-        // is authoritative for per-column indexing.
-        let tokenizer: Arc<dyn Tokenizer> = fts_tokenizers
-            .first()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        // Recover each FTS column's analyzer from the source reader so a
+        // rebuild carries the analyzer it was built with, instead of
+        // defaulting to ASCII.
+        let fts_columns: Vec<FtsConfig> = if let Some(fts) = &reader.fts() {
+            fts.fts_columns_config()
+                .map(|c| {
+                    FtsConfig::new(c.name.clone())
+                        .analyzer(c.tokenizer.name())
+                        .positions(c.positions)
+                        .stored(c.stored)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let (vector_columns, vector_layout) = if let Some(vec) = &reader.vec() {
             if vec.is_multi_cell() {
@@ -422,9 +427,7 @@ impl BuilderOptions {
             reader.id_column(),
             fts_columns,
             vector_columns,
-            Some(tokenizer),
         )
-        .with_fts_tokenizers(fts_tokenizers)
         .with_vector_layout(vector_layout)
     }
 
@@ -642,37 +645,25 @@ impl SuperfileBuilder {
             }
         }
 
-        // 4. FTS requires a tokenizer.
-        if !opts.fts_columns.is_empty() && opts.tokenizer.is_none() {
-            return Err(BuildError::FtsColumnTypeInvalid {
-                column: opts.fts_columns[0].column.clone(),
-                actual: "missing tokenizer in BuilderOptions".to_string(),
-            });
-        }
-
-        // 5. Wire up the unified FTS + vector sub-builders.
+        // 4 + 5. Resolve each FTS column's analyzer name and wire up the
+        //        unified FTS + vector sub-builders. Resolution happens
+        //        once, here — `FtsConfig` carries the name (the same
+        //        record `inf.fts.columns` persists) and an unknown name
+        //        is a build error.
         let fts_builder = if opts.fts_columns.is_empty() {
             None
         } else {
-            let tk = opts
-                .tokenizer
-                .as_ref()
-                .expect("validated non-empty FTS implies Some tokenizer")
-                .clone();
-            debug_assert_eq!(
-                opts.fts_columns.len(),
-                opts.fts_tokenizers.len(),
-                "fts_tokenizers must align 1:1 with fts_columns"
-            );
-            let mut fb = FtsBuilder::new(tk);
-            // Register each column with its own analyzer (per-field
-            // analysis). `fts_tokenizers` is aligned to `fts_columns`.
-            for (fc, tok) in opts.fts_columns.iter().zip(&opts.fts_tokenizers) {
-                fb.register_column_with_tokenizer(
-                    fc.column.clone(),
-                    fc.positions,
-                    Arc::clone(tok),
-                )?;
+            // The constructor's default tokenizer is irrelevant: every
+            // column below registers its own analyzer explicitly.
+            let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            for fc in &opts.fts_columns {
+                let tok = tokenizer_for_name(&fc.analyzer).ok_or_else(|| {
+                    BuildError::UnknownAnalyzer {
+                        column: fc.column.clone(),
+                        analyzer: fc.analyzer.clone(),
+                    }
+                })?;
+                fb.register_column_with_tokenizer(fc.column.clone(), fc.positions, tok)?;
             }
             Some(fb)
         };
@@ -1964,7 +1955,7 @@ fn superfile_kvs(
         // `fts_tokenizers` is aligned 1:1 with `fts_columns`.
         kvs.push((
             kv::FTS_COLUMNS.into(),
-            fts_columns_json(&options.fts_columns, &options.fts_tokenizers),
+            fts_columns_json(&options.fts_columns),
         ));
     }
     if !options.vector_columns.is_empty() {
@@ -2228,10 +2219,10 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 /// Output shape per column:
 /// `{"name":"<escaped>","tokenizer":"<name>"}`.
 /// `tokenizer` is that column's analyzer name (`"ascii_lower"` or
-/// `"standard"`), taken from `tokenizers[i]` — the reader reconstructs
-/// the matching tokenizer from it for query-time tokenization.
-/// `tokenizers` is aligned 1:1 with `cols`.
-fn fts_columns_json(cols: &[FtsConfig], tokenizers: &[Arc<dyn Tokenizer>]) -> String {
+/// `"standard"`), straight from `FtsConfig.analyzer` — the reader
+/// reconstructs the matching tokenizer from it for query-time
+/// tokenization.
+fn fts_columns_json(cols: &[FtsConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
@@ -2240,7 +2231,7 @@ fn fts_columns_json(cols: &[FtsConfig], tokenizers: &[Arc<dyn Tokenizer>]) -> St
         s.push_str(r#"{"name":""#);
         s.push_str(&escape_json(&c.column));
         s.push_str(r#"","tokenizer":""#);
-        s.push_str(&escape_json(tokenizers[i].name()));
+        s.push_str(&escape_json(&c.analyzer));
         s.push('"');
         // Emitted only when set: a positionless column's JSON stays
         // byte-identical to files written before positions existed
@@ -2343,7 +2334,7 @@ mod tests {
             fts::reader::BoolMode,
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
-        test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+        test_helpers::{decimal128_ids, default_vector_config},
     };
 
     fn schema_with_fts() -> Arc<Schema> {
@@ -2358,13 +2349,8 @@ mod tests {
         BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         )
     }
 
@@ -2418,17 +2404,7 @@ mod tests {
                 Field::new("doc_id", ty.clone(), false),
                 Field::new("title", DataType::LargeUtf8, false),
             ]));
-            let opts = BuilderOptions::new(
-                schema,
-                "doc_id",
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                    stored: true,
-                }],
-                vec![],
-                Some(default_tokenizer()),
-            );
+            let opts = BuilderOptions::new(schema, "doc_id", vec![FtsConfig::new("title")], vec![]);
             let err =
                 SuperfileBuilder::new(opts).expect_err(&format!("expected rejection for {ty:?}"));
             assert!(
@@ -2443,13 +2419,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "nope".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("nope")],
             vec![],
-            Some(default_tokenizer()),
         );
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
         assert!(matches!(err, BuildError::FtsColumnMissing(_)));
@@ -2461,17 +2432,7 @@ mod tests {
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::Utf8, false),
         ]));
-        let opts = BuilderOptions::new(
-            schema,
-            "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
-            vec![],
-            Some(default_tokenizer()),
-        );
+        let opts = BuilderOptions::new(schema, "doc_id", vec![FtsConfig::new("title")], vec![]);
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
         assert!(matches!(err, BuildError::FtsColumnMustBeLargeUtf8 { .. }));
     }
@@ -2481,13 +2442,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("title", 1)],
-            Some(default_tokenizer()),
         );
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
         assert!(matches!(err, BuildError::DuplicateLogicalName(_)));
@@ -2500,7 +2456,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("body", 1)], // same name as a schema column
-            None,
         );
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
         assert!(matches!(err, BuildError::DuplicateLogicalName(_)));
@@ -2513,27 +2468,21 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("inf.bad", 1)],
-            None,
         );
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
     }
 
     #[test]
-    fn new_with_fts_requires_tokenizer() {
+    fn new_rejects_unknown_analyzer() {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title").analyzer("nonesuch")],
             vec![],
-            None,
         );
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
-        assert!(matches!(err, BuildError::FtsColumnTypeInvalid { .. }));
+        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
     }
 
     fn batch_two_rows(schema: &Arc<Schema>) -> RecordBatch {
@@ -2582,7 +2531,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 1)],
-            None,
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -2598,7 +2546,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 1)],
-            None,
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -2617,7 +2564,7 @@ mod tests {
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let ids = decimal128_ids(vec![1u64, 2, 3]);
         let titles = LargeStringArray::from(vec!["a", "b", "c"]);
@@ -2657,7 +2604,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 7)],
-            None,
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -2678,21 +2624,8 @@ mod tests {
 
     #[test]
     fn fts_columns_json_round_trip_shape() {
-        let cols = vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            },
-        ];
-        let toks: Vec<Arc<dyn Tokenizer>> =
-            vec![Arc::new(AsciiLowerTokenizer), Arc::new(AsciiLowerTokenizer)];
-        let s = fts_columns_json(&cols, &toks);
+        let cols = vec![FtsConfig::new("title"), FtsConfig::new("body")];
+        let s = fts_columns_json(&cols);
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
@@ -2709,20 +2642,10 @@ mod tests {
     #[test]
     fn fts_columns_json_positions_emitted_only_when_true() {
         let cols = vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: true,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            },
+            FtsConfig::new("title").positions(true),
+            FtsConfig::new("body"),
         ];
-        let toks: Vec<Arc<dyn Tokenizer>> =
-            vec![Arc::new(AsciiLowerTokenizer), Arc::new(AsciiLowerTokenizer)];
-        let s = fts_columns_json(&cols, &toks);
+        let s = fts_columns_json(&cols);
         assert!(
             s.contains(r#"{"name":"title","tokenizer":"ascii_lower","positions":true}"#),
             "positional column carries the flag: {s}"
@@ -2736,22 +2659,11 @@ mod tests {
     /// Per-column analyzers: each column records its own tokenizer name.
     #[test]
     fn fts_columns_json_per_column_analyzers() {
-        use crate::superfile::fts::tokenize::StandardTokenizer;
         let cols = vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            },
+            FtsConfig::new("title").analyzer("standard"),
+            FtsConfig::new("body"),
         ];
-        let toks: Vec<Arc<dyn Tokenizer>> =
-            vec![Arc::new(StandardTokenizer), Arc::new(AsciiLowerTokenizer)];
-        let s = fts_columns_json(&cols, &toks);
+        let s = fts_columns_json(&cols);
         assert!(
             s.contains(r#"{"name":"title","tokenizer":"standard"}"#),
             "title uses the standard analyzer: {s}"
@@ -2767,20 +2679,10 @@ mod tests {
     #[test]
     fn fts_columns_json_stored_emitted_only_when_false() {
         let cols = vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: false,
-            },
+            FtsConfig::new("title"),
+            FtsConfig::new("body").stored(false),
         ];
-        let toks: Vec<Arc<dyn Tokenizer>> =
-            vec![Arc::new(AsciiLowerTokenizer), Arc::new(AsciiLowerTokenizer)];
-        let s = fts_columns_json(&cols, &toks);
+        let s = fts_columns_json(&cols);
         assert!(
             s.contains(r#"{"name":"title","tokenizer":"ascii_lower"}"#),
             "stored column stays in the legacy shape: {s}"
@@ -2799,19 +2701,10 @@ mod tests {
             schema_with_fts(),
             "doc_id",
             vec![
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                    stored: true,
-                },
-                FtsConfig {
-                    column: "body".into(),
-                    positions: false,
-                    stored: false,
-                },
+                FtsConfig::new("title"),
+                FtsConfig::new("body").stored(false),
             ],
             vec![],
-            Some(default_tokenizer()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -3047,13 +2940,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema,
             "doc_id",
-            vec![FtsConfig {
-                column: "body".into(),
-                positions: true,
-                stored: !unstored,
-            }],
+            vec![FtsConfig::new("body").positions(true).stored(!unstored)],
             vec![vec_cfg],
-            Some(default_tokenizer()),
         )
         .with_vector_layout(VectorLayout::MultiCellIvf);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
@@ -3100,13 +2988,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("emb", 7)],
-            Some(default_tokenizer()),
         );
         let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
         let schema = b1.opts.schema.clone();
@@ -3224,13 +3107,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
         let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
         let schema = b1.opts.schema.clone();
@@ -3277,7 +3155,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 7)],
-            None,
         );
         let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
         let schema = b1.opts.schema.clone();
@@ -3332,13 +3209,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
         let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
         let schema = b1.opts.schema.clone();
@@ -3385,13 +3257,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("emb", 7)],
-            Some(default_tokenizer()),
         );
 
         // Create first superfile
@@ -3486,7 +3353,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 7)],
-            None,
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -3546,7 +3412,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            None,
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -3569,13 +3434,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("emb", 7)],
-            Some(default_tokenizer()),
         );
 
         // Create original superfile
@@ -3658,13 +3518,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -3705,13 +3560,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
 
         // Create first superfile
@@ -3771,13 +3621,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
         let schema = opts.schema.clone();
 
@@ -3901,13 +3746,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title").positions(positions)],
             vec![],
-            Some(default_tokenizer()),
         );
         let schema = opts.schema.clone();
 
@@ -4018,13 +3858,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("emb", 7)],
-            Some(default_tokenizer()),
         );
 
         // Create superfile with both FTS and vectors
@@ -4073,13 +3908,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
         let schema = opts.schema.clone();
 
@@ -4145,13 +3975,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
 
         // Create superfile with FTS
@@ -4201,13 +4026,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
 
         let mut readers = Vec::with_capacity(NUM_FILES);
@@ -4256,13 +4076,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
 
         // Create three superfiles
@@ -4318,7 +4133,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 7)],
-            None,
         );
 
         // Create first superfile with only vectors (no FTS)
@@ -4398,13 +4212,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
 
         // Create first superfile with 2 rows (indices 0, 1)
@@ -4471,13 +4280,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -4553,13 +4357,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
 
         // Create first superfile with ids 10, 11, titles ["hello world", "rust async"]
@@ -4651,13 +4450,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
 
         // Create superfile with specific string values to validate min/max ordering
@@ -4734,7 +4528,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq8Residual)],
-            None,
         );
         let mut b1 = SuperfileBuilder::new(sq8_opts.clone()).expect("new SuperfileBuilder");
         let schema = b1.opts.schema.clone();
@@ -4806,33 +4599,16 @@ mod tests {
             Field::new("rating", DataType::Int64, false),
         ]));
         let fts = vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "bucket".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "key".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "category".into(),
-                positions: false,
-                stored: true,
-            },
+            FtsConfig::new("title"),
+            FtsConfig::new("bucket"),
+            FtsConfig::new("key"),
+            FtsConfig::new("category"),
         ];
         let sq8_opts = BuilderOptions::new(
             schema.clone(),
             "doc_id",
             fts,
             vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq8Residual)],
-            Some(default_tokenizer()),
         );
 
         let make_file = |id0: u64, title: &str| {
@@ -4906,23 +4682,14 @@ mod tests {
             Field::new("body", DataType::LargeUtf8, false),
         ]));
         let fts = vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: false,
-            },
+            FtsConfig::new("title"),
+            FtsConfig::new("body").stored(false),
         ];
         let sq8_opts = BuilderOptions::new(
             schema.clone(),
             "doc_id",
             fts,
             vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq8Residual)],
-            Some(default_tokenizer()),
         );
         let make_file = |id0: u64, body: &str| {
             let mut b = SuperfileBuilder::new(sq8_opts.clone()).expect("new SuperfileBuilder");
@@ -4979,7 +4746,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 7)], // Fp32 is the default_vector_config codec
-            None,
         );
         let mut b = SuperfileBuilder::new(fp32_opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
@@ -5132,7 +4898,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
                 .expect("batch");
-        let opts = BuilderOptions::new(schema, "doc_id", vec![], vec![make_cfg()], None)
+        let opts = BuilderOptions::new(schema, "doc_id", vec![], vec![make_cfg()])
             .with_vector_layout(VectorLayout::MultiCellIvf);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         b.add_batch_ids_only(&batch).expect("ids");

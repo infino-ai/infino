@@ -44,9 +44,7 @@ use infino::{
         Supertable, SupertableOptions,
         storage::{LocalFsStorageProvider, StorageProvider},
     },
-    test_helpers::{
-        build_title_batch, default_disk_cache, default_supertable_options, default_tokenizer,
-    },
+    test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
 };
 use rayon::ThreadPoolBuilder;
 
@@ -585,18 +583,9 @@ fn tag_options() -> SupertableOptions {
             .build()
             .expect("rayon pool"),
     );
-    SupertableOptions::new(
-        tag_schema(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    )
-    .expect("tag options")
-    .with_writer_pool(pool)
+    SupertableOptions::new(tag_schema(), vec![FtsConfig::new("title")], vec![])
+        .expect("tag options")
+        .with_writer_pool(pool)
 }
 
 fn tag_batch(titles: &[&str], tags: &[Option<&str>]) -> RecordBatch {

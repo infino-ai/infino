@@ -574,7 +574,6 @@ mod tests {
             error::QueryError,
             query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
-        test_helpers::default_tokenizer as tok,
     };
 
     /// One more than the manifest's exact-value cardinality cap.
@@ -741,11 +740,11 @@ mod tests {
     }
 
     fn options_id_cat_title() -> SupertableOptions {
-        options_id_cat_title_with(tok())
+        options_id_cat_title_with(ASCII_LOWER_TOKENIZER)
     }
 
-    /// [`options_id_cat_title`] with `title` analyzed by `tokenizer`.
-    fn options_id_cat_title_with(tokenizer: Arc<dyn Tokenizer>) -> SupertableOptions {
+    /// [`options_id_cat_title`] with `title` analyzed by the named analyzer.
+    fn options_id_cat_title_with(analyzer: &str) -> SupertableOptions {
         // Single-threaded writer pool so each commit produces
         // exactly one superfile — keeps assertions on per-superfile
         // counts deterministic.
@@ -757,13 +756,8 @@ mod tests {
         );
         SupertableOptions::new(
             schema_id_cat_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title").analyzer(analyzer)],
             vec![],
-            Some(tokenizer),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -827,7 +821,7 @@ mod tests {
                 .build()
                 .expect("rayon pool"),
         );
-        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![])
             .expect("rating options")
             .with_writer_pool(pool);
         let table = Supertable::create(options).expect("create rating table");
@@ -1365,18 +1359,10 @@ mod tests {
                 .build()
                 .expect("rayon pool"),
         );
-        let opts = SupertableOptions::new(
-            Arc::clone(&schema),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool);
+        let opts =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
+                .expect("valid options")
+                .with_writer_pool(pool);
 
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
@@ -1419,18 +1405,10 @@ mod tests {
                 .build()
                 .expect("rayon pool"),
         );
-        let opts = SupertableOptions::new(
-            Arc::clone(&schema),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool);
+        let opts =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
+                .expect("valid options")
+                .with_writer_pool(pool);
 
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
@@ -1619,7 +1597,7 @@ mod tests {
             DataType::LargeUtf8,
             true,
         )]));
-        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![])
             .expect("nullable category options");
         let table = Supertable::create(options).expect("create");
         let mut writer = table.writer().expect("writer");
@@ -1840,10 +1818,9 @@ mod tests {
         // FilterExec narrows. Whatever the plan, the rows must be exactly
         // the textbook LIKE matches — checked against an independent
         // oracle for every pattern under both analyzers.
-        let analyzers: [Arc<dyn Tokenizer>; 2] = [tok(), Arc::new(StandardTokenizer)];
-        for tokenizer in analyzers {
-            let name = tokenizer.name();
-            let st = Supertable::create(options_id_cat_title_with(tokenizer)).expect("create");
+        let analyzers = [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER];
+        for name in analyzers {
+            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
             let mut w = st.writer().expect("writer");
             let titles = with_walk_filler(LIKE_TITLES);
             let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
@@ -1880,9 +1857,8 @@ mod tests {
         // case folding matches against `s` and `k` — the index-bounded
         // plan must return exactly that, under both analyzers.
         let rt = Runtime::new().expect("runtime");
-        let analyzers: [Arc<dyn Tokenizer>; 2] = [tok(), Arc::new(StandardTokenizer)];
-        for tokenizer in analyzers {
-            let name = tokenizer.name();
+        let analyzers = [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER];
+        for name in analyzers {
             let titles = with_walk_filler(FOLD_TITLES);
             let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
             let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
@@ -1895,7 +1871,7 @@ mod tests {
             // Two superfiles: the second holds only rows whose every
             // spelling an ASCII token misses, so an unsound term-bloom or
             // term-range leaf would prune it whole and lose its rows.
-            let st = Supertable::create(options_id_cat_title_with(tokenizer)).expect("create");
+            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
@@ -2012,7 +1988,7 @@ mod tests {
     /// narrow one with two such terms (plus the filler rows that let it
     /// walk its dictionary).
     fn mixed_like_table() -> Supertable {
-        let st = Supertable::create(options_id_cat_title_with(Arc::new(StandardTokenizer)))
+        let st = Supertable::create(options_id_cat_title_with(STANDARD_TOKENIZER))
             .expect("create");
         let mut w = st.writer().expect("writer");
         let filler = WALK_FILLER_WORDS.join(" ");
@@ -2309,11 +2285,7 @@ mod tests {
         );
         SupertableOptions::new(
             schema_with_vector(dim),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -2322,7 +2294,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)

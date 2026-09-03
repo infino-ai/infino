@@ -29,7 +29,7 @@ use infino::{
         fts::reader::{Bm25Stats, BoolMode},
     },
     supertable::{Supertable, SupertableOptions},
-    test_helpers::{default_tokenizer, default_vector_config, lazy_foreground_disk_cache},
+    test_helpers::{default_vector_config, lazy_foreground_disk_cache},
 };
 use tempfile::TempDir;
 
@@ -64,13 +64,8 @@ fn cold_options() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }

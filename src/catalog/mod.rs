@@ -64,7 +64,7 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
-        fts::tokenize::{ASCII_LOWER_TOKENIZER, Tokenizer, tokenizer_for_name},
+        fts::tokenize::ASCII_LOWER_TOKENIZER,
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
@@ -347,8 +347,6 @@ impl Connection {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         validate_schema(&schema).map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
-        let tokenizers =
-            table_tokenizers(&indexes).map_err(|e| e.with_context("create_table", Some(name)))?;
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -356,7 +354,6 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizers,
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -434,7 +431,6 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizers,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -564,8 +560,6 @@ impl Connection {
                     );
                 }
                 let (fts_cfg, vec_cfg) = spec.to_configs();
-                let tokenizers = table_tokenizers(&spec)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
 
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&entry.location),
@@ -584,7 +578,6 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizers,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -970,16 +963,10 @@ fn build_options(
     schema: SchemaRef,
     fts: Vec<FtsConfig>,
     vectors: Vec<VectorConfig>,
-    tokenizers: Vec<Arc<dyn Tokenizer>>,
     storage: Option<Arc<dyn StorageProvider>>,
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
-    // Seed the default tokenizer with the first column's analyzer (None
-    // when there are no FTS columns), then set the authoritative
-    // per-column tokenizers for per-field analysis.
-    let seed = tokenizers.first().cloned();
-    let mut opts =
-        SupertableOptions::new(schema, fts, vectors, seed)?.with_fts_tokenizers(tokenizers);
+    let mut opts = SupertableOptions::new(schema, fts, vectors)?;
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -995,20 +982,6 @@ fn sql_exec_error(e: DataFusionError) -> InfinoError {
         DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
         other => InfinoError::Query(other.to_string()),
     }
-}
-
-/// Resolve each FTS column's analyzer name to a tokenizer instance,
-/// in declaration order (per-field analysis). Empty when there are no
-/// FTS columns. An unknown analyzer name is a configuration error.
-fn table_tokenizers(indexes: &IndexSpec) -> Result<Vec<Arc<dyn Tokenizer>>, InfinoError> {
-    indexes
-        .fts_analyzers()
-        .iter()
-        .map(|name| {
-            tokenizer_for_name(name)
-                .ok_or_else(|| InfinoError::Config(format!("unknown FTS analyzer: {name:?}")))
-        })
-        .collect()
 }
 
 /// Construct the storage provider for `backend` (None for `memory://`).

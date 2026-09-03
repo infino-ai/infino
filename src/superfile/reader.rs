@@ -1966,7 +1966,7 @@ mod tests {
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             vector::distance::normalize,
         },
-        test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+        test_helpers::{decimal128_ids, default_vector_config},
     };
 
     fn schema_with_text() -> Arc<Schema> {
@@ -1981,13 +1981,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema.clone(),
             "doc_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let ids = decimal128_ids(vec![10u64, 11, 12, 13]);
@@ -2062,7 +2057,7 @@ mod tests {
     /// in row order, which is the oracle's ground truth.
     fn build_shuffled_id_superfile() -> (Bytes, Vec<i128>) {
         let schema = schema_with_text();
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
         let ids: Vec<i128> = (0..SHUFFLED_ID_ROWS)
@@ -2127,7 +2122,7 @@ mod tests {
     #[test]
     fn id_lookup_many_takes_the_first_occurrence_of_a_repeated_id() {
         let schema = schema_with_text();
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         // Row 1 and row 3 carry the same `_id`.
         let ids = Decimal128Array::from_iter_values([70i128, 71, 72, 71, 73])
@@ -2395,7 +2390,7 @@ mod tests {
     async fn bm25_search_errors_when_no_fts() {
         // Build a superfile with no FTS, no vec.
         let schema = schema_with_text();
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let ids = decimal128_ids(vec![1u64]);
         let title = LargeStringArray::from(vec!["x"]);
@@ -2443,7 +2438,6 @@ mod tests {
             "doc_id",
             vec![],
             vec![default_vector_config("emb", 7)],
-            None,
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         // 4 unit-norm vectors so cosine is well-defined.
@@ -2564,20 +2558,8 @@ mod tests {
         let opts = BuilderOptions::new(
             schema.clone(),
             "doc_id",
-            vec![
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                    stored: true,
-                },
-                FtsConfig {
-                    column: "body".into(),
-                    positions: false,
-                    stored: true,
-                },
-            ],
+            vec![FtsConfig::new("title"), FtsConfig::new("body")],
             vec![],
-            Some(default_tokenizer()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let ids = decimal128_ids(vec![1u64, 2, 3]);

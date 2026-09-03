@@ -244,26 +244,18 @@ fn open_rejects_mismatched_options_via_options_hash() {
         arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
         arrow_schema::Field::new("doc_id", arrow_schema::DataType::UInt64, false),
     ]));
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
+    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("pool"),
     );
-    let mismatched_opts = SupertableOptions::new(
-        other_schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
-        vec![],
-        Some(tk),
-    )
-    .expect("opts")
-    .with_writer_pool(pool)
-    .with_storage(Arc::clone(&storage));
+    let mismatched_opts =
+        SupertableOptions::new(other_schema, vec![FtsConfig::new("title")], vec![])
+            .expect("opts")
+            .with_writer_pool(pool)
+            .with_storage(Arc::clone(&storage));
 
     let err = Supertable::open(mismatched_opts)
         .expect_err("open must surface OptionsHashMismatch for a reordered schema");

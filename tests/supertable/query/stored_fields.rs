@@ -24,7 +24,6 @@ use infino::{
         fts::reader::{Bm25Stats, BoolMode},
     },
     supertable::{Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
 };
 
 /// Docs per commit; two commits keep the corpus multi-superfile.
@@ -42,19 +41,10 @@ fn options_with_index_only_body() -> SupertableOptions {
     SupertableOptions::new(
         schema,
         vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: false,
-            },
+            FtsConfig::new("title"),
+            FtsConfig::new("body").stored(false),
         ],
         vec![],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }

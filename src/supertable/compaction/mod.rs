@@ -975,9 +975,7 @@ mod tests {
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
-        test_helpers::{
-            build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
-        },
+        test_helpers::{build_title_batch, default_supertable_options, default_vector_config},
     };
 
     const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
@@ -1882,13 +1880,8 @@ mod tests {
         // non-IVF-mergeable case, so compaction routes to the re-index branch.
         let opts = SupertableOptions::new(
             Arc::clone(&schema),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("emb", 42)],
-            Some(default_tokenizer()),
         )
         .expect("options with an fp32 vector column")
         // One writer thread ⇒ one superfile per commit (deterministic doc-id

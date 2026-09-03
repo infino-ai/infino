@@ -28,7 +28,7 @@ use infino::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         vector::distance::normalize,
     },
-    test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+    test_helpers::{decimal128_ids, default_vector_config},
 };
 
 /// Decimal128 precision / scale for the `doc_id` column.
@@ -62,13 +62,8 @@ fn build_corruptable_positional_superfile() -> Vec<u8> {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: true,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title").positions(true)],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let n = CRC_TEST_N_DOCS;
@@ -96,13 +91,8 @@ fn build_corruptable_superfile() -> Vec<u8> {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", CRC_TEST_ROT_SEED)],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 

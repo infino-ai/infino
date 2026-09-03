@@ -230,14 +230,8 @@ mod tests {
     }
 
     fn fc(name: &str) -> FtsConfig {
-        FtsConfig {
-            column: name.into(),
-            positions: false,
-            stored: true,
-        }
+        FtsConfig::new(name)
     }
-
-    use crate::test_helpers::default_tokenizer as tok;
 
     /// Build a FixedSizeListArray of `n_rows` × `dim` f32s from a flat
     /// `Vec<f32>` of length `n_rows * dim`. No null entries.
@@ -265,13 +259,8 @@ mod tests {
     fn split_extracts_vectors_and_drops_columns() {
         let dim = 16;
         let schema = schema_id_title_emb(dim);
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+            .expect("valid options");
 
         let batch = build_batch(schema, 4, dim);
         let (scalar, vectors) = split_vectors(&batch, &opts).expect("split should succeed");
@@ -301,13 +290,8 @@ mod tests {
     fn split_rejects_batch_with_wrong_schema() {
         let dim = 16;
         let schema = schema_id_title_emb(dim);
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+            .expect("valid options");
 
         // Build a batch with a different schema (no `title` column).
         let other_schema = Arc::new(Schema::new(vec![Field::new(
@@ -334,13 +318,8 @@ mod tests {
             Field::new("title", DataType::LargeUtf8, false),
             Field::new("emb", fixed_list_f32(dim), true),
         ]));
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+            .expect("valid options");
 
         // Build a FSL with a NULL entry at row 1.
         use arrow::buffer::NullBuffer;
@@ -375,7 +354,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![], Some(tok()))
+        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![])
             .expect("valid options");
 
         let titles = LargeStringArray::from(vec!["x", "y"]);
@@ -398,13 +377,9 @@ mod tests {
             Field::new("other", fixed_list_f32(16), false),
             Field::new("c", DataType::UInt64, false),
         ]));
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![],
-            vec![vc("emb", 16), vc("other", 16)],
-            None,
-        )
-        .expect("valid options");
+        let opts =
+            SupertableOptions::new(schema.clone(), vec![], vec![vc("emb", 16), vc("other", 16)])
+                .expect("valid options");
 
         let n = 2;
         let dim = 16;
@@ -449,13 +424,8 @@ mod tests {
         // (and `collect_first_nulls_primitive`).
         let dim = 16;
         let schema = schema_id_title_emb(dim);
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+            .expect("valid options");
 
         // Three rows; the inner f32 buffer has a null at flat index 1
         // (row 0, lane 1). The FSL itself has no row-level nulls.
@@ -499,13 +469,9 @@ mod tests {
         // is not in the (otherwise schema-matching) batch.
         let dim = 16;
         let schema = schema_id_title_emb(dim);
-        let mut opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let mut opts =
+            SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+                .expect("valid options");
         opts.vector_columns[0].column = "not_a_column".into();
 
         let batch = build_batch(schema, 2, dim);
@@ -523,13 +489,9 @@ mod tests {
         // downcast to FixedSizeListArray fails.
         let dim = 16;
         let schema = schema_id_title_emb(dim);
-        let mut opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let mut opts =
+            SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+                .expect("valid options");
         opts.vector_columns[0].column = "title".into();
 
         let batch = build_batch(schema, 2, dim);
@@ -549,13 +511,9 @@ mod tests {
         // against the batch's FSL list_size.
         const WRONG_DIM: usize = 32;
         let schema = schema_id_title_emb(dim);
-        let mut opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let mut opts =
+            SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+                .expect("valid options");
         opts.vector_columns[0].dim = WRONG_DIM;
 
         let batch = build_batch(schema, 2, dim);
@@ -574,13 +532,8 @@ mod tests {
     fn split_returns_zero_copy_view_into_batch() {
         let dim = 16;
         let schema = schema_id_title_emb(dim);
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![fc("title")],
-            vec![vc("emb", dim)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
+            .expect("valid options");
         let batch = build_batch(schema, 4, dim);
 
         let (_scalar, vectors) = split_vectors(&batch, &opts).expect("split should succeed");

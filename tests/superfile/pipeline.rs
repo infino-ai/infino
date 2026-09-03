@@ -21,7 +21,7 @@ use infino::{
             rerank_codec::RerankCodec,
         },
     },
-    test_helpers::{decimal128_ids, default_tokenizer},
+    test_helpers::decimal128_ids,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -71,18 +71,7 @@ fn build_pipeline_superfile() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            },
-        ],
+        vec![FtsConfig::new("title"), FtsConfig::new("body")],
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
@@ -91,7 +80,6 @@ fn build_pipeline_superfile() -> Bytes {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -235,7 +223,7 @@ fn end_to_end_no_indexes_still_valid_parquet() {
     // A "naked" superfile (no FTS, no vectors) should still open and
     // be readable as Parquet.
     let schema = pipeline_schema();
-    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     let ids = decimal128_ids(vec![1u64, 2]);
@@ -280,13 +268,8 @@ async fn end_to_end_fts_only_blob_offsets_within_file() {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let ids = decimal128_ids(vec![1u64, 2]);
@@ -324,13 +307,8 @@ async fn end_to_end_three_batches_doc_ids_continuous() {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     for chunk in 0..MULTI_BATCH_CHUNK_COUNT {
@@ -382,18 +360,7 @@ fn add_batch_from_reader_mergeability_compatible_superfiles() {
     let opts = BuilderOptions::new(
         r1.schema().clone(),
         r1.id_column(),
-        vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            },
-        ],
+        vec![FtsConfig::new("title"), FtsConfig::new("body")],
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: 16,
@@ -402,7 +369,6 @@ fn add_batch_from_reader_mergeability_compatible_superfiles() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -422,13 +388,7 @@ fn add_batch_from_reader_mergeability_id_column_mismatch() {
         Field::new("body", DataType::LargeUtf8, false),
         Field::new("score", DataType::Float32, true),
     ]));
-    let opts = BuilderOptions::new(
-        schema_with_alt_id.clone(),
-        "different_id",
-        vec![],
-        vec![],
-        None,
-    );
+    let opts = BuilderOptions::new(schema_with_alt_id.clone(), "different_id", vec![], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     let ids = decimal128_ids(vec![1u64]);
@@ -457,7 +417,7 @@ fn add_batch_from_reader_mergeability_id_column_mismatch() {
         Field::new("body", DataType::LargeUtf8, false),
         Field::new("score", DataType::Float32, true),
     ]));
-    let orig_opts = BuilderOptions::new(builder_schema, "doc_id", vec![], vec![], None);
+    let orig_opts = BuilderOptions::new(builder_schema, "doc_id", vec![], vec![]);
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
     let err = orig_builder.add_batch_from_reader(&reader, None);
@@ -476,7 +436,7 @@ fn add_batch_from_reader_mergeability_schema_mismatch() {
         // missing "body" column compared to pipeline_schema
         Field::new("score", DataType::Float32, true),
     ]));
-    let opts = BuilderOptions::new(schema_short.clone(), "doc_id", vec![], vec![], None);
+    let opts = BuilderOptions::new(schema_short.clone(), "doc_id", vec![], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     let ids = decimal128_ids(vec![1u64]);
@@ -493,7 +453,7 @@ fn add_batch_from_reader_mergeability_schema_mismatch() {
 
     // Try to merge into builder with full pipeline schema
     let orig_schema = pipeline_schema();
-    let orig_opts = BuilderOptions::new(orig_schema, "doc_id", vec![], vec![], None);
+    let orig_opts = BuilderOptions::new(orig_schema, "doc_id", vec![], vec![]);
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
     let err = orig_builder.add_batch_from_reader(&reader, None);
@@ -510,13 +470,8 @@ fn add_batch_from_reader_mergeability_fts_column_count_mismatch() {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -542,20 +497,8 @@ fn add_batch_from_reader_mergeability_fts_column_count_mismatch() {
     let orig_opts = BuilderOptions::new(
         pipeline_schema(),
         "doc_id",
-        vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-                stored: true,
-            },
-        ],
+        vec![FtsConfig::new("title"), FtsConfig::new("body")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
@@ -573,13 +516,8 @@ fn add_batch_from_reader_mergeability_fts_column_name_mismatch() {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "body".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("body")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -605,13 +543,8 @@ fn add_batch_from_reader_mergeability_fts_column_name_mismatch() {
     let orig_opts = BuilderOptions::new(
         pipeline_schema(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
@@ -638,7 +571,6 @@ fn add_batch_from_reader_mergeability_vector_column_count_mismatch() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        None,
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -665,7 +597,7 @@ fn add_batch_from_reader_mergeability_vector_column_count_mismatch() {
     let reader = SuperfileReader::open(bytes).expect("open superfile");
 
     // Try to merge into builder with no vector columns
-    let orig_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let orig_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![]);
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
     let err = orig_builder.add_batch_from_reader(&reader, None);
@@ -691,7 +623,6 @@ fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        None,
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -730,7 +661,6 @@ fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        None,
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
@@ -757,7 +687,6 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        None,
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -796,7 +725,6 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        None,
     );
     let mut orig_builder = SuperfileBuilder::new(orig_opts).expect("new SuperfileBuilder");
 
@@ -810,7 +738,7 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
 #[test]
 fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_records() {
     let schema = pipeline_schema();
-    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     let ids = decimal128_ids(vec![100u64, 101, 102]);
@@ -837,7 +765,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_records() {
     deleted.insert(1);
 
     // Merge with deleted_docs_bitmap
-    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![]);
     let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
 
     builder2
@@ -884,13 +812,8 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_fts() {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -920,13 +843,8 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_fts() {
     let builder2_opts = BuilderOptions::new(
         pipeline_schema(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
 
@@ -990,7 +908,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        None,
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -1039,7 +956,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        None,
     );
     let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
 
@@ -1087,7 +1003,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
 fn add_batch_from_reader_with_deleted_docs_bitmap_all_deletes() {
     // Edge case: delete all documents
     let schema = pipeline_schema();
-    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     let ids = decimal128_ids(vec![100u64, 101, 102]);
@@ -1115,7 +1031,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_all_deletes() {
     deleted.insert(1);
     deleted.insert(2);
 
-    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![]);
     let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
 
     builder2
@@ -1131,7 +1047,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_all_deletes() {
 fn add_batch_from_reader_with_deleted_docs_bitmap_no_deletes() {
     // Edge case: bitmap is provided but empty (no deletions)
     let schema = pipeline_schema();
-    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
     let ids = decimal128_ids(vec![100u64, 101]);
@@ -1156,7 +1072,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_no_deletes() {
     // Create empty bitmap (no deletions)
     let deleted = roaring::RoaringBitmap::new();
 
-    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![], None);
+    let builder2_opts = BuilderOptions::new(pipeline_schema(), "doc_id", vec![], vec![]);
     let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
 
     builder2
@@ -1181,11 +1097,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
@@ -1194,7 +1106,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -1233,11 +1144,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
     let builder2_opts = BuilderOptions::new(
         pipeline_schema(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
+        vec![FtsConfig::new("title")],
         vec![SfVectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
@@ -1246,7 +1153,6 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     );
     let mut builder2 = SuperfileBuilder::new(builder2_opts).expect("new SuperfileBuilder");
 

@@ -26,7 +26,7 @@ use infino::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
     },
-    test_helpers::{decimal128_ids, default_tokenizer},
+    test_helpers::decimal128_ids,
 };
 
 /// k large enough to capture every match on these tiny corpora.
@@ -51,19 +51,10 @@ fn options() -> BuilderOptions {
         schema(),
         "doc_id",
         vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-                stored: true,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: true,
-                stored: false,
-            },
+            FtsConfig::new("title"),
+            FtsConfig::new("body").positions(true).stored(false),
         ],
         vec![],
-        Some(default_tokenizer()),
     )
 }
 

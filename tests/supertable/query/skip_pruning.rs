@@ -122,20 +122,11 @@ fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
             .build()
             .expect("build pool"),
     );
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
-    SupertableOptions::new(
-        schema_id_title(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-            stored: true,
-        }],
-        vec![],
-        Some(tk),
-    )
-    .expect("opts")
-    .with_writer_pool(pool)
-    .with_store(store)
+    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
+    SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+        .expect("opts")
+        .with_writer_pool(pool)
+        .with_store(store)
 }
 
 #[test]
