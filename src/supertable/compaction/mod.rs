@@ -435,13 +435,6 @@ impl Supertable {
                 "compaction jobs planned"
             );
             for job in jobs {
-                info!(
-                    role = table.role().as_str(),
-                    inputs = job.inputs.len(),
-                    partition_key = ?job.partition_key,
-                    estimated_output_bytes = job.estimated_output_bytes,
-                    "running compaction job"
-                );
                 table.run_compaction_job(job, stale_seal_timeout).await?;
                 table
                     .refresh()
@@ -623,6 +616,19 @@ impl Supertable {
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "run_compaction_job",
+            skip_all,
+            fields(
+                role = self.role().as_str(),
+                inputs = job.inputs.len(),
+                partition_key = ?job.partition_key,
+                estimated_output_bytes = job.estimated_output_bytes,
+            )
+        )
+    )]
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
