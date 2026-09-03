@@ -5567,10 +5567,12 @@ impl SupertableReader {
     /// them. Tombstoned rows are dropped by the shared `fanout` (a deleted
     /// row must never be a kNN candidate).
     ///
-    /// The caller passes a plan that is bounded as lowered, but a `LIKE`
-    /// leaf is bound per superfile: a token that widens past the
-    /// dictionary cap in *this* superfile makes `evaluate` return `None`
-    /// there. `None` means the index constrains nothing for that
+    /// The caller passes a plan that is bounded as lowered, and for a plan
+    /// without a `LIKE` leaf `evaluate` therefore returns `Some(bitmap)`
+    /// for every superfile — a `None` there is a planner bug and is
+    /// reported as one. A `LIKE` leaf is bound per superfile: a token that
+    /// widens past the dictionary cap in *this* superfile makes `evaluate`
+    /// return `None` there, meaning the index constrains nothing for that
     /// superfile, so every one of its rows stays a kNN candidate — the
     /// `FilterExec` above the TVF re-applies the exact predicate. Treating
     /// it as the empty set would drop matching rows.
@@ -5580,6 +5582,7 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
+        let unbounded_is_legitimate = plan.has_like();
         let op_stats = self.op_stats.clone();
         // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
         // pool, not on the tokio worker driving this fan-out.
@@ -5600,11 +5603,17 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                Ok(bitmap.unwrap_or_else(|| {
-                    let mut all = RoaringBitmap::new();
-                    all.insert_range(0..r.n_docs() as u32);
-                    all
-                }))
+                match bitmap {
+                    Some(bitmap) => Ok(bitmap),
+                    None if unbounded_is_legitimate => {
+                        let mut all = RoaringBitmap::new();
+                        all.insert_range(0..r.n_docs() as u32);
+                        Ok(all)
+                    }
+                    None => Err(QueryError::Execute(
+                        "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                    )),
+                }
             }
         })
         .await
