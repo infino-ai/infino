@@ -74,6 +74,11 @@ use crate::runtime_metrics::{
 pub(crate) struct MeteredExec {
     input: Arc<dyn ExecutionPlan>,
     op_stats: Option<Arc<OpStatsCollector>>,
+    /// Whether the planner may carry a `LIMIT` fetch past this node into
+    /// the child. The one place this is `false` is the meter the table
+    /// provider wraps around a scan that carries filters — see
+    /// [`Self::without_limit_pushdown`].
+    limit_pushdown: bool,
 }
 
 impl MeteredExec {
@@ -85,7 +90,42 @@ impl MeteredExec {
         input: Arc<dyn ExecutionPlan>,
         op_stats: Option<Arc<OpStatsCollector>>,
     ) -> Self {
-        Self { input, op_stats }
+        Self {
+            input,
+            op_stats,
+            limit_pushdown: true,
+        }
+    }
+
+    /// Wrap `input` and stop `LimitPushdown` from embedding a fetch below
+    /// this node. The table provider uses this around a filtered scan:
+    /// its access plans carry tombstone (and index-candidate) row
+    /// selections, and a scan-level limit lets the Parquet opener's limit
+    /// pruning replace those selections with whole row groups that the
+    /// predicate's statistics prove "fully matching" — returning deleted
+    /// rows. With the `FilterExec` folded into the scan as a row filter,
+    /// nothing else above the scan would hold the fetch, so this node
+    /// refuses it and DataFusion keeps a limit node above instead. The
+    /// provider pushes its own scan-level limit only for filter-less
+    /// scans, where no predicate can mark a row group fully matching.
+    pub(crate) fn without_limit_pushdown(
+        input: Arc<dyn ExecutionPlan>,
+        op_stats: Option<Arc<OpStatsCollector>>,
+    ) -> Self {
+        Self {
+            input,
+            op_stats,
+            limit_pushdown: false,
+        }
+    }
+
+    /// A meter over `input` with this node's collector and limit policy.
+    fn rewrap(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(MeteredExec {
+            input,
+            op_stats: self.op_stats.clone(),
+            limit_pushdown: self.limit_pushdown,
+        })
     }
 }
 
@@ -122,10 +162,7 @@ impl ExecutionPlan for MeteredExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(MeteredExec::new(
-            children.swap_remove(0),
-            self.op_stats.clone(),
-        )))
+        Ok(self.rewrap(children.swap_remove(0)))
     }
 
     // ---- Everything below is delegation. See the module header: a meter
@@ -153,15 +190,17 @@ impl ExecutionPlan for MeteredExec {
         // makes the planner insert a `RepartitionExec` *below* this node
         // instead, which both adds an exchange and moves the Parquet decode
         // into a spawned task where this node's thread clock cannot see it.
-        Ok(self.input.repartitioned(target_partitions, config)?.map(
-            |input| -> Arc<dyn ExecutionPlan> {
-                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
-            },
-        ))
+        Ok(self
+            .input
+            .repartitioned(target_partitions, config)?
+            .map(|input| self.rewrap(input)))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        // `false` makes `LimitPushdown` keep its limit node above this
+        // meter instead of walking into the scan; see
+        // [`Self::without_limit_pushdown`].
+        self.limit_pushdown
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -172,11 +211,10 @@ impl ExecutionPlan for MeteredExec {
         &self,
         projection: &ProjectionExec,
     ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(self.input.try_swapping_with_projection(projection)?.map(
-            |input| -> Arc<dyn ExecutionPlan> {
-                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
-            },
-        ))
+        Ok(self
+            .input
+            .try_swapping_with_projection(projection)?
+            .map(|input| self.rewrap(input)))
     }
 
     fn gather_filters_for_pushdown(
@@ -211,15 +249,12 @@ impl ExecutionPlan for MeteredExec {
         // default answer is `Unsupported`, which stops the pushdown walk
         // dead for any shape where the sort cannot sink, and a blocked
         // walk costs that shape its row-group reorder and reverse scan.
-        let rewrap = |input| -> Arc<dyn ExecutionPlan> {
-            Arc::new(MeteredExec::new(input, self.op_stats.clone()))
-        };
         Ok(match self.input.try_pushdown_sort(order)? {
             SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
-                inner: rewrap(inner),
+                inner: self.rewrap(inner),
             },
             SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
-                inner: rewrap(inner),
+                inner: self.rewrap(inner),
             },
             SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
         })
@@ -230,18 +265,18 @@ impl ExecutionPlan for MeteredExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        // Not consulted on today's plan shapes: `supports_limit_pushdown`
-        // above routes the LimitPushdown walk into the child directly, so
-        // the fetch reaches the source either way (verified by A/B EXPLAIN
-        // — the plans are identical with this pair deleted). Kept because
-        // the module contract is that every planner question is answered
-        // by the child: a shape or rule that does consult this must get
-        // the source's answer, not a meter defaulting to `None`.
-        self.input
-            .with_fetch(limit)
-            .map(|input| -> Arc<dyn ExecutionPlan> {
-                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
-            })
+        // When the walk may pass, `supports_limit_pushdown` above routes
+        // `LimitPushdown` into the child directly and this is rarely
+        // consulted; it still delegates so a shape or rule that does ask
+        // gets the source's answer, not a meter defaulting to `None`. When
+        // the walk may not pass, this is exactly the question that must
+        // be refused: with no fetch-capable node here, `LimitPushdown`
+        // keeps a limit node above the meter (see
+        // [`Self::without_limit_pushdown`]).
+        if !self.limit_pushdown {
+            return None;
+        }
+        self.input.with_fetch(limit).map(|input| self.rewrap(input))
     }
 
     fn with_preserve_order(&self, preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
@@ -254,9 +289,7 @@ impl ExecutionPlan for MeteredExec {
         // skip row groups, not from a meter defaulting to `None`.
         self.input
             .with_preserve_order(preserve_order)
-            .map(|input| -> Arc<dyn ExecutionPlan> {
-                Arc::new(MeteredExec::new(input, self.op_stats.clone()))
-            })
+            .map(|input| self.rewrap(input))
     }
 
     fn execute(
