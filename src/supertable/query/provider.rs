@@ -1033,10 +1033,20 @@ impl TableProvider for SupertableProvider {
         // reports operator time as wall-clock `elapsed_compute` and does not
         // report Parquet decode at all, so without this a SQL query's CPU is
         // both mis-clocked and missing its dominant leg.
-        Ok(Arc::new(MeteredExec::new(
-            DataSourceExec::from_data_source(config),
-            self.scan_store.op_stats(),
-        )))
+        //
+        // A filtered scan also refuses a scan-level `LIMIT` through the
+        // meter: the access plans above carry tombstone selections, and the
+        // Parquet opener's limit pruning would swap them for whole row
+        // groups the predicate's statistics prove fully matching, returning
+        // deleted rows. `effective_limit` above pushes our own limit only
+        // when there are no filters, for the same reason.
+        let scan = DataSourceExec::from_data_source(config);
+        let op_stats = self.scan_store.op_stats();
+        Ok(if filters.is_empty() {
+            Arc::new(MeteredExec::new(scan, op_stats))
+        } else {
+            Arc::new(MeteredExec::without_limit_pushdown(scan, op_stats))
+        })
     }
 }
 
