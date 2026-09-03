@@ -28,7 +28,11 @@ use futures::{
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::time;
-use tracing::{info, warn};
+#[cfg(not(feature = "detailed-tracing"))]
+use tracing::Span;
+#[cfg(feature = "detailed-tracing")]
+use tracing::info_span;
+use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -481,6 +485,10 @@ impl Supertable {
     }
 
     /// Merges the given superfiles into one
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "merge_superfiles", skip_all, fields(inputs = superfiles.len()))
+    )]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -506,15 +514,18 @@ impl Supertable {
             .try_reserve(estimated_bytes)
             .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
 
-        info!(inputs = superfiles.len(), "opening compaction inputs");
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
+            #[cfg(feature = "detailed-tracing")]
+            let span = info_span!("compaction_input", superfile_id = %entry.superfile_id);
+            #[cfg(not(feature = "detailed-tracing"))]
+            let span = Span::none();
             let open_fut = async {
-                info!(superfile_id = %entry.superfile_id, "opening compaction input");
                 let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
                     .await;
                 (entry.superfile_id, r)
-            };
+            }
+            .instrument(span);
             superfile_readers_fut.push(open_fut);
         }
         let readers = join_all(superfile_readers_fut).await;
