@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use chrono::Utc;
@@ -61,6 +61,24 @@ const RAYON_POOL_THREADS: usize = 1;
 const VECTOR_ROT_SEED: u64 = 42;
 /// Vector-search top-k for the tombstone-filtered ANN query.
 const VECTOR_SEARCH_K: usize = 5;
+/// Rows in the `LIMIT` fixture. With [`LIMIT_FIXTURE_TITLE_LEN`]-character
+/// pseudo-random titles the superfile (Parquet pages plus the embedded
+/// term index over as many distinct terms) passes DataFusion's 10 MiB
+/// `repartition_file_min_size`, so the scan is split into byte ranges
+/// across partitions — the production shape — instead of getting a
+/// round-robin `RepartitionExec` that would stop a `LIMIT` short of the
+/// scan and hide the bug under test. The test asserts that shape.
+const LIMIT_FIXTURE_ROWS: usize = 60_000;
+/// Characters per pseudo-random title in the `LIMIT` fixture.
+const LIMIT_FIXTURE_TITLE_LEN: usize = 128;
+/// `LIMIT` small enough that one fully matching row group satisfies it.
+const LIMIT_FIXTURE_FETCH: usize = 3;
+/// Multiplier of the LCG that draws the `LIMIT` fixture's titles.
+const TITLE_LCG_MULT: u64 = 6_364_136_223_846_793_005;
+/// Alphabet the `LIMIT` fixture's titles are drawn from: one token per
+/// title under the default analyzer, and dense enough that Parquet's
+/// compression cannot shrink the file under the split threshold.
+const TITLE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
 fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
     WalStateDoc {
@@ -208,6 +226,114 @@ async fn sql_query_excludes_tombstoned_row() {
         })
         .collect();
     assert_eq!(titles, vec!["bb", "dd"]);
+}
+
+/// `n` distinct pseudo-random titles of [`LIMIT_FIXTURE_TITLE_LEN`]
+/// characters, reproducible from `seed`.
+fn pseudo_random_titles(n: usize, seed: u64) -> Vec<String> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            (0..LIMIT_FIXTURE_TITLE_LEN)
+                .map(|_| {
+                    state = state.wrapping_mul(TITLE_LCG_MULT).wrapping_add(1);
+                    TITLE_ALPHABET[(state >> 33) as usize % TITLE_ALPHABET.len()] as char
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The `title` values of `batches`, in order.
+fn title_values(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title column");
+            (0..col.len()).map(move |i| col.value(i).to_owned())
+        })
+        .collect()
+}
+
+/// The physical plan DataFusion prints for `sql` (EXPLAIN's columns are
+/// plain `Utf8`, not the `LargeUtf8` user columns come back as).
+fn physical_plan(st: &Supertable, sql: &str) -> String {
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql(&format!("EXPLAIN {sql}"))
+        .expect("explain");
+    for batch in &batches {
+        let kinds = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("plan_type column");
+        let plans = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("plan column");
+        for i in 0..kinds.len() {
+            if kinds.value(i) == "physical_plan" {
+                return plans.value(i).to_owned();
+            }
+        }
+    }
+    panic!("no physical plan in EXPLAIN output");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_limit_under_a_row_filter_keeps_deleted_rows_out() {
+    // A predicate the index cannot bound (`_id > 0`) runs as a Parquet row
+    // filter with the `FilterExec` folded into the scan, so nothing above
+    // the scan would hold a `LIMIT`'s fetch — and a scan-level limit lets
+    // the Parquet opener's limit pruning replace the tombstone row
+    // selection with whole row groups the predicate's statistics prove
+    // fully matching, handing back deleted rows. The provider's meter
+    // refuses the fetch, a limit node stays above the scan, and the
+    // deleted first row stays out of the first three.
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    let titles = pseudo_random_titles(LIMIT_FIXTURE_ROWS, 7);
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&refs)).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+
+    let deleted = titles[0].as_str();
+    let stats = st.delete(col("title").eq(lit(deleted))).expect("delete");
+    assert_eq!(stats.n_tombstoned(), 1);
+
+    let sql = format!("SELECT title FROM supertable WHERE _id > 0 LIMIT {LIMIT_FIXTURE_FETCH}");
+    let got = title_values(&st.reader().expect("reader").query_sql(&sql).expect("sql"));
+    assert_eq!(got.len(), LIMIT_FIXTURE_FETCH);
+    assert!(
+        !got.iter().any(|t| t == deleted),
+        "the deleted row came back under LIMIT: {got:?}"
+    );
+
+    // The shape that makes the check above load-bearing: byte-range
+    // partitions (no repartition node between the limit and the scan), the
+    // filter folded into the scan as a row filter, and the fetch held
+    // above the scan rather than inside it.
+    let plan = physical_plan(&st, &sql);
+    assert!(!plan.contains("RepartitionExec"), "{plan}");
+    assert!(!plan.contains("FilterExec"), "{plan}");
+    let scan = plan
+        .lines()
+        .find(|l| l.contains("DataSourceExec"))
+        .expect("a DataSourceExec in the physical plan");
+    assert!(!scan.contains("limit="), "{scan}");
 }
 
 // Deleting the row nearest a query must not shrink an unfiltered result

@@ -21,11 +21,13 @@
 //!      `vector_centroid_skip`.
 //!   2. **Row-group / page skip (DataFusion).** The surviving
 //!      superfiles' Parquet bytes are exposed to a DataFusion
-//!      `ParquetSource` via an in-memory object store. The same
-//!      predicate is handed to DataFusion as a physical expression
-//!      so `PruningPredicate` prunes row groups and pages, then
-//!      projects + limits. We deliberately do **not** reimplement
-//!      this commodity layer.
+//!      `ParquetSource` via an in-memory object store. DataFusion's
+//!      own filter pushdown hands the `FilterExec` predicate to that
+//!      source, where `PruningPredicate` prunes row groups and pages;
+//!      when the index could not bound the rows, [`scan`] also turns
+//!      on Parquet row filters so the same predicate decodes the
+//!      filter columns first and only surviving rows materialize.
+//!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
 //! is reported [`TableProviderFilterPushDown::Inexact`], so
@@ -59,7 +61,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{ColumnStatistics, DFSchema, Statistics, stats::Precision},
+    common::{ColumnStatistics, Statistics, stats::Precision},
     datasource::{
         listing::PartitionedFile,
         physical_plan::{
@@ -72,7 +74,6 @@ use datafusion::{
     execution::object_store::ObjectStoreUrl,
     logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType},
     object_store::path::Path as ObjPath,
-    physical_expr::PhysicalExpr,
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
@@ -122,9 +123,8 @@ use crate::{
 };
 
 /// Logical name the supertable is registered under in the
-/// DataFusion `SessionContext`. Callers reference it as
-/// `FROM supertable`; we also use it as the schema qualifier when
-/// resolving filter columns to a physical pruning predicate.
+/// DataFusion `SessionContext`; callers reference it as
+/// `FROM supertable`.
 pub(crate) const TABLE_NAME: &str = "supertable";
 
 /// Distance between the endpoints of a min/max range that covers a
@@ -815,9 +815,9 @@ impl TableProvider for SupertableProvider {
     }
 
     /// Report every filter as `Inexact`: DataFusion hands us the
-    /// predicates (for both pruning tiers) **and** keeps a
-    /// `FilterExec` above the scan, so correctness never depends on
-    /// our conservative pruning. The `FilterExec` also does the
+    /// predicates (for the superfile skip and the index bound) **and**
+    /// keeps a `FilterExec` above the scan, so correctness never depends
+    /// on our conservative pruning. The `FilterExec` also does the
     /// candidate-superset verification in the same scan pass as the
     /// projection (one decode), which a self-verifying `exact_match`
     /// candidate would split into an extra pass — measured slower.
@@ -1042,20 +1042,32 @@ impl TableProvider for SupertableProvider {
         // (`with_pushdown_filters`) so the predicate columns are decoded
         // first and only surviving rows materialize.
         //
-        // When the index bounded the rows, each access plan already selects
-        // exactly the candidate rows and the `FilterExec` above (filters
-        // are `Inexact`) verifies the exact predicate over that tiny set.
-        // A superfile the selectivity gate sent to a scan deliberately gets
-        // no row filter either: the gate fires when the predicate matches
-        // most rows, and a row filter that keeps most rows only adds its
-        // own decode pass on top of the scan — measured on the 1M-row SQL
-        // bench, `bucket IN (all)` and a majority `category` aggregate ran
-        // 1.6–3× slower with it attached.
-        let predicate = if any_plan_unbounded {
-            row_group_predicate(state, filters, &self.schema)
-        } else {
-            None
-        };
+        // The predicate itself is not attached here. Every filter is
+        // reported `Inexact`, so DataFusion keeps a `FilterExec` above the
+        // scan, and its physical filter-pushdown rule then offers that
+        // node's predicate to the source: with row filters enabled the
+        // source accepts it once and the `FilterExec` is dropped; with them
+        // disabled the source still keeps it for statistics pruning and the
+        // node stays. Attaching our own copy of the same conjunction as
+        // well made the row filter `p AND p` — a second evaluation of the
+        // predicate over every row the first pass kept, which on a dense
+        // predicate is most of them.
+        //
+        // When the index *did* bound the rows, the per-superfile access plan
+        // already selects exactly the candidate rows and the `FilterExec`
+        // verifies the exact predicate over that tiny set, so row filters
+        // stay off. A superfile the selectivity gate sent to a scan
+        // deliberately gets none either: the gate fires when the predicate
+        // matches most rows, and a row filter that keeps most rows only adds
+        // its own decode pass on top of the scan — measured on the 1M-row
+        // SQL bench, `bucket IN (all)` and a majority `category` aggregate
+        // ran 1.6–3× slower with it attached.
+        // A scan with no filters at all also lowers to `Unbounded`; it has
+        // no predicate to filter rows by and gets no row filter — otherwise
+        // DataFusion's post-optimization dynamic filters (TopK, join probe
+        // side, aggregate) would start running as Parquet row filters on
+        // filter-less scans, a change nothing has measured.
+        let row_filter = !filters.is_empty() && any_plan_unbounded;
 
         // Only push the LIMIT into the scan when there are no filters:
         // with an `Inexact` filter re-applied above, a scan-level limit
@@ -1064,9 +1076,8 @@ impl TableProvider for SupertableProvider {
         let effective_limit = if filters.is_empty() { limit } else { None };
 
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
-        if let Some(predicate) = predicate.as_ref() {
+        if row_filter {
             source = source
-                .with_predicate(Arc::clone(predicate))
                 .with_pushdown_filters(true)
                 .with_reorder_filters(true);
         }
@@ -1113,10 +1124,20 @@ impl TableProvider for SupertableProvider {
         // reports operator time as wall-clock `elapsed_compute` and does not
         // report Parquet decode at all, so without this a SQL query's CPU is
         // both mis-clocked and missing its dominant leg.
-        Ok(Arc::new(MeteredExec::new(
-            DataSourceExec::from_data_source(config),
-            self.scan_store.op_stats(),
-        )))
+        //
+        // A filtered scan also refuses a scan-level `LIMIT` through the
+        // meter: the access plans above carry tombstone selections, and the
+        // Parquet opener's limit pruning would swap them for whole row
+        // groups the predicate's statistics prove fully matching, returning
+        // deleted rows. `effective_limit` above pushes our own limit only
+        // when there are no filters, for the same reason.
+        let scan = DataSourceExec::from_data_source(config);
+        let op_stats = self.scan_store.op_stats();
+        Ok(if filters.is_empty() {
+            Arc::new(MeteredExec::new(scan, op_stats))
+        } else {
+            Arc::new(MeteredExec::without_limit_pushdown(scan, op_stats))
+        })
     }
 }
 
@@ -1671,25 +1692,6 @@ fn flip_op(op: ScalarOp) -> ScalarOp {
         ScalarOp::Gt => ScalarOp::Lt,
         ScalarOp::GtEq => ScalarOp::LtEq,
     }
-}
-
-/// Lower the conjunction of `filters` into a single physical
-/// predicate for DataFusion's row-group pruning, or `None` if the
-/// filters are empty or can't be lowered (column-resolution /
-/// planning failure → skip pruning, never incorrect).
-fn row_group_predicate(
-    state: &dyn Session,
-    filters: &[Expr],
-    schema: &SchemaRef,
-) -> Option<Arc<dyn PhysicalExpr>> {
-    let combined = filters.iter().cloned().reduce(|a, b| a.and(b))?;
-    // Filter columns may arrive qualified (`supertable.col`) or
-    // bare depending on the plan; try the qualified schema first,
-    // then the unqualified one.
-    let df_schema = DFSchema::try_from_qualified_schema(TABLE_NAME, schema.as_ref())
-        .or_else(|_| DFSchema::try_from(schema.as_ref().clone()))
-        .ok()?;
-    state.create_physical_expr(combined, &df_schema).ok()
 }
 
 #[cfg(test)]
