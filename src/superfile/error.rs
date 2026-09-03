@@ -204,6 +204,15 @@ pub enum FtsError {
     )]
     PositionsUnavailable { column: String },
 
+    /// A dictionary walk handed to the reader pool dropped its result
+    /// channel without sending. The reader pool installs no panic handler,
+    /// so a panic inside the walk aborts the process before the awaiting
+    /// task can see this; the variant covers a sender lost any other way
+    /// (a pool torn down mid-query) and fails that one query, the FTS twin
+    /// of the vector path's variant.
+    #[error("dictionary walk dropped its result during {0}")]
+    TaskDropped(&'static str),
+
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 }

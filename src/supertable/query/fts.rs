@@ -873,7 +873,11 @@ impl SupertableReader {
                         let set = cell
                             .get_or_try_init(|| async {
                                 let set = r
-                                    .bm25_prefix_cursor_set(&column_arc, &prefix_arc)
+                                    .bm25_prefix_cursor_set(
+                                        &column_arc,
+                                        &prefix_arc,
+                                        Some(&reader_pool),
+                                    )
                                     .await
                                     .map_err(fts_read_error)?;
                                 // Flushed inside the OnceCell init so slices
@@ -924,7 +928,7 @@ impl SupertableReader {
                     }
                     None => {
                         let (hits, work) = r
-                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k, Some(&reader_pool))
                             .await
                             .map_err(fts_read_error)?;
                         if let Some(stats) = &op_stats {
@@ -2808,7 +2812,7 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5))
+        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5, None))
             .expect("oracle")
             .0;
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();

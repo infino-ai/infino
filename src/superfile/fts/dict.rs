@@ -210,14 +210,26 @@ impl<'a> DictReader<'a> {
     /// query paths use [`Self::lookup`].
     pub fn iter_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, u64)> {
         let mut out = Vec::new();
+        self.for_each_prefix(prefix, |key, value| {
+            out.push((key.to_vec(), value));
+            true
+        });
+        out
+    }
+
+    /// Visit every `(key, value)` pair whose key starts with `prefix`, in
+    /// lexicographic order, until `visit` returns `false`. The same range
+    /// scan as [`Self::iter_prefix`] without materializing the keys, for a
+    /// caller that keeps only a filtered subset or stops early — a `LIKE`
+    /// expansion walks a column's whole vocabulary this way and gives up
+    /// once too many terms qualify.
+    pub fn for_each_prefix(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], u64) -> bool) {
         let mut stream = self.fst.range().ge(prefix).into_stream();
         while let Some((key, value)) = stream.next() {
-            if !key.starts_with(prefix) {
+            if !key.starts_with(prefix) || !visit(key, value) {
                 break;
             }
-            out.push((key.to_vec(), value));
         }
-        out
     }
 }
 

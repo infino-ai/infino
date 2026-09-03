@@ -2646,14 +2646,19 @@ pub mod sql {
     /// family split can never drift apart.
     pub const BULK_RANGE_SCAN: &str = "WHERE rating < N (range scan, returns rows)";
     pub const BULK_TOKEN_MATCH_ALL: &str = "token_match (all rows)";
+    /// A substring `LIKE` the default `ascii_lower` analyzer cannot bound:
+    /// a full column scan whose cost is the scan, not the rows it returns.
+    /// Classified with the bulk shapes so it never averages into the
+    /// point-lookup family the serving cost model prices per row.
+    pub const BULK_LIKE_SCAN: &str = "WHERE title LIKE '%term…%' (substring scan, ascii_lower)";
 
-    /// The one classification of a bulk row-set shape by name. Both the
-    /// warm/cold query table (this module) and the serving-cost family
+    /// The one classification of a bulk / scan-priced shape by name. Both
+    /// the warm/cold query table (this module) and the serving-cost family
     /// split (`supertable.rs`) call this rather than each re-deriving the
-    /// same `name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL` check,
-    /// so the two tables can never classify the same shape differently.
+    /// same name check, so the two tables can never classify the same shape
+    /// differently.
     pub fn is_bulk_shape(name: &str) -> bool {
-        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL
+        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL || name == BULK_LIKE_SCAN
     }
 
     /// Scan-backed aggregates — realistic analytics shapes that provably
@@ -2805,6 +2810,10 @@ pub mod sql {
     pub fn scan_battery(sample_key: &str, sample_title: &str) -> Vec<(&'static str, String)> {
         let k = sample_key.replace('\'', "''");
         let t = sample_title.replace('\'', "''");
+        // Titles are `doc{id:07} term… term…`: the leading doc token is
+        // unique per row and space-delimited, so a `LIKE 'doc… %'` pattern
+        // names one complete term the index can resolve directly.
+        let doc_token = t.split(' ').next().unwrap_or(t.as_str());
         vec![
             (
                 "WHERE key = ? (point lookup, unsorted col)",
@@ -2817,6 +2826,23 @@ pub mod sql {
             (
                 BULK_RANGE_SCAN,
                 "SELECT title, rating FROM supertable WHERE rating < 10".to_string(),
+            ),
+            (
+                // The pattern's only token is closed on both sides (pattern
+                // start, then a space), so it is answered from the index
+                // under any analyzer — one row, no column scan.
+                "WHERE title LIKE 'doc… %' (leading complete token, index-bounded)",
+                format!("SELECT key, rating FROM supertable WHERE title LIKE '{doc_token} %'"),
+            ),
+            (
+                // An open-edged token under the default `ascii_lower`
+                // analyzer cannot be bounded (a run holding a non-ASCII byte
+                // is dropped whole), so this stays a DataFusion column scan;
+                // `term09999` sits at the Zipf tail (the FTS battery's
+                // `single_rare` term), so the result stays small and the
+                // cost is the scan itself.
+                BULK_LIKE_SCAN,
+                "SELECT key, rating FROM supertable WHERE title LIKE '%term09999%'".to_string(),
             ),
         ]
     }

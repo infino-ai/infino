@@ -935,6 +935,16 @@ impl FtsReader {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
     }
 
+    /// Open the term dictionary over fetched FST bytes, mapping an FST
+    /// parse failure to the reader's malformed-blob error.
+    pub(super) fn open_dict(fst_bytes: &[u8]) -> Result<DictReader<'_>, FtsError> {
+        DictReader::open(fst_bytes).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
+        })
+    }
+
     /// Async FST-dictionary fetch for the query path. Resolves
     /// zero-copy for in-memory / warm sources; for a cold `Lazy`
     /// source it `await`s the object-store range on the caller's
@@ -1169,11 +1179,7 @@ impl FtsReader {
                     true => {
                         dict_ranges += 1;
                         let fst_bytes = self.dict_bytes_async().await?;
-                        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-                            FtsError::Read(ReadError::MalformedVersion(format!(
-                                "FST parse failed: {e}"
-                            )))
-                        })?;
+                        let dict = Self::open_dict(&fst_bytes)?;
                         let key = make_key(&col_meta.name, term);
                         let packed = dict
                             .lookup(&key)
@@ -1243,11 +1249,7 @@ impl FtsReader {
         let positions_region = self.positions_range.clone();
 
         let fst_bytes = self.dict_bytes()?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
 
         // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
         // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
@@ -1385,10 +1387,11 @@ impl FtsReader {
     /// `column` whose bytes begin with `term_prefix`, in lex order.
     ///
     /// Mirrors [`Self::iter_column_terms`] but bounds the walk to a
-    /// prefix range instead of the whole column. Used by
-    /// [`SuperfileReader::bm25_search_prefix`] to expand a
-    /// prefix into the concrete terms list before delegating to
-    /// `search` in OR mode.
+    /// prefix range instead of the whole column. This is the synchronous,
+    /// commit-time form (the writer's term summary reaches it through
+    /// `iter_column_terms`); the query path's prefix search expands through
+    /// [`Self::terms_with_prefix`], which walks the same dictionary on the
+    /// reader pool.
     ///
     /// `term_prefix` is the prefix as it appears in the FST — the
     /// caller is responsible for any tokenizer-level normalization
@@ -1400,27 +1403,38 @@ impl FtsReader {
         column: &str,
         term_prefix: &[u8],
     ) -> Result<Vec<Vec<u8>>, FtsError> {
-        if !self.column_id_by_name.contains_key(column) {
+        if !self.has_column(column) {
             return Ok(Vec::new());
         }
-        let mut full_prefix = column.as_bytes().to_vec();
-        full_prefix.push(FST_SEPARATOR);
-        let column_prefix_len = full_prefix.len();
-        full_prefix.extend_from_slice(term_prefix);
-        let fst_bytes = self
-            .dict_bytes()
-            .expect("FST bytes must be available for term iteration");
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
-        let pairs = dict.iter_prefix(&full_prefix);
-        Ok(pairs
-            .into_iter()
-            .map(|(key, _)| key[column_prefix_len..].to_vec())
-            .collect())
+        let fst_bytes = self.dict_bytes()?;
+        collect_terms_with_prefix(&fst_bytes, column, term_prefix)
     }
+
+    /// Whether `column` is registered as an FTS column in this superfile.
+    pub(super) fn has_column(&self, column: &str) -> bool {
+        self.column_id_by_name.contains_key(column)
+    }
+}
+
+/// Every key of `column`'s dictionary that begins with `term_prefix`, in
+/// lex order, with the column key prefix stripped. The CPU half shared by
+/// the sync commit-time walk ([`FtsReader::iter_terms_with_prefix`]) and
+/// the query path's pooled one (`FtsReader::terms_with_prefix`).
+pub(super) fn collect_terms_with_prefix(
+    fst_bytes: &[u8],
+    column: &str,
+    term_prefix: &[u8],
+) -> Result<Vec<Vec<u8>>, FtsError> {
+    let mut full_prefix = column.as_bytes().to_vec();
+    full_prefix.push(FST_SEPARATOR);
+    let column_prefix_len = full_prefix.len();
+    full_prefix.extend_from_slice(term_prefix);
+    let dict = FtsReader::open_dict(fst_bytes)?;
+    let pairs = dict.iter_prefix(&full_prefix);
+    Ok(pairs
+        .into_iter()
+        .map(|(key, _)| key[column_prefix_len..].to_vec())
+        .collect())
 }
 
 /// One query's built OR cursors for one superfile: the postings fetch

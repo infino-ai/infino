@@ -567,9 +567,13 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::tokenize::{StandardTokenizer, Tokenizer},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{Supertable, SupertableOptions, manifest::ManifestSnapshot},
+        supertable::{
+            Supertable, SupertableOptions, manifest::ManifestSnapshot,
+            query::candidate::LIKE_MAX_TERMS,
+        },
         test_helpers::default_tokenizer as tok,
     };
 
@@ -586,6 +590,15 @@ mod tests {
     }
 
     fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
+        options_one_superfile_per_commit_with(dim, tok())
+    }
+
+    /// [`options_one_superfile_per_commit`] with `title` analyzed by
+    /// `tokenizer`.
+    fn options_one_superfile_per_commit_with(
+        dim: usize,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> SupertableOptions {
         let pool = Arc::new(
             ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -610,7 +623,7 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
+            Some(tokenizer),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -656,14 +669,27 @@ mod tests {
     /// `title = 'rare'` over the global top-k would underflow, which is
     /// exactly what the pushdown must avoid. Requires `dim >= 2`.
     fn supertable_for_pushdown(dim: usize, n: usize, n_common: usize) -> Supertable {
-        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        let titles: Vec<String> = (0..n)
+            .map(|i| if i < n_common { "common" } else { "rare" }.to_owned())
+            .collect();
+        supertable_ranked_by_index(dim, &titles, tok())
+    }
+
+    /// Single-superfile table where doc `i` carries `titles[i]` and the
+    /// vector `[1, i, 0, …]`, so distance to the query `[1, 0, …]` ranks by
+    /// index (see [`supertable_for_pushdown`]). `title` is analyzed with
+    /// `tokenizer`. Requires `dim >= 2`.
+    fn supertable_ranked_by_index(
+        dim: usize,
+        titles: &[String],
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> Supertable {
+        let n = titles.len();
+        let st = Supertable::create(options_one_superfile_per_commit_with(dim, tokenizer))
+            .expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
-        let titles = LargeStringArray::from(
-            (0..n)
-                .map(|i| if i < n_common { "common" } else { "rare" })
-                .collect::<Vec<_>>(),
-        );
+        let titles = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
         let mut flat = Vec::<f32>::with_capacity(n * dim);
         for i in 0..n {
             for d in 0..dim {
@@ -940,6 +966,89 @@ mod tests {
             .expect("query_sql");
         let total: usize = rows.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, k, "unbounded predicate falls back to plain kNN");
+    }
+
+    /// Titles across `batches`, in hit order.
+    fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let t = col_str(b, "title");
+                (0..t.len())
+                    .map(|i| t.value(i).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vector_search_tvf_where_like_contains_ranks_among_matching() {
+        // `%fox%` bounds no manifest summary (no bloom term, no prefix), so
+        // the plan must keep every superfile and bound the rows from each
+        // superfile's dictionary — the three nearest titles containing
+        // `fox` come back, not zero rows and not the unfiltered top-k.
+        let dim = 16;
+        let k = 3;
+        let titles: Vec<String> = [
+            "common",
+            "common",
+            "common",
+            "firefox browser",
+            "outfoxed",
+            "plain",
+            "fox",
+            "nothing",
+        ]
+        .iter()
+        .map(|t| (*t).to_owned())
+        .collect();
+        let st = supertable_ranked_by_index(dim, &titles, Arc::new(StandardTokenizer));
+        let q = csv_one_hot(dim, 0);
+        let filtered = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE title LIKE '%fox%'"
+            ))
+            .expect("query_sql");
+        assert_eq!(
+            titles_of(&filtered),
+            vec!["firefox browser", "outfoxed", "fox"],
+            "the k nearest rows whose title contains `fox`, by distance"
+        );
+    }
+
+    #[test]
+    fn vector_search_tvf_where_like_token_over_the_cap_keeps_every_row() {
+        // Every title is a distinct term containing `zz`, more of them than
+        // a LIKE token may widen to, so the index bounds nothing in this
+        // superfile. That must fall back to ranking every row (the
+        // FilterExec re-checks the pattern), never to an error or to an
+        // empty candidate set.
+        let dim = 16;
+        let k = 3;
+        let titles: Vec<String> = (0..LIKE_MAX_TERMS + 8).map(|i| format!("w{i}zz")).collect();
+        let st = supertable_ranked_by_index(dim, &titles, Arc::new(StandardTokenizer));
+        let q = csv_one_hot(dim, 0);
+        // Contains: no manifest gate at all.
+        let contains = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE title LIKE '%zz%'"
+            ))
+            .expect("query_sql");
+        assert_eq!(titles_of(&contains), vec!["w0zz", "w1zz", "w2zz"]);
+        // Prefix: the term-range gate keeps the superfile, then the same
+        // over-cap fallback applies.
+        let prefix = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE title LIKE 'w%'"
+            ))
+            .expect("query_sql");
+        assert_eq!(titles_of(&prefix), vec!["w0zz", "w1zz", "w2zz"]);
     }
 
     #[test]

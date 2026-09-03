@@ -5567,22 +5567,33 @@ impl SupertableReader {
     /// them. Tombstoned rows are dropped by the shared `fanout` (a deleted
     /// row must never be a kNN candidate).
     ///
-    /// The caller passes only a bounded plan, so `evaluate` returns
-    /// `Some(bitmap)` per superfile; a defensive `None` (unbounded) is
-    /// treated as the empty set, skipping that superfile.
+    /// The caller passes a plan that is bounded as lowered, and for a plan
+    /// without a `LIKE` leaf `evaluate` therefore returns `Some(bitmap)`
+    /// for every superfile — a `None` there is a planner bug and is
+    /// reported as one. A `LIKE` leaf is bound per superfile: a token that
+    /// widens past the dictionary cap in *this* superfile makes `evaluate`
+    /// return `None` there, meaning the index constrains nothing for that
+    /// superfile, so every one of its rows stays a kNN candidate — the
+    /// `FilterExec` above the TVF re-applies the exact predicate. Treating
+    /// it as the empty set would drop matching rows.
     async fn candidate_bitmaps_from_plan(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
+        let unbounded_is_legitimate = plan.has_like();
         let op_stats = self.op_stats.clone();
+        // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
+        // pool, not on the tokio worker driving this fan-out.
+        let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
             let plan = Arc::clone(&plan_arc);
             let op_stats = op_stats.clone();
+            let reader_pool = Arc::clone(&reader_pool);
             async move {
                 let (bitmap, work) = plan
-                    .evaluate(r.as_ref())
+                    .evaluate(r.as_ref(), Some(&reader_pool))
                     .await
                     .map_err(|e| QueryError::Parquet(e.to_string()))?;
                 // The SQL predicate's posting walks, summed across the
@@ -5592,11 +5603,17 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                bitmap.ok_or_else(|| {
-                    QueryError::Execute(
+                match bitmap {
+                    Some(bitmap) => Ok(bitmap),
+                    None if unbounded_is_legitimate => {
+                        let mut all = RoaringBitmap::new();
+                        all.insert_range(0..r.n_docs() as u32);
+                        Ok(all)
+                    }
+                    None => Err(QueryError::Execute(
                         "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
-                    )
-                })
+                    )),
+                }
             }
         })
         .await
