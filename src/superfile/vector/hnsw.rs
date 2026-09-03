@@ -770,6 +770,15 @@ impl VisitedSet {
         }
     }
 
+    /// Grow the stamp array to cover at least `n` nodes, preserving existing
+    /// stamps. New slots are 0, which reads as unvisited under any live epoch
+    /// (epochs start at 1 after the first `clear`).
+    fn ensure(&mut self, n: usize) {
+        if self.stamp.len() < n {
+            self.stamp.resize(n, 0);
+        }
+    }
+
     /// Mark `node` visited; return whether it was already visited.
     #[inline]
     fn test_and_set(&mut self, node: u32) -> bool {
@@ -1071,8 +1080,24 @@ impl Hnsw {
         k: usize,
         ef: usize,
     ) -> Vec<(u32, f32)> {
-        let mut visited = VisitedSet::new(self.len);
-        self.search_scratch(scorer, query, k, ef, &mut visited)
+        // Reuse a per-thread visited set instead of allocating (then zeroing,
+        // then freeing) an O(n) buffer on every query — 40 MB at 10M nodes.
+        // That per-query alloc+memset dominated warm latency at scale and,
+        // worse, serialized concurrent queries on the allocator's arena locks,
+        // capping QPS. `search_layer` epoch-clears the set on entry, so a dirty
+        // carry-over from the prior query is correct; serving is multi-threaded,
+        // so the scratch is thread-local: grown to the thread's largest index
+        // seen and then reused for the thread's lifetime (a bounded, one-time
+        // cost — no per-query allocation, no cross-thread contention).
+        thread_local! {
+            static SEARCH_VISITED: std::cell::RefCell<VisitedSet> =
+                std::cell::RefCell::new(VisitedSet::new(0));
+        }
+        SEARCH_VISITED.with(|cell| {
+            let mut visited = cell.borrow_mut();
+            visited.ensure(self.len);
+            self.search_scratch(scorer, query, k, ef, &mut visited)
+        })
     }
 
     /// [`search`](Self::search) reusing a caller-owned visited set. The set is
