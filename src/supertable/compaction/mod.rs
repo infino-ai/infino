@@ -1885,6 +1885,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![default_vector_config("emb", 42)],
             Some(default_tokenizer()),

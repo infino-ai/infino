@@ -82,6 +82,7 @@ fn build_test_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

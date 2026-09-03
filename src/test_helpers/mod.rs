@@ -297,6 +297,7 @@ pub fn default_supertable_options() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

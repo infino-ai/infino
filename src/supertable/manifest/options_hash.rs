@@ -118,6 +118,18 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
             push_str(&mut buf, t.name());
         }
     }
+    // 3d. stored flags — same only-when-non-default rule: an all-stored
+    //     table's stream stays byte-identical to hashes stamped before
+    //     index-only columns existed, so pre-existing manifests keep
+    //     verifying; a table with an index-only column hashes
+    //     differently (its superfiles' Parquet bodies differ, so the
+    //     options identity must too).
+    if opts.fts_columns.iter().any(|c| !c.stored) {
+        push_tag(&mut buf, b"fts_stored");
+        for c in &opts.fts_columns {
+            buf.push(c.stored as u8);
+        }
+    }
 
     // 4. vector_columns (same declared-order rationale).
     push_tag(&mut buf, b"vector_columns");
@@ -293,6 +305,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -334,6 +347,7 @@ mod tests {
             vec![FtsConfig {
                 column: "body".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -359,6 +373,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -386,10 +401,12 @@ mod tests {
                 FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 },
                 FtsConfig {
                     column: "subtitle".into(),
                     positions: false,
+                    stored: true,
                 },
             ],
             vec![],
@@ -417,10 +434,12 @@ mod tests {
                 FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 },
                 FtsConfig {
                     column: "subtitle".into(),
                     positions: false,
+                    stored: true,
                 },
             ],
             vec![],
@@ -433,10 +452,12 @@ mod tests {
                 FtsConfig {
                     column: "subtitle".into(),
                     positions: false,
+                    stored: true,
                 },
                 FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 },
             ],
             vec![],
@@ -470,10 +491,12 @@ mod tests {
                     FtsConfig {
                         column: "title".into(),
                         positions: title_pos,
+                        stored: true,
                     },
                     FtsConfig {
                         column: "subtitle".into(),
                         positions: subtitle_pos,
+                        stored: true,
                     },
                 ],
                 vec![],
@@ -492,6 +515,49 @@ mod tests {
         // same options. If this assertion ever fails, the encoding
         // drifted and every existing table would fail open-validation.
         let hex: String = h_ff.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, ALL_FALSE_GOLDEN_HEX);
+    }
+
+    /// The stored flag follows the same only-when-non-default rule as
+    /// positions: an all-stored table's stream carries no `fts_stored`
+    /// block (its hash equals the pre-flag golden above, which the
+    /// positions test pins), an index-only column changes the hash, and
+    /// WHICH column is index-only matters.
+    #[test]
+    fn compute_options_hash_stored_flag() {
+        let schema_two = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("subtitle", DataType::LargeUtf8, false),
+        ]));
+        let opts = |title_stored: bool, subtitle_stored: bool| {
+            SupertableOptions::new(
+                schema_two.clone(),
+                vec![
+                    FtsConfig {
+                        column: "title".into(),
+                        positions: false,
+                        stored: title_stored,
+                    },
+                    FtsConfig {
+                        column: "subtitle".into(),
+                        positions: false,
+                        stored: subtitle_stored,
+                    },
+                ],
+                vec![],
+                Some(default_tokenizer()),
+            )
+            .expect("opts")
+        };
+        let h_tt = compute_options_hash(&opts(true, true), &time_range());
+        let h_ft = compute_options_hash(&opts(false, true), &time_range());
+        let h_tf = compute_options_hash(&opts(true, false), &time_range());
+        assert_ne!(h_tt.0, h_ft.0, "index-only column must change the hash");
+        assert_ne!(h_ft.0, h_tf.0, "which column is index-only must matter");
+
+        // All-stored equals the pre-flag golden — existing manifests
+        // keep verifying.
+        let hex: String = h_tt.0.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, ALL_FALSE_GOLDEN_HEX);
     }
 
@@ -540,6 +606,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),

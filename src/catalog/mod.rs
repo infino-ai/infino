@@ -36,7 +36,7 @@ use arrow_schema::SchemaRef;
 use dashmap::DashMap;
 use datafusion::{config::Dialect, error::DataFusionError, execution::context::SQLOptions};
 use futures::future::try_join_all;
-pub use index_spec::IndexSpec;
+pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
@@ -411,6 +411,7 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes.fts_analyzers(),
+                    fts_stored: indexes.fts_stored(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
@@ -544,7 +545,15 @@ impl Connection {
                         .get(i)
                         .map(String::as_str)
                         .unwrap_or(ASCII_LOWER_TOKENIZER);
-                    spec = spec.fts_with_analyzer(column.clone(), analyzer);
+                    // Same back-compat rule for `fts_stored`: a catalog
+                    // written before index-only columns existed can only
+                    // mean the text is stored.
+                    let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+                    spec = spec.fts(
+                        FtsField::new(column.clone())
+                            .analyzer(analyzer)
+                            .stored(stored),
+                    );
                 }
                 for v in &entry.vectors {
                     spec = spec.vector(
@@ -1303,7 +1312,7 @@ mod tests {
             .create_table(
                 "std",
                 schema_id_title(),
-                IndexSpec::new().fts_with_analyzer("title", "standard"),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("standard")),
             )
             .expect("create standard table");
         std_tbl
@@ -1323,7 +1332,7 @@ mod tests {
             .create_table(
                 "bad",
                 schema_id_title(),
-                IndexSpec::new().fts_with_analyzer("title", "nonesuch"),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("nonesuch")),
             )
             .expect_err("unknown analyzer must be rejected");
         assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
@@ -1361,8 +1370,8 @@ mod tests {
                 "docs",
                 schema.clone(),
                 IndexSpec::new()
-                    .fts_with_analyzer("title", "standard")
-                    .fts_with_analyzer("body", "ascii_lower"),
+                    .fts(FtsField::new("title").analyzer("standard"))
+                    .fts(FtsField::new("body").analyzer("ascii_lower")),
             )
             .expect("create_table");
         table
@@ -1409,8 +1418,8 @@ mod tests {
                     "docs",
                     schema.clone(),
                     IndexSpec::new()
-                        .fts_with_analyzer("title", "standard")
-                        .fts_with_analyzer("body", "ascii_lower"),
+                        .fts(FtsField::new("title").analyzer("standard"))
+                        .fts(FtsField::new("body").analyzer("ascii_lower")),
                 )
                 .expect("create_table");
             table
@@ -1439,6 +1448,85 @@ mod tests {
         assert_eq!(
             body_cafe, 0,
             "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An index-only column (`FtsField::stored(false)`) survives a
+    /// storage-backed reopen: the catalog records the flag, `open_table`
+    /// reconstructs it, and the reopened table both searches the column
+    /// and keeps rejecting it as a projection target.
+    #[test]
+    fn index_only_column_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("infino-idxonly-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+        let schema = schema_title_body();
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema.clone(),
+                    IndexSpec::new()
+                        .fts("title")
+                        .fts(FtsField::new("body").stored(false)),
+                )
+                .expect("create_table");
+            table
+                .append(&title_body_batch(
+                    schema.clone(),
+                    "stored title",
+                    "hidden signal text",
+                ))
+                .expect("append");
+        }
+        let conn2 = connect(&uri).expect("reconnect");
+        let table = conn2.open_table("docs").expect("open_table");
+        // schema() keeps the ingest contract, index-only column included.
+        assert_eq!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["title", "body"],
+        );
+        // Searchable after reopen…
+        let hits = table
+            .bm25_search("body", "signal", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("index-only search after reopen");
+        assert_eq!(n_rows(&hits), 1);
+        // …and still not readable: projecting it fails with a clean,
+        // caller-level error.
+        let err = table
+            .bm25_search(
+                "body",
+                "signal",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                Some(&["_id", "body", "score"]),
+            )
+            .expect_err("index-only column must not be projectable after reopen");
+        let msg = err.to_string();
+        assert!(msg.contains("body"), "error names the column: {msg}");
+        assert!(!msg.contains("DataFusion"), "no engine internals: {msg}");
+        // Appends still require the column (it is part of the write
+        // contract even though it is never stored).
+        let title_only = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let short = RecordBatch::try_new(
+            title_only,
+            vec![Arc::new(LargeStringArray::from(vec!["no body"]))],
+        )
+        .expect("batch");
+        assert!(
+            table.append(&short).is_err(),
+            "append without the index-only column must be rejected"
         );
         let _ = fs::remove_dir_all(&dir);
     }

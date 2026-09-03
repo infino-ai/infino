@@ -341,6 +341,7 @@ fn vector_crash_fixture_with_writers(
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![VectorConfig {
             column: "emb".into(),

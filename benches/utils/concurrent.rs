@@ -244,6 +244,7 @@ fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOpti
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![VectorConfig {
             column: VEC_COLUMN.into(),

@@ -887,6 +887,7 @@ impl FtsReader {
                 dl_norm_k1,
                 positions: col_cfg.positions,
                 tokenizer,
+                stored: col_cfg.stored,
             });
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
         }
@@ -1930,7 +1931,7 @@ mod tests {
             Ok(())
         })
         .expect("feed prebuilt postings");
-        b.set_prebuilt_doc_lengths(0, ra.read_doc_lengths(0).expect("doc lengths"));
+        b.append_prebuilt_doc_lengths(0, &ra.read_doc_lengths(0).expect("doc lengths"));
         let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
 
         // The two readers must expose identical postings (doc_ids, tfs,
@@ -1979,7 +1980,7 @@ mod tests {
             Ok(())
         })
         .expect("feed prebuilt postings");
-        b.set_prebuilt_doc_lengths(0, ra.read_doc_lengths(0).expect("doc lengths"));
+        b.append_prebuilt_doc_lengths(0, &ra.read_doc_lengths(0).expect("doc lengths"));
         let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
 
         let collect = |r: &FtsReader| {

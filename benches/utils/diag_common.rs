@@ -124,6 +124,7 @@ pub fn diag_options() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: true,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

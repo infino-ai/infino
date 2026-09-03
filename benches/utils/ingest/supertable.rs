@@ -312,6 +312,7 @@ pub fn options_for(
         fts.push(FtsConfig {
             column: TEXT_COLUMN.into(),
             positions: true,
+            stored: true,
         });
     }
     if modality.has_vector_filter_bucket() {
@@ -320,6 +321,7 @@ pub fn options_for(
         fts.push(FtsConfig {
             column: VECTOR_FILTER_COLUMN.into(),
             positions: false,
+            stored: true,
         });
     }
     let vector = if modality.has_vector() {

@@ -121,6 +121,7 @@ fn faulted_vector_table() -> (Supertable, RecordBatch, Arc<FaultStorage>, TempDi
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         Some(default_tokenizer()),
@@ -477,6 +478,7 @@ fn fts_superfile_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

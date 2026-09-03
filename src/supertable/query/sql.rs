@@ -117,7 +117,10 @@ impl SqlSchemas {
 /// cached on the handle. This is the one place that walks the full column set,
 /// so a wide (thousands of columns) table pays it once, not per query.
 pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
-    let scalar = options.scalar_schema();
+    // Stored shape: index-only FTS columns are absent from Parquet, so
+    // SQL never sees them — selecting or filtering one fails at plan
+    // time like any unknown column.
+    let scalar = options.stored_schema();
     let fts: HashSet<&str> = options
         .fts_columns
         .iter()
@@ -757,6 +760,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(tokenizer),
@@ -1366,6 +1370,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(tok()),
@@ -1419,6 +1424,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(tok()),
@@ -2306,6 +2312,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),

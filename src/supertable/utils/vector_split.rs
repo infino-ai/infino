@@ -233,6 +233,7 @@ mod tests {
         FtsConfig {
             column: name.into(),
             positions: false,
+            stored: true,
         }
     }
 

@@ -58,6 +58,7 @@ fn options_title_only() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

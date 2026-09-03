@@ -162,7 +162,9 @@ pub(crate) async fn resolve_hits_named(
     hits: &[SuperfileHit],
     projection: Option<&[&str]>,
 ) -> Result<RecordBatch, QueryError> {
-    let scalar_schema = reader.options().scalar_schema();
+    // Stored shape: an index-only FTS column has no Parquet data to
+    // project, so its name is rejected up front like any unknown column.
+    let scalar_schema = reader.options().stored_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
     // `_id` decodes from its own dedicated id pages (cheap by
@@ -1014,6 +1016,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -1309,6 +1312,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(tok()),

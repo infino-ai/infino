@@ -1984,6 +1984,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2567,10 +2568,12 @@ mod tests {
                 FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 },
                 FtsConfig {
                     column: "body".into(),
                     positions: false,
+                    stored: true,
                 },
             ],
             vec![],

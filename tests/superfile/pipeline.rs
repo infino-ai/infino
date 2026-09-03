@@ -75,10 +75,12 @@ fn build_pipeline_superfile() -> Bytes {
             FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: "body".into(),
                 positions: false,
+                stored: true,
             },
         ],
         vec![SfVectorConfig {
@@ -281,6 +283,7 @@ async fn end_to_end_fts_only_blob_offsets_within_file() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -324,6 +327,7 @@ async fn end_to_end_three_batches_doc_ids_continuous() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -382,10 +386,12 @@ fn add_batch_from_reader_mergeability_compatible_superfiles() {
             FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: "body".into(),
                 positions: false,
+                stored: true,
             },
         ],
         vec![SfVectorConfig {
@@ -507,6 +513,7 @@ fn add_batch_from_reader_mergeability_fts_column_count_mismatch() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -539,10 +546,12 @@ fn add_batch_from_reader_mergeability_fts_column_count_mismatch() {
             FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: "body".into(),
                 positions: false,
+                stored: true,
             },
         ],
         vec![],
@@ -567,6 +576,7 @@ fn add_batch_from_reader_mergeability_fts_column_name_mismatch() {
         vec![FtsConfig {
             column: "body".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -598,6 +608,7 @@ fn add_batch_from_reader_mergeability_fts_column_name_mismatch() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -876,6 +887,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_fts() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -911,6 +923,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_fts() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -1171,6 +1184,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![SfVectorConfig {
             column: "emb".into(),
@@ -1222,6 +1236,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![SfVectorConfig {
             column: "emb".into(),

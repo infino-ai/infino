@@ -50,10 +50,12 @@ fn build_two_column(corpus: &[(u64, &str, &str)]) -> SuperfileReader {
             FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: "body".into(),
                 positions: false,
+                stored: true,
             },
         ],
         vec![],

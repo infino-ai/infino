@@ -69,10 +69,12 @@ fn build_test_superfile() -> Bytes {
             FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: "body".into(),
                 positions: false,
+                stored: true,
             },
         ],
         Vec::new(),

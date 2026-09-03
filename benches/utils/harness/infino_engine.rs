@@ -52,6 +52,7 @@ fn build_superfile(column: &str, docs: &[(u64, &str)], positions: bool) -> Vec<u
         vec![FtsConfig {
             column: column.to_string(),
             positions,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

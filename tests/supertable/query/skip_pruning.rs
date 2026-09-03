@@ -128,6 +128,7 @@ fn options_with_counting_store(store: Arc<CountingStore>) -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(tk),

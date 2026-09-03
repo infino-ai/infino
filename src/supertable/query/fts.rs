@@ -2047,6 +2047,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(tok()),
@@ -2241,6 +2242,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: true,
+                stored: true,
             }],
             vec![],
             Some(tok()),
@@ -2488,6 +2490,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(tok()),
@@ -3040,6 +3043,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: true,
+                stored: true,
             }],
             vec![],
             Some(tok()),

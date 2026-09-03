@@ -163,6 +163,7 @@ fn build_fts_only_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

@@ -125,18 +125,22 @@ pub fn sql_options() -> SupertableOptions {
             FtsConfig {
                 column: TITLE_COLUMN.into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: BUCKET_COLUMN.into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: KEY_COLUMN.into(),
                 positions: false,
+                stored: true,
             },
             FtsConfig {
                 column: CATEGORY_COLUMN.into(),
                 positions: false,
+                stored: true,
             },
         ],
         vec![VectorConfig {
@@ -298,6 +302,7 @@ fn spec_options(spec: &SqlCorpusSpec) -> SupertableOptions {
         .map(|column| FtsConfig {
             column: column.clone(),
             positions: false,
+            stored: true,
         })
         .collect();
     let vectors = spec

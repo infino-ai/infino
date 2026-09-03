@@ -278,6 +278,7 @@ fn time_range_assigns_int64_superfiles_to_bucket_zero() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(tk),
@@ -356,6 +357,7 @@ fn time_range_superfile_spanning_two_buckets_errors() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(tk),

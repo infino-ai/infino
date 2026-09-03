@@ -2201,6 +2201,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![],
             Some(tk),
@@ -2529,6 +2530,7 @@ mod tests {
                 vec![FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 }],
                 vec![VectorConfig {
                     column: "emb".into(),
@@ -2822,6 +2824,7 @@ mod tests {
                 vec![FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 }],
                 vec![VectorConfig {
                     column: "emb".into(),
@@ -3037,6 +3040,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -3139,6 +3143,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -3243,6 +3248,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -3342,6 +3348,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -3452,6 +3459,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -3812,6 +3820,7 @@ mod tests {
                 vec![FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 }],
                 vec![VectorConfig {
                     column: "emb".into(),
@@ -4187,18 +4196,22 @@ mod tests {
                     FtsConfig {
                         column: "title".into(),
                         positions: false,
+                        stored: true,
                     },
                     FtsConfig {
                         column: "bucket".into(),
                         positions: false,
+                        stored: true,
                     },
                     FtsConfig {
                         column: "key".into(),
                         positions: false,
+                        stored: true,
                     },
                     FtsConfig {
                         column: "category".into(),
                         positions: false,
+                        stored: true,
                     },
                 ],
                 vec![VectorConfig {
@@ -4352,6 +4365,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -4446,6 +4460,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -4538,6 +4553,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -4710,6 +4726,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -4911,6 +4928,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -5193,6 +5211,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -5352,6 +5371,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -5455,6 +5475,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -5572,6 +5593,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -5739,6 +5761,7 @@ mod tests {
                 vec![FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 }],
                 vec![VectorConfig {
                     column: "emb".into(),
@@ -5910,6 +5933,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -6136,6 +6160,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -6421,6 +6446,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -6610,6 +6636,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -6790,6 +6817,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -6919,6 +6947,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -7046,6 +7075,7 @@ mod tests {
                 vec![FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 }],
                 vec![VectorConfig {
                     column: "emb".into(),
@@ -7173,6 +7203,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -7312,6 +7343,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -7444,6 +7476,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -7572,6 +7605,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -7694,6 +7728,7 @@ mod tests {
                 vec![FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 }],
                 vec![VectorConfig {
                     column: "emb".into(),
@@ -7872,6 +7907,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -8011,6 +8047,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),

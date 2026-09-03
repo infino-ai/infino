@@ -467,6 +467,7 @@ mod tests {
                 vec![FtsConfig {
                     column: "title".into(),
                     positions: false,
+                    stored: true,
                 }],
                 vec![],
                 Some(tk),

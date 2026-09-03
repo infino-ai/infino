@@ -84,6 +84,7 @@ fn options_with_pool_width(n_threads: usize) -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         Vec::new(),
         Some(default_tokenizer()),
@@ -272,6 +273,7 @@ fn a_vector_append_pins_exact_payload_bytes() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         Some(default_tokenizer()),
@@ -503,6 +505,7 @@ fn the_fts_leg_is_a_strict_subset_when_a_column_is_unindexed() {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         Vec::new(),
         Some(default_tokenizer()),

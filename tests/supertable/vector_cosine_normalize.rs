@@ -85,6 +85,7 @@ fn cosine_options() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![VectorConfig::new(
             "emb".into(),

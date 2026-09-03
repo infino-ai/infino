@@ -152,6 +152,7 @@ fn build_test_superfile_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

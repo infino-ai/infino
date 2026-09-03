@@ -78,6 +78,7 @@ fn gcs_options(dim: usize) -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![VectorConfig {
             column: "emb".into(),

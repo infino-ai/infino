@@ -59,6 +59,12 @@ pub(crate) struct TableEntry {
     /// `ascii_lower` on reopen.
     #[serde(default)]
     pub(crate) fts_analyzers: Vec<String>,
+    /// FTS stored flags, parallel to `fts` (`false` = index-only, the
+    /// raw text is not kept in the table). Absent in catalogs written
+    /// before index-only columns existed; a missing or short entry
+    /// defaults to stored on reopen.
+    #[serde(default)]
+    pub(crate) fts_stored: Vec<bool>,
     /// Vector-indexed columns.
     pub(crate) vectors: Vec<VectorEntry>,
     /// Creation time, seconds since the Unix epoch.
@@ -174,6 +180,7 @@ mod tests {
             schema_ipc: schema_to_ipc(&sample_schema()).expect("ipc"),
             fts: vec!["title".into()],
             fts_analyzers: vec!["ascii_lower".into()],
+            fts_stored: vec![true],
             vectors: vec![VectorEntry {
                 column: "emb".into(),
                 dim: 8,
@@ -181,6 +188,20 @@ mod tests {
             }],
             created_at_unix: 0,
         }
+    }
+
+    /// A catalog entry written before `fts_stored` existed (the key is
+    /// absent from its JSON) deserializes to an empty vec — which the
+    /// open path reads as "every FTS column stored". Pins the serde
+    /// default, so old catalogs keep opening.
+    #[test]
+    fn table_entry_without_fts_stored_defaults_to_all_stored() {
+        let mut v = serde_json::to_value(sample_table_entry()).expect("encode");
+        let obj = v.as_object_mut().expect("object");
+        obj.remove("fts_stored");
+        assert!(!obj.contains_key("fts_stored"));
+        let entry: TableEntry = serde_json::from_value(v).expect("legacy entry decodes");
+        assert!(entry.fts_stored.is_empty(), "missing key ⇒ empty ⇒ stored");
     }
 
     // ---- read_catalog --------------------------------------------------

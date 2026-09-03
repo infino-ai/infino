@@ -71,6 +71,7 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![VectorConfig {
             column: "emb".into(),

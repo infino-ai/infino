@@ -66,6 +66,7 @@ fn options_title_only() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         Vec::new(),
         Some(default_tokenizer()),
@@ -501,6 +502,7 @@ fn vector_options() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         Some(default_tokenizer()),
@@ -632,6 +634,7 @@ fn drained_sq16_adaptive_table(dir: &TempDir) -> Supertable {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![vector],
         Some(default_tokenizer()),

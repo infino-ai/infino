@@ -2489,6 +2489,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![SfVectorConfig {
             provided_centroids: None,
@@ -2531,6 +2532,7 @@ pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Met
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![SfVectorConfig {
             provided_centroids: None,

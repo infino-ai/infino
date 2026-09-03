@@ -65,6 +65,7 @@ fn build_corruptable_positional_superfile() -> Vec<u8> {
         vec![FtsConfig {
             column: "title".into(),
             positions: true,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -98,6 +99,7 @@ fn build_corruptable_superfile() -> Vec<u8> {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![default_vector_config("emb", CRC_TEST_ROT_SEED)],
         Some(default_tokenizer()),

@@ -133,6 +133,7 @@ fn build_infino_superfile_with(corpus: &[(u64, &str)], positions: bool) -> Super
         vec![FtsConfig {
             column: "title".into(),
             positions,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),

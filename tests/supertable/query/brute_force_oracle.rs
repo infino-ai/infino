@@ -154,6 +154,7 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(tk),

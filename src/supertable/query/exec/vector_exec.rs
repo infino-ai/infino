@@ -614,6 +614,7 @@ mod tests {
             vec![FtsConfig {
                 column: "title".into(),
                 positions: false,
+                stored: true,
             }],
             vec![VectorConfig {
                 column: "emb".into(),

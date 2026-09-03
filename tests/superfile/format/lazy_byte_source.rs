@@ -81,6 +81,7 @@ fn build_test_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -145,6 +146,7 @@ fn build_positional_test_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
             positions: true,
+            stored: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -402,6 +404,7 @@ fn build_vec_plus_fts_bytes() -> Bytes {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![default_vector_config("emb", LAZY_VEC_ROT_SEED)],
         Some(default_tokenizer()),

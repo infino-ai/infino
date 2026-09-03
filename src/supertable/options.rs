@@ -1285,12 +1285,14 @@ impl SupertableOptions {
     /// Effective scalar-only schema — the user's columns with
     /// vector columns projected out *and* the supertable-
     /// injected id column prepended. This is what the
-    /// underlying `SuperfileBuilder` sees and what Parquet
-    /// stores.
+    /// underlying `SuperfileBuilder` sees at ingest.
     ///
     /// Vectors live in the embedded vector blob, never in
     /// Parquet, so they don't appear here. The id column is
-    /// always first.
+    /// always first. Index-only FTS columns DO appear here —
+    /// their text must reach the builder to be tokenized —
+    /// but the builder drops them from the Parquet body, so
+    /// the readable shape is [`Self::stored_schema`].
     ///
     /// Cost is one schema-walk + one `Vec::clone` of the
     /// surviving fields per call. Caching on first call is a
@@ -1315,6 +1317,33 @@ impl SupertableOptions {
                 .filter(|f| !vector_names.contains(f.name().as_str()))
                 .cloned(),
         );
+        Arc::new(Schema::new(kept))
+    }
+
+    /// The readable (stored) schema — [`Self::scalar_schema`] minus
+    /// index-only FTS columns (`stored: false`). Index-only text feeds
+    /// the FTS blob at ingest but never lands in Parquet, so it cannot
+    /// be scanned, projected, or filtered on; the SQL scan view and the
+    /// search-result projection surface resolve names against this
+    /// shape so such a column is rejected up front like any unknown
+    /// column, instead of failing mid-decode.
+    pub fn stored_schema(&self) -> Arc<Schema> {
+        let unstored: HashSet<&str> = self
+            .fts_columns
+            .iter()
+            .filter(|fc| !fc.stored)
+            .map(|fc| fc.column.as_str())
+            .collect();
+        let scalar = self.scalar_schema();
+        if unstored.is_empty() {
+            return scalar;
+        }
+        let kept: Vec<Arc<Field>> = scalar
+            .fields()
+            .iter()
+            .filter(|f| !unstored.contains(f.name().as_str()))
+            .cloned()
+            .collect();
         Arc::new(Schema::new(kept))
     }
 }
@@ -1389,6 +1418,7 @@ mod tests {
         FtsConfig {
             column: name.into(),
             positions: false,
+            stored: true,
         }
     }
 

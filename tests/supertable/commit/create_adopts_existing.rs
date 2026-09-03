@@ -126,6 +126,7 @@ fn vector_options() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         Some(default_tokenizer()),

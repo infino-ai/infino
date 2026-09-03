@@ -210,6 +210,7 @@ fn options_title_emb() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![VectorConfig {
             column: "emb".into(),

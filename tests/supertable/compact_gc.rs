@@ -514,6 +514,7 @@ fn hidden_vector_options() -> SupertableOptions {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![vector_config],
         Some(default_tokenizer()),

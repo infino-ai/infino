@@ -46,6 +46,7 @@ fn build_standard(corpus: &[(u64, &str)]) -> SuperfileReader {
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
+            stored: true,
         }],
         vec![],
         Some(Arc::new(StandardTokenizer)),
