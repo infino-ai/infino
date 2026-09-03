@@ -1192,17 +1192,17 @@ impl DiskCacheStore {
         expected_size: Option<u64>,
     ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
         let path = self.cache_path(uri);
-        let Ok(meta) = fs::metadata(&path) else {
+        let Ok(meta) = tokio::fs::metadata(&path).await else {
             // A counted file that is gone (deleted outside the engine) must stop counting now:
             // left in place, its record double-counts against the fetched replacement and a later
             // eviction of it would unlink the replacement's file.
-            self.discard_cache_file(uri);
+            self.discard_cache_file(uri).await;
             return Ok(None);
         };
 
         let size = meta.len();
         if size == 0 || expected_size.is_some_and(|want| want != size) {
-            self.discard_cache_file(uri);
+            self.discard_cache_file(uri).await;
             return Ok(None);
         }
 
@@ -1236,8 +1236,8 @@ impl DiskCacheStore {
                 if counted {
                     self.current_bytes.fetch_sub(size, Ordering::Release);
                 }
-                let _ = fs::remove_file(&path);
-                let _ = fs::remove_file(self.blocks_path(uri));
+                let _ = tokio::fs::remove_file(&path).await;
+                let _ = tokio::fs::remove_file(self.blocks_path(uri)).await;
                 Ok(None)
             }
         }
@@ -1246,14 +1246,14 @@ impl DiskCacheStore {
     /// Delete an unusable cache file and give back the bytes the scan counted for it. Subtracts the
     /// record's own size, so the accounting balances even when the file on disk no longer matches
     /// what the scan saw (or is gone entirely).
-    fn discard_cache_file(&self, uri: &SuperfileUri) {
+    async fn discard_cache_file(&self, uri: &SuperfileUri) {
         if let Some((_, file)) = self.unindexed.remove(uri) {
             self.current_bytes
                 .fetch_sub(file.size_bytes, Ordering::Release);
         }
 
-        let _ = fs::remove_file(self.cache_path(uri));
-        let _ = fs::remove_file(self.blocks_path(uri));
+        let _ = tokio::fs::remove_file(self.cache_path(uri)).await;
+        let _ = tokio::fs::remove_file(self.blocks_path(uri)).await;
     }
 
     /// Delete never-opened files, oldest first, until `bytes_needed` is freed. Returns the bytes
@@ -2141,12 +2141,18 @@ impl DiskCacheStore {
         // so chunk writers can use positioned (`pwrite`) writes
         // off the async reactor without a shared file lock.
         let file = {
-            let f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(dest_path)?;
-            f.set_len(size)?;
+            let dest = dest_path.to_path_buf();
+            let f = spawn_blocking(carry_span(move || {
+                let f = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&dest)?;
+                f.set_len(size)?;
+                Ok::<_, DiskCacheError>(f)
+            }))
+            .await
+            .map_err(|e| DiskCacheError::SuperfileOpen(format!("preallocate join: {e}")))??;
             Arc::new(f)
         };
 
@@ -2435,15 +2441,21 @@ async fn cold_fetch_to_disk_cancelable(
         filled.resize(n_chunks as usize, false);
     }
     let file = {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true);
-        if first_attempt {
-            opts.truncate(true);
-        }
-        let file = opts.open(dest_path)?;
-        if first_attempt {
-            file.set_len(size)?;
-        }
+        let dest = dest_path.to_path_buf();
+        let file = spawn_blocking(carry_span(move || {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true);
+            if first_attempt {
+                opts.truncate(true);
+            }
+            let file = opts.open(&dest)?;
+            if first_attempt {
+                file.set_len(size)?;
+            }
+            Ok::<_, DiskCacheError>(file)
+        }))
+        .await
+        .map_err(|e| DiskCacheError::SuperfileOpen(format!("preallocate join: {e}")))??;
         Arc::new(file)
     };
 
