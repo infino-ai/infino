@@ -146,9 +146,11 @@ impl Collected {
 impl FtsReader {
     /// Expand each of `patterns` into the indexed terms of `column` it
     /// covers, in lex order, in one pass over the dictionary. A slot is
-    /// `None` when more than `max_terms` terms qualify for its pattern —
-    /// too broad for a posting-list answer; the caller falls back to
-    /// scanning for that token.
+    /// `None` when its pattern cannot be answered from the dictionary:
+    /// more than `max_terms` terms qualify (too broad for a posting-list
+    /// answer), or it needs the whole column walked and `allow_full_walk`
+    /// is off (the caller judged that walk dearer than the scan it would
+    /// replace). The caller falls back to scanning for that token.
     ///
     /// An [`TermPattern::Exact`] token is its own expansion. A prefix
     /// token walks only its own subtree. Every suffix or infix token is
@@ -168,12 +170,16 @@ impl FtsReader {
         patterns: &[TermPattern<'_>],
         fold: bool,
         max_terms: usize,
+        allow_full_walk: bool,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), FtsError> {
         self.resolve_column_id(column)?;
         let walks: Vec<Walk> = patterns.iter().map(|p| p.walk(fold)).collect();
         let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
         let mut work = MatchWork::default();
-        if walks.iter().any(|w| *w != Walk::None) {
+        let needs_dict = walks
+            .iter()
+            .any(|w| *w == Walk::Subtree || (*w == Walk::Full && allow_full_walk));
+        if needs_dict {
             let fst_bytes = self.dict_bytes_async().await?;
             let dict = Self::open_dict(&fst_bytes)?;
             work.planned_ranges += 1;
@@ -193,7 +199,7 @@ impl FtsReader {
                 }
             }
             let mut full: Vec<usize> = (0..patterns.len())
-                .filter(|&i| walks[i] == Walk::Full)
+                .filter(|&i| walks[i] == Walk::Full && allow_full_walk)
                 .collect();
             if !full.is_empty() {
                 dict.for_each_prefix(&make_key(column, ""), |key, _| {
@@ -216,6 +222,7 @@ impl FtsReader {
         for ((slot, pattern), walk) in collected.into_iter().zip(patterns).zip(&walks) {
             out.push(match walk {
                 Walk::None => Some(vec![pattern.text().to_owned()]),
+                Walk::Full if !allow_full_walk => None,
                 Walk::Subtree | Walk::Full => slot.finish(),
             });
         }
@@ -225,6 +232,8 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
+    use tokio::runtime::Runtime;
+
     use super::{
         super::test_util::{build_blob, build_standard_fold_blob},
         *,
@@ -239,8 +248,8 @@ mod tests {
         fold: bool,
         max_terms: usize,
     ) -> (Vec<Option<Vec<String>>>, MatchWork) {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(r.expand_terms("body", patterns, fold, max_terms))
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(r.expand_terms("body", patterns, fold, max_terms, true))
             .expect("expand_terms")
     }
 
@@ -313,6 +322,45 @@ mod tests {
             ]
         );
         assert_eq!(work.planned_ranges, 1, "one FST fetch for the whole leaf");
+    }
+
+    #[test]
+    fn a_disallowed_full_walk_leaves_the_pattern_unanswered() {
+        // The caller judged the whole-column walk dearer than the scan: the
+        // suffix and infix tokens come back `None`, the prefix token still
+        // walks its subtree, the exact token is untouched, and the FST is
+        // still fetched once for the subtree walk.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let rt = Runtime::new().expect("runtime");
+        let (out, work) = rt
+            .block_on(r.expand_terms(
+                "body",
+                &[
+                    TermPattern::Contains("o"),
+                    TermPattern::Suffix("me"),
+                    TermPattern::Prefix("ja"),
+                    TermPattern::Exact("rust"),
+                ],
+                false,
+                MAX_TERMS,
+                false,
+            ))
+            .expect("expand_terms");
+        assert_eq!(out, vec![None, None, owned(&["java"]), owned(&["rust"])]);
+        assert_eq!(work.planned_ranges, 1);
+        // Nothing but full-walk patterns: no dictionary fetch at all.
+        let (out, work) = rt
+            .block_on(r.expand_terms(
+                "body",
+                &[TermPattern::Contains("o")],
+                false,
+                MAX_TERMS,
+                false,
+            ))
+            .expect("expand_terms");
+        assert_eq!(out, vec![None]);
+        assert_eq!(work.planned_ranges, 0);
     }
 
     #[test]
@@ -402,9 +450,9 @@ mod tests {
     fn unknown_column_errors_like_a_match_would() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = Runtime::new().expect("runtime");
         let err = rt
-            .block_on(r.expand_terms("nope", &[TermPattern::Prefix("ru")], false, MAX_TERMS))
+            .block_on(r.expand_terms("nope", &[TermPattern::Prefix("ru")], false, MAX_TERMS, true))
             .expect_err("unknown column");
         assert!(matches!(err, FtsError::UnknownColumn(_)));
     }

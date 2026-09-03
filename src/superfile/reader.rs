@@ -1202,19 +1202,23 @@ impl SuperfileReader {
 
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of
     /// `column` each covers, in one dictionary pass (a slot is `None` when
-    /// more than `max_terms` qualify); `fold` compares terms under the
-    /// `ILIKE` folding. Delegates to [`FtsReader::expand_terms`].
+    /// more than `max_terms` qualify, or when it needs the whole column
+    /// walked and `allow_full_walk` is off); `fold` compares terms under
+    /// the `ILIKE` folding. Delegates to [`FtsReader::expand_terms`].
     pub(crate) async fn expand_terms(
         &self,
         column: &str,
         patterns: &[TermPattern<'_>],
         fold: bool,
         max_terms: usize,
+        allow_full_walk: bool,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.expand_terms(column, patterns, fold, max_terms).await?)
+        Ok(fts
+            .expand_terms(column, patterns, fold, max_terms, allow_full_walk)
+            .await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s

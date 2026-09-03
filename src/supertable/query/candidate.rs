@@ -248,7 +248,8 @@ impl CandidatePlan {
                     tokens,
                     fold,
                 } => {
-                    let (expanded, mut work) = expand_like(reader, column, tokens, *fold).await?;
+                    let (expanded, mut work) =
+                        expand_like(reader, column, tokens, *fold, true).await?;
                     let (docs, eval_work) = expanded.evaluate(reader).await?;
                     work.merge(eval_work);
                     Ok((docs, work))
@@ -474,7 +475,8 @@ impl CandidatePlan {
                     tokens,
                     fold,
                 } => {
-                    let (expanded, mut work) = expand_like(reader, column, tokens, *fold).await?;
+                    let (expanded, mut work) =
+                        expand_like(reader, column, tokens, *fold, true).await?;
                     let (rows, est_work) = expanded.estimate(reader).await?;
                     work.merge(est_work);
                     Ok((rows, work))
@@ -525,11 +527,14 @@ impl CandidatePlan {
     /// superfile: each fragment token becomes the
     /// [`TermsAny`](Self::TermsAny) of the indexed terms it covers, or
     /// `Unbounded` (dropping out of its `AND`) when more than
-    /// [`LIKE_MAX_TERMS`] qualify. Every other node is copied. The work is
-    /// the dictionary fetches performed.
+    /// [`LIKE_MAX_TERMS`] qualify or when the token needs the column's
+    /// whole dictionary walked and `full_walk_pays(column)` says that walk
+    /// is dearer than the scan it would replace. Every other node is
+    /// copied. The work is the dictionary fetches performed.
     pub(crate) fn expand<'a>(
         &'a self,
         reader: &'a SuperfileReader,
+        full_walk_pays: &'a (dyn Fn(&str) -> bool + Sync),
     ) -> BoxFuture<'a, Result<(CandidatePlan, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
@@ -537,13 +542,15 @@ impl CandidatePlan {
                     column,
                     tokens,
                     fold,
-                } => expand_like(reader, column, tokens, *fold).await,
+                } => expand_like(reader, column, tokens, *fold, full_walk_pays(column)).await,
                 CandidatePlan::And(children) => {
-                    let (expanded, work) = expand_children(reader, children).await?;
+                    let (expanded, work) =
+                        expand_children(reader, children, full_walk_pays).await?;
                     Ok((and_combine(expanded), work))
                 }
                 CandidatePlan::Or(children) => {
-                    let (expanded, work) = expand_children(reader, children).await?;
+                    let (expanded, work) =
+                        expand_children(reader, children, full_walk_pays).await?;
                     Ok((or_combine(expanded), work))
                 }
                 leaf => Ok((leaf.clone(), MatchWork::default())),
@@ -556,11 +563,12 @@ impl CandidatePlan {
 async fn expand_children(
     reader: &SuperfileReader,
     children: &[CandidatePlan],
+    full_walk_pays: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<(Vec<CandidatePlan>, MatchWork), ReadError> {
     let mut expanded = Vec::with_capacity(children.len());
     let mut work = MatchWork::default();
     for child in children {
-        let (plan, child_work) = child.expand(reader).await?;
+        let (plan, child_work) = child.expand(reader, full_walk_pays).await?;
         work.merge(child_work);
         expanded.push(plan);
     }
@@ -568,20 +576,22 @@ async fn expand_children(
 }
 
 /// Bind one `TermsLike` leaf to a superfile: the `AND` of each token's
-/// expansion. A token widening past [`LIKE_MAX_TERMS`] contributes no
-/// constraint (`Unbounded`, which `and_combine` drops); every token too
-/// wide ⇒ the leaf is `Unbounded` and the superfile scans. `fold` is the
-/// leaf's `ILIKE` flag.
+/// expansion. A token widening past [`LIKE_MAX_TERMS`], or one that needs
+/// the whole dictionary walked while `allow_full_walk` is off, contributes
+/// no constraint (`Unbounded`, which `and_combine` drops); every token
+/// unanswered ⇒ the leaf is `Unbounded` and the superfile scans. `fold`
+/// is the leaf's `ILIKE` flag.
 async fn expand_like(
     reader: &SuperfileReader,
     column: &str,
     tokens: &[LikeToken],
     fold: bool,
+    allow_full_walk: bool,
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
     // One dictionary pass widens every token of the leaf.
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
     let (expansions, work) = reader
-        .expand_terms(column, &patterns, fold, LIKE_MAX_TERMS)
+        .expand_terms(column, &patterns, fold, LIKE_MAX_TERMS, allow_full_walk)
         .await?;
     let parts = expansions
         .into_iter()

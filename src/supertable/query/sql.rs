@@ -548,14 +548,15 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{collections::HashSet, iter::repeat_n, sync::Arc};
 
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
-        RecordBatch, StringArray, StringViewArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{datasource::MemTable, prelude::SessionContext};
+    use tokio::runtime::Runtime;
 
     use crate::{
         memory::ConnectionMemoryBudget,
@@ -1738,12 +1739,14 @@ mod tests {
             let name = tokenizer.name();
             let st = Supertable::create(options_id_cat_title_with(tokenizer)).expect("create");
             let mut w = st.writer().expect("writer");
-            let cats: Vec<&str> = LIKE_TITLES.iter().map(|_| "x").collect();
-            w.append(&build_cat_batch(0, &cats, LIKE_TITLES))
+            let titles = with_walk_filler(LIKE_TITLES);
+            let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
+            w.append(&build_cat_batch(0, &cats, &title_refs))
                 .expect("append");
             w.commit().expect("commit");
             for pattern in LIKE_PATTERNS {
-                let expected: HashSet<&str> = LIKE_TITLES
+                let expected: HashSet<&str> = title_refs
                     .iter()
                     .copied()
                     .filter(|title| like_oracle(title, pattern))
@@ -1770,12 +1773,14 @@ mod tests {
         // decide — including the long s and the Kelvin sign that Unicode
         // case folding matches against `s` and `k` — the index-bounded
         // plan must return exactly that, under both analyzers.
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = Runtime::new().expect("runtime");
         let analyzers: [Arc<dyn Tokenizer>; 2] = [tok(), Arc::new(StandardTokenizer)];
         for tokenizer in analyzers {
             let name = tokenizer.name();
-            let cats: Vec<&str> = FOLD_TITLES.iter().map(|_| "x").collect();
-            let batch = build_cat_batch(0, &cats, FOLD_TITLES);
+            let titles = with_walk_filler(FOLD_TITLES);
+            let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
+            let batch = build_cat_batch(0, &cats, &title_refs);
 
             let st = Supertable::create(options_id_cat_title_with(tokenizer)).expect("create");
             let mut w = st.writer().expect("writer");
@@ -1800,33 +1805,106 @@ mod tests {
         }
     }
 
-    #[test]
-    fn query_sql_like_mixes_bounded_and_unbounded_superfiles() {
-        // Two superfiles under the `standard` analyzer. The first holds
-        // more distinct terms containing `zz` than a LIKE token may widen
-        // to, so `%zz%` is unbounded there and that superfile scans with
-        // the row filter; the second holds two such terms and is bounded.
-        // One query spans both paths and must still be exact. A prefix
-        // pattern flips the roles: bounded in the first, empty in the
-        // second (no term starts with `q1`), which skips it outright.
-        const OVER_CAP_ROWS: usize = LIKE_MAX_TERMS + 76;
+    /// Rows of the wide superfile in [`mixed_like_table`]: more distinct
+    /// terms containing `zz` than a LIKE token may widen to.
+    const OVER_CAP_ROWS: usize = LIKE_MAX_TERMS + 76;
+
+    /// Prose appended to every wide-superfile title, and standing alone
+    /// as the filler rows of [`with_walk_filler`], so a superfile's stored
+    /// text dwarfs its vocabulary and a suffix or substring token takes
+    /// the whole-dictionary walk (the walk-vs-scan gate compares the two;
+    /// a handful of short titles on their own sit far under it and would
+    /// only ever exercise the scan).
+    const WALK_FILLER: &str = " lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
+                                eiusmod tempor incididunt ut labore et dolore magna aliqua \
+                                lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
+                                eiusmod tempor incididunt ut labore et dolore magna aliqua";
+
+    /// Filler rows [`with_walk_filler`] adds: enough copies of
+    /// [`WALK_FILLER`] to hold well over the gate's bytes-per-term floor
+    /// against the fixture titles' vocabulary.
+    const WALK_FILLER_ROWS: usize = 64;
+
+    /// `titles` followed by [`WALK_FILLER_ROWS`] rows of [`WALK_FILLER`].
+    /// The oracles judge the filler rows like any other, so they may add
+    /// to a pattern's expected set (`%` matches them all).
+    fn with_walk_filler(titles: &[&str]) -> Vec<String> {
+        titles
+            .iter()
+            .map(|t| (*t).to_owned())
+            .chain(repeat_n(WALK_FILLER.trim().to_owned(), WALK_FILLER_ROWS))
+            .collect()
+    }
+
+    /// Two superfiles under the `standard` analyzer: a wide one whose
+    /// `q{i}zz` titles hold more distinct `zz` terms than the cap, and a
+    /// narrow one with two such terms (plus the filler rows that let it
+    /// walk its dictionary).
+    fn mixed_like_table() -> Supertable {
         let st = Supertable::create(options_id_cat_title_with(Arc::new(StandardTokenizer)))
             .expect("create");
         let mut w = st.writer().expect("writer");
-        let wide: Vec<String> = (0..OVER_CAP_ROWS).map(|i| format!("q{i}zz")).collect();
+        let wide: Vec<String> = (0..OVER_CAP_ROWS)
+            .map(|i| format!("q{i}zz{WALK_FILLER}"))
+            .collect();
         let wide_refs: Vec<&str> = wide.iter().map(String::as_str).collect();
         let cats: Vec<&str> = wide_refs.iter().map(|_| "x").collect();
         w.append(&build_cat_batch(0, &cats, &wide_refs))
             .expect("append wide");
         w.commit().expect("commit wide");
-        w.append(&build_cat_batch(
-            0,
-            &["y", "y", "y"],
-            &["buzz lightyear", "fizz", "plain"],
-        ))
-        .expect("append narrow");
+        let narrow = with_walk_filler(&["buzz lightyear", "fizz", "plain"]);
+        let narrow_refs: Vec<&str> = narrow.iter().map(String::as_str).collect();
+        let cats: Vec<&str> = narrow_refs.iter().map(|_| "y").collect();
+        w.append(&build_cat_batch(0, &cats, &narrow_refs))
+            .expect("append narrow");
         w.commit().expect("commit narrow");
         assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
+        st
+    }
+
+    /// Value `i` of a string column of whichever Arrow string width
+    /// DataFusion chose for it (EXPLAIN's columns are not coerced the way
+    /// user columns are).
+    fn string_at(column: &ArrayRef, i: usize) -> String {
+        let any = column.as_any();
+        if let Some(a) = any.downcast_ref::<StringArray>() {
+            a.value(i).to_owned()
+        } else if let Some(a) = any.downcast_ref::<LargeStringArray>() {
+            a.value(i).to_owned()
+        } else if let Some(a) = any.downcast_ref::<StringViewArray>() {
+            a.value(i).to_owned()
+        } else {
+            panic!("not a string column: {:?}", column.data_type());
+        }
+    }
+
+    /// The physical plan DataFusion prints for `sql`.
+    fn explain_physical(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain");
+        for batch in &batches {
+            for i in 0..batch.num_rows() {
+                if string_at(batch.column(0), i) == "physical_plan" {
+                    return string_at(batch.column(1), i);
+                }
+            }
+        }
+        panic!("no physical plan in EXPLAIN output");
+    }
+
+    #[test]
+    fn query_sql_like_mixes_bounded_and_unbounded_superfiles() {
+        // The first superfile holds more distinct terms containing `zz`
+        // than a LIKE token may widen to, so `%zz%` is unbounded there and
+        // that superfile scans with the row filter; the second holds two
+        // such terms and is bounded. One query spans both paths and must
+        // still be exact. A prefix pattern flips the roles: bounded in the
+        // first, empty in the second (no term starts with `q1`), which
+        // skips it outright.
+        let st = mixed_like_table();
 
         // Contains: unbounded in the wide superfile, bounded in the narrow.
         assert_eq!(
@@ -1852,6 +1930,46 @@ mod tests {
             ),
             2,
         );
+    }
+
+    #[test]
+    fn query_sql_row_filter_attaches_only_where_a_plan_is_unbounded() {
+        // DataFusion's Parquet row filter pays only when the index found
+        // no bound: a LIKE token past the cap in some superfile, or a plan
+        // that was never bounded. A bounded plan leaves it off, and so
+        // does a plan the selectivity gate sends to a scan for being
+        // dense — there the filter would keep nearly every row and only
+        // add its own decode pass.
+        //
+        // The witness is the `FilterExec` node: with the row filter on,
+        // DataFusion pushes the filter into the scan (the source accepts
+        // row filters) and drops the node; with it off the node stays
+        // above the scan. The scan prints `predicate=` either way — every
+        // filter is kept there for statistics pruning — so that text
+        // proves nothing. The probes project a column so no query folds
+        // to a manifest count without a scan.
+        let st = mixed_like_table();
+        let expect_row_filter = |sql: &str, on: bool| {
+            let plan = explain_physical(&st, sql);
+            assert!(plan.contains("DataSourceExec"), "{sql}\n{plan}");
+            assert_eq!(!plan.contains("FilterExec"), on, "{sql}\n{plan}");
+        };
+        // Over the cap in the wide superfile ⇒ on.
+        expect_row_filter("SELECT title FROM supertable WHERE title LIKE '%zz%'", true);
+        // Bounded in both superfiles (prefix subtree walk; empty in the
+        // narrow one) ⇒ off.
+        expect_row_filter("SELECT title FROM supertable WHERE title LIKE 'q1%'", false);
+        // Equality on the FTS column, bounded ⇒ off.
+        expect_row_filter("SELECT title FROM supertable WHERE title = 'fizz'", false);
+        // A dense predicate nearly every row of both superfiles satisfies
+        // (`lorem` is in every filler row): the gate sends them to a scan,
+        // and the row filter stays off.
+        expect_row_filter(
+            "SELECT title FROM supertable WHERE title IN ('lorem', 'plain')",
+            false,
+        );
+        // Never bounded (a non-FTS column) ⇒ on, as before.
+        expect_row_filter("SELECT title FROM supertable WHERE category = 'y'", true);
     }
 
     #[test]

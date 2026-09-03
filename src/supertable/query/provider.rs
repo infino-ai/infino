@@ -184,6 +184,18 @@ const PUSHDOWN_MIN_ROWS: u64 = 4096;
 /// plain scan.
 const PUSHDOWN_MAX_DENSITY: f64 = 0.5;
 
+/// Gate for a `LIKE` token that needs a superfile's whole dictionary
+/// walked (a suffix or infix, or an `ILIKE` token that may be spelled
+/// with `ſ`): the walk is taken only when the column holds at least this
+/// many stored bytes per distinct term, i.e. when the scan it replaces is
+/// large next to the vocabulary. Measured on a 127,600-row news corpus
+/// split into 40 superfiles (55 bytes of text per dictionary key), the
+/// walk path ran at 1.8× the plain scan: a key visit costs about as much
+/// as scanning 45 bytes, so break-even sits near 45 bytes per term and
+/// 128 keeps the walk under ~35% of the scan. A superfile without a term
+/// count passes (nothing to judge by).
+const LIKE_WALK_MIN_BYTES_PER_TERM: u64 = 128;
+
 /// A [`TableProvider`] over a pinned supertable snapshot.
 ///
 /// Cheap to build (just `Arc` clones); all real work happens in
@@ -758,6 +770,31 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
+/// Whether walking a column's whole dictionary (`terms` distinct terms) is
+/// worth it against scanning its `bytes` of stored text — see
+/// [`LIKE_WALK_MIN_BYTES_PER_TERM`]. A missing term count (0) passes.
+fn full_walk_pays(terms: u64, bytes: u64) -> bool {
+    terms == 0 || bytes / terms >= LIKE_WALK_MIN_BYTES_PER_TERM
+}
+
+/// Stored (uncompressed) bytes of `column`'s data pages across a
+/// superfile's row groups — the volume a scan of that column decodes.
+/// `None` when the footer has no leaf column of that name.
+fn column_stored_bytes(meta: &ParquetMetaData, column: &str) -> Option<u64> {
+    let index = meta
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|descr| descr.name() == column)?;
+    Some(
+        meta.row_groups()
+            .iter()
+            .map(|rg| rg.column(index).uncompressed_size().max(0) as u64)
+            .sum(),
+    )
+}
+
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
 /// Used to tokenize an equality literal for FTS-bloom pruning.
 fn scalar_as_str(v: &ScalarValue) -> Option<&str> {
@@ -873,6 +910,12 @@ impl TableProvider for SupertableProvider {
             tombstones: Arc<RoaringBitmap>,
         }
         let mut superfiles: Vec<SuperfileScan> = Vec::with_capacity(survivors.len());
+        // Whether some superfile's plan came out `Unbounded` — the whole
+        // plan is, or a `LIKE` token found no bound in that superfile's
+        // dictionary. Decides whether DataFusion's row filter is attached
+        // below; a superfile the selectivity gate sends to a scan is not
+        // counted (see there).
+        let mut any_plan_unbounded = matches!(candidate_plan, CandidatePlan::Unbounded);
 
         for (entry, prepared) in survivors.iter().zip(prepared_files) {
             // Pass 1 (per superfile): resolve candidate rows from the
@@ -890,8 +933,27 @@ impl TableProvider for SupertableProvider {
             let mut predicate_work = MatchWork::default();
             let expanded;
             let plan = if needs_expansion {
+                // A whole-dictionary walk pays only when the column's
+                // stored text is large next to its vocabulary; judged per
+                // column from the manifest's term count and the Parquet
+                // footer's column size, neither of which costs a read.
+                let meta = self
+                    .scan_metas
+                    .get(&prepared.path)
+                    .map(|m| Arc::clone(m.value()));
+                let full_walk_pays = |column: &str| {
+                    let terms = entry
+                        .fts_summary
+                        .get(column)
+                        .map_or(0, |summary| summary.n_terms_distinct);
+                    let bytes = meta
+                        .as_ref()
+                        .and_then(|m| column_stored_bytes(m, column))
+                        .unwrap_or(0);
+                    full_walk_pays(terms, bytes)
+                };
                 let (plan, expand_work) = candidate_plan
-                    .expand(prepared.reader.as_ref())
+                    .expand(prepared.reader.as_ref(), &full_walk_pays)
                     .await
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 predicate_work.merge(expand_work);
@@ -900,6 +962,7 @@ impl TableProvider for SupertableProvider {
             } else {
                 &candidate_plan
             };
+            any_plan_unbounded |= matches!(plan, CandidatePlan::Unbounded);
             let (est, est_work) = plan
                 .estimate(prepared.reader.as_ref())
                 .await
@@ -973,23 +1036,25 @@ impl TableProvider for SupertableProvider {
 
         // Tier 2 - DataFusion-owned row-group / page pruning + row-level
         // filter pushdown, used **only when the index could not bound the
-        // rows** of some superfile: an `Unbounded` candidate plan, a `LIKE`
-        // token too wide for that superfile's dictionary, or a superfile
-        // the selectivity gate sent to a scan. In that fallback the
-        // predicate becomes a Parquet `RowFilter` (`with_pushdown_filters`)
-        // so the predicate columns are decoded first and only surviving
-        // rows materialize.
+        // rows** of some superfile: an `Unbounded` candidate plan, or a
+        // `LIKE` token that found no bound in that superfile's dictionary.
+        // In that fallback the predicate becomes a Parquet `RowFilter`
+        // (`with_pushdown_filters`) so the predicate columns are decoded
+        // first and only surviving rows materialize.
         //
-        // When the index bounded *every* superfile, each access plan
-        // already selects exactly the candidate rows and the `FilterExec`
-        // above (filters are `Inexact`) verifies the exact predicate over
-        // that tiny set. So we attach the pushdown predicate only when some
-        // superfile scans.
-        let all_bounded = superfiles.iter().all(|seg| seg.candidates.is_some());
-        let predicate = if all_bounded {
-            None
-        } else {
+        // When the index bounded the rows, each access plan already selects
+        // exactly the candidate rows and the `FilterExec` above (filters
+        // are `Inexact`) verifies the exact predicate over that tiny set.
+        // A superfile the selectivity gate sent to a scan deliberately gets
+        // no row filter either: the gate fires when the predicate matches
+        // most rows, and a row filter that keeps most rows only adds its
+        // own decode pass on top of the scan — measured on the 1M-row SQL
+        // bench, `bucket IN (all)` and a majority `category` aggregate ran
+        // 1.6–3× slower with it attached.
+        let predicate = if any_plan_unbounded {
             row_group_predicate(state, filters, &self.schema)
+        } else {
+            None
         };
 
         // Only push the LIMIT into the scan when there are no filters:
@@ -2379,6 +2444,25 @@ mod tests {
             3,
             "an open-edged LIKE token under ascii_lower prunes nothing"
         );
+    }
+
+    #[test]
+    fn a_whole_dictionary_walk_pays_only_when_text_dwarfs_vocabulary() {
+        // Below the bytes-per-term floor the scan is cheaper than the walk
+        // (the measured news-corpus shape sits at 55 bytes per term).
+        assert!(!full_walk_pays(452_011, 24_700_000));
+        // Long documents over a small vocabulary: the walk is a rounding
+        // error next to the scan.
+        assert!(full_walk_pays(10_000, 8 * 1024 * 1024));
+        // Exactly at the floor passes; one byte under does not.
+        let terms = 1_000;
+        assert!(full_walk_pays(terms, terms * LIKE_WALK_MIN_BYTES_PER_TERM));
+        assert!(!full_walk_pays(
+            terms,
+            terms * LIKE_WALK_MIN_BYTES_PER_TERM - 1
+        ));
+        // No term count to judge by ⇒ the walk is allowed.
+        assert!(full_walk_pays(0, 0));
     }
 
     /// Build a provider over a freshly-committed two-superfile table
