@@ -909,104 +909,146 @@ impl TableProvider for SupertableProvider {
             prepared: Arc<PreparedScanFile>,
             candidates: Option<RoaringBitmap>,
             tombstones: Arc<RoaringBitmap>,
+            /// This superfile's plan came out `Unbounded` — the whole plan
+            /// is, or a `LIKE` token found no bound in its dictionary.
+            unbounded: bool,
+            /// The pushdown predicate's df probes, dictionary walks and
+            /// posting walks on this superfile.
+            predicate_work: MatchWork,
         }
-        let mut superfiles: Vec<SuperfileScan> = Vec::with_capacity(survivors.len());
-        // Whether some superfile's plan came out `Unbounded` — the whole
-        // plan is, or a `LIKE` token found no bound in that superfile's
-        // dictionary. Decides whether DataFusion's row filter is attached
-        // below; a superfile the selectivity gate sends to a scan is not
-        // counted (see there).
-        let mut any_plan_unbounded = matches!(candidate_plan, CandidatePlan::Unbounded);
         // The plan's dictionary walks (a `LIKE` leaf's expansion) are CPU
         // work and run on the reader pool behind a oneshot; only their FST
         // fetches stay on this runtime.
         let reader_pool: &ThreadPool = &self.manifest.options.reader_pool;
 
-        for (entry, prepared) in survivors.iter().zip(prepared_files) {
-            // Pass 1 (per superfile): resolve candidate rows from the
-            // index. `None` => no usable bound, scan the superfile.
-            //
-            // Selectivity gate: estimate the match count from per-term
-            // `df` first (cheap, header-only). If a predicate would match
-            // more than `PUSHDOWN_MAX_FRACTION` of this superfile, skip the
-            // index path and let DataFusion scan: at that match density
-            // the rows saturate the data pages, so an index `RowSelection`
-            // can't skip any page and only adds posting-walk + selection
-            // overhead. The floor keeps the pushdown active on small
-            // superfiles; the density cap binds even under the floor so
-            // an all-matching predicate never takes the index path.
-            let mut predicate_work = MatchWork::default();
-            let expanded;
-            let plan = if needs_expansion {
-                // A whole-dictionary walk pays only when the column's
-                // stored text is large next to its vocabulary; judged per
-                // column from the manifest's term count and the Parquet
-                // footer's column size, neither of which costs a read.
-                let meta = self
-                    .scan_metas
-                    .get(&prepared.path)
-                    .map(|m| Arc::clone(m.value()));
-                let full_walk_pays = |column: &str| {
-                    let terms = entry
-                        .fts_summary
-                        .get(column)
-                        .map_or(0, |summary| summary.n_terms_distinct);
-                    let bytes = meta
-                        .as_ref()
-                        .and_then(|m| column_stored_bytes(m, column))
-                        .unwrap_or(0);
-                    full_walk_pays(terms, bytes)
-                };
-                let (plan, expand_work) = candidate_plan
-                    .expand(prepared.reader.as_ref(), &full_walk_pays, Some(reader_pool))
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                predicate_work.merge(expand_work);
-                expanded = plan;
-                &expanded
-            } else {
-                &candidate_plan
-            };
-            any_plan_unbounded |= matches!(plan, CandidatePlan::Unbounded);
-            let (est, est_work) = plan
-                .estimate(prepared.reader.as_ref(), Some(reader_pool))
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            predicate_work.merge(est_work);
-            let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64)
-                .max(PUSHDOWN_MIN_ROWS);
-            let density_cap = (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
-            let candidates = if est > gate || est >= density_cap {
-                None
-            } else {
-                let (bitmap, eval_work) = plan
-                    .evaluate(prepared.reader.as_ref(), Some(reader_pool))
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                predicate_work.merge(eval_work);
-                bitmap
-            };
-            // The pushdown predicate's df probes + posting walks, flushed
-            // through the same collector that meters this scan's pages.
-            if let Some(stats) = self.scan_store.op_stats() {
-                stats.add_fts_postings_bytes(predicate_work.postings_bytes);
-                stats.add_planned_read_ranges(predicate_work.planned_ranges);
-                stats.add_kernel_cpu_ns(predicate_work.kernel_cpu_ns);
+        // Pass 1 (per superfile), fanned out: every survivor resolves its
+        // candidate rows in its own future and `try_join_all` drives them
+        // together, so one superfile's dictionary fetch overlaps another's
+        // walk on the reader pool and a third's posting reads, instead of
+        // each superfile waiting for the one before it. The futures share
+        // this task rather than being spawned — the CPU is on the pool and
+        // the I/O is awaited, so the task only polls, and nothing here is
+        // `'static`. `try_join_all` keeps survivor order, so the file list
+        // below stays deterministic in manifest order, and the first
+        // error (in time) ends the scan.
+        let superfiles: Vec<SuperfileScan> = try_join_all(
+            survivors
+                .iter()
+                .zip(prepared_files)
+                .map(|(entry, prepared)| {
+                    let candidate_plan = &candidate_plan;
+                    async move {
+                        // Resolve candidate rows from the index. `None` => no
+                        // usable bound, scan the superfile.
+                        //
+                        // Selectivity gate: estimate the match count from
+                        // per-term `df` first (cheap, header-only). If a
+                        // predicate would match more than
+                        // `PUSHDOWN_MAX_FRACTION` of this superfile, skip the
+                        // index path and let DataFusion scan: at that match
+                        // density the rows saturate the data pages, so an index
+                        // `RowSelection` can't skip any page and only adds
+                        // posting-walk + selection overhead. The floor keeps
+                        // the pushdown active on small superfiles; the density
+                        // cap binds even under the floor so an all-matching
+                        // predicate never takes the index path.
+                        let mut predicate_work = MatchWork::default();
+                        let expanded;
+                        let plan = if needs_expansion {
+                            // A whole-dictionary walk pays only when the
+                            // column's stored text is large next to its
+                            // vocabulary; judged per column from the manifest's
+                            // term count and the Parquet footer's column size,
+                            // neither of which costs a read.
+                            let meta = self
+                                .scan_metas
+                                .get(&prepared.path)
+                                .map(|m| Arc::clone(m.value()));
+                            let full_walk_pays = |column: &str| {
+                                let terms = entry
+                                    .fts_summary
+                                    .get(column)
+                                    .map_or(0, |summary| summary.n_terms_distinct);
+                                let bytes = meta
+                                    .as_ref()
+                                    .and_then(|m| column_stored_bytes(m, column))
+                                    .unwrap_or(0);
+                                full_walk_pays(terms, bytes)
+                            };
+                            let (plan, expand_work) = candidate_plan
+                                .expand(
+                                    prepared.reader.as_ref(),
+                                    &full_walk_pays,
+                                    Some(reader_pool),
+                                )
+                                .await
+                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                            predicate_work.merge(expand_work);
+                            expanded = plan;
+                            &expanded
+                        } else {
+                            candidate_plan
+                        };
+                        let unbounded = matches!(plan, CandidatePlan::Unbounded);
+                        let (est, est_work) = plan
+                            .estimate(prepared.reader.as_ref(), Some(reader_pool))
+                            .await
+                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                        predicate_work.merge(est_work);
+                        let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION)
+                            as u64)
+                            .max(PUSHDOWN_MIN_ROWS);
+                        let density_cap =
+                            (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
+                        let candidates = if est > gate || est >= density_cap {
+                            None
+                        } else {
+                            let (bitmap, eval_work) = plan
+                                .evaluate(prepared.reader.as_ref(), Some(reader_pool))
+                                .await
+                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                            predicate_work.merge(eval_work);
+                            bitmap
+                        };
+
+                        // This superfile's tombstoned rows (empty when no
+                        // overlay); the batch prefetch above already resolved
+                        // them, so this is a cache read.
+                        let tombstones = match self.tombstone_cache.as_ref() {
+                            Some(cache) => {
+                                cache.bitmap_for(entry.superfile_id, now).map_err(|e| {
+                                    DataFusionError::Execution(format!("tombstone cache: {e}"))
+                                })?
+                            }
+                            None => Arc::new(RoaringBitmap::new()),
+                        };
+
+                        Ok::<SuperfileScan, DataFusionError>(SuperfileScan {
+                            prepared,
+                            candidates,
+                            tombstones,
+                            unbounded,
+                            predicate_work,
+                        })
+                    }
+                }),
+        )
+        .await?;
+
+        // Whether some superfile's plan came out `Unbounded`. Decides
+        // whether DataFusion's row filter is attached below; a superfile
+        // the selectivity gate sends to a scan is not counted (see there).
+        let any_plan_unbounded = superfiles.iter().any(|seg| seg.unbounded);
+        // The pushdown predicates' df probes, dictionary walks and posting
+        // walks, flushed through the same collector that meters this
+        // scan's pages — once the fan-out is in, so the tallies land in
+        // manifest order whatever order the superfiles finished in.
+        if let Some(stats) = self.scan_store.op_stats() {
+            for seg in &superfiles {
+                stats.add_fts_postings_bytes(seg.predicate_work.postings_bytes);
+                stats.add_planned_read_ranges(seg.predicate_work.planned_ranges);
+                stats.add_kernel_cpu_ns(seg.predicate_work.kernel_cpu_ns);
             }
-
-            // This superfile's tombstoned rows (empty when no overlay).
-            let tombstones = match self.tombstone_cache.as_ref() {
-                Some(cache) => cache
-                    .bitmap_for(entry.superfile_id, now)
-                    .map_err(|e| DataFusionError::Execution(format!("tombstone cache: {e}")))?,
-                None => Arc::new(RoaringBitmap::new()),
-            };
-
-            superfiles.push(SuperfileScan {
-                prepared,
-                candidates,
-                tombstones,
-            });
         }
 
         // The single object store DataFusion reads every survivor through.
