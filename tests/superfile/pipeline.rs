@@ -555,6 +555,133 @@ fn add_batch_from_reader_mergeability_fts_column_name_mismatch() {
     );
 }
 
+/// Build a one-row superfile over [`pipeline_schema`] with `body` indexed
+/// under `cfg` — fixture for the per-column FTS-config mergeability tests.
+fn one_row_superfile_with(cfg: FtsConfig) -> SuperfileReader {
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![cfg], vec![]);
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    SuperfileReader::open(Bytes::from(b.finish().expect("finish builder"))).expect("open")
+}
+
+/// Merges carry prebuilt postings without re-tokenizing, so an input
+/// whose column was analyzed differently must be refused — carried
+/// postings under one analyzer with the merged file recording another
+/// would silently stop matching at query time.
+#[test]
+fn add_batch_from_reader_mergeability_fts_analyzer_mismatch() {
+    let reader = one_row_superfile_with(FtsConfig::new("body").analyzer("standard"));
+    let opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![FtsConfig::new("body")], // ascii_lower default
+        vec![],
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let err = b
+        .add_batch_from_reader(&reader, None)
+        .expect_err("analyzer mismatch must be refused");
+    assert!(
+        err.to_string().contains("analyzer"),
+        "error names the disagreement: {err}"
+    );
+}
+
+/// A positional column merged with a positionless input would declare
+/// phrase support half its docs can't answer — refused loudly.
+#[test]
+fn add_batch_from_reader_mergeability_fts_positions_mismatch() {
+    let reader = one_row_superfile_with(FtsConfig::new("body"));
+    let opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![FtsConfig::new("body").positions(true)],
+        vec![],
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let err = b
+        .add_batch_from_reader(&reader, None)
+        .expect_err("positions mismatch must be refused");
+    assert!(
+        err.to_string().contains("positions"),
+        "error names the disagreement: {err}"
+    );
+}
+
+/// An input with no FTS index merged into an FTS-declaring builder
+/// would silently contribute zero postings for its rows — refused.
+#[test]
+fn add_batch_from_reader_mergeability_fts_presence_mismatch() {
+    let schema = pipeline_schema();
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let ids = decimal128_ids(vec![1u64]);
+    let titles = LargeStringArray::from(vec!["test"]);
+    let bodies = LargeStringArray::from(vec!["test"]);
+    let scores = Float32Array::from(vec![1.0]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(titles),
+            Arc::new(bodies),
+            Arc::new(scores),
+        ],
+    )
+    .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let no_fts_reader =
+        SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open");
+
+    let opts = BuilderOptions::new(
+        pipeline_schema(),
+        "doc_id",
+        vec![FtsConfig::new("body")],
+        vec![],
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let err = b
+        .add_batch_from_reader(&no_fts_reader, None)
+        .expect_err("an input without an FTS index must be refused");
+    assert!(
+        err.to_string().contains("column len"),
+        "error names the presence mismatch: {err}"
+    );
+}
+
+/// The streaming FTS merge takes its config from the FIRST input; a
+/// later input built under a different analyzer must be refused, not
+/// carried into a file whose recorded analyzer disagrees with the
+/// postings.
+#[test]
+fn fts_merge_rejects_mixed_analyzers() {
+    let a = Arc::new(one_row_superfile_with(FtsConfig::new("body")));
+    let b = Arc::new(one_row_superfile_with(
+        FtsConfig::new("body").analyzer("standard"),
+    ));
+    let err = SuperfileBuilder::build_from_readers_fts_merge(&[(a, None), (b, None)])
+        .expect_err("mixed-analyzer inputs must be refused");
+    assert!(
+        err.to_string().contains("analyzer"),
+        "error names the disagreement: {err}"
+    );
+}
+
 #[test]
 fn add_batch_from_reader_mergeability_vector_column_count_mismatch() {
     // Build superfile with one vector column

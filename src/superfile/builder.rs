@@ -97,6 +97,7 @@ use crate::superfile::{
     },
     fts::{
         builder::FtsBuilder,
+        reader::ColumnMeta,
         tokenize::{ASCII_LOWER_TOKENIZER, AsciiLowerTokenizer, tokenizer_for_name},
     },
     stats::SuperfileStats,
@@ -431,11 +432,71 @@ impl BuilderOptions {
         .with_vector_layout(vector_layout)
     }
 
+    /// Verify a merge input's per-column FTS configuration is
+    /// carry-compatible with this builder's. Merges carry each input's
+    /// prebuilt postings across without re-tokenizing, so the inputs'
+    /// FTS shape must agree exactly — not just column names:
+    ///
+    /// - **presence**: an input without an FTS index merged into an
+    ///   FTS-declaring builder would silently contribute zero postings
+    ///   (and the reverse would silently drop the input's index);
+    /// - **analyzer**: the merged file records ONE analyzer per column,
+    ///   and queries tokenize with it — postings carried from an input
+    ///   built under a different analyzer would silently stop matching;
+    /// - **positions**: a positional column merged with a positionless
+    ///   input would declare phrase support that half its docs can't
+    ///   answer;
+    /// - **stored**: schema equality catches this indirectly (an
+    ///   unstored column is absent from the Parquet schema), but the
+    ///   explicit check names the actual disagreement.
+    ///
+    /// Inputs from one table can never disagree (the table's options
+    /// identity pins the per-column config), so every error here is a
+    /// misuse of the merge entry points — made loud instead of silent.
+    fn check_fts_carry_compat(&self, remote: Option<&[&ColumnMeta]>) -> Result<(), BuildError> {
+        let remote = remote.unwrap_or(&[]);
+        if self.fts_columns.len() != remote.len() {
+            return Err(BuildError::FTSSchemaMismatch(format!(
+                "mismatched column len. self {} vs other {}",
+                self.fts_columns.len(),
+                remote.len()
+            )));
+        }
+        for (own, other) in self.fts_columns.iter().zip(remote.iter()) {
+            if own.column != other.name {
+                return Err(BuildError::FTSSchemaMismatch(format!(
+                    "mismatched column name. self {} vs other {}",
+                    own.column, other.name
+                )));
+            }
+            let other_analyzer = other.tokenizer.name();
+            if own.analyzer != other_analyzer {
+                return Err(BuildError::FTSSchemaMismatch(format!(
+                    "column {}: mismatched analyzer. self {} vs other {}",
+                    own.column, own.analyzer, other_analyzer
+                )));
+            }
+            if own.positions != other.positions {
+                return Err(BuildError::FTSSchemaMismatch(format!(
+                    "column {}: mismatched positions flag. self {} vs other {}",
+                    own.column, own.positions, other.positions
+                )));
+            }
+            if own.stored != other.stored {
+                return Err(BuildError::FTSSchemaMismatch(format!(
+                    "column {}: mismatched stored flag. self {} vs other {}",
+                    own.column, own.stored, other.stored
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn check_mergeability(
         &self,
         remote_id_col: &str,
         remote_schema: &Arc<Schema>,
-        remote_fts_columns: Option<Vec<&str>>,
+        remote_fts_columns: Option<Vec<&ColumnMeta>>,
         remote_vector_columns: Option<Vec<&ColumnReader>>,
     ) -> Result<bool, BuildError> {
         if self.id_column != *remote_id_col {
@@ -452,26 +513,7 @@ impl BuilderOptions {
             });
         }
 
-        if let Some(remote_fts_columns) = remote_fts_columns {
-            let self_fts_columns = &self.fts_columns;
-            if self_fts_columns.len() != remote_fts_columns.len() {
-                return Err(BuildError::FTSSchemaMismatch(format!(
-                    "mismatched column len. self {} vs other {}",
-                    self_fts_columns.len(),
-                    remote_fts_columns.len()
-                )));
-            }
-            for (self_fts_column, remote_fts_column) in
-                self_fts_columns.iter().zip(remote_fts_columns.iter())
-            {
-                if self_fts_column.column != *remote_fts_column {
-                    return Err(BuildError::FTSSchemaMismatch(format!(
-                        "mismatched column name. self {} vs other {}",
-                        self_fts_column.column, remote_fts_column
-                    )));
-                }
-            }
-        }
+        self.check_fts_carry_compat(remote_fts_columns.as_deref())?;
 
         if let Some(remote_vector_columns) = remote_vector_columns {
             let self_vec_columns = &self.vector_columns;
@@ -869,6 +911,13 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         deleted: Option<&RoaringBitmap>,
     ) -> Result<(), BuildError> {
+        // Config compatibility first, before any early return — a
+        // presence or per-column mismatch must fail loud, never carry
+        // partially (see `check_fts_carry_compat`).
+        let remote_cfg = reader
+            .fts()
+            .map(|f| f.fts_columns_config().collect::<Vec<_>>());
+        self.opts.check_fts_carry_compat(remote_cfg.as_deref())?;
         let Some(fts) = reader.fts() else {
             return Ok(());
         };
@@ -931,6 +980,12 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         remap: &[Option<u32>],
     ) -> Result<(), BuildError> {
+        // Same compatibility gate as `carry_fts_from_reader`, so callers
+        // that feed this directly (the multi-cell merge) get it too.
+        let remote_cfg = reader
+            .fts()
+            .map(|f| f.fts_columns_config().collect::<Vec<_>>());
+        self.opts.check_fts_carry_compat(remote_cfg.as_deref())?;
         let Some(fts) = reader.fts() else {
             return Ok(());
         };
@@ -1176,6 +1231,15 @@ impl SuperfileBuilder {
                     "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
                 ));
             }
+            // Per-input FTS config gate: the carry loop below skips
+            // FTS-less inputs, so check presence + per-column agreement
+            // here where every input passes through.
+            let remote_cfg = reader
+                .fts()
+                .map(|f| f.fts_columns_config().collect::<Vec<_>>());
+            superfile_builder
+                .opts
+                .check_fts_carry_compat(remote_cfg.as_deref())?;
             scalar_batches.push(record_batch);
         }
 
@@ -1489,7 +1553,9 @@ impl SuperfileBuilder {
         self.opts.check_mergeability(
             reader.id_column(),
             reader.schema(),
-            reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
+            reader
+                .fts()
+                .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
             reader
                 .vec()
                 .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
@@ -1650,7 +1716,9 @@ impl SuperfileBuilder {
             superfile_builder.opts.check_mergeability(
                 reader.id_column(),
                 reader.schema(),
-                reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
+                reader
+                    .fts()
+                    .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
                 reader
                     .vec()
                     .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
