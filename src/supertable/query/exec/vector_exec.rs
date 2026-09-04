@@ -567,7 +567,7 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{StandardTokenizer, Tokenizer},
+            fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{

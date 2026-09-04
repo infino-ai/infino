@@ -566,7 +566,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{StandardTokenizer, Tokenizer},
+            fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -1988,8 +1988,7 @@ mod tests {
     /// narrow one with two such terms (plus the filler rows that let it
     /// walk its dictionary).
     fn mixed_like_table() -> Supertable {
-        let st = Supertable::create(options_id_cat_title_with(STANDARD_TOKENIZER))
-            .expect("create");
+        let st = Supertable::create(options_id_cat_title_with(STANDARD_TOKENIZER)).expect("create");
         let mut w = st.writer().expect("writer");
         let filler = WALK_FILLER_WORDS.join(" ");
         let wide: Vec<String> = (0..OVER_CAP_ROWS)

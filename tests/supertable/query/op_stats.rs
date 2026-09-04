@@ -18,7 +18,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
+    ConnectOptions, Connection, FtsField, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
@@ -865,7 +865,7 @@ fn sql_like_fixture(dir: &TempDir, padded: bool) -> Connection {
         .create_table(
             "docs",
             schema.clone(),
-            IndexSpec::new().fts_with_analyzer("title", STANDARD_TOKENIZER),
+            IndexSpec::new().fts(FtsField::new("title").analyzer(STANDARD_TOKENIZER)),
         )
         .expect("create_table");
     let padding = if padded { LIKE_PADDING } else { "" };
