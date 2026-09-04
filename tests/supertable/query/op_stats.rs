@@ -18,7 +18,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
+    ConnectOptions, Connection, FtsField, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
@@ -33,7 +33,7 @@ use infino::{
         Supertable, SupertableOptions,
         query::vector::{VectorFilter, VectorSearchOptions},
     },
-    test_helpers::{default_tokenizer, default_vector_config},
+    test_helpers::default_vector_config,
 };
 use tempfile::TempDir;
 
@@ -61,17 +61,9 @@ fn options_title_only() -> SupertableOptions {
         DataType::LargeUtf8,
         false,
     )]));
-    SupertableOptions::new(
-        schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        Vec::new(),
-        Some(default_tokenizer()),
-    )
-    .expect("valid options")
-    .with_writer_pool(writer_pool)
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], Vec::new())
+        .expect("valid options")
+        .with_writer_pool(writer_pool)
 }
 
 /// One segment's titles: `rust` in every other doc, `async` and `web`
@@ -498,12 +490,8 @@ fn vector_options() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }
@@ -627,16 +615,8 @@ fn drained_sq16_adaptive_table(dir: &TempDir) -> Supertable {
         metric: Metric::L2Sq,
         ..default_vector_config("emb", VECTOR_ROT_SEED).with_rerank_codec(RerankCodec::Sq16Adaptive)
     };
-    let opts = SupertableOptions::new(
-        schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        vec![vector],
-        Some(default_tokenizer()),
-    )
-    .expect("valid options");
+    let opts = SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![vector])
+        .expect("valid options");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(opts.with_storage(storage)).expect("create");
@@ -885,7 +865,7 @@ fn sql_like_fixture(dir: &TempDir, padded: bool) -> Connection {
         .create_table(
             "docs",
             schema.clone(),
-            IndexSpec::new().fts_with_analyzer("title", STANDARD_TOKENIZER),
+            IndexSpec::new().fts(FtsField::new("title").analyzer(STANDARD_TOKENIZER)),
         )
         .expect("create_table");
     let padding = if padded { LIKE_PADDING } else { "" };

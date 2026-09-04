@@ -38,7 +38,6 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
 };
 use tempfile::TempDir;
 
@@ -82,17 +81,13 @@ fn cosine_options() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![VectorConfig::new(
             "emb".into(),
             DIM,
             ROT_SEED,
             Metric::Cosine,
         )],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }

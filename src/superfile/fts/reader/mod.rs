@@ -23,6 +23,6 @@ mod work;
 pub use core::*;
 
 pub(crate) use expand::{LONG_S_ASCII, TermPattern, has_fold_partner};
-pub use metadata::OpenOptions;
+pub use metadata::{ColumnMeta, OpenOptions};
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub use work::MatchWork;

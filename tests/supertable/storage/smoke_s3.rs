@@ -68,10 +68,7 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
     ]));
     infino::supertable::SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![VectorConfig {
             column: "emb".into(),
             dim,
@@ -80,7 +77,6 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
             provided_centroids: None,
         }],
-        Some(infino::test_helpers::default_tokenizer()),
     )
     .expect("real S3 test options")
     .with_writer_pool(pool)

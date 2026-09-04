@@ -51,7 +51,6 @@ use infino::{
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
 };
 use tempfile::TempDir;
 
@@ -241,10 +240,7 @@ fn build_batch(start: usize, n: usize) -> RecordBatch {
 fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
     SupertableOptions::new(
         concurrent_schema(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
             dim: VEC_DIM,
@@ -253,7 +249,6 @@ fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOpti
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     )
     .expect("SupertableOptions with FTS + vector")
     .with_storage(storage)

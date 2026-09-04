@@ -107,7 +107,10 @@ impl TableResolver {
         reader.op_stats = self.op_stats.clone();
         let resolved = ResolvedTable {
             reader: Arc::new(reader),
-            scalar_schema: table.options().scalar_schema(),
+            // Stored shape: search TVF output columns resolve against
+            // what Parquet actually holds (index-only FTS columns are
+            // not projectable).
+            scalar_schema: table.options().stored_schema(),
         };
         self.cache
             .lock()

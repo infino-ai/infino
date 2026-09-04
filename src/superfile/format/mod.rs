@@ -12,7 +12,10 @@ pub mod footer;
 pub const PROJECT_MAGIC: &[u8; 3] = b"INF";
 
 /// File-format version. Semver string. Bump major to break compatibility.
-pub const FORMAT_VERSION: &str = "1.0.0";
+/// 1.1.0: `inf.fts.columns` entries may carry `"stored":false` (index-only
+/// FTS columns, absent from the Parquet body); the field is emitted only
+/// when false, and same-major readers default a missing field to true.
+pub const FORMAT_VERSION: &str = "1.1.0";
 
 /// CRC width in bytes (`u32` CRC-32C, little-endian) appended after a
 /// directory or after a subsection's payload. Defined once so the

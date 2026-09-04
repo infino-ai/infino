@@ -25,7 +25,7 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
-    test_helpers::{default_tokenizer, default_vector_config},
+    test_helpers::default_vector_config,
 };
 use tempfile::TempDir;
 
@@ -56,12 +56,8 @@ fn vector_options() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }

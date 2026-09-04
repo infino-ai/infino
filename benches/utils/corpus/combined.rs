@@ -7,22 +7,19 @@ use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::corpus::{
-    TEXT_CORPUS_CHUNK_DOCS, TOKENS_PER_DOC, VECTOR_CORPUS_CHUNK_DOCS, VOCAB_SIZE, ZipfDistribution,
-    chunk_seed, dim, normalize,
+    TextDocGen, VECTOR_CORPUS_CHUNK_DOCS, chunk_seed, dim, normalize, text_flavor,
 };
 
 /// Gaussian scale of a planted cluster center (matches `corpus.rs`).
 const CENTER_GAUSSIAN_SCALE: f32 = 3.0;
 /// Per-dimension Gaussian noise around a cluster center.
 const DOC_NOISE_SIGMA: f32 = 0.3;
-/// Average bytes-per-token estimate for pre-sizing a doc `String`.
-const AVG_BYTES_PER_TOKEN: usize = 8;
 
 /// Stream the same deterministic synthetic docs as [`super::MmapTextCorpus`] +
 /// [`super::MmapVectorCorpus`], one append chunk at a time.
 ///
 /// The mmap corpora generate in parallel by drawing each scheduling chunk
-/// from its own [`chunk_seed`]-derived RNG ([`TEXT_CORPUS_CHUNK_DOCS`] docs
+/// from its own [`chunk_seed`]-derived RNG ([`TextDocGen::chunk_docs`] docs
 /// per text chunk, [`VECTOR_CORPUS_CHUNK_DOCS`] per vector chunk). To stay
 /// bit-identical, this stream reseeds its per-column RNG at the same chunk
 /// boundaries — otherwise streamed ground truth would grade vectors the
@@ -39,7 +36,7 @@ pub struct SequentialSyntheticCorpus {
     vec_rng: StdRng,
     text_rng: StdRng,
     centers: Vec<Vec<f32>>,
-    zipf: ZipfDistribution,
+    text_gen: TextDocGen,
     normalize_vectors: bool,
 }
 
@@ -67,7 +64,7 @@ impl SequentialSyntheticCorpus {
             vec_rng: StdRng::seed_from_u64(chunk_seed(vec_seed, 0)),
             text_rng: StdRng::seed_from_u64(chunk_seed(text_seed, 0)),
             centers,
-            zipf: ZipfDistribution::new(VOCAB_SIZE),
+            text_gen: TextDocGen::new(text_flavor()),
             normalize_vectors,
         }
     }
@@ -110,19 +107,14 @@ impl SequentialSyntheticCorpus {
             if gen_text {
                 // Reseed at the parallel text corpus's chunk boundary so the
                 // token stream matches the chunk-seeded mmap writer.
-                if doc_id.is_multiple_of(TEXT_CORPUS_CHUNK_DOCS) {
-                    self.text_rng = StdRng::seed_from_u64(chunk_seed(
-                        self.text_seed,
-                        doc_id / TEXT_CORPUS_CHUNK_DOCS,
-                    ));
+                let text_chunk_docs = self.text_gen.chunk_docs();
+                if doc_id.is_multiple_of(text_chunk_docs) {
+                    self.text_rng =
+                        StdRng::seed_from_u64(chunk_seed(self.text_seed, doc_id / text_chunk_docs));
                 }
-                let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * AVG_BYTES_PER_TOKEN);
-                doc.push_str(&format!("doc{doc_id:07}"));
-                for _ in 0..TOKENS_PER_DOC {
-                    let idx = self.zipf.sample(&mut self.text_rng);
-                    doc.push(' ');
-                    doc.push_str(&format!("term{idx:05}"));
-                }
+                let mut doc = String::new();
+                self.text_gen
+                    .write_doc(&mut self.text_rng, doc_id, &mut doc);
                 titles.push(doc);
             }
 

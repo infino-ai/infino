@@ -148,18 +148,10 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
             .build()
             .expect("pool"),
     );
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
-    let opts = SupertableOptions::new(
-        schema_id_title(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        vec![],
-        Some(tk),
-    )
-    .expect("opts")
-    .with_writer_pool(pool);
+    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
+    let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+        .expect("opts")
+        .with_writer_pool(pool);
 
     let st = Supertable::create(opts).expect("create");
     let mut w = st.writer().expect("writer");

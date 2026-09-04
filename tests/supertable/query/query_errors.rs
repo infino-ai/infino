@@ -29,7 +29,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
-    test_helpers::{default_tokenizer, default_vector_config},
+    test_helpers::default_vector_config,
 };
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
@@ -60,12 +60,8 @@ fn options_title_rating_emb() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }

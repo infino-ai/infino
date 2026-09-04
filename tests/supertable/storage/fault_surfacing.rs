@@ -34,7 +34,7 @@ use infino::{
     },
     test_helpers::{
         build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
-        default_tokenizer, default_vector_config,
+        default_vector_config,
         fault_storage::{FaultKind, FaultOp, FaultStorage},
         lazy_foreground_disk_cache,
     },
@@ -118,12 +118,8 @@ fn faulted_vector_table() -> (Supertable, RecordBatch, Arc<FaultStorage>, TempDi
     );
     let options = SupertableOptions::new(
         Arc::clone(&schema),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
     .with_writer_pool(pool)
@@ -474,12 +470,8 @@ fn fts_superfile_bytes() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut builder = SuperfileBuilder::new(opts).expect("builder");
     let ids = decimal128_ids(vec![1u64, 2, 3, 4]);

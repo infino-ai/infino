@@ -6064,11 +6064,12 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        // Tokenize the predicate once with the index tokenizer (the same
-        // tokenizer used at build time, so the terms match the postings AND
-        // the manifest term blooms). No tokens (empty / punctuation-only) ⇒
+        // Tokenize the predicate once with the FILTER COLUMN's analyzer
+        // (the same one used at build time, so the terms match the
+        // postings AND the manifest term blooms). A non-FTS filter column
+        // matches nothing; no tokens (empty / punctuation-only) ⇒
         // nothing matches.
-        let Some(tokenizer) = manifest.options.tokenizer.as_ref() else {
+        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(filter.column) else {
             return Ok(Vec::new());
         };
         let tokens: Vec<String> = tokenizer.tokenize(filter.query).collect();
@@ -7585,7 +7586,7 @@ mod tests {
             slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
             writer::{recalibrate_probe_laws, split_overflow_cell},
         },
-        test_helpers::{default_tokenizer as tok, distinct_unit_vectors},
+        test_helpers::distinct_unit_vectors,
     };
 
     /// Drive an async future to completion on a throwaway current-thread
@@ -8647,10 +8648,7 @@ mod tests {
         );
         SupertableOptions::new(
             schema_with_vector(dim),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -8659,7 +8657,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -8714,10 +8711,7 @@ mod tests {
         let opts = BuilderOptions::new(
             scalar_schema.clone(),
             "_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -8726,7 +8720,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("builder");
 
@@ -8794,10 +8787,7 @@ mod tests {
         let opts = BuilderOptions::new(
             scalar_schema.clone(),
             "_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -8806,7 +8796,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         );
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let id_arr = Decimal128Array::from(ids.to_vec())
@@ -11350,10 +11339,7 @@ mod tests {
         );
         SupertableOptions::new(
             schema_with_vector(dim),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -11362,7 +11348,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq16,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -12215,10 +12200,7 @@ mod tests {
         );
         let opts = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -12227,7 +12209,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool);
@@ -12282,10 +12263,7 @@ mod tests {
         );
         let opts = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -12294,7 +12272,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool);
@@ -12389,10 +12366,7 @@ mod tests {
         );
         let opts = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -12401,7 +12375,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool);
@@ -12504,10 +12477,7 @@ mod tests {
         );
         let opts = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -12516,7 +12486,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool);

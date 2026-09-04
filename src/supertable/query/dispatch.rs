@@ -655,13 +655,7 @@ mod codec_verify_tests {
     /// `codec` under `metric`, and open it as a reader.
     fn build_reader(metric: Metric, codec: RerankCodec) -> SuperfileReader {
         let schema = Arc::new(Schema::new(vec![decimal128_id_field("doc_id")]));
-        let opts = BuilderOptions::new(
-            schema.clone(),
-            "doc_id",
-            vec![],
-            vec![cfg(metric, codec)],
-            None,
-        );
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![cfg(metric, codec)]);
         let mut b = SuperfileBuilder::new(opts).expect("new builder");
         let batch = RecordBatch::try_new(schema, vec![Arc::new(decimal128_ids(vec![10u64, 11]))])
             .expect("batch");

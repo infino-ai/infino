@@ -292,15 +292,7 @@ pub fn default_supertable_options() -> SupertableOptions {
             .build()
             .expect("rayon ThreadPoolBuilder with num_threads(1) builds"),
     );
-    SupertableOptions::new(
-        schema_id_title(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    )
-    .expect("SupertableOptions::new with default test fixture args")
-    .with_writer_pool(pool)
+    SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+        .expect("SupertableOptions::new with default test fixture args")
+        .with_writer_pool(pool)
 }

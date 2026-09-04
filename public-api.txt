@@ -276,6 +276,26 @@ impl core::marker::Unpin for infino::Connection
 impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
+pub struct infino::FtsField
+impl infino::FtsField
+pub fn infino::FtsField::analyzer(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::FtsField::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::FtsField::stored(self, bool) -> Self
+impl core::clone::Clone for infino::FtsField
+pub fn infino::FtsField::clone(&self) -> infino::FtsField
+impl core::convert::From<&str> for infino::FtsField
+pub fn infino::FtsField::from(&str) -> Self
+impl core::convert::From<alloc::string::String> for infino::FtsField
+pub fn infino::FtsField::from(alloc::string::String) -> Self
+impl core::fmt::Debug for infino::FtsField
+pub fn infino::FtsField::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::FtsField
+impl core::marker::Send for infino::FtsField
+impl core::marker::Sync for infino::FtsField
+impl core::marker::Unpin for infino::FtsField
+impl core::marker::UnsafeUnpin for infino::FtsField
+impl core::panic::unwind_safe::RefUnwindSafe for infino::FtsField
+impl core::panic::unwind_safe::UnwindSafe for infino::FtsField
 pub struct infino::GcReport
 pub infino::GcReport::bytes_freed: u64
 pub infino::GcReport::delete_errors: u64
@@ -318,8 +338,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::GcSettings
 impl core::panic::unwind_safe::UnwindSafe for infino::GcSettings
 pub struct infino::IndexSpec
 impl infino::IndexSpec
-pub fn infino::IndexSpec::fts(self, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn infino::IndexSpec::fts_with_analyzer(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::IndexSpec::fts(self, impl core::convert::Into<infino::FtsField>) -> Self
 pub fn infino::IndexSpec::new() -> Self
 pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, infino::Metric) -> Self
 impl core::clone::Clone for infino::IndexSpec

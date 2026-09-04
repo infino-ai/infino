@@ -90,9 +90,10 @@ pub enum BuildError {
     ReservedPrefixInColumnName(String),
 
     #[error(
-        "FTS columns declared but no tokenizer supplied; tokenizer is required iff fts_columns is non-empty"
+        "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
+         \"ascii_lower\", \"standard\")"
     )]
-    MissingTokenizer,
+    UnknownAnalyzer { column: String, analyzer: String },
 
     #[error("input RecordBatch schema does not match the supertable's declared schema")]
     BatchSchemaMismatch,

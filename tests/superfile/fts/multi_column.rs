@@ -46,18 +46,8 @@ fn build_two_column(corpus: &[(u64, &str, &str)]) -> SuperfileReader {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![
-            FtsConfig {
-                column: "title".into(),
-                positions: false,
-            },
-            FtsConfig {
-                column: "body".into(),
-                positions: false,
-            },
-        ],
+        vec![FtsConfig::new("title"), FtsConfig::new("body")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let ids = decimal128_ids(corpus.iter().map(|(i, _, _)| *i));

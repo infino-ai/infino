@@ -25,7 +25,7 @@ mod uri;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -36,7 +36,7 @@ use arrow_schema::SchemaRef;
 use dashmap::DashMap;
 use datafusion::{config::Dialect, error::DataFusionError, execution::context::SQLOptions};
 use futures::future::try_join_all;
-pub use index_spec::IndexSpec;
+pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
@@ -64,16 +64,22 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
-        fts::tokenize::{ASCII_LOWER_TOKENIZER, Tokenizer, tokenizer_for_name},
+        fts::tokenize::ASCII_LOWER_TOKENIZER,
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
         Supertable as SupertableHandle,
+        manifest::disk_cache::ManifestDiskCache,
         options::SupertableOptions,
         query::exec::common::collect_plan_metered,
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
+
+/// Subdirectory under a tables cache root holding the manifest-part cache.
+const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
+/// budget for a tables content-addressed manifest-part cache.
+const MANIFEST_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Open (or create) a catalog rooted at `uri`.
 ///
@@ -347,8 +353,6 @@ impl Connection {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         validate_schema(&schema).map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
-        let tokenizers =
-            table_tokenizers(&indexes).map_err(|e| e.with_context("create_table", Some(name)))?;
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -356,7 +360,6 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizers,
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -411,6 +414,7 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes.fts_analyzers(),
+                    fts_stored: indexes.fts_stored(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
@@ -433,13 +437,14 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizers,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
-                if let Some(cache) = disk_cache {
-                    opts = opts.with_disk_cache(cache);
+                if let Some((cache, manifest_cache)) = disk_cache {
+                    opts = opts
+                        .with_disk_cache(cache)
+                        .with_manifest_disk_cache(manifest_cache);
                 }
 
                 // Honor the connection's read-consistency policy (default
@@ -456,7 +461,7 @@ impl Connection {
                 // Gate the commit + memo insert: else a racing `open_table`
                 // sees the commit, misses the memo, and builds a rival store.
                 let gate = single_flight_gate(building, name);
-                let _built = gate.lock().expect("catalog build gate poisoned");
+                let _built = lock_gate(&gate);
 
                 let name_owned = name.to_string();
                 bridge_on_runtime(
@@ -515,7 +520,7 @@ impl Connection {
                 // same-name peer is mid-build (same `Arc`, same mutex); the
                 // winner builds, the rest wake to find a warm `handles`.
                 let gate = single_flight_gate(building, name);
-                let _built = gate.lock().expect("catalog build gate poisoned");
+                let _built = lock_gate(&gate);
 
                 // A peer may have built it while we waited on the gate.
                 if let Some(handle) = live_handle(handles, name) {
@@ -544,7 +549,15 @@ impl Connection {
                         .get(i)
                         .map(String::as_str)
                         .unwrap_or(ASCII_LOWER_TOKENIZER);
-                    spec = spec.fts_with_analyzer(column.clone(), analyzer);
+                    // Same back-compat rule for `fts_stored`: a catalog
+                    // written before index-only columns existed can only
+                    // mean the text is stored.
+                    let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+                    spec = spec.fts(
+                        FtsField::new(column.clone())
+                            .analyzer(analyzer)
+                            .stored(stored),
+                    );
                 }
                 for v in &entry.vectors {
                     spec = spec.vector(
@@ -555,8 +568,6 @@ impl Connection {
                     );
                 }
                 let (fts_cfg, vec_cfg) = spec.to_configs();
-                let tokenizers = table_tokenizers(&spec)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
 
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&entry.location),
@@ -575,13 +586,14 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizers,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
                 .map_err(|e| e.with_context("open_table", Some(name)))?;
-                if let Some(cache) = disk_cache {
-                    opts = opts.with_disk_cache(cache);
+                if let Some((cache, manifest_cache)) = disk_cache {
+                    opts = opts
+                        .with_disk_cache(cache)
+                        .with_manifest_disk_cache(manifest_cache);
                 }
                 // Honor the connection's read-consistency policy. Default is
                 // BoundedStaleness(1s): the per-query pointer re-check is
@@ -693,7 +705,7 @@ impl Connection {
                 // the pre-commit catalog re-inserts the handle after we evict,
                 // and the warm path keeps serving the dropped table.
                 let gate = single_flight_gate(building, name);
-                let _dropping = gate.lock().expect("catalog build gate poisoned");
+                let _dropping = lock_gate(&gate);
 
                 // Evict first: a later create/open rebuilds fresh, and this
                 // frees the handle's `DiskCacheStore`.
@@ -961,16 +973,10 @@ fn build_options(
     schema: SchemaRef,
     fts: Vec<FtsConfig>,
     vectors: Vec<VectorConfig>,
-    tokenizers: Vec<Arc<dyn Tokenizer>>,
     storage: Option<Arc<dyn StorageProvider>>,
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
-    // Seed the default tokenizer with the first column's analyzer (None
-    // when there are no FTS columns), then set the authoritative
-    // per-column tokenizers for per-field analysis.
-    let seed = tokenizers.first().cloned();
-    let mut opts =
-        SupertableOptions::new(schema, fts, vectors, seed)?.with_fts_tokenizers(tokenizers);
+    let mut opts = SupertableOptions::new(schema, fts, vectors)?;
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -986,20 +992,6 @@ fn sql_exec_error(e: DataFusionError) -> InfinoError {
         DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
         other => InfinoError::Query(other.to_string()),
     }
-}
-
-/// Resolve each FTS column's analyzer name to a tokenizer instance,
-/// in declaration order (per-field analysis). Empty when there are no
-/// FTS columns. An unknown analyzer name is a configuration error.
-fn table_tokenizers(indexes: &IndexSpec) -> Result<Vec<Arc<dyn Tokenizer>>, InfinoError> {
-    indexes
-        .fts_analyzers()
-        .iter()
-        .map(|name| {
-            tokenizer_for_name(name)
-                .ok_or_else(|| InfinoError::Config(format!("unknown FTS analyzer: {name:?}")))
-        })
-        .collect()
 }
 
 /// Construct the storage provider for `backend` (None for `memory://`).
@@ -1060,12 +1052,13 @@ fn build_disk_cache(
     options: &ConnectOptions,
     storage: &Arc<dyn StorageProvider>,
     name: &str,
-) -> Result<Option<Arc<DiskCacheStore>>, InfinoError> {
+) -> Result<Option<(Arc<DiskCacheStore>, Arc<ManifestDiskCache>)>, InfinoError> {
     let Some(cache_root) = options.cache_dir.as_ref() else {
         return Ok(None);
     };
+    let table_root = cache_root.join(name);
     let mut cfg = DiskCacheConfig {
-        cache_root: cache_root.join(name),
+        cache_root: table_root.clone(),
         cold_fetch_mode: options.cold_fetch_mode.to_internal(),
         ..Default::default()
     };
@@ -1082,7 +1075,12 @@ fn build_disk_cache(
     if options.cache_budget_bytes.is_none() {
         cache.mark_budget_auto_sized();
     }
-    Ok(Some(cache))
+    let manifest_cache = ManifestDiskCache::new(
+        table_root.join(MANIFEST_CACHE_SUBDIR),
+        MANIFEST_CACHE_BUDGET_BYTES,
+    )
+    .map_err(|e| InfinoError::Io(e.to_string()))?;
+    Ok(Some((cache, manifest_cache)))
 }
 
 /// The cached handle for `name`, or `None` (after evicting it) if its table was
@@ -1109,6 +1107,25 @@ fn single_flight_gate(building: &DashMap<String, Arc<Mutex<()>>>, name: &str) ->
         .entry(name.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+/// Grab the build gate. If it's poisoned, ignore that and use it anyway.
+///
+/// Why ignoring poison is safe: a lock gets poisoned when a thread crashes
+/// while holding it, warning "the data might be half-written." But the only
+/// shared write under this gate is `handles.insert`, on the last line, after
+/// the build has fully succeeded. A crash happens before that, so nothing is
+/// half-written and there's nothing to protect.
+///
+/// What this fixes: the old code crashed on poison instead. The gate is kept
+/// forever (one per table name), so once poisoned, every later open of that
+/// table crashed on it, restarted, and crashed again: a permanent crash loop.
+///
+/// Keep the write last: if you add a shared-state write in the middle of the
+/// gated section, a crash could leave it half-done and ignoring poison would no
+/// longer be safe.
+fn lock_gate(gate: &Mutex<()>) -> MutexGuard<'_, ()> {
+    gate.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Table names are flat, case-sensitive `[A-Za-z0-9_-]+` identifiers
@@ -1252,6 +1269,140 @@ mod tests {
         assert_eq!(count_rows(&conn, "docs"), 1);
     }
 
+    /// A durable (Storage-backed) connection over a fresh temp dir. The
+    /// returned `TempDir` must stay in scope: dropping it deletes the catalog.
+    fn storage_conn() -> (Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        (conn, dir)
+    }
+
+    /// Borrow the Storage backend's `building` (build gates) and `handles`
+    /// (warm memo) maps, or fail loudly if the connection is not durable.
+    fn storage_maps(
+        conn: &Connection,
+    ) -> (
+        &DashMap<String, Arc<Mutex<()>>>,
+        &DashMap<String, SupertableHandle>,
+    ) {
+        match &conn.inner.store {
+            CatalogStore::Storage {
+                building, handles, ..
+            } => (building, handles),
+            _ => panic!("expected a Storage-backed catalog"),
+        }
+    }
+
+    /// Poison a name's build gate exactly the way a panicking cold-path build
+    /// does: lock the gate on another thread and panic while the guard is held,
+    /// which drops the guard mid-unwind and marks the `Mutex` poisoned.
+    fn poison_gate(building: &DashMap<String, Arc<Mutex<()>>>, name: &str) {
+        let gate = single_flight_gate(building, name);
+        let joined = thread::spawn(move || {
+            let _guard = gate.lock().expect("lock gate to poison it");
+            panic!("simulated build panic under the gate (e.g. rayon EAGAIN)");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            single_flight_gate(building, name).is_poisoned(),
+            "the gate must be poisoned after a held-guard panic",
+        );
+    }
+
+    /// Run `f`, returning `Err(())` if it panicked. The panic hook is silenced
+    /// for the call so a caught panic does not spew to stderr; a real assertion
+    /// failure elsewhere still prints normally.
+    fn without_panic<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::panic::set_hook(prev);
+        out.map_err(|_| ())
+    }
+
+    // ---- Regression: "catalog build gate poisoned" crash loop -------------
+    //
+    // A build that panics while holding a name's single-flight gate poisons
+    // that gate's `Mutex`. In production the panic came from rayon's thread
+    // pool failing to spawn OS threads (`EAGAIN` / "Resource temporarily
+    // unavailable") during a cold-path build. The gate `Arc<Mutex<()>>` is
+    // cached per name and never evicted, so a propagated `PoisonError` was
+    // sticky: every later catalog op on that name re-locked the poisoned mutex
+    // and panicked, turning one transient blip into a permanent crash loop.
+    //
+    // `lock_gate` recovers the poisoned guard instead of propagating it. Each
+    // test below poisons a gate the way a panicking build would, then drives
+    // one of the three ops that lock it (open / drop / create) and asserts the
+    // op does not panic and still produces a correct result.
+
+    #[test]
+    fn poisoned_gate_does_not_wedge_open() {
+        let (conn, _dir) = storage_conn();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+
+        let (building, handles) = storage_maps(&conn);
+        // Evict the warm handle so open takes the cold path and locks the gate,
+        // exactly as a fresh worker does on first open.
+        handles.remove("docs");
+        poison_gate(building, "docs");
+
+        let table = without_panic(|| conn.open_table("docs"))
+            .expect("open_table must not panic on a poisoned gate (that was the crash loop)")
+            .expect("open_table should rebuild after recovering the poisoned gate");
+        assert_eq!(
+            n_rows(
+                &table
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("bm25_search after recovery"),
+            ),
+            1,
+            "the recovered table must still be queryable",
+        );
+    }
+
+    #[test]
+    fn poisoned_gate_does_not_wedge_drop() {
+        let (conn, _dir) = storage_conn();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        let (building, _handles) = storage_maps(&conn);
+        poison_gate(building, "docs");
+
+        without_panic(|| conn.drop_table("docs", false))
+            .expect("drop_table must not panic on a poisoned gate")
+            .expect("drop_table should succeed after recovering the poisoned gate");
+        assert!(
+            conn.list_tables().expect("list").is_empty(),
+            "the table must be unregistered after drop",
+        );
+    }
+
+    #[test]
+    fn poisoned_gate_does_not_wedge_create() {
+        let (conn, _dir) = storage_conn();
+
+        // Pre-poison the gate for a name that does not exist yet, then create
+        // it: `create_table` commits the memo under this same gate.
+        let (building, _handles) = storage_maps(&conn);
+        poison_gate(building, "fresh");
+
+        let table = without_panic(|| {
+            conn.create_table("fresh", schema_id_title(), IndexSpec::new().fts("title"))
+        })
+        .expect("create_table must not panic on a poisoned gate")
+        .expect("create_table should succeed after recovering the poisoned gate");
+        table
+            .append(&build_title_batch(&["fox"]))
+            .expect("append to the created table");
+        assert_eq!(count_rows(&conn, "fresh"), 1, "the created table is usable");
+    }
+
     #[test]
     fn memory_create_open_search_drop() {
         let conn = connect("memory://").expect("connect");
@@ -1303,7 +1454,7 @@ mod tests {
             .create_table(
                 "std",
                 schema_id_title(),
-                IndexSpec::new().fts_with_analyzer("title", "standard"),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("standard")),
             )
             .expect("create standard table");
         std_tbl
@@ -1323,7 +1474,7 @@ mod tests {
             .create_table(
                 "bad",
                 schema_id_title(),
-                IndexSpec::new().fts_with_analyzer("title", "nonesuch"),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("nonesuch")),
             )
             .expect_err("unknown analyzer must be rejected");
         assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
@@ -1361,8 +1512,8 @@ mod tests {
                 "docs",
                 schema.clone(),
                 IndexSpec::new()
-                    .fts_with_analyzer("title", "standard")
-                    .fts_with_analyzer("body", "ascii_lower"),
+                    .fts(FtsField::new("title").analyzer("standard"))
+                    .fts(FtsField::new("body").analyzer("ascii_lower")),
             )
             .expect("create_table");
         table
@@ -1409,8 +1560,8 @@ mod tests {
                     "docs",
                     schema.clone(),
                     IndexSpec::new()
-                        .fts_with_analyzer("title", "standard")
-                        .fts_with_analyzer("body", "ascii_lower"),
+                        .fts(FtsField::new("title").analyzer("standard"))
+                        .fts(FtsField::new("body").analyzer("ascii_lower")),
                 )
                 .expect("create_table");
             table
@@ -1439,6 +1590,85 @@ mod tests {
         assert_eq!(
             body_cafe, 0,
             "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An index-only column (`FtsField::stored(false)`) survives a
+    /// storage-backed reopen: the catalog records the flag, `open_table`
+    /// reconstructs it, and the reopened table both searches the column
+    /// and keeps rejecting it as a projection target.
+    #[test]
+    fn index_only_column_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("infino-idxonly-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+        let schema = schema_title_body();
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema.clone(),
+                    IndexSpec::new()
+                        .fts("title")
+                        .fts(FtsField::new("body").stored(false)),
+                )
+                .expect("create_table");
+            table
+                .append(&title_body_batch(
+                    schema.clone(),
+                    "stored title",
+                    "hidden signal text",
+                ))
+                .expect("append");
+        }
+        let conn2 = connect(&uri).expect("reconnect");
+        let table = conn2.open_table("docs").expect("open_table");
+        // schema() keeps the ingest contract, index-only column included.
+        assert_eq!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["title", "body"],
+        );
+        // Searchable after reopen…
+        let hits = table
+            .bm25_search("body", "signal", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("index-only search after reopen");
+        assert_eq!(n_rows(&hits), 1);
+        // …and still not readable: projecting it fails with a clean,
+        // caller-level error.
+        let err = table
+            .bm25_search(
+                "body",
+                "signal",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                Some(&["_id", "body", "score"]),
+            )
+            .expect_err("index-only column must not be projectable after reopen");
+        let msg = err.to_string();
+        assert!(msg.contains("body"), "error names the column: {msg}");
+        assert!(!msg.contains("DataFusion"), "no engine internals: {msg}");
+        // Appends still require the column (it is part of the write
+        // contract even though it is never stored).
+        let title_only = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let short = RecordBatch::try_new(
+            title_only,
+            vec![Arc::new(LargeStringArray::from(vec!["no body"]))],
+        )
+        .expect("batch");
+        assert!(
+            table.append(&short).is_err(),
+            "append without the index-only column must be rejected"
         );
         let _ = fs::remove_dir_all(&dir);
     }

@@ -89,7 +89,7 @@ use infino::{
         OpenError, Supertable, SupertableOptions,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options, default_tokenizer},
+    test_helpers::{build_title_batch, default_supertable_options},
 };
 
 const ENV_DIR: &str = "INFINO_M12_CRASH_DIR";
@@ -338,10 +338,7 @@ fn vector_crash_fixture_with_writers(
     );
     let options = SupertableOptions::new(
         schema.clone(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![VectorConfig {
             column: "emb".into(),
             dim,
@@ -350,7 +347,6 @@ fn vector_crash_fixture_with_writers(
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
     .with_writer_pool(pool);

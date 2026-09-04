@@ -79,7 +79,6 @@ fn build_superfile_with_ids(
             metric,
             rerank_codec: corpus::bench_rerank_codec(metric),
         }],
-        None,
     );
     let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
     let mut offset = 0;

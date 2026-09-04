@@ -9990,8 +9990,7 @@ mod tests {
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
         },
         test_helpers::{
-            build_title_batch, default_supertable_options, default_tokenizer as tok,
-            distinct_unit_vectors,
+            build_title_batch, default_supertable_options, distinct_unit_vectors,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
@@ -10903,16 +10902,8 @@ mod tests {
     }
 
     fn options_id_title() -> SupertableOptions {
-        SupertableOptions::new(
-            schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
+        SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
     }
 
     /// Force a single-threaded writer pool for deterministic
@@ -11085,7 +11076,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(writer_pool_with(1))
@@ -11106,7 +11096,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq16,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(writer_pool_with(1))
@@ -11635,7 +11624,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            None,
         )
         .expect("valid options")
         .with_writer_pool(pool)

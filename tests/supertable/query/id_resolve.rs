@@ -23,7 +23,6 @@ use infino::{
         fts::reader::{Bm25Stats, BoolMode},
     },
     supertable::{Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
 };
 
 /// Commits — enough that the writer's row-sharding produces a real
@@ -53,18 +52,10 @@ fn options_title_only() -> SupertableOptions {
         DataType::LargeUtf8,
         false,
     )]));
-    SupertableOptions::new(
-        schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    )
-    .expect("valid options")
-    .with_writer_pool(Arc::clone(&pool))
-    .with_reader_pool(pool)
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![])
+        .expect("valid options")
+        .with_writer_pool(Arc::clone(&pool))
+        .with_reader_pool(pool)
 }
 
 /// Every doc carries `common`; each doc also carries a unique token so

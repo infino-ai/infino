@@ -14,11 +14,9 @@ use infino::{
     config::OptimizeOptions,
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::tokenize::Tokenizer,
         vector::distance::Metric,
     },
     supertable::{LocalFsStorageProvider, Supertable, SupertableOptions, storage::StorageProvider},
-    test_helpers::default_tokenizer,
 };
 use tempfile::TempDir;
 
@@ -100,7 +98,7 @@ pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
 
 pub(crate) const CORPUS_VEC_SEED: u64 = 1;
-const CORPUS_TEXT_SEED: u64 = 1;
+pub(crate) const CORPUS_TEXT_SEED: u64 = 1;
 /// Existing base-only vector corpus used instead of synthetic generation.
 const VECTOR_CORPUS_PATH_ENV: &str = "INFINO_BENCH_VECTOR_CORPUS_PATH";
 
@@ -306,21 +304,14 @@ pub fn options_for(
             .build()
             .expect("pool"),
     );
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
     let mut fts = Vec::new();
     if modality.has_fts() {
-        fts.push(FtsConfig {
-            column: TEXT_COLUMN.into(),
-            positions: true,
-        });
+        fts.push(FtsConfig::new(TEXT_COLUMN).positions(true));
     }
     if modality.has_vector_filter_bucket() {
         // Single token per row, equality-only predicates — positions buy
         // nothing and would triple the (tiny) index.
-        fts.push(FtsConfig {
-            column: VECTOR_FILTER_COLUMN.into(),
-            positions: false,
-        });
+        fts.push(FtsConfig::new(VECTOR_FILTER_COLUMN));
     }
     let vector = if modality.has_vector() {
         vec![VectorConfig {
@@ -334,7 +325,7 @@ pub fn options_for(
     } else {
         vec![]
     };
-    let mut opts = SupertableOptions::new(schema_for(modality), fts, vector, Some(tk))
+    let mut opts = SupertableOptions::new(schema_for(modality), fts, vector)
         .expect("opts")
         .with_reader_pool(pool.clone())
         .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)

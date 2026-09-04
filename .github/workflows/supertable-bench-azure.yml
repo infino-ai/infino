@@ -101,7 +101,9 @@ on:
       # `corpus-dir=` arguments. Empty (the default) selects the synthetic
       # planted-cluster corpus, so every existing leg — and the A/B baseline
       # it is compared against — is byte-identical to before this input
-      # existed. A real-corpus leg sets e.g. corpus: annb:glove-100-angular.
+      # existed. A real-corpus leg sets e.g. corpus: annb:glove-100-angular;
+      # `realistic` selects the generated text corpus the FTS quality phase
+      # is calibrated on (no corpus_dir needed).
       corpus:          { type: string, required: false, default: "" }
       corpus_dir:      { type: string, required: false, default: "" }
       docs:            { type: string, required: false, default: "1000000" }
@@ -212,8 +214,15 @@ jobs:
             if [ -n "${{ inputs.corpus_dir }}" ]; then
               args="$args corpus-dir=${{ inputs.corpus_dir }}"
             else
-              echo "::error::corpus set without corpus_dir; downloadable corpora need a staging dir"
-              exit 1
+              # Generated corpora (`synthetic`, `realistic`) need no staging
+              # dir; every other spec downloads or reads files.
+              case "${{ inputs.corpus }}" in
+                synthetic|realistic) ;;
+                *)
+                  echo "::error::corpus set without corpus_dir; downloadable corpora need a staging dir"
+                  exit 1
+                  ;;
+              esac
             fi
           fi
           echo "args=$args"       >> "$GITHUB_OUTPUT"
