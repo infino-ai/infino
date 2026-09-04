@@ -25,7 +25,7 @@ mod uri;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -430,7 +430,7 @@ impl Connection {
                 // Gate the commit + memo insert: else a racing `open_table`
                 // sees the commit, misses the memo, and builds a rival store.
                 let gate = single_flight_gate(building, name);
-                let _built = gate.lock().expect("catalog build gate poisoned");
+                let _built = lock_gate(&gate);
 
                 let name_owned = name.to_string();
                 bridge_on_runtime(
@@ -489,7 +489,7 @@ impl Connection {
                 // same-name peer is mid-build (same `Arc`, same mutex); the
                 // winner builds, the rest wake to find a warm `handles`.
                 let gate = single_flight_gate(building, name);
-                let _built = gate.lock().expect("catalog build gate poisoned");
+                let _built = lock_gate(&gate);
 
                 // A peer may have built it while we waited on the gate.
                 if let Some(handle) = live_handle(handles, name) {
@@ -646,7 +646,7 @@ impl Connection {
                 // the pre-commit catalog re-inserts the handle after we evict,
                 // and the warm path keeps serving the dropped table.
                 let gate = single_flight_gate(building, name);
-                let _dropping = gate.lock().expect("catalog build gate poisoned");
+                let _dropping = lock_gate(&gate);
 
                 // Evict first: a later create/open rebuilds fresh, and this
                 // frees the handle's `DiskCacheStore`.
@@ -1058,6 +1058,25 @@ fn single_flight_gate(building: &DashMap<String, Arc<Mutex<()>>>, name: &str) ->
         .clone()
 }
 
+/// Grab the build gate. If it's poisoned, ignore that and use it anyway.
+///
+/// Why ignoring poison is safe: a lock gets poisoned when a thread crashes
+/// while holding it, warning "the data might be half-written." But the only
+/// shared write under this gate is `handles.insert`, on the last line, after
+/// the build has fully succeeded. A crash happens before that, so nothing is
+/// half-written and there's nothing to protect.
+///
+/// What this fixes: the old code crashed on poison instead. The gate is kept
+/// forever (one per table name), so once poisoned, every later open of that
+/// table crashed on it, restarted, and crashed again: a permanent crash loop.
+///
+/// Keep the write last: if you add a shared-state write in the middle of the
+/// gated section, a crash could leave it half-done and ignoring poison would no
+/// longer be safe.
+fn lock_gate(gate: &Mutex<()>) -> MutexGuard<'_, ()> {
+    gate.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Table names are flat, case-sensitive `[A-Za-z0-9_-]+` identifiers
 /// that may not start with `_` — they are SQL identifiers and
 /// object-store path segments, and the `_`-prefixed namespace is
@@ -1197,6 +1216,140 @@ mod tests {
             .append(&build_title_batch(&["fox"]))
             .expect("append");
         assert_eq!(count_rows(&conn, "docs"), 1);
+    }
+
+    /// A durable (Storage-backed) connection over a fresh temp dir. The
+    /// returned `TempDir` must stay in scope: dropping it deletes the catalog.
+    fn storage_conn() -> (Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        (conn, dir)
+    }
+
+    /// Borrow the Storage backend's `building` (build gates) and `handles`
+    /// (warm memo) maps, or fail loudly if the connection is not durable.
+    fn storage_maps(
+        conn: &Connection,
+    ) -> (
+        &DashMap<String, Arc<Mutex<()>>>,
+        &DashMap<String, SupertableHandle>,
+    ) {
+        match &conn.inner.store {
+            CatalogStore::Storage {
+                building, handles, ..
+            } => (building, handles),
+            _ => panic!("expected a Storage-backed catalog"),
+        }
+    }
+
+    /// Poison a name's build gate exactly the way a panicking cold-path build
+    /// does: lock the gate on another thread and panic while the guard is held,
+    /// which drops the guard mid-unwind and marks the `Mutex` poisoned.
+    fn poison_gate(building: &DashMap<String, Arc<Mutex<()>>>, name: &str) {
+        let gate = single_flight_gate(building, name);
+        let joined = thread::spawn(move || {
+            let _guard = gate.lock().expect("lock gate to poison it");
+            panic!("simulated build panic under the gate (e.g. rayon EAGAIN)");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            single_flight_gate(building, name).is_poisoned(),
+            "the gate must be poisoned after a held-guard panic",
+        );
+    }
+
+    /// Run `f`, returning `Err(())` if it panicked. The panic hook is silenced
+    /// for the call so a caught panic does not spew to stderr; a real assertion
+    /// failure elsewhere still prints normally.
+    fn without_panic<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::panic::set_hook(prev);
+        out.map_err(|_| ())
+    }
+
+    // ---- Regression: "catalog build gate poisoned" crash loop -------------
+    //
+    // A build that panics while holding a name's single-flight gate poisons
+    // that gate's `Mutex`. In production the panic came from rayon's thread
+    // pool failing to spawn OS threads (`EAGAIN` / "Resource temporarily
+    // unavailable") during a cold-path build. The gate `Arc<Mutex<()>>` is
+    // cached per name and never evicted, so a propagated `PoisonError` was
+    // sticky: every later catalog op on that name re-locked the poisoned mutex
+    // and panicked, turning one transient blip into a permanent crash loop.
+    //
+    // `lock_gate` recovers the poisoned guard instead of propagating it. Each
+    // test below poisons a gate the way a panicking build would, then drives
+    // one of the three ops that lock it (open / drop / create) and asserts the
+    // op does not panic and still produces a correct result.
+
+    #[test]
+    fn poisoned_gate_does_not_wedge_open() {
+        let (conn, _dir) = storage_conn();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+
+        let (building, handles) = storage_maps(&conn);
+        // Evict the warm handle so open takes the cold path and locks the gate,
+        // exactly as a fresh worker does on first open.
+        handles.remove("docs");
+        poison_gate(building, "docs");
+
+        let table = without_panic(|| conn.open_table("docs"))
+            .expect("open_table must not panic on a poisoned gate (that was the crash loop)")
+            .expect("open_table should rebuild after recovering the poisoned gate");
+        assert_eq!(
+            n_rows(
+                &table
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("bm25_search after recovery"),
+            ),
+            1,
+            "the recovered table must still be queryable",
+        );
+    }
+
+    #[test]
+    fn poisoned_gate_does_not_wedge_drop() {
+        let (conn, _dir) = storage_conn();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        let (building, _handles) = storage_maps(&conn);
+        poison_gate(building, "docs");
+
+        without_panic(|| conn.drop_table("docs", false))
+            .expect("drop_table must not panic on a poisoned gate")
+            .expect("drop_table should succeed after recovering the poisoned gate");
+        assert!(
+            conn.list_tables().expect("list").is_empty(),
+            "the table must be unregistered after drop",
+        );
+    }
+
+    #[test]
+    fn poisoned_gate_does_not_wedge_create() {
+        let (conn, _dir) = storage_conn();
+
+        // Pre-poison the gate for a name that does not exist yet, then create
+        // it: `create_table` commits the memo under this same gate.
+        let (building, _handles) = storage_maps(&conn);
+        poison_gate(building, "fresh");
+
+        let table = without_panic(|| {
+            conn.create_table("fresh", schema_id_title(), IndexSpec::new().fts("title"))
+        })
+        .expect("create_table must not panic on a poisoned gate")
+        .expect("create_table should succeed after recovering the poisoned gate");
+        table
+            .append(&build_title_batch(&["fox"]))
+            .expect("append to the created table");
+        assert_eq!(count_rows(&conn, "fresh"), 1, "the created table is usable");
     }
 
     #[test]
