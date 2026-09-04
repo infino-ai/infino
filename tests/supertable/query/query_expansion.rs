@@ -18,6 +18,9 @@
 //! lives in one superfile only, and the ranked path — `bm25_search`
 //! picks the registration up, a per-call expansion overrides it, and a
 //! search with no expansion is bit-identical to one with an empty one.
+//! `hybrid_search` runs that same expanded text arm: with a group
+//! registered every surface form is fused in as a text hit, and clearing
+//! it restores the literal token.
 
 #![deny(clippy::unwrap_used)]
 
@@ -26,18 +29,20 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
     InfinoError,
     superfile::{
-        builder::FtsConfig,
+        builder::{FtsConfig, VectorConfig},
         fts::reader::{Bm25SearchOptions, BoolMode, QueryExpansion},
     },
-    supertable::{Supertable, SupertableOptions},
+    supertable::{Supertable, SupertableOptions, query::vector::VectorSearchOptions},
     test_helpers::{
         brute_force_bm25::{BruteForceBm25, OracleQuery},
-        default_tokenizer,
+        default_tokenizer, default_vector_config,
     },
 };
 use rayon::ThreadPoolBuilder;
@@ -51,6 +56,29 @@ const ORACLE_SCORE_TOLERANCE: f32 = 1e-3;
 
 /// Single-thread writer pool for deterministic builds.
 const RAYON_POOL_THREADS: usize = 1;
+
+/// Dimension of the hybrid fixture's vector column: the engine's
+/// minimum, and what `default_vector_config` builds.
+const HYBRID_DIM: usize = 16;
+/// Random-rotation seed for the hybrid fixture's vector index.
+const HYBRID_ROT_SEED: u64 = 7;
+/// Rows for the hybrid test: three surface forms of `run` and three
+/// unrelated titles. Row `i` carries a one-hot embedding at dim `i`.
+const HYBRID_DOCS: &[(&str, &str)] = &[
+    ("run tests first", "h0"),
+    ("the suite runs nightly", "h1"),
+    ("running late again", "h2"),
+    ("login page redesign", "h3"),
+    ("nothing to see here", "h4"),
+    ("pass the suite", "h5"),
+];
+/// Tags of the [`HYBRID_DOCS`] rows holding any surface form of `run`.
+const HYBRID_RUN_FORMS: &[&str] = &["h0", "h1", "h2"];
+/// Tags of the [`HYBRID_DOCS`] rows holding the literal token `run`.
+const HYBRID_LITERAL_RUN: &[&str] = &["h0"];
+/// The unrelated row the hybrid query vector points at, so the vector
+/// arm's best hit is one the text arm never surfaces.
+const HYBRID_QUERY_ROW: usize = 3;
 
 /// The planted families: every member rewrites to its head in corpus B.
 const FAMILIES: &[(&str, &[&str])] = &[
@@ -75,15 +103,38 @@ const SURFACE: &[(&str, &str)] = &[
     ("the who", "t8"),
 ];
 
-/// `title` (FTS, positions on so phrases are answerable) + `tag`.
-fn schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
+/// `title` (full-text indexed) + `tag`.
+fn scalar_fields() -> Vec<Field> {
+    vec![
         Field::new("title", DataType::LargeUtf8, false),
         Field::new("tag", DataType::LargeUtf8, false),
-    ]))
+    ]
 }
 
-fn options() -> SupertableOptions {
+fn schema() -> Arc<Schema> {
+    Arc::new(Schema::new(scalar_fields()))
+}
+
+/// The element field shared by the `emb` column type and its arrays.
+fn embedding_item_field() -> Field {
+    Field::new("item", DataType::Float32, true)
+}
+
+/// The scalar fields plus `emb`, a fixed-size `f32` vector column.
+fn hybrid_schema() -> Arc<Schema> {
+    let mut fields = scalar_fields();
+    fields.push(Field::new(
+        "emb",
+        DataType::FixedSizeList(Arc::new(embedding_item_field()), HYBRID_DIM as i32),
+        false,
+    ));
+    Arc::new(Schema::new(fields))
+}
+
+/// Options over `schema`: `title` full-text indexed with positions on
+/// (so phrases are answerable), `vectors` indexed, and a single-thread
+/// writer pool for deterministic builds.
+fn options_for(schema: Arc<Schema>, vectors: Vec<VectorConfig>) -> SupertableOptions {
     let pool = Arc::new(
         ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
@@ -91,12 +142,23 @@ fn options() -> SupertableOptions {
             .expect("writer pool"),
     );
     SupertableOptions::new(
-        schema(),
+        schema,
         vec![FtsConfig::new("title").positions(true)],
-        vec![],
+        vectors,
     )
     .expect("valid options")
     .with_writer_pool(pool)
+}
+
+fn options() -> SupertableOptions {
+    options_for(schema(), vec![])
+}
+
+/// The `title` and `tag` arrays for one batch of docs.
+fn text_columns(docs: &[(String, String)]) -> (LargeStringArray, LargeStringArray) {
+    let titles = LargeStringArray::from(docs.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>());
+    let tags = LargeStringArray::from(docs.iter().map(|(_, g)| g.as_str()).collect::<Vec<_>>());
+    (titles, tags)
 }
 
 /// One committed superfile per `commits` entry.
@@ -104,14 +166,55 @@ fn table(commits: &[Vec<(String, String)>]) -> Supertable {
     let st = Supertable::create(options()).expect("create");
     let mut w = st.writer().expect("writer");
     for docs in commits {
-        let titles =
-            LargeStringArray::from(docs.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>());
-        let tags = LargeStringArray::from(docs.iter().map(|(_, g)| g.as_str()).collect::<Vec<_>>());
+        let (titles, tags) = text_columns(docs);
         let batch =
             RecordBatch::try_new(schema(), vec![Arc::new(titles), Arc::new(tags)]).expect("batch");
         w.append(&batch).expect("append");
         w.commit().expect("commit");
     }
+    st
+}
+
+/// A unit vector along dim `active`.
+fn one_hot(active: usize) -> Vec<f32> {
+    (0..HYBRID_DIM)
+        .map(|d| if d == active { 1.0 } else { 0.0 })
+        .collect()
+}
+
+/// `n` rows of embeddings, row `i` one-hot at dim `i`.
+fn one_hot_embeddings(n: usize) -> FixedSizeListArray {
+    assert!(n <= HYBRID_DIM, "one dim per row");
+    let flat: Vec<f32> = (0..n).flat_map(one_hot).collect();
+    FixedSizeListArray::try_new(
+        Arc::new(embedding_item_field()),
+        HYBRID_DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("embeddings")
+}
+
+/// One superfile holding [`HYBRID_DOCS`] with its one-hot embeddings.
+fn hybrid_table() -> Supertable {
+    let st = Supertable::create(options_for(
+        hybrid_schema(),
+        vec![default_vector_config("emb", HYBRID_ROT_SEED)],
+    ))
+    .expect("create");
+    let mut w = st.writer().expect("writer");
+    let (titles, tags) = text_columns(&owned(HYBRID_DOCS));
+    let batch = RecordBatch::try_new(
+        hybrid_schema(),
+        vec![
+            Arc::new(titles),
+            Arc::new(tags),
+            Arc::new(one_hot_embeddings(HYBRID_DOCS.len())),
+        ],
+    )
+    .expect("batch");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
     st
 }
 
@@ -154,18 +257,19 @@ fn stop_only() -> Arc<QueryExpansion> {
     Arc::new(QueryExpansion::new().stop(STOP.iter().copied()))
 }
 
-/// `token_match` hits as the set of their `tag`s.
-fn tags(st: &Supertable, query: &str, mode: BoolMode) -> HashSet<String> {
-    let batches = st
-        .token_match("title", query, mode, Some(&["tag"]))
-        .expect("token_match");
+/// Column 0 of a batch projected with `tag` first.
+fn tag_column(b: &RecordBatch) -> &LargeStringArray {
+    b.column(0)
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .expect("tag is LargeUtf8")
+}
+
+/// The `tag`s of batches projected as `["tag"]`, as a set.
+fn tag_set(batches: &[RecordBatch]) -> HashSet<String> {
     let mut out = HashSet::new();
-    for b in &batches {
-        let col = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .expect("tag is LargeUtf8");
+    for b in batches {
+        let col = tag_column(b);
         for i in 0..col.len() {
             out.insert(col.value(i).to_string());
         }
@@ -173,22 +277,23 @@ fn tags(st: &Supertable, query: &str, mode: BoolMode) -> HashSet<String> {
     out
 }
 
+/// `token_match` hits as the set of their `tag`s.
+fn tags(st: &Supertable, query: &str, mode: BoolMode) -> HashSet<String> {
+    tag_set(
+        &st.token_match("title", query, mode, Some(&["tag"]))
+            .expect("token_match"),
+    )
+}
+
 fn count(st: &Supertable, query: &str, mode: BoolMode) -> u64 {
     st.count("title", query, mode).expect("count")
 }
 
-/// Ranked hits as `tag → score`, through the options-taking entry.
-fn scored(st: &Supertable, query: &str, opts: &Bm25SearchOptions) -> HashMap<String, f32> {
-    let batches = st
-        .bm25_search_with_options("title", query, K_ALL, opts, Some(&["tag", "score"]))
-        .expect("bm25_search");
+/// `tag → score` from batches projected as `["tag", "score"]`.
+fn tag_scores(batches: &[RecordBatch]) -> HashMap<String, f32> {
     let mut out = HashMap::new();
-    for b in &batches {
-        let tag = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .expect("tag is LargeUtf8");
+    for b in batches {
+        let tag = tag_column(b);
         let score = b
             .column(1)
             .as_any()
@@ -199,6 +304,40 @@ fn scored(st: &Supertable, query: &str, opts: &Bm25SearchOptions) -> HashMap<Str
         }
     }
     out
+}
+
+/// Ranked hits as `tag → score`, through the options-taking entry.
+fn scored(st: &Supertable, query: &str, opts: &Bm25SearchOptions) -> HashMap<String, f32> {
+    tag_scores(
+        &st.bm25_search_with_options("title", query, K_ALL, opts, Some(&["tag", "score"]))
+            .expect("bm25_search"),
+    )
+}
+
+/// Assert the fused head is exactly `want`: the `want.len()` best fused
+/// scores belong to `want`, and the last of them sits strictly above the
+/// best remaining row. Under reciprocal-rank fusion a row both arms
+/// surfaced scores the sum of two reciprocal ranks, so on a table this
+/// small the head is precisely the rows the text arm surfaced.
+fn assert_fused_head(scores: &HashMap<String, f32>, want: &[&str], what: &str) {
+    let mut ranked: Vec<(&str, f32)> = scores.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    assert!(
+        ranked.len() > want.len(),
+        "{what}: expected vector-only rows below the head: {ranked:?}"
+    );
+    let (head, tail) = ranked.split_at(want.len());
+    assert_eq!(
+        head.iter().map(|(t, _)| *t).collect::<HashSet<_>>(),
+        want.iter().copied().collect::<HashSet<_>>(),
+        "{what}: fused head"
+    );
+    let head_floor = head.last().map_or(f32::INFINITY, |(_, s)| *s);
+    let tail_ceiling = tail.first().map_or(f32::NEG_INFINITY, |(_, s)| *s);
+    assert!(
+        head_floor > tail_ceiling,
+        "{what}: the head must sit strictly above the vector-only rows: {ranked:?}"
+    );
 }
 
 /// Queries over heads that carry no stop word.
@@ -616,4 +755,68 @@ fn registration_is_validated_and_clearing_restores_literal_matching() {
         HashSet::from(["t3".to_string()]),
         "cleared: the literal token only"
     );
+}
+
+/// `hybrid_search` runs the same expanded text arm as `bm25_search`:
+/// with the group registered every surface form of `run` is a text hit,
+/// and after clearing only the literal token is. The vector arm is held
+/// fixed — `k` is the row count, so it surfaces every row and fusion is
+/// a union that can only reorder — and the query vector points at a row
+/// the text arm never matches, so the head of the fused ranking is
+/// exactly the rows the text arm surfaced.
+#[test]
+fn hybrid_search_applies_the_registration_and_clearing_restores_literal_matching() {
+    let st = hybrid_table();
+    let k = HYBRID_DOCS.len();
+    let query_vector = one_hot(HYBRID_QUERY_ROW);
+    let every_tag: HashSet<String> = HYBRID_DOCS.iter().map(|(_, g)| g.to_string()).collect();
+    // The fixture's premise: at `k` = the row count the vector arm alone
+    // reaches every row.
+    let reached = tag_set(
+        &st.vector_search(
+            "emb",
+            &query_vector,
+            k,
+            VectorSearchOptions::new(),
+            None,
+            Some(&["tag"]),
+        )
+        .expect("vector_search"),
+    );
+    assert_eq!(reached, every_tag, "the vector arm must surface every row");
+
+    let fused = |st: &Supertable| {
+        tag_scores(
+            &st.hybrid_search(
+                "title",
+                "run",
+                BoolMode::Or,
+                "emb",
+                &query_vector,
+                VectorSearchOptions::new(),
+                k,
+                Some(&["tag", "score"]),
+            )
+            .expect("hybrid_search"),
+        )
+    };
+
+    st.set_query_expansion("title", Some(vocabulary()))
+        .expect("register");
+    let with_group = fused(&st);
+    assert_eq!(
+        with_group.keys().cloned().collect::<HashSet<_>>(),
+        every_tag,
+        "registered: fusion is a union, so every row is returned"
+    );
+    assert_fused_head(&with_group, HYBRID_RUN_FORMS, "registered");
+
+    st.set_query_expansion("title", None).expect("clear");
+    let literal = fused(&st);
+    assert_eq!(
+        literal.keys().cloned().collect::<HashSet<_>>(),
+        every_tag,
+        "cleared: fusion is a union, so every row is returned"
+    );
+    assert_fused_head(&literal, HYBRID_LITERAL_RUN, "cleared");
 }

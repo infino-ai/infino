@@ -28,7 +28,10 @@ use infino::{
 };
 use proptest::prelude::*;
 
-use crate::fts::brute_force_oracle::build_infino_superfile;
+use crate::fts::{
+    brute_force_oracle::build_infino_superfile,
+    fuzz_oracle::{cases as fuzz_cases, max_atoms, max_doc_len, max_docs, rt},
+};
 
 /// Score-equality tolerance: the two scorers share the BM25 formula and,
 /// on the short docs planted here (every length inside the norm table's
@@ -392,17 +395,23 @@ struct Atom {
     word: usize,
 }
 
-/// Docs of 1..=12 vocab words (every length inside the exact norm region).
+/// Random corpora on the fuzz oracle's caps. `max_doc_len()` is clamped
+/// at its `MAX_DOC_LEN_HARD`, so every doc length stays inside the norm
+/// table's exact region and the reader and the oracle compute the same
+/// length norm — the exact score comparison below depends on it.
 fn corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
     let words = fuzz_vocab().len();
-    prop::collection::vec(prop::collection::vec(0..words, 1..=12), 1..=300)
+    prop::collection::vec(
+        prop::collection::vec(0..words, 1..=max_doc_len()),
+        1..=max_docs(),
+    )
 }
 
 fn atoms_strategy() -> impl Strategy<Value = Vec<Atom>> {
     let words = fuzz_vocab().len();
     prop::collection::vec(
         (0u8..3u8, 0..words).prop_map(|(polarity, word)| Atom { polarity, word }),
-        1..=4,
+        1..=max_atoms(),
     )
 }
 
@@ -446,18 +455,8 @@ fn render(atoms: &[Atom], and_mode: bool) -> (String, OracleQuery) {
     (rendered.join(" "), q)
 }
 
-fn rt() -> &'static tokio::runtime::Runtime {
-    use std::sync::OnceLock;
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("build fuzz runtime")
-    })
-}
-
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig { cases: fuzz_cases(), ..ProptestConfig::default() })]
 
     #[test]
     fn fuzz_grouped_queries_match_the_oracle(

@@ -48,15 +48,17 @@
 //! CI; a deeper run is on-demand via env overrides (there is no nightly
 //! lane): `PROPTEST_CASES`, `INFINO_FTS_FUZZ_MAX_DOCS`,
 //! `INFINO_FTS_FUZZ_MAX_DOC_LEN` (hard-capped at 15 to keep norms
-//! exact), `INFINO_FTS_FUZZ_MAX_ATOMS`.
+//! exact), `INFINO_FTS_FUZZ_MAX_ATOMS`. The caps and the shared runtime
+//! also drive the term-group fuzz cell in [`super::expansion`].
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::OnceLock};
 
 use infino::{
     superfile::{SuperfileReader, fts::reader::BoolMode},
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
+use tokio::runtime::{Builder, Runtime};
 
 use crate::fts::brute_force_oracle::build_infino_superfile_positional;
 
@@ -87,23 +89,23 @@ fn env_cap(name: &str, default: usize) -> usize {
 
 /// Default proptest case count — modest for CI, overridable via the
 /// standard `PROPTEST_CASES` env var.
-fn cases() -> u32 {
+pub(crate) fn cases() -> u32 {
     env_cap("PROPTEST_CASES", 96) as u32
 }
 
 /// Max docs per generated corpus. Default crosses several 128-doc PFOR
 /// blocks so block-crossing kernels are reached organically.
-fn max_docs() -> usize {
+pub(crate) fn max_docs() -> usize {
     env_cap("INFINO_FTS_FUZZ_MAX_DOCS", 400).clamp(1, 4096)
 }
 
 /// Max tokens per generated doc — hard-clamped to keep norms exact.
-fn max_doc_len() -> usize {
+pub(crate) fn max_doc_len() -> usize {
     env_cap("INFINO_FTS_FUZZ_MAX_DOC_LEN", 12).clamp(1, MAX_DOC_LEN_HARD)
 }
 
 /// Max clause atoms per generated query.
-fn max_atoms() -> usize {
+pub(crate) fn max_atoms() -> usize {
     env_cap("INFINO_FTS_FUZZ_MAX_ATOMS", 4).clamp(1, 6)
 }
 
@@ -183,13 +185,13 @@ fn build_query(atoms: &[Atom]) -> String {
     rendered.join(" ")
 }
 
-/// Shared tokio runtime — one per test-fn invocation, reused across all
-/// proptest cases (each case only awaits I/O-free in-memory reads).
-fn rt() -> &'static tokio::runtime::Runtime {
-    use std::sync::OnceLock;
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+/// Shared tokio runtime for the proptest cells here and in
+/// [`super::expansion`]: built on first use and reused across every case
+/// (each case only awaits I/O-free in-memory reads).
+pub(crate) fn rt() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
+        Builder::new_current_thread()
             .build()
             .expect("build fuzz runtime")
     })
