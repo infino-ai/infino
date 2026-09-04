@@ -50,11 +50,12 @@ use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
+        error::FtsError,
         format::{self, footer, kv},
         fts::{
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
-                PreparedClauses, TermPattern,
+                self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork,
+                NormalizedExpansion, OrCursorSet, PreparedClauses, QueryExpansion, TermPattern,
             },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
@@ -1095,6 +1096,25 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        self.bm25_hits_expanded_async(column, query, k, mode, None)
+            .await
+    }
+
+    /// [`Self::bm25_hits_async`] with a query-time `expansion` (stop
+    /// terms and term groups) applied to the parsed query before the
+    /// default operator resolves polarity — the same rewrite the table
+    /// layer applies, so a single superfile is a faithful oracle for it.
+    /// The expansion is normalized through the column's own analyzer
+    /// here; an entry that is not exactly one term is a typed
+    /// `FtsError::Expansion`. `None` runs the unexpanded search exactly.
+    pub async fn bm25_hits_expanded_async(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+        expansion: Option<&QueryExpansion>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
         // Tokenize with the target column's configured tokenizer so
         // query terms match how the column was indexed (ascii_lower /
         // standard). Falls back to ascii_lower when there is no FTS
@@ -1104,11 +1124,22 @@ impl SuperfileReader {
             .as_ref()
             .and_then(|f| f.column_tokenizer(column).ok())
             .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        let normalized = match expansion {
+            None => None,
+            Some(expansion) => Some(
+                NormalizedExpansion::normalize(expansion, tok.as_ref()).map_err(FtsError::from)?,
+            ),
+        };
 
-        // Split the query into clause lists and resolve the bare
-        // tokens' polarity from the default operator. The parsed
-        // tokens borrow `query`, so nothing is copied here.
-        let clauses = tok.parse(query).into_clauses(mode);
+        // Split the query into clause lists, apply the expansion, and
+        // resolve the bare tokens' polarity from the default operator.
+        // The parsed tokens borrow `query`, so nothing is copied here.
+        let parsed = tok.parse(query);
+        let parsed = match &normalized {
+            Some(expansion) => expansion.apply(parsed),
+            None => parsed,
+        };
+        let clauses = parsed.into_clauses(mode);
         let musts: Vec<&str> = clauses.musts.iter().map(|t| &**t).collect();
         let shoulds: Vec<&str> = clauses.shoulds.iter().map(|t| &**t).collect();
         let negatives: Vec<&str> = clauses.negatives.iter().map(|t| &**t).collect();
@@ -1130,9 +1161,9 @@ impl SuperfileReader {
                 must_phrases: &must_phrases,
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
-                must_groups: &[],
-                should_groups: &[],
-                negative_groups: &[],
+                must_groups: &clauses.must_groups,
+                should_groups: &clauses.should_groups,
+                negative_groups: &clauses.negative_groups,
                 global_idf: None,
             },
             k,

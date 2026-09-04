@@ -70,7 +70,7 @@ use crate::{
     InfinoError,
     runtime_metrics::op_stats,
     superfile::{
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::reader::{Bm25SearchOptions, BoolMode},
         reader::VectorSearchOptions,
     },
     supertable::{
@@ -151,8 +151,11 @@ impl SupertableReader {
         let q_vec = calibrated_query(self, vec_col, q_vec);
         // Both retrievers run concurrently on the query runtime; each
         // inherits its own manifest skip and returns hits best-first.
+        // Per-superfile statistics and no per-call expansion: the text
+        // arm applies whatever expansion is registered for `text_col`.
+        let bm25_opts = Bm25SearchOptions::new().with_mode(mode);
         let (bm25_res, vector_res) = future::join(
-            self.bm25_search_async(text_col, q_text, k, mode, Bm25Stats::PerSuperfile),
+            self.bm25_search_async(text_col, q_text, k, &bm25_opts),
             self.vector_search_user_table_async(vec_col, &q_vec, k, options),
         )
         .await;

@@ -3,6 +3,7 @@
 
 pub mod brute_force_oracle;
 pub mod edge_and_unranked;
+pub mod expansion;
 pub mod fuzz_oracle;
 pub mod multi_column;
 pub mod must_should;

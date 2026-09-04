@@ -152,6 +152,16 @@ impl Table for RemoteTable {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
+        // A per-call vocabulary has no wire representation; registering
+        // one on a hosted table is a server-side act. Refuse loudly rather
+        // than silently searching without it.
+        if opts.expansion.is_some() {
+            return Err(InfinoError::Query(
+                "a per-call query expansion is not supported over the remote transport; \
+                 register it on the hosted table instead"
+                    .to_string(),
+            ));
+        }
         let body = json!({
             "table_name": self.table_name,
             "field_name": column,

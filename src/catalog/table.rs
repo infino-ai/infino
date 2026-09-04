@@ -111,7 +111,7 @@ impl Table for SupertableHandle {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        SupertableHandle::bm25_search(self, column, query, k, opts.mode, opts.stats, projection)
+        SupertableHandle::bm25_search_with_options(self, column, query, k, &opts, projection)
     }
     fn token_match(
         &self,
