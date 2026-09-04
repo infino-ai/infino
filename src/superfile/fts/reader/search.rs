@@ -1489,6 +1489,66 @@ mod tests {
         assert_eq!(ids, vec![1], "doc 0 excluded by negated 'async'");
     }
 
+    /// Under table-wide statistics a group scores with the smallest idf
+    /// among **all** its members' global values — the table's commonest
+    /// form — even when that form is absent from this superfile, and
+    /// even when the members present here are all rarer. The gather
+    /// stamps every member, so the map is the whole story.
+    #[tokio::test]
+    async fn group_under_global_idf_scores_with_the_table_wide_commonest_member() {
+        // build_blob: doc 2 "java spring boot" holds `java` once; `kotlin`
+        // appears nowhere in this superfile.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let group = vec![vec!["java".to_string(), "kotlin".into()]];
+        // Table-wide, `kotlin` is (hypothetically) far commoner than `java`.
+        let common_kotlin: f32 = 0.05;
+        let mut global: GlobalTermIdf = GlobalTermIdf::new();
+        global.insert("java".into(), 0.5);
+        global.insert("kotlin".into(), common_kotlin);
+        let hits = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    should_groups: &group,
+                    global_idf: Some(&global),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("group search under global idf");
+        assert_eq!(hits.len(), 1, "only doc 2 holds a member");
+        let (doc, score) = hits[0];
+        assert_eq!(doc, 2);
+        let dl_norm_k1 = r.columns[0].dl_norm_k1.get(doc);
+        let want = bm25::score_with_dl_norm_k1(common_kotlin * (bm25::K1 + 1.0), 1, dl_norm_k1);
+        assert!(
+            (score - want).abs() < 1e-6,
+            "group must score with the absent commonest member's idf: got {score}, want {want}"
+        );
+        // Without a global map the same group takes the smallest idf among
+        // the members present here — `java`'s local idf — which is larger.
+        let local = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    should_groups: &group,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("group search under local idf");
+        assert!(
+            local[0].1 > score,
+            "local idf ({}) must exceed the table-wide commonest member's ({score})",
+            local[0].1
+        );
+    }
+
     #[tokio::test]
     async fn search_excluding_negation_only_errors() {
         let (blob, json) = build_blob();

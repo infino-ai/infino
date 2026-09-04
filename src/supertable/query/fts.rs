@@ -531,9 +531,12 @@ impl SupertableReader {
         // (global N from the manifest + df summed across the superfiles
         // that contain the term), then score every superfile against it
         // instead of its own per-superfile idf. The scored set is every
-        // term that contributes to a score: the bare musts + shoulds, plus
-        // each member of a scored (must/should) phrase — a phrase's score
-        // is Σ member idf. Negated terms/phrases are pure exclusions, so
+        // term that contributes to a score: the bare musts + shoulds, each
+        // member of a scored (must/should) phrase — a phrase's score is Σ
+        // member idf — and each member of a scored group, whose idf is the
+        // table-wide commonest member's; gathering every member is what
+        // lets a superfile that lacks that member still score the group
+        // with it. Negated terms/phrases/groups are pure exclusions, so
         // their idf never matters and they stay out of the gather.
         let global_idf: Option<Arc<GlobalTermIdf>> = match opts.stats {
             Bm25Stats::PerSuperfile => None,
@@ -549,6 +552,11 @@ impl SupertableReader {
                 }
                 for phrase in must_phrases.iter().chain(should_phrases.iter()) {
                     for member in phrase {
+                        add(member);
+                    }
+                }
+                for group in must_groups.iter().chain(should_groups.iter()) {
+                    for member in group {
                         add(member);
                     }
                 }
@@ -2491,6 +2499,105 @@ mod tests {
         )
         .expect("valid options")
         .with_writer_pool(pool)
+    }
+
+    /// `Bm25Stats::Global` with term groups: a fragmented table must rank
+    /// grouped queries identically to a single superfile. A group's idf is
+    /// its commonest member's, and under global statistics that member is
+    /// chosen table-wide — including in a superfile that does not hold it
+    /// — so every superfile scores the group with one idf. The corpus
+    /// spreads the surface forms unevenly across the commits, so each
+    /// superfile's own commonest present form differs from the table's
+    /// and per-superfile statistics visibly diverge.
+    #[test]
+    fn global_stats_grouped_queries_match_single_superfile() {
+        /// The family's surface forms.
+        const FORMS: [&str; 4] = ["run", "runs", "running", "ran"];
+        /// Docs per commit on the fragmented table.
+        const CHUNK: usize = 6;
+        // 24 uniform-length (4-token) docs: `<form> <topic> shared dNN`.
+        // The form index advances every five docs, so each six-doc commit
+        // sees a different mix (`run` dominates the table at 9 docs while
+        // the second commit holds none of it).
+        let titles: Vec<String> = (0..24)
+            .map(|i| {
+                let form = FORMS[(i / 5) % FORMS.len()];
+                let topic = ["alpha", "beta", "gamma"][i % 3];
+                format!("{form} {topic} shared d{i:02}")
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
+        let vocab = Arc::new(QueryExpansion::new().group(FORMS[0], FORMS[1..].iter().copied()));
+
+        let single = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = single.writer().expect("writer");
+            w.append(&build_batch(0, &refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        single
+            .set_query_expansion("title", Some(Arc::clone(&vocab)))
+            .expect("register on single");
+        let multi = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = multi.writer().expect("writer");
+            for chunk in refs.chunks(CHUNK) {
+                w.append(&build_batch(0, chunk)).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+        multi
+            .set_query_expansion("title", Some(vocab))
+            .expect("register on multi");
+        assert!(
+            multi
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_all_superfiles()
+                .len()
+                > 1,
+            "multi table must be fragmented across superfiles"
+        );
+
+        let score_map =
+            |hits: Vec<(String, f32)>| -> HashMap<String, f32> { hits.into_iter().collect() };
+        // A bare group, a group beside a term, a must group with a
+        // should term, and a group under negation.
+        for q in ["run", "run alpha", "+run alpha", "run -beta"] {
+            let single_ref = score_map(all_scored(&single, q, Bm25Stats::PerSuperfile));
+            let multi_global = score_map(all_scored(&multi, q, Bm25Stats::Global));
+            let multi_local = score_map(all_scored(&multi, q, Bm25Stats::PerSuperfile));
+            assert!(!single_ref.is_empty(), "query {q:?} matched nothing");
+            assert_eq!(
+                single_ref.len(),
+                multi_global.len(),
+                "hit count mismatch for {q:?}"
+            );
+            for (title, s_score) in &single_ref {
+                let g_score = multi_global
+                    .get(title)
+                    .unwrap_or_else(|| panic!("global result missing {title:?} for {q:?}"));
+                assert!(
+                    (s_score - g_score).abs() <= 1e-5 * s_score.abs().max(1.0),
+                    "global score {g_score} != single score {s_score} for {title:?} / {q:?}"
+                );
+            }
+            // Per-superfile statistics genuinely differ here — each
+            // commit's commonest present form is not the table's — or the
+            // test would pass without `Global` doing anything.
+            if q == "run" {
+                let local_diverges = single_ref.iter().any(|(title, s)| {
+                    multi_local
+                        .get(title)
+                        .is_none_or(|l| (s - l).abs() > 1e-4 * s.abs().max(1.0))
+                });
+                assert!(
+                    local_diverges,
+                    "per-superfile group stats unexpectedly matched single-superfile for {q:?}"
+                );
+            }
+        }
     }
 
     /// A.1 oracle: `Bm25Stats::Global` must rank phrase-bearing queries
