@@ -21,7 +21,7 @@
 //! waiting for the `SidecarCache` TTL window to close — these
 //! tests pin that behaviour.
 
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
@@ -53,6 +53,7 @@ use infino::{
     },
 };
 use tempfile::TempDir;
+use tokio::time::sleep;
 
 /// BM25 top-k for the tombstone-filtered FTS query.
 const BM25_TOP_K: usize = 10;
@@ -118,11 +119,14 @@ fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
 /// returns the row's real id — a once-intermittent failure of the vector
 /// test below.
 fn stable_id_of(st: &Supertable, title: &str) -> i128 {
+    // A SQL string literal escapes an embedded quote by doubling it, so a
+    // title containing `'` still selects exactly that row.
+    let escaped_title = title.replace('\'', "''");
     let batches = st
         .reader()
         .expect("reader")
         .query_sql(&format!(
-            "SELECT _id FROM supertable WHERE title = '{title}'"
+            "SELECT _id FROM supertable WHERE title = '{escaped_title}'"
         ))
         .expect("resolve _id by title");
     let ids: Vec<i128> = batches
@@ -478,7 +482,7 @@ async fn vector_query_excludes_tombstoned_row() {
     let mut w = st.writer().expect("writer");
     w.append(&vec_batch(&titles[..1], &rows[..1]))
         .expect("append row 0");
-    sleep(ID_GAP_WAIT);
+    sleep(ID_GAP_WAIT).await;
     w.append(&vec_batch(&titles[1..], &rows[1..]))
         .expect("append rows 1..N");
     w.commit().expect("commit");
