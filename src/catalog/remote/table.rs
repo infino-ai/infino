@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats,
-    OptimizeError, OptimizeOptions, VectorFilter, catalog::table::Table,
+    OptimizeError, OptimizeOptions, QueryExpansion, VectorFilter, catalog::table::Table,
     superfile::VectorSearchOptions,
 };
 
@@ -221,6 +221,21 @@ impl Table for RemoteTable {
             .get("count")
             .and_then(Value::as_u64)
             .ok_or_else(|| InfinoError::Backend("count response missing `count`".to_string()))
+    }
+
+    fn set_query_expansion(
+        &self,
+        _column: &str,
+        _expansion: Option<Arc<QueryExpansion>>,
+    ) -> Result<(), InfinoError> {
+        // A vocabulary has no wire representation in this version;
+        // registering one on a hosted table is a server-side act. Refuse
+        // loudly rather than pretend the registration took.
+        Err(InfinoError::Query(
+            "set_query_expansion is not supported over the remote transport; \
+             register the vocabulary on the hosted table instead"
+                .to_string(),
+        ))
     }
 
     fn vector_search(

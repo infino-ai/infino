@@ -33,8 +33,10 @@ from a **`Connection`** — the catalog of tables opened with
 SQL across them. The handle's public operations are **synchronous
 methods on the supertable itself**: `append`, `update`, `delete`, the
 search methods (`bm25_search` / `vector_search` / `hybrid_search`,
-returning Arrow rows; the unranked `token_match` / `exact_match`), and
-`schema`.
+returning Arrow rows; the unranked `token_match` / `exact_match`),
+`set_query_expansion` (a per-column query-time vocabulary of stop terms
+and term groups that the full-text methods and SQL functions apply),
+and `schema`.
 
 Internally those methods drive a **reader** (a pinned, consistent
 snapshot) for queries and a single **writer** (staged changes published
@@ -118,6 +120,9 @@ columns:
   - `vector_search(column, query, k)` — vector kNN as a relation.
   - `bm25_search(column, query, k)` and
   `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.
+  `bm25_search` (and `token_match` below) apply the column's registered
+  query-time expansion, if any, so a vocabulary set on the handle reaches
+  SQL callers without a change to their SQL.
   - `token_match(column, query, mode)` and `exact_match(column, value)`
   — the unranked token / exact-match relations. Negation is then a
   SQL composition over them (e.g. `token_match(..,'rust') EXCEPT token_match(..,'compiler')`), keeping it index-bounded rather than a

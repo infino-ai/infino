@@ -20,6 +20,13 @@
 //! // Unranked candidate sets (Arrow rows, score == 0.0).
 //! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
 //! let exact = table.exact_match("title", "rust async", None)?;
+//!
+//! // A query-time vocabulary — stop terms and term groups — registered
+//! once per column and applied by every full-text query over it (and by
+//! the SQL functions); `exact_match` never expands.
+//! table.set_query_expansion("title", Some(Arc::new(
+//!     QueryExpansion::new().stop(["the"]).group("run", ["runs", "running", "ran"]),
+//! )))?;
 //! ```
 //!
 //! Internally these drive the async kernel on the snapshot-pinned

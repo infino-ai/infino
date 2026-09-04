@@ -183,10 +183,12 @@ impl core::marker::UnsafeUnpin for infino::OptimizeError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
 impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
 pub struct infino::Bm25SearchOptions
+pub infino::Bm25SearchOptions::expansion: core::option::Option<alloc::sync::Arc<infino::QueryExpansion>>
 pub infino::Bm25SearchOptions::mode: infino::BoolMode
 pub infino::Bm25SearchOptions::stats: infino::Bm25Stats
 impl infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::new() -> Self
+pub fn infino::Bm25SearchOptions::with_expansion(self, core::option::Option<alloc::sync::Arc<infino::QueryExpansion>>) -> Self
 pub fn infino::Bm25SearchOptions::with_mode(self, infino::BoolMode) -> Self
 pub fn infino::Bm25SearchOptions::with_stats(self, infino::Bm25Stats) -> Self
 impl core::clone::Clone for infino::Bm25SearchOptions
@@ -198,7 +200,6 @@ impl core::default::Default for infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::default() -> infino::Bm25SearchOptions
 impl core::fmt::Debug for infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for infino::Bm25SearchOptions
 impl core::marker::StructuralPartialEq for infino::Bm25SearchOptions
 impl core::marker::Freeze for infino::Bm25SearchOptions
 impl core::marker::Send for infino::Bm25SearchOptions
@@ -391,6 +392,29 @@ impl core::marker::Unpin for infino::OptimizeOptions
 impl core::marker::UnsafeUnpin for infino::OptimizeOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
+pub struct infino::QueryExpansion
+impl infino::QueryExpansion
+pub fn infino::QueryExpansion::group<H, I, S>(self, H, I) -> Self where H: core::convert::Into<alloc::string::String>, I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn infino::QueryExpansion::is_empty(&self) -> bool
+pub fn infino::QueryExpansion::new() -> Self
+pub fn infino::QueryExpansion::stop<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+impl core::clone::Clone for infino::QueryExpansion
+pub fn infino::QueryExpansion::clone(&self) -> infino::QueryExpansion
+impl core::cmp::Eq for infino::QueryExpansion
+impl core::cmp::PartialEq for infino::QueryExpansion
+pub fn infino::QueryExpansion::eq(&self, &infino::QueryExpansion) -> bool
+impl core::default::Default for infino::QueryExpansion
+pub fn infino::QueryExpansion::default() -> infino::QueryExpansion
+impl core::fmt::Debug for infino::QueryExpansion
+pub fn infino::QueryExpansion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::QueryExpansion
+impl core::marker::Freeze for infino::QueryExpansion
+impl core::marker::Send for infino::QueryExpansion
+impl core::marker::Sync for infino::QueryExpansion
+impl core::marker::Unpin for infino::QueryExpansion
+impl core::marker::UnsafeUnpin for infino::QueryExpansion
+impl core::panic::unwind_safe::RefUnwindSafe for infino::QueryExpansion
+impl core::panic::unwind_safe::UnwindSafe for infino::QueryExpansion
 pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
@@ -402,6 +426,7 @@ pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Resu
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
+pub fn infino::Supertable::set_query_expansion(&self, &str, core::option::Option<alloc::sync::Arc<infino::QueryExpansion>>) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
