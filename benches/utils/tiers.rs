@@ -11,10 +11,12 @@
 //! `s3` reads `INFINO_REAL_S3_BUCKET`, `azure` reads
 //! `INFINO_REAL_AZURE_CONTAINER`, `gcs` reads `INFINO_REAL_GCS_BUCKET`.
 
-use std::fs;
-use std::sync::{Arc, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    fs,
+    sync::{Arc, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use infino::{
