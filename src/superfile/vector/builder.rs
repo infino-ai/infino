@@ -167,6 +167,78 @@ fn n_cent_row_count_cap(n_docs: usize) -> usize {
     }
 }
 
+/// The fine-cluster `n_cent` a cell pack actually stores for `requested_n_cent`
+/// at `n_docs` rows. The cap switches at the consolidated-cell boundary (see
+/// [`CONSOLIDATED_CELL_ROWS_THRESHOLD`]): consolidated cells keep the byte-target
+/// count uncapped; smaller cells clamp to the banded [`n_cent_row_count_cap`]
+/// the measured 1M/10M cold-GET layout depends on. Both build clamp sites and
+/// the merge splice-gate ([`effective_fine_n_cent`]) route through this one
+/// function, so the gate can never target a count the build will not store —
+/// which would otherwise rebuild a sub-threshold, above-cap cell on every
+/// compaction only to land back on the same capped count.
+pub(crate) fn effective_cell_n_cent(requested_n_cent: usize, n_docs: usize) -> usize {
+    let base = requested_n_cent.max(1);
+    let capped = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
+        base
+    } else {
+        base.min(n_cent_row_count_cap(n_docs))
+    };
+    capped.min(n_docs.max(1))
+}
+
+/// Target rows per IVF cluster for a STREAMING user-superfile build.
+/// Matches the layout the banded cap produces at its design points
+/// (1M rows / 1024 clusters = 976; the drain's fine-cluster p50 sits
+/// ~1000 on the same corpora), so the continuous rule below reproduces
+/// the measured shapes where they were measured and interpolates
+/// between them instead of stepping.
+const STREAM_ROWS_PER_CENT: usize = 1000;
+
+/// IVF centroid count for a streaming user-superfile build, derived
+/// continuously from the rows the build holds:
+/// `next_pow2(rows / STREAM_ROWS_PER_CENT)` clamped to
+/// `[N_CENT_SMALL, N_CENT_LARGE]`.
+///
+/// Replaces the banded `n_cent_row_count_cap` on THIS path only. The
+/// band step made the centroid count a step function of shard size:
+/// sharding 1M rows across 7 builders put every 142K-row shard in the
+/// ≥100K band, so each shard trained the full 1024 centroids on all of
+/// its rows and 7 writers did ~2.6x the k-means work of 1 writer —
+/// measured 2x SLOWER wall time on a 4-core box. Under the continuous
+/// rule a 142K shard trains 128 centroids (~1116 rows/cluster) and
+/// sharding divides the centroid work the way it divides the rows.
+///
+/// NEAREST power of two, not round-up: rounding up would keep every
+/// shard finer than the target (500..1000 rows/cluster) and shift the
+/// measured 10M supertable shard layout (~78K rows: 64 under the band,
+/// 128 rounded up). Nearest keeps rows-per-cluster bracketing the
+/// target (707..1414) and reproduces EVERY measured design shape
+/// exactly: 1M -> 1024, ~78K supertable shards -> 64, small builds ->
+/// 64, >=5M -> 4096.
+///
+/// Cell packs and maintenance rebuilds keep the banded cap — those are
+/// the measured 1M/10M cell layouts, not this path.
+fn stream_n_cent_for_rows(n_docs: usize) -> usize {
+    // Clamp the target to the ceiling BEFORE the power-of-two math: any
+    // target past `N_CENT_LARGE` resolves to `N_CENT_LARGE` regardless
+    // (rounding only moves values between adjacent powers of two, and
+    // the final clamp caps them), and the pre-clamp makes every
+    // operation below total — `next_power_of_two` cannot overflow-panic
+    // and the squared comparison stays far inside `usize` — with no
+    // assumption about how large a corpus a caller hands in.
+    let target = (n_docs / STREAM_ROWS_PER_CENT).min(N_CENT_LARGE);
+    let up = target.next_power_of_two();
+    let down = up / 2;
+    // Nearest in log space: `down` wins iff `target <= down·√2`, i.e.
+    // `target² <= 2·down² = down·up`.
+    let nearest = if target * target <= down * up {
+        down
+    } else {
+        up
+    };
+    nearest.clamp(N_CENT_SMALL, N_CENT_LARGE)
+}
+
 /// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
 /// 2 = NegDot.
 fn metric_id(m: Metric) -> u32 {
@@ -1186,15 +1258,7 @@ fn materialized_centroids(
     // measured shape. Oversized fine-run splitting always runs — the
     // cap alone does not stop Lloyd from parking 2×-skewed runs that
     // flatten fine-first p=1 recall below 0.99.
-    let consolidated = n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD;
-    let requested = if consolidated {
-        requested_n_cent.max(1).min(n_docs.max(1))
-    } else {
-        requested_n_cent
-            .max(1)
-            .min(n_cent_row_count_cap(n_docs))
-            .min(n_docs.max(1))
-    };
+    let requested = effective_cell_n_cent(requested_n_cent, n_docs);
     // Keep the final Lloyd assignments — `split_oversized_fine_runs`
     // consumes them for the first bound check so a balanced pack (the
     // common commit-cell case) does not pay a redundant full sample
@@ -1757,7 +1821,13 @@ fn stream_fp32_rows_to_buckets(
                 .expect("residual-family codec has divisor"),
         )
     });
-    let chunk_rows = materialized_chunk_rows_for_dim(dim);
+    // Bound the chunk by the rows this call actually holds: the budgeted
+    // chunk is 32K rows (~128 MiB per fp32 buffer at dim=1024), and the
+    // commit path reaches here once per small per-cell subsection — sizing
+    // the scratch to the budget regardless of `n_docs` zeroed ~320 MiB per
+    // call to process a few hundred rows. Measured: 46% of supertable
+    // vector ingest wall was memset under these allocations.
+    let chunk_rows = materialized_chunk_rows_for_dim(dim).min(n_docs.max(1));
     let mut chunk_rotated = vec![0.0f32; chunk_rows * dim];
     // Cosine rows must be unit before ANY consumer below sees them: the
     // fixed cosine grid spans [-1, 1], so a non-unit component saturates at
@@ -2145,17 +2215,9 @@ pub(crate) fn build_cell_subsection_from_source(
             }
         }
     }
-    // Mirrors the `materialized_centroids` `n_cent` cap switch so the
-    // sample is sized for the runs actually trained: consolidated cells
-    // uncapped, sub-threshold cells under the legacy row-count cap.
-    let effective_n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
-        requested_n_cent.max(1).min(n_docs)
-    } else {
-        requested_n_cent
-            .max(1)
-            .min(n_cent_row_count_cap(n_docs))
-            .min(n_docs)
-    };
+    // Sample is sized for the runs actually trained; the cap switch lives in
+    // the shared `effective_cell_n_cent`.
+    let effective_n_cent = effective_cell_n_cent(requested_n_cent, n_docs);
     let sample_size = if cfg.provided_centroids.is_some() {
         0
     } else {
@@ -2516,8 +2578,8 @@ fn build_subsection_streaming(
         // `n_cent > sample_rows` would crash k-means (`k > n` is asserted
         // by the trainer). At steady-state shapes (`n_docs > sample_size`,
         // `sample_size ≥ 100_000`) the sample_rows bound is the active
-        // one and is comfortably above the row-count cap.
-        let n_cent = n_cent_row_count_cap(n_docs)
+        // one and is comfortably above the row-count rule.
+        let n_cent = stream_n_cent_for_rows(n_docs)
             .min(n_docs.max(1))
             .min(sample_rows.max(1))
             .max(1);
@@ -3442,6 +3504,44 @@ mod tests {
             n_cent_row_count_cap(N_CENT_LARGE_DOC_THRESHOLD),
             N_CENT_LARGE
         );
+    }
+
+    /// The streaming rule preserves the banded cap's design points and
+    /// interpolates between them, so sharding a corpus divides the
+    /// k-means work instead of multiplying it.
+    #[test]
+    fn stream_n_cent_scales_with_rows_and_keeps_design_points() {
+        // Clamp floor: empty and small builds keep the small layout.
+        assert_eq!(stream_n_cent_for_rows(0), N_CENT_SMALL);
+        assert_eq!(stream_n_cent_for_rows(62_500), N_CENT_SMALL);
+        // Design point: the 1M single build keeps its measured layout.
+        assert_eq!(stream_n_cent_for_rows(1_000_000), N_CENT_MEDIUM);
+        // 10M supertable commit shards (~78K rows) keep the measured 64:
+        // nearest-pow2 rounds 78 DOWN, where round-up would have shifted
+        // a measured layout to 128 for nothing.
+        assert_eq!(stream_n_cent_for_rows(78_125), N_CENT_SMALL);
+        // Clamp ceiling: at and past the large threshold, the large cap.
+        assert_eq!(stream_n_cent_for_rows(5_000_000), N_CENT_LARGE);
+        assert_eq!(stream_n_cent_for_rows(10_000_000), N_CENT_LARGE);
+        // Total for ANY input: the pre-clamp keeps the pow2 math from
+        // overflowing, so even an absurd row count resolves instead of
+        // panicking.
+        assert_eq!(stream_n_cent_for_rows(usize::MAX), N_CENT_LARGE);
+        // The fix itself: a 1M/7 shard no longer trains the full 1024 —
+        // its centroid count follows its own rows, landing rows/cluster
+        // near the target (142,858 / 128 ≈ 1116).
+        assert_eq!(stream_n_cent_for_rows(1_000_000_usize.div_ceil(7)), 128);
+        // Power-of-two fractions of the design point keep the design
+        // ratio: half the corpus, half the clusters.
+        assert_eq!(stream_n_cent_for_rows(500_000), 512);
+        assert_eq!(stream_n_cent_for_rows(250_000), 256);
+        // Monotone in rows: more rows never means fewer clusters.
+        let mut prev = 0;
+        for rows in [0, 10_000, 62_500, 142_858, 500_000, 1_000_000, 5_000_000] {
+            let n = stream_n_cent_for_rows(rows);
+            assert!(n >= prev, "n_cent must be monotone in rows");
+            prev = n;
+        }
     }
 
     #[test]

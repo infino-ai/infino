@@ -64,6 +64,8 @@ use datafusion::{
 use futures::{future, stream};
 use tracing::debug;
 
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     runtime_metrics::op_stats,
@@ -131,7 +133,7 @@ impl SupertableReader {
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn hybrid_search_async(
         &self,
@@ -194,7 +196,7 @@ impl Supertable {
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn hybrid_search(
         &self,

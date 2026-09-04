@@ -78,6 +78,10 @@ pub struct ParquetParts {
     pub vec_offset: u64,
     /// Byte length of the vector blob (0 if absent).
     pub vec_length: u64,
+    /// Absolute byte offset of the stable-id sidecar within `bytes` (0 if absent).
+    pub ids_offset: u64,
+    /// Byte length of the stable-id sidecar (0 if absent).
+    pub ids_length: u64,
 }
 
 /// Absolute layout of a superfile written through
@@ -88,6 +92,8 @@ pub struct ParquetLayout {
     pub fts_length: u64,
     pub vec_offset: u64,
     pub vec_length: u64,
+    pub ids_offset: u64,
+    pub ids_length: u64,
 }
 
 struct CountingWriter<'a, W> {
@@ -284,12 +290,14 @@ pub fn splice_index_blobs(
     body: EncodedBody,
     fts_blob: &[u8],
     vec_blob: &[u8],
+    ids_blob: &[u8],
     extra_kv: &[(String, String)],
 ) -> Result<ParquetParts, FooterError> {
     let mut bytes = Vec::with_capacity(
         (body.body_len as usize)
             .saturating_add(fts_blob.len())
-            .saturating_add(vec_blob.len()),
+            .saturating_add(vec_blob.len())
+            .saturating_add(ids_blob.len()),
     );
     let layout = splice_index_streams_to(
         body,
@@ -297,6 +305,8 @@ pub fn splice_index_blobs(
         fts_blob.len() as u64,
         Cursor::new(vec_blob),
         vec_blob.len() as u64,
+        Cursor::new(ids_blob),
+        ids_blob.len() as u64,
         extra_kv,
         &mut bytes,
     )?;
@@ -306,6 +316,8 @@ pub fn splice_index_blobs(
         fts_length: layout.fts_length,
         vec_offset: layout.vec_offset,
         vec_length: layout.vec_length,
+        ids_offset: layout.ids_offset,
+        ids_length: layout.ids_length,
     })
 }
 
@@ -313,12 +325,14 @@ pub fn splice_index_blobs(
 /// footer to `output`. This is the single superfile splice implementation:
 /// the in-memory [`splice_index_blobs`] wrapper and drain's disk-backed shard
 /// assembly both call here.
-pub(crate) fn splice_index_streams_to<W, F, V>(
+pub(crate) fn splice_index_streams_to<W, F, V, I>(
     body: EncodedBody,
     mut fts_blob: F,
     fts_length: u64,
     mut vec_blob: V,
     vec_length: u64,
+    mut ids_blob: I,
+    ids_length: u64,
     extra_kv: &[(String, String)],
     mut output: W,
 ) -> Result<ParquetLayout, FooterError>
@@ -326,6 +340,7 @@ where
     W: Write,
     F: Read,
     V: Read,
+    I: Read,
 {
     let EncodedBody {
         body_file,
@@ -364,6 +379,16 @@ where
     } else {
         0
     };
+    let ids_offset = if ids_length > 0 {
+        let offset = output.written;
+        let copied = io::copy(&mut ids_blob, &mut output)?;
+        if copied != ids_length {
+            return Err(FooterError::Malformed("stable-id stream length mismatch"));
+        }
+        offset
+    } else {
+        0
+    };
 
     // Patch KV metadata. Preserve everything parquet-rs put in the
     // footer (Arrow schema KV among them); append `extra_kv` plus the
@@ -396,6 +421,16 @@ where
             Some(vec_length.to_string()),
         ));
     }
+    if ids_length > 0 {
+        kvs.push(KeyValue::new(
+            kv::IDS_OFFSET.to_string(),
+            Some(ids_offset.to_string()),
+        ));
+        kvs.push(KeyValue::new(
+            kv::IDS_LENGTH.to_string(),
+            Some(ids_length.to_string()),
+        ));
+    }
     let new_fm = FileMetaData::new(
         old_fm.version(),
         old_fm.num_rows(),
@@ -422,6 +457,8 @@ where
         fts_length,
         vec_offset,
         vec_length,
+        ids_offset,
+        ids_length,
     })
 }
 
@@ -595,7 +632,9 @@ mod tests {
             row_group_size,
             column_page_size_limits,
         )?;
-        splice_index_blobs(body, fts_blob, vec_blob, extra_kv)
+        // Sidecar exercised by builder/reader round-trip tests, not this
+        // body+splice composition helper.
+        splice_index_blobs(body, fts_blob, vec_blob, &[], extra_kv)
     }
 
     #[test]

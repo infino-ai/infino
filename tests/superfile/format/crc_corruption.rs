@@ -319,8 +319,8 @@ fn corrupt_fts_positions_region_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 4,
-        "positional superfile must embed a v4 FTS blob (dense corpus ⇒ bitset blocks)"
+        version, 5,
+        "positional superfile must embed a v5 FTS blob (coarse table; dense corpus ⇒ bitset blocks)"
     );
     let positions_off_rel = u64::from_le_bytes(
         bytes[fts_off + 48..fts_off + 56]
@@ -401,8 +401,8 @@ fn corrupt_fts_bitset_block_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 4,
-        "dense corpus must embed a v4 FTS blob (bitset blocks)"
+        version, 5,
+        "dense corpus must embed a v5 FTS blob (coarse table; bitset blocks)"
     );
     // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
     let postings_offset_rel = u64::from_le_bytes(

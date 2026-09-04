@@ -114,6 +114,8 @@ const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
 
 pub use crate::superfile::fts::reader::BoolMode;
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     runtime_bridge::run_on_pool,
@@ -314,7 +316,7 @@ impl SupertableReader {
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn bm25_search_async(
         &self,
@@ -871,7 +873,11 @@ impl SupertableReader {
                         let set = cell
                             .get_or_try_init(|| async {
                                 let set = r
-                                    .bm25_prefix_cursor_set(&column_arc, &prefix_arc)
+                                    .bm25_prefix_cursor_set(
+                                        &column_arc,
+                                        &prefix_arc,
+                                        Some(&reader_pool),
+                                    )
                                     .await
                                     .map_err(fts_read_error)?;
                                 // Flushed inside the OnceCell init so slices
@@ -922,7 +928,7 @@ impl SupertableReader {
                     }
                     None => {
                         let (hits, work) = r
-                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k, Some(&reader_pool))
                             .await
                             .map_err(fts_read_error)?;
                         if let Some(stats) = &op_stats {
@@ -1079,7 +1085,7 @@ impl SupertableReader {
     /// [`SupertableReader::token_match`].
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn token_match_async(
         &self,
@@ -1834,7 +1840,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn bm25_search(
         &self,
@@ -1866,7 +1872,7 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn token_match(
         &self,
@@ -1893,7 +1899,7 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column))
+        tracing::instrument(skip_all, fields(column = column, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn exact_match(
         &self,
@@ -2806,7 +2812,7 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5))
+        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5, None))
             .expect("oracle")
             .0;
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();

@@ -86,7 +86,7 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
         live.insert(centroids.uri.clone());
     }
-    if let Some(graphs) = manifest.slow_vector_state_graphs_blob() {
+    if let Some(graphs) = manifest.resident_vector_index_blob() {
         live.insert(graphs.uri.clone());
     }
     if let Some(centroid_graph) = manifest.slow_vector_state_centroid_graph_blob() {
@@ -113,6 +113,10 @@ impl Supertable {
         bridge_on_runtime(self.gc_async(safety_gap), &self.inner().query_runtime())
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "gc", skip_all, fields(role = self.role().as_str()))
+    )]
     pub(crate) async fn gc_async(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         gc_storage_sweep_for_inner(self.inner(), safety_gap).await
     }

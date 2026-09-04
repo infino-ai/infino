@@ -28,16 +28,45 @@ use crate::{
         op_stats::{metering_active, timed_section},
     },
     superfile::{
-        ReadError,
         error::FtsError,
+        format,
         fts::{
             bm25,
-            dict::{DictReader, make_key},
+            dict::make_key,
             fst_value::FstValue,
             posting::{BLOCK_LEN, decode_block},
         },
     },
 };
+
+/// Threshold-first seed tuning for the single-term ranked walk. The walk
+/// fills its top-k heap in doc-id order, so its skip threshold rises only
+/// as the heap fills and it decodes many blocks before the threshold is
+/// high enough to skip them. Decoding the highest-block-max blocks up front
+/// (found via the coarse block-max table) raises the k-th threshold first,
+/// so the main walk prunes those otherwise-wasted decodes.
+mod seed {
+    /// Don't seed lists shorter than this many blocks — the setup isn't
+    /// worth it when there's little waste to prune.
+    pub const MIN_BLOCKS: usize = 256;
+    /// Minimum coarse spans to gather when selecting seed-block candidates.
+    pub const TOP_SPANS: usize = 16;
+    /// Floor on seed-block count (enough for a tight threshold at small k).
+    pub const MIN_BLOCKS_SEED: usize = 32;
+    /// Hard cap so a pathological k can't make the seed scan the whole list.
+    pub const MAX_BLOCKS_SEED: usize = 2048;
+}
+
+/// Seed-block count for top-k `k`: `~1.25·k`, clamped. The top-k spreads
+/// roughly one doc per high-block-max block, so the decoded count reaches
+/// its irreducible floor when the seed covers about one block per top-k
+/// doc; decoding past that is pure cost, so target just enough (the `k/4`
+/// slack absorbs blocks that hold more than one top doc). Saturating so a
+/// merge caller's huge `k` clamps to the cap rather than overflowing.
+fn seed_blocks_for(k: usize) -> usize {
+    k.saturating_add(k / 4)
+        .clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
+}
 
 impl FtsReader {
     /// Ranked search over heterogeneous atoms — the walk every
@@ -335,6 +364,25 @@ impl FtsReader {
     /// finishes here since it's cheap; the phrase-atom shape also
     /// finishes here, but only because it isn't wired to the reader
     /// pool yet, not because it's cheap.
+    /// Collapse repeated clause terms into distinct terms plus a per-term repeat
+    /// count (query-term-frequency). Order-preserving; O(n²) over the handful of
+    /// query terms (the same shape the count path already dedups with). Returns
+    /// each term with count 1 — a no-op — for a distinct-term query.
+    fn dedup_terms_with_qtf<'a>(terms: &[&'a str]) -> (Vec<&'a str>, Vec<u32>) {
+        let mut distinct: Vec<&str> = Vec::with_capacity(terms.len());
+        let mut qtf: Vec<u32> = Vec::with_capacity(terms.len());
+        for &t in terms {
+            match distinct.iter().position(|&d| d == t) {
+                Some(i) => qtf[i] += 1,
+                None => {
+                    distinct.push(t);
+                    qtf.push(1);
+                }
+            }
+        }
+        (distinct, qtf)
+    }
+
     pub(crate) async fn prepare_clauses(
         &self,
         column: &str,
@@ -429,7 +477,7 @@ impl FtsReader {
             // Negatives are a hard exclusion filter, not scored, so their
             // idf is irrelevant — always build them with local stats.
             _ => Some(ExcludeFilter::new(
-                self.build_term_cursors(column_id, lists.negatives, None, false)
+                self.build_term_cursors(column_id, lists.negatives, None, false, None)
                     .await?,
             )),
         };
@@ -437,6 +485,16 @@ impl FtsReader {
         // `build_term_cursors` call (the dictionary fetch is a real
         // byte-source range on every query, warm or cold).
         let mut dict_ranges = u64::from(neg_filter.is_some());
+
+        // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
+        // repeat count becomes a query-term-frequency multiplier on the term's
+        // idf. BM25 is linear in `idf_x_k1p1`, so this scores identically to N
+        // duplicate cursors at 1/N the cursor + scan cost — e.g. `+to +be +or
+        // +not +to +be` builds 4 cursors, not 6. A no-op for distinct-term
+        // queries. The single-term fast path below gates on the pre-dedup count,
+        // so a repeated lone term (`+to +to`) routes through the weighted path.
+        let (musts, must_qtf) = Self::dedup_terms_with_qtf(lists.musts);
+        let (shoulds, should_qtf) = Self::dedup_terms_with_qtf(lists.shoulds);
 
         // Single-atom fast path: BlockMaxWAND-driven block skipping.
         // One term scores identically whichever clause list it sits
@@ -468,9 +526,15 @@ impl FtsReader {
             });
         }
 
-        if lists.musts.is_empty() {
+        if musts.is_empty() {
             let cursors = self
-                .build_term_cursors(column_id, lists.shoulds, lists.global_idf, false)
+                .build_term_cursors(
+                    column_id,
+                    &shoulds,
+                    lists.global_idf,
+                    false,
+                    Some(&should_qtf),
+                )
                 .await?;
             dict_ranges += 1;
             if cursors.is_empty() {
@@ -496,10 +560,10 @@ impl FtsReader {
         // Build must cursors; if any must is missing, the
         // intersection is empty.
         let must_cursors = self
-            .build_term_cursors(column_id, lists.musts, lists.global_idf, false)
+            .build_term_cursors(column_id, &musts, lists.global_idf, false, Some(&must_qtf))
             .await?;
         dict_ranges += 1;
-        if must_cursors.len() != lists.musts.len() {
+        if must_cursors.len() != musts.len() {
             let postings_bytes = term_cursor_bytes(&must_cursors)
                 + neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
             let planned_ranges = term_cursor_ranges(&must_cursors)
@@ -512,7 +576,7 @@ impl FtsReader {
                 kernel_cpu_ns: 0,
             });
         }
-        if lists.shoulds.is_empty() {
+        if shoulds.is_empty() {
             return Ok(PreparedClauses::Must {
                 column_id,
                 must_cursors,
@@ -525,7 +589,13 @@ impl FtsReader {
         // Shoulds absent from this superfile contribute nothing;
         // when none survive, the walk is a plain must intersection.
         let should_cursors = self
-            .build_term_cursors(column_id, lists.shoulds, lists.global_idf, false)
+            .build_term_cursors(
+                column_id,
+                &shoulds,
+                lists.global_idf,
+                false,
+                Some(&should_qtf),
+            )
             .await?;
         dict_ranges += 1;
         if should_cursors.is_empty() {
@@ -668,7 +738,7 @@ impl FtsReader {
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(column_id, terms, global_idf, false)
+            self.build_term_cursors(column_id, terms, global_idf, false, None)
                 .await?
         };
         Ok(OrCursorSet { column_id, cursors })
@@ -679,10 +749,10 @@ impl FtsReader {
     /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
     /// The ranged path carries no negation in v1.
     ///
-    /// Kernel choice goes through the same `route_or_to_windowed` seam as the
-    /// single-shot path, so a query runs the same kernel whether or not the
-    /// fan-out sliced it — hardcoding BMM here once caused an 11-24x
-    /// post-compact broad-OR regression.
+    /// Runs the same windowed MaxScore union kernel as the single-shot path, so
+    /// a query runs the identical kernel whether or not the fan-out sliced it —
+    /// hardcoding a single-regime scorer here once caused an 11-24x post-compact
+    /// broad-OR regression.
     pub(crate) fn search_or_range_prebuilt(
         &self,
         set: &OrCursorSet,
@@ -695,27 +765,15 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
-        if route_or_to_windowed(&cursors, k) {
-            self.run_windowed_union(
-                set.column_id,
-                cursors,
-                k,
-                None,
-                floor.next_down(),
-                doc_id_start,
-                doc_id_end,
-            )
-        } else {
-            self.run_max_score_bmm_range(
-                set.column_id,
-                cursors,
-                k,
-                doc_id_start,
-                doc_id_end,
-                None,
-                floor.next_down(),
-            )
-        }
+        self.run_windowed_maxscore(
+            set.column_id,
+            cursors,
+            k,
+            None,
+            floor.next_down(),
+            doc_id_start,
+            doc_id_end,
+        )
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -777,11 +835,7 @@ impl FtsReader {
         floor_eff: f32,
     ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
         let key = make_key(&col_meta.name, term);
         let Some(packed) = dict.lookup(&key) else {
@@ -844,7 +898,13 @@ impl FtsReader {
         // Gated: an unmetered process must not pay the procfs reads on
         // the most common query shape.
         let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions, false)?;
+        let term_meta = TermMeta::parse(
+            postings,
+            metadata_offset,
+            col_meta.positions,
+            false,
+            self.has_coarse_block_max,
+        )?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
@@ -854,17 +914,156 @@ impl FtsReader {
         // that makes `peek()` the current kth-best score.
         let mut heap: BinaryHeap<TopKEntry> =
             BinaryHeap::with_capacity(k.min(term_meta.num_blocks * BLOCK_LEN).max(1));
-        let mut buf_d = vec![0u32; BLOCK_LEN];
-        let mut buf_t = vec![0u32; BLOCK_LEN];
+        // Stack-resident decode scratch: `BLOCK_LEN` is a compile-time
+        // const and these never cross an await (the whole scoring walk
+        // below is synchronous), so they stay off the heap — no per-query
+        // malloc/free on the most common query shape.
+        let mut buf_d = [0u32; BLOCK_LEN];
+        let mut buf_t = [0u32; BLOCK_LEN];
 
-        for i in 0..term_meta.num_blocks {
+        let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
+        // The coarse block-max table exists only on V5 blobs; on V1–V4 the
+        // walk falls back to the flat per-block skip (and no seed).
+        let coarse_enabled = term_meta.has_coarse;
+
+        // Threshold-first seed. The doc-id-order walk below fills `heap_min`
+        // slowly, so on a common term it decodes ~2/3 of its blocks before
+        // the k-th threshold has risen enough to skip them (measured: `the`
+        // TOP_10 decodes ~1,209 blocks, only ~368 of them irreducible). To
+        // raise the bar first, decode the highest-block-max blocks up front
+        // — found cheaply via the coarse level — and take the k-th score of
+        // those as a floor for the main walk's skip bar.
+        //
+        // Correctness: `seed_threshold` is the k-th of a *subset* of docs, so
+        // it is a true lower bound on the final k-th; skipping a block whose
+        // block-max is *strictly* below it drops only docs that score below a
+        // lower bound on the k-th — never a top-k or tied-at-k doc. The seed
+        // does not touch `heap`; the main walk re-decodes any seed block it
+        // needs and admits in doc-id order, so the top-k (and its tie-break)
+        // is bit-identical to the un-seeded walk. Only applied without a
+        // negation filter (so the seed's admitted set matches the final one)
+        // and on lists long enough to have waste to prune.
+        let seed_threshold: f32 = if coarse_enabled
+            && filter.is_none()
+            && term_meta.num_blocks >= seed::MIN_BLOCKS
+        {
+            let num_coarse = term_meta.num_blocks.div_ceil(coarse_span);
+            // Seed depth scales with k: a fixed handful of blocks gives a
+            // tight k-th only at small k; at k=100/1000 the top-k spreads
+            // across more blocks, so decode more to raise the threshold.
+            let m_want = seed_blocks_for(k);
+            // Gather enough top spans to contain the top `m_want` blocks
+            // (over-cover: worst case each is in its own span).
+            let mut spans: Vec<(f32, usize)> = (0..num_coarse)
+                .map(|g| (term_meta.coarse_entry(postings, g), g))
+                .collect();
+            let s = m_want.max(seed::TOP_SPANS).min(spans.len());
+            spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+            // Candidate blocks from those spans, then the top blocks by
+            // block-max across them.
+            let mut cand: Vec<(f32, usize)> = Vec::with_capacity(s * coarse_span);
+            for &(_, g) in &spans[..s] {
+                let start = g * coarse_span;
+                let end = (start + coarse_span).min(term_meta.num_blocks);
+                for bi in start..end {
+                    let (_, _, bm) = term_meta.skip_entry(postings, bi);
+                    cand.push((bm, bi));
+                }
+            }
+            let m = m_want.min(cand.len());
+            cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+            // Decode those blocks, score, keep a k-sized seed heap. Clamp the
+            // preallocation to the corpus size: `k` is caller-controlled and may
+            // be `usize::MAX` (an unbounded "return everything" request), which
+            // would overflow `with_capacity`. The heap never holds more than the
+            // docs in scope anyway.
+            let mut seed_heap: BinaryHeap<TopKEntry> =
+                BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
+            for &(_, bi) in &cand[..m] {
+                let (_, off, _) = term_meta.skip_entry(postings, bi);
+                let end = term_meta.block_end_in_term(postings, bi);
+                let bytes = &postings[metadata_offset + off..metadata_offset + end];
+                let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+                for j in 0..n {
+                    let score =
+                        bm25::score_with_dl_norm_k1(idf_x_k1p1, buf_t[j], dl_norm_k1.get(buf_d[j]));
+                    if score <= floor_eff {
+                        continue;
+                    }
+                    if seed_heap.len() < k {
+                        seed_heap.push(TopKEntry(score, buf_d[j]));
+                    } else if let Some(TopKEntry(mn, _)) = seed_heap.peek()
+                        && score > *mn
+                    {
+                        seed_heap.pop();
+                        seed_heap.push(TopKEntry(score, buf_d[j]));
+                    }
+                }
+            }
+            // Only a *full* seed heap gives a valid k-th lower bound.
+            match seed_heap.len() >= k {
+                true => seed_heap
+                    .peek()
+                    .map(|TopKEntry(s, _)| *s)
+                    .unwrap_or(f32::NEG_INFINITY),
+                false => f32::NEG_INFINITY,
+            }
+        } else {
+            f32::NEG_INFINITY
+        };
+
+        // Two skip levels. The coarse table bounds a whole span of
+        // `COARSE_BLOCK_MAX_SPAN` blocks with a single entry, so a span
+        // the running k-th-best already dominates is jumped in one
+        // comparison instead of one skip-entry read per block. On a long,
+        // heavily-skipped list (a common term at small k) that per-block
+        // scan is the dominant cost; the coarse level removes ~31/32 of
+        // it. Inside a span that might qualify, the walk falls back to
+        // the per-block bar — identical decisions, identical top-k.
+        let mut i = 0usize;
+        while i < term_meta.num_blocks {
+            if coarse_enabled && i.is_multiple_of(coarse_span) {
+                let coarse_max = term_meta.coarse_entry(postings, i / coarse_span);
+                let span_end = (i + coarse_span).min(term_meta.num_blocks);
+                // Seed skip, span-wide (strict): no block in the span can
+                // reach the seeded lower bound on the k-th, so none can be
+                // top-k. Strict `<` keeps a block exactly at the bound in
+                // play, preserving the tie-break.
+                if coarse_max < seed_threshold {
+                    i = span_end;
+                    continue;
+                }
+                // Floor skip, span-wide: nothing in the span reaches the
+                // caller's floor.
+                if coarse_max <= floor_eff {
+                    i = span_end;
+                    continue;
+                }
+                // BMW skip, span-wide: heap full AND no block in the span
+                // can beat the kth-best.
+                if heap.len() >= k
+                    && let Some(TopKEntry(min_score, _)) = heap.peek()
+                    && coarse_max <= *min_score
+                {
+                    i = span_end;
+                    continue;
+                }
+            }
+
             // last_doc_id (first tuple slot) is unused here — it serves
             // AND-merge seeks, which single-term never does.
             let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
 
+            // Seed skip (strict): block can't reach the seeded lower bound
+            // on the k-th, so it holds no top-k doc.
+            if block_max_bm25 < seed_threshold {
+                i += 1;
+                continue;
+            }
             // Floor skip: nothing in this block can reach the caller's
             // floor — dead regardless of local heap state.
             if block_max_bm25 <= floor_eff {
+                i += 1;
                 continue;
             }
             // BMW skip: heap full AND this block can't beat the kth-best.
@@ -872,6 +1071,7 @@ impl FtsReader {
                 && let Some(TopKEntry(min_score, _)) = heap.peek()
                 && block_max_bm25 <= *min_score
             {
+                i += 1;
                 continue;
             }
 
@@ -908,6 +1108,7 @@ impl FtsReader {
                     heap.push(TopKEntry(score, doc_id));
                 }
             }
+            i += 1;
         }
 
         Ok((
@@ -928,29 +1129,58 @@ impl FtsReader {
     /// Missing terms (FST miss) are silently dropped — fine for OR
     /// semantics where a missing term contributes nothing. Returned
     /// `Vec` may be empty (all terms missed) or shorter than `terms`.
+    ///
+    /// A thin wrapper over [`Self::build_term_cursors_opt`] that discards
+    /// the per-term slot positions; callers that need to know *which*
+    /// term missed (bare-atom builds, which keep a `None` slot for it)
+    /// use the `_opt` form directly.
     pub(super) async fn build_term_cursors(
         &self,
         column_id: u32,
         terms: &[&str],
         global_idf: Option<&GlobalTermIdf>,
         count_only: bool,
+        qtf: Option<&[u32]>,
     ) -> Result<Vec<TermCursor>, FtsError> {
+        Ok(self
+            .build_term_cursors_opt(column_id, terms, global_idf, count_only, qtf)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// Build a `TermCursor` for every term, **preserving input order and
+    /// arity**: the result has one slot per input term, `None` where the
+    /// term is absent from the FST. One FST open and one parallel postings
+    /// fan-out for the whole batch — so a multi-term build costs a single
+    /// dictionary fetch and a single overlapped range wave, not one of each
+    /// per term.
+    /// `qtf`, when present, is a per-term query-term-frequency weight (parallel to
+    /// `terms`): each built cursor folds its weight into the effective idf, which
+    /// scales both the score and the BlockMaxWAND skip ceilings, so a deduplicated
+    /// repeated term ranks identically to the duplicates it replaced (BM25 is
+    /// linear in idf). `None` leaves idf unweighted.
+    pub(super) async fn build_term_cursors_opt(
+        &self,
+        column_id: u32,
+        terms: &[&str],
+        global_idf: Option<&GlobalTermIdf>,
+        count_only: bool,
+        qtf: Option<&[u32]>,
+    ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
-        // Resolve each present term to either an inline (df=1) value or
-        // a PFOR metadata offset, preserving query order. FST misses
-        // are dropped (fine for OR; AND callers length-check). Collect
-        // the PFOR offsets so all their byte ranges can be fetched in
-        // one parallel fan-out below — never the whole postings region.
-        // Each resolved entry carries its term's global idf (when in
-        // `Bm25Stats::Global`) so the cursor is built with the global
-        // value; `None` per term falls back to this superfile's local idf.
+        // Resolve each term to an inline (df=1) value, a PFOR metadata
+        // offset, or a miss — preserving query order and arity (a miss is a
+        // `None` slot, so the caller can tell which term was absent). Collect
+        // the PFOR offsets so all their byte ranges can be fetched in one
+        // parallel fan-out below — never the whole postings region. Each
+        // resolved entry carries its term's global idf (when in
+        // `Bm25Stats::Global`) so the cursor is built with the global value;
+        // `None` per term falls back to this superfile's local idf.
         enum Resolved {
             Inline {
                 doc_id: u32,
@@ -962,17 +1192,18 @@ impl FtsReader {
                 header_probed: bool,
             },
         }
-        let mut resolved: Vec<Resolved> = Vec::with_capacity(terms.len());
+        let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(terms.len());
         let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();
         for term in terms {
             let key = make_key(&col_meta.name, term);
             let Some(packed) = dict.lookup(&key) else {
+                resolved.push(None);
                 continue;
             };
             let gidf = global_idf.and_then(|m| m.get(*term).copied());
             match FstValue::unpack(packed) {
                 FstValue::Inline { doc_id, tf } => {
-                    resolved.push(Resolved::Inline { doc_id, tf, gidf });
+                    resolved.push(Some(Resolved::Inline { doc_id, tf, gidf }));
                 }
                 FstValue::Pfor {
                     metadata_offset,
@@ -985,10 +1216,10 @@ impl FtsReader {
                     // A hint-less slot (21-bit length overflow) costs a
                     // header probe BEFORE the body fetch — two planned
                     // ranges, recorded on the cursor for the tallies.
-                    resolved.push(Resolved::Pfor {
+                    resolved.push(Some(Resolved::Pfor {
                         gidf,
                         header_probed: postings_length_hint.is_none(),
-                    });
+                    }));
                 }
             }
         }
@@ -996,10 +1227,13 @@ impl FtsReader {
         let pfor_bytes = self.fetch_term_postings(&pfor_offsets).await?;
         let mut pfor_iter = pfor_bytes.into_iter();
 
-        let mut cursors: Vec<TermCursor> = Vec::with_capacity(resolved.len());
-        for r in resolved {
+        let mut cursors: Vec<Option<TermCursor>> = Vec::with_capacity(resolved.len());
+        for (i, r) in resolved.into_iter().enumerate() {
+            // Per-term query-term-frequency weight (1 when unweighted).
+            let weight = qtf.map_or(1, |w| w[i]);
             match r {
-                Resolved::Inline { doc_id, tf, gidf } => {
+                None => cursors.push(None),
+                Some(Resolved::Inline { doc_id, tf, gidf }) => {
                     // On a positional column the inline slot carries
                     // the term's single position, tf implied 1 — the
                     // builder only inlines tf == 1 postings there.
@@ -1011,27 +1245,32 @@ impl FtsReader {
                         false => tf,
                     };
                     let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                    cursors.push(TermCursor::new_inline(
+                    let cursor = TermCursor::new_inline(
                         doc_id,
                         tf,
                         self.n_docs as u64,
                         dl_norm_k1,
                         gidf,
-                    ));
+                        weight,
+                    );
+                    cursors.push(Some(cursor));
                 }
-                Resolved::Pfor {
+                Some(Resolved::Pfor {
                     gidf,
                     header_probed,
-                } => {
+                }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    cursors.push(TermCursor::new(
+                    let cursor = TermCursor::new(
                         term_bytes,
                         self.n_docs as u64,
                         col_meta.positions,
                         gidf,
+                        weight,
                         header_probed,
                         count_only,
-                    )?);
+                        self.has_coarse_block_max,
+                    )?;
+                    cursors.push(Some(cursor));
                 }
             }
         }
@@ -1374,35 +1613,15 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        // k-gated routing exercises both ranged kernels: the uniform OR takes
-        // the windowed scan at K_ALL (deep k) but MaxScore at the small top-k;
-        // the dominant-UB OR stays on MaxScore throughout. Assert it rather
-        // than assume it, so a corpus tweak can't silently test one branch twice.
+        // Two shapes through the one ranged union kernel: a uniform OR
+        // (exercises the windowed accumulate) and a rare+common OR (exercises
+        // the dominant-leader path), each sliced identically to the un-ranged
+        // search so the partition union must reproduce the whole-superfile
+        // result regardless of where the cuts fall.
         let shapes: [&[&str]; 2] = [
             &["alpha", "beta", "gamma", "delta"],
             &["rareterm", "alpha", "beta"],
         ];
-        let column_id = r.resolve_column_id("body").expect("column");
-        let uniform = r
-            .build_term_cursors(column_id, shapes[0], None, false)
-            .await
-            .expect("cursors");
-        assert!(
-            route_or_to_windowed(&uniform, K_ALL),
-            "uniform OR at K_ALL (deep k) must route to the windowed ranged branch"
-        );
-        assert!(
-            !route_or_to_windowed(&uniform, K_TOP),
-            "uniform OR at small k must route to the MaxScore ranged branch"
-        );
-        let dominant = r
-            .build_term_cursors(column_id, shapes[1], None, false)
-            .await
-            .expect("cursors");
-        assert!(
-            !route_or_to_windowed(&dominant, K_ALL) && !route_or_to_windowed(&dominant, K_TOP),
-            "dominant-UB OR must route to MaxScore at every k (not uniform, no ≥100k list)"
-        );
         // Uneven partitions, including window-boundary-crossing cuts.
         let partitions: [&[(u32, u32)]; 3] = [
             &[(0, N_DOCS)],

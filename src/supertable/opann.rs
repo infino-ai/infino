@@ -817,22 +817,22 @@ pub(crate) fn fanout_prior_for_k(
 /// fine clusters (the actual selection → scan → shortlist → rerank the reader
 /// serves, so within-path loss is captured — unlike the old centroid-coverage
 /// proxy). For each `k` this stamps the SMALLEST fanout whose measured recall
-/// clears `target_recall − recall_slack`. When no observed fanout clears it —
-/// the recall PLATEAUS below target even at the widest (full-fanout) rung — the
-/// point stays `0`, the "GFC can't reach target here" sentinel, which resolves
-/// to `None` in [`CellRoutingParams::fanout_for_k_at`] so the reader falls back
-/// to the constant and `auto` picks stamped. The result is floored monotone in
-/// `k` (a larger `k` never asks for a narrower fanout than a smaller one —
-/// measurement noise near the target can otherwise invert two adjacent
-/// anchors). The ladder is expected ASCENDING in fanout; it is sorted defensively.
+/// clears `register_floor` (the configured graceful recall bar). When no
+/// observed fanout clears it — the recall PLATEAUS below the floor even at the
+/// widest (full-fanout) rung — the point stays `0`, the "GFC can't reach the
+/// floor here" sentinel, which resolves to `None` in
+/// [`CellRoutingParams::fanout_for_k_at`] so the reader falls back to the
+/// constant and `auto` picks stamped. The result is floored monotone in `k` (a
+/// larger `k` never asks for a narrower fanout than a smaller one — measurement
+/// noise near the floor can otherwise invert two adjacent anchors). The ladder
+/// is expected ASCENDING in fanout; it is sorted defensively.
 ///
 /// [`CellRoutingParams::fanout_for_k_at`]: crate::supertable::manifest::list::CellRoutingParams::fanout_for_k_at
 pub(crate) fn fanout_knee_from_recalls(
     ladder: &[(u32, [f64; WIDTH_LAW_KS.len()])],
-    target_recall: f64,
-    recall_slack: f64,
+    register_floor: f64,
 ) -> [u32; WIDTH_LAW_KS.len()] {
-    let floor = (target_recall - recall_slack).max(0.0);
+    let floor = register_floor.max(0.0);
     let mut rungs: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder.to_vec();
     rungs.sort_by_key(|(f, _)| *f);
     let mut out = [0u32; WIDTH_LAW_KS.len()];
@@ -840,8 +840,8 @@ pub(crate) fn fanout_knee_from_recalls(
         // An anchor with no positive measured recall at ANY rung is
         // corpus-unsupported (k > the calibrated corpus, or every probe missed)
         // — it must stay the sentinel `0`, never take a spurious fanout. This
-        // also guards the degenerate `floor <= 0` config (target ≤ slack) below,
-        // where every rung would otherwise "clear" a 0-recall anchor.
+        // also guards the degenerate `floor <= 0` config below, where every rung
+        // would otherwise "clear" a 0-recall anchor.
         let best = rungs
             .iter()
             .map(|(_, recall_by_k)| recall_by_k[ki])
@@ -851,7 +851,7 @@ pub(crate) fn fanout_knee_from_recalls(
             continue;
         }
         // Smallest fanout whose measured recall@k clears the graceful floor.
-        // A finite floor of 0 (target ≤ slack) is cleared by the first rung.
+        // A finite floor of 0 is cleared by the first rung.
         if floor <= 0.0 {
             *slot = rungs.first().map(|(f, _)| *f).unwrap_or(0);
             continue;
@@ -1068,11 +1068,11 @@ mod pool_hint_tests {
     }
 
     /// The measured-recall knee: for each `k`, the SMALLEST ladder fanout whose
-    /// real recall@k clears `target − slack`; `0` when nothing clears (plateau
-    /// below target); floored monotone in `k`.
+    /// real recall@k clears the register floor; `0` when nothing clears (plateau
+    /// below the floor); floored monotone in `k`.
     #[test]
     fn fanout_knee_picks_smallest_clearing_rung() {
-        // Recall climbs with fanout; target 0.99, slack 0.01 → floor 0.98.
+        // Recall climbs with fanout; register floor 0.98.
         // The knee is the first rung at/above 0.98 for each anchor.
         let ladder = [
             (16u32, [0.90, 0.85, 0.70, 0.50]),
@@ -1084,10 +1084,7 @@ mod pool_hint_tests {
         // (0.985); k=1000 never clears (max 0.97 < 0.98) → sentinel 0. The
         // monotone floor then lifts nothing (0 stays 0; the sequence is
         // already non-decreasing 64,256,1024).
-        assert_eq!(
-            fanout_knee_from_recalls(&ladder, 0.99, 0.01),
-            [64, 256, 1024, 0]
-        );
+        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [64, 256, 1024, 0]);
     }
 
     /// A ladder whose recall plateaus below the floor at every anchor — even at
@@ -1102,7 +1099,7 @@ mod pool_hint_tests {
             // Widest rung still short of floor 0.98 at every anchor.
             (512, [0.94, 0.92, 0.88, 0.70]),
         ];
-        assert_eq!(fanout_knee_from_recalls(&ladder, 0.99, 0.01), [0, 0, 0, 0]);
+        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [0, 0, 0, 0]);
     }
 
     /// The stamped knee may EXCEED the old `width × fine` prior — reading more
@@ -1118,7 +1115,7 @@ mod pool_hint_tests {
             (32u32, [0.99, 0.90, 0.80, 0.70]),
             (512, [0.999, 0.99, 0.95, 0.90]),
         ];
-        let knee = fanout_knee_from_recalls(&ladder, 0.99, 0.01);
+        let knee = fanout_knee_from_recalls(&ladder, 0.98);
         assert_eq!(knee[1], 512, "measured recall pushes k=10 well past W×F=32");
         assert!(
             knee[1] > prior[1],
@@ -1136,15 +1133,15 @@ mod pool_hint_tests {
             (64u32, [0.99, 0.97, 0.99, 0.60]),
             (256, [0.999, 0.99, 0.995, 0.75]),
         ];
-        let knee = fanout_knee_from_recalls(&ladder, 0.99, 0.01);
+        let knee = fanout_knee_from_recalls(&ladder, 0.98);
         // k=1→64, k=10→256, k=100 measured 64 but floored up to 256, k=1000→0.
         assert_eq!(knee, [64, 256, 256, 0]);
     }
 
     /// An anchor the corpus can't support (recall stays 0 at every rung) must
-    /// stay the sentinel `0`, even under a degenerate `target ≤ slack` config
-    /// where the floor collapses to 0 — a 0-recall anchor must never be handed
-    /// the first rung's fanout, or the reader would route a `k` GFC cannot serve.
+    /// stay the sentinel `0`, even under a degenerate zero-floor config where
+    /// the floor collapses to 0 — a 0-recall anchor must never be handed the
+    /// first rung's fanout, or the reader would route a `k` GFC cannot serve.
     #[test]
     fn fanout_knee_unsupported_anchor_stays_sentinel_at_zero_floor() {
         // k=1 and k=10 are measured; k=100 and k=1000 were never observed (0).
@@ -1152,8 +1149,8 @@ mod pool_hint_tests {
             (16u32, [0.90, 0.80, 0.0, 0.0]),
             (64, [0.999, 0.99, 0.0, 0.0]),
         ];
-        // Degenerate floor: target 0.5, slack 0.6 → floor clamps to 0.
-        let knee = fanout_knee_from_recalls(&ladder, 0.5, 0.6);
+        // Degenerate floor: a register floor of 0 clears the first supported rung.
+        let knee = fanout_knee_from_recalls(&ladder, 0.0);
         // Supported anchors clear at the first rung (floor 0); unsupported ones
         // (all-zero recall) stay 0 despite the collapsed floor.
         assert_eq!(knee, [16, 16, 0, 0]);

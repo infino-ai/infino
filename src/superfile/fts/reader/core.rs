@@ -256,29 +256,35 @@ impl PreparedClauses {
 }
 
 /// Multi-term OR algorithm selector for the bench harness's
-/// `search_with_algo_for_bench` entry point. Production code routes
-/// through `FtsReader::dispatch_or_algo`, which picks
-/// automatically; this enum exists so head-to-head bench runs can
-/// compare all three under identical inputs.
+/// `search_with_algo_for_bench` entry point, so head-to-head bench runs can
+/// compare the kernels under identical inputs. Production code routes through
+/// `FtsReader::dispatch_or_algo`, which sends every multi-term union to
+/// `WindowedMaxscore` and a 2-term rare+common OR to WAND+BMW.
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OrAlgo {
-    /// Block-Max MaxScore: production default for dominant-term ORs.
+    /// Per-candidate Block-Max MaxScore. Superseded on the production path by
+    /// `WindowedMaxscore`; retained as a bench baseline and the correctness
+    /// oracle the windowed kernels are checked against.
     Bmm,
-    /// WAND + Block-Max-WAND: historical baseline; retained for
-    /// regression comparisons.
+    /// WAND + Block-Max-WAND. The production path for a 2-term rare+common OR
+    /// (it pivots on the rare term to skip the common term's long list); a
+    /// bench baseline otherwise.
     WandBmw,
-    /// Exhaustive union walk with SIMD scoring + top-K heap. Wins
-    /// when no term dominates (uniform `term_max_bm25` upper bounds)
-    /// so BMM/BMW's skip checks rarely trigger and become pure
-    /// overhead.
+    /// Exhaustive union walk with SIMD scoring + top-K heap. Bench-only — the
+    /// dispatcher never routes here (see `run_exhaustive_union`); kept for the
+    /// one narrow shape where it narrowly wins.
     Exhaustive,
-    /// Windowed union: accumulate each term's contribution into a
-    /// fixed doc-id window (presence bitset + score array), then drain
-    /// in doc order into the top-k heap. Removes the per-doc f-way
-    /// merge; wins when no term dominates and the union is large (the
-    /// MaxScore-can't-prune case).
+    /// Windowed union: accumulate each term's contribution into a fixed doc-id
+    /// window (presence bitset + score array), then drain in doc order into the
+    /// top-k heap. Superseded by `WindowedMaxscore` (which adds the
+    /// essential/non-essential split); bench-only.
     Windowed,
+    /// Windowed MaxScore: **the production union kernel.** The windowed OR-sum
+    /// with a per-window essential/non-essential split recomputed from the live
+    /// threshold, so one kernel covers both the dense (all-essential OR-sum)
+    /// and selective (pruned-leader) regimes without an a-priori route.
+    WindowedMaxscore,
 }
 
 /// Doc-id window for the windowed union scorer. Power of two so the
@@ -320,16 +326,47 @@ pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 8;
 /// `total_df >= max_doc / N`.
 pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
 
-/// Rarest-term sparsity gate for the ranked-AND membership walk
-/// (`FtsReader::and_membership_scored`): route there only when the rarest term
-/// covers less than `1/N` of the doc-id space. The membership walk drives the
-/// rarest term's *entire* list (bit-testing the others) and gives up the
-/// flat-merge's block-max heap-bar skip, so it only pays when that list is
-/// genuinely short. A looser `1/16` (the count path's divisor) let moderately
-/// sparse rarest terms through and regressed the ranked tail (p99), where the
-/// bar-skip was doing real work; `1/64` restricts it to the clearly-rare∧common
-/// shape the walk targets. Bench-calibrated against the ranked-AND tail.
-pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 64;
+/// Ranked-AND membership-walk routing (`FtsReader::and_membership_scored`) uses
+/// two sparsity tiers for the rarest term, plus a density check on the middle
+/// tier. All thresholds are `1/N` fractions of the doc-id space.
+///
+/// - **Rarest < `1/AND_MEMBERSHIP_ALWAYS_DIVISOR`** (very sparse): always route
+///   to the walk. Driving so short a list, bit-testing the others, is cheaper
+///   than the flat-merge regardless of the others' density — this is the tier
+///   the walk always served.
+/// - **Rarest in `[1/ALWAYS, 1/AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR)`**
+///   (moderately sparse): route only when the others are collectively dense
+///   enough (see [`AND_MEMBERSHIP_OTHERS_DENSITY_MULT`]). This is the band the
+///   walk newly reaches — a discriminating term plus common ones — and the one
+///   that needs the density guard, because a moderately-sparse rarest with only
+///   moderately-common companions is handled better by the flat-merge's block
+///   decode + block-max skip.
+/// - **Rarest ≥ `1/RAREST_SPARSE_DIVISOR`**: never; the all-dense case (every
+///   term common) keeps the flat-merge.
+///
+/// The walk now carries the flat-merge's own Block-Max-AND heap-bar skip, so the
+/// middle tier no longer regresses the ranked tail (p99) the way a skip-less
+/// walk did when this was a flat `1/16` gate.
+pub(super) const AND_MEMBERSHIP_ALWAYS_DIVISOR: u64 = 64;
+
+/// Upper sparsity bound for the density-gated middle routing tier — see
+/// [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]. A rarest term denser than `1/16` of the
+/// corpus never routes to the membership walk.
+pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 16;
+
+/// Density guard for the middle routing tier: the *other* terms must be
+/// collectively at least this many times denser than the driver (their combined
+/// df ≥ `MULT` × the rarest df). The walk's win is skipping the flat-merge's
+/// decode of the common terms' blocks; that only outweighs iterating the whole
+/// driver list when those others are much denser than the driver. When they are
+/// only moderately denser (e.g. three mid-frequency terms), the flat-merge's
+/// block decode is already cheap and its block-max skip prunes the driver, so it
+/// wins — routing such a query to the walk regressed it. Sparsity alone can't
+/// tell the two apart (same rarest term, different companions), so this ratio is
+/// the discriminator. Calibrated on the ranked-AND intersection set: middle-tier
+/// wins sit at ≥ ~38× and the one regression at ~4.5×, so `8` separates them
+/// with margin on both sides. (The very-sparse tier skips this check.)
+pub(super) const AND_MEMBERSHIP_OTHERS_DENSITY_MULT: u64 = 8;
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
@@ -357,105 +394,6 @@ pub(super) const WAND_BMW_2TERM_MAX_K: usize = 128;
 /// term can dominate the BM25 UB (higher idf) while still being common
 /// (long list), which WAND can't skip — only df separates the cases.
 pub(super) const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
-
-/// Score upper-bound spread below which a multi-term OR counts as
-/// "common-heavy" (no single term dominates): `max_ub <=
-/// OR_WINDOW_DOMINANCE_MULT * avg_ub`. Uniform terms sit near the average;
-/// a dominant (rarer) term sits well above it. See [`no_dominant_term_ub`].
-pub(super) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
-
-/// `k` cutoff for a common-heavy OR: at or below it MaxScore prunes (its
-/// heap fills and the threshold rises above the common terms' block maxima),
-/// so keep it there; above it pruning is dead and the SIMD windowed scan
-/// wins. Bench-tuned to the x86 target (the crossover is lower on wide-SIMD
-/// x86 than on ARM).
-pub(super) const OR_WINDOWED_UNIFORM_MAX_PRUNING_K: usize = 32;
-
-/// True when no single term dominates the score upper bound
-/// (`max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`). Such a "common-heavy" OR
-/// only prunes on MaxScore at small `k`; a dominant term skips hard at any `k`.
-pub(super) fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
-    let total: f32 = cursors.iter().map(|c| c.term_max_bm25).sum();
-    if total <= 0.0 {
-        return false;
-    }
-    let max = cursors
-        .iter()
-        .map(|c| c.term_max_bm25)
-        .fold(0.0f32, f32::max);
-    let avg = total / cursors.len() as f32;
-    max <= OR_WINDOW_DOMINANCE_MULT * avg
-}
-
-/// Route a multi-term OR to the non-pruning windowed scan instead of MaxScore,
-/// true only where MaxScore's pruning is dead at this `k`: a dominant long list
-/// too deep to fill the heap without its tail ([`or_topk_pruning_ineffective`]),
-/// or a common-heavy shape past [`OR_WINDOWED_UNIFORM_MAX_PRUNING_K`]. Otherwise
-/// MaxScore. Shared by the single-shot and ranged OR entries so a query runs the
-/// same kernel whether or not the fan-out sliced it.
-pub(super) fn route_or_to_windowed(cursors: &[TermCursor], k: usize) -> bool {
-    or_topk_pruning_ineffective(cursors, k)
-        || (k > OR_WINDOWED_UNIFORM_MAX_PRUNING_K
-            && cursors.len() >= OR_WINDOW_MIN_TERMS
-            && no_dominant_term_ub(cursors))
-}
-
-/// Minimum dominant-term df for the deep-`k` reroute to the windowed
-/// scorer to pay off. Below this the union is small enough that
-/// MaxScore's scalar full scan beats the windowed scorer's fixed
-/// per-window setup, so short unions stay on MaxScore. Calibrated on the
-/// warm FTS bench: the win concentrates on dominant lists in the millions
-/// (~corpus-scale), the mid range is a wash, and lists shorter than this
-/// regressed. See [`or_topk_pruning_ineffective`].
-pub(super) const OR_WINDOWED_MIN_DOMINANT_DF: u64 = 100_000;
-
-/// True when block-max pruning (MaxScore / WAND) can no longer skip
-/// blocks at this `k`, so both degrade to a full union scan — at which
-/// point the SIMD windowed scorer does that same scan far faster than
-/// MaxScore's scalar per-doc f-way merge.
-///
-/// Pruning stays alive only while the top-k threshold sits *above* the
-/// common (low-idf, longest-list) term's score upper bound: only then
-/// can that term's blocks be skipped. The threshold holds there only as
-/// long as the rarer terms alone can fill the heap. Once `k` reaches the
-/// combined df of every term *except* the single longest list, the heap
-/// must admit docs from that longest list's tail — docs whose only
-/// matching term is the common one — the threshold collapses toward its
-/// low upper bound, and no block clears the skip test any more.
-///
-/// `rest_df` (sum of all dfs but the largest) is a conservative bound on
-/// how many docs the rarer terms can contribute: it ignores overlap, so
-/// the true fillable count is `<= rest_df`. When `k >= rest_df` the heap
-/// therefore *cannot* be filled without the common term's tail, and
-/// pruning is dead. This is `df`-only — no extra reads — and
-/// self-correcting: a "rare" second term that is actually long keeps
-/// `rest_df` high, leaves pruning alive, and stays on MaxScore.
-///
-/// Reroute only when the dominant list is also *long* (`max_df >=`
-/// [`OR_WINDOWED_MIN_DOMINANT_DF`]). Once pruning is dead both scorers
-/// scan the whole union, but the windowed scorer's per-window bookkeeping
-/// (a 4096-wide score accumulator + presence bitset) only pays off when
-/// the dominant list is long enough to amortize it; on a short union it
-/// is pure overhead and MaxScore's scalar scan is faster. A union with
-/// fewer than the floor's matches can't have a longer dominant list than
-/// the floor, so this gates out exactly the small-union case that
-/// regressed on the bench.
-pub(super) fn or_topk_pruning_ineffective(cursors: &[TermCursor], k: usize) -> bool {
-    let max_df = cursors.iter().map(|c| c.df).max().unwrap_or(0);
-    let total_df: u64 = cursors.iter().map(|c| c.df).sum();
-    or_reroute_by_df(max_df, total_df, cursors.len(), k)
-}
-
-/// Pure df-math behind [`or_topk_pruning_ineffective`], split out so the
-/// routing decision can be unit-tested at df values (hundreds of
-/// thousands) that a fast in-memory corpus can't reach.
-pub(super) fn or_reroute_by_df(max_df: u64, total_df: u64, n_terms: usize, k: usize) -> bool {
-    if n_terms < 2 || max_df < OR_WINDOWED_MIN_DOMINANT_DF {
-        return false;
-    }
-    let rest_df = total_df.saturating_sub(max_df);
-    k as u64 >= rest_df
-}
 
 /// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
 ///
@@ -523,6 +461,10 @@ pub struct FtsReader {
     /// bitset-encoded, so the unranked count kernels prefer membership
     /// bit-tests (no decode) over decoding a common term's blocks.
     pub(super) has_bitset_blocks: bool,
+    /// True iff the blob is `VERSION_V5` — each PFOR term's postings region
+    /// ends with a coarse block-max table. `V1`–`V4` blobs lack it, so the
+    /// ranked walk skips the coarse level and the threshold seed there.
+    pub(super) has_coarse_block_max: bool,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -579,6 +521,7 @@ impl FtsReader {
             && version != format::fts::VERSION_V2
             && version != format::fts::VERSION_V3
             && version != format::fts::VERSION_V4
+            && version != format::fts::VERSION_V5
         {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
@@ -592,7 +535,8 @@ impl FtsReader {
         let header_size = match version {
             v if v == format::fts::VERSION_V2
                 || v == format::fts::VERSION_V3
-                || v == format::fts::VERSION_V4 =>
+                || v == format::fts::VERSION_V4
+                || v == format::fts::VERSION_V5 =>
             {
                 format::fts::HEADER_SIZE_V2
             }
@@ -682,15 +626,20 @@ impl FtsReader {
             v if v == format::fts::VERSION_V2 => true,
             v if v == format::fts::VERSION_V3 => true,
             v if v == format::fts::VERSION_V4 => true,
+            v if v == format::fts::VERSION_V5 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
                 ))));
             }
         };
-        let has_position_subindex =
-            version == format::fts::VERSION_V3 || version == format::fts::VERSION_V4;
-        let has_bitset_blocks = version == format::fts::VERSION_V4;
+        let has_position_subindex = version == format::fts::VERSION_V3
+            || version == format::fts::VERSION_V4
+            || version == format::fts::VERSION_V5;
+        let has_bitset_blocks =
+            version == format::fts::VERSION_V4 || version == format::fts::VERSION_V5;
+        // V5 appends a per-term coarse block-max table; V1–V4 do not.
+        let has_coarse_block_max = version == format::fts::VERSION_V5;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -951,6 +900,7 @@ impl FtsReader {
             positions_range,
             has_position_subindex,
             has_bitset_blocks,
+            has_coarse_block_max,
             columns,
             column_id_by_name,
         })
@@ -983,6 +933,16 @@ impl FtsReader {
 
     fn dict_bytes(&self) -> Result<Bytes, FtsError> {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
+    }
+
+    /// Open the term dictionary over fetched FST bytes, mapping an FST
+    /// parse failure to the reader's malformed-blob error.
+    pub(super) fn open_dict(fst_bytes: &[u8]) -> Result<DictReader<'_>, FtsError> {
+        DictReader::open(fst_bytes).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
+        })
     }
 
     /// Async FST-dictionary fetch for the query path. Resolves
@@ -1164,12 +1124,19 @@ impl FtsReader {
         }
         let mut dict_ranges = 0u64;
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
-        for term in terms {
-            let mut cursors = self
-                .build_term_cursors(column_id, &[term], global_idf, false)
+        // All bare terms in one FST open + one parallel postings fan-out
+        // (arity-preserving: each term maps to its own slot, `None` when
+        // absent), rather than a serial per-term build that re-fetched the
+        // dictionary and issued a separate range wave for each. One planned
+        // dictionary range for the whole batch.
+        if !terms.is_empty() {
+            let term_cursors = self
+                .build_term_cursors_opt(column_id, terms, global_idf, false, None)
                 .await?;
             dict_ranges += 1;
-            out.push(cursors.pop().map(AnyCursor::Term));
+            for cursor in term_cursors {
+                out.push(cursor.map(AnyCursor::Term));
+            }
         }
         for phrase in phrases {
             let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
@@ -1178,7 +1145,7 @@ impl FtsReader {
             // per-member rescale ratio cancels out of the phrase's tf/length
             // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, global_idf, false)
+                .build_term_cursors(column_id, &member_refs, global_idf, false, None)
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1205,17 +1172,14 @@ impl FtsReader {
                             0,
                             true,
                             self.has_position_subindex,
+                            self.has_coarse_block_max,
                         )?;
                         positional.push((Some(term_meta), None));
                     }
                     true => {
                         dict_ranges += 1;
                         let fst_bytes = self.dict_bytes_async().await?;
-                        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-                            FtsError::Read(ReadError::MalformedVersion(format!(
-                                "FST parse failed: {e}"
-                            )))
-                        })?;
+                        let dict = Self::open_dict(&fst_bytes)?;
                         let key = make_key(&col_meta.name, term);
                         let packed = dict
                             .lookup(&key)
@@ -1285,11 +1249,7 @@ impl FtsReader {
         let positions_region = self.positions_range.clone();
 
         let fst_bytes = self.dict_bytes()?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
 
         // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
         // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
@@ -1342,7 +1302,13 @@ impl FtsReader {
                     // one `decode_run` per doc in posting order. Read the slice
                     // once and walk it in lockstep with the doc cursor.
                     let position_bytes = if positional {
-                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true, false)?;
+                        let meta = TermMeta::parse(
+                            term_bytes.as_ref(),
+                            0,
+                            true,
+                            false,
+                            self.has_coarse_block_max,
+                        )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
                                 "positional column missing a positions region".into(),
@@ -1360,8 +1326,16 @@ impl FtsReader {
                     };
                     let mut pos_at = 0usize;
 
-                    let mut cursor =
-                        TermCursor::new(term_bytes, n_docs, positional, None, false, false)?;
+                    let mut cursor = TermCursor::new(
+                        term_bytes,
+                        n_docs,
+                        positional,
+                        None,
+                        1,
+                        false,
+                        false,
+                        self.has_coarse_block_max,
+                    )?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
@@ -1413,10 +1387,11 @@ impl FtsReader {
     /// `column` whose bytes begin with `term_prefix`, in lex order.
     ///
     /// Mirrors [`Self::iter_column_terms`] but bounds the walk to a
-    /// prefix range instead of the whole column. Used by
-    /// [`SuperfileReader::bm25_search_prefix`] to expand a
-    /// prefix into the concrete terms list before delegating to
-    /// `search` in OR mode.
+    /// prefix range instead of the whole column. This is the synchronous,
+    /// commit-time form (the writer's term summary reaches it through
+    /// `iter_column_terms`); the query path's prefix search expands through
+    /// [`Self::terms_with_prefix`], which walks the same dictionary on the
+    /// reader pool.
     ///
     /// `term_prefix` is the prefix as it appears in the FST — the
     /// caller is responsible for any tokenizer-level normalization
@@ -1428,27 +1403,38 @@ impl FtsReader {
         column: &str,
         term_prefix: &[u8],
     ) -> Result<Vec<Vec<u8>>, FtsError> {
-        if !self.column_id_by_name.contains_key(column) {
+        if !self.has_column(column) {
             return Ok(Vec::new());
         }
-        let mut full_prefix = column.as_bytes().to_vec();
-        full_prefix.push(FST_SEPARATOR);
-        let column_prefix_len = full_prefix.len();
-        full_prefix.extend_from_slice(term_prefix);
-        let fst_bytes = self
-            .dict_bytes()
-            .expect("FST bytes must be available for term iteration");
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
-        let pairs = dict.iter_prefix(&full_prefix);
-        Ok(pairs
-            .into_iter()
-            .map(|(key, _)| key[column_prefix_len..].to_vec())
-            .collect())
+        let fst_bytes = self.dict_bytes()?;
+        collect_terms_with_prefix(&fst_bytes, column, term_prefix)
     }
+
+    /// Whether `column` is registered as an FTS column in this superfile.
+    pub(super) fn has_column(&self, column: &str) -> bool {
+        self.column_id_by_name.contains_key(column)
+    }
+}
+
+/// Every key of `column`'s dictionary that begins with `term_prefix`, in
+/// lex order, with the column key prefix stripped. The CPU half shared by
+/// the sync commit-time walk ([`FtsReader::iter_terms_with_prefix`]) and
+/// the query path's pooled one (`FtsReader::terms_with_prefix`).
+pub(super) fn collect_terms_with_prefix(
+    fst_bytes: &[u8],
+    column: &str,
+    term_prefix: &[u8],
+) -> Result<Vec<Vec<u8>>, FtsError> {
+    let mut full_prefix = column.as_bytes().to_vec();
+    full_prefix.push(FST_SEPARATOR);
+    let column_prefix_len = full_prefix.len();
+    full_prefix.extend_from_slice(term_prefix);
+    let dict = FtsReader::open_dict(fst_bytes)?;
+    let pairs = dict.iter_prefix(&full_prefix);
+    Ok(pairs
+        .into_iter()
+        .map(|(key, _)| key[column_prefix_len..].to_vec())
+        .collect())
 }
 
 /// One query's built OR cursors for one superfile: the postings fetch

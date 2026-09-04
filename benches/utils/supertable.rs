@@ -1585,14 +1585,26 @@ fn assert_expected_cold_reads(
         .first_query
         .class_io(storage_meter::UriClass::HiddenData)
         .get_count;
+    let hidden_manifest = split
+        .first_query
+        .class_io(storage_meter::UriClass::HiddenManifest)
+        .get_count;
     let valid = match expected {
         ExpectedTiers::UserOnly => user_data > 0 && hidden_data == 0,
-        ExpectedTiers::HiddenOnly => user_data == 0 && hidden_data > 0,
-        ExpectedTiers::Both => user_data > 0 && hidden_data > 0,
+        // The registered graph tier hydrates its resident sections from
+        // the content-addressed graph blob on the first query, and that
+        // blob lives under the hidden table's slow-vector-state
+        // (manifest-classed) namespace — so hidden-tier serving is proven
+        // by EITHER hidden data GETs (routed cells) or hidden manifest
+        // GETs (graph hydration). The check this assert exists for —
+        // silent fallback to the user path — still trips on user_data.
+        ExpectedTiers::HiddenOnly => user_data == 0 && (hidden_data > 0 || hidden_manifest > 0),
+        ExpectedTiers::Both => user_data > 0 && (hidden_data > 0 || hidden_manifest > 0),
     };
     assert!(
         valid,
-        "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
+        "{label}: unexpected cold data reads (user data GET={user_data}, \
+         hidden data GET={hidden_data}, hidden manifest GET={hidden_manifest})"
     );
     // Lock in the cold-probe gains, per window: the first query's
     // one-time warmup fan and the second query's steady per-query fetch
@@ -2473,6 +2485,16 @@ pub mod vector {
     /// [`WIDTH_SWEEP_MONOTONICITY_SLACK`]; recall gates stay on the
     /// engine default.
     const UNFILTERED_SWEEP_WIDTHS: &[usize] = &[2, 8, 32];
+    /// `k` knots the codec-rung curve is reported at. A coarse rerank
+    /// codec loses the tail of the neighbourhood long before it loses the
+    /// top-1, so recall at a single `k` cannot say whether a rung is
+    /// usable; these are three of the four knots the drain already stamps
+    /// per-`k` laws for. Diagnostic only — the gated floor stays at
+    /// [`TOP_K`].
+    const CURVE_KS: &[usize] = &[1, 10, 100];
+    /// Deepest knot in [`CURVE_KS`]: one exact oracle is computed at this
+    /// depth and every shallower `k` reads its sorted prefix.
+    const CURVE_KS_DEEPEST: usize = 100;
     /// Recall a wider sweep point may lose vs the previous one before the
     /// width-sweep assert trips. The floored core cannot lose recall by
     /// construction; the slack absorbs the residual eviction band above
@@ -2569,14 +2591,19 @@ pub mod vector {
                 None,
             )
             .expect("routing-state vector hits");
+        // The registered graph tier walks the resident plane over the
+        // hidden index and resolves nodes straight to stable ids — no
+        // per-superfile fetch — so its hits carry the nil marker URI
+        // rather than a hidden cell superfile's. Every scan-path hit
+        // (user or hidden) carries the real URI it was scored in, so nil
+        // is unambiguously hidden-tier serving. A silent fallback to the
+        // user path still trips both this assert (real user URIs) and
+        // the per-class cold-GET assert beside it (user-class bytes).
         let user_hits = hits
             .iter()
-            .filter(|hit| !hidden_uris.contains(&hit.superfile))
+            .filter(|hit| !hidden_uris.contains(&hit.superfile) && !hit.superfile.0.is_nil())
             .count();
-        let hidden_hits = hits
-            .iter()
-            .filter(|hit| hidden_uris.contains(&hit.superfile))
-            .count();
+        let hidden_hits = hits.len() - user_hits;
         HitTierStats {
             user_hits,
             hidden_hits,
@@ -3995,7 +4022,7 @@ pub mod vector {
                     &gt_correct,
                     &q_cal,
                     &gt_cal,
-                    exec_vec::RecallFloors::SUPERTABLE,
+                    exec_vec::RecallFloors::supertable_pre_drain(),
                     phases.warm,
                     phases.cold,
                     COLD_ITERS,
@@ -4090,6 +4117,58 @@ pub mod vector {
                         &gt_correct,
                         rerank,
                     );
+                    // Codec-rung curve: recall at every knot in
+                    // [`CURVE_KS`] for whatever rung this run configured,
+                    // so the rungs can be compared at the `k` a workload
+                    // actually reads. `recall_at_k` divides by the truth
+                    // row's length, so each knot needs the oracle
+                    // truncated to exactly `k`; one exact oracle at the
+                    // deepest knot supplies them all by prefix. Search
+                    // runs at the same engine defaults the gated row
+                    // above used, so the @10 line reproduces it.
+                    // The deepest knot needs an oracle deeper than the
+                    // gated one, so it is computed here from the still-
+                    // mmapped corpus. A run that reopened a cached oracle
+                    // has no vectors resident: the knots at or under
+                    // [`TOP_K`] still read the gated oracle's prefix, and
+                    // the deeper knot is skipped rather than guessed.
+                    let gt_deep = corpus.as_ref().map(|prepared| {
+                        let vslice = prepared
+                            .vectors()
+                            .expect("vector modality prepared a vector corpus")
+                            .as_slice();
+                        corpus::ground_truth(
+                            &vslice[..n_docs * dim()],
+                            n_docs,
+                            &q_correct,
+                            CURVE_KS_DEEPEST,
+                        )
+                    });
+                    for &k in CURVE_KS {
+                        let source = match (gt_deep.as_ref(), k <= TOP_K) {
+                            (Some(deep), _) => deep,
+                            (None, true) => &gt_correct,
+                            (None, false) => continue,
+                        };
+                        let truths: Vec<Vec<u32>> = source
+                            .iter()
+                            .map(|t| t[..k.min(t.len())].to_vec())
+                            .collect();
+                        let (recall, p50) = exec_vec::mean_recall_timed(
+                            &warm_reader,
+                            supertable::VEC_COLUMN,
+                            &q_correct,
+                            &truths,
+                            k,
+                            nprobe,
+                            rerank,
+                        );
+                        eprintln!(
+                            "[codec-curve] infino/post-drain recall@{k} = {recall:.3} \
+                             p50 = {:.3} ms",
+                            p50.as_secs_f64() * 1e3,
+                        );
+                    }
                 }
                 routing_states.push(measure_routing_state(
                     "post-drain",

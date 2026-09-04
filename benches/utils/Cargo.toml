@@ -61,4 +61,18 @@ hex = "0.4"
 # of 3.18 (hdf5-metno-src 0.9.x, HDF5 1.14.6) — 0.12+ pulls src 0.10.x,
 # which demands cmake 3.26 and fails on Ubuntu 22.04's apt cmake 3.22.
 hdf5 = { version = "0.11.0", package = "hdf5-metno", features = ["static"] }
+# `corpus.rs` passes `ndarray::s![...]` straight into hdf5-metno's API when
+# reading HDF5 datasets, so this must be the SAME ndarray hdf5-metno 0.11.0
+# resolves to — which is 0.17.2 (`cargo tree -i ndarray`). Pinned to that
+# version explicitly rather than left to the resolver: a benchmark A/B
+# compares absolute times across two builds, so a dependency free to move
+# between them is a measurement hazard, not just untidy.
+#
+# A wildcard was tried here to unify the graph for a DOWNSTREAM consumer
+# (`retrievalbench`, which also links lancedb's lance-index and its own
+# ndarray). That was the wrong place: the wildcard resolves to 0.17.2 anyway,
+# so it changed nothing here, and a conflict between two of a consumer's
+# dependencies is the consumer's to resolve. Loosening an upstream pin to fix
+# a downstream graph just moves the non-determinism somewhere it is harder to
+# see.
 ndarray = "0.17.2"

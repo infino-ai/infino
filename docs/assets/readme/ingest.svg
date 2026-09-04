@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="176" viewBox="0 0 880 176" role="img">
+<rect width="880" height="176" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">Ingest throughput</text>
+<text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">1M docs · 16 commits · object storage</text>
+<line x1="434.5" y1="50" x2="434.5" y2="126" stroke="#DCD6C7"/>
+<text x="434.5" y="142.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">20 K docs/s</text>
+<line x1="685.0" y1="50" x2="685.0" y2="126" stroke="#DCD6C7"/>
+<text x="685.0" y="142.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">40 K docs/s</text>
+<text x="170.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">vector</text>
+<rect x="184" y="56" width="508.5" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">40.6 K docs/s</text>
+<text x="170.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">FTS</text>
+<rect x="184" y="78" width="484.7" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">38.7 K docs/s</text>
+<text x="170.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">SQL</text>
+<rect x="184" y="100" width="303.1" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">24.2 K docs/s</text>
+<text x="854.0" y="164.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">recorded battery blocks, benches/README.md at 3aaffb64</text>
+</svg>

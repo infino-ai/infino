@@ -242,6 +242,7 @@ impl SqlEngine for InfinoSqlEngine {
             vector: true,
             sql: true,
             hybrid: true,
+            ..Default::default()
         }
     }
 

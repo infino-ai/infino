@@ -77,13 +77,16 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
 use futures::{
     future::try_join_all,
-    stream::{self, StreamExt},
+    stream::{self, FuturesUnordered, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use tokio::time::sleep;
+use tokio::{
+    sync::mpsc::{Receiver, Sender, channel},
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -111,6 +114,8 @@ use super::{
         },
     },
 };
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
@@ -130,9 +135,9 @@ use crate::{
             fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
-                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, DOC_ID_BYTES,
-                OUTER_HEADER_SIZE, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry,
-                dir_entry, outer_hdr, sub_hdr,
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
+                STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry, dir_entry, outer_hdr,
+                sub_hdr,
             },
         },
         reader::vector_layout_from_kv,
@@ -144,8 +149,10 @@ use crate::{
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow, transcode_clamped_components},
             distance::Metric,
+            hnsw::PayloadKind,
             ivf_merge::{
-                MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
+                MergedIvfSubsection, fine_run_target_n_cent, merge_fragment_subsections,
+                route_clusters_into_cells,
             },
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -172,7 +179,7 @@ use crate::{
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
-            vector::stable_ids_by_local_for_routing,
+            vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
@@ -182,11 +189,6 @@ use crate::{
         },
     },
 };
-
-/// Target bytes per fine IVF run inside one global cell. Fine-centroid count
-/// is derived from this target; it is not copied from the outer/global grid or
-/// repeated as a fixed count for every small commit delta.
-const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 
 /// Multipart chunk size for large superfile uploads.
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
@@ -862,7 +864,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(rows = batch.num_rows()))
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         let mut w = self
@@ -901,7 +903,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows()))
+        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn update(
         &self,
@@ -945,7 +947,10 @@ impl Supertable {
     /// assert_eq!(stats.n_tombstoned(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
+    )]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         let mut w = self
             .writer()
@@ -1079,7 +1084,7 @@ impl SupertableWriter {
     /// id column at position 0.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len()))
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len(), role = self.inner.role.as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         let options = &self.inner.options;
@@ -1402,6 +1407,8 @@ impl SupertableWriter {
             buffered = self.buffer.len(),
             updates = self.pending_updates.len(),
             deletes = self.pending_deletes.len(),
+            role = self.inner.role.as_str(),
+            origin = OpOrigin::Ingest.as_str(),
         ))
     )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
@@ -1912,23 +1919,117 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            let (outputs, cell_hints) = commit_shards_via_drain(
-                buffer,
-                &self.inner,
-                &pack_grid,
-                metric,
-                packed_cell_shard_count(&self.inner.options),
-                &self.op_stats,
-            )?;
-            let build_elapsed = commit_t0.elapsed();
-            let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
-            let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-            let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
-            let data_put_bytes: usize = user_batch
-                .pending_storage_writes
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum();
+            // Pipelined publish on storage-backed tables: shards stream
+            // to the uploader as each finishes packing, so the commit
+            // pays ~max(pack, PUT) instead of pack + PUT. The manifest
+            // CAS below still runs strictly after every byte is durable —
+            // the durability boundary is unmoved. The in-memory path
+            // keeps the collected build: there is no upload to overlap.
+            let piped_storage = self.inner.options.storage.as_ref().cloned();
+            let (
+                user_batch,
+                build_elapsed,
+                upload_drain_elapsed,
+                prepare_elapsed,
+                output_bytes,
+                data_put_bytes,
+            ) = if let Some(storage) = piped_storage {
+                let (tx, rx) =
+                    channel::<(u32, PreparedSuperfile)>(commit_write_concurrency().get());
+                let runtime = self.inner.query_runtime();
+                let uploader = runtime.spawn(upload_prepared_shards(
+                    storage,
+                    self.inner.options.put_multipart_threshold_bytes,
+                    rx,
+                ));
+                let built = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    Some(&tx),
+                );
+                // Stamped where the pack ends, not after the join below:
+                // every shard has been handed off by now, so this is the
+                // pack's own cost. Charging the join to it would bury the
+                // upload time that did NOT fit under the pack inside the
+                // build number — which is the one number that would show
+                // this change failing to overlap anything.
+                let build_elapsed = commit_t0.elapsed();
+                // Close the channel even on a build error so the
+                // uploader terminates; join it BEFORE surfacing the
+                // build result so no upload outlives this commit.
+                drop(tx);
+                let uploaded = bridge_on_runtime(
+                    async move {
+                        uploader.await.map_err(|join| {
+                            BuildError::Store(format!("pipelined uploader: {join}"))
+                        })?
+                    },
+                    &runtime,
+                );
+                // The upload tail: PUTs still in flight when the last
+                // shard finished packing. Zero here means the network kept
+                // up with the pack entirely.
+                let upload_drain_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let (outputs, _hints) = built?;
+                // A real error, not a `debug_assert`: on the piped path
+                // every shard leaves through the channel, so a collected
+                // shard here is one the uploader never saw. Releasing it
+                // would publish a manifest entry whose bytes were never
+                // PUT, so the commit must fail instead.
+                if !outputs.is_empty() {
+                    return Err(BuildError::Store(
+                        "pipelined drain-commit returned collected shards".into(),
+                    ));
+                }
+                let (prepared, uploaded_bytes) = uploaded?;
+                let user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
+                let prepare_elapsed = commit_t0
+                    .elapsed()
+                    .saturating_sub(build_elapsed)
+                    .saturating_sub(upload_drain_elapsed);
+                let bytes = uploaded_bytes as usize;
+                (
+                    user_batch,
+                    build_elapsed,
+                    upload_drain_elapsed,
+                    prepare_elapsed,
+                    bytes,
+                    bytes,
+                )
+            } else {
+                let (outputs, cell_hints) = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    None,
+                )?;
+                let build_elapsed = commit_t0.elapsed();
+                let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
+                let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+                let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let data_put_bytes: usize = user_batch
+                    .pending_storage_writes
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .sum();
+                (
+                    user_batch,
+                    build_elapsed,
+                    // The unpiped path uploads in the publish wave, so it
+                    // has no tail to drain here.
+                    time::Duration::ZERO,
+                    prepare_elapsed,
+                    output_bytes,
+                    data_put_bytes,
+                )
+            };
             // Computed before the batch moves into the publish future;
             // flushed only after Ok below, so a failed or retried commit
             // never counts.
@@ -1948,11 +2049,12 @@ impl SupertableWriter {
                 stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
             }
             if crate::storage::io_counters::timeline_enabled() {
-                eprintln!(
-                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
-                     publish {:.1}ms ({:.1} MiB data PUT)",
+                info!(
+                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + upload drain \
+                     {:.1}ms + prepare {:.1}ms + publish {:.1}ms ({:.1} MiB data PUT)",
                     build_elapsed.as_secs_f64() * 1e3,
                     output_bytes as f64 / (1u64 << 20) as f64,
+                    upload_drain_elapsed.as_secs_f64() * 1e3,
                     prepare_elapsed.as_secs_f64() * 1e3,
                     publish_t0.elapsed().as_secs_f64() * 1e3,
                     data_put_bytes as f64 / (1u64 << 20) as f64,
@@ -3561,6 +3663,10 @@ async fn materialized_user_rows_for_drain(
 /// window where it is drained out of the user arm but not yet in the graph —
 /// invisible to both. Recall-quality overlays belong in B, where lagging only
 /// costs a temporarily wider serving law, never a missing row. Origin: OPANN #422.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "drain", skip_all)
+)]
 pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     user_inner: Arc<SupertableInner>,
     hidden_inner: Arc<SupertableInner>,
@@ -3625,7 +3731,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     }
     let batch_cfg = drain_batch_superfiles(&user_inner.options);
     if batch_cfg == 0 {
-        eprintln!("[supertable drain] skipped (drain_batch_superfiles = 0)");
+        info!("[supertable drain] skipped (drain_batch_superfiles = 0)");
         return Ok(());
     }
 
@@ -3735,7 +3841,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .cloned()
             .collect();
         if selected.is_empty() {
-            eprintln!(
+            info!(
                 "[supertable drain] nothing to drain: all {} user superfile(s) already drained",
                 sources.len()
             );
@@ -4033,7 +4139,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             } else {
                 0.0
             };
-            eprintln!(
+            info!(
                 "[supertable drain] batch {}/{} materialize I/O: {} object reads, {:.1} MiB, wall {:.1}ms, Σdur {:.1}ms, implied concurrency {:.1}x ({} range-gets)",
                 batch_idx + 1,
                 n_batches,
@@ -4134,7 +4240,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             }
                         },
                     ))
-                    .buffered(commit_write_concurrency())
+                    .buffered(commit_write_concurrency().get())
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
@@ -4289,7 +4395,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             DrainTestFailurePhase::AfterBatch,
             local_checkpoint.batches_done,
         )?;
-        eprintln!(
+        info!(
             "[supertable drain] batch {}/{} ({} sf, {batch_log})",
             batch_idx + 1,
             n_batches,
@@ -4506,7 +4612,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
-        let mut uploads = stream::iter(put_futures).buffer_unordered(commit_write_concurrency());
+        let mut uploads =
+            stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
         while let Some(uploaded) = uploads.next().await {
             let uri = uploaded?;
             let entry = entry_by_uri.get(&uri).cloned().ok_or_else(|| {
@@ -4685,8 +4792,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // serve ivf. Gating here (not inside
         // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
         // build step.
-        let building_graph =
-            crate::config::global().vector.search_mode == crate::config::VectorSearchMode::HnswIvf;
+        // Which resident index this drain builds, if any. One manifest slot
+        // carries whichever it is, and the envelope states its kind, so adding
+        // a kind here does not widen the manifest.
+        let index_mode = crate::config::global().vector.search_mode;
+        let building_graph = index_mode == crate::config::VectorSearchMode::HnswIvf;
+        let building_flat = index_mode == crate::config::VectorSearchMode::FlatIvf;
         // Warm the DISK CACHE with the just-drained cell bytes — already
         // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
         // full re-read of these same cells is served from the local cache
@@ -4709,6 +4820,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         let graph_ref = if building_graph {
             build_hnsw_graph_ref(storage.as_ref(), &prospective).await
+        } else if building_flat {
+            build_flat_index_ref(storage.as_ref(), &prospective).await
         } else {
             None
         };
@@ -4757,7 +4870,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         {
             tracing::warn!("drain local checkpoint cleanup failed: {error}");
         }
-        eprintln!(
+        info!(
             "[supertable drain] cell build: {} row(s), {} cell(s) -> {} packed shard superfile(s) for {} worker(s), {:.1}ms",
             total_rows,
             n_cells_total,
@@ -4768,13 +4881,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
             let (train_ms, assign_ms, calib_ms) =
                 crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
-            eprintln!(
+            info!(
                 "[supertable drain] cell build phases (summed CPU, {n_cells_total} cells): train {train_ms:.1}ms + assign {assign_ms:.1}ms + calibrate {calib_ms:.1}ms",
             );
         }
     }
 
-    eprintln!(
+    info!(
         "[supertable drain] done ({}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
         match consolidate {
             DrainConsolidate::Kmeans => "kmeans",
@@ -4792,7 +4905,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     );
     let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
     if clamped_components > 0 {
-        eprintln!(
+        warn!(
             "[supertable drain] BUG: {clamped_components} component(s) saturated their \
              destination quantizer during this drain's re-encodes. Cosine: an ingest \
              path bypassed normalization; L2/NegDot: a destination grid failed to \
@@ -5446,28 +5559,19 @@ fn assign_cells<'a>(
     Ok(out)
 }
 
-/// Size one cell's fine IVF so one run is approximately
-/// [`DRAIN_FINE_RUN_TARGET_BYTES`]. The stride counts every per-row byte in
-/// the packed IVF: RaBitQ estimate code, local id, Sq8+epsilon rerank bytes,
-/// inline stable id, and the conservative norm word.
 /// Per-cell drain config plus the centroid count derived for that cell. The
-/// count sizes each fine run to ~`DRAIN_FINE_RUN_TARGET_BYTES` of encoded
-/// rows against the cell's row count (independent of any caller knob), and is
-/// passed alongside the config into the cell-pack build.
+/// count sizes each fine run to the fine-run byte target of encoded rows against
+/// the cell's row count (independent of any caller knob), via the shared
+/// [`fine_run_target_n_cent`] — the same sizing merge re-applies, so a cell's
+/// fine runs stay near target through drains and compactions alike.
 fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig, usize) {
     debug_assert!(n_rows > 0);
-    let dim = cfg.dim;
     let rerank_codec = if cfg.rerank_codec.is_ivf_mergeable() {
         cfg.rerank_codec
     } else {
         RerankCodec::Sq8Residual
     };
-    let rabitq_bytes = dim.div_ceil(u8::BITS as usize);
-    let rerank_bytes = rerank_codec.per_vector_bytes(dim);
-    let row_stride =
-        rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
-    let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
-    let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
+    let n_cent = fine_run_target_n_cent(cfg.dim, rerank_codec, n_rows);
     let cell_cfg = VectorConfig {
         rerank_codec,
         provided_centroids: None,
@@ -5719,6 +5823,95 @@ fn build_prepared_from_spilled_cells(
 /// Rows are resharded by centroid distance instead of arrival time; drain
 /// never writes superfiles or touches S3 here — the writer publishes through
 /// the normal batch path.
+/// Streaming handoff for the pipelined commit publish: each pool task
+/// sends its shard the moment prepare finishes, so the uploader has the
+/// storage bytes in flight while the remaining shards are still packing.
+///
+/// Bounded, and sent to with `blocking_send` from the pack's pool threads:
+/// an unbounded queue would let a fast pack outrun a slow object store and
+/// hold every sealed shard at once, which is the peak memory the pipeline
+/// exists to avoid. At this depth the bytes in memory are what the uploader
+/// has in flight plus one queued shard per upload slot.
+type PipelinedShardTx = Sender<(u32, PreparedSuperfile)>;
+
+/// Drain `rx`, PUTting each shard's storage bytes as it arrives, at most
+/// [`commit_write_concurrency`] uploads in flight. Returns the prepared
+/// shards in shard-id order (manifest entry order must not depend on
+/// upload completion order) with their storage bytes taken, plus the
+/// uploaded byte total.
+///
+/// The manifest CAS runs strictly after this completes, so the
+/// durability boundary is unmoved. A failure after some PUTs leaves
+/// orphans that gc reaps past its reclaim grace — the same recovery as a
+/// crash between the batch upload wave and the CAS on the unpiped path.
+async fn upload_prepared_shards(
+    storage: Arc<dyn StorageProvider>,
+    multipart_threshold: u64,
+    mut rx: Receiver<(u32, PreparedSuperfile)>,
+) -> Result<(Vec<PreparedSuperfile>, u64), BuildError> {
+    let cap = commit_write_concurrency().get();
+    let mut in_flight = FuturesUnordered::new();
+    let mut done: Vec<(u32, PreparedSuperfile)> = Vec::new();
+    let mut uploaded_bytes: u64 = 0;
+    let mut open = true;
+    // The first upload error, held until every PUT already started has
+    // settled. Returning at the first failure would drop the other futures
+    // mid-request: a cancelled multipart leaves its uploaded parts behind
+    // with no abort, and those parts are not an orphaned superfile that gc
+    // reclaims. Draining also keeps receiving, so a packing thread parked on
+    // a full queue is never left there.
+    let mut failure: Option<BuildError> = None;
+    while open || !in_flight.is_empty() {
+        tokio::select! {
+            received = rx.recv(), if open && in_flight.len() < cap => match received {
+                Some((shard_id, mut prepared)) => {
+                    if failure.is_some() {
+                        // The commit is already lost; take the shard off the
+                        // queue and drop it rather than starting a PUT whose
+                        // bytes nothing will reference.
+                        continue;
+                    }
+                    let Some((uri, bytes)) = prepared.bytes_for_storage.take() else {
+                        // Unreachable as written: `prepare_superfile` fills
+                        // `bytes_for_storage` whenever the table has storage,
+                        // and this path runs only when it does. Fail closed
+                        // regardless — accepting the shard would hand
+                        // `collect_prepared_superfiles` an entry to publish
+                        // for an object nothing ever PUT, which is the same
+                        // hazard the collected-shards guard above refuses.
+                        failure.get_or_insert_with(|| {
+                            BuildError::Store(format!(
+                                "pipelined shard {shard_id} carries no storage bytes"
+                            ))
+                        });
+                        continue;
+                    };
+                    uploaded_bytes += bytes.len() as u64;
+                    let storage = Arc::clone(&storage);
+                    in_flight.push(async move {
+                        put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                            .await
+                            .map(|()| (shard_id, prepared))
+                            .map_err(|error| BuildError::Store(error.to_string()))
+                    });
+                }
+                None => open = false,
+            },
+            Some(finished) = in_flight.next(), if !in_flight.is_empty() => match finished {
+                Ok(shard) => done.push(shard),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    done.sort_by_key(|(shard_id, _)| *shard_id);
+    Ok((done.into_iter().map(|(_, p)| p).collect(), uploaded_bytes))
+}
+
 fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
@@ -5726,6 +5919,7 @@ fn commit_shards_via_drain(
     metric: Metric,
     n_packed_shards: usize,
     op_stats: &Option<Arc<OpStatsCollector>>,
+    pipeline: Option<&PipelinedShardTx>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -5822,17 +6016,51 @@ fn commit_shards_via_drain(
         &inner.options.writer_pool,
         op_stats,
         &packed_shards,
-        |task| {
+        |task| -> Result<Option<(u32, ShardOutput)>, BuildError> {
             let (shard_id, cells) = task;
-            build_one_packed_shard_via_drain(
+            let output = build_one_packed_shard_via_drain(
                 cells,
                 &source_scalar,
                 &vector_views,
                 &local_by_id,
                 options,
                 &vc,
-            )
-            .map(|output| output.map(|output| (*shard_id, output)))
+            )?;
+            let Some(tx) = pipeline else {
+                return Ok(output.map(|output| (*shard_id, output)));
+            };
+            // Pipelined publish: prepare on this pool thread and hand the
+            // shard to the uploader NOW, so its storage bytes go out while
+            // the remaining shards are still packing — sealed bytes never
+            // accumulate across the fan-out.
+            let Some(output) = output else {
+                return Ok(None);
+            };
+            let Some(prepared) = prepare_superfile(inner, output)? else {
+                return Ok(None);
+            };
+            let PreparedSuperfile {
+                entry,
+                bytes_for_store,
+                bytes_for_storage,
+                bytes_for_cache,
+            } = prepared;
+            let entry = finish_superfile_entry(entry, Some(*shard_id))?;
+            // `blocking_send`, not `send`: this runs on a rayon pool thread
+            // (the fan-out is a `pool.install`), never a tokio worker, so
+            // parking here parks the pack — which is the backpressure. The
+            // uploader is a separate runtime task and keeps draining.
+            tx.blocking_send((
+                *shard_id,
+                PreparedSuperfile {
+                    entry,
+                    bytes_for_store,
+                    bytes_for_storage,
+                    bytes_for_cache,
+                },
+            ))
+            .map_err(|_| BuildError::Store("pipelined commit uploader closed mid-build".into()))?;
+            Ok(None)
         },
     )?;
     let fanout_elapsed = stage_t0
@@ -5840,7 +6068,7 @@ fn commit_shards_via_drain(
         .saturating_sub(flatten_elapsed)
         .saturating_sub(assign_elapsed);
     if crate::storage::io_counters::timeline_enabled() {
-        eprintln!(
+        info!(
             "[supertable commit] flatten {:.1}ms + assign {:.1}ms + shard pack/finish {:.1}ms",
             flatten_elapsed.as_secs_f64() * 1e3,
             assign_elapsed.as_secs_f64() * 1e3,
@@ -5902,6 +6130,7 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         metric,
         UPDATE_PACKED_SHARDS,
         op_stats,
+        None,
     )?;
     let output = outputs.pop().ok_or(BuildError::NoDocsToBuild)?;
     if !outputs.is_empty() || output.n_docs != expected_rows {
@@ -6832,7 +7061,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(upload) = in_flight.next().await {
         if let Err(error) = upload {
             drop(in_flight);
@@ -7320,7 +7549,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(landed) = in_flight.next().await {
         if let Err(error) = landed {
             drop(in_flight);
@@ -8134,6 +8363,10 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// already durable), then a list+pointer etag-CAS stamp with refresh-and-retry
 /// on contention — so a lost race rebuilds the blob from the winning
 /// membership, never stamping stale state.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "refresh_vector_state", skip_all)
+)]
 pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -8201,7 +8434,7 @@ async fn build_and_publish_centroid_router_section(
         )
         .await;
     let section_ref = match bytes {
-        Some(bytes) => slow_vector_state::write_graph_section(storage, bytes)
+        Some(bytes) => slow_vector_state::write_resident_index_blob(storage, bytes)
             .await
             .inspect(|reference| {
                 tracing::debug!(uri = %reference.uri, "centroid-router: published section");
@@ -8263,7 +8496,7 @@ async fn previous_centroid_section(
 /// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
 /// correctness — the copy-flip and query-time doc-id dedup are the
 /// correctness guards.
-fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
+fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
     let entries = manifest.get_all_superfiles();
     let count: u64 = entries.iter().map(|e| e.n_docs).sum();
     let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
@@ -8286,27 +8519,35 @@ fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
     h
 }
 
-/// Encode + PUT a data bundle as a graph section, logging the outcome.
-async fn publish_hnsw_blob(
+/// Encode + PUT a data bundle as the generation's resident index section,
+/// logging the outcome under the kind actually published.
+///
+/// The kind is in the message because this function serves both index types:
+/// a flat publish logging as a graph publish is the same class of confusion
+/// the reasoned declines exist to remove — the log saying the mode you did not
+/// ask for.
+async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
+    kind: PayloadKind,
     data_bundle: &[u8],
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
-    let blob = crate::superfile::vector::hnsw::encode_graph_bundle(
+    let blob = crate::superfile::vector::hnsw::encode_resident_envelope(
         population_key,
         high_water,
         &[],
-        Some(data_bundle),
+        Some((kind, data_bundle)),
     );
     let blob_mib = blob.len() / (1024 * 1024);
-    match slow_vector_state::write_graph_section(storage, blob).await {
+    let label = kind.label();
+    match slow_vector_state::write_resident_index_blob(storage, blob).await {
         Ok(reference) => {
-            tracing::debug!(uri = %reference.uri, blob_mib, "hnsw: published graph section");
+            tracing::debug!(uri = %reference.uri, blob_mib, "{label}: published resident index");
             Some(reference)
         }
         Err(error) => {
-            tracing::warn!("hnsw: publish failed: {error}");
+            tracing::warn!("{label}: publish failed: {error}");
             None
         }
     }
@@ -8335,6 +8576,69 @@ async fn publish_hnsw_blob(
 /// build step — directly callable in tests without touching global config. The
 /// scale-free **centroid** graph is not yet built here — the bundle carries an
 /// empty centroid section.
+/// Build and publish the resident flat 4-bit index, returning the routing ref
+/// the manifest stamps. `None` means no index — the query serves `ivf`.
+///
+/// Peer of [`build_hnsw_graph_ref`], and shorter for two reasons that are worth
+/// stating rather than inferring from the absence of code.
+///
+/// There is no incremental arm. Extending a flat index would mean appending
+/// rows to a plane whose ruler was fitted over the previous population, which
+/// is exactly the first-input-ruler rule the graph's walk plane follows — but
+/// there it buys consistency with neighbour lists that already exist, and a
+/// scan has no neighbour lists. A rebuild is simply the correct answer, and it
+/// costs one pass over the corpus.
+///
+/// There is no calibration arm either: [`assemble_flat_sections`] owns the doc
+/// ceiling and the register gate, because both are decisions about the fitted
+/// plane rather than about publication.
+async fn build_flat_index_ref(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let column = manifest
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())?;
+    let population_key = resident_index_population_key(manifest);
+    let high_water_now = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.id_max)
+        .max()
+        .unwrap_or(0);
+    let t0 = std::time::Instant::now();
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_flat_sections(manifest, &column, &None)
+            .await
+        {
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("flat build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
+            Err(error) => {
+                tracing::warn!("flat build: assemble failed: {error}");
+                return None;
+            }
+        };
+    tracing::debug!(
+        data_bundle_mib = data_bundle.len() / (1024 * 1024),
+        wall_s = t0.elapsed().as_secs_f64(),
+        "flat: built index"
+    );
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Flat,
+        &data_bundle,
+    )
+    .await
+}
+
 async fn build_hnsw_graph_ref(
     storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
@@ -8365,7 +8669,7 @@ async fn build_hnsw_graph_ref(
         );
         return None;
     }
-    let population_key = graph_population_key(manifest);
+    let population_key = resident_index_population_key(manifest);
     let high_water_now = manifest
         .get_all_superfiles()
         .iter()
@@ -8376,10 +8680,17 @@ async fn build_hnsw_graph_ref(
 
     // Incremental append: extend the prior persisted graph with only the new
     // rows, cloning it (fetch + decode) rather than mutating a serving graph.
-    if let Some(prior_ref) = manifest.slow_vector_state_graphs_blob()
-        && let Ok(sections) =
-            slow_vector_state::fetch_graph_sections(storage, prior_ref, /* need_sq8 */ false).await
-        && let Some(prior_data) = sections.data
+    if let Some(prior_ref) = manifest.resident_vector_index_blob()
+        && let Ok(sections) = slow_vector_state::hydrate_resident_index(
+            storage,
+            prior_ref,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        && let Some(prior_data) = sections.data.and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
     {
         let prior_count = prior_data.doc_ids.len();
         match crate::supertable::query::vector::assemble_hnsw_incremental(
@@ -8391,7 +8702,7 @@ async fn build_hnsw_graph_ref(
         )
         .await
         {
-            Ok(Some((data_bundle, new_high_water, inserted))) => {
+            Ok(IndexOutcome::Ready((data_bundle, new_high_water, inserted))) => {
                 tracing::debug!(
                     inserted,
                     nodes = prior_count + inserted,
@@ -8399,13 +8710,17 @@ async fn build_hnsw_graph_ref(
                     wall_s = t0.elapsed().as_secs_f64(),
                     "hnsw: incremental insert into prior graph"
                 );
-                return publish_hnsw_blob(storage, population_key, new_high_water, &data_bundle)
-                    .await;
+                return publish_resident_index(
+                    storage,
+                    population_key,
+                    new_high_water,
+                    PayloadKind::Graph,
+                    &data_bundle,
+                )
+                .await;
             }
-            Ok(None) => {
-                tracing::debug!(
-                    "hnsw: incremental not applicable (not a pure append); full rebuild"
-                );
+            Ok(IndexOutcome::Unavailable(reason)) => {
+                tracing::debug!("hnsw incremental: not applicable ({reason}); full rebuild");
             }
             Err(error) => {
                 tracing::debug!("hnsw: incremental error ({error}); full rebuild");
@@ -8414,31 +8729,35 @@ async fn build_hnsw_graph_ref(
     }
 
     // Full rebuild.
-    let data_bundle = match crate::supertable::query::vector::assemble_hnsw_sections(
-        manifest, &column, &None,
-    )
-    .await
-    {
-        Ok(Some(bundle)) => bundle,
-        Ok(None) => {
-            tracing::debug!(
-                column,
-                "hnsw: build skipped — no Sq16 rows assembled (column absent, not sq16, or empty)"
-            );
-            return None;
-        }
-        Err(error) => {
-            tracing::warn!("hnsw: build skipped — assemble error: {error}");
-            return None;
-        }
-    };
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_hnsw_sections(manifest, &column, &None)
+            .await
+        {
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("hnsw build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
+            Err(error) => {
+                tracing::warn!("hnsw build: assemble failed: {error}");
+                return None;
+            }
+        };
     tracing::debug!(
         total_docs,
         data_bundle_mib = data_bundle.len() / (1024 * 1024),
         wall_s = t0.elapsed().as_secs_f64(),
         "hnsw: built graph (full)"
     );
-    publish_hnsw_blob(storage, population_key, high_water_now, &data_bundle).await
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Graph,
+        &data_bundle,
+    )
+    .await
 }
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
@@ -8529,7 +8848,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         // commit — a lag between the watermark and the graph is a window where a
         // just-drained row is invisible to both arms, the exact visibility gap
         // the atomic-drain stamp closes.
-        let graphs_ref = old.slow_vector_state_graphs_blob().cloned();
+        let graphs_ref = old.resident_vector_index_blob().cloned();
         // Build + publish the centroid-router section once for this settle. A
         // membership commit CLEARED the ref (its node map indexes the visible
         // superfile set), so a present ref means a prior no-op settle already
@@ -8568,7 +8887,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
-            && old.slow_vector_state_graphs_blob() == graphs_ref.as_ref()
+            && old.resident_vector_index_blob() == graphs_ref.as_ref()
             && old.slow_vector_state_centroid_graph_blob() == centroid_graph.as_ref()
         {
             return Ok(());
@@ -8920,11 +9239,14 @@ async fn put_superfile_replace(
 /// maintenance compaction each fan out their PUTs at this width, so keeping
 /// each at ~50% of cores bounds the combined in-flight PUTs to roughly the
 /// core count rather than a multiple of it.
-fn commit_write_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
-        .unwrap_or(1)
-        .max(1)
+///
+/// Returns `NonZeroUsize` because several callers are unsound at zero — a
+/// zero-capacity `channel` panics, and a zero-width `buffered` stalls — and
+/// a single-core host divides to zero before the floor applies. Carrying the
+/// floor in the type means no caller has to restate it.
+fn commit_write_concurrency() -> NonZeroUsize {
+    let half = available_parallelism().map(|n| n.get() / 2).unwrap_or(1);
+    NonZeroUsize::new(half).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// Upper bound on the drain's auto-sized read fan-out — keeps a very large box
@@ -9007,7 +9329,7 @@ async fn write_superfile_list_with_threshold(
     // fanout from each stacks and starves the connection pool until requests
     // hit the per-request timeout. Capping each operation at ~50% of cores
     // leaves headroom for a concurrent maintenance pass without saturation.
-    let write_concurrency = commit_write_concurrency();
+    let write_concurrency = commit_write_concurrency().get();
 
     let replace_futs = pending_storage_replaces
         .iter()
@@ -9498,7 +9820,7 @@ async fn put_superfile_multipart(
 
     let mut upload = storage.put_multipart(path).await?;
     let total = bytes.len();
-    let part_concurrency = commit_write_concurrency().max(1);
+    let part_concurrency = commit_write_concurrency().get();
     let mut parts: Vec<UploadPart> = Vec::with_capacity(part_concurrency);
     let mut offset = 0;
     while offset < total {
@@ -9643,6 +9965,7 @@ mod tests {
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer as tok,
+            distinct_unit_vectors,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
@@ -9660,7 +9983,7 @@ mod tests {
     /// default `ivf` mode no longer exercises (the caller now gates the build).
     /// Drives the caller-gated build step directly on the drained cells
     /// (`build_hnsw_graph_ref` → the full `assemble_hnsw_sections` build +
-    /// `publish_hnsw_blob` internally), fetches the published graph back, and
+    /// `publish_resident_index` internally), fetches the published graph back, and
     /// asserts it actually SERVES — a query on the batch's axis finds its exact
     /// row through the fetched graph. Behavioral coverage, not a
     /// build-and-forget stub: it would catch a wrong node→id map or a build
@@ -9712,19 +10035,273 @@ mod tests {
         let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
             .await
             .expect("full build registers a graph");
-        let prior = slow_vector_state::fetch_graph_sections(
+        let prior = slow_vector_state::hydrate_resident_index(
             storage.as_ref(),
             &ref1,
-            /* need_sq8 */ false,
+            slow_vector_state::WalkPlaneRequest::AsStored,
         )
         .await
         .expect("fetch built graph")
         .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
         .expect("data graph present after full build");
         assert!(
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"
         );
+    }
+
+    /// Rows in the flat drain-build fixture — enough that the register gate's
+    /// held-out queries rank against a real corpus.
+    const FLAT_DRAIN_ROWS: usize = 512;
+    /// Dimension for the flat drain-build fixture.
+    const FLAT_DRAIN_DIM: usize = 32;
+    /// Seed for the fixture corpus, fixed so a failure reproduces.
+    const FLAT_DRAIN_SEED: u64 = 0x51A7_1DEA;
+    /// Separation the probe row must win its own query by, on the scan's
+    /// `-dot` scale. Random unit directions at this dimension sit well below
+    /// it, so a smaller margin would mean the scan found the wrong row.
+    const FLAT_DRAIN_MIN_MARGIN: f32 = 0.2;
+
+    /// A batch of [`distinct_unit_vectors`], returned alongside the vectors
+    /// themselves so one row can be replayed as a query.
+    ///
+    /// Not [`build_axis_vector_batch_range`]: the flat index's register gate
+    /// grades its scan against an exhaustive Sq16 one, and one-hot rows put a
+    /// block of exact ties at the head of every ground-truth list.
+    fn build_distinct_vector_batch(n: usize, dim: usize, seed: u64) -> (RecordBatch, Vec<f32>) {
+        let vectors = distinct_unit_vectors(n, dim, seed);
+        let titles =
+            LargeStringArray::from((0..n).map(|i| format!("doc {i} beta")).collect::<Vec<_>>());
+        let values = Arc::new(Float32Array::from(vectors.clone()));
+        let list = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            values,
+            None,
+        )
+        .expect("fixed-size list");
+        let batch = RecordBatch::try_new(
+            schema_id_title_emb(dim),
+            vec![Arc::new(titles), Arc::new(list)],
+        )
+        .expect("vector batch");
+        (batch, vectors)
+    }
+
+    /// End-to-end coverage of the opt-in `flat` drain-build path, the peer of
+    /// [`hnsw_drain_full_build_serves_its_rows`]. Drives the caller-gated
+    /// build step on the drained cells (`build_flat_index_ref` → the register
+    /// gate → `publish_resident_index` with [`PayloadKind::Flat`]), hydrates
+    /// the published blob back, and asserts it SERVES: a query replaying a
+    /// corpus row finds that row and wins by a margin.
+    ///
+    /// Behavioral, not build-and-forget. A build that published a plane whose
+    /// node→id map was misaligned, or an envelope whose kind tag said graph,
+    /// would still produce bytes and a plausible top-k.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flat_drain_build_publishes_an_index_that_serves() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_sq16(FLAT_DRAIN_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+        let (batch, vectors) =
+            build_distinct_vector_batch(FLAT_DRAIN_ROWS, FLAT_DRAIN_DIM, FLAT_DRAIN_SEED);
+        {
+            let mut writer = table.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("drain");
+
+        let reader = hidden.reader().expect("hidden reader");
+        let reference = build_flat_index_ref(storage.as_ref(), reader.manifest())
+            .await
+            .expect("a drained Sq16 corpus must register a flat index");
+        let index = slow_vector_state::hydrate_resident_index(
+            storage.as_ref(),
+            &reference,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        .expect("fetch the published index")
+        .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Flat(f) => Some(f),
+            slow_vector_state::ResidentIndexKind::Graph(_) => None,
+        })
+        .expect("the envelope must state Flat, and the payload decode as one");
+
+        assert_eq!(
+            index.len(),
+            FLAT_DRAIN_ROWS,
+            "the plane holds one node per drained row"
+        );
+        assert_eq!(index.dim(), FLAT_DRAIN_DIM);
+        assert_eq!(index.column(), "emb");
+
+        let probe = &vectors[..FLAT_DRAIN_DIM];
+        let top = index.search(probe, 2);
+        assert_eq!(top.len(), 2, "an exhaustive scan fills k");
+        assert!(
+            index.doc_id(top[0].0).is_some(),
+            "the nearest node must resolve to a stable id"
+        );
+        assert!(
+            top[0].1 + FLAT_DRAIN_MIN_MARGIN < top[1].1,
+            "a row queried with its own vector must win by a clear margin, \
+             got {} against runner-up {}",
+            top[0].1,
+            top[1].1
+        );
+    }
+
+    /// Payload size for the pipelined-uploader tests. Small enough to stay
+    /// under any multipart threshold, large enough to be a real object.
+    const UPLOAD_TEST_BYTES: usize = 64;
+    /// Shard ids the uploader tests send, deliberately out of order so the
+    /// returned order cannot accidentally match the arrival order.
+    const UPLOAD_TEST_SHARD_IDS: [u32; 3] = [2, 0, 1];
+    /// Base uuid for the uploader tests' superfiles; the shard id occupies
+    /// the low byte, so a returned entry names the shard that produced it.
+    const UPLOAD_TEST_UUID_BASE: u128 = 0x5D40_0000_0000_0000_0000_0000_0000_0000;
+
+    /// A minimal entry for the uploader tests: the uploader only moves
+    /// `bytes_for_storage` and orders by shard id, so the entry's contents
+    /// are irrelevant beyond identifying the superfile.
+    fn upload_test_prepared(shard_id: u32) -> (SuperfileUri, PreparedSuperfile) {
+        let uuid = Uuid::from_u128(UPLOAD_TEST_UUID_BASE + u128::from(shard_id));
+        let uri = SuperfileUri(uuid);
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uuid,
+            uri,
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        });
+        let bytes = Bytes::from(vec![shard_id as u8; UPLOAD_TEST_BYTES]);
+        (
+            uri,
+            PreparedSuperfile {
+                entry,
+                bytes_for_store: None,
+                bytes_for_storage: Some((uri, bytes)),
+                bytes_for_cache: None,
+            },
+        )
+    }
+
+    /// The uploader returns shards in shard-id order no matter what order
+    /// they finish uploading in — manifest entry order must not depend on
+    /// the network. Fed deliberately out of order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_returns_shard_id_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        for shard_id in UPLOAD_TEST_SHARD_IDS {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let (prepared, uploaded) = upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx)
+            .await
+            .expect("all uploads succeed");
+        let ids: Vec<u32> = prepared
+            .iter()
+            .map(|p| p.entry.superfile_id.as_u128() as u32 & 0xFF)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            UPLOAD_TEST_SHARD_IDS.len(),
+            "every shard comes back"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "returned in shard-id order, not arrival order");
+        assert_eq!(
+            uploaded as usize,
+            UPLOAD_TEST_SHARD_IDS.len() * UPLOAD_TEST_BYTES,
+            "uploaded byte total counts every shard"
+        );
+    }
+
+    /// A failed PUT must not cancel the PUTs already in flight. Cancelling a
+    /// multipart upload mid-request leaves its parts stored with no abort,
+    /// and parts are not an orphaned superfile that gc reclaims — so the
+    /// uploader records the first error, lets every started request settle,
+    /// and only then reports the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_settles_started_puts_before_reporting_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+
+        // Fail exactly one shard, named by its own URI so the other two are
+        // untouched whatever order the uploads are dispatched in.
+        let (doomed_uri, doomed) = upload_test_prepared(0);
+        faults.fail(FaultOp::PutAtomic, &doomed_uri.0.to_string(), 1);
+
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        tx.send((0, doomed)).await.expect("send");
+        for shard_id in [1u32, 2] {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let err = match upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx).await {
+            Err(error) => error,
+            Ok(_) => panic!("a failed shard PUT must fail the batch"),
+        };
+        assert!(
+            format!("{err:?}").contains("injected"),
+            "the injected fault is what surfaces: {err:?}"
+        );
+        assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+        // The uploader drained rather than returning at the first error, so
+        // the doomed shard is the only one missing from storage.
+        assert!(
+            !storage
+                .head(&superfile_storage_path(&doomed_uri))
+                .await
+                .is_ok_and(|meta| meta.size > 0),
+            "the faulted shard must not be durable"
+        );
+    }
+
+    /// The commit write fanout is a `NonZeroUsize` because a zero would
+    /// panic the uploader's channel and stall `buffered`; a single-core host
+    /// divides to zero before the floor applies.
+    #[test]
+    fn commit_write_concurrency_is_never_zero() {
+        assert!(commit_write_concurrency().get() >= 1);
     }
 
     /// Default shard target for the fanout unit tests, in bytes — mirrors the shipped

@@ -247,6 +247,36 @@ pub fn build_title_batch(titles: &[&str]) -> RecordBatch {
         .expect("RecordBatch shape matches schema_id_title")
 }
 
+/// Multiplier turning an LCG state into the next pseudo-random draw.
+const UNIT_VECTOR_LCG_MULT: u64 = 6_364_136_223_846_793_005;
+
+/// `n * dim` row-major f32s: `n` DISTINCT pseudo-random unit directions,
+/// reproducible from `seed`. Callers wrap them into whatever batch shape
+/// their fixture schema wants.
+///
+/// The alternative most fixtures reach for is one-hot rows cycling over the
+/// axes, which are separable and easy to assert on. They are the wrong
+/// corpus for anything graded on RECALL: they repeat each direction `n / dim`
+/// times, so the head of every ground-truth list is a block of exact ties and
+/// two rankings break those ties differently. Measured recall is then capped
+/// by the tie count rather than by whatever is under test — which is how a
+/// codec gate ends up deciding a test that has nothing to do with it.
+pub fn distinct_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed;
+    let mut out = Vec::<f32>::with_capacity(n * dim);
+    for _ in 0..n {
+        let row: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state.wrapping_mul(UNIT_VECTOR_LCG_MULT).wrapping_add(1);
+                ((state >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+            })
+            .collect();
+        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+        out.extend(row.iter().map(|v| v / norm));
+    }
+    out
+}
+
 /// `SupertableOptions` with the test-fixture defaults:
 /// [`schema_id_title`] schema, a single FTS column `title`,
 /// no vector columns, and a 1-thread rayon writer pool.

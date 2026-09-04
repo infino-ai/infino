@@ -188,6 +188,19 @@ vector:
   #                          different column) serves `ivf` AUTOMATICALLY, so
   #                          correctness never depends on the graph. Best for
   #                          single-box, latency-tier, RAM-provisioned tables.
+  #   flat_ivf             — OPT-IN: scan a resident 4-bit plane exhaustively
+  #                          and return the codes' own ranking. No grid, no
+  #                          cells, no graph, and no resident Sq16 plane —
+  #                          0.5 bytes/dim against 2.0 for every other mode.
+  #                          The codec sets the recall ceiling (~0.93 recall@10
+  #                          on dbpedia-1536): a declared trade, gated by
+  #                          flat_register_floor. Per-query work is linear in
+  #                          the corpus, so it is bounded by flat_max_docs;
+  #                          past that ceiling (and pre-drain, filtered, or
+  #                          another column) it serves `ivf`, which is what the
+  #                          `_ivf` suffix names. Cosine columns only. Best for
+  #                          embedded tables sized by resident memory rather
+  #                          than by QPS.
   search_mode: ivf
 
   # For search_mode = ivf: the cluster router.
@@ -266,24 +279,46 @@ vector:
   # Memory scales with docs x m0 (base layer only), bounded by hnsw_max_docs.
   hnsw_m0: 0
 
-  # For search_mode = hnsw_ivf: how far below target_recall the graph is still
-  # accepted before the drain gives up and serves ivf (floor = target - this).
-  # Widen to keep more hard high-dim tables on the fast graph; tighten to
-  # demand near-target recall from the graph or step aside to ivf.
-  hnsw_recall_slack: 0.01
+  # Register floor for the GRAPH index: the recall its calibrated (m0, ef) must
+  # reach before the drain publishes it. Below this, queries serve ivf.
+  hnsw_register_floor: 0.98
 
-  # For search_mode = hnsw_ivf: navigate the resident graph on an int8 (SQ8)
-  # plane derived at load from the Sq16 codes' high byte (scored with an
-  # int8-VNNI kernel where present), then re-rank the final beam on full Sq16.
-  # Roughly halves warm hnsw latency at unchanged recall; costs an extra
-  # resident plane (~1 byte/dim/row, ~50% over the Sq16 plane), built only when
-  # enabled. false walks entirely on Sq16 (no extra plane).
-  hnsw_sq8_walk: true
+  # Register floor for the FLAT index, same contract, its own number. Separate
+  # because the floors answer different questions: the graph is a latency
+  # optimization over a correct scan, so its floor is a quality bar, while a
+  # flat plane is a memory trade the operator chose whose recall ceiling is
+  # set by the codec (16 levels/coordinate measures ~0.93 on dbpedia-1536).
+  # The default is therefore a broken-plane TRIPWIRE, not a bar: a healthy
+  # plane sits well above it, a degenerate ruler or mis-sliced section
+  # collapses toward random and lands far below. Raise it to impose a bar.
+  flat_register_floor: 0.80
 
-  # For search_mode = hnsw_ivf with hnsw_sq8_walk: how many of the SQ8 walk's
+  # For search_mode = hnsw_ivf: which resident plane the graph walk scores
+  # candidates on. Every option re-ranks its final beam on the full Sq16 plane
+  # (always resident), so this decides which candidates reach the beam and what
+  # each candidate costs — never the returned order.
+  #
+  #   sq16         walk the Sq16 codes directly. Adds no plane (smallest
+  #                resident footprint), slowest walk.
+  #   sq8          DEFAULT. Int8 plane from the Sq16 high byte (+1 byte/dim),
+  #                scored with an int8-VNNI kernel. Roughly halves warm walk
+  #                latency at unchanged recall. Derived from Sq16 on read when
+  #                absent, so selecting it never needs a rebuild.
+  #   sq4          Fitted 4-bit nibbles in rotated space (+0.5 bytes/dim),
+  #                scored with the AVX-512 / VNNI nibble kernel: half sq8's
+  #                plane bytes and fewer bytes touched per candidate. Cannot be
+  #                derived on read (the fit needs a rotation and a moment pass),
+  #                so it is written at drain and applies at the next full
+  #                rebuild. Incremental drains inherit the prior plane + ruler.
+  #   sq4_residual sq4 plus a residual nibble plane (+1 byte/dim total), which
+  #                recovers most of the 4-bit reconstruction error. Same
+  #                rebuild caveat.
+  hnsw_plane: sq8
+
+  # For search_mode = hnsw_ivf on a coarse walk plane: how many of the walk's
   # nearest candidates to re-rank on full Sq16 before returning the top k.
   # Clamped to [k, ef]. Recall saturates well below ef (256 is the knee for
-  # k <= 100); wider only adds tail cost.
+  # k <= 100); wider only adds tail cost. Ignored when hnsw_plane is sq16.
   hnsw_refine_k: 256
 
   # For search_mode = hnsw_ivf: scale ceiling for the per-row DATA graph. The
@@ -292,6 +327,19 @@ vector:
   # graph is built and hnsw queries fall back to the scan path. ~10M
   # rows of Sq16 codes is the practical single-host resident ceiling.
   hnsw_max_docs: 10000000
+
+  # For search_mode = flat_ivf: scale ceiling for the resident 4-bit plane. Built
+  # at drain and persisted only when the table's doc count is at or below
+  # this; above it queries fall back to ivf.
+  #
+  # This is a LATENCY bound, not a memory one -- the plane is 0.5 bytes/dim,
+  # so 10M x 1536 would still fit one host at ~7.7 GiB. An exhaustive scan is
+  # linear in the corpus: measured ~1.6 ms at 100K x 1536 and ~20 ms at 1M,
+  # where a warm routed read serves ~2 ms at higher recall. A ceiling, not a
+  # recommendation -- the trade favors the scan up to a few hundred thousand
+  # rows; what it keeps at any scale is the pinned, cache-independent
+  # footprint and a width-invariant worst case.
+  flat_max_docs: 1000000
 
   # For search_mode = hnsw_ivf: row cap for the cheap calibration probe. On a
   # larger corpus, calibrate on a subsample of this many rows first. Subsample

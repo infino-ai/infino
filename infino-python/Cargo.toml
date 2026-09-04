@@ -1,6 +1,6 @@
 [package]
 name = "infino-python"
-version = "0.5.7"
+version = "0.5.10"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -29,6 +29,9 @@ arrow-schema = "58"
 # stable ABI), so distribution needs one wheel per platform rather than
 # one per Python version.
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
+# Lean search-result marshalling: return `_id` keys as a numpy array so the
+# only GIL-held step is one array creation (vs building a pyarrow Table).
+numpy = "0.28"
 # Parse a SQL predicate string (for `update` / `delete`) into a DataFusion
 # `Expr` — the type the core `update` / `delete` take. Pinned to infino's
 # datafusion version so the `Expr` type unifies with the core signatures;

@@ -11,14 +11,16 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    config::OptimizeOptions,
     superfile::{
         builder::{FtsConfig, VectorConfig},
         fts::tokenize::Tokenizer,
         vector::distance::Metric,
     },
-    supertable::{Supertable, SupertableOptions, storage::StorageProvider},
+    supertable::{LocalFsStorageProvider, Supertable, SupertableOptions, storage::StorageProvider},
     test_helpers::default_tokenizer,
 };
+use tempfile::TempDir;
 
 use crate::{
     corpus::{self, MmapTextCorpus, MmapVectorCorpus, dim},
@@ -597,6 +599,77 @@ fn text_delta_batch(modality: Modality, corpus: &PreparedCorpus) -> RecordBatch 
 /// dead weight. SQL's extra columns are derived inline from `doc_id`.
 /// The text/vector corpus is identical across modalities (same seeds),
 /// so each shape is directly comparable to its single-modality competitor.
+/// Build a LOCAL vector supertable from the prepared corpus's first
+/// `n_docs` rows and run the standard lifecycle — chunked appends,
+/// commits, then `optimize()` — so whatever serving index the process
+/// config selects (`vector.search_mode`: the stamped ivf laws, the
+/// resident graph, or the resident flat plane) is built, calibrated,
+/// and serving before the handle is returned.
+///
+/// For in-process comparisons against RAM-resident library peers: the
+/// backing store is a LocalFs tempdir (returned as the guard, dropped
+/// with the table), so the deploy story stays "cargo bench" with no
+/// object-store daemon, while a resident serving index answers from RAM
+/// exactly as it would over any backend.
+pub fn build_local_for_serving(
+    corpus: &PreparedCorpus,
+    n_docs: usize,
+) -> (Supertable, Arc<dyn StorageProvider>, TempDir) {
+    let dir = TempDir::new().expect("local supertable tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("LocalFs provider"));
+    let st = Supertable::create(options_for(Modality::Vector, Some(Arc::clone(&storage))))
+        .expect("create local supertable");
+    let schema = schema_for(Modality::Vector);
+    // A zero-doc build is a caller bug, named here rather than surfacing
+    // as `step_by(0)`'s opaque panic; an empty table also has nothing for
+    // `optimize()` to calibrate, so tolerating it would return a handle
+    // that serves no mode meaningfully.
+    assert!(n_docs > 0, "build_local_for_serving needs at least one row");
+    let commits = n_commits();
+    let chunk_size = n_docs.div_ceil(commits);
+    let mut w = st.writer().expect("writer");
+    for start in (0..n_docs).step_by(chunk_size) {
+        let end = (start + chunk_size).min(n_docs);
+        let batch = chunk_batch(Modality::Vector, corpus, &schema, start, end, end - start);
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+    // The full maintenance pass: drain to the hidden index, compact,
+    // calibrate the serving laws, and build whichever resident index the
+    // config opts into. Serving state after this is what a caller gets.
+    st.optimize(&OptimizeOptions::default())
+        .expect("optimize local supertable");
+    (st, storage, dir)
+}
+
+/// Serialized size of the resident vector-index blob the drain published
+/// (flat plane or graph bundle), by `head()`ing the object the hidden
+/// manifest references — the engine's own accounting, not plane
+/// arithmetic re-derived in bench code. `None` when no resident index
+/// was published (ivf mode, above the scale ceiling, or a declined
+/// register probe).
+pub fn served_index_blob_bytes(st: &Supertable) -> Option<u64> {
+    let hidden = st.vector_index_table()?;
+    let reference = hidden
+        .pinned_reader()
+        .manifest()
+        .resident_vector_index_blob_ref()?;
+    // The ref's URI is relative to the HIDDEN table's (prefixed) provider,
+    // so head through that handle — heading the user-root provider turns
+    // "blob exists" into NotFound. A manifest that names a blob the store
+    // cannot head is corruption, not absence: fail loudly, never `None`.
+    let storage = hidden
+        .options()
+        .storage
+        .as_ref()
+        .expect("hidden table with a published blob has storage attached");
+    let meta = tiers::block_on(storage.head(&reference.uri))
+        .expect("head the resident-index blob the hidden manifest references");
+    Some(meta.size)
+}
+
 pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestResult {
     let n_docs = n_docs();
     let commits = n_commits();

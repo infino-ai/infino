@@ -109,8 +109,9 @@ use crate::superfile::{
         cell_posting::{CellPostingBuilder, MaterializedIvfRow},
         distance::Metric,
         ivf_merge::{
-            MergedIvfSubsection, Sq8IvfMergeInput, merge_sq8_ivf_subsections,
-            merge_sq8_ivf_subsections_from_parsed, stable_ids_in_merged_local_order,
+            MergedIvfSubsection, Sq8IvfMergeInput, effective_fine_n_cent,
+            merge_sq8_ivf_subsections, merge_sq8_ivf_subsections_from_parsed,
+            stable_ids_in_merged_local_order,
         },
         layout::VectorLayout,
         reader::{ColumnReader, VectorReader},
@@ -239,6 +240,45 @@ pub struct BuilderOptions {
 /// cost scales with page COUNT (selection planning / offset-index
 /// walks), not page decode volume.
 pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
+
+/// Append one batch's `_id` values to a stable-id sidecar buffer: each id as
+/// a little-endian `i128`, in the batch's row order. Returns `false` (leaving
+/// `out` untouched for this batch) when the id column is absent or not
+/// `Decimal128`, so callers can abandon the sidecar and fall back to the
+/// Parquet id column. Used by both the whole-corpus and streaming-merge build
+/// paths so the two produce a byte-identical sidecar.
+fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &str) -> bool {
+    let Ok(idx) = batch.schema().index_of(id_column) else {
+        return false;
+    };
+    let Some(col) = batch.column(idx).as_any().downcast_ref::<Decimal128Array>() else {
+        return false;
+    };
+    out.reserve(col.len() * format::ID_SIDECAR_ENTRY_BYTES);
+    for i in 0..col.len() {
+        out.extend_from_slice(&col.value(i).to_le_bytes());
+    }
+    true
+}
+
+/// Materialize the stable-id sidecar from the accumulated batches: one
+/// little-endian `i128` per row, in Parquet row order — which is local doc
+/// id order, since rows are appended in `add_batch` order and both the FTS
+/// and vector indices number local doc ids the same way. The sidecar mirrors
+/// the `_id` column so a hit → `_id` resolve reads a fixed-width slice
+/// instead of decompressing the Parquet id pages. Returns an empty vec when
+/// the id column is absent or not `Decimal128` (the reader then falls back to
+/// the Parquet id column), so callers can pass the result through unchecked.
+fn stable_id_sidecar_bytes(batches: &[RecordBatch], id_column: &str) -> Vec<u8> {
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let mut out = Vec::with_capacity(total_rows * format::ID_SIDECAR_ENTRY_BYTES);
+    for batch in batches {
+        if !append_stable_id_sidecar(&mut out, batch, id_column) {
+            return Vec::new();
+        }
+    }
+    out
+}
 
 impl BuilderOptions {
     /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
@@ -931,9 +971,10 @@ impl SuperfileBuilder {
 
         if any_tombstones {
             // Materialize → filter by file-local tombstone id → rebuild per cell.
-            // Also track the max fine-cluster count seen per cell so rebuilds
-            // keep the source IVF width (empty clusters stay empty).
-            let mut by_cell: HashMap<u32, (usize, Vec<MaterializedIvfRow>)> = HashMap::new();
+            // The fine-cluster count is re-derived from the surviving row count at
+            // rebuild time (see the build loop) so a merged cell is re-clustered
+            // to the fine-run byte target rather than inheriting a source width.
+            let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
             for (reader_idx, (reader, deleted)) in readers.iter().enumerate() {
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
                 let superseded = superseded_per_reader.get(reader_idx);
@@ -956,20 +997,19 @@ impl SuperfileBuilder {
                     if rows.is_empty() {
                         continue;
                     }
-                    let entry = by_cell.entry(cell_id).or_insert_with(|| (0, Vec::new()));
-                    entry.0 = entry.0.max(col.n_cent as usize);
-                    entry.1.extend(rows);
+                    by_cell.entry(cell_id).or_default().extend(rows);
                 }
             }
 
             let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
             cell_ids.sort_unstable();
             for cell_id in cell_ids {
-                let (n_cent, mut rows) = by_cell.remove(&cell_id).expect("cell present");
+                let mut rows = by_cell.remove(&cell_id).expect("cell present");
                 for (i, row) in rows.iter_mut().enumerate() {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+                let n_cent = effective_fine_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
                 let merged = build_merged_subsection_from_materialized(
                     vec_cfg.clone(),
                     n_cent.max(1),
@@ -1012,7 +1052,27 @@ impl SuperfileBuilder {
                 let same_shape = sources
                     .windows(2)
                     .all(|pair| pair[0].2.n_cent == pair[1].2.n_cent);
-                if same_shape {
+                // Byte-splice concatenates cluster-i with cluster-i positionally,
+                // so it emits the SOURCE fine-cluster count. That stays near the
+                // fine-run byte target only while the merged union still fits that
+                // many clusters; once the union crosses the target the spliced
+                // clusters fatten, their summary centroids drift to the blob's
+                // center of mass, and cell routing misranks (recall caps, cold
+                // reads balloon). Take the fast splice only when the union still
+                // fits the source width; otherwise fall through to the rebuild
+                // path, which re-clusters to the re-derived width. Compare
+                // against the EFFECTIVE count the build would store (byte target
+                // passed through the small-cell cap), not the raw byte target —
+                // a sub-threshold cell whose byte target exceeds the cap stores
+                // the capped count, so a raw-target gate would reject the splice
+                // and rebuild it on every compaction only to re-derive that same
+                // capped count.
+                let merged_docs: usize =
+                    sources.iter().map(|(_, _, inp)| inp.n_docs as usize).sum();
+                let fits_target =
+                    effective_fine_n_cent(sources[0].2.dim, sources[0].2.rerank_codec, merged_docs)
+                        <= sources[0].2.n_cent;
+                if same_shape && fits_target {
                     let mut inputs: Vec<Sq8IvfMergeInput> =
                         sources.into_iter().map(|(_, _, inp)| inp).collect();
                     let mut doc_base = 0u32;
@@ -1033,15 +1093,12 @@ impl SuperfileBuilder {
                     packed_cells.push((cell_id, merged));
                     continue;
                 }
-                // Same cell, different fine `n_cent` (a small delta drain
-                // merging into a larger base): byte-splice is positional per
-                // cluster, so rebuild this cell from materialized rows at the
-                // widest source width — same path the tombstone branch uses.
-                let n_cent = sources
-                    .iter()
-                    .map(|(_, _, inp)| inp.n_cent)
-                    .max()
-                    .unwrap_or(1);
+                // Reached when the sources disagree on fine `n_cent` (a small
+                // delta drain merging into a larger base) OR agree but their
+                // union no longer fits that width. Byte-splice is positional per
+                // cluster, so rebuild this cell from materialized rows and
+                // re-cluster to the fine-run byte target re-derived from the
+                // merged row count — same path the tombstone branch uses.
                 let mut rows: Vec<MaterializedIvfRow> = Vec::new();
                 for (reader_idx, ci, _) in sources {
                     let v = readers[reader_idx]
@@ -1054,6 +1111,7 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+                let n_cent = effective_fine_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
                 let merged = build_merged_subsection_from_materialized(
                     vec_cfg.clone(),
                     n_cent.max(1),
@@ -1289,6 +1347,14 @@ impl SuperfileBuilder {
         let mut merged_doc_lengths: Vec<Vec<u32>> = vec![Vec::new(); n_fts_columns as usize];
         let mut stats_collector = Vec::with_capacity(readers.len());
         let mut base: u32 = 0;
+        // Stream the stable-id sidecar from the merged rows as they are written
+        // to the body, in the same order — so the compacted superfile resolves
+        // `_id` from the sidecar just like a fresh build. `ids_ok` clears on the
+        // first batch missing the id column, falling the whole file back to the
+        // Parquet id column.
+        let mut id_sidecar_bytes: Vec<u8> = Vec::new();
+        let mut ids_ok = true;
+        let id_column = superfile_builder.opts.id_column.clone();
 
         for (idx, (reader, deleted)) in readers.iter().enumerate() {
             superfile_builder.opts.check_mergeability(
@@ -1384,6 +1450,14 @@ impl SuperfileBuilder {
             // prebuilt postings.
             let n_rows = record_batch.num_rows() as u32;
             body_encoder.write_batch(&record_batch)?;
+            // Sidecar from the same rows, same order, before the batch is
+            // dropped. Read from `record_batch` (not the FTS remap) so it
+            // aligns with the body exactly.
+            if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, &record_batch, &id_column)
+            {
+                ids_ok = false;
+                id_sidecar_bytes = Vec::new();
+            }
             drop(record_batch);
             superfile_builder.next_local_doc_id += n_rows;
             base += n_rows;
@@ -1404,7 +1478,8 @@ impl SuperfileBuilder {
             return Ok(SuperfileStats::from_children(stats_collector.as_slice()));
         }
         let body = body_encoder.finish()?;
-        superfile_builder.finish_to_with_body(body, output)?;
+        let ids_bytes: &[u8] = if ids_ok { &id_sidecar_bytes } else { &[] };
+        superfile_builder.finish_to_with_body(body, ids_bytes, output)?;
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
@@ -1446,6 +1521,8 @@ impl SuperfileBuilder {
                 fts_length: 0,
                 vec_offset: 0,
                 vec_length: 0,
+                ids_offset: 0,
+                ids_length: 0,
             });
         }
         let n_docs = self.next_local_doc_id as u64;
@@ -1517,7 +1594,8 @@ impl SuperfileBuilder {
             let (fts_file, vec_file) = blobs_res?;
             (body_res?, fts_file, vec_file)
         };
-        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
+        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
+        splice_body_and_blobs_to(body, fts_file, vec_file, &ids_bytes, &kvs, output)
     }
 
     /// Finish the build with a Parquet body the caller **already encoded** —
@@ -1531,6 +1609,7 @@ impl SuperfileBuilder {
     pub(crate) fn finish_to_with_body<W: Write>(
         mut self,
         body: EncodedBody,
+        ids_bytes: &[u8],
         output: W,
     ) -> Result<ParquetLayout, BuildError> {
         let n_docs = self.next_local_doc_id as u64;
@@ -1548,7 +1627,10 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
         )?;
-        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
+        // The caller streams the sidecar from the merged rows as it writes the
+        // body (empty ⇒ the id column wasn't available; reader falls back to
+        // the Parquet id column).
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids_bytes, &kvs, output)
     }
 
     /// Finish the build and return the assembled superfile bytes.
@@ -1623,12 +1705,15 @@ impl SuperfileBuilder {
         vector_file
             .seek(SeekFrom::Start(0))
             .map_err(BuildError::Io)?;
+        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
         splice_index_streams_to(
             body,
             BufReader::new(Cursor::new(Vec::<u8>::new())),
             0,
             BufReader::new(vector_file),
             vector_length,
+            Cursor::new(&ids_bytes),
+            ids_bytes.len() as u64,
             &kvs,
             &mut output,
         )?;
@@ -1811,6 +1896,7 @@ fn splice_body_and_blobs_to<W: Write>(
     body: EncodedBody,
     fts_file: NamedTempFile,
     vec_file: NamedTempFile,
+    ids_bytes: &[u8],
     kvs: &[(String, String)],
     output: W,
 ) -> Result<ParquetLayout, BuildError> {
@@ -1822,6 +1908,8 @@ fn splice_body_and_blobs_to<W: Write>(
         fts_length,
         BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
         vec_length,
+        Cursor::new(ids_bytes),
+        ids_bytes.len() as u64,
         kvs,
         output,
     )?;
@@ -3119,6 +3207,97 @@ mod tests {
         assert_eq!(merged_batch.num_rows(), 4);
     }
 
+    /// A compacted (merged) superfile carries the stable-id sidecar — the
+    /// build path `optimize()` uses — and resolving `_id` through it matches
+    /// the merged Parquet id column, over non-contiguous ids where span
+    /// arithmetic can't apply.
+    #[test]
+    fn merged_superfile_writes_sidecar_and_resolves_id() {
+        use crate::superfile::format::footer::read_kv_metadata;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let schema = opts.schema.clone();
+
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new b1");
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(vec![100u64, 305])),
+                Arc::new(LargeStringArray::from(vec!["alpha beta", "gamma delta"])),
+                Arc::new(LargeStringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .expect("batch1");
+        b1.add_batch(&batch1, &[]).expect("add b1");
+        let bytes1 = b1.finish().expect("finish b1");
+
+        let mut b2 = SuperfileBuilder::new(opts).expect("new b2");
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(vec![7u64, 90_210])),
+                Arc::new(LargeStringArray::from(vec!["foo bar", "baz qux"])),
+                Arc::new(LargeStringArray::from(vec!["p", "q"])),
+            ],
+        )
+        .expect("batch2");
+        b2.add_batch(&batch2, &[]).expect("add b2");
+        let bytes2 = b2.finish().expect("finish b2");
+
+        let r1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open r1");
+        let r2 = SuperfileReader::open(Bytes::from(bytes2)).expect("open r2");
+        let (merged_bytes, _) = SuperfileBuilder::build_from_readers(&[
+            (Arc::new(r1), empty_bitmap()),
+            (Arc::new(r2), empty_bitmap()),
+        ])
+        .expect("merge");
+
+        // The merge path wrote the sidecar (this is the compaction path).
+        let kvs = read_kv_metadata(&merged_bytes).expect("kv metadata");
+        assert!(
+            kvs.contains_key(kv::IDS_LENGTH),
+            "merge/compaction writes the stable-id sidecar"
+        );
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let n = merged.n_docs() as u32;
+        let locals: Vec<u32> = (0..n).collect();
+        // Resolves through the sidecar (present on open).
+        let resolved = merged
+            .take_by_local_doc_ids(&locals, &["doc_id"])
+            .expect("resolve via sidecar");
+        let resolved = resolved
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+
+        // Ground truth: the merged id column read in row order.
+        let full = merged.get_record_batch(None).expect("full batch");
+        let idx = full.schema().index_of("doc_id").expect("doc_id column");
+        let truth = full
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+
+        let resolved: Vec<i128> = (0..resolved.len()).map(|i| resolved.value(i)).collect();
+        let truth: Vec<i128> = (0..truth.len()).map(|i| truth.value(i)).collect();
+        assert_eq!(
+            resolved, truth,
+            "sidecar-resolved ids match the merged Parquet id column"
+        );
+    }
+
     /// Turn a slice of file-local doc ids into a tombstone bitmap, or `None`
     /// when the slice is empty (the "nothing deleted" case).
     fn tombstones(ids: &[u32]) -> Option<Arc<RoaringBitmap>> {
@@ -4229,12 +4408,20 @@ mod tests {
         cells: &[(u32, usize, usize)],
         rerank_codec: RerankCodec,
     ) -> Arc<SuperfileReader> {
+        pack_cells_superfile_with_codec_dim(id_base, cells, rerank_codec, 16)
+    }
+
+    fn pack_cells_superfile_with_codec_dim(
+        id_base: i128,
+        cells: &[(u32, usize, usize)],
+        rerank_codec: RerankCodec,
+        dim: usize,
+    ) -> Arc<SuperfileReader> {
         use crate::superfile::vector::{
             builder::build_merged_subsection_from_materialized,
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
         };
 
-        let dim = 16usize;
         let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
             let (scale, offset): (Arc<[f32]>, Arc<[f32]>) =
                 if rerank_codec == RerankCodec::Sq8FixedResidual {
@@ -4443,7 +4630,10 @@ mod tests {
     /// Base drain and a small delta drain legitimately pack the same global
     /// cell at different fine widths (fine `n_cent` is sized by packed bytes).
     /// The merge must rebuild such cells from materialized rows instead of
-    /// failing the byte-splice `n_cent` equality check.
+    /// failing the byte-splice `n_cent` equality check — and it re-derives the
+    /// fine width from the merged row count, not the widest source, so a small
+    /// merged cell collapses to a single fine run (8 rows fit far inside one
+    /// fine-run byte target) instead of inheriting the source's 4.
     #[test]
     fn multi_cell_merge_rebuilds_cells_with_mismatched_fine_width() {
         // Cell 0 disagrees on width (4 vs 1); cell 1 agrees (splice path).
@@ -4460,10 +4650,62 @@ mod tests {
         let v = merged.vec().expect("vec");
         assert_eq!(v.packed_cell_ids(), &[0, 1]);
         let cols: Vec<_> = v.vector_columns_config().collect();
-        assert_eq!(cols[0].n_docs, 8); // 6 + 2 rebuilt at the widest width
-        assert_eq!(cols[0].n_cent, 4);
-        assert_eq!(cols[1].n_docs, 5); // 2 + 3 byte-spliced
+        assert_eq!(cols[0].n_docs, 8); // 6 + 2 rebuilt from materialized rows
+        assert_eq!(cols[0].n_cent, 1); // re-derived to the byte target, not max(4,1)
+        assert_eq!(cols[1].n_docs, 5); // 2 + 3 byte-spliced (union fits width 2)
         assert_eq!(cols[1].n_cent, 2);
+    }
+
+    /// Regression: two fragments of the SAME cell that agree on fine `n_cent`
+    /// take the byte-splice path, which concatenates cluster-i with cluster-i
+    /// and emits the *source* fine-cluster count. When their union outgrows the
+    /// fine-run byte target the merge must instead re-cluster to the re-derived
+    /// width — otherwise the merged cell keeps a too-coarse count, its summary
+    /// centroids drift, and cell routing scans far more of the corpus than it
+    /// should. Before the fix this byte-spliced to the source width (1) for a
+    /// union that needs several fine runs.
+    #[test]
+    fn multi_cell_merge_resplits_when_union_exceeds_fine_run_target() {
+        // A wide vector inflates the per-row stride so a small, fast corpus
+        // still crosses the real fine-run byte target.
+        let dim = 512usize;
+        let codec = RerankCodec::Sq8Residual;
+        // Largest row count that still fits one fine run, then a union that
+        // spans several runs.
+        let rows_per_run = (1..)
+            .find(|&n| effective_fine_n_cent(dim, codec, n) > 1)
+            .expect("threshold")
+            - 1;
+        let left_rows = rows_per_run + rows_per_run / 2;
+        let right_rows = rows_per_run + rows_per_run / 2;
+        let total = left_rows + right_rows;
+        // The stored width is the byte target passed through the small-cell cap;
+        // at this corpus size the target is well under the cap, so they agree.
+        let expected_n_cent = effective_fine_n_cent(dim, codec, total);
+        assert!(
+            expected_n_cent > 1,
+            "test corpus must exceed one fine run (rows_per_run={rows_per_run})"
+        );
+
+        // Both fragments pack cell 0 at fine width 1 → same_shape → byte-splice
+        // candidate; the union exceeds one run and must be re-clustered.
+        let a = pack_cells_superfile_with_codec_dim(1_000, &[(0, left_rows, 1)], codec, dim);
+        let b = pack_cells_superfile_with_codec_dim(9_000, &[(0, right_rows, 1)], codec, dim);
+
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)], &[])
+                .expect("merge over-target same-shape cell");
+        assert_eq!(stats.n_docs as usize, total);
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let v = merged.vec().expect("vec");
+        let cols: Vec<_> = v.vector_columns_config().collect();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].n_docs as usize, total);
+        assert_eq!(
+            cols[0].n_cent as usize, expected_n_cent,
+            "merged cell must re-cluster to the byte-target width, not the source width 1"
+        );
     }
 
     #[test]

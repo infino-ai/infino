@@ -125,7 +125,10 @@ resolve the query tokens to their posting lists and intersect them (all
 tokens present) or union them (any token present) to get the matching
 document set, with no BM25 scoring. This is the boolean retrieval the
 table layer's SQL `WHERE` pushdown builds on; ranking and matching share
-one set of posting lists.
+one set of posting lists. The ordered term dictionary adds **term
+expansion**: a walk over one column's keys widens a prefix, suffix, or
+substring to every indexed term it covers, which is how a SQL `LIKE`
+fragment becomes a union of posting lists instead of a column scan.
 
 Document identifiers in the index are local to the superfile.
 

@@ -43,9 +43,6 @@ use crate::superfile::{
 pub(super) struct TermMeta {
     /// Document frequency — number of docs containing the term.
     pub(super) df: u64,
-    /// Byte length of the term's whole region (header + skip table +
-    /// blocks), relative to the term's `metadata_offset`.
-    pub(super) postings_length: usize,
     /// Number of PFOR blocks (= number of skip-table entries).
     pub(super) num_blocks: usize,
     /// Absolute offset (within the postings region) of the first
@@ -63,6 +60,17 @@ pub(super) struct TermMeta {
     /// skip table on a `VERSION_V3` positional term. `None` on
     /// `V1`/`V2` (no sub-index) and on positionless terms.
     pub(super) subindex_start: Option<usize>,
+    /// Absolute offset (within the postings region) of the coarse
+    /// block-max table — `ceil(num_blocks / COARSE_BLOCK_MAX_SPAN)`
+    /// fixed-point `u32`s at the tail of the term region.
+    pub(super) coarse_start: usize,
+    /// Term-relative end of the last posting block: `postings_length`
+    /// minus the coarse table's bytes. The blocks end here; the coarse
+    /// table follows.
+    pub(super) blocks_end_in_term: usize,
+    /// Whether this term carries a coarse block-max table (V5 blobs).
+    /// `false` for V1–V4 — the ranked walk then skips the coarse level.
+    pub(super) has_coarse: bool,
 }
 
 impl TermMeta {
@@ -75,6 +83,7 @@ impl TermMeta {
         metadata_offset: usize,
         positional: bool,
         has_subindex: bool,
+        has_coarse: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -149,15 +158,63 @@ impl TermMeta {
             }
             false => None,
         };
+        // Coarse block-max table (V5 only): `ceil(num_blocks / span)` u32s at
+        // the tail of the term region, so the blocks end where it begins.
+        // V1–V4 blobs have no such table — the blocks run to `postings_length`
+        // and the ranked walk skips the coarse level.
+        let coarse_size = match has_coarse {
+            true => num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * U32_BYTES,
+            false => 0,
+        };
+        if coarse_size > postings_length {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "coarse block-max table larger than the term region".into(),
+            )));
+        }
+        let blocks_end_in_term = postings_length - coarse_size;
+        let coarse_start = metadata_offset + blocks_end_in_term;
         Ok(Self {
             df,
-            postings_length,
             num_blocks,
             skip_start,
             positions_offset,
             positions_length,
             subindex_start,
+            coarse_start,
+            blocks_end_in_term,
+            has_coarse,
         })
+    }
+
+    /// Decode a 4-byte block-max slot (a per-block skip entry's field or a
+    /// coarse-table entry) into a guaranteed upper bound on the BM25 score.
+    /// V5 stores the exact `f32` bits; legacy `V1`-`V4` store
+    /// `ceil(max × scale)` as fixed-point. Both return a value at or above
+    /// the true max:
+    /// - V5 nudges the exact stored max up one `f32` ULP. The stored value
+    ///   equals the reader's per-doc score for the block's max doc, so for
+    ///   local scoring it is already an exact bound; the ULP guards the
+    ///   cross-superfile idf-rescale multiply, whose f32 rounding could
+    ///   otherwise dip a hair below a score-tied doc and drop tied hits.
+    /// - Legacy adds one fixed-point step, covering both the `x1000 / scale`
+    ///   division rounding and files written before the encode-side `ceil`.
+    #[inline]
+    fn decode_block_max(&self, raw: u32) -> f32 {
+        if self.has_coarse {
+            f32::from_bits(raw).next_up()
+        } else {
+            raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
+        }
+    }
+
+    /// Decode coarse block-max entry `g` into a guaranteed upper bound
+    /// on the BM25 score of every block in span `g` (blocks
+    /// `[g*SPAN .. (g+1)*SPAN)`). Coarse entries exist only on V5, where
+    /// they are `f32` bits.
+    #[inline]
+    pub(super) fn coarse_entry(&self, postings: &[u8], g: usize) -> f32 {
+        let at = self.coarse_start + g * U32_BYTES;
+        self.decode_block_max(read_u32_le(&postings[at..at + U32_BYTES]))
     }
 
     /// For a `VERSION_V3` positional term, the run offset of the nearest
@@ -202,25 +259,20 @@ impl TermMeta {
             &postings[entry_off + skip_entry::BLOCK_OFFSET_OFF
                 ..entry_off + skip_entry::BLOCK_OFFSET_OFF + U32_BYTES],
         ) as usize;
-        let max_bm25_x1000 = read_u32_le(
+        let block_max_raw = read_u32_le(
             &postings[entry_off + skip_entry::MAX_BM25_OFF
                 ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
         );
-        // Decode to a guaranteed upper bound on the block's BM25. The
-        // builder ceil()s on encode, but `x1000 as f32 / SCALE` can still
-        // round a hair below the true max (f32 division), and superfiles
-        // written before the encode-side ceil truncated outright. Add one
-        // fixed-point step before unscaling so the decoded bound is always
-        // >= the true block max. This matters for the cross-superfile
-        // floor: block-skip compares `block_max <= floor`, and a bound
-        // that dips below a score-tied block's true max would let a rising
-        // floor skip that block, dropping tied hits by completion order
-        // (nondeterministic top-k). The +1 step costs ~1/SCALE of pruning
-        // tightness — negligible — and keeps the top-k deterministic.
+        // Decode to a guaranteed upper bound on the block's BM25 (V5 exact
+        // f32 + one ULP; legacy fixed-point + one step). The upper-bound
+        // guarantee matters for the cross-superfile floor: block-skip
+        // compares `block_max <= floor`, and a bound that dips below a
+        // score-tied block's true max would let a rising floor skip it,
+        // dropping tied hits by completion order (nondeterministic top-k).
         (
             last_doc_id,
             block_offset,
-            max_bm25_x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+            self.decode_block_max(block_max_raw),
         )
     }
 
@@ -247,7 +299,9 @@ impl TermMeta {
             let next_off = self.skip_start + (i + 1) * SKIP_ENTRY_SIZE;
             read_u32_le(&postings[next_off + 4..next_off + 8]) as usize
         } else {
-            self.postings_length
+            // The coarse block-max table follows the last block, so the
+            // blocks end before it — not at `postings_length`.
+            self.blocks_end_in_term
         }
     }
 }
@@ -373,29 +427,35 @@ impl TermCursor {
         n_docs: u64,
         positional: bool,
         global_idf: Option<f32>,
+        weight: u32,
         header_probed: bool,
         count_only: bool,
+        has_coarse: bool,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
         // The plain-term cursor never decodes positions, so it needs no
         // sub-index (it reads block offsets straight from the skip table).
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false)?;
+        // `has_coarse` (V5) tells it the last block ends before the coarse
+        // table, not at `postings_length`.
+        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false, has_coarse)?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
-        let idf = global_idf.unwrap_or(local_idf);
-        // Stored per-block BMW upper bounds bake in the LOCAL idf. Only a
-        // global-idf override needs to rescale them by global/local:
-        // block_max = local_idf_x_k1p1 × (an idf-independent tf-factor),
-        // so the linear rescale is exact and keeps the BMW skip UBs
-        // consistent with the global-idf scores computed from
-        // `idf_x_k1p1` below. `None` (the default per-superfile path, and
-        // the case where a gathered global idf happens to equal the
-        // local one) leaves the stored value untouched — the block loop
-        // does no extra work, matching the per-superfile scorer exactly.
-        let idf_rescale = match global_idf {
-            Some(_) if local_idf > 0.0 && idf != local_idf => Some(idf / local_idf),
-            _ => None,
+        // Effective idf folds in the query-term-frequency `weight` (> 1 only for a
+        // deduplicated repeated term) on top of any global-idf override.
+        let idf = global_idf.unwrap_or(local_idf) * weight as f32;
+        // Stored per-block BMW upper bounds bake in the LOCAL idf, so any factor
+        // that scales the score away from it — a global-idf override and/or a qtf
+        // `weight` — must rescale them by the same ratio: block_max =
+        // local_idf_x_k1p1 × (an idf-independent tf-factor), so the linear rescale
+        // is exact and keeps the BMW skip UBs consistent with the scores computed
+        // from `idf_x_k1p1` below. When `idf == local_idf` (the default
+        // per-superfile path with weight 1) the ratio is 1 and the block loop does
+        // no extra work, matching the per-superfile scorer exactly.
+        let idf_rescale = if local_idf > 0.0 && idf != local_idf {
+            Some(idf / local_idf)
+        } else {
+            None
         };
 
         // Collect straight into the `Arc` allocation: `0..num_blocks` is
@@ -460,8 +520,11 @@ impl TermCursor {
         n_docs: u64,
         dl_norm_k1: f32,
         global_idf: Option<f32>,
+        weight: u32,
     ) -> Self {
-        let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1));
+        // Fold the qtf `weight` into the effective idf so the single-doc block-max
+        // (computed below from `idf_x_k1p1`) scales together with the score.
+        let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
@@ -601,6 +664,28 @@ impl TermCursor {
     /// (the doc ids must be decoded to locate the doc), so it falls back to
     /// `skip_to` + `current_tf`. Like [`Self::contains`] it advances
     /// `current_block`, so a cursor probed this way must not also be iterated.
+    /// Rank of the doc at in-block position `bit` among a bitset block's presence
+    /// bits — the count of set bits before `bit`, i.e. that doc's index into the
+    /// block's doc-order tf array. `word` is the presence word already loaded at
+    /// `bit`'s position; `bitset_end` is the end of the presence bitmap (start of
+    /// the tf array). Shared by [`Self::bitset_probe_tf`] (which first checks the
+    /// bit is set) and [`Self::tf_at_contained`] (which knows it is).
+    #[inline]
+    fn bitset_tf_rank(raw: &[u8], bit: usize, word: u64, bitset_end: usize) -> u32 {
+        let word_idx = bit / 64;
+        let presence = &raw[posting::HEADER_SIZE..bitset_end];
+        let mut rank: u32 = 0;
+        for w in presence[..word_idx * 8].chunks_exact(8) {
+            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
+        }
+        let below = if bit.is_multiple_of(64) {
+            0u64
+        } else {
+            (1u64 << (bit % 64)) - 1
+        };
+        rank + (word & below).count_ones()
+    }
+
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -645,25 +730,15 @@ impl TermCursor {
         if (word >> (bit % 64)) & 1 == 0 {
             return None; // doc not present in this block
         }
-        // Present. `rank` = number of set bits before `bit` = popcount of the
-        // whole presence words ahead of this one + popcount of this word below
-        // `bit`. The r-th set bit (doc) maps to the r-th tf in doc order.
-        let presence = &raw[posting::HEADER_SIZE..bitset_end];
-        let mut rank: u32 = 0;
-        for w in presence[..word_idx * 8].chunks_exact(8) {
-            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
-        }
-        let below = if bit.is_multiple_of(64) {
-            0u64
-        } else {
-            (1u64 << (bit % 64)) - 1
-        };
-        rank += (word & below).count_ones();
+        // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
+        let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
         // Decode this block's tf array once (doc order), reused across a run of
         // candidates in the same block; the doc ids are never expanded.
         if self.tf_decoded_block != self.current_block {
-            let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
-            posting::decode_block_tfs(bytes, &mut self.block_tfs);
+            // Reuse `raw` (still borrowing this block's bytes, disjoint from
+            // the `&mut self.block_tfs` decode target) rather than recomputing
+            // the same subslice and its bounds check.
+            posting::decode_block_tfs(raw, &mut self.block_tfs);
             self.tf_decoded_block = self.current_block;
         }
         Some(self.block_tfs[rank as usize])
@@ -685,9 +760,16 @@ impl TermCursor {
 
     #[inline(always)]
     pub(super) fn current_doc_id(&self) -> u32 {
-        if self.is_exhausted() || self.pos >= self.block_n {
+        if self.is_exhausted() {
             u32::MAX
         } else {
+            // A live cursor always has `pos < block_n` — every mutator
+            // (`next`, `advance_by`, `skip_to`, `advance_block`) restores it
+            // or marks the cursor exhausted (see the `pos` field doc). The
+            // extra `pos >= block_n` guard was dead on this hot walk
+            // primitive; the debug tripwire fires if a future change breaks
+            // the invariant.
+            debug_assert!(self.pos < self.block_n);
             self.block_doc_ids[self.pos]
         }
     }
@@ -907,6 +989,72 @@ impl TermCursor {
             }
         }
     }
+
+    /// Tf for `doc` on a cursor a preceding [`Self::contains(doc)`] just confirmed
+    /// present. `contains` already advanced `current_block` to `doc`'s block (and,
+    /// on a PACKED block, decoded it), so this skips the block-advance and the
+    /// presence bit-test that [`Self::bitset_probe_tf`] repeats, doing only the tf
+    /// lookup: a popcount-rank into the tf array on a bitset block, or a binary
+    /// search over the decoded doc ids on a PACKED one. Only valid immediately
+    /// after `contains(doc)` returned `true` with no intervening advance.
+    ///
+    /// Kept at the end of the impl, past the doc-cursor hot methods
+    /// (`skip_to`, `next`, `decode_current_block`, `current_doc_id`), so adding
+    /// it doesn't shift their code offsets — those methods drive the flat-merge
+    /// AND path, which is measurably sensitive to its own instruction layout.
+    pub(super) fn tf_at_contained(&mut self, doc: u32) -> u32 {
+        // Inline (df=1) cursor: single pre-decoded posting.
+        if self.bytes.is_empty() {
+            return self.block_tfs[0];
+        }
+        let block = self.blocks[self.current_block];
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        if raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET {
+            let base = read_u32_le(&raw[4..8]);
+            let bit = (doc - base) as usize;
+            let tf_bits = raw[2] as usize;
+            let tfs_size = BLOCK_LEN * tf_bits / 8;
+            let bitset_end = raw.len() - tfs_size;
+            let word_idx = bit / 64;
+            let word_at = posting::HEADER_SIZE + word_idx * 8;
+            let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+            let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
+            if self.tf_decoded_block != self.current_block {
+                posting::decode_block_tfs(raw, &mut self.block_tfs);
+                self.tf_decoded_block = self.current_block;
+            }
+            self.block_tfs[rank as usize]
+        } else {
+            // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
+            let pos = self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .expect("contains(doc) confirmed presence");
+            self.block_tfs[pos]
+        }
+    }
+
+    /// Whether this term's postings are stored in the dense **bitset** encoding,
+    /// sampled from the first block's encoding byte (a dense term's blocks are
+    /// uniformly bitset). When true, [`Self::contains`] answers by an O(1)
+    /// bit-test instead of a block decode — the signal a 2-term AND uses to
+    /// decide the membership walk beats the flat-merge's block expansion.
+    ///
+    /// `#[cold]`: called once per query at dispatch, not in a per-doc loop —
+    /// out-of-line so it stays clear of the hot doc-cursor methods' layout.
+    #[cold]
+    pub(super) fn is_bitset_dense(&self) -> bool {
+        if self.bytes.is_empty() {
+            return false; // inline df=1 cursor: no postings bytes
+        }
+        match self.blocks.first() {
+            Some(block) => {
+                self.bytes
+                    .get(block.block_byte_offset + posting::ENCODING_OFF)
+                    == Some(&posting::ENCODING_BITSET)
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -982,7 +1130,7 @@ mod tests {
         let reader = FtsReader::open(bytes, json).expect("open FtsReader");
 
         let mut cursors = reader
-            .build_term_cursors(0, &["common"], None, false)
+            .build_term_cursors(0, &["common"], None, false, None)
             .await
             .expect("build term cursors");
         let cursor = cursors.first_mut().expect("`common` present in dictionary");

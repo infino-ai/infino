@@ -40,9 +40,9 @@
 //! about the rotation is persisted — swapping the construction is not an
 //! on-disk format change.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::OnceLock};
 
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use wide::f32x8;
 
@@ -51,6 +51,20 @@ use wide::f32x8;
 /// variance across coordinates well enough for the 1-bit RaBitQ codes
 /// while staying `O(dim·log dim)`.
 const ROTATION_STAGES: usize = 3;
+
+/// Stage depth for the BLOCKED transform, which needs more than the
+/// padded one.
+///
+/// A full power-of-two Walsh–Hadamard mixes every coordinate with every
+/// other in one stage; a block-diagonal one only mixes within its block,
+/// and relies on the inter-stage permutation to carry information across
+/// blocks. Depth is what buys back that mixing, and it is nearly free
+/// here: the transform is `O(dim log dim)` once per query against a scan
+/// that touches every stored row, so at 100K rows the rotation is ~0.01%
+/// of the query. Kept separate from [`ROTATION_STAGES`] because that
+/// depth is part of the 1-bit RaBitQ code construction and changing it
+/// would alter every stored sign code.
+const BLOCKED_STAGES: usize = 6;
 
 /// `wide::f32x8` lane width (butterfly + sign/scale loops).
 ///
@@ -69,6 +83,95 @@ pub struct RandomRotation {
     padded_dim: usize,
     /// One `±1` sign-flip diagonal per stage, each length `padded_dim`.
     signs: Vec<Vec<f32>>,
+    /// Seed the blocked state derives from, so it can be rebuilt on
+    /// demand without keeping the RNG alive.
+    seed: u64,
+    /// State for the BLOCKED transform, built on first use.
+    ///
+    /// Only the 4-bit plane walks the blocked form, but this type is on the
+    /// default path — every 1-bit RaBitQ column constructs one — and the
+    /// block permutations plus sign diagonals run ~74 KB per rotation at
+    /// dim 1536. Building them eagerly charges that to callers that never
+    /// read them. The state is a pure function of `(dim, seed)`, so
+    /// deferring it changes nothing observable.
+    blocked: OnceLock<BlockedState>,
+}
+
+/// Lazily-built state for the blocked (unpadded) transform.
+#[derive(Debug)]
+struct BlockedState {
+    /// Power-of-two block sizes summing to `dim`, largest first — the
+    /// block-diagonal structure that removes the padding.
+    blocks: Vec<usize>,
+    /// One seeded permutation of `0..dim` per stage, so the transform mixes
+    /// ACROSS blocks and not only within them.
+    perms: Vec<Vec<u32>>,
+    /// `±1` diagonals per stage, each length `dim`. Separate from the padded
+    /// path's diagonals because this runs [`BLOCKED_STAGES`] stages at width
+    /// `dim`, not [`ROTATION_STAGES`] at width `padded_dim`.
+    signs: Vec<Vec<f32>>,
+}
+
+impl BlockedState {
+    /// Derive the state from `(dim, seed)`.
+    ///
+    /// The RNG is re-seeded and advanced past the padded path's draws first,
+    /// so the diagonals this produces are exactly the ones the eager
+    /// construction produced — the stream position is part of the value.
+    fn build(dim: usize, padded_dim: usize, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let normal = Normal::new(0.0f32, 1.0).expect("valid stddev");
+        // Replay the padded path's draws so the blocked draws land at the
+        // same stream offset they would have eagerly.
+        for _ in 0..ROTATION_STAGES * padded_dim {
+            let _ = normal.sample(&mut rng);
+        }
+        let blocks = power_of_two_blocks(dim);
+        let perms = (0..BLOCKED_STAGES)
+            .map(|_| {
+                let mut perm: Vec<u32> = (0..dim as u32).collect();
+                for i in (1..dim).rev() {
+                    let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+                    perm.swap(i, j);
+                }
+                perm
+            })
+            .collect();
+        let signs = (0..BLOCKED_STAGES)
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        if normal.sample(&mut rng) >= 0.0 {
+                            1.0f32
+                        } else {
+                            -1.0f32
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        BlockedState {
+            blocks,
+            perms,
+            signs,
+        }
+    }
+}
+
+/// Decompose `dim` into descending power-of-two blocks: the greedy
+/// binary decomposition, so `1536 → [1024, 512]` and `200 → [128, 64,
+/// 8]`. Every block is a valid Walsh–Hadamard length, and the blocks sum
+/// to exactly `dim` — that is what removes the padding.
+fn power_of_two_blocks(dim: usize) -> Vec<usize> {
+    let mut blocks = Vec::new();
+    let mut rest = dim;
+    while rest > 0 {
+        // Largest power of two not exceeding `rest`.
+        let block = 1usize << (usize::BITS - 1 - rest.leading_zeros()) as usize;
+        blocks.push(block);
+        rest -= block;
+    }
+    blocks
 }
 
 impl RandomRotation {
@@ -96,10 +199,13 @@ impl RandomRotation {
                     .collect()
             })
             .collect();
+        let dim = dim.max(1);
         RandomRotation {
             dim,
             padded_dim,
             signs,
+            seed,
+            blocked: OnceLock::new(),
         }
     }
 
@@ -109,6 +215,142 @@ impl RandomRotation {
     /// thread-local scratch buffer (one allocation per thread, reused),
     /// then copies the leading `dim` components into `out`.
     #[inline]
+    /// [`Self::apply`] keeping EVERY padded component: `out` has length
+    /// `padded_dim`, not `dim`. On a power-of-two `dim` this is `apply`;
+    /// on any other `dim` the sliced form is a projection (energy leaks
+    /// into the padding lanes it drops), while the padded form is an
+    /// exact isometry — `⟨R x, R q⟩ = ⟨x, q⟩` bit-for-bit in exact
+    /// arithmetic. A codec that SCORES in rotated space (the Sq4 resident
+    /// plane) must keep the padded components or every non-pow2 dim pays
+    /// a silent dot-product error; the 1-bit sign codes tolerate the
+    /// sliced form by design and keep using `apply`.
+    pub fn apply_padded(&self, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.dim);
+        debug_assert_eq!(out.len(), self.padded_dim);
+        let m = self.padded_dim;
+        let scale = 1.0 / (m as f32).sqrt();
+        out[..self.dim].copy_from_slice(x);
+        out[self.dim..].fill(0.0);
+        for stage_signs in &self.signs {
+            apply_signs(out, stage_signs);
+            walsh_hadamard(out);
+            scale_in_place(out, scale);
+        }
+    }
+
+    /// Inverse of [`Self::apply_padded`]: `x_padded` (length
+    /// `padded_dim`) back to the original space, sliced to `dim`. Each
+    /// stage is self-inverse (the normalized WHT is symmetric orthogonal
+    /// and a `±1` diagonal is its own inverse), so the inverse applies
+    /// the stages in reverse order with the per-stage operations
+    /// swapped: un-transform, then un-flip.
+    pub fn apply_inverse_padded(&self, x_padded: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x_padded.len(), self.padded_dim);
+        debug_assert_eq!(out.len(), self.dim);
+        let m = self.padded_dim;
+        let scale = 1.0 / (m as f32).sqrt();
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.extend_from_slice(x_padded);
+            for stage_signs in self.signs.iter().rev() {
+                walsh_hadamard(&mut buf);
+                scale_in_place(&mut buf, scale);
+                apply_signs(&mut buf, stage_signs);
+            }
+            out.copy_from_slice(&buf[..self.dim]);
+        });
+    }
+
+    /// [`Self::apply_padded`] with no padding: `out` has length `dim`
+    /// exactly, and the transform is still an exact isometry.
+    ///
+    /// Padding to a power of two is what makes `apply_padded` exact, but
+    /// a codec that scores in rotated space then STORES the padding: at
+    /// `dim = 1536` the working size is 2048, so a third of every stored
+    /// plane encodes zeros. Since a flat scan's per-query cost is
+    /// bytes-read ÷ bandwidth, that third is paid twice — once in
+    /// residency and once in latency — for no recall.
+    ///
+    /// This form decomposes `dim` into power-of-two blocks
+    /// (`1536 → 1024 + 512`, `200 → 128 + 64 + 8`) and runs the
+    /// sign-flip + Walsh–Hadamard within each block. A block-diagonal
+    /// orthogonal matrix is orthogonal, so `⟨R x, R q⟩ = ⟨x, q⟩` holds
+    /// exactly with zero padding. Blocks alone would only mix
+    /// coordinates among their own block, so each stage first applies a
+    /// seeded permutation: over [`ROTATION_STAGES`] stages every
+    /// coordinate visits different blocks and mixing is global.
+    pub fn apply_blocked(&self, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.dim);
+        debug_assert_eq!(out.len(), self.dim);
+        out.copy_from_slice(x);
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.resize(self.dim, 0.0);
+            let st = self.blocked();
+            for (stage_signs, perm) in st.signs.iter().zip(&st.perms) {
+                // Permute into scratch, then transform back into `out`,
+                // so neither buffer is read and written at once.
+                for (dst, &src) in buf.iter_mut().zip(perm) {
+                    *dst = out[src as usize];
+                }
+                apply_signs(&mut buf, stage_signs);
+                let mut start = 0;
+                for &block in &st.blocks {
+                    let seg = &mut buf[start..start + block];
+                    walsh_hadamard(seg);
+                    scale_in_place(seg, 1.0 / (block as f32).sqrt());
+                    start += block;
+                }
+                out.copy_from_slice(&buf);
+            }
+        });
+    }
+
+    /// Inverse of [`Self::apply_blocked`]. Each stage is self-inverse in
+    /// its sign flip and its normalized WHT, so the stages run in reverse
+    /// with the permutation undone last.
+    pub fn apply_inverse_blocked(&self, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.dim);
+        debug_assert_eq!(out.len(), self.dim);
+        out.copy_from_slice(x);
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.resize(self.dim, 0.0);
+            let st = self.blocked();
+            for (stage_signs, perm) in st.signs.iter().zip(&st.perms).rev() {
+                buf.copy_from_slice(out);
+                let mut start = 0;
+                for &block in &st.blocks {
+                    let seg = &mut buf[start..start + block];
+                    walsh_hadamard(seg);
+                    scale_in_place(seg, 1.0 / (block as f32).sqrt());
+                    start += block;
+                }
+                apply_signs(&mut buf, stage_signs);
+                // Undo the permutation: `apply_blocked` wrote
+                // `buf[i] = out[perm[i]]`, so scatter back.
+                for (i, &src) in perm.iter().enumerate() {
+                    out[src as usize] = buf[i];
+                }
+            }
+        });
+    }
+
+    /// The blocked transform's state, built on first use.
+    fn blocked(&self) -> &BlockedState {
+        self.blocked
+            .get_or_init(|| BlockedState::build(self.dim, self.padded_dim, self.seed))
+    }
+
+    /// Transform working size: `dim` rounded up to a power of two — the
+    /// component count [`Self::apply_padded`] produces.
+    pub fn padded_dim(&self) -> usize {
+        self.padded_dim
+    }
+
     pub fn apply(&self, x: &[f32], out: &mut [f32]) {
         debug_assert_eq!(x.len(), self.dim);
         debug_assert_eq!(out.len(), self.dim);
@@ -380,6 +622,111 @@ mod tests {
                 "linearity broken at i={i}: got {} expected {expected}",
                 r_combined[i]
             );
+        }
+    }
+
+    /// Two rotations built from the same `(dim, seed)` must agree on the
+    /// blocked transform, whether or not either has already forced its
+    /// lazily-built state.
+    ///
+    /// The state is derived by advancing a re-seeded RNG past the padded
+    /// path's draws, so the stream POSITION is part of the value: a wrong
+    /// replay count yields a different-but-still-orthogonal rotation, which
+    /// every isometry and round-trip assertion would happily accept while
+    /// silently invalidating any plane encoded before the change.
+    #[test]
+    fn blocked_state_is_deterministic_for_a_seed() {
+        for &dim in &[200usize, 768, 1536] {
+            let warmed = RandomRotation::new(dim, 0xB10C);
+            let x: Vec<f32> = (0..dim).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
+            let mut a = vec![0.0f32; dim];
+            warmed.apply_blocked(&x, &mut a);
+            // A second instance that has never forced its state.
+            let fresh = RandomRotation::new(dim, 0xB10C);
+            let mut b = vec![0.0f32; dim];
+            fresh.apply_blocked(&x, &mut b);
+            assert_eq!(
+                a, b,
+                "dim {dim}: blocked transform differs across instances"
+            );
+        }
+    }
+
+    /// The blocked form must preserve inner products EXACTLY while
+    /// producing only `dim` components — that pairing is the whole point
+    /// (an unpadded transform that merely approximated the dot product
+    /// would trade recall for the bytes it saves, which is not a trade
+    /// worth making). Also pins the round-trip, since the plane decodes
+    /// nodes through the inverse.
+    #[test]
+    fn blocked_apply_is_an_exact_isometry_and_inverts() {
+        // Include the non-power-of-two dims that actually pay padding:
+        // 1536 (OpenAI) → 1024+512, 200 (GloVe) → 128+64+8, 768 → 512+256.
+        for &dim in &[8usize, 24, 96, 200, 768, 1536] {
+            let rot = RandomRotation::new(dim, 0xA11CE);
+            let mut state = 0x1234_5678_9ABC_DEF0u64;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((state >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+            };
+            let x: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let q: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let mut rx = vec![0.0f32; dim];
+            let mut rq = vec![0.0f32; dim];
+            rot.apply_blocked(&x, &mut rx);
+            rot.apply_blocked(&q, &mut rq);
+            let plain: f32 = x.iter().zip(&q).map(|(a, b)| a * b).sum();
+            let rotated: f32 = rx.iter().zip(&rq).map(|(a, b)| a * b).sum();
+            assert!(
+                (plain - rotated).abs() <= 1e-3 * plain.abs().max(1.0),
+                "dim {dim}: blocked rotation is not an isometry \
+                 (plain {plain}, rotated {rotated})"
+            );
+            let mut back = vec![0.0f32; dim];
+            rot.apply_inverse_blocked(&rx, &mut back);
+            for (i, (a, b)) in x.iter().zip(&back).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-3,
+                    "dim {dim} coord {i}: round-trip {b} != {a}"
+                );
+            }
+        }
+    }
+
+    /// `apply_padded` must be an exact isometry on every dim (pow2 or
+    /// not): padded dot products equal raw dot products, and the padded
+    /// inverse returns the original vector. This is the property the Sq4
+    /// resident plane scores through; the sliced `apply` deliberately
+    /// does not hold it for non-pow2 dims.
+    #[test]
+    fn padded_apply_is_an_exact_isometry_and_inverts() {
+        for &dim in &[8usize, 24, 96, 768] {
+            let rot = RandomRotation::new(dim, 0xA11CE);
+            let padded = rot.padded_dim();
+            let mut rng = 0x1234_5678_9ABC_DEF0u64;
+            let next = |state: &mut u64| {
+                *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((*state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            };
+            let a: Vec<f32> = (0..dim).map(|_| next(&mut rng)).collect();
+            let b: Vec<f32> = (0..dim).map(|_| next(&mut rng)).collect();
+            let (mut ra, mut rb) = (vec![0.0f32; padded], vec![0.0f32; padded]);
+            rot.apply_padded(&a, &mut ra);
+            rot.apply_padded(&b, &mut rb);
+            let dot = |x: &[f32], y: &[f32]| -> f32 { x.iter().zip(y).map(|(p, q)| p * q).sum() };
+            let (raw, rotated) = (dot(&a, &b), dot(&ra, &rb));
+            assert!(
+                (raw - rotated).abs() <= 1e-3 * raw.abs().max(1.0),
+                "dim {dim}: padded rotation not an isometry (raw {raw}, rotated {rotated})"
+            );
+            let mut back = vec![0.0f32; dim];
+            rot.apply_inverse_padded(&ra, &mut back);
+            for (orig, inv) in a.iter().zip(&back) {
+                assert!(
+                    (orig - inv).abs() <= 1e-4,
+                    "dim {dim}: inverse rotation diverged ({orig} vs {inv})"
+                );
+            }
         }
     }
 }

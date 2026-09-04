@@ -64,6 +64,42 @@ pub(crate) fn avx512_enabled() -> bool {
     })
 }
 
+/// True iff the host supports AVX-512 VNNI (`vpdpbusd`: four `u8 × i8`
+/// products accumulated into each `i32` lane).
+///
+/// This is the 4-bit plane's throughput gate. A float kernel retires 16
+/// multiply-accumulates per 512-bit register because every nibble must
+/// first widen to `f32`; `vpdpbusd` retires 64 on the bytes as loaded, so
+/// a scan that is compute-bound rather than bandwidth-bound moves by ~4×.
+/// The distinction is real and measurable: at 1536d the 100K plane
+/// exceeds L3 and both a float and an integer kernel sit at memory
+/// bandwidth, while at 200d the plane is cache-resident and the float
+/// kernel measured 3.7× slower than an integer competitor.
+///
+/// Also implies [`avx512_enabled`] — a specialized kernel is never
+/// enabled without the foundation — so callers check this gate alone.
+// The only dispatch site that calls this is the 4-bit plane's integer
+// query, which is itself x86-gated, so on other targets the function is
+// unused in the library build.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline]
+pub(crate) fn has_avx512vnni() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if !avx512_enabled() {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512vnni")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
 /// True iff the host supports AVX-512 VPOPCNTDQ (per-element 64-bit
 /// popcount). Required by `quant::estimate_dot_rotated`'s AVX-512
 /// rewrite — its "masked add of query lanes keyed by code bits"

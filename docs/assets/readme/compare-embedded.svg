@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="228" viewBox="0 0 880 228" role="img">
+<rect width="880" height="228" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">Quantized vector indexes vs embedded libraries</text>
+<text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">dbpedia-1536 · 100K · top-10 · same queries, same ground truth</text>
+<text x="696.1" y="52.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">warm p50</text>
+<text x="778.4" y="52.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">recall@10</text>
+<text x="854.0" y="52.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">resident</text>
+<text x="218.0" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">turbovec 2-bit</text>
+<rect x="232" y="70" width="3.6" height="9" rx="1" fill="#B7B4AB"/>
+<text x="696.1" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">0.42 ms</text>
+<text x="778.4" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">0.835</text>
+<text x="854.0" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">38 MiB</text>
+<text x="218.0" y="106.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600" text-anchor="end">Infino flat_ivf (4-bit)</text>
+<rect x="232" y="98" width="12.9" height="9" rx="1" fill="#D6400F"/>
+<text x="696.1" y="106.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">1.51 ms</text>
+<text x="778.4" y="106.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">0.934</text>
+<text x="854.0" y="106.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">75 MiB</text>
+<text x="218.0" y="134.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">turbovec 4-bit</text>
+<rect x="232" y="126" width="13.2" height="9" rx="1" fill="#B7B4AB"/>
+<text x="696.1" y="134.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">1.55 ms</text>
+<text x="778.4" y="134.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">0.944</text>
+<text x="854.0" y="134.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">75 MiB</text>
+<text x="218.0" y="162.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">FAISS PQ fastscan</text>
+<rect x="232" y="154" width="37.3" height="9" rx="1" fill="#B7B4AB"/>
+<text x="696.1" y="162.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">4.38 ms</text>
+<text x="778.4" y="162.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">0.672</text>
+<text x="854.0" y="162.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">74 MiB</text>
+<text x="218.0" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">FAISS PQ 8-bit</text>
+<rect x="232" y="182" width="386.1" height="9" rx="1" fill="#B7B4AB"/>
+<text x="696.1" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">45.3 ms</text>
+<text x="778.4" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">0.943</text>
+<text x="854.0" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">76 MiB</text>
+</svg>

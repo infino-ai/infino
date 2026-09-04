@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="298" viewBox="0 0 880 298" role="img">
+<rect width="880" height="298" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">RAM to serve vector search</text>
+<text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">all-in: index + manifest + working set · dbpedia-1536</text>
+<line x1="361.7" y1="50" x2="361.7" y2="244" stroke="#DCD6C7"/>
+<text x="361.7" y="260.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">2.00 GiB</text>
+<line x1="539.4" y1="50" x2="539.4" y2="244" stroke="#DCD6C7"/>
+<text x="539.4" y="260.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">4.00 GiB</text>
+<line x1="717.1" y1="50" x2="717.1" y2="244" stroke="#DCD6C7"/>
+<text x="717.1" y="260.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">6.00 GiB</text>
+<text x="26.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600">100K</text>
+<text x="170.0" y="85.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">float32 vectors</text>
+<rect x="184" y="76" width="50.8" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="85.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">586 MiB</text>
+<text x="170.0" y="107.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">ivf (default)</text>
+<rect x="184" y="98" width="36.7" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="107.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">423 MiB · 1.4x less</text>
+<text x="170.0" y="129.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">flat_ivf</text>
+<rect x="184" y="120" width="13.3" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="129.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">153 MiB · 3.8x less</text>
+<text x="26.0" y="164.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600">1M</text>
+<text x="170.0" y="183.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">float32 vectors</text>
+<rect x="184" y="174" width="508.5" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="183.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">5.72 GiB</text>
+<text x="170.0" y="205.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">ivf (default)</text>
+<rect x="184" y="196" width="274.2" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="205.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">3.09 GiB · 1.9x less</text>
+<text x="170.0" y="227.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">flat_ivf</text>
+<rect x="184" y="218" width="73.0" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="227.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">841 MiB · 7.0x less</text>
+<rect x="26" y="265" width="9" height="9" rx="1" fill="#D6400F"/>
+<text x="42.0" y="273.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749">measured, serving</text>
+<rect x="202" y="265" width="9" height="9" rx="1" fill="#B7B4AB"/>
+<text x="218.0" y="273.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749">float32 vectors, for scale</text>
+<text x="854.0" y="286.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">dbpedia-1536, Azure Blob, EPYC 9V74 8 vCPU, 3aaffb64 · float32 = rows x 1536 x 4B</text>
+</svg>

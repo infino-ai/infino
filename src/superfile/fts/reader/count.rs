@@ -19,11 +19,7 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{
-            builder::TERM_META_SIZE,
-            dict::{DictReader, make_key},
-            fst_value::FstValue,
-        },
+        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue},
     },
 };
 
@@ -243,7 +239,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true)
+            .build_term_cursors(column_id, tokens, None, true, None)
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -283,7 +279,7 @@ impl FtsReader {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true)
+            .build_term_cursors(column_id, tokens, None, true, None)
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += 1;
@@ -324,11 +320,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory FST lookups. Absent and inline
@@ -676,7 +668,7 @@ mod tests {
         // Prove `mix` really has both encodings — else the test silently checks
         // nothing about the transition.
         let cursors = r
-            .build_term_cursors(0, &["mix"], None, true)
+            .build_term_cursors(0, &["mix"], None, true, None)
             .await
             .expect("build cursors");
         let mix = &cursors[0];

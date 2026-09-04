@@ -34,7 +34,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use dashmap::DashMap;
-use datafusion::{config::Dialect, error::DataFusionError};
+use datafusion::{config::Dialect, error::DataFusionError, execution::context::SQLOptions};
 use futures::future::try_join_all;
 pub use index_spec::IndexSpec;
 use manifest::{
@@ -46,6 +46,8 @@ use tokio::runtime::Runtime;
 use tracing::{debug, info};
 use uri::{Backend, parse_uri};
 
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
@@ -58,6 +60,7 @@ use crate::{
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageError, StorageProvider,
+        gcs::{GCS_BEARER_TOKEN_OPTION, SwappableGcpCredential},
     },
     superfile::{
         builder::FtsConfig,
@@ -113,11 +116,23 @@ pub fn connect_with(
         return connect_remote(backend, options);
     }
     let usage_meter = UsageMeter::new();
+    let gcs_credential = match &backend {
+        Backend::Gcs { .. } => options
+            .storage_options
+            .get(GCS_BEARER_TOKEN_OPTION)
+            .map(|bearer| SwappableGcpCredential::new(bearer.clone())),
+        _ => None,
+    };
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
         _ => {
-            let root = backend_to_provider(&backend, &options, Arc::clone(&usage_meter))?
-                .expect("non-memory backend yields a storage provider");
+            let root = backend_to_provider(
+                &backend,
+                &options,
+                Arc::clone(&usage_meter),
+                gcs_credential.as_ref(),
+            )?
+            .expect("non-memory backend yields a storage provider");
             // Opt-in probe: fail at connect on bad credentials, not first use.
             if options.validate {
                 bridge_sync_to_async(read_catalog(root.as_ref()))?;
@@ -147,6 +162,7 @@ pub fn connect_with(
             store,
             connection_memory_budget,
             usage_meter,
+            gcs_credential,
         }),
     })
 }
@@ -178,6 +194,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
             usage_meter: UsageMeter::new(),
+            gcs_credential: None,
         }),
     })
 }
@@ -209,6 +226,8 @@ struct ConnectionInner {
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
+    /// Swappable GCS credential shared by every provider on this connection.
+    gcs_credential: Option<Arc<SwappableGcpCredential>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -358,6 +377,14 @@ impl Connection {
                 handles,
                 building,
             } => {
+                let (existing, _) =
+                    bridge_on_runtime(read_catalog(root.as_ref()), &shared_io_runtime())
+                        .map_err(|e| e.with_context("create_table", Some(name)))?;
+                if existing.tables.contains_key(name) {
+                    return Err(InfinoError::AlreadyExists(name.to_string())
+                        .with_context("create_table", Some(name)));
+                }
+
                 // Record what was actually used to build the table, so
                 // `open_table` reconstructs matching options (the
                 // supertable's options-hash check then validates them).
@@ -392,6 +419,7 @@ impl Connection {
                     &self.inner.backend.join(&location),
                     &self.inner.options,
                     Arc::clone(&self.inner.usage_meter),
+                    self.inner.gcs_credential.as_ref(),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?
                 .expect("non-memory backend yields a storage provider");
@@ -534,6 +562,7 @@ impl Connection {
                     &self.inner.backend.join(&entry.location),
                     &self.inner.options,
                     Arc::clone(&self.inner.usage_meter),
+                    self.inner.gcs_credential.as_ref(),
                 )
                 .map_err(|e| e.with_context("open_table", Some(name)))?
                 .expect("non-memory backend yields a storage provider");
@@ -595,6 +624,26 @@ impl Connection {
             return c.open_table(name);
         }
         Ok(Supertable::from_local(self.open_table_handle(name)?))
+    }
+
+    /// Rotate the GCS bearer token in place, returning `true` when it was
+    /// swapped. Only the bearer (`google_bearer_token`) is honored; any other
+    /// key in `storage_options` is ignored on this path. Returns `false` when
+    /// the connection has no in-place-rotatable credential (a non-GCS backend)
+    /// or no bearer key was supplied — in both cases the caller should reopen,
+    /// which applies the full `storage_options`.
+    pub fn update_storage_credentials(&self, storage_options: &[(String, String)]) -> bool {
+        let Some(credential) = &self.inner.gcs_credential else {
+            return false;
+        };
+        let Some((_, bearer)) = storage_options
+            .iter()
+            .find(|(key, _)| key == GCS_BEARER_TOKEN_OPTION)
+        else {
+            return false;
+        };
+        credential.set_bearer(bearer.clone());
+        true
     }
 
     /// Remove a table from the catalog. **Idempotent**: dropping a table that
@@ -765,7 +814,9 @@ impl Connection {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(sql = sql))
+        // Connection-level entry: no table handle yet, so no `role` — the
+        // per-table spans beneath this one carry it.
+        tracing::instrument(skip_all, fields(sql = sql, origin = OpOrigin::Query.as_str()))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
@@ -823,8 +874,25 @@ impl Connection {
         // poll on runtime threads where the scope's slot is invisible.
         let op_stats = op_stats::current();
         let drive = async move {
+            // Plan, check, execute. `SessionContext::sql` would run a DDL or session statement while
+            // producing the DataFrame, so the read-only check sits between planning and execution.
+            // It runs on the planned tree, so spelling is irrelevant: `SELECT ... INTO` is a CREATE
+            // TABLE, and an INSERT behind a comment or an EXPLAIN is the same DML node. Planning has
+            // no side effects; a refused statement has touched nothing.
+            let plan =
+                ctx.state().create_logical_plan(&sql).await.map_err(|e| {
+                    InfinoError::Query(e.to_string()).with_context("query_sql", None)
+                })?;
+
+            read_only_sql_options().verify_plan(&plan).map_err(|e| {
+                InfinoError::Query(format!(
+                    "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
+                ))
+                .with_context("query_sql", None)
+            })?;
+
             let df = ctx
-                .sql(&sql)
+                .execute_logical_plan(plan)
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
@@ -875,6 +943,16 @@ impl Connection {
     fn query_runtime(&self) -> Arc<Runtime> {
         shared_io_runtime()
     }
+}
+
+/// `query_sql`'s read-only policy: refuse every plan node that acts on data, schema, or session
+/// state (DDL, DML and `COPY`, session statements such as `SET`). **The check is on the planned
+/// tree, so whatever the planner turns into a write is refused, however it was spelled.**
+fn read_only_sql_options() -> SQLOptions {
+    SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false)
 }
 
 /// Build `SupertableOptions` from a schema + lowered configs, attaching
@@ -930,6 +1008,7 @@ fn backend_to_provider(
     backend: &Backend,
     options: &ConnectOptions,
     usage_meter: Arc<UsageMeter>,
+    gcs_credential: Option<&Arc<SwappableGcpCredential>>,
 ) -> Result<Option<Arc<dyn StorageProvider>>, InfinoError> {
     let provider: Option<Arc<dyn StorageProvider>> = match backend {
         Backend::Memory => None,
@@ -946,8 +1025,13 @@ fn backend_to_provider(
                 .with_usage_meter(usage_meter),
         )),
         Backend::Gcs { bucket, prefix } => Some(Arc::new(
-            GcsStorageProvider::new_with_prefix(bucket, prefix, &options.storage_options)?
-                .with_usage_meter(usage_meter),
+            GcsStorageProvider::new_with_shared_credential(
+                bucket,
+                prefix,
+                &options.storage_options,
+                gcs_credential.cloned(),
+            )?
+            .with_usage_meter(usage_meter),
         )),
         // A remote (hosted) connection forwards operations over the wire and
         // never opens a local storage provider; `connect_with` routes it away
@@ -1127,7 +1211,10 @@ mod tests {
 
     use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::prelude::{col, lit};
+    use datafusion::{
+        logical_expr::LogicalPlan,
+        prelude::{SessionContext, col, lit},
+    };
 
     use super::*;
     use crate::{
@@ -2473,6 +2560,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_create_on_storage_leaks_no_subtree() {
+        // Top-level physical roots for the table are its unique
+        // `<name>-...` location directories under the catalog root.
+        fn location_dirs(dir: &Path, prefix: &str) -> usize {
+            fs::read_dir(dir)
+                .expect("read catalog root")
+                .flatten()
+                .filter(|e| {
+                    e.path().is_dir() && e.file_name().to_string_lossy().starts_with(prefix)
+                })
+                .count()
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("first create");
+        assert_eq!(location_dirs(dir.path(), "docs-"), 1);
+
+        let again = conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"));
+        assert!(matches!(again, Err(InfinoError::AlreadyExists(_))));
+        assert_eq!(
+            location_dirs(dir.path(), "docs-"),
+            1,
+            "a rejected re-create must not leave an orphaned location"
+        );
+    }
+
+    #[test]
     fn query_sql_resolves_tables_by_catalog_name() {
         use arrow_array::Int64Array;
 
@@ -2785,6 +2903,17 @@ mod tests {
             .downcast_ref::<LargeStringArray>()
             .expect("MIN(title) is LargeUtf8");
         assert_eq!(lo.value(0), "alpha");
+    }
+
+    #[test]
+    fn update_storage_credentials_is_false_without_a_gcs_backend() {
+        let conn = connect("memory://").expect("connect");
+        assert!(
+            !conn.update_storage_credentials(&[(
+                "google_bearer_token".to_string(),
+                "t1".to_string()
+            )])
+        );
     }
 
     /// Cross-table join whose key is a viewed string column: the join key comes
@@ -3225,6 +3354,184 @@ mod tests {
         let conn = connect("memory://").expect("connect");
         let err = conn.query_sql("NOT VALID SQL @@@");
         assert!(matches!(err, Err(InfinoError::Query(_))), "got {err:?}");
+    }
+
+    /// A connection with one populated table, `docs` (`_id`, `title`). Writes in the gate tests
+    /// target a real table so the refusal comes from the gate, not from name resolution.
+    fn conn_with_docs() -> Connection {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new())
+            .expect("create docs");
+        docs.append(&build_title_batch(&["one row"]))
+            .expect("append docs");
+        conn
+    }
+
+    /// `docs` is still the only table and still has its one row: the refused writes changed nothing.
+    fn assert_docs_intact(conn: &Connection) {
+        assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_owned()]);
+        let rows = conn
+            .query_sql("SELECT title FROM docs")
+            .expect("docs intact");
+        assert_eq!(n_rows(&rows), 1);
+    }
+
+    /// `sql` was refused by the read-only gate itself, not by a later planning or execution error.
+    fn assert_refused_as_write(conn: &Connection, sql: &str) {
+        let err = conn.query_sql(sql);
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("read-only")),
+            "expected read-only refusal for {sql:?}, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn query_sql_refuses_every_plannable_write() {
+        // Every write the planner can plan, against a live table.
+        //  - DDL, DML, COPY and session statements each plan to a side-effecting node.
+        //  - `SELECT INTO` plans to CREATE TABLE; a comment or an EXPLAIN in front of an INSERT
+        //    leaves the same DML node underneath.
+        //  - all are refused between planning and execution.
+        // Afterwards the catalog and the table are exactly as created.
+        let conn = conn_with_docs();
+        for sql in [
+            "CREATE TABLE evil (x int)",
+            "CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 'x'",
+            "CREATE VIEW v AS SELECT title FROM docs",
+            "DROP TABLE docs",
+            "SELECT * INTO newt FROM docs",
+            "COPY docs TO 'x.csv'",
+            "INSERT INTO docs VALUES (1, 'x')",
+            "UPDATE docs SET title = 'x'",
+            "DELETE FROM docs",
+            "SET datafusion.execution.batch_size = 1",
+            "RESET datafusion.execution.batch_size",
+            "START TRANSACTION",
+            "/* c */ INSERT INTO docs VALUES (1, 'x')",
+            "INSERT/**/INTO docs VALUES (1, 'x')",
+            "-- c\nINSERT INTO docs VALUES (1, 'x')",
+            "EXPLAIN INSERT INTO docs VALUES (1, 'x')",
+            "EXPLAIN SELECT * INTO newt FROM docs",
+        ] {
+            assert_refused_as_write(&conn, sql);
+        }
+        assert_docs_intact(&conn);
+        assert!(
+            conn.query_sql("SELECT * FROM evil").is_err(),
+            "CREATE TABLE must not have run"
+        );
+        assert!(
+            conn.query_sql("SELECT * FROM newt").is_err(),
+            "SELECT INTO must not have run"
+        );
+    }
+
+    #[test]
+    fn query_sql_refuses_writes_the_planner_cannot_plan() {
+        // Writes the planner cannot plan today.
+        //  - they fail at planning, so they never execute either;
+        //  - the error is the planner's, not the read-only message.
+        // If a DataFusion upgrade learns to plan one, it becomes a DML or DDL node and the gate refuses it.
+        let conn = conn_with_docs();
+        for sql in [
+            "ALTER TABLE docs ADD COLUMN y int",
+            "TRUNCATE TABLE docs",
+            "WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
+            "(INSERT INTO docs VALUES (1, 'x'))",
+            "SELECT 1; DROP TABLE docs",
+        ] {
+            let err = conn.query_sql(sql);
+            assert!(
+                matches!(err, Err(InfinoError::Query(_))),
+                "{sql:?}: got {err:?}"
+            );
+        }
+        assert_docs_intact(&conn);
+    }
+
+    #[test]
+    fn query_sql_allows_read_only_shapes() {
+        // Reads in every position the gate inspects: table and table-free reads, CTEs, set
+        // operations, subqueries, EXPLAIN. None is refused.
+        let conn = conn_with_docs();
+        for sql in [
+            "SELECT title FROM docs",
+            "SELECT COUNT(*) FROM docs",
+            "SELECT 1 AS one",
+            "VALUES (1), (2)",
+            "(SELECT 1)",
+            "WITH t AS (SELECT title FROM docs) SELECT title FROM t",
+            "SELECT title FROM docs UNION ALL SELECT title FROM docs",
+            "SELECT 1 INTERSECT SELECT 1",
+            "SELECT 1 EXCEPT SELECT 2",
+            "SELECT (SELECT COUNT(*) FROM docs) AS scalar",
+            "SELECT * FROM (SELECT title FROM docs) AS sub",
+            "EXPLAIN SELECT title FROM docs",
+        ] {
+            conn.query_sql(sql)
+                .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
+        }
+    }
+
+    /// Exhaustive over `LogicalPlan`, so a DataFusion upgrade that adds a variant fails to compile
+    /// here. On that failure:
+    ///  - classify the new variant below;
+    ///  - if it acts on data, schema or session state, confirm `SQLOptions::verify_plan` refuses it;
+    ///  - if upstream does not, `read_only_sql_options` needs its own check for that node.
+    fn plan_has_side_effect(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Ddl(_)
+            | LogicalPlan::Dml(_)
+            | LogicalPlan::Copy(_)
+            | LogicalPlan::Statement(_) => true,
+            LogicalPlan::Projection(_)
+            | LogicalPlan::Filter(_)
+            | LogicalPlan::Window(_)
+            | LogicalPlan::Aggregate(_)
+            | LogicalPlan::Sort(_)
+            | LogicalPlan::Join(_)
+            | LogicalPlan::Repartition(_)
+            | LogicalPlan::Union(_)
+            | LogicalPlan::TableScan(_)
+            | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Subquery(_)
+            | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::Limit(_)
+            | LogicalPlan::Values(_)
+            | LogicalPlan::Explain(_)
+            | LogicalPlan::Analyze(_)
+            | LogicalPlan::Extension(_)
+            | LogicalPlan::Distinct(_)
+            | LogicalPlan::DescribeTable(_)
+            | LogicalPlan::Unnest(_)
+            | LogicalPlan::RecursiveQuery(_) => false,
+        }
+    }
+
+    #[test]
+    fn read_only_gate_matches_the_side_effecting_plan_nodes() {
+        // One plan per class on a bare DataFusion context; the policy is about plan shape, not the
+        // provider under the scan.
+        //  - a read and an EXPLAIN pass;
+        //  - a DDL, a DML, a COPY and a session statement are refused;
+        //  - `plan_has_side_effect` agrees with `verify_plan` on every one.
+        let options = read_only_sql_options();
+        let ctx = SessionContext::new();
+        ctx.register_batch("docs", build_title_batch(&["one row"]))
+            .expect("register docs");
+        for (sql, side_effect) in [
+            ("SELECT title FROM docs", false),
+            ("EXPLAIN SELECT title FROM docs", false),
+            ("CREATE TABLE t (x int)", true),
+            ("INSERT INTO docs VALUES ('x')", true),
+            ("COPY docs TO 'x.csv'", true),
+            ("SET datafusion.execution.batch_size = 1", true),
+        ] {
+            let plan = bridge_sync_to_async(ctx.state().create_logical_plan(sql)).expect("plans");
+            assert_eq!(plan_has_side_effect(&plan), side_effect, "{sql}");
+            assert_eq!(options.verify_plan(&plan).is_err(), side_effect, "{sql}");
+        }
     }
 
     #[test]

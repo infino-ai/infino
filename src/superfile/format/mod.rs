@@ -71,6 +71,26 @@ pub mod fts {
     /// unchanged, so existing indices need no reindex.
     pub const VERSION_V4: u32 = 4;
 
+    /// The version new code writes: everything `V4` allows (positions region
+    /// iff positional, `V3` sub-index for positional terms, bitset blocks
+    /// self-describing per block) **plus** two block-max changes:
+    ///
+    /// 1. Each skip-table entry stores the per-block max BM25 as an **exact
+    ///    little-endian `f32`** (the 4-byte slot that held `V1`–`V4`'s
+    ///    `ceil`-quantised fixed-point `u32`). It equals the reader's per-doc
+    ///    score for the block's max doc (same quantized-length scoring), so it
+    ///    is an exact upper bound with none of the fixed-point `ceil` slack.
+    /// 2. A per-term **coarse block-max table** at the tail of each PFOR
+    ///    term's postings region — one `f32` per [`COARSE_BLOCK_MAX_SPAN`]
+    ///    blocks, the span's max of the per-block maxes — giving the ranked
+    ///    walk a second, coarser skip level.
+    ///
+    /// The header + region layout is otherwise identical to `V2`–`V4`.
+    /// Readers accept `V1`–`V5` and gate the block-max decode on the version:
+    /// `V1`–`V4` blobs decode the fixed-point `u32` (and carry no coarse
+    /// table), so existing indices read unchanged and need no reindex.
+    pub const VERSION_V5: u32 = 5;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
@@ -93,12 +113,35 @@ pub mod fts {
     /// write and read paths share one scale.
     pub const AVGDL_FIXED_POINT_SCALE: f32 = 1000.0;
 
-    /// Fixed-point scale for a posting block's max-BM25 upper bound.
-    /// The builder stores `round(max_bm25 × 1000)` in each skip-table
-    /// entry (`max_bm25_x1000`); the reader recovers the `f32` bound
-    /// by dividing by this. Drives WAND / block-max skip decisions, so
-    /// write and read must agree on the scale.
+    /// **Legacy** fixed-point scale for a posting block's max-BM25 upper
+    /// bound, used only by `V1`–`V4` blobs. Those store `ceil(max_bm25 ×
+    /// this)` as a `u32` in each skip-table entry; the reader recovers the
+    /// bound by dividing by this and adding one step (a safety margin for
+    /// files written before the encode-side `ceil`).
+    ///
+    /// `V5` no longer uses a fixed-point scale at all — it stores the block
+    /// max as an **exact `f32`** (see [`VERSION_V5`]). The `ceil`-to-`u32`
+    /// quantization at scale 1000 rounded the bound *up* by up to ~0.002,
+    /// which for a low-idf term like "the" (BM25 ~0.1–0.3) is a large
+    /// *relative* inflation that blocks skips a tight bound would allow.
+    /// Storing the exact `f32` (same 4 bytes, matching the precision of the
+    /// reader's per-doc scoring) removes that slack.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
+
+    /// Number of consecutive posting blocks summarised by one entry of
+    /// a term's coarse block-max table (V5 only). The table sits at the tail
+    /// of a PFOR term's postings region: `ceil(num_blocks / this)` `f32`s,
+    /// each the max of its span's per-block max BM25.
+    ///
+    /// It gives the ranked single-term walk a second, coarser skip level:
+    /// when the running k-th-best score already dominates a whole span's
+    /// upper bound, the walk jumps the span in one comparison instead of
+    /// touching each block's skip entry. On a very long, heavily-skipped
+    /// posting list (a common term at small k) the per-block skip scan is
+    /// itself the dominant cost; the coarse level removes ~31/32 of it.
+    /// The span is a coarse-max of already-`ceil`-quantised block bounds,
+    /// so it stays a true upper bound and the top-k is unchanged.
+    pub const COARSE_BLOCK_MAX_SPAN: usize = 32;
 
     /// Total FTS blob header size in bytes for [`VERSION_V1_LEGACY`] (no
     /// positions). The FST directory begins immediately after this
@@ -210,7 +253,8 @@ pub mod fts {
         pub const LAST_DOC_ID_OFF: usize = 0;
         /// `[4..8]` byte offset to the encoded PFOR block (`u32` LE).
         pub const BLOCK_OFFSET_OFF: usize = 4;
-        /// `[8..12]` fixed-point block-max BM25 bound (`u32` LE).
+        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5,
+        /// fixed-point `u32` (`ceil(max × scale)`) on legacy `V1`-`V4`. LE.
         pub const MAX_BM25_OFF: usize = 8;
         /// `[12..16]` block's position-runs offset, relative to the
         /// term's `positions_offset` (`u32` LE). Zero on positionless
@@ -455,6 +499,18 @@ pub mod kv {
     /// `inf.vec.layout = multi_cell_ivf`.
     pub const VEC_CELLS: &str = "inf.vec.cells";
 
+    /// Optional: byte offset of the raw stable-id sidecar — a packed
+    /// little-endian `i128` array, one entry per local doc id (Parquet row
+    /// order), mirroring the `_id` column. Lets a hit → `_id` resolve read a
+    /// fixed-width slice instead of decompressing the Parquet id pages.
+    /// Absent on superfiles written before the sidecar existed; readers fall
+    /// back to the Parquet id column when it is missing.
+    pub const IDS_OFFSET: &str = "inf.ids.offset";
+
+    /// Present iff the stable-id sidecar is present: its byte length
+    /// (`16 * n_docs`).
+    pub const IDS_LENGTH: &str = "inf.ids.length";
+
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
 
@@ -466,6 +522,9 @@ pub mod kv {
 
     /// All vector-related keys (presence is all-or-none).
     pub const VEC_KEYS: &[&str] = &[VEC_OFFSET, VEC_LENGTH, VEC_COLUMNS];
+
+    /// Stable-id sidecar keys (presence is all-or-none).
+    pub const IDS_KEYS: &[&str] = &[IDS_OFFSET, IDS_LENGTH];
 
     /// All known keys (for diagnostics only).
     pub const ALL: &[&str] = &[
@@ -482,8 +541,15 @@ pub mod kv {
         VEC_COLUMNS,
         VEC_LAYOUT,
         VEC_CELLS,
+        IDS_OFFSET,
+        IDS_LENGTH,
     ];
 }
+
+/// Width of one stable-id sidecar entry (`inf.ids.*`): a `Decimal128` id
+/// packed as a little-endian `i128`. The sidecar is `n_docs` of these, in
+/// local doc id order.
+pub(crate) const ID_SIDECAR_ENTRY_BYTES: usize = size_of::<i128>();
 
 /// Reserved column-name prefix; user FTS column / vector index names must not
 /// start with this string. Defensive — keeps the user's namespace and our

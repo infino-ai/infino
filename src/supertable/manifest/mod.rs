@@ -56,6 +56,7 @@ use futures::future;
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
+use tracing::warn;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -96,6 +97,7 @@ use crate::{
         query::{hierarchical_iter, prune::PruneLeaf},
         slow_vector_state,
     },
+    utils::trace::record,
 };
 
 /// Object-store / LocalFS directory prefix under which committed superfile
@@ -658,6 +660,23 @@ impl ManifestSnapshot {
     /// the refresh path can read the pointer itself (conditionally,
     /// via [`probe_pointer`]) and still share the list + parts
     /// loading below.
+    // The shared body of both load paths (`load` reads the pointer itself,
+    // the refresh path probes it conditionally), so one span here covers
+    // manifest load cost wherever it is paid. Cost scales with part count,
+    // not table size — `parts` is the field that shows that.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.load",
+            skip_all,
+            fields(
+                manifest_id = pointer.manifest_id,
+                list_bytes = tracing::field::Empty,
+                parts = tracing::field::Empty,
+                superfiles = tracing::field::Empty
+            )
+        )
+    )]
     pub(crate) async fn load_with_pointer(
         current_manifest: Option<Arc<Self>>,
         storage: Arc<dyn StorageProvider>,
@@ -676,6 +695,7 @@ impl ManifestSnapshot {
             .get(&pointer.manifest_uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
+        record("list_bytes", list_bytes.len() as u64);
         let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
 
         let options = if let Some(options) = options {
@@ -942,6 +962,11 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
         };
 
+        record("parts", new_manifest.parts.len() as u64);
+        record(
+            "superfiles",
+            new_manifest.superfile_list.superfiles.len() as u64,
+        );
         Ok(Arc::new(new_manifest))
     }
 
@@ -1209,7 +1234,7 @@ impl ManifestSnapshot {
     /// or `None` on manifests written before it existed or above the
     /// data-graph scale ceiling. Consumers fall back to the lazy build /
     /// scan path when absent.
-    pub(crate) fn slow_vector_state_graphs_blob(&self) -> Option<&RoutingRef> {
+    pub(crate) fn resident_vector_index_blob(&self) -> Option<&RoutingRef> {
         self.list.as_ref()?.slow_vector_state_graphs.as_ref()
     }
 
@@ -1222,6 +1247,17 @@ impl ManifestSnapshot {
             .as_ref()?
             .slow_vector_state_centroid_graph
             .as_ref()
+    }
+
+    test_visible! {
+        /// Bench/test introspection for the published resident vector-index
+        /// blob (the flat plane or graph bundle the drain persisted): its
+        /// storage ref, so a bench can `head()` the object and report the
+        /// engine's own serialized size instead of re-deriving plane
+        /// arithmetic from internals.
+        fn resident_vector_index_blob_ref(&self) -> Option<RoutingRef> {
+            self.resident_vector_index_blob().cloned()
+        }
     }
 
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
@@ -1588,7 +1624,7 @@ impl ManifestSnapshot {
                 Some(cache)
             }
             Err(error) => {
-                eprintln!(
+                warn!(
                     "[supertable] full-part centroid hydration unavailable ({error}); falling \
                      back to per-superfile centroid reads"
                 );
@@ -2175,6 +2211,19 @@ impl ManifestPartLoader {
         self.load_with_form(part_id, false).await
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.part_load",
+            skip_all,
+            fields(
+                part_id = ?part_id,
+                prefer_routing = prefer_routing,
+                cache_hit = tracing::field::Empty,
+                bytes = tracing::field::Empty
+            )
+        )
+    )]
     async fn load_with_form(
         &self,
         part_id: PartId,
@@ -2196,15 +2245,19 @@ impl ManifestPartLoader {
         if let Some(cache) = &self.manifest_disk_cache
             && let Some(bytes) = cache.get(expected_hash).await
         {
+            record("cache_hit", true);
+            record("bytes", bytes.len() as u64);
             let parsed = decode_part_off_thread(Bytes::from(bytes)).await?;
             return Ok(Arc::new(parsed));
         }
+        record("cache_hit", false);
 
         let (bytes, _) = self
             .storage
             .get(uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
+        record("bytes", bytes.len() as u64);
         // Hash verify runs inside the same blocking task as the decode:
         // blake3 over a multi-hundred-MiB part is CPU the polling task
         // must not absorb (it serializes the nominally-concurrent part
@@ -2274,6 +2327,10 @@ impl UserCentroidCache {
 /// task, so 18 nominally-concurrent part loads decoded one at a time.
 /// `spawn_blocking` keeps the runtime free to drive the remaining
 /// fetches while decodes run in parallel on the blocking pool.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "manifest.part_decode", skip_all, fields(bytes = bytes.len() as u64))
+)]
 async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLoadError> {
     match spawn_blocking(carry_span(move || part::decode(&bytes))).await {
         Ok(result) => Ok(result?),
@@ -2286,6 +2343,14 @@ async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLo
 /// [`decode_part_off_thread`] preceded by a blake3 content-hash check on
 /// the same blocking task, for the storage-GET path where the bytes are
 /// not yet verified.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "manifest.part_verify_decode",
+        skip_all,
+        fields(bytes = bytes.len() as u64)
+    )
+)]
 async fn verify_and_decode_part_off_thread(
     bytes: Bytes,
     expected_hash: ContentHash,

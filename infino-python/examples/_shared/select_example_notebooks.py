@@ -3,20 +3,20 @@
 
 """Print the example notebooks that ``make python-examples-test`` should run.
 
-The ``langchain/`` and ``crewai/`` suites run through the published integration
-packages (``langchain-infino`` / ``crewai-infino``), which the test installs
-with ``--no-deps`` and links against the from-source infino build. A breaking
-infino API change can land before those packages ship a compatible release —
-they cannot depend on the new infino until it is published — so during that
-window their notebooks would hard-fail through no fault of this repo.
+The ``langchain/`` suite runs through the published ``langchain-infino``
+package, which the test installs with ``--no-deps`` and links against the
+from-source infino build. A breaking infino API change can land before that
+package ships a compatible release — it cannot depend on the new infino until
+it is published — so during that window its notebooks would hard-fail through
+no fault of this repo.
 
-To avoid that, each integration is gated on a *compat probe* that exercises the
-integration's own table-creation path against an in-memory infino. If the probe
-raises (e.g. an ``IndexSpec`` signature change), the integration is not yet
-compatible: its notebooks are skipped with a note to stderr and omitted from the
-printed list. The gate self-heals — once the integration releases a compatible
-version the probe passes and its notebooks run again. Direct-infino examples
-(``rag/``, ``code_search/``, ...) are never gated.
+To avoid that, the integration is gated on a *compat probe* that exercises its
+own table-creation path against an in-memory infino. If the probe raises (e.g.
+an ``IndexSpec`` signature change), the integration is not yet compatible: its
+notebooks are skipped with a note to stderr and omitted from the printed list.
+The gate self-heals — once the integration releases a compatible version the
+probe passes and its notebooks run again. Direct-infino examples (``rag/``,
+``code_search/``, ...) are never gated.
 
 Stdout: the notebooks to execute, one path per line.
 """
@@ -56,22 +56,8 @@ def _probe_langchain() -> None:
     )
 
 
-def _probe_crewai() -> None:
-    import infino
-    from crewai_infino import InfinoIndex
-
-    conn = infino.connect("memory://")
-    InfinoIndex.create(
-        conn,
-        "compat_probe",
-        embed_documents=lambda texts: [[0.1] * _DIM for _ in texts],
-        embed_query=lambda text: [0.1] * _DIM,
-        dim=_DIM,
-    )
-
-
 # example subdirectory -> the probe that decides whether to run it
-_GATED = {"langchain": _probe_langchain, "crewai": _probe_crewai}
+_GATED = {"langchain": _probe_langchain}
 
 
 def _compatible(name: str) -> bool:

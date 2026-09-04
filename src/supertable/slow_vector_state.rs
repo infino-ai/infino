@@ -35,7 +35,7 @@ use crate::{
     config,
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
-    superfile::vector::hnsw,
+    superfile::vector::{flat, hnsw},
     supertable::{
         manifest::{
             SuperfileEntry, VectorSummary,
@@ -549,7 +549,7 @@ async fn write_blob_and_section(
 /// [`RoutingRef`]. A separate content-addressed object per section,
 /// exactly like the centroid section — the manifest carries the ref, GC
 /// retains it while referenced, and an identical rebuild is a no-op PUT.
-pub(crate) async fn write_graph_section(
+pub(crate) async fn write_resident_index_blob(
     storage: &dyn StorageProvider,
     bytes: Vec<u8>,
 ) -> Result<RoutingRef, SlowVectorStateError> {
@@ -557,7 +557,7 @@ pub(crate) async fn write_graph_section(
     Ok(RoutingRef { uri, content_hash })
 }
 
-/// Fetch a graph section written by [`write_graph_section`], verifying its
+/// Fetch a graph section written by [`write_resident_index_blob`], verifying its
 /// bytes hash to `reference.content_hash`. Returns the verified section bytes as
 /// a [`Bytes`] handed straight to the decoder (no `to_vec` copy) plus whether
 /// the backing is an `mmap` (the caller decodes with `hnsw::decode_hnsw` /
@@ -576,7 +576,7 @@ pub(crate) async fn write_graph_section(
 /// bundle in synchronously — a CPU/IO wave that must not run on a tokio worker
 /// (the runtime anti-pattern). It runs on the blocking pool, mirroring
 /// [`load_full_state`].
-pub(crate) async fn fetch_graph_section(
+pub(crate) async fn fetch_resident_index_blob(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
 ) -> Result<(Bytes, bool), SlowVectorStateError> {
@@ -604,7 +604,7 @@ fn is_mmap_resource_exhaustion(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::OutOfMemory
 }
 
-/// The bundle bytes for [`fetch_graph_section`] plus whether the backing is an
+/// The bundle bytes for [`fetch_resident_index_blob`] plus whether the backing is an
 /// `mmap`: `mmap`-backed for a local file (the default), else striped from
 /// storage into a heap buffer for remote backends. A *benign* local mmap
 /// failure (missing/moved file, permissions) is non-fatal — it falls through to
@@ -647,37 +647,98 @@ async fn fetch_graph_bytes(
     Ok((bytes, false))
 }
 
-/// The graph sections of one published generation, decoded resident. Held
-/// on the table handle behind a single-slot cache keyed by `uri` (a new
-/// drain generation publishes a new URI and replaces it), mirroring
+/// Which resident index one published generation carries.
+///
+/// A drain builds whichever `vector.search_mode` names, so the kinds are
+/// mutually exclusive by construction — an enum rather than a struct of
+/// `Option`s, so "both present" and "neither present" are not states the
+/// serving path has to consider.
+pub(crate) enum ResidentIndexKind {
+    /// The self-contained per-row `hnsw` index: graph + Sq16 plane +
+    /// node→doc-id map, plus whichever walk plane the bundle stored.
+    Graph(hnsw::HnswIndex),
+    /// The flat 4-bit index: a nibble plane + ruler + node→doc-id map, and
+    /// deliberately no Sq16 plane.
+    Flat(flat::Sq4FlatIndex),
+}
+
+impl ResidentIndexKind {
+    /// The graph, or `None` when this generation published a flat index.
+    ///
+    /// Present so the graph's own paths — the walk, and the incremental drain
+    /// that extends it — read as narrowly as they did before there was a
+    /// second kind, instead of matching an enum they only have one arm for.
+    pub(crate) fn graph(&self) -> Option<&hnsw::HnswIndex> {
+        match self {
+            ResidentIndexKind::Graph(g) => Some(g),
+            ResidentIndexKind::Flat(_) => None,
+        }
+    }
+
+    /// The flat index, or `None` when this generation published a graph.
+    pub(crate) fn flat(&self) -> Option<&flat::Sq4FlatIndex> {
+        match self {
+            ResidentIndexKind::Flat(f) => Some(f),
+            ResidentIndexKind::Graph(_) => None,
+        }
+    }
+}
+
+/// The resident vector index of one published generation, decoded. Held on the
+/// table handle behind a single-slot cache keyed by `uri` (a new drain
+/// generation publishes a new URI and replaces it), mirroring
 /// [`CentroidSection`].
 ///
-/// `data` is the self-contained per-row `hnsw` index (graph + Sq16
-/// plane + node→doc-id map), present only when the table was within the
-/// data-graph scale ceiling at drain.
-pub(crate) struct ResidentGraphSections {
+/// `data` is absent when the drain declined to build one at all — above the
+/// scale ceiling, below the register floor, or under `search_mode = ivf` —
+/// and the query serves the ivf scan.
+pub(crate) struct ResidentVectorIndex {
     pub uri: String,
-    /// Largest stable doc id the graph covers (the append-delta boundary an
+    /// Largest stable doc id the index covers (the append-delta boundary an
     /// incremental drain inserts past).
     pub high_water_id: i128,
-    pub data: Option<hnsw::HnswIndex>,
+    pub data: Option<ResidentIndexKind>,
+}
+
+/// Why a caller is hydrating the graph — which decides what the walk section
+/// decodes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkPlaneRequest {
+    /// A SERVING hydration: make resident the plane `vector.hnsw_plane` names.
+    /// Free to ask for a narrower view than the bundle stores, because it only
+    /// reads.
+    Configured,
+    /// A MAINTENANCE hydration: make resident the plane the bundle actually
+    /// stored, whatever the running config says.
+    ///
+    /// An incremental drain re-encodes the bundle, so it must see the plane on
+    /// disk in order to extend it. Asking for a narrower view here would hand
+    /// the drain an index whose walk plane looks absent and make it rewrite the
+    /// bundle without one — dropping a persisted section that, for the fitted
+    /// 4-bit codecs, nothing can reconstruct afterwards.
+    AsStored,
 }
 
 /// Fetch + decode the combined graph bundle for one generation. A decode
 /// failure on a sub-section leaves that section `None` (the caller falls
 /// back) rather than failing the whole fetch — only a bad bundle frame or a
 /// hash mismatch is an error.
-pub(crate) async fn fetch_graph_sections(
+pub(crate) async fn hydrate_resident_index(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
-    need_sq8: bool,
-) -> Result<ResidentGraphSections, SlowVectorStateError> {
-    let (raw, mmap_backed) = fetch_graph_section(storage, reference).await?;
-    // Serve the resident SQ8 walk plane only when SQ8-walk serving is enabled
-    // AND the caller needs it. The drain/incremental-append maintenance path
-    // hydrates the graph but never walks the SQ8 plane, so it passes
-    // `need_sq8 = false` and skips the plane build entirely.
-    let sq8_walk = need_sq8 && config::global().vector.hnsw_sq8_walk;
+    request: WalkPlaneRequest,
+) -> Result<ResidentVectorIndex, SlowVectorStateError> {
+    let (raw, mmap_backed) = fetch_resident_index_blob(storage, reference).await?;
+    // A serving caller gets the configured walk plane and nothing else, so a
+    // table configured for the Sq16 walk pays no plane residency at all. A
+    // maintenance caller gets the stored plane (`None` = "as stored"); see
+    // `WalkPlaneRequest`.
+    let want = match request {
+        WalkPlaneRequest::Configured => Some(hnsw::WalkCodec::from_config(
+            config::global().vector.hnsw_plane,
+        )),
+        WalkPlaneRequest::AsStored => None,
+    };
     // Decoding faults the (mmap-backed) plane pages in and parses the graph — a
     // CPU/IO wave that must stay off the tokio workers (the runtime
     // anti-pattern), so it runs on the blocking pool. On a mapped bundle the
@@ -685,30 +746,46 @@ pub(crate) async fn fetch_graph_sections(
     // the mapping alive; on the heap path the data section is copied out so
     // `raw` frees.
     let (high_water_id, data) = spawn_blocking(move || {
-        let bundle = hnsw::decode_graph_bundle(&raw, mmap_backed)
+        let bundle = hnsw::decode_resident_envelope(&raw, mmap_backed)
             .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
-        let data = bundle
-            .data_bundle
-            .as_ref()
-            .and_then(|b| hnsw::decode_hnsw(b, sq8_walk));
+        // The envelope states which index its payload holds, so this is a
+        // dispatch rather than a guess. A payload that fails to decode leaves
+        // `data` absent and the query serves the ivf scan — the same fallback
+        // an absent payload gets.
+        let data = match bundle.data_bundle.as_ref() {
+            None => None,
+            Some((hnsw::PayloadKind::Graph, b)) => {
+                hnsw::decode_hnsw(b, want).map(ResidentIndexKind::Graph)
+            }
+            Some((hnsw::PayloadKind::Flat, b)) => {
+                flat::Sq4FlatIndex::decode(b).map(ResidentIndexKind::Flat)
+            }
+        };
         Ok::<_, SlowVectorStateError>((bundle.high_water_id, data))
     })
     .await
     .map_err(|join_error| {
         SlowVectorStateError::Parse(format!("graph bundle decode task failed: {join_error}"))
     })??;
-    if let Some(idx) = &data {
-        // Surface the stamped params every time the resident graph hydrates,
-        // so serving always shows what a table's graph is actually running.
-        tracing::debug!(
+    // Surface what a table is actually running, every time it hydrates.
+    match &data {
+        Some(ResidentIndexKind::Graph(idx)) => tracing::debug!(
             nodes = idx.graph.len(),
             dim = idx.dim,
             base_degree = idx.graph.base_degree(),
             ef = idx.ef_search,
             "hnsw: resident graph hydrated (stamped)"
-        );
+        ),
+        Some(ResidentIndexKind::Flat(idx)) => tracing::debug!(
+            rows = idx.len(),
+            dim = idx.dim(),
+            residual = idx.has_residual(),
+            resident_mib = idx.resident_bytes() / (1024 * 1024),
+            "flat: resident index hydrated"
+        ),
+        None => {}
     }
-    Ok(ResidentGraphSections {
+    Ok(ResidentVectorIndex {
         uri: reference.uri.clone(),
         high_water_id,
         data,
@@ -1012,18 +1089,18 @@ mod tests {
         // format-agnostic (the encode/decode is tested in the hnsw module).
         let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 31) as u8).collect();
 
-        let reference = write_graph_section(&storage, bytes.clone())
+        let reference = write_resident_index_blob(&storage, bytes.clone())
             .await
             .expect("write graph section");
         // Republish of identical bytes addresses the same object.
-        let again = write_graph_section(&storage, bytes.clone())
+        let again = write_resident_index_blob(&storage, bytes.clone())
             .await
             .expect("republish");
         assert_eq!(reference, again);
 
         // LocalFs → `local_path` is `Some`, so this exercises the mmap serving
         // path; the bytes must round-trip byte-exact through the mapping.
-        let (fetched, is_mmap) = fetch_graph_section(&storage, &reference)
+        let (fetched, is_mmap) = fetch_resident_index_blob(&storage, &reference)
             .await
             .expect("fetch graph section");
         assert!(
@@ -1040,7 +1117,7 @@ mod tests {
             uri: reference.uri.clone(),
             content_hash: ContentHash::of(b"different"),
         };
-        let err = fetch_graph_section(&storage, &tampered)
+        let err = fetch_resident_index_blob(&storage, &tampered)
             .await
             .expect_err("hash mismatch");
         assert!(matches!(err, SlowVectorStateError::HashMismatch), "{err:?}");

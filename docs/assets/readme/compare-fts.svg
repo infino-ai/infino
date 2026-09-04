@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="228" viewBox="0 0 880 228" role="img">
+<rect width="880" height="228" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">Full-text vs search libraries</text>
+<text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">Search Benchmark, the Game · latency vs Lucene = 1.00 · lower is faster</text>
+<line x1="616.9" y1="50" x2="616.9" y2="180" stroke="#DCD6C7"/>
+<text x="250.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600" text-anchor="end">Infino</text>
+<text x="250.0" y="80.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">0.1</text>
+<rect x="264" y="56" width="420.0" height="8" rx="1" fill="#D6400F"/>
+<text x="854.0" y="63.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#17130F" font-weight="600" text-anchor="end">1.19×</text>
+<rect x="264" y="70" width="261.2" height="8" rx="1" fill="#E8A090"/>
+<text x="854.0" y="77.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#17130F" font-weight="600" text-anchor="end">0.74×</text>
+<text x="250.0" y="110.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Lucene</text>
+<text x="250.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">10.5.0</text>
+<rect x="264" y="100" width="352.9" height="8" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="107.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" font-weight="600" text-anchor="end">1.00×</text>
+<rect x="264" y="114" width="352.9" height="8" rx="1" fill="#CFCBC2"/>
+<text x="854.0" y="121.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" font-weight="600" text-anchor="end">1.00×</text>
+<text x="250.0" y="154.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Tantivy</text>
+<text x="250.0" y="168.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">0.26</text>
+<rect x="264" y="144" width="405.9" height="8" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="151.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" font-weight="600" text-anchor="end">1.15×</text>
+<rect x="264" y="158" width="282.4" height="8" rx="1" fill="#CFCBC2"/>
+<text x="854.0" y="165.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" font-weight="600" text-anchor="end">0.80×</text>
+<rect x="26" y="207" width="9" height="9" rx="1" fill="#B7B4AB"/>
+<text x="42.0" y="214.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749">search (top-k)</text>
+<rect x="150" y="207" width="9" height="9" rx="1" fill="#CFCBC2"/>
+<text x="166.0" y="214.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749">count</text>
+</svg>
