@@ -109,6 +109,11 @@ pub struct ColumnMeta {
     /// column must be tokenized with it to match how the column was
     /// indexed.
     pub tokenizer: Arc<dyn Tokenizer>,
+    /// Whether the column's raw text is kept in the Parquet body (from
+    /// `inf.fts.columns`). Index-only columns (`false`) are searchable
+    /// but absent from the stored schema, so they cannot be read back;
+    /// a rebuild carries their postings across instead of re-tokenizing.
+    pub stored: bool,
 }
 
 /// JSON-deserialized form of one entry in `inf.fts.columns`. The KV
@@ -128,10 +133,20 @@ pub struct FtsColumnConfig {
     /// deserializes to `false`.
     #[serde(default)]
     pub positions: bool,
+    /// Whether the raw text is kept in the Parquet body. Files written
+    /// before index-only columns existed lack the field, which can only
+    /// mean the text is stored — so a missing field deserializes to
+    /// `true` (the writer emits it only when `false`).
+    #[serde(default = "default_stored")]
+    pub stored: bool,
 }
 
 pub(super) fn default_tokenizer() -> String {
     "ascii_lower".to_string()
+}
+
+pub(super) fn default_stored() -> bool {
+    true
 }
 
 /// Per-open knobs for [`FtsReader::open_with`]. Mirrors the

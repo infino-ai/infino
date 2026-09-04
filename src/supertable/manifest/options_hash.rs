@@ -109,13 +109,25 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
     //     superfiles are tokenized differently, so the options identity
     //     must differ too).
     if opts
-        .fts_tokenizers
+        .fts_columns
         .iter()
-        .any(|t| t.name() != ASCII_LOWER_TOKENIZER)
+        .any(|c| c.analyzer != ASCII_LOWER_TOKENIZER)
     {
         push_tag(&mut buf, b"fts_analyzers");
-        for t in &opts.fts_tokenizers {
-            push_str(&mut buf, t.name());
+        for c in &opts.fts_columns {
+            push_str(&mut buf, &c.analyzer);
+        }
+    }
+    // 3d. stored flags — same only-when-non-default rule: an all-stored
+    //     table's stream stays byte-identical to hashes stamped before
+    //     index-only columns existed, so pre-existing manifests keep
+    //     verifying; a table with an index-only column hashes
+    //     differently (its superfiles' Parquet bodies differ, so the
+    //     options identity must too).
+    if opts.fts_columns.iter().any(|c| !c.stored) {
+        push_tag(&mut buf, b"fts_stored");
+        for c in &opts.fts_columns {
+            buf.push(c.stored as u8);
         }
     }
 
@@ -260,14 +272,12 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
             manifest::{ClusterCentroids, list::PartitionStrategy, part::ContentHash},
             options::SupertableOptions,
         },
-        test_helpers::default_tokenizer,
     };
 
     fn schema_title_only() -> Arc<Schema> {
@@ -288,14 +298,14 @@ mod tests {
     }
 
     fn fts_opts() -> SupertableOptions {
+        fts_opts_analyzer(ASCII_LOWER_TOKENIZER)
+    }
+
+    fn fts_opts_analyzer(analyzer: &str) -> SupertableOptions {
         SupertableOptions::new(
             schema_title_only(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title").analyzer(analyzer)],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts")
     }
@@ -331,12 +341,8 @@ mod tests {
                 DataType::LargeUtf8,
                 false,
             )])),
-            vec![FtsConfig {
-                column: "body".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("body")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -356,12 +362,8 @@ mod tests {
                 DataType::LargeUtf8,
                 true, // nullable
             )])),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -382,18 +384,8 @@ mod tests {
         ]));
         let opts_b = SupertableOptions::new(
             schema_two,
-            vec![
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                },
-                FtsConfig {
-                    column: "subtitle".into(),
-                    positions: false,
-                },
-            ],
+            vec![FtsConfig::new("title"), FtsConfig::new("subtitle")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -413,34 +405,14 @@ mod tests {
         ]));
         let opts_a = SupertableOptions::new(
             schema_two.clone(),
-            vec![
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                },
-                FtsConfig {
-                    column: "subtitle".into(),
-                    positions: false,
-                },
-            ],
+            vec![FtsConfig::new("title"), FtsConfig::new("subtitle")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let opts_b = SupertableOptions::new(
             schema_two,
-            vec![
-                FtsConfig {
-                    column: "subtitle".into(),
-                    positions: false,
-                },
-                FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                },
-            ],
+            vec![FtsConfig::new("subtitle"), FtsConfig::new("title")],
             vec![],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -467,17 +439,10 @@ mod tests {
             SupertableOptions::new(
                 schema_two.clone(),
                 vec![
-                    FtsConfig {
-                        column: "title".into(),
-                        positions: title_pos,
-                    },
-                    FtsConfig {
-                        column: "subtitle".into(),
-                        positions: subtitle_pos,
-                    },
+                    FtsConfig::new("title").positions(title_pos),
+                    FtsConfig::new("subtitle").positions(subtitle_pos),
                 ],
                 vec![],
-                Some(default_tokenizer()),
             )
             .expect("opts")
         };
@@ -492,6 +457,44 @@ mod tests {
         // same options. If this assertion ever fails, the encoding
         // drifted and every existing table would fail open-validation.
         let hex: String = h_ff.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, ALL_FALSE_GOLDEN_HEX);
+    }
+
+    /// The stored flag follows the same only-when-non-default rule as
+    /// positions: an all-stored table's stream carries no `fts_stored`
+    /// block (its hash equals the pre-flag golden above, which the
+    /// positions test pins), an index-only column changes the hash, and
+    /// WHICH column is index-only matters.
+    #[test]
+    fn compute_options_hash_stored_flag() {
+        let schema_two = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("subtitle", DataType::LargeUtf8, false),
+        ]));
+        let opts = |title_stored: bool, subtitle_stored: bool| {
+            SupertableOptions::new(
+                schema_two.clone(),
+                vec![
+                    FtsConfig::new("title")
+                        .positions(false)
+                        .stored(title_stored),
+                    FtsConfig::new("subtitle")
+                        .positions(false)
+                        .stored(subtitle_stored),
+                ],
+                vec![],
+            )
+            .expect("opts")
+        };
+        let h_tt = compute_options_hash(&opts(true, true), &time_range());
+        let h_ft = compute_options_hash(&opts(false, true), &time_range());
+        let h_tf = compute_options_hash(&opts(true, false), &time_range());
+        assert_ne!(h_tt.0, h_ft.0, "index-only column must change the hash");
+        assert_ne!(h_ft.0, h_tf.0, "which column is index-only must matter");
+
+        // All-stored equals the pre-flag golden — existing manifests
+        // keep verifying.
+        let hex: String = h_tt.0.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, ALL_FALSE_GOLDEN_HEX);
     }
 
@@ -510,19 +513,13 @@ mod tests {
 
         // The standard analyzer changes the hash: its superfiles are
         // tokenized differently, so the options identity must differ.
-        let standard = compute_options_hash(
-            &fts_opts().with_fts_tokenizers(vec![Arc::new(StandardTokenizer)]),
-            &strat,
-        );
+        let standard = compute_options_hash(&fts_opts_analyzer("standard"), &strat);
         assert_ne!(ascii.0, standard.0, "analyzer choice must change the hash");
 
         // Explicit ascii_lower equals the default: the analyzer block is
         // emitted only for a non-ascii_lower analyzer, so all-ascii_lower
         // tables keep the pre-analyzer hash (see ALL_FALSE_GOLDEN_HEX).
-        let ascii_explicit = compute_options_hash(
-            &fts_opts().with_fts_tokenizers(vec![Arc::new(AsciiLowerTokenizer)]),
-            &strat,
-        );
+        let ascii_explicit = compute_options_hash(&fts_opts_analyzer("ascii_lower"), &strat);
         assert_eq!(
             ascii.0, ascii_explicit.0,
             "all-ascii_lower hash must be unchanged"
@@ -537,10 +534,7 @@ mod tests {
         let opts_a = fts_opts();
         let opts_b = SupertableOptions::new(
             schema_title_emb(16),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim: 16,
@@ -549,7 +543,6 @@ mod tests {
                 rerank_codec: RerankCodec::default(),
                 provided_centroids: None,
             }],
-            Some(default_tokenizer()),
         )
         .expect("opts");
         let h_a = compute_options_hash(&opts_a, &time_range());
@@ -575,7 +568,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                Some(default_tokenizer()),
             )
             .expect("opts")
         };
@@ -598,7 +590,6 @@ mod tests {
                     rerank_codec,
                     provided_centroids: None,
                 }],
-                Some(default_tokenizer()),
             )
             .expect("opts")
         };

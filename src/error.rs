@@ -211,6 +211,12 @@ impl From<SupertableBuildError> for InfinoError {
         if matches!(e, SupertableBuildError::TableGone) {
             return InfinoError::NotFound(e.to_string());
         }
+        // A bad analyzer name is a configuration mistake, not a schema
+        // shape problem — surface it as the same class a bad connect
+        // option gets.
+        if matches!(e, SupertableBuildError::UnknownAnalyzer { .. }) {
+            return InfinoError::Config(e.to_string());
+        }
         InfinoError::Schema(e.to_string())
     }
 }

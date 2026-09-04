@@ -11,4 +11,5 @@ pub mod phrase;
 pub mod pipeline;
 pub mod prefix_and_floor;
 pub mod standard_tokenizer;
+pub mod stored_fields;
 pub mod uses_spill_builder;

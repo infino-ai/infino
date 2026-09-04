@@ -2381,17 +2381,9 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        SupertableOptions::new(
-            cat_title_schema(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(default_tokenizer()),
-        )
-        .expect("opts")
-        .with_writer_pool(pool)
+        SupertableOptions::new(cat_title_schema(), vec![FtsConfig::new("title")], vec![])
+            .expect("opts")
+            .with_writer_pool(pool)
     }
 
     fn cat_title_batch(cats: &[&str], titles: &[&str]) -> RecordBatch {
@@ -2679,7 +2671,7 @@ mod tests {
         );
         // No FTS column — this fixture exercises the scalar-stats path
         // (min/max/sum/null/distinct), not the term bloom.
-        SupertableOptions::new(num_schema(), vec![], vec![], None)
+        SupertableOptions::new(num_schema(), vec![], vec![])
             .expect("opts")
             .with_writer_pool(pool)
     }

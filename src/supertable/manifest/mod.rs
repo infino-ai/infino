@@ -4225,18 +4225,10 @@ mod tests {
     }
 
     fn opts() -> Arc<SupertableOptions> {
-        let tk = default_tokenizer();
+        let _tk = default_tokenizer();
         Arc::new(
-            SupertableOptions::new(
-                schema(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
-                vec![],
-                Some(tk),
-            )
-            .expect("valid options"),
+            SupertableOptions::new(schema(), vec![FtsConfig::new("title")], vec![])
+                .expect("valid options"),
         )
     }
 
@@ -4614,7 +4606,7 @@ mod tests {
                 DataType::LargeUtf8,
                 false,
             )]));
-            Arc::new(SupertableOptions::new(s, vec![], vec![], None).expect("opts"))
+            Arc::new(SupertableOptions::new(s, vec![], vec![]).expect("opts"))
         }
 
         fn build_manifest_with_loader(
@@ -5058,7 +5050,7 @@ mod tests {
     }
 
     fn make_opts() -> Arc<SupertableOptions> {
-        SupertableOptions::new(simple_schema(), vec![], vec![], None)
+        SupertableOptions::new(simple_schema(), vec![], vec![])
             .map(Arc::new)
             .expect("valid options")
     }
@@ -5549,7 +5541,7 @@ mod tests {
 
         let consumer_opts = |knob: bool| {
             Arc::new(
-                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                SupertableOptions::new(simple_schema(), vec![], vec![])
                     .expect("valid options")
                     .with_summary_centroids_from_superfiles(knob),
             )
@@ -5678,7 +5670,7 @@ mod tests {
     async fn consumer_mode_hydrates_parts_from_routing_sibling() {
         let consumer_opts = |knob: bool| {
             Arc::new(
-                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                SupertableOptions::new(simple_schema(), vec![], vec![])
                     .expect("valid options")
                     .with_summary_centroids_from_superfiles(knob),
             )
@@ -5973,7 +5965,7 @@ mod tests {
         // a loader — the second (removal) phase loads carried-over parts
         // (part_0, part_1) back from storage.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = TARGET_SUPERFILES_PER_PART;
         let opts = Arc::new(base_opts.with_storage(storage.clone()));
 
@@ -6219,7 +6211,7 @@ mod tests {
     #[tokio::test]
     async fn update_rewrite_partition_within_target() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -6322,7 +6314,7 @@ mod tests {
     #[tokio::test]
     async fn update_split_partition_exceeds_target() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -6449,7 +6441,7 @@ mod tests {
     #[tokio::test]
     async fn update_split_partition_exceeds_size_threshold() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 10_000;
         // Any real encoded part is bigger than 1 byte, so the latest part is
         // always considered at-cap.
@@ -6561,7 +6553,7 @@ mod tests {
     #[tokio::test]
     async fn update_older_entry_preserved_when_latest_rewritten() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -6700,7 +6692,7 @@ mod tests {
         // the LAST existing part (the latest); the earlier part carries over
         // unchanged. Each superfile keeps its own partition_hint/partition_key.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -6846,7 +6838,7 @@ mod tests {
         // the earlier part carries over with the exact URI and content_hash that
         // were written — no re-encode, no PUT.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -6983,7 +6975,7 @@ mod tests {
         // entries. p0..p2 carry over unchanged. Each superfile keeps its own
         // partition_hint.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -7189,7 +7181,7 @@ mod tests {
         // Under the default single-bucket Hash strategy the commit-time
         // partition_key stamped on every entry is bucket 0, regardless of hint.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 8;
         let opts = Arc::new(base_opts);
 
@@ -7336,7 +7328,7 @@ mod tests {
         // in the same partition. The resulting part should contain the
         // surviving existing superfile plus the new one — not the removed one.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -7580,7 +7572,7 @@ mod tests {
         // part_a_latest matches and is rewritten with only its surviving
         // superfile.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -7915,7 +7907,7 @@ mod tests {
         // removed superfile; part_a_latest holds no matching id and carries over
         // unchanged. sf_a_old_keep and sf_a_latest survive.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 

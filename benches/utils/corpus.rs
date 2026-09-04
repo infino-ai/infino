@@ -2486,10 +2486,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![SfVectorConfig {
             provided_centroids: None,
             column: "emb".into(),
@@ -2498,7 +2495,6 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
             metric: Metric::Cosine,
             rerank_codec: bench_rerank_codec(Metric::Cosine),
         }],
-        Some(default_tokenizer()),
     );
 
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -2528,10 +2524,7 @@ pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Met
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![SfVectorConfig {
             provided_centroids: None,
             column: "emb".into(),
@@ -2540,7 +2533,6 @@ pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Met
             metric,
             rerank_codec: bench_rerank_codec(metric),
         }],
-        Some(default_tokenizer()),
     );
 
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");

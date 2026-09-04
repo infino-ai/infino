@@ -1991,7 +1991,6 @@ mod tests {
             manifest::{SuperfileEntry, SuperfileUri},
             options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         },
-        test_helpers::default_tokenizer as tok,
     };
 
     /// Manifest entry fixture for the work-unit tests. `n_docs` is the
@@ -2042,17 +2041,9 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        SupertableOptions::new(
-            schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool)
+        SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
+            .with_writer_pool(pool)
     }
 
     fn build_batch(_start: u64, titles: &[&str]) -> RecordBatch {
@@ -2238,12 +2229,8 @@ mod tests {
         );
         SupertableOptions::new(
             schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: true,
-            }],
+            vec![FtsConfig::new("title").positions(true)],
             vec![],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -2482,16 +2469,8 @@ mod tests {
             ),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = BuilderOptions::new(
-            schema.clone(),
-            "_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        );
+        let opts =
+            BuilderOptions::new(schema.clone(), "_id", vec![FtsConfig::new("title")], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let n = titles.len();
         let ids = Decimal128Array::from((0..n as i128).collect::<Vec<_>>())
@@ -3037,12 +3016,8 @@ mod tests {
         );
         SupertableOptions::new(
             schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: true,
-            }],
+            vec![FtsConfig::new("title").positions(true)],
             vec![],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)

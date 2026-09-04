@@ -43,12 +43,8 @@ fn build_standard(corpus: &[(u64, &str)]) -> SuperfileReader {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title").analyzer("standard")],
         vec![],
-        Some(Arc::new(StandardTokenizer)),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let ids = decimal128_ids(corpus.iter().map(|(i, _)| *i));

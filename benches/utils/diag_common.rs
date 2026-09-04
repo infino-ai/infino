@@ -24,7 +24,6 @@ use infino::{
     OptimizeOptions,
     superfile::builder::FtsConfig,
     supertable::{OptimizeError, Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
 };
 use rayon::ThreadPoolBuilder;
 
@@ -121,12 +120,8 @@ pub fn diag_schema() -> Arc<Schema> {
 pub fn diag_options() -> SupertableOptions {
     SupertableOptions::new(
         diag_schema(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: true,
-        }],
+        vec![FtsConfig::new("title").positions(true)],
         vec![],
-        Some(default_tokenizer()),
     )
     .expect("diag supertable options")
 }

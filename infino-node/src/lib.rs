@@ -519,9 +519,25 @@ pub struct VectorFilter {
 #[napi]
 #[derive(Clone, Default)]
 pub struct IndexSpec {
-    fts: Vec<String>,
+    /// `(column, analyzer, stored)`; `analyzer` `None` means the default.
+    fts: Vec<(String, Option<String>, bool)>,
     /// `(column, dim, metric)`.
     vectors: Vec<(String, u32, String)>,
+}
+
+/// Per-column FTS options for `IndexSpec.fts`.
+#[napi(object)]
+#[derive(Clone, Default)]
+pub struct FtsOptions {
+    /// Tokenizer: `"ascii_lower"` (default — ASCII split + lowercase,
+    /// non-ASCII dropped) or `"standard"` (the Unicode-aware UAX #29
+    /// tokenizer that keeps non-ASCII text).
+    pub analyzer: Option<String>,
+    /// Keep the raw text in the table (default true). `false` makes the
+    /// column index-only: searchable, but the text is never stored, so
+    /// it cannot be selected, projected, or filtered on (append/update
+    /// batches still carry it).
+    pub stored: Option<bool>,
 }
 
 #[napi]
@@ -531,11 +547,14 @@ impl IndexSpec {
         Self::default()
     }
 
-    /// Mark `column` (a UTF-8 string column) as full-text indexed.
+    /// Mark `column` (a UTF-8 string column) as full-text indexed,
+    /// with optional per-column `options` (analyzer, stored).
     #[napi]
-    pub fn fts(&self, column: String) -> Self {
+    pub fn fts(&self, column: String, options: Option<FtsOptions>) -> Self {
         let mut next = self.clone();
-        next.fts.push(column);
+        let opts = options.unwrap_or_default();
+        next.fts
+            .push((column, opts.analyzer, opts.stored.unwrap_or(true)));
         next
     }
 
@@ -554,8 +573,12 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> Result<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for column in &self.fts {
-            spec = spec.fts(column.clone());
+        for (column, analyzer, stored) in &self.fts {
+            let mut field = infino::FtsField::new(column.clone()).stored(*stored);
+            if let Some(a) = analyzer {
+                field = field.analyzer(a.clone());
+            }
+            spec = spec.fts(field);
         }
         for (column, dim, metric) in &self.vectors {
             spec = spec.vector(column.clone(), *dim as usize, metric_from_str(metric)?);

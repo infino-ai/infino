@@ -24,7 +24,6 @@ use infino::{
         vector::distance::Metric,
     },
     supertable::{Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
 };
 use rayon::prelude::*;
 
@@ -122,22 +121,10 @@ pub fn sql_options() -> SupertableOptions {
     SupertableOptions::new(
         schema(),
         vec![
-            FtsConfig {
-                column: TITLE_COLUMN.into(),
-                positions: false,
-            },
-            FtsConfig {
-                column: BUCKET_COLUMN.into(),
-                positions: false,
-            },
-            FtsConfig {
-                column: KEY_COLUMN.into(),
-                positions: false,
-            },
-            FtsConfig {
-                column: CATEGORY_COLUMN.into(),
-                positions: false,
-            },
+            FtsConfig::new(TITLE_COLUMN),
+            FtsConfig::new(BUCKET_COLUMN),
+            FtsConfig::new(KEY_COLUMN),
+            FtsConfig::new(CATEGORY_COLUMN),
         ],
         vec![VectorConfig {
             provided_centroids: None,
@@ -147,7 +134,6 @@ pub fn sql_options() -> SupertableOptions {
             metric: Metric::Cosine,
             rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
         }],
-        Some(default_tokenizer()),
     )
     .expect("supertable sql options")
 }
@@ -295,10 +281,7 @@ fn spec_options(spec: &SqlCorpusSpec) -> SupertableOptions {
     let fts = spec
         .fts_columns
         .iter()
-        .map(|column| FtsConfig {
-            column: column.clone(),
-            positions: false,
-        })
+        .map(|column| FtsConfig::new(column.clone()))
         .collect();
     let vectors = spec
         .vector
@@ -312,13 +295,8 @@ fn spec_options(spec: &SqlCorpusSpec) -> SupertableOptions {
             rerank_codec: corpus::bench_rerank_codec(v.metric),
         })
         .collect();
-    SupertableOptions::new(
-        Arc::clone(&spec.schema),
-        fts,
-        vectors,
-        Some(default_tokenizer()),
-    )
-    .expect("invariant: schema-driven supertable options are well-formed")
+    SupertableOptions::new(Arc::clone(&spec.schema), fts, vectors)
+        .expect("invariant: schema-driven supertable options are well-formed")
 }
 
 /// Appends every batch to `table` and commits once — the write-side tail

@@ -162,7 +162,9 @@ pub(crate) async fn resolve_hits_named(
     hits: &[SuperfileHit],
     projection: Option<&[&str]>,
 ) -> Result<RecordBatch, QueryError> {
-    let scalar_schema = reader.options().scalar_schema();
+    // Stored shape: an index-only FTS column has no Parquet data to
+    // project, so its name is rejected up front like any unknown column.
+    let scalar_schema = reader.options().stored_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
     // `_id` decodes from its own dedicated id pages (cheap by
@@ -923,7 +925,6 @@ mod tests {
         },
         test_helpers::{
             build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
-            default_tokenizer as tok,
         },
     };
 
@@ -1011,10 +1012,7 @@ mod tests {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -1023,7 +1021,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -1304,17 +1301,9 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool);
+        let opts = SupertableOptions::new(schema.clone(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
+            .with_writer_pool(pool);
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         let titles = LargeStringArray::from(vec![
@@ -1422,7 +1411,7 @@ mod tests {
             decimal128_id_field("doc_id"),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let ids = decimal128_ids(0..TITLES.len() as u64);
         let title = LargeStringArray::from(TITLES.to_vec());

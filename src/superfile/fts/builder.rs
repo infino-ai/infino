@@ -1784,23 +1784,26 @@ impl FtsBuilder {
         Ok(())
     }
 
-    /// Set a column's per-doc lengths directly (the compaction merge feeds the
-    /// inputs' already-clamped stored lengths rather than recomputing them
+    /// Append a run of per-doc lengths to a column (the compaction merge feeds
+    /// the inputs' already-clamped stored lengths rather than recomputing them
     /// from text) and advance the builder's doc count so `finish` sizes the
-    /// doc-lengths table and `n_docs` correctly.
+    /// doc-lengths table and `n_docs` correctly. Append (not replace) so the
+    /// prebuilt feed composes: with lengths a prior input already carried
+    /// across, and with lengths `add_doc` accumulated for docs tokenized into
+    /// the same builder — the merged lengths axis stays aligned with the
+    /// column's ascending local-doc-id axis either way.
     ///
-    /// Also recomputes `total_tokens` as the sum of the lengths. `finish`
+    /// Also accumulates `total_tokens` as the sum of the lengths. `finish`
     /// derives `avgdl = total_tokens / n_docs` from it, and a doc length *is*
     /// its token count (`add_doc` clamps only at `u32::MAX`, never reached in
     /// practice), so this sum equals what re-indexing the same corpus would
     /// accumulate — keeping merged BM25 scores identical to a fresh build.
-    pub(crate) fn set_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: Vec<u32>) {
-        let n = doc_lengths.len() as u32;
+    pub(crate) fn append_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: &[u32]) {
         let total_tokens: u64 = doc_lengths.iter().map(|&dl| u64::from(dl)).sum();
         let col = &mut self.columns[column_id as usize];
-        col.total_tokens = total_tokens;
-        col.doc_lengths = doc_lengths;
-        self.n_docs = self.n_docs.max(n);
+        col.total_tokens += total_tokens;
+        col.doc_lengths.extend_from_slice(doc_lengths);
+        self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
     }
 
     /// Spilled-mode hot path. Per-token cost: intern lookup + dense-

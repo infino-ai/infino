@@ -460,18 +460,9 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let tk = default_tokenizer();
+        let _tk = default_tokenizer();
         Arc::new(
-            SupertableOptions::new(
-                schema,
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
-                vec![],
-                Some(tk),
-            )
-            .expect("opts"),
+            SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![]).expect("opts"),
         )
     }
 

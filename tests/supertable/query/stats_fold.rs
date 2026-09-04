@@ -50,7 +50,7 @@ fn options_cat_rating() -> SupertableOptions {
         Field::new("category", DataType::LargeUtf8, false),
         Field::new("rating", DataType::Int64, false),
     ]));
-    SupertableOptions::new(schema, vec![], vec![], None).expect("valid options")
+    SupertableOptions::new(schema, vec![], vec![]).expect("valid options")
 }
 
 /// Commit `idx` carries categories `cat{idx}_{row}` and ratings
@@ -254,7 +254,7 @@ fn options_day_id() -> SupertableOptions {
         Field::new("day", DataType::Date32, false),
         Field::new("id", DataType::Int64, false),
     ]));
-    SupertableOptions::new(schema, vec![], vec![], None).expect("valid options")
+    SupertableOptions::new(schema, vec![], vec![]).expect("valid options")
 }
 
 /// Base day (days-since-epoch) for commit 0; later commits and rows step
@@ -416,7 +416,7 @@ fn options_full_domain_u64() -> SupertableOptions {
         Field::new("i", DataType::Int64, false),
         Field::new("u", DataType::UInt64, false),
     ]));
-    SupertableOptions::new(schema, vec![], vec![], None)
+    SupertableOptions::new(schema, vec![], vec![])
         .expect("valid options")
         .with_writer_pool(single_superfile_writer_pool())
 }
@@ -428,7 +428,7 @@ fn options_split_domain_i64() -> SupertableOptions {
         Field::new("i", DataType::Int64, false),
         Field::new("n", DataType::Int64, false),
     ]));
-    SupertableOptions::new(schema, vec![], vec![], None)
+    SupertableOptions::new(schema, vec![], vec![])
         .expect("valid options")
         .with_writer_pool(single_superfile_writer_pool())
 }

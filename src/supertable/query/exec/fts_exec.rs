@@ -425,7 +425,6 @@ mod tests {
     use crate::{
         superfile::builder::FtsConfig,
         supertable::{Supertable, SupertableOptions},
-        test_helpers::default_tokenizer as tok,
     };
 
     fn title_schema() -> Arc<Schema> {
@@ -443,17 +442,9 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        SupertableOptions::new(
-            title_schema(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool)
+        SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
+            .with_writer_pool(pool)
     }
 
     fn supertable_with_titles(titles: &[&str]) -> Supertable {

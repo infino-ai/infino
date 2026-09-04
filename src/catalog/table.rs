@@ -199,7 +199,13 @@ impl Supertable {
         Self { inner }
     }
 
-    /// The table's Arrow schema.
+    /// The table's Arrow schema — the shape `append` and `update`
+    /// batches must match.
+    ///
+    /// An FTS column declared with `stored(false)` appears here (its
+    /// text must arrive in every batch to be indexed) but is
+    /// write+search-only: it cannot be selected via SQL, named in a
+    /// search projection, or used in a predicate.
     pub fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
