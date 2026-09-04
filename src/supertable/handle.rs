@@ -4220,14 +4220,7 @@ mod tests {
         // pre-compact warm/cold queries against a disk-cache consumer).
         use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         let hits = consumer
-            .bm25_search(
-                "title",
-                "doc",
-                5,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "doc", 5, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 pre-optimize");
         assert!(!hits.is_empty(), "pre-optimize FTS should return hits");
 
@@ -4236,14 +4229,7 @@ mod tests {
             .expect("sql-shaped optimize after lazy reads");
 
         let hits_after = consumer
-            .bm25_search(
-                "title",
-                "doc",
-                5,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "doc", 5, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 post-optimize");
         assert!(
             !hits_after.is_empty(),
@@ -8094,14 +8080,7 @@ mod tests {
     fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
         use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         table
-            .bm25_search(
-                "title",
-                query,
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", query, 10, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 search")
             .iter()
             .map(|b| b.num_rows())

@@ -30,8 +30,7 @@ pub enum Bm25Stats {
     /// but a term's idf — and therefore a doc's score — depends on
     /// which superfile it lands in, so scores are only approximately
     /// comparable across superfiles and ranking drifts as the table
-    /// fragments. The default.
-    #[default]
+    /// fragments.
     PerSuperfile,
     /// Score every superfile against table-wide idf: the document count
     /// and per-term document-frequencies aggregated across all
@@ -39,7 +38,9 @@ pub enum Bm25Stats {
     /// idf for the whole table, so a fragmented table ranks like a
     /// single unified corpus, at the cost of a document-frequency
     /// gather before scoring. (Length normalization still uses each
-    /// superfile's own average document length.)
+    /// superfile's own average document length.) The default: ranking
+    /// should not depend on how commits happened to shard the corpus.
+    #[default]
     Global,
 }
 
@@ -47,20 +48,24 @@ impl From<&str> for Bm25Stats {
     fn from(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "global" => Bm25Stats::Global,
-            _ => Bm25Stats::PerSuperfile,
+            "per_superfile" => Bm25Stats::PerSuperfile,
+            // Anything else is treated as "unspecified" and takes the
+            // default, so this conversion and the enum default cannot
+            // drift apart.
+            _ => Bm25Stats::default(),
         }
     }
 }
 
 /// Options for a BM25 search: the boolean `mode` and the corpus-statistics
 /// `stats`. Set fields with the `with_*` builders; [`Default`] is
-/// [`BoolMode::Or`] with [`Bm25Stats::PerSuperfile`].
+/// [`BoolMode::Or`] with [`Bm25Stats::Global`].
 ///
 /// ```ignore
-/// // OR mode, per-superfile stats (the defaults):
+/// // OR mode, global stats (the defaults):
 /// Bm25SearchOptions::new()
-/// // AND mode, global stats:
-/// Bm25SearchOptions::new().with_mode(BoolMode::And).with_stats(Bm25Stats::Global)
+/// // AND mode, per-superfile (segment-local) stats:
+/// Bm25SearchOptions::new().with_mode(BoolMode::And).with_stats(Bm25Stats::PerSuperfile)
 /// ```
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct Bm25SearchOptions {
@@ -71,7 +76,7 @@ pub struct Bm25SearchOptions {
 }
 
 impl Bm25SearchOptions {
-    /// Default options: `Or` mode, per-superfile statistics.
+    /// Default options: `Or` mode, global statistics.
     pub fn new() -> Self {
         Self::default()
     }

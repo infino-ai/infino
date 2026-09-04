@@ -181,7 +181,7 @@ async fn cold_bm25_projection_pairs_each_hit_with_its_own_row() {
             "fox",
             TOP_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("cold bm25");
@@ -206,7 +206,7 @@ async fn cold_bm25_projection_pairs_each_hit_with_its_own_row() {
             "async wolf",
             TOP_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("cold bm25 or");

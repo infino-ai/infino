@@ -54,7 +54,7 @@
 //! drifts as the table fragments. [`Bm25Stats`] selects how a query
 //! handles this:
 //!
-//!  - [`Bm25Stats::PerSuperfile`] (default) scores each superfile
+//!  - [`Bm25Stats::PerSuperfile`] scores each superfile
 //!    against its own local statistics — no extra pass, fastest. For
 //!    `k ≥ 10` and reasonably balanced superfiles the top-k *set* still
 //!    converges to the global answer even if score *order* within the
@@ -1544,8 +1544,23 @@ impl SupertableReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.bm25_hits_stats(column, query, k, mode, Bm25Stats::default())
+    }
+
+    /// [`bm25_hits`](Self::bm25_hits) with an explicit statistics
+    /// scope. Callers that pin mode-specific behavior (the
+    /// per-superfile fan shape, or local-idf scoring parity) select it
+    /// here instead of relying on the crate default.
+    pub fn bm25_hits_stats(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+        stats: Bm25Stats,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.bm25_search_async(column, query, k, mode, Bm25Stats::PerSuperfile))
+        self.block_on(self.bm25_search_async(column, query, k, mode, stats))
     }
 
     /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
@@ -2603,7 +2618,7 @@ mod tests {
                 "rust",
                 5,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["title", "does_not_exist"]),
             )
             .expect_err("unknown projection column must error");
@@ -2910,14 +2925,7 @@ mod tests {
 
         // Bare call → `_id` + `score` only (no scalar decode).
         let bare = st
-            .bm25_search(
-                "title",
-                "fox",
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "fox", 10, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 rows");
         assert_eq!(bare.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(bare[0].num_columns(), 2, "_id + score");
@@ -2929,7 +2937,7 @@ mod tests {
                 "fox",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["_id", "title", "score"]),
             )
             .expect("bm25 projected rows");

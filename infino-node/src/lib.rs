@@ -389,14 +389,14 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
     }
 }
 
-/// Parse a BM25 statistics-scope string (`"per_superfile"` default, or
-/// `"global"` for corpus-wide IDF across superfiles).
+/// Parse a BM25 statistics-scope string: `"global"` (corpus-wide IDF, the
+/// default when omitted) or `"per_superfile"` (segment-local IDF).
 fn parse_stats(stats: Option<&str>) -> Result<Bm25Stats> {
-    match stats
-        .unwrap_or("per_superfile")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let Some(stats) = stats else {
+        // Omitted means the engine default.
+        return Ok(Bm25Stats::default());
+    };
+    match stats.to_ascii_lowercase().as_str() {
         "per_superfile" => Ok(Bm25Stats::PerSuperfile),
         "global" => Ok(Bm25Stats::Global),
         other => Err(Error::new(

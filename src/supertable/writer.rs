@@ -10264,14 +10264,7 @@ mod tests {
         // Every doc's title contains "alpha" (see build_simple_batch); a match-all term must
         // surface hits from the one-piece index.
         let hits = st
-            .bm25_search(
-                "title",
-                "alpha",
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "alpha", 10, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 over one-piece commit");
         let n: usize = hits.iter().map(|b| b.num_rows()).sum();
         assert!(n > 0, "single-shard FTS index must return hits");

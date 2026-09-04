@@ -287,14 +287,7 @@ fn run_bm25_queries(st: &Supertable) -> Vec<Vec<i128>> {
         .iter()
         .map(|q| {
             let batches = reader
-                .bm25_search(
-                    "title",
-                    q,
-                    BM25_K,
-                    BoolMode::Or,
-                    Bm25Stats::PerSuperfile,
-                    None,
-                )
+                .bm25_search("title", q, BM25_K, BoolMode::Or, Bm25Stats::Global, None)
                 .unwrap_or_else(|e| panic!("bm25_search({q:?}) failed: {e}"));
             extract_sorted_ids(&batches)
         })
