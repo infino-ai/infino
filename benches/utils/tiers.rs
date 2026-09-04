@@ -771,7 +771,7 @@ pub fn open_superfile_cold_reader(
     storage: Arc<dyn StorageProvider>,
     uri: &SuperfileUri,
     known_size: u64,
-) -> (TempDir, Arc<SuperfileReader>) {
+) -> (RetryingTempDir, Arc<SuperfileReader>) {
     let (cache_dir, cache) = fresh_superfile_cache(storage);
     let offsets = superfile_cold_size_hint(known_size);
     let reader = block_on(async move {
@@ -780,7 +780,9 @@ pub fn open_superfile_cold_reader(
             .await
             .expect("cold reader")
     });
-    (cache_dir, reader)
+    // The open above starts background section fills; hand callers a
+    // removal that survives writes landing after the reader drops.
+    (cache_dir.into(), reader)
 }
 
 fn fresh_disk_cache_with_mode(

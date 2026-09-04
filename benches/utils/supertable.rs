@@ -57,7 +57,6 @@ use infino::{
         writer::maintenance_pool_width,
     },
 };
-use tempfile::TempDir;
 
 use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
@@ -962,7 +961,10 @@ fn build_measured(
     (built, metrics)
 }
 
-fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempDir, Supertable) {
+fn open_consumer(
+    modality: Modality,
+    built: &supertable::IngestResult,
+) -> (tiers::RetryingTempDir, Supertable) {
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         Arc::clone(&built.storage),
         Some(built.total_index_bytes),
@@ -972,7 +974,9 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
         Arc::clone(&built.storage),
         cache,
     );
-    (cache_dir, tiers::open_consumer(opts))
+    // Consumers keep background fills going; every caller's cache dir gets
+    // the removal that retries until the tree is actually gone.
+    (cache_dir.into(), tiers::open_consumer(opts))
 }
 
 // ==== shared routing-state observability framework ====
@@ -2341,7 +2345,7 @@ pub mod fts {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
             Self {
                 consumer,
-                _cache_dir: cache_dir.into(),
+                _cache_dir: cache_dir,
             }
         }
     }
@@ -2658,7 +2662,7 @@ pub mod vector {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
             Self {
                 consumer,
-                _cache_dir: cache_dir.into(),
+                _cache_dir: cache_dir,
                 id_to_dense,
             }
         }
@@ -5558,7 +5562,7 @@ pub mod sql {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
             Self {
                 consumer,
-                _cache_dir: cache_dir.into(),
+                _cache_dir: cache_dir,
             }
         }
     }
