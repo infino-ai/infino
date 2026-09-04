@@ -9,7 +9,7 @@
 use std::{error::Error, future::Future, ops::Range, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use object_store::RetryConfig;
+use object_store::{BackoffConfig, RetryConfig};
 use tokio::time;
 use tracing::warn;
 
@@ -20,6 +20,15 @@ use super::{ObjectMeta, StorageError};
 pub(crate) const MAX_RETRIES: usize = 20;
 
 /// Overall `object_store` retry window, paired with [`MAX_RETRIES`].
+///
+/// This is the budget the retry loop spends across *all* attempts, so it
+/// must stay strictly larger than any single backend's per-request timeout
+/// (`AZURE_REQUEST_TIMEOUT`, `GCS_REQUEST_TIMEOUT`). If a request's own
+/// timeout equalled this budget, one stalled request would consume the
+/// entire window and no retry would ever fire — the stall would surface as
+/// a fatal error after a single attempt. Paired with a 60s per-request
+/// timeout this leaves room for roughly five attempts while capping the
+/// worst-case total hang at 300s.
 pub(crate) const RETRY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Transient re-issue backoff: `BASE × 2^min(attempt, MAX_SHIFT)` ms, capped.
@@ -37,7 +46,18 @@ pub(crate) fn config() -> RetryConfig {
     RetryConfig {
         max_retries: MAX_RETRIES,
         retry_timeout: RETRY_TIMEOUT,
-        ..Default::default()
+        // Spelled out rather than left to `..Default::default()` so the
+        // curve is visible at the call site. These values match
+        // object_store's own defaults (100ms initial, doubling, capped at
+        // 15s), so this is behaviour-preserving. object_store applies
+        // jitter on top: each sleep is a random value in
+        // `[prev, prev * base)`, so retries don't synchronize into a
+        // thundering herd.
+        backoff: BackoffConfig {
+            init_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(15),
+            base: 2.0,
+        },
     }
 }
 

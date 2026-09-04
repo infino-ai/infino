@@ -161,7 +161,22 @@ const AZURE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whole-request timeout (incl. body). The 30s default is too tight for
 /// a multi-MB superfile PUT on a modest uplink — it aborts mid-upload.
-const AZURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+///
+/// This must stay strictly *below* the retry budget
+/// ([`retry::RETRY_TIMEOUT`]): the timeout bounds one request, the budget
+/// bounds the whole retry loop. If the two were equal, a single stalled
+/// request would burn the entire budget and the retry loop would give up
+/// after one attempt (surfacing as a fatal `TransientExhausted` /
+/// "error sending request" on a large commit) instead of re-dialing on a
+/// fresh connection. At 60s against the 300s budget the loop still gets
+/// ~5 attempts while the worst-case total hang stays at 300s (not
+/// doubled). 60s comfortably covers each 8 MiB multipart part and a
+/// typical single-shot `put_atomic` (the ~64 MiB default superfile split)
+/// down to ~1 MB/s; the only edge case — a ~100 MiB single-shot on a
+/// sub-1.7 MB/s link — is removed by the deferred multipart-threshold
+/// reduction (see the request's future-work notes). A stalled request now
+/// fails in 60s and is retried rather than being fatal.
+const AZURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// HTTP client options: deep warm idle pool + bounded connect/request.
 fn tuned_client_options() -> ClientOptions {
@@ -545,6 +560,22 @@ mod tests {
             StorageError::Permanent { uri, .. } => assert_eq!(uri, "k"),
             other => panic!("expected Permanent; got {other:?}"),
         }
+    }
+
+    // ---- timeout invariant ---------------------------------------------
+
+    #[test]
+    fn request_timeout_stays_below_retry_budget() {
+        // The per-request timeout must be strictly less than the retry
+        // budget, or a single stalled request burns the whole budget and no
+        // retry fires. (Regression: the two were both 300s, so a stalled
+        // block PUT gave up after one attempt.)
+        assert!(
+            AZURE_REQUEST_TIMEOUT < crate::storage::retry::RETRY_TIMEOUT,
+            "request timeout ({AZURE_REQUEST_TIMEOUT:?}) must be below the retry budget \
+             ({:?}) so a stalled request is retried, not fatal",
+            crate::storage::retry::RETRY_TIMEOUT,
+        );
     }
 
     // ---- path ----------------------------------------------------------
