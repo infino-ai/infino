@@ -69,11 +69,17 @@ use crate::{
     },
     supertable::{
         Supertable as SupertableHandle,
+        manifest::disk_cache::ManifestDiskCache,
         options::SupertableOptions,
         query::exec::common::collect_plan_metered,
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
+
+/// Subdirectory under a tables cache root holding the manifest-part cache.
+const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
+/// budget for a tables content-addressed manifest-part cache.
+const MANIFEST_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Open (or create) a catalog rooted at `uri`.
 ///
@@ -438,8 +444,10 @@ impl Connection {
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
-                if let Some(cache) = disk_cache {
-                    opts = opts.with_disk_cache(cache);
+                if let Some((cache, manifest_cache)) = disk_cache {
+                    opts = opts
+                        .with_disk_cache(cache)
+                        .with_manifest_disk_cache(manifest_cache);
                 }
 
                 // Honor the connection's read-consistency policy (default
@@ -580,8 +588,10 @@ impl Connection {
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
                 .map_err(|e| e.with_context("open_table", Some(name)))?;
-                if let Some(cache) = disk_cache {
-                    opts = opts.with_disk_cache(cache);
+                if let Some((cache, manifest_cache)) = disk_cache {
+                    opts = opts
+                        .with_disk_cache(cache)
+                        .with_manifest_disk_cache(manifest_cache);
                 }
                 // Honor the connection's read-consistency policy. Default is
                 // BoundedStaleness(1s): the per-query pointer re-check is
@@ -1060,12 +1070,13 @@ fn build_disk_cache(
     options: &ConnectOptions,
     storage: &Arc<dyn StorageProvider>,
     name: &str,
-) -> Result<Option<Arc<DiskCacheStore>>, InfinoError> {
+) -> Result<Option<(Arc<DiskCacheStore>, Arc<ManifestDiskCache>)>, InfinoError> {
     let Some(cache_root) = options.cache_dir.as_ref() else {
         return Ok(None);
     };
+    let table_root = cache_root.join(name);
     let mut cfg = DiskCacheConfig {
-        cache_root: cache_root.join(name),
+        cache_root: table_root.clone(),
         cold_fetch_mode: options.cold_fetch_mode.to_internal(),
         ..Default::default()
     };
@@ -1082,7 +1093,12 @@ fn build_disk_cache(
     if options.cache_budget_bytes.is_none() {
         cache.mark_budget_auto_sized();
     }
-    Ok(Some(cache))
+    let manifest_cache = ManifestDiskCache::new(
+        table_root.join(MANIFEST_CACHE_SUBDIR),
+        MANIFEST_CACHE_BUDGET_BYTES,
+    )
+    .map_err(|e| InfinoError::Io(e.to_string()))?;
+    Ok(Some((cache, manifest_cache)))
 }
 
 /// The cached handle for `name`, or `None` (after evicting it) if its table was
