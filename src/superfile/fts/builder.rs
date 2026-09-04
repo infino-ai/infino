@@ -1069,6 +1069,35 @@ fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, l
         }
     }
 
+    // Pass 4: repair within-rank doc order. The counting scatter above is
+    // stable, so within a rank `out` holds arrival order. The tokenizing
+    // ingest path always arrives in ascending doc order, but the
+    // compaction carry paths can feed a term's docs out of order (the
+    // multi-cell merge remaps postings through the packed row order), and
+    // the sorted-chunk contract downstream — the external-merge heap key
+    // and `encode_block`'s strictly-ascending doc ids — is `(lex_rank,
+    // doc_id)`. Scan each rank run and sort only the runs that need it:
+    // linear for the already-sorted ingest shape.
+    let mut run_start = 0usize;
+    let mut run_rank = lex_rank[triple_term_id(&out[0]) as usize];
+    let mut run_sorted = true;
+    for i in 1..=n {
+        let rank_at = |t: &[u32; N]| lex_rank[triple_term_id(t) as usize];
+        let boundary = i == n || rank_at(&out[i]) != run_rank;
+        if boundary {
+            if !run_sorted {
+                out[run_start..i].sort_unstable_by_key(|t| triple_doc_id(t));
+            }
+            if i < n {
+                run_rank = rank_at(&out[i]);
+            }
+            run_start = i;
+            run_sorted = true;
+        } else if triple_doc_id(&out[i]) < triple_doc_id(&out[i - 1]) {
+            run_sorted = false;
+        }
+    }
+
     *triples = out;
 }
 
@@ -3991,6 +4020,38 @@ fn sort_partition_to_file<const N: usize>(
 mod tests {
     use super::*;
     use crate::test_helpers::default_tokenizer as tokenizer;
+
+    /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
+    /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
+    /// order — the compaction carry paths feed postings remapped through
+    /// a packed row order, unlike the always-ascending ingest path. A
+    /// term-only stable scatter once preserved the unsorted arrival
+    /// order, and `encode_block` then indexed a bitset block out of
+    /// bounds on the merged output.
+    #[test]
+    fn radix_sort_orders_docs_within_term_for_unsorted_feeds() {
+        // 4 terms × enough triples to clear the radix threshold, docs
+        // deliberately fed in descending order per term.
+        let n_terms = 4u32;
+        let per_term = RADIX_SORT_MIN_TRIPLES as u32;
+        // Identity lex ranks (term ids already lexicographic).
+        let lex_rank: Vec<u32> = (0..n_terms).collect();
+        let mut triples: Vec<[u32; 3]> = Vec::new();
+        for doc in (0..per_term).rev() {
+            for term in 0..n_terms {
+                triples.push([term, doc, 1]);
+            }
+        }
+        assert!(triples.len() >= RADIX_SORT_MIN_TRIPLES);
+        radix_sort_records_by_lex_rank(&mut triples, &lex_rank);
+        let sorted = triples.windows(2).all(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let ka = (lex_rank[triple_term_id(a) as usize], triple_doc_id(a));
+            let kb = (lex_rank[triple_term_id(b) as usize], triple_doc_id(b));
+            ka < kb
+        });
+        assert!(sorted, "triples must come out in (lex_rank, doc_id) order");
+    }
 
     #[test]
     fn register_column_returns_sequential_ids() {
