@@ -90,13 +90,22 @@ impl Drop for RetryingTempDir {
         let path = dir.keep();
         let deadline = Instant::now() + CACHE_DIR_REMOVE_MAX_WAIT;
         loop {
-            let _ = fs::remove_dir_all(&path);
+            // Keep the last outcome for the give-up warning: a persistent
+            // error (e.g. permissions) reads very differently from an `Ok`
+            // whose tree reappeared under a still-running fill.
+            let last = fs::remove_dir_all(&path);
             if !path.exists() {
                 return;
             }
             if Instant::now() >= deadline {
+                let outcome = match &last {
+                    Ok(()) => "last removal returned Ok but the tree persisted \
+                               (still being recreated by a live fill?)"
+                        .to_string(),
+                    Err(e) => format!("last removal error: {e}"),
+                };
                 eprintln!(
-                    "[bench] WARNING: cache dir {} still present after {}s of removal retries",
+                    "[bench] WARNING: cache dir {} still present after {}s of removal retries; {outcome}",
                     path.display(),
                     CACHE_DIR_REMOVE_MAX_WAIT.as_secs()
                 );
