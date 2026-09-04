@@ -127,8 +127,8 @@ use crate::{
         fts::{
             bm25,
             reader::{
-                Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet,
-                PreparedClauses,
+                Bm25Stats, ClauseLists, GlobalTermIdf, NormalizedExpansion, OR_WINDOW_MIN_TERMS,
+                OrCursorSet, PreparedClauses, QueryExpansion,
             },
         },
     },
@@ -1959,6 +1959,49 @@ impl Supertable {
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("count", None))
     }
+
+    /// Register — or with `None`, clear — the query-time expansion (stop
+    /// terms and term groups) the full-text paths apply to `column`:
+    /// `bm25_search` when the call itself carries no expansion,
+    /// `token_match`, `count`, `hybrid_search`, and the SQL `bm25_search`
+    /// / `token_match` table functions. `exact_match` never expands.
+    ///
+    /// Every entry is normalized through the column's analyzer here,
+    /// once, so a query never pays for it; an entry that does not come out
+    /// as exactly one term is rejected with [`InfinoError::Config`] naming
+    /// the column and the entry, as is a column with no full-text index.
+    /// The registration lives on this open handle only — nothing is
+    /// persisted, a reopened table starts with none — and a query pins the
+    /// registrations it sees together with its manifest snapshot. An
+    /// expansion that changes nothing (empty, or groups that reduce to
+    /// their heads) is stored as no registration, so such a column keeps
+    /// running the unexpanded code exactly.
+    pub fn set_query_expansion(
+        &self,
+        column: &str,
+        expansion: Option<Arc<QueryExpansion>>,
+    ) -> Result<(), InfinoError> {
+        let options = self.options();
+        let Some(tokenizer) = options.try_fts_tokenizer_for(column) else {
+            return Err(
+                InfinoError::Config(no_fts_index_message(column, &options.fts_columns))
+                    .with_context("set_query_expansion", None),
+            );
+        };
+        let normalized = match expansion {
+            None => None,
+            Some(expansion) => {
+                let normalized = NormalizedExpansion::normalize(&expansion, tokenizer.as_ref())
+                    .map_err(|e| {
+                        InfinoError::Config(format!("query expansion for column {column:?}: {e}"))
+                            .with_context("set_query_expansion", None)
+                    })?;
+                (!normalized.is_empty()).then(|| Arc::new(normalized))
+            }
+        };
+        self.replace_query_expansion(column, normalized);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1976,8 +2019,9 @@ mod tests {
     use tokio::runtime::Builder;
     use uuid::Uuid;
 
-    use super::{Bm25Stats, BoolMode, FanOut, build_work_units, fanout_for};
+    use super::{Bm25Stats, BoolMode, FanOut, QueryExpansion, build_work_units, fanout_for};
     use crate::{
+        InfinoError,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -3720,6 +3764,41 @@ mod tests {
             st.count("title", "alpha -beta", BoolMode::Or)
                 .expect("count after delete"),
             2
+        );
+    }
+
+    #[test]
+    fn set_query_expansion_validates_the_column_and_every_entry() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let vocab = Arc::new(
+            QueryExpansion::new()
+                .stop(["the"])
+                .group("run", ["runs", "ran"]),
+        );
+        st.set_query_expansion("title", Some(Arc::clone(&vocab)))
+            .expect("a vocabulary of single terms registers on an FTS column");
+        st.set_query_expansion("title", None)
+            .expect("clearing a registration always succeeds");
+
+        // A column with no full-text index is a configuration error that
+        // names the column, not a silent no-op.
+        let err = st
+            .set_query_expansion("nope", Some(Arc::clone(&vocab)))
+            .expect_err("no FTS index on `nope`");
+        assert!(
+            matches!(&err, InfinoError::Config(m) if m.contains("nope")),
+            "got {err:?}"
+        );
+
+        // So is an entry the column's analyzer does not turn into exactly
+        // one term; the message names the column and the entry.
+        let two_words = Arc::new(QueryExpansion::new().group("run", ["new york"]));
+        let err = st
+            .set_query_expansion("title", Some(two_words))
+            .expect_err("a two-word member is refused");
+        assert!(
+            matches!(&err, InfinoError::Config(m) if m.contains("new york") && m.contains("title")),
+            "got {err:?}"
         );
     }
 }

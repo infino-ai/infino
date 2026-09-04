@@ -9,6 +9,8 @@
 
 use thiserror::Error;
 
+use crate::superfile::fts::reader::ExpansionError;
+
 /// Errors that can occur while building a superfile.
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -218,6 +220,13 @@ pub enum FtsError {
     /// of the vector path's variant.
     #[error("dictionary walk dropped its result during {0}")]
     TaskDropped(&'static str),
+
+    /// A query-time expansion (stop terms / term groups) carried an
+    /// entry the column's analyzer does not turn into exactly one term.
+    /// Malformed *request*, not a read failure — the caller supplied a
+    /// vocabulary that cannot be matched against this column's index.
+    #[error("query expansion: {0}")]
+    Expansion(#[from] ExpansionError),
 
     #[error("read error: {0}")]
     Read(#[from] ReadError),
