@@ -911,14 +911,16 @@ const TOP_K: usize = 10;
 
 /// Selected phases for a per-modality supertable runner.
 ///
-/// Read phases (`warm`, `cold`) still build the object-store table because
-/// they need the committed artifact; `build` controls whether the ingest
-/// section is emitted.
+/// Read phases (`warm`, `cold`, `quality`) still build the object-store
+/// table because they need the committed artifact; `build` controls whether
+/// the ingest section is emitted. `quality` grades what the FTS search path
+/// returns against a BM25 oracle (FTS only; the other modalities ignore it).
 #[derive(Clone, Copy)]
 pub struct Phases {
     pub build: bool,
     pub warm: bool,
     pub cold: bool,
+    pub quality: bool,
 }
 
 impl Phases {
@@ -926,7 +928,13 @@ impl Phases {
         build: true,
         warm: true,
         cold: true,
+        quality: true,
     };
+
+    /// Whether any read phase needs the built artifact opened in-process.
+    pub fn reads(&self) -> bool {
+        self.warm || self.cold || self.quality
+    }
 }
 
 /// Ingest a prepared corpus, sampling RSS over the build window. Returns the
@@ -1678,8 +1686,8 @@ pub mod fts {
         let mut report = Report::load("supertable_fts");
 
         // Build-only matches main `supertable_all`: one isolated subprocess
-        // with a clean RSS sample. Warm/cold need the artifact in-process.
-        if phases.build && !phases.warm && !phases.cold {
+        // with a clean RSS sample. Warm/cold/quality need the artifact in-process.
+        if phases.build && !phases.reads() {
             eprintln!(
                 "[supertable_fts] build-only: isolated ingest of {} docs to object storage...",
                 fmt_count(n_docs),
@@ -1710,10 +1718,24 @@ pub mod fts {
         // vector index but is still metered for phase parity.
         let run_lifecycle = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
-        if phases.warm || phases.cold {
+        if phases.reads() {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
             let reader = consumer.reader().expect("reader");
             exec_fts::assert_correct(&reader, supertable::TEXT_COLUMN, n_docs, "supertable_fts");
+            if phases.quality {
+                // Grades the pre-compact layout — the fragmented state a
+                // fresh ingest serves from, and the one where per-superfile
+                // statistics differ most from the corpus-wide oracle.
+                crate::fts_quality::run(
+                    &mut report,
+                    &reader,
+                    supertable::TEXT_COLUMN,
+                    n_docs,
+                    supertable::CORPUS_TEXT_SEED,
+                    "supertable_fts",
+                );
+                report.save();
+            }
             drop(consumer);
             drop(cache_dir);
         }

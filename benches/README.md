@@ -24,6 +24,7 @@ Raw logs: Actions artifacts on that run.
 ```sh
 cargo bench                              # all cells
 cargo bench -- supertable fts            # one cell
+cargo bench -- supertable fts quality corpus=realistic   # BM25 top-k parity vs oracle
 cargo bench -- superfile sql cold        # phases: build | warm | cold
 INFINO_BENCH_SUPERFILE_DOCS=100000 \
   cargo bench -- superfile fts warm      # plain ints only (no 100K suffix)
@@ -52,6 +53,13 @@ engine diagnostics (`info,infino=debug`); an explicit `RUST_LOG` overrides
 both.
 
 Synthetic FTS corpus: seed `1`, 200 Zipfian tokens/doc, 10K vocab.
+`corpus=realistic` swaps the text generator for one calibrated to English
+Wikipedia — log-normal doc lengths (median 89 tokens, 13% under 16, a 1%
+tail past 3000), an open Zipf vocabulary over 1M ranks (rank 1 in ~84% of
+docs), ~56% within-doc repeated tokens, and mixed-case / punctuation /
+digit surface forms — same seed, same `term{rank}` names, so the batteries
+apply to both. The quality table below is measured on it; the speed tables
+stay on the uniform corpus.
 Synthetic vectors: cosine, **1024-d**, seed `1` (archived tables below used 384-d).
 
 ### Object store
@@ -101,6 +109,9 @@ cargo bench -- dataset run datasets/bench-10m fts
 | `supertable sql` | | SQL |
 
 Each cell: `build`, `warm`, `cold`. Multi-cell runs isolate each cell in its own process (RSS).
+`supertable fts` also runs `quality` (part of `all`): the engine's BM25 top-k at
+k = 10 / 100 / 1000 graded against a streaming textbook oracle over the whole
+corpus, gated at recall ≥ 0.99 vs the engine's own length-quantized formula.
 
 Vector cells report a `default` config row; probe/rerank are not env-tunable.
 Recall is checked against brute-force ground truth.
@@ -212,6 +223,9 @@ JSON metrics land in `target/infino-bench/<bench>.json` (local only).
 | five_term_and | 2.13 ms | 11.33 ms | 1.17 GiB | 1.07 GiB | 1.17 GiB | 453.28 ms | 343.62 ms |
 | ten_term_and | 2.43 ms | 11.29 ms | 1.14 GiB | 1.06 GiB | 1.14 GiB | 392.86 ms | 304.12 ms |
 <!-- END: bench/fts/supertable/search -->
+
+<!-- BEGIN: bench/fts/supertable/quality -->
+<!-- END: bench/fts/supertable/quality -->
 
 ### Superfile vector
 

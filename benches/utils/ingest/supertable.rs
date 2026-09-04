@@ -100,7 +100,7 @@ pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
 
 pub(crate) const CORPUS_VEC_SEED: u64 = 1;
-const CORPUS_TEXT_SEED: u64 = 1;
+pub(crate) const CORPUS_TEXT_SEED: u64 = 1;
 /// Existing base-only vector corpus used instead of synthetic generation.
 const VECTOR_CORPUS_PATH_ENV: &str = "INFINO_BENCH_VECTOR_CORPUS_PATH";
 
