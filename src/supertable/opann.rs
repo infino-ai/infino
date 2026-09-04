@@ -827,6 +827,14 @@ pub(crate) fn fanout_prior_for_k(
 /// noise near the floor can otherwise invert two adjacent anchors). The ladder
 /// is expected ASCENDING in fanout; it is sorted defensively.
 ///
+/// The bar is `register_floor` (default 0.98) by design, NOT the full
+/// `target_recall`: the global-fine path's recall ceiling sits around 0.99, so
+/// grading each rung against the full target would leave every fanout short of
+/// the bar, stamp the sentinel `0` everywhere, and keep `auto` from ever
+/// engaging the graph. Whether 0.98 leaves the graph at recall parity with the
+/// stamped grid is a tracked follow-up (infino#714); this policy deliberately
+/// keeps the 0.98 acceptance bar until then.
+///
 /// [`CellRoutingParams::fanout_for_k_at`]: crate::supertable::manifest::list::CellRoutingParams::fanout_for_k_at
 pub(crate) fn fanout_knee_from_recalls(
     ladder: &[(u32, [f64; WIDTH_LAW_KS.len()])],

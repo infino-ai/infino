@@ -913,6 +913,23 @@ impl Supertable {
         let Some(hidden) = self.inner.vector_index_table.as_ref() else {
             return;
         };
+        // Under `auto`, only pin the resident graph when the table actually
+        // resolves to `centroid_graph`. The settle-side calibration ran (the
+        // column gate above fires for `auto` too, so the fanout is stamped), but
+        // an `auto` table that routes `stamped` never consults the resident
+        // graph — building and holding it would be pure wasted memory. Explicit
+        // `centroid_graph` always pins. Skipping is never a correctness risk:
+        // the query path rebuilds the router lazily if it ever needs it.
+        if config::global().vector.ivf_router == config::IvfRouter::Auto {
+            let manifest = hidden.inner.manifest.load_full();
+            if !crate::supertable::query::vector::auto_prefers_centroid_graph(
+                &manifest,
+                &column,
+                &config::global().vector,
+            ) {
+                return;
+            }
+        }
         let reader = match hidden.reader() {
             Ok(reader) => reader,
             Err(error) => {

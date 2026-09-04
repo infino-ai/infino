@@ -838,19 +838,60 @@ pub(crate) struct StampedCentroidRouter {
 /// metric — the router now scores per-metric, and single-vector-column tables
 /// are the common case). Pure and config-injected so the gating predicate and
 /// column pick are unit-testable without the process-global router config.
+///
+/// Fires for `auto` as well as `centroid_graph`: the settle-side calibration is
+/// what STAMPS the per-table `fanout_for_k`, and `auto_router_choice` needs that
+/// stamp as its input. Gate `auto` off here and a table run only under `auto`
+/// never calibrates, so its stamped fanout stays `None` and `auto` forever
+/// resolves to `stamped` — the graph would never engage. The serving-side eager
+/// build additionally resolves `auto` (see [`auto_prefers_centroid_graph`]) so
+/// it does not pin a resident graph for an `auto` table that routes `stamped`.
 pub(crate) fn select_eager_router_column(
     search_mode: config::VectorSearchMode,
     ivf_router: config::IvfRouter,
     global_fine_fanout: usize,
     vector_columns: &[crate::superfile::builder::VectorConfig],
 ) -> Option<String> {
-    if search_mode != config::VectorSearchMode::Ivf
-        || ivf_router != config::IvfRouter::CentroidGraph
-        || global_fine_fanout == 0
-    {
+    let router_engaged = matches!(
+        ivf_router,
+        config::IvfRouter::CentroidGraph | config::IvfRouter::Auto
+    );
+    if search_mode != config::VectorSearchMode::Ivf || !router_engaged || global_fine_fanout == 0 {
         return None;
     }
     vector_columns.first().map(|vc| vc.column.clone())
+}
+
+/// Whether an `auto` table's stamped state resolves to `centroid_graph` for at
+/// least one calibrated `k` — the serving-side eager-build gate. The query path
+/// resolves `auto` per the query's own `k` ([`auto_router_choice`]); the eager
+/// pre-warm has no single `k`, so it pins the resident graph when ANY calibrated
+/// anchor would route to it. That never skips a pin a real query needs (the
+/// stamped fanout is non-decreasing in `k`, so the concentration test is
+/// loosest at the smallest anchor), and skips the pin only for `auto` tables
+/// that route `stamped` at every `k` — the wasteful case this guards against.
+/// Resident inputs only (no I/O), matching the query-path gate.
+pub(crate) fn auto_prefers_centroid_graph(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    vcfg: &config::VectorSettings,
+) -> bool {
+    let Some(routing) = manifest.vector_cell_routing() else {
+        return false;
+    };
+    let total = total_fine_clusters(manifest, column);
+    let n_docs = manifest.n_docs_total();
+    crate::supertable::manifest::list::WIDTH_LAW_KS
+        .iter()
+        .any(|&k| {
+            auto_router_choice(
+                routing.fanout_for_k_at(k),
+                total,
+                n_docs,
+                vcfg.centroid_graph_concentration_ratio,
+                vcfg.centroid_graph_scale_floor_docs,
+            ) == config::IvfRouter::CentroidGraph
+        })
 }
 
 /// The configured [`Metric`] for `column`, or `None` when the column is not a
@@ -915,16 +956,27 @@ fn resolve_ivf_router(
     }
 }
 
-/// Total fine clusters across the hidden manifest for `column`: the sum of each
-/// resident cell summary's fine-centroid count, which equals the centroid
-/// router's node count. Resident, no I/O — the `auto` gate's concentration
-/// denominator.
+/// The centroid router's node count for `column`, reconstructed from the
+/// resident manifest — the `auto` gate's concentration denominator. Resident,
+/// no I/O.
+///
+/// This must be the SAME quantity the fanout was calibrated against, i.e.
+/// `router.node_map.len()`, not the nominal `n_cent` sum. The router's node walk
+/// ([`VectorReader::global_fine_cluster_vectors`]) skips cells with no indexed
+/// docs (`n_docs == 0 || n_cent == 0`), so a cell that summarizes to a nominal
+/// `n_cent` while holding no live rows contributes zero router nodes. Summing
+/// the nominal `n_cent` over those empty cells inflates the denominator and
+/// biases the `fanout < ratio × total` concentration test toward `true`,
+/// selecting `centroid_graph` where the calibrated fanout is not actually a
+/// concentrated subset of the routable clusters. Counting only cells with at
+/// least one indexed doc realigns the denominator with the calibration input.
 fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
     manifest
         .get_all_superfiles()
         .iter()
         .filter_map(|e| e.vector_summary.get(column))
         .flat_map(|s| s.cells.iter())
+        .filter(|c| c.clusters.n_cent > 0 && c.clusters.counts.iter().any(|&n| n > 0))
         .map(|c| c.clusters.n_cent as usize)
         .sum()
 }
@@ -1397,10 +1449,17 @@ fn score_rows_unified(
         .collect()
 }
 
-/// Uniform additive jitter applied to a sampled corpus row when it becomes a
+/// Per-component jitter applied to a sampled corpus row when it becomes a
 /// held-out calibration query, so measured recall reflects true off-node search
-/// rather than a row's trivial self-hit (matching the HNSW calibrator's own
-/// perturbation fraction).
+/// rather than a row's trivial self-hit. Expressed as a fraction of the row's
+/// own L2 norm: the HNSW calibrator renormalizes its queries to the unit plane,
+/// so its fixed `0.05` is already norm-relative; this path keeps queries RAW
+/// (the reader prepares the metric space), so a fixed absolute step would be
+/// negligible against a raw-magnitude L2Sq/NegDot row (components ~100) — the
+/// jittered query would sit on top of its source, route into its own rank-0
+/// cluster, and stamp a too-small fanout. Scaling by the norm makes the
+/// perturbation meaningful at every metric while leaving the ~unit Cosine case
+/// (its later normalize divides the norm out) unchanged.
 const ROUTER_CALIB_QUERY_JITTER: f32 = 0.05;
 
 /// Headroom over `k` for the per-query ground-truth candidate heap. Boundary
@@ -1508,6 +1567,26 @@ async fn sample_router_calibration_queries(
     let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
     for (entry, reader) in entries.iter().zip(readers.iter()) {
         let Some(vr) = reader.vec() else { continue };
+        // Draw queries from EXACTLY the superfile set the ground-truth scan
+        // covers. The GT scan ([`VectorReader::calibration_flat_cluster_rows`])
+        // and the router's node walk are both v2-only (a v1 single-cell pack has
+        // no global flat-cluster ids and contributes no router node), so a v1
+        // superfile's rows can enter neither the GT heaps nor the prefix pools.
+        // Were they still sampled as queries, GT would be computed over a corpus
+        // the queries don't match — a skewed stamp. The hidden index is written
+        // exclusively as MultiCellIvf packs, so a v1 reader here is not expected;
+        // skip it (keeping GT and queries on the same corpus) but say so.
+        if !vr.is_multi_cell() {
+            if vr.has_index_column(column) {
+                tracing::warn!(
+                    superfile = %entry.superfile_id,
+                    column,
+                    "router fanout calibrate: skipping an unexpected v1 (single-cell) superfile \
+                     in the hidden index; its rows are excluded from both queries and ground truth"
+                );
+            }
+            continue;
+        }
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
             .await
@@ -1548,10 +1627,18 @@ async fn sample_router_calibration_queries(
                     &mut v,
                 );
             }
-            for x in &mut v {
-                // Uniform [0,1) → [-1,1) scaled by the jitter fraction.
-                let u = (router_calib_rand(&mut jrng) >> 40) as f32 / (1u64 << 24) as f32;
-                *x += (u * 2.0 - 1.0) * ROUTER_CALIB_QUERY_JITTER;
+            // Scale the jitter to THIS row's L2 norm so the perturbation is the
+            // same relative size at every metric (a fixed absolute step vanishes
+            // against raw-magnitude L2Sq/NegDot rows). A degenerate zero vector
+            // has no scale to perturb, so it is left as-is.
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let jitter_scale = norm * ROUTER_CALIB_QUERY_JITTER;
+            if jitter_scale > 0.0 {
+                for x in &mut v {
+                    // Uniform [0,1) → [-1,1) scaled by the norm-relative fraction.
+                    let u = (router_calib_rand(&mut jrng) >> 40) as f32 / (1u64 << 24) as f32;
+                    *x += (u * 2.0 - 1.0) * jitter_scale;
+                }
             }
             v
         })
@@ -1769,6 +1856,11 @@ pub(crate) async fn calibrate_centroid_router_fanout(
         })
         .collect();
 
+    // The acceptance bar for the knee is `hnsw_register_floor` (default 0.98),
+    // NOT `target_recall`: the global-fine path's recall ceiling sits ~0.99, so
+    // requiring the full `target_recall` would leave every rung short of the bar
+    // and stamp the sentinel — `auto` would then never engage. The
+    // recall-parity-vs-stamped question this bar implies is a tracked follow-up.
     let knee = crate::supertable::opann::fanout_knee_from_recalls(
         &recall_ladder,
         vcfg.hnsw_register_floor,
@@ -1779,7 +1871,7 @@ pub(crate) async fn calibrate_centroid_router_fanout(
         total_fine,
         max_fanout,
         calib_k,
-        target = vcfg.target_recall,
+        acceptance_bar = vcfg.hnsw_register_floor,
         prior = ?prior,
         rungs = ?ladder,
         knee = ?knee,
@@ -7562,6 +7654,14 @@ mod tests {
             .as_deref(),
             Some("only"),
         );
+        // `auto` engages the settle-side build too: the calibration it runs is
+        // what stamps the fanout `auto_router_choice` reads. Gate it off and an
+        // `auto`-only table never calibrates → never routes centroid_graph.
+        assert_eq!(
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Auto, 32, &cols)
+                .as_deref(),
+            Some("nd"),
+        );
         // Gated off: default `stamped` router.
         assert_eq!(
             select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Stamped, 32, &cols),
@@ -7866,6 +7966,88 @@ mod tests {
         assert_eq!(
             resolve_ivf_router(IvfRouter::Auto, || IvfRouter::Stamped),
             IvfRouter::Stamped,
+        );
+    }
+
+    /// End-to-end gate for `ivf_router = auto`, spanning the settle-side
+    /// calibration trigger and the query-side resolution the previous test
+    /// exercised only in isolation with a hand-passed `Some(fanout)`. The gap it
+    /// closes: under `auto` the settle-side column gate used to return `None`, so
+    /// the fanout was never calibrated, so `fanout_for_k_at` was always `None`,
+    /// so `auto_router_choice` always saw an unstamped table and returned
+    /// `Stamped` — the graph could never engage. This checks the whole chain:
+    /// the settle gate FIRES under `auto` (calibration runs), the stamp it
+    /// produces resolves through `fanout_for_k_at`, and a concentrated fanout at
+    /// scale routes `centroid_graph`.
+    #[test]
+    fn auto_calibrates_then_routes_centroid_graph_end_to_end() {
+        use super::{auto_router_choice, select_eager_router_column};
+        use crate::config::{IvfRouter, VectorSearchMode};
+        use crate::supertable::manifest::list::{CellRoutingParams, WIDTH_LAW_KS};
+
+        let cols = vec![VectorConfig {
+            column: "emb".to_string(),
+            dim: 8,
+            rot_seed: 1,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        }];
+
+        // Step 1 — the settle-side column gate MUST fire under `auto`, or the
+        // fanout is never measured. This is the crux of the fix: pre-fix it
+        // returned `None` here and the rest of the chain never ran.
+        assert_eq!(
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Auto, 1024, &cols)
+                .as_deref(),
+            Some("emb"),
+            "auto must engage the settle-side calibration that stamps the fanout",
+        );
+
+        const RATIO: f64 = 0.5;
+        const FLOOR: u64 = 10_000_000;
+        const TOTAL_FINE: usize = 4000;
+        const N_DOCS: u64 = 12_000_000;
+
+        // Step 2 — the settle-side calibration stamps a real per-`k` fanout.
+        // A concentrated stamp (well under `RATIO × TOTAL_FINE = 2000`) at every
+        // anchor, sentinel `0` at the excluded k=1000 knot.
+        let stamped = CellRoutingParams {
+            fanout_for_k: [2, 8, 120, 0],
+            ..CellRoutingParams::default()
+        };
+
+        // Step 3 — the query path resolves that stamp per its `k`, and every
+        // calibrated anchor routes to the graph at scale.
+        for &k in &WIDTH_LAW_KS[..3] {
+            let stamped_fanout = stamped.fanout_for_k_at(k);
+            assert!(
+                stamped_fanout.is_some(),
+                "calibrated fanout must resolve at k={k}",
+            );
+            assert_eq!(
+                auto_router_choice(stamped_fanout, TOTAL_FINE, N_DOCS, RATIO, FLOOR),
+                IvfRouter::CentroidGraph,
+                "a concentrated stamped fanout at scale must route centroid_graph at k={k}",
+            );
+        }
+
+        // The pre-fix state made concrete: an `auto` table that never calibrated
+        // carries an all-zero fanout law, so `fanout_for_k_at` is `None` and
+        // `auto_router_choice` falls back to `Stamped` no matter the scale. This
+        // is exactly the dead-end the settle-side gate change escapes.
+        let uncalibrated = CellRoutingParams::default();
+        assert_eq!(uncalibrated.fanout_for_k_at(100), None);
+        assert_eq!(
+            auto_router_choice(
+                uncalibrated.fanout_for_k_at(100),
+                TOTAL_FINE,
+                N_DOCS,
+                RATIO,
+                FLOOR
+            ),
+            IvfRouter::Stamped,
+            "an uncalibrated auto table is stuck on stamped — the bug the fix removes",
         );
     }
 
@@ -9236,6 +9418,56 @@ mod tests {
         assert_eq!(postings.get(&1), Some(&10));
         assert_eq!(postings.get(&2), Some(&20));
         assert_eq!(postings.get(&3), Some(&30));
+    }
+
+    /// The `auto` concentration denominator ([`total_fine_clusters`]) must count
+    /// only the fine clusters the centroid router actually indexes — the same
+    /// quantity the fanout was calibrated against. The router's node walk skips
+    /// cells with no indexed docs, so a summarized-but-empty cell contributes no
+    /// router node; counting its nominal `n_cent` inflates the denominator and
+    /// biases the concentration test toward `centroid_graph`.
+    #[test]
+    fn total_fine_clusters_excludes_empty_cells() {
+        use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids, VectorSummary};
+
+        const DIM: u32 = 16;
+        let column = "emb";
+        // A cell with `n_cent` fine clusters whose per-cluster indexed counts are
+        // `counts` (all-zero counts = an empty cell that indexes no rows).
+        let cell = |cell_id: u32, n_cent: u32, counts: Vec<u32>| CellVectorSummary {
+            cell_id: Some(cell_id),
+            clusters: ClusterCentroids::from_fp32(
+                n_cent,
+                DIM,
+                &vec![cell_id as f32; (n_cent as usize) * DIM as usize],
+                counts,
+            ),
+        };
+
+        let sf_id = Uuid::from_u128(0xB0BA);
+        let mut entry = synthetic_entry(sf_id);
+        entry.vector_summary.insert(
+            column.into(),
+            VectorSummary {
+                centroid: vec![0.0; DIM as usize],
+                cells: vec![
+                    // Populated: 3 fine clusters, two of them carrying rows.
+                    cell(1, 3, vec![5, 0, 2]),
+                    // Empty: 4 nominal fine clusters, zero indexed rows. Pre-fix
+                    // this added 4 to the denominator though it has no node.
+                    cell(2, 4, vec![0, 0, 0, 0]),
+                ],
+            },
+        );
+
+        let opts = Arc::new(options_one_superfile_per_commit(DIM as usize));
+        let manifest = ManifestSnapshot::new(1, opts, vec![Arc::new(entry)], None, None);
+
+        assert_eq!(
+            super::total_fine_clusters(&manifest, column),
+            3,
+            "only the populated cell's fine clusters count toward the denominator",
+        );
     }
 
     /// `score_fine_candidates` must skip a superseded cell exactly as the

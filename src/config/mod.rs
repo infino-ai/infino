@@ -1164,9 +1164,10 @@ impl Config {
     /// overrides. Useful for tests and for documenting what the
     /// shipped default is independent of any host environment.
     pub fn defaults() -> Result<Self, ConfigError> {
-        let cfg: Config = Figment::new()
+        let mut cfg: Config = Figment::new()
             .merge(Yaml::string(EMBEDDED_DEFAULT))
             .extract()?;
+        cfg.clamp_vector_autotuning();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1180,9 +1181,60 @@ impl Config {
         // Before extraction, because extraction is exactly where a retired key
         // would vanish without trace.
         Self::reject_retired_keys(&fig)?;
-        let cfg: Config = fig.extract()?;
+        let mut cfg: Config = fig.extract()?;
+        cfg.clamp_vector_autotuning();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Warn on and clamp the `ivf_router = auto` tuning knobs, which arrive off
+    /// the same untrusted YAML surface as `target_recall` but — unlike it — had
+    /// no guard, so a NaN / negative / nonsensical value silently disabled the
+    /// gate (every `auto` table falling back to `stamped`) with no diagnostic.
+    /// Clamp rather than reject: these are optional tuning knobs, so a bad value
+    /// reverts to the shipped default with a loud warning instead of bricking
+    /// the whole process. Mirrors [`WidthLawCalibration::new`]'s target_recall
+    /// fallback, said once at load where the value is in hand.
+    fn clamp_vector_autotuning(&mut self) {
+        let v = &mut self.vector;
+        // Concentration ratio: `fanout < ratio × total_fine`. A non-finite or
+        // non-positive ratio makes the comparison meaningless (NaN is always
+        // false → gate disabled); a ratio above 1 is nonsensical (the fanout is
+        // clamped to the cluster total, so `> 1` makes concentration always
+        // true). Valid range is (0, 1].
+        if !(v.centroid_graph_concentration_ratio.is_finite()
+            && v.centroid_graph_concentration_ratio > 0.0
+            && v.centroid_graph_concentration_ratio <= 1.0)
+        {
+            tracing::warn!(
+                got = v.centroid_graph_concentration_ratio,
+                default = DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
+                "vector.centroid_graph_concentration_ratio must be finite and in (0, 1]; \
+                 falling back to the default (a bad value silently disables ivf_router = auto)"
+            );
+            v.centroid_graph_concentration_ratio = DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO;
+        }
+        // Scale floor: a 0 floor treats every table as "at scale", routing tiny
+        // tables to the graph the floor exists to keep them off of (measured
+        // loss below ~10M). Require a positive floor.
+        if v.centroid_graph_scale_floor_docs == 0 {
+            tracing::warn!(
+                default = DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
+                "vector.centroid_graph_scale_floor_docs must be positive; falling back to the \
+                 default (a 0 floor routes below-scale tables to a graph that loses there)"
+            );
+            v.centroid_graph_scale_floor_docs = DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS;
+        }
+        // Max fanout: the calibration sweep's ceiling. A 0 collapses the sweep
+        // to a single cluster (`max(1)`), stamping a degenerate fanout of 1.
+        if v.centroid_graph_max_fanout == 0 {
+            tracing::warn!(
+                default = DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
+                "vector.centroid_graph_max_fanout must be positive; falling back to the default \
+                 (a 0 ceiling collapses the fanout calibration sweep)"
+            );
+            v.centroid_graph_max_fanout = DEFAULT_CENTROID_GRAPH_MAX_FANOUT;
+        }
     }
 
     /// Fail the load if any [`RETIRED_CONFIG_KEYS`] entry is present, naming
@@ -1470,6 +1522,51 @@ mod tests {
         assert_eq!(overridden.vector.ivf_router, IvfRouter::Auto);
         assert_eq!(overridden.vector.centroid_graph_concentration_ratio, 0.25);
         assert_eq!(overridden.vector.centroid_graph_scale_floor_docs, 5_000_000);
+    }
+
+    /// A misconfigured `ivf_router = auto` threshold clamps to the shipped
+    /// default (with a load-time warning) instead of silently disabling the
+    /// gate. Load still succeeds — these are tuning knobs, not hard errors.
+    #[test]
+    fn centroid_graph_auto_thresholds_clamp_on_misconfig() {
+        let clamped = |patch: serde_json::Value| -> VectorSettings {
+            Config::from_figment(
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Serialized::defaults(patch)),
+            )
+            .expect("clamped config still loads")
+            .vector
+        };
+
+        // A negative / above-1 / NaN-equivalent ratio reverts to the default.
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_concentration_ratio": -0.2 } }))
+                .centroid_graph_concentration_ratio,
+            DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
+        );
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_concentration_ratio": 1.5 } }))
+                .centroid_graph_concentration_ratio,
+            DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
+        );
+        // A 0 scale floor and a 0 max fanout both revert to their defaults.
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_scale_floor_docs": 0 } }))
+                .centroid_graph_scale_floor_docs,
+            DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
+        );
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_max_fanout": 0 } }))
+                .centroid_graph_max_fanout,
+            DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
+        );
+        // A valid in-range ratio is left untouched.
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_concentration_ratio": 0.75 } }))
+                .centroid_graph_concentration_ratio,
+            0.75,
+        );
     }
 
     #[test]

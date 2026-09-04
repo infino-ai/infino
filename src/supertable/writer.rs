@@ -8413,6 +8413,16 @@ async fn build_and_publish_centroid_router_section(
     else {
         return (None, None);
     };
+    // Below the `auto` scale floor, `auto_router_choice` can only ever resolve
+    // to `stamped` (the graph measured a loss under ~10M), so building the
+    // router, running the recall sweep, and writing the section blob every drain
+    // is dead work. Skip it for `auto`-only tables under the floor. Explicit
+    // `centroid_graph` is forced regardless of scale and still builds here.
+    if vcfg.ivf_router == crate::config::IvfRouter::Auto
+        && manifest.n_docs_total() < vcfg.centroid_graph_scale_floor_docs
+    {
+        return (None, None);
+    }
     let section = match fetch_centroid_section(storage, centroids_ref, entries).await {
         Ok(section) => section,
         Err(error) => {
@@ -8881,14 +8891,30 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                 (resolved, fanout)
             }
         };
+        // A freshly measured fanout is stamped independently of the section blob
+        // (it is computed before the blob is written, so a section-write failure
+        // leaves `centroid_graph = None` while the fanout still changed). Treat
+        // "the measured fanout already matches what's stamped" as part of the
+        // no-op condition, so a changed fanout is never dropped by the
+        // short-circuit even when the section blob is unchanged.
+        let fanout_already_stamped = match measured_fanout {
+            None => true,
+            Some(fanout) => matches!(
+                old.get_partition_strategy(),
+                PartitionStrategy::VectorCell { routing, .. }
+                    if routing.fanout_for_k == fanout
+            ),
+        };
         // No-op only when NOTHING changed — routing blob, centroid section, the
-        // resolved graph ref, and the centroid-router section all already stamped.
+        // resolved graph ref, the centroid-router section, and the stamped
+        // fanout all already match.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
             && old.resident_vector_index_blob() == graphs_ref.as_ref()
             && old.slow_vector_state_centroid_graph_blob() == centroid_graph.as_ref()
+            && fanout_already_stamped
         {
             return Ok(());
         }
