@@ -1960,7 +1960,7 @@ impl VectorReader {
         &self,
         column: &str,
         superseded: Option<&BTreeSet<u32>>,
-    ) -> Option<Vec<(u32, i128, Vec<u8>)>> {
+    ) -> Option<Vec<(u32, EncodedCellRow)>> {
         if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
             return None;
         }
@@ -1972,7 +1972,12 @@ impl VectorReader {
             }
             let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
             for row in rows {
-                out.push((base + row.cluster, row.stable_id, row.encoded.codes));
+                // Carry the row's full encoded body (codec + per-cluster ruler),
+                // not just the raw codes: the calibrator decodes each row against
+                // its own quantizer, so an adaptive-grid (L2Sq/NegDot) row is
+                // measured in the space the served path scores it in. The stable
+                // id rides along inside `EncodedCellRow`.
+                out.push((base + row.cluster, row.encoded));
             }
         }
         Some(out)

@@ -105,7 +105,8 @@ use crate::{
         error::ReadError,
         fts::reader::BoolMode,
         vector::{
-            distance::{Metric, dequantize_sq16_into, distance, normalize, relative_score_window},
+            cell_posting::EncodedCellRow,
+            distance::{Metric, distance, normalize, relative_score_window},
             hnsw::{self, HnswParams, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{ProbeTally, ScanCandidate, ScanOutcome},
@@ -1340,7 +1341,7 @@ fn recall_by_fanout_for_query(
 /// superfile's rows. `selected_for_si[qi]` maps this superfile's selected flat
 /// cluster → its selection rank for query `qi`.
 fn score_rows_unified(
-    rows: Vec<(u32, i128, Vec<u8>)>,
+    rows: Vec<(u32, EncodedCellRow)>,
     selected_for_si: Vec<HashMap<u32, u32>>,
     queries_prepared: &[Vec<f32>],
     metric: Metric,
@@ -1351,25 +1352,36 @@ fn score_rows_unified(
     let nq = queries_prepared.len();
     let mut gt_heaps: Vec<BinaryHeap<GtCand>> = (0..nq).map(|_| BinaryHeap::new()).collect();
     let mut px_heaps: Vec<BinaryHeap<PrefixCand>> = (0..nq).map(|_| BinaryHeap::new()).collect();
-    let stride = dim * 2;
     let mut scratch = vec![0f32; dim];
-    for (flat, sid, codes) in &rows {
-        if codes.len() != stride {
+    for (flat, enc) in &rows {
+        // Decode each row against ITS OWN codec + per-cluster ruler, so an
+        // adaptive-grid row (the L2Sq/NegDot default `Sq16Adaptive`) is measured
+        // in the same space the served path scores it in. A fixed `[-1, 1]` grid
+        // decode is correct only for the fixed-grid `Sq16` (cosine) codec; using
+        // it on adaptive codes distorts every row and craters the measured recall.
+        let Some(ops) = enc.rerank_codec.ops() else {
+            continue;
+        };
+        if enc.codes.len() != dim * 2 {
             continue;
         }
-        dequantize_sq16_into(codes, &mut scratch);
+        ops.dequantize_row_into(
+            &enc.codes,
+            &enc.residuals,
+            dim,
+            &enc.scale,
+            &enc.offset,
+            &mut scratch,
+        );
         gfc_prepare_for_metric(metric, &mut scratch);
+        let sid = enc.stable_id;
         for qi in 0..nq {
             let dist = distance(metric, &queries_prepared[qi], &scratch);
-            gt_push(&mut gt_heaps[qi], GtCand { dist, sid: *sid }, gt_cap);
+            gt_push(&mut gt_heaps[qi], GtCand { dist, sid }, gt_cap);
             if let Some(&rank) = selected_for_si[qi].get(flat) {
                 prefix_push(
                     &mut px_heaps[qi],
-                    PrefixCand {
-                        dist,
-                        rank,
-                        sid: *sid,
-                    },
+                    PrefixCand { dist, rank, sid },
                     prefix_cap,
                 );
             }
@@ -1488,7 +1500,7 @@ async fn sample_router_calibration_queries(
     let stride = dim * 2;
     let empty_superseded = BTreeMap::new();
     let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
-    let mut reservoir: Vec<Vec<u8>> = Vec::with_capacity(nq);
+    let mut reservoir: Vec<EncodedCellRow> = Vec::with_capacity(nq);
     let mut seen: usize = 0;
     let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
     for (entry, reader) in entries.iter().zip(readers.iter()) {
@@ -1504,11 +1516,11 @@ async fn sample_router_calibration_queries(
                 continue;
             }
             if reservoir.len() < nq {
-                reservoir.push(row.encoded.codes);
+                reservoir.push(row.encoded);
             } else {
                 let j = (router_calib_rand(&mut rng) % (seen as u64 + 1)) as usize;
                 if j < nq {
-                    reservoir[j] = row.encoded.codes;
+                    reservoir[j] = row.encoded;
                 }
             }
             seen += 1;
@@ -1517,9 +1529,22 @@ async fn sample_router_calibration_queries(
     let mut jrng = seed ^ 0xD1B5_4A32_D192_ED03;
     let queries = reservoir
         .iter()
-        .map(|code| {
+        .map(|enc| {
+            // Reconstruct the sampled row against its own codec + per-cluster
+            // ruler. The adaptive-grid codec (L2Sq/NegDot) needs its fitted
+            // `scale`/`offset`; a fixed `[-1, 1]` grid decode would fabricate a
+            // distorted query that no longer sits near its own corpus row.
             let mut v = vec![0f32; dim];
-            dequantize_sq16_into(code, &mut v);
+            if let Some(ops) = enc.rerank_codec.ops() {
+                ops.dequantize_row_into(
+                    &enc.codes,
+                    &enc.residuals,
+                    dim,
+                    &enc.scale,
+                    &enc.offset,
+                    &mut v,
+                );
+            }
             for x in &mut v {
                 // Uniform [0,1) → [-1,1) scaled by the jitter fraction.
                 let u = (router_calib_rand(&mut jrng) >> 40) as f32 / (1u64 << 24) as f32;
@@ -6873,6 +6898,117 @@ mod tests {
         assert!(
             got.iter().all(|arr| arr[k1000].is_none()),
             "k=1000 is never measured (> ROUTER_CALIB_MAX_ANCHOR)"
+        );
+    }
+
+    /// The measured-recall calibrator must decode each corpus row against ITS
+    /// OWN codec + per-cluster ruler. The L2Sq/NegDot default codec
+    /// (`Sq16Adaptive`) stores a per-cluster fitted grid; decoding those codes
+    /// off the fixed `[-1, 1]` cosine grid distorts every row and mismeasures
+    /// recall. This fixture pins that: the router selects the true-nearest's
+    /// cluster (by fp32 centroid geometry, modelled here as the rank-0
+    /// selection), so a CORRECT decode measures recall@1 = 1.0, while the
+    /// fixed-grid mis-decode reorders the ground truth onto an UNSELECTED
+    /// cluster and measures 0.0. The cosine (fixed `Sq16`) leg guards the
+    /// already-correct path against regression.
+    #[test]
+    fn calibrator_measures_adaptive_recall_in_codec_space() {
+        use super::{gt_finalize, recall_by_fanout_for_query, score_rows_unified};
+        use crate::superfile::vector::{
+            cell_posting::EncodedCellRow,
+            distance::{encode_sq16_adaptive_row, encode_sq16_row},
+            rerank_codec::RerankCodec,
+        };
+        use crate::supertable::manifest::list::WIDTH_LAW_KS;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let dim = 2;
+        let k1 = WIDTH_LAW_KS
+            .iter()
+            .position(|&k| k == 1)
+            .expect("k=1 anchor");
+
+        // Run one fixture through the calibrator's own scan + finalize +
+        // nested-prefix recall, returning measured recall@1. `rows` are
+        // (flat cluster, encoded row); `selected` maps the query's selected flat
+        // clusters → rank; only the rank-0 (fanout 1) cluster's rows enter the
+        // pool, so a ground truth that lands in an unselected cluster is missed.
+        let measure = |rows: Vec<(u32, EncodedCellRow)>,
+                       selected: HashMap<u32, u32>,
+                       query: Vec<f32>,
+                       metric: Metric|
+         -> f64 {
+            let queries = vec![query];
+            let mut contrib = score_rows_unified(rows, vec![selected], &queries, metric, dim, 8, 8);
+            let (gt_cands, px_cands) = contrib.remove(0);
+            let gt = gt_finalize(gt_cands.into_iter().collect(), 1);
+            let per_fanout = recall_by_fanout_for_query(&px_cands, &gt, &[1u32], 1);
+            per_fanout[0][k1].expect("recall@1 measured")
+        };
+
+        // --- L2Sq, adaptive per-cluster ruler -----------------------------
+        // One ruler fit to the corpus range [1, 100] per dim. sid 1 lives in the
+        // near cluster (flat 0); sids 2/3 in the far cluster (flat 1). Decoded
+        // off the fixed [-1, 1] grid, sid 3's high codes collapse toward the
+        // origin and it spuriously outranks the true nearest sid 1 — the exact
+        // reorder this fix removes.
+        let scale = vec![(100.0f32 - 1.0) / 65535.0; dim];
+        let offset = vec![1.0f32; dim];
+        let adaptive = |v: &[f32], flat: u32, sid: i128| -> (u32, EncodedCellRow) {
+            let mut codes = vec![0u8; dim * 2];
+            encode_sq16_adaptive_row(v, &scale, &offset, &mut codes);
+            (
+                flat,
+                EncodedCellRow {
+                    stable_id: sid,
+                    rerank_codec: RerankCodec::Sq16Adaptive,
+                    scale: Arc::from(scale.clone()),
+                    offset: Arc::from(offset.clone()),
+                    codes,
+                    residuals: Vec::new(),
+                    norm_sq: None,
+                },
+            )
+        };
+        let l2_rows = vec![
+            adaptive(&[1.0, 1.0], 0, 1),
+            adaptive(&[100.0, 100.0], 1, 2),
+            adaptive(&[90.0, 90.0], 1, 3),
+        ];
+        let sel_l2 = HashMap::from([(0u32, 0u32)]);
+        let recall_l2 = measure(l2_rows, sel_l2, vec![0.0, 0.0], Metric::L2Sq);
+        assert!(
+            (recall_l2 - 1.0).abs() < 1e-9,
+            "L2Sq adaptive recall@1 must be 1.0 (fixed-grid mis-decode measures 0.0), got \
+             {recall_l2}"
+        );
+
+        // --- Cosine, fixed [-1, 1] grid (regression guard) ----------------
+        // sid 1 points along the query; sid 2 opposite. The fixed-grid decode is
+        // the correct codec here, so recall@1 stays 1.0 both before and after.
+        let cos_row = |v: &[f32], flat: u32, sid: i128| -> (u32, EncodedCellRow) {
+            let mut codes = vec![0u8; dim * 2];
+            encode_sq16_row(v, &mut codes);
+            (
+                flat,
+                EncodedCellRow {
+                    stable_id: sid,
+                    rerank_codec: RerankCodec::Sq16,
+                    scale: Arc::from(Vec::<f32>::new()),
+                    offset: Arc::from(Vec::<f32>::new()),
+                    codes,
+                    residuals: Vec::new(),
+                    norm_sq: None,
+                },
+            )
+        };
+        let cos_rows = vec![cos_row(&[0.9, 0.1], 0, 1), cos_row(&[-0.9, 0.1], 1, 2)];
+        let sel_cos = HashMap::from([(0u32, 0u32)]);
+        let recall_cos = measure(cos_rows, sel_cos, vec![1.0, 0.0], Metric::Cosine);
+        assert!(
+            (recall_cos - 1.0).abs() < 1e-9,
+            "cosine fixed-grid recall@1 must stay 1.0, got {recall_cos}"
         );
     }
 
