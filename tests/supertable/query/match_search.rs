@@ -329,6 +329,142 @@ fn vector_filter_restricts_hits_to_the_predicate_match_set() {
     );
 }
 
+/// Notes text for [`two_analyzer_table`], parallel to [`SEG1_TITLES`].
+/// `café` appears in exactly two docs; the accent matters — under the
+/// `standard` analyzer it is a real term, under `ascii_lower` the token
+/// is dropped entirely.
+const NOTES: &[&str] = &[
+    "café menu",     // 0
+    "tea list",      // 1
+    "café hours",    // 2
+    "water only",    // 3
+    "juice board",   // 4
+    "espresso shot", // 5
+    "matcha bowl",   // 6
+    "cold brew",     // 7
+];
+
+/// Schema `[title (ascii_lower FTS), notes (standard FTS), emb (vector)]`
+/// over [`SEG1_TITLES`] × [`NOTES`]: two FTS columns with DIFFERENT
+/// analyzers next to a vector column, one commit, one-hot embeddings.
+fn two_analyzer_table() -> Supertable {
+    let writer_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("writer pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("notes", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(DIM), false),
+    ]));
+    let st = Supertable::create(
+        SupertableOptions::new(
+            schema.clone(),
+            vec![
+                FtsConfig::new("title"),
+                FtsConfig::new("notes").analyzer("standard"),
+            ],
+            vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+        )
+        .expect("valid options")
+        .with_writer_pool(writer_pool),
+    )
+    .expect("create");
+
+    let titles = LargeStringArray::from(SEG1_TITLES.to_vec());
+    let notes = LargeStringArray::from(NOTES.to_vec());
+    let mut flat = Vec::<f32>::with_capacity(NOTES.len() * DIM);
+    for i in 0..NOTES.len() {
+        for d in 0..DIM {
+            flat.push(if d == i { 1.0 } else { 0.0 });
+        }
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(titles), Arc::new(notes), Arc::new(fsl)],
+    )
+    .expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    st
+}
+
+/// Regression: a `VectorFilter` predicate is tokenized with the FILTER
+/// COLUMN's analyzer, not any table-wide default. `café` is a real term
+/// only under the `standard` analyzer, so filtering on `notes`
+/// (standard) must return exactly the café rows, while the same
+/// predicate on `title` (ascii_lower, which drops non-ASCII tokens)
+/// must match nothing. The bug this pins: the predicate used to be
+/// tokenized with a single table-level tokenizer, so a filter on a
+/// standard-analyzer column silently tokenized to nothing and returned
+/// zero rows.
+#[test]
+fn vector_filter_tokenizes_with_the_filter_columns_analyzer() {
+    let st = two_analyzer_table();
+    let reader = st.reader().expect("reader");
+
+    // Ground truth from the engine's own per-column token match.
+    let allowed = stable_ids(
+        &reader
+            .token_match("notes", "café", BoolMode::Or)
+            .expect("token_match on the standard column"),
+    );
+    assert_eq!(allowed.len(), 2, "café appears in exactly two notes");
+
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "notes",
+                query: "café",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search on the standard column");
+    assert_eq!(
+        stable_ids(&hits),
+        allowed,
+        "the filter tokenized café with the notes column's standard \
+         analyzer and matched exactly its rows"
+    );
+
+    // The same predicate against the ascii_lower column tokenizes to
+    // nothing (non-ASCII dropped) — per-column analysis, not a blanket
+    // standard default.
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "café",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search on the ascii column");
+    assert!(
+        hits.is_empty(),
+        "ascii_lower drops the non-ASCII token, so the predicate \
+         matches nothing on the title column"
+    );
+}
+
 #[test]
 fn token_match_or_is_the_unranked_bm25_candidate_set() {
     let st = demo_two_superfiles();
