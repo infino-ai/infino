@@ -21,10 +21,11 @@
 //! waiting for the `SidecarCache` TTL window to close — these
 //! tests pin that behaviour.
 
-use std::sync::Arc;
+use std::{sync::Arc, thread::sleep, time::Duration};
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+    LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
 use chrono::Utc;
@@ -61,6 +62,9 @@ const RAYON_POOL_THREADS: usize = 1;
 const VECTOR_ROT_SEED: u64 = 42;
 /// Vector-search top-k for the tombstone-filtered ANN query.
 const VECTOR_SEARCH_K: usize = 5;
+/// Pause between two appends of one commit so the Snowflake `_id`s minted
+/// for them land in different millisecond ticks (a gapped id span).
+const ID_GAP_WAIT: Duration = Duration::from_millis(20);
 
 fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
     WalStateDoc {
@@ -84,6 +88,40 @@ fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
     }
 }
 
+/// Resolve the stable `_id` of the single row titled `title` by reading
+/// it back from the table.
+///
+/// Never derive a row's `_id` as `id_min + row_index`: the writer mints
+/// one 128-bit Snowflake id per row at `append` time, and two rows minted
+/// across a millisecond tick are not numerically adjacent (the timestamp
+/// field advances, the per-ms sequence resets). Under scheduler pressure
+/// that tick can land between any two rows of one append, so the
+/// arithmetic names an id no row carries while the engine correctly
+/// returns the row's real id — a once-intermittent failure of the vector
+/// test below.
+fn stable_id_of(st: &Supertable, title: &str) -> i128 {
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql(&format!(
+            "SELECT _id FROM supertable WHERE title = '{title}'"
+        ))
+        .expect("resolve _id by title");
+    let ids: Vec<i128> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id is Decimal128");
+            (0..col.len()).map(move |i| col.value(i))
+        })
+        .collect();
+    assert_eq!(ids.len(), 1, "expected exactly one row titled {title:?}");
+    ids[0]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fts_query_excludes_tombstoned_row() {
     let dir = TempDir::new().expect("tempdir");
@@ -105,14 +143,9 @@ async fn fts_query_excludes_tombstoned_row() {
     w.commit().expect("commit");
     drop(w);
 
-    // Resolve the middle row's `_id`. The producer assigned ids
-    // contiguously starting at `id_min`, so middle = id_min + 1.
-    let manifest = st.reader().expect("reader").manifest().clone();
-    let entry = manifest
-        .get_all_superfiles()
-        .first()
-        .expect("at least one superfile");
-    let target = entry.id_min + 1;
+    // Resolve the middle row's `_id` from the table (see `stable_id_of`
+    // for why `id_min + 1` is not a safe stand-in).
+    let target = stable_id_of(&st, "alpha bravo");
 
     // Drive the tombstone phase.
     let ws = WalStore::new(Arc::clone(&storage));
@@ -153,14 +186,9 @@ async fn sql_query_excludes_tombstoned_row() {
     w.commit().expect("commit");
     drop(w);
 
-    let manifest = st.reader().expect("reader").manifest().clone();
-    let entry = manifest
-        .get_all_superfiles()
-        .first()
-        .expect("at least one superfile");
-    // Tombstone two of the four rows: id_min and id_min+2.
-    let target_a = entry.id_min;
-    let target_b = entry.id_min + 2;
+    // Tombstone two of the four rows, "aa" and "cc".
+    let target_a = stable_id_of(&st, "aa");
+    let target_b = stable_id_of(&st, "cc");
 
     let ws = WalStore::new(Arc::clone(&storage));
     let wal_a = build_delete_wal(target_a, 9_000_011);
@@ -186,7 +214,7 @@ async fn sql_query_excludes_tombstoned_row() {
     let arr = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::Int64Array>()
+        .downcast_ref::<Int64Array>()
         .expect("count column");
     assert_eq!(arr.value(0), 2);
 
@@ -202,7 +230,7 @@ async fn sql_query_excludes_tombstoned_row() {
             let col = b
                 .column(0)
                 .as_any()
-                .downcast_ref::<arrow_array::LargeStringArray>()
+                .downcast_ref::<LargeStringArray>()
                 .expect("title column");
             (0..col.len()).map(move |i| col.value(i))
         })
@@ -219,18 +247,15 @@ async fn sql_query_excludes_tombstoned_row() {
 //    `local_doc_id` its unambiguous row index.
 //  - tombstone the query's nearest row via `Supertable::delete`.
 //  - `k=1` must return the next-nearest *live* row, never empty.
+//  - identities come from the table (`stable_id_of`), and the fixture
+//    deliberately mints row 0 and rows 1..N in different millisecond
+//    ticks so the superfile's `_id` span is gapped: row 1's `_id` is
+//    NOT `id_min + 1`, exactly the shape under which this test once
+//    failed intermittently.
 // Pre-fix the filter ran on the already-truncated top-k with no
 // backfill, so a deleted row in the top-k just vanished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vector_query_excludes_tombstoned_row() {
-    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
-    use infino::{
-        superfile::fts::tokenize::Tokenizer,
-        supertable::query::vector::VectorSearchOptions,
-        test_helpers::{default_tokenizer, default_vector_config},
-    };
-
     // The bench-tier default vector config is 16-dim cosine. Stick
     // with the same dim here so the test reuses the well-trodden
     // fixture-style config without re-tuning n_cent or codec.
@@ -324,17 +349,27 @@ async fn vector_query_excludes_tombstoned_row() {
     rows[1][0] = 0.99;
     rows[1][1] = 0.01;
 
+    // Two appends with a pause between them, one commit: row 0's `_id`
+    // is minted in an earlier millisecond tick than rows 1..N, so the
+    // superfile's id span is gapped. The single-thread writer pool still
+    // packs both appends into one superfile.
     let mut w = st.writer().expect("writer");
-    w.append(&vec_batch(&titles, &rows)).expect("append");
+    w.append(&vec_batch(&titles[..1], &rows[..1]))
+        .expect("append row 0");
+    sleep(ID_GAP_WAIT);
+    w.append(&vec_batch(&titles[1..], &rows[1..]))
+        .expect("append rows 1..N");
     w.commit().expect("commit");
     drop(w);
+    assert_eq!(
+        st.reader().expect("reader").n_superfiles(),
+        1,
+        "fixture must commit a single superfile"
+    );
 
-    let manifest = st.reader().expect("reader").manifest().clone();
-    let entry = manifest
-        .get_all_superfiles()
-        .first()
-        .expect("at least one superfile");
-    let target = entry.id_min; // stable `_id` for row 0
+    // Identities from the table, never `id_min` arithmetic.
+    let target = stable_id_of(&st, "row-0");
+    let nearest_live = stable_id_of(&st, "row-1");
 
     let stats = st.delete(col("title").eq(lit("row-0"))).expect("delete");
     assert_eq!(stats.n_tombstoned(), 1);
@@ -359,7 +394,7 @@ async fn vector_query_excludes_tombstoned_row() {
     );
     assert_eq!(
         top1[0].stable_id,
-        Some(target + 1),
+        Some(nearest_live),
         "k=1 must return the nearest live row, not the tombstoned one"
     );
 
