@@ -412,10 +412,16 @@ impl FtsReader {
         }
         let floor_eff = floor.next_down();
 
-        if lists.has_phrases() {
-            // Phrase-bearing query: the heterogeneous atom walks.
+        if lists.needs_atom_walk() {
+            // Phrase- or group-bearing query: the heterogeneous atom walks.
             let (must_atoms, must_dict) = self
-                .build_atom_cursors(column_id, lists.musts, lists.must_phrases, lists.global_idf)
+                .build_atom_cursors(
+                    column_id,
+                    lists.musts,
+                    lists.must_phrases,
+                    lists.must_groups,
+                    lists.global_idf,
+                )
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
                 // A must atom can never match in this superfile. The
@@ -434,6 +440,7 @@ impl FtsReader {
                     column_id,
                     lists.shoulds,
                     lists.should_phrases,
+                    lists.should_groups,
                     lists.global_idf,
                 )
                 .await?;
@@ -441,7 +448,13 @@ impl FtsReader {
             // Negatives are a hard exclusion filter, not scored, so their
             // idf is irrelevant — always build them local.
             let (negative_built, negative_dict) = self
-                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases, None)
+                .build_atom_cursors(
+                    column_id,
+                    lists.negatives,
+                    lists.negative_phrases,
+                    lists.negative_groups,
+                    None,
+                )
                 .await?;
             let negative_atoms: Vec<AnyCursor> = negative_built.into_iter().flatten().collect();
             let postings_bytes = atom_cursor_bytes(&must_atoms)

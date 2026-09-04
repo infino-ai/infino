@@ -1130,6 +1130,9 @@ impl SuperfileReader {
                 must_phrases: &must_phrases,
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
+                must_groups: &[],
+                should_groups: &[],
+                negative_groups: &[],
                 global_idf: None,
             },
             k,
@@ -1238,43 +1241,57 @@ impl SuperfileReader {
         Ok(fts.token_match_count(column, tokens, mode).await?)
     }
 
-    /// Phrase-aware unranked match: `local_doc_id`s whose `column`
-    /// matches the `terms` and exact `phrases` under `mode`,
-    /// ascending. Used by the table layer whenever the match set
-    /// contains a phrase; plain-token queries keep
+    /// Atom-aware unranked match: `local_doc_id`s whose `column` matches
+    /// the `terms`, exact `phrases` and term `groups` (any member present)
+    /// under `mode`, ascending. Used by the table layer whenever the match
+    /// set contains a phrase or a group; plain-token queries keep
     /// [`token_match`](Self::token_match).
     pub async fn atoms_match_ids(
         &self,
         column: &str,
         terms: &[&str],
         phrases: &[Vec<String>],
+        groups: &[Vec<String>],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.atoms_match_ids(column, terms, phrases, mode).await?)
+        Ok(fts
+            .atoms_match_ids(column, terms, phrases, groups, mode)
+            .await?)
     }
 
-    /// Phrase-aware unranked match **count** — the phrase sibling of
+    /// Atom-aware unranked match **count** — the atoms sibling of
     /// [`token_match_count`](Self::token_match_count). `neg_terms` /
-    /// `neg_phrases` are counted as a skip-based exclusion gate (a doc
-    /// matching any negated clause is not counted); pass empty slices for
-    /// an unnegated count.
+    /// `neg_phrases` / `neg_groups` are counted as a skip-based exclusion
+    /// gate (a doc matching any negated clause is not counted); pass empty
+    /// slices for an unnegated count.
     pub async fn atoms_match_count(
         &self,
         column: &str,
         terms: &[&str],
         phrases: &[Vec<String>],
+        groups: &[Vec<String>],
         mode: BoolMode,
         neg_terms: &[&str],
         neg_phrases: &[Vec<String>],
+        neg_groups: &[Vec<String>],
     ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .atoms_match_count(column, terms, phrases, mode, neg_terms, neg_phrases)
+            .atoms_match_count(
+                column,
+                terms,
+                phrases,
+                groups,
+                mode,
+                neg_terms,
+                neg_phrases,
+                neg_groups,
+            )
             .await?)
     }
 

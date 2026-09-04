@@ -11,6 +11,7 @@ mod cursor;
 mod expand;
 mod expansion;
 mod filter;
+mod group;
 mod metadata;
 mod options;
 mod phrase;

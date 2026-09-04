@@ -19,11 +19,15 @@
 //! per column on the table handle, or built for one call — and consults
 //! it at the single place a query is parsed.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    mem,
+};
 
 use thiserror::Error;
 
-use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::fts::tokenize::{ParsedQuery, Tokenizer};
 
 /// A query-time vocabulary applied to `bm25_search`, `token_match` and
 /// `count`: stop terms and term groups. Nothing in it knows a language or
@@ -164,6 +168,73 @@ impl NormalizedExpansion {
     pub(crate) fn is_empty(&self) -> bool {
         self.stop.is_empty() && self.groups.is_empty()
     }
+
+    /// Whether `term` (an analyzer output) is a stop term.
+    fn is_stop(&self, term: &str) -> bool {
+        self.stop.contains(term)
+    }
+
+    /// The group `term` heads — the head first, then its members — or
+    /// `None` when `term` is not a head.
+    fn group_for(&self, term: &str) -> Option<&[String]> {
+        self.groups.get(term).map(Vec::as_slice)
+    }
+
+    /// Apply this expansion to a freshly parsed query, before the default
+    /// operator resolves polarity — the one step every search path
+    /// (ranked and unranked) shares, so they can never disagree on what a
+    /// query means.
+    ///
+    /// 1. Stop removal touches the **bare** tokens only. A quoted phrase
+    ///    keeps every word, and a `+term` / `-term` keeps its sigil: an
+    ///    explicit sigil is the caller overriding the vocabulary. If
+    ///    removal would leave no bare token, no must and no phrase, the
+    ///    bare tokens are kept unchanged — to the caller, "nothing matched
+    ///    because every word was a stop term" is indistinguishable from a
+    ///    corpus miss, and `the who` on a music column must still find the
+    ///    band.
+    /// 2. Every remaining bare, `+` and `-` token that heads a group moves
+    ///    out of its term list into the matching group list as the head
+    ///    plus its members. Members are not chased through other groups,
+    ///    and phrase words are never expanded.
+    ///
+    /// An empty expansion hands `parsed` back untouched, allocating
+    /// nothing.
+    pub(crate) fn apply<'q>(&self, mut parsed: ParsedQuery<'q>) -> ParsedQuery<'q> {
+        if !self.stop.is_empty() && !parsed.positives.is_empty() {
+            let mut bare = mem::take(&mut parsed.positives);
+            let kept = bare.iter().filter(|t| !self.is_stop(t)).count();
+            let nothing_left = kept == 0
+                && parsed.musts.is_empty()
+                && parsed.must_phrases.is_empty()
+                && parsed.positive_phrases.is_empty();
+            if !nothing_left {
+                bare.retain(|t| !self.is_stop(t));
+            }
+            parsed.positives = bare;
+        }
+        if !self.groups.is_empty() {
+            self.split_groups(&mut parsed.musts, &mut parsed.must_groups);
+            self.split_groups(&mut parsed.positives, &mut parsed.positive_groups);
+            self.split_groups(&mut parsed.negatives, &mut parsed.negative_groups);
+        }
+        parsed
+    }
+
+    /// Move every token of `terms` that heads a group into `groups` (as
+    /// the head followed by its members); the rest stay in `terms`, in
+    /// their original order.
+    fn split_groups(&self, terms: &mut Vec<Cow<'_, str>>, groups: &mut Vec<Vec<String>>) {
+        if terms.is_empty() {
+            return;
+        }
+        for token in mem::take(terms) {
+            match self.group_for(&token) {
+                Some(members) => groups.push(members.to_vec()),
+                None => terms.push(token),
+            }
+        }
+    }
 }
 
 /// Tokenize one vocabulary entry, requiring exactly one term.
@@ -181,7 +252,7 @@ fn one_term(tokenizer: &dyn Tokenizer, entry: &str) -> Result<String, ExpansionE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+    use crate::superfile::fts::{reader::BoolMode, tokenize::AsciiLowerTokenizer};
 
     fn normalized(expansion: &QueryExpansion) -> NormalizedExpansion {
         NormalizedExpansion::normalize(expansion, &AsciiLowerTokenizer).expect("normalizes")
@@ -305,5 +376,154 @@ mod tests {
         let norm = normalized(&exp);
         assert!(norm.stop.contains("a") && norm.stop.contains("b"));
         assert!(group(&norm, "x").is_some() && group(&norm, "p").is_some());
+    }
+
+    // ---- apply: the parse-point rewrite ----
+
+    /// The test vocabulary: three stop terms and two families.
+    fn vocabulary() -> NormalizedExpansion {
+        normalized(
+            &QueryExpansion::new()
+                .stop(["the", "and", "of"])
+                .group("run", ["runs", "running", "ran"])
+                .group("fail", ["fails", "failing", "failed"]),
+        )
+    }
+
+    fn parse_and_apply<'q>(norm: &NormalizedExpansion, query: &'q str) -> ParsedQuery<'q> {
+        norm.apply(AsciiLowerTokenizer.parse(query))
+    }
+
+    fn strs<'a>(tokens: &'a [Cow<'a, str>]) -> Vec<&'a str> {
+        tokens.iter().map(|t| t.as_ref()).collect()
+    }
+
+    fn run_group() -> Vec<String> {
+        vec!["run".into(), "runs".into(), "running".into(), "ran".into()]
+    }
+
+    fn fail_group() -> Vec<String> {
+        vec![
+            "fail".into(),
+            "fails".into(),
+            "failing".into(),
+            "failed".into(),
+        ]
+    }
+
+    #[test]
+    fn stop_removal_touches_bare_tokens_only() {
+        let p = parse_and_apply(&vocabulary(), "the login and page +the -of");
+        assert_eq!(strs(&p.positives), vec!["login", "page"]);
+        // An explicit sigil keeps the term: the caller overrode the
+        // vocabulary.
+        assert_eq!(strs(&p.musts), vec!["the"]);
+        assert_eq!(strs(&p.negatives), vec!["of"]);
+    }
+
+    #[test]
+    fn phrase_words_are_never_removed_or_expanded() {
+        let p = parse_and_apply(&vocabulary(), "\"the who\" \"running fails\" the");
+        // The bare `the` goes; the quoted ones stay, unexpanded.
+        assert!(p.positives.is_empty());
+        assert_eq!(p.positive_phrases.len(), 2);
+        assert_eq!(strs(&p.positive_phrases[0]), vec!["the", "who"]);
+        assert_eq!(strs(&p.positive_phrases[1]), vec!["running", "fails"]);
+        assert!(p.positive_groups.is_empty());
+    }
+
+    #[test]
+    fn all_stop_query_keeps_its_bare_tokens() {
+        // Nothing but stop terms and no other positive atom: dropping them
+        // would make the query empty, so it is left alone.
+        let p = parse_and_apply(&vocabulary(), "the and of");
+        assert_eq!(strs(&p.positives), vec!["the", "and", "of"]);
+        // A negative alone does not rescue the query — there is still
+        // nothing positive to match, so the bare tokens stay.
+        let p = parse_and_apply(&vocabulary(), "the -login");
+        assert_eq!(strs(&p.positives), vec!["the"]);
+        assert_eq!(strs(&p.negatives), vec!["login"]);
+        // A must, a must-phrase or a bare phrase does rescue it: the stop
+        // terms go and the remaining atom carries the query.
+        let p = parse_and_apply(&vocabulary(), "+login the and");
+        assert!(p.positives.is_empty());
+        assert_eq!(strs(&p.musts), vec!["login"]);
+        let p = parse_and_apply(&vocabulary(), "\"login page\" the");
+        assert!(p.positives.is_empty());
+        assert_eq!(p.positive_phrases.len(), 1);
+        let p = parse_and_apply(&vocabulary(), "+\"login page\" of");
+        assert!(p.positives.is_empty());
+        assert_eq!(p.must_phrases.len(), 1);
+    }
+
+    #[test]
+    fn group_heads_move_into_the_matching_group_list() {
+        let p = parse_and_apply(&vocabulary(), "+run login fail -running -page");
+        assert_eq!(p.must_groups, vec![run_group()]);
+        assert!(p.musts.is_empty());
+        assert_eq!(strs(&p.positives), vec!["login"]);
+        assert_eq!(p.positive_groups, vec![fail_group()]);
+        // `running` is a member, not a head: it stays a literal negative.
+        assert_eq!(strs(&p.negatives), vec!["running", "page"]);
+        assert!(p.negative_groups.is_empty());
+    }
+
+    #[test]
+    fn members_are_not_chased_and_order_is_preserved() {
+        // `runs` heads its own group whose member `ran` is also a member of
+        // `run`; expanding `run` yields `run`'s list only — no transitive
+        // closure through `runs`.
+        let norm = normalized(
+            &QueryExpansion::new()
+                .group("run", ["runs", "ran"])
+                .group("runs", ["ran", "sprint"]),
+        );
+        let p = parse_and_apply(&norm, "alpha run beta runs gamma");
+        assert_eq!(strs(&p.positives), vec!["alpha", "beta", "gamma"]);
+        assert_eq!(
+            p.positive_groups,
+            vec![
+                vec!["run".to_string(), "runs".into(), "ran".into()],
+                vec!["runs".to_string(), "ran".into(), "sprint".into()],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stop_term_that_is_also_a_head_is_dropped_when_bare_and_expanded_when_sigiled() {
+        let norm = normalized(&QueryExpansion::new().stop(["run"]).group("run", ["runs"]));
+        let p = parse_and_apply(&norm, "run login");
+        assert_eq!(strs(&p.positives), vec!["login"]);
+        assert!(p.positive_groups.is_empty());
+        let p = parse_and_apply(&norm, "+run login");
+        assert_eq!(p.must_groups, vec![vec!["run".to_string(), "runs".into()]]);
+    }
+
+    #[test]
+    fn an_empty_expansion_leaves_the_parse_unchanged() {
+        let norm = normalized(&QueryExpansion::new());
+        let query = "+run the \"login page\" -fails";
+        let p = parse_and_apply(&norm, query);
+        let raw = AsciiLowerTokenizer.parse(query);
+        assert_eq!(strs(&p.musts), strs(&raw.musts));
+        assert_eq!(strs(&p.positives), strs(&raw.positives));
+        assert_eq!(strs(&p.negatives), strs(&raw.negatives));
+        assert_eq!(p.positive_phrases.len(), raw.positive_phrases.len());
+        assert!(p.must_groups.is_empty() && p.positive_groups.is_empty());
+        assert!(p.negative_groups.is_empty());
+    }
+
+    #[test]
+    fn into_clauses_resolves_bare_groups_by_mode() {
+        let p = parse_and_apply(&vocabulary(), "run +fail -ran");
+        let or = vocabulary()
+            .apply(AsciiLowerTokenizer.parse("run +fail -ran"))
+            .into_clauses(BoolMode::Or);
+        assert_eq!(or.should_groups, vec![run_group()]);
+        assert_eq!(or.must_groups, vec![fail_group()]);
+        assert_eq!(strs(&or.negatives), vec!["ran"]);
+        let and = p.into_clauses(BoolMode::And);
+        assert!(and.should_groups.is_empty());
+        assert_eq!(and.must_groups, vec![fail_group(), run_group()]);
     }
 }

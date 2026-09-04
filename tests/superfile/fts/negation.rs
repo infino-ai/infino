@@ -113,7 +113,7 @@ async fn count_with_negation_matches_corpus_truth() {
     // are identical on a positional index.
     let r = build_infino_superfile_positional(&corp);
     async fn count(r: &SuperfileReader, pos: &[&str], mode: BoolMode, neg: &[&str]) -> u64 {
-        r.atoms_match_count("title", pos, &[], mode, neg, &[])
+        r.atoms_match_count("title", pos, &[], &[], mode, neg, &[], &[])
             .await
             .expect("atoms_match_count")
             .0
@@ -155,8 +155,10 @@ async fn count_with_negation_matches_corpus_truth() {
             "title",
             &[],
             &phrase(&["web", "framework"]),
+            &[],
             BoolMode::And,
             &["go"],
+            &[],
             &[],
         )
         .await
@@ -180,9 +182,11 @@ async fn count_with_negation_matches_corpus_truth() {
             "title",
             &["web"],
             &[],
+            &[],
             BoolMode::Or,
             &[],
             &phrase(&["web", "framework"]),
+            &[],
         )
         .await
         .expect("atoms_match_count")
@@ -448,10 +452,19 @@ async fn count_negation_over_dense_bitset_corpus() {
         neg_terms: &[&str],
         neg_phrases: &[Vec<String>],
     ) -> u64 {
-        r.atoms_match_count("title", terms, phrases, mode, neg_terms, neg_phrases)
-            .await
-            .expect("atoms_match_count")
-            .0
+        r.atoms_match_count(
+            "title",
+            terms,
+            phrases,
+            &[],
+            mode,
+            neg_terms,
+            neg_phrases,
+            &[],
+        )
+        .await
+        .expect("atoms_match_count")
+        .0
     }
 
     let who_phrase = docs_with_phrase(&corp, &["the", "who"]);
