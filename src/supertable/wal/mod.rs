@@ -22,14 +22,19 @@
 //!
 //! - [`lease`] — advisory cooperative ownership: `try_acquire` /
 //!   `try_heartbeat` / `try_release` + a `spawn_heartbeat`
-//!   background task with stuck-worker detection.
+//!   background task with stuck-worker detection. The delete
+//!   path doesn't call `try_acquire` at all — it stamps the lease
+//!   into the doc it creates, so the WAL it is about to drive is
+//!   owned from birth.
 //! - [`pipeline`] — the append-phase + tombstone-phase
 //!   orchestrators that drive a WAL through its state machine
 //!   (Intent → Appended → Complete for UPDATE; Intent →
 //!   Complete for DELETE).
 //! - [`recovery`] — on-demand sweep that lists WALs at
-//!   `wal/mutations/*.json`, takes the lease, and drives each
-//!   non-`Complete` WAL through the rest of its pipeline.
+//!   `wal/mutations/*.json`, takes the lease where it is vacant
+//!   or expired, and drives each non-`Complete` WAL it wins
+//!   through the rest of its pipeline. WALs a live owner still
+//!   holds are skipped for the pass.
 //! - [`gc`] — sweep over `wal/mutations/*` reaping `Complete`
 //!   state docs past the wal-grace window + orphan `.arrow`
 //!   sidecars past the sidecar-grace window.

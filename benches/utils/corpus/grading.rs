@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-use crate::corpus::{self, DIM, LifecycleGroundTruth};
+use crate::corpus::{self, LifecycleGroundTruth, dim};
 
 const CACHE_MAGIC: &[u8; 8] = b"INFLGT02";
 const CACHE_VERSION: u32 = 2;
@@ -58,7 +58,7 @@ impl CacheKey {
         Self {
             n_docs: options.n_docs as u64,
             augmented_docs: options.augmented_docs as u64,
-            dim: DIM as u64,
+            dim: dim() as u64,
             n_cent: corpus::n_cent(options.n_docs) as u64,
             corpus_seed: options.corpus_seed,
             normalized_vectors: options.normalized_vectors,
@@ -109,7 +109,7 @@ pub fn lifecycle_ground_truth_cached(options: LifecycleGradingOptions<'_>) -> Li
 
     assert_eq!(
         options.vectors.len(),
-        options.augmented_docs * DIM,
+        options.augmented_docs * dim(),
         "cannot recompute lifecycle ground truth from a base-only vector corpus; \
          set {GROUND_TRUTH_PATH_ENV} to a valid existing oracle cache"
     );
@@ -212,15 +212,15 @@ fn validate_options(options: &LifecycleGradingOptions<'_>) {
     assert!(options.n_docs > 0);
     assert!(options.n_docs <= options.augmented_docs);
     assert!(
-        options.vectors.len() == options.n_docs * DIM
-            || options.vectors.len() == options.augmented_docs * DIM,
+        options.vectors.len() == options.n_docs * dim()
+            || options.vectors.len() == options.augmented_docs * dim(),
         "lifecycle vector corpus must contain either the base or augmented row count"
     );
     assert!(options.filter_keep_every > 0);
     assert!(options.top_k > 0);
     assert!(options.correctness_query_count <= options.queries.len());
     for query in options.queries {
-        assert_eq!(query.len(), DIM);
+        assert_eq!(query.len(), dim());
     }
 }
 
@@ -357,7 +357,7 @@ fn pull_key(cursor: &mut &[u8]) -> Result<CacheKey> {
 
 fn push_queries(bytes: &mut Vec<u8>, queries: &[Vec<f32>]) {
     bytes.extend_from_slice(&(queries.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&(DIM as u64).to_le_bytes());
+    bytes.extend_from_slice(&(dim() as u64).to_le_bytes());
     for query in queries {
         for value in query {
             bytes.extend_from_slice(&value.to_bits().to_le_bytes());
@@ -366,7 +366,7 @@ fn push_queries(bytes: &mut Vec<u8>, queries: &[Vec<f32>]) {
 }
 
 fn validate_queries(cursor: &mut &[u8], expected: &[Vec<f32>]) -> Result<()> {
-    if read_u64(cursor)? as usize != expected.len() || read_u64(cursor)? as usize != DIM {
+    if read_u64(cursor)? as usize != expected.len() || read_u64(cursor)? as usize != dim() {
         return invalid_data("lifecycle ground-truth cache query shape mismatch");
     }
     for query in expected {
@@ -381,15 +381,15 @@ fn validate_queries(cursor: &mut &[u8], expected: &[Vec<f32>]) -> Result<()> {
 
 fn pull_queries(cursor: &mut &[u8]) -> Result<Vec<Vec<f32>>> {
     let count = read_u64(cursor)? as usize;
-    let dim = read_u64(cursor)? as usize;
-    if dim != DIM {
+    let stored_dim = read_u64(cursor)? as usize;
+    if stored_dim != dim() {
         return invalid_data("lifecycle ground-truth cache query dim mismatch");
     }
     // Bound the claimed count by the bytes actually present before allocating,
     // so a corrupt count can't drive a huge Vec::with_capacity (mirrors the
     // validate-before-allocate guard in pull_ground_truth).
     if count
-        .checked_mul(dim)
+        .checked_mul(stored_dim)
         .and_then(|n| n.checked_mul(4))
         .is_none_or(|need| need > cursor.len())
     {
@@ -397,8 +397,8 @@ fn pull_queries(cursor: &mut &[u8]) -> Result<Vec<Vec<f32>>> {
     }
     let mut queries = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut query = Vec::with_capacity(dim);
-        for _ in 0..dim {
+        let mut query = Vec::with_capacity(stored_dim);
+        for _ in 0..stored_dim {
             query.push(f32::from_bits(read_u32(cursor)?));
         }
         queries.push(query);

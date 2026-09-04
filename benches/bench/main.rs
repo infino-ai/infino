@@ -16,7 +16,7 @@
 //! cargo bench -- supertable vector build cold
 //!
 //! # Diagnostics (standalone programs, same binary):
-//! cargo bench -- diagnostic              # all eight
+//! cargo bench -- diagnostic              # all nine
 //! cargo bench -- diagnostic scale        # a subset, grouped
 //! cargo bench -- tombstone               # bare names also work
 //!
@@ -29,14 +29,16 @@
 //! Token vocabulary:
 //!   tier        : `superfile` | `supertable`        (omitted => both)
 //!   modality    : `fts` | `vector` | `sql`          (omitted => all three)
-//!   phase       : `build` | `warm` | `cold` | `search` (= warm+cold)
+//!   phase       : `build` | `warm` | `cold` | `quality` | `search` (= warm+cold)
+//!                 (`quality` = FTS BM25 top-k parity vs a textbook oracle;
+//!                 supertable fts only, other cells ignore it)
 //!                 (omitted => all three phases)
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `object-store` | `concurrent` | `disk-warm`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `object-store` | `concurrent` | `disk-warm` | `write-diag`,
 //!                 by name, or grouped under the `diagnostic` keyword —
-//!                 `cargo bench -- diagnostic` runs all eight,
+//!                 `cargo bench -- diagnostic` runs all nine,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
@@ -45,7 +47,7 @@
 //! plain integers) and object-store backend (`INFINO_BENCH_STORE`) are env
 //! knobs.
 
-use infino_bench_utils::supertable::Phases;
+use infino_bench_utils::{corpus, supertable::Phases};
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +74,7 @@ enum Diagnostic {
     Concurrent,
     DiskWarm,
     RecallWhileIngest,
+    WriteDiag,
 }
 
 impl Diagnostic {
@@ -86,6 +89,7 @@ impl Diagnostic {
             Diagnostic::Concurrent => "concurrent",
             Diagnostic::DiskWarm => "disk-warm",
             Diagnostic::RecallWhileIngest => "recall_while_ingest",
+            Diagnostic::WriteDiag => "write-diag",
         }
     }
 
@@ -108,6 +112,7 @@ impl Diagnostic {
                 );
             }
             Diagnostic::RecallWhileIngest => infino_bench_utils::recall_while_ingest::run(),
+            Diagnostic::WriteDiag => infino_bench_utils::write_diag::run(),
         }
     }
 }
@@ -172,6 +177,17 @@ fn run_cell_in_child(tier: Tier, modality: Modality, phases: Phases, phase_selec
         if phases.cold {
             cmd.arg("cold");
         }
+        if phases.quality {
+            cmd.arg("quality");
+        }
+    }
+    // The corpus selector is process-wide state installed from the
+    // arguments, so a child that did not receive it would silently run
+    // the default corpus under the parent's label.
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with("corpus=") || arg.starts_with("corpus-dir=") {
+            cmd.arg(arg);
+        }
     }
     let status = cmd.status().expect("spawn bench cell child");
     if !status.success() {
@@ -193,7 +209,7 @@ enum DatasetVerb {
 
 fn dataset_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "Usage:\n  cargo bench -- dataset <prepare|bench|run> <prefix> [fts|vector|sql ...] [warm|cold|search]\n\
+        "Usage:\n  cargo bench -- dataset <prepare|bench|run> <prefix> [fts|vector|sql ...] [warm|cold|quality|search]\n\
          \n\
          prepare : ingest the corpus to <prefix> and write the sidecar (fails if already there)\n\
          bench   : open the dataset at <prefix> and run the read phases (fails if absent)\n\
@@ -227,7 +243,7 @@ fn run_dataset_command(tokens: &[String]) {
     };
     let mut prefix: Option<&str> = None;
     let mut modalities: Vec<Modality> = Vec::new();
-    let (mut warm, mut cold) = (false, false);
+    let (mut warm, mut cold, mut quality) = (false, false, false);
     for tok in &tokens[1..] {
         match tok.as_str() {
             "fts" if !modalities.contains(&Modality::Fts) => modalities.push(Modality::Fts),
@@ -238,6 +254,7 @@ fn run_dataset_command(tokens: &[String]) {
             "fts" | "vector" | "sql" => {}
             "warm" => warm = true,
             "cold" => cold = true,
+            "quality" => quality = true,
             "search" => {
                 warm = true;
                 cold = true;
@@ -260,9 +277,10 @@ fn run_dataset_command(tokens: &[String]) {
     if modalities.is_empty() {
         modalities = vec![Modality::Fts, Modality::Vector, Modality::Sql];
     }
-    if !(warm || cold) {
+    if !(warm || cold || quality) {
         warm = true;
         cold = true;
+        quality = true;
     }
 
     for &m in &modalities {
@@ -283,11 +301,13 @@ fn run_dataset_command(tokens: &[String]) {
                 build: true,
                 warm: false,
                 cold: false,
+                quality: false,
             },
             (DatasetVerb::Bench, true) => Phases {
                 build: false,
                 warm,
                 cold,
+                quality,
             },
             (DatasetVerb::Run, exists) => {
                 if exists {
@@ -297,6 +317,7 @@ fn run_dataset_command(tokens: &[String]) {
                     build: !exists,
                     warm,
                     cold,
+                    quality,
                 }
             }
         };
@@ -311,18 +332,35 @@ fn print_usage_and_exit(code: i32) -> ! {
          \n\
          Tier      : superfile | supertable        (omitted => both)\n\
          Modality  : fts | vector | sql            (omitted => all three)\n\
-         Phase     : build | warm | cold | search  (search = warm+cold; omitted => all)\n\
+         Phase     : build | warm | cold | quality | search  (search = warm+cold; omitted => all;\n\
+         \x20           quality = FTS BM25 parity vs a textbook oracle, supertable fts only)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
          Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | disk-warm | recall_while_ingest,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
+         \n\
+         corpus=<spec>     : corpus source (default synthetic). Vector cells\n\
+         \x20                   always consume it; supertable fts/sql consume its\n\
+         \x20                   text (the dataset must carry a text column); the\n\
+         \x20                   superfile sql cell ingests its schema; superfile\n\
+         \x20                   fts is synthetic-only and refuses it.\n\
+         \x20   synthetic          seeded planted-cluster generator\n\
+         \x20   annb:<slug>        published ann-benchmarks dataset; ships official\n\
+         \x20                      queries + top-k neighbours (glove-100-angular,\n\
+         \x20                      sift-128-euclidean, deep-image-96-angular, ...)\n\
+         \x20   hf:<owner/repo>    Hugging Face parquet dataset; real embeddings at\n\
+         \x20                      scale, ground truth computed from the ingested rows\n\
+         \x20   parquet:<dir>      local directory of *.parquet shards, read in\n\
+         \x20                      name order (no download)\n\
+         corpus-dir=<path> : where downloadable corpora are staged\n\
          \n\
          Examples:\n\
          \x20 cargo bench\n\
          \x20 cargo bench -- supertable\n\
          \x20 cargo bench -- superfile fts\n\
          \x20 cargo bench -- supertable sql warm\n\
-         \x20 cargo bench -- tombstone\n"
+         \x20 cargo bench -- tombstone\n\
+         \x20 cargo bench -- supertable vector corpus=annb:glove-100-angular corpus-dir=/data/annb\n"
     );
     std::process::exit(code);
 }
@@ -358,9 +396,15 @@ fn parse_args() -> Selection {
     let mut build = false;
     let mut warm = false;
     let mut cold = false;
+    let mut quality = false;
     let mut want_all = false;
     let mut want_diagnostics = false;
     let mut unknown: Vec<String> = Vec::new();
+    // Corpus selection is an ARGUMENT, not an env var: the bench tier's
+    // only env-tunable knobs are the two doc counts, and a corpus that can
+    // change from the environment silently makes two runs incomparable.
+    let mut corpus_spec: Option<String> = None;
+    let mut corpus_dir: Option<String> = None;
 
     let push_tier = |t: Tier, tiers: &mut Vec<Tier>| {
         if !tiers.contains(&t) {
@@ -391,6 +435,7 @@ fn parse_args() -> Selection {
             "build" => build = true,
             "warm" => warm = true,
             "cold" => cold = true,
+            "quality" => quality = true,
             "search" => {
                 warm = true;
                 cold = true;
@@ -404,13 +449,30 @@ fn parse_args() -> Selection {
             "concurrent" => diagnostics.push(Diagnostic::Concurrent),
             "disk-warm" | "disk_warm" => diagnostics.push(Diagnostic::DiskWarm),
             "recall_while_ingest" => diagnostics.push(Diagnostic::RecallWhileIngest),
+            "write-diag" | "write_diag" => diagnostics.push(Diagnostic::WriteDiag),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
-            other => unknown.push(other.to_string()),
+            other => match other.split_once('=') {
+                Some(("corpus", spec)) => corpus_spec = Some(spec.to_string()),
+                Some(("corpus-dir", dir)) => corpus_dir = Some(dir.to_string()),
+                _ => unknown.push(other.to_string()),
+            },
         }
     }
 
     if !unknown.is_empty() {
         eprintln!("[bench] unknown selector(s): {}", unknown.join(", "));
+        print_usage_and_exit(2);
+    }
+
+    // Install before any tier runs: the source resolves once per process
+    // and every corpus read goes through it.
+    if let Some(spec) = corpus_spec.as_deref()
+        && let Err(err) = corpus::set_source(spec, corpus_dir.as_deref())
+    {
+        eprintln!("[bench] {err}");
+        print_usage_and_exit(2);
+    } else if corpus_dir.is_some() && corpus_spec.is_none() {
+        eprintln!("[bench] corpus-dir= given without corpus=; nothing would read it");
         print_usage_and_exit(2);
     }
 
@@ -428,12 +490,18 @@ fn parse_args() -> Selection {
             Diagnostic::ObjectStore,
             Diagnostic::Concurrent,
             Diagnostic::DiskWarm,
+            Diagnostic::WriteDiag,
         ];
     }
 
-    let phase_selected = build || warm || cold;
+    let phase_selected = build || warm || cold || quality;
     let phases = if phase_selected {
-        Phases { build, warm, cold }
+        Phases {
+            build,
+            warm,
+            cold,
+            quality,
+        }
     } else {
         Phases::ALL
     };
@@ -450,14 +518,39 @@ fn parse_args() -> Selection {
 }
 
 fn main() {
+    // Every bench run installs a subscriber, unconditionally — but QUIET by
+    // default: warnings and errors only, so the engine's declines (an index
+    // refusing to register, a query falling back to ivf) still surface while
+    // the per-query DEBUG chatter stays out of bench logs. The measured
+    // tables are println-based and unaffected either way.
+    //
+    // `--debug` restores the full engine diagnostics (`info,infino=debug`).
+    // An explicit `RUST_LOG` beats both — an operator who states a directive
+    // gets that directive.
+    //
     // Span-timing diagnosis: with a `--features detailed-tracing` build,
-    // `INFINO_TRACE_SPANS=1` (+ `RUST_LOG=infino=info`) prints every
-    // instrumented span's busy time on close — per-stage attribution for
-    // query-path latency without touching engine code.
+    // `INFINO_TRACE_SPANS=1` additionally prints every instrumented span's
+    // busy time on close — per-stage attribution for query-path latency
+    // without touching engine code.
+    let debug_flag = std::env::args().any(|a| a == "--debug");
+    let env_filter = move || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(if debug_flag {
+                "info,infino=debug"
+            } else {
+                "warn"
+            })
+        })
+    };
     if std::env::var("INFINO_TRACE_SPANS").is_ok() {
         tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
+            .with_env_filter(env_filter())
             .with_span_events(FmtSpan::CLOSE)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
             .with_writer(std::io::stderr)
             .init();
     }

@@ -23,8 +23,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::{
     error::{DataFusionError, Result as DfResult},
+    execution::TaskContext,
     logical_expr::Expr,
-    physical_plan::ExecutionPlan,
+    physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
 use futures::{
@@ -57,7 +58,8 @@ use crate::{
         manifest::SuperfileUri,
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
-            SuperfileHit, superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
+            SuperfileHit, exec::metered_exec::MeteredExec, superfile_reader::superfile_reader,
+            vector::row_id_from_manifest_entry,
         },
     },
 };
@@ -81,6 +83,72 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
     }
 }
 
+/// Meter, execute and account for one physical plan: wrap the root in
+/// [`MeteredExec`], collect, then harvest the executed plan's own
+/// metrics. The three steps belong together — a site that collects
+/// without harvesting reports CPU, page bytes and ranges with no row
+/// count beside them, which is how the mutation predicate resolve once
+/// reported zero decoded rows for a scan it genuinely paid for. Every
+/// SQL execution site (catalog, reader-level, predicate resolve) goes
+/// through here; error mapping stays with the caller, whose surface it
+/// belongs to.
+pub(crate) async fn collect_plan_metered(
+    plan: &Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> DfResult<Vec<RecordBatch>> {
+    let metered: Arc<dyn ExecutionPlan> =
+        Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
+    let batches = collect(metered, task_ctx).await?;
+    // Harvesting the unwrapped plan and the wrapped one reach the same
+    // leaves — the walk dedupes by node identity and sums childless nodes
+    // only, and the meter delegates `execute` to this same tree.
+    harvest_datafusion_metrics(plan, op_stats);
+    Ok(batches)
+}
+
+/// Fold DataFusion's row instrumentation into the per-query stats after a
+/// SQL plan has executed: leaf (source) operators' `output_rows` sum into
+/// `rows_materialized` — the rows the scans decoded from storage.
+///
+/// Deliberately NOT `elapsed_compute`. That is an `Instant` timer around
+/// synchronous poll sections — wall time, so on a busy host it counts
+/// whatever the thread was descheduled for, the exact contention bleed
+/// per-op metering exists to remove. It also omits Parquet decode
+/// entirely. CPU now comes from
+/// [`MeteredExec`](crate::supertable::query::exec::metered_exec::MeteredExec),
+/// which brackets each scan poll with the same thread-CPU clock the
+/// search kernels use, so SQL and search are priced on one clock.
+pub(crate) fn harvest_datafusion_metrics(
+    plan: &Arc<dyn ExecutionPlan>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) {
+    // Deduped by node identity: plans are trees in practice, but nothing
+    // forbids an operator `Arc` appearing under two parents, and a shared
+    // node's metrics must not be added once per path.
+    fn walk(node: &Arc<dyn ExecutionPlan>, seen: &mut HashSet<usize>, leaf_rows: &mut u64) {
+        if !seen.insert(Arc::as_ptr(node) as *const () as usize) {
+            return;
+        }
+        if let Some(metrics) = node.metrics()
+            && node.children().is_empty()
+            && let Some(rows) = metrics.output_rows()
+        {
+            *leaf_rows += rows as u64;
+        }
+        for child in node.children() {
+            walk(child, seen, leaf_rows);
+        }
+    }
+    let Some(stats) = op_stats else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    let mut leaf_rows = 0u64;
+    walk(plan, &mut seen, &mut leaf_rows);
+    stats.add_rows_materialized(leaf_rows);
+}
+
 /// Resolve `hits` to one `RecordBatch`, with `projection` naming the
 /// output columns (any of `_id`, the visible scalar columns, or the
 /// trailing `score`); `None` returns the engine-native `_id` + `score`
@@ -89,63 +157,14 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// by every public row-returning search method (`bm25_search`,
 /// `vector_search`, `token_match`, `exact_match`); `what` labels error
 /// messages with the calling method.
-/// Fold DataFusion's own operator instrumentation into the per-query
-/// stats after a SQL plan has executed. Every operator's
-/// `elapsed_compute` (DataFusion brackets its synchronous poll sections
-/// with an `Instant` timer — approximately on-CPU for compute-bound
-/// operators, and excluding async I/O waits) sums into the kernel
-/// counter; leaf (source) operators' `output_rows` sum into
-/// `rows_materialized` — the rows the scans decoded from storage.
-/// Infino's own TVF exec nodes report no DataFusion metrics (their
-/// kernels bracket and flush internally), so nothing double-counts.
-pub(crate) fn harvest_datafusion_metrics(
-    plan: &Arc<dyn ExecutionPlan>,
-    op_stats: &Option<Arc<OpStatsCollector>>,
-) {
-    // Deduped by node identity: plans are trees in practice, but nothing
-    // forbids an operator `Arc` appearing under two parents, and a shared
-    // node's metrics must not be added once per path.
-    fn walk(
-        node: &Arc<dyn ExecutionPlan>,
-        seen: &mut HashSet<usize>,
-        compute_ns: &mut u64,
-        leaf_rows: &mut u64,
-    ) {
-        if !seen.insert(Arc::as_ptr(node) as *const () as usize) {
-            return;
-        }
-        if let Some(metrics) = node.metrics() {
-            if let Some(ns) = metrics.elapsed_compute() {
-                *compute_ns += ns as u64;
-            }
-            if node.children().is_empty()
-                && let Some(rows) = metrics.output_rows()
-            {
-                *leaf_rows += rows as u64;
-            }
-        }
-        for child in node.children() {
-            walk(child, seen, compute_ns, leaf_rows);
-        }
-    }
-    let Some(stats) = op_stats else {
-        return;
-    };
-    let mut seen = HashSet::new();
-    let mut compute_ns = 0u64;
-    let mut leaf_rows = 0u64;
-    walk(plan, &mut seen, &mut compute_ns, &mut leaf_rows);
-    stats.add_kernel_cpu_ns(compute_ns);
-    stats.add_rows_materialized(leaf_rows);
-}
-
 pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
     projection: Option<&[&str]>,
-    what: &str,
-) -> DfResult<RecordBatch> {
-    let scalar_schema = reader.options().scalar_schema();
+) -> Result<RecordBatch, QueryError> {
+    // Stored shape: an index-only FTS column has no Parquet data to
+    // project, so its name is rejected up front like any unknown column.
+    let scalar_schema = reader.options().stored_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
     // `_id` decodes from its own dedicated id pages (cheap by
@@ -158,24 +177,37 @@ pub(crate) async fn resolve_hits_named(
         Some(names) => names,
         None => &bare,
     };
-    let indices: Option<Vec<usize>> = Some(
-        names
-            .iter()
-            .map(|name| {
-                output_schema.index_of(name).map_err(|_| {
-                    DataFusionError::Execution(format!("{what}: unknown column {name:?}"))
-                })
-            })
-            .collect::<Result<_, _>>()?,
-    );
-    resolve_hits(
-        reader,
-        hits,
-        &scalar_schema,
-        &output_schema,
-        indices.as_deref(),
-    )
-    .await
+    // Resolving a projected name to a column is caller-input validation, not
+    // query execution: the single-table search methods run their own kernels
+    // (no SQL engine involved), so an unknown column must read as a bad request
+    // that names the column and the valid set — never as an internal execution
+    // failure.
+    let indices: Vec<usize> = names
+        .iter()
+        .map(|name| {
+            output_schema
+                .index_of(name)
+                .map_err(|_| QueryError::InvalidQuery(unknown_column_message(name, &output_schema)))
+        })
+        .collect::<Result<_, _>>()?;
+    // Past name resolution, any failure is a store/decode fault reading the
+    // projected columns — not the caller's mistake.
+    resolve_hits(reader, hits, &scalar_schema, &output_schema, Some(&indices))
+        .await
+        .map_err(|e| QueryError::Store(e.to_string()))
+}
+
+/// Message for a projection naming a column the search output does not
+/// carry. Lists the selectable columns (`_id`, the visible scalar columns,
+/// and the trailing `score`) so the caller can correct the request.
+fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
+    let available = output_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("unknown column {name:?} in projection; valid columns: {available}")
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25
@@ -893,7 +925,6 @@ mod tests {
         },
         test_helpers::{
             build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
-            default_tokenizer as tok,
         },
     };
 
@@ -981,10 +1012,7 @@ mod tests {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -993,7 +1021,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -1274,17 +1301,9 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let opts = SupertableOptions::new(
-            schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool);
+        let opts = SupertableOptions::new(schema.clone(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
+            .with_writer_pool(pool);
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         let titles = LargeStringArray::from(vec![
@@ -1392,7 +1411,7 @@ mod tests {
             decimal128_id_field("doc_id"),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let ids = decimal128_ids(0..TITLES.len() as u64);
         let title = LargeStringArray::from(TITLES.to_vec());

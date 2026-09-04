@@ -145,6 +145,14 @@ impl WalStoreError {
             _ => false,
         }
     }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            WalStoreError::Storage { source, .. } => source.is_permission_denied(),
+            _ => false,
+        }
+    }
 }
 
 /// Storage prefix for WAL state-doc + sidecar objects.

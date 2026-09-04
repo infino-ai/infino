@@ -15,6 +15,10 @@ clone to a green pull request.
   `rustup +nightly component add miri`.
 - **cargo-llvm-cov** — only required to run the coverage gate locally:
   `cargo install cargo-llvm-cov --locked`.
+- **CMake ≥ 3.18** — the bench utilities read ann-benchmarks datasets
+  through a vendored, statically-built HDF5 (compiled once by `cargo build`;
+  nothing to install beyond CMake itself, which any current distro package
+  provides).
 - **pre-commit** — optional but recommended for local development. Install via
   [pre-commit.com](https://pre-commit.com/#install) and run `pre-commit install`
   in the repository root. This sets up git hooks to catch style and lint issues

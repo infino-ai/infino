@@ -17,7 +17,7 @@
 # readable from files instead of reconstructed from process env.
 
 # Supertable runtime knobs. Reader fan-out (skip + per-superfile
-# search + top-k merge) and writer commit-time rayon-shard run on
+# search + top-k merge) and the writer's parallel commit builds run on
 # separate pools so a long-running commit can't spike reader p99 or
 # vice versa.
 #
@@ -42,11 +42,17 @@ supertable:
 
   # Threshold above which the supertable's writer triggers an
   # internal commit() to flush the in-memory buffer to disk-
-  # equivalent (one superfile per writer-pool thread). Specified
+  # equivalent. Specified
   # in mebibytes (1 MiB = 1024 × 1024 bytes). Set 0 to disable
   # auto-flush — only caller-driven commit() will produce
   # superfiles.
   commit_threshold_size_mb: 1024
+
+  # Split point for a commit's buffer, in mebibytes: the writer cuts the buffered
+  # rows every this many bytes and builds one superfile per piece, in parallel and
+  # capped by the writer pool. So the file count follows the data volume rather
+  # than the core count. Set 0 to fall back to one piece per writer-pool thread.
+  superfile_buffer_split_mb: 64
 
   # Verify the trailing whole-blob CRC and per-subsection CRCs
   # on every SuperfileReader::open. Defaults to true. Set to
@@ -138,6 +144,12 @@ vector:
   # each selected cell. The user-table routing default takes this; the
   # hidden index's per-table stamp in the manifest overrides it. Pairs with
   # fine_nprobe_pct as max(floor, floor(pct × cell fine-cluster count)).
+  # Recall the drain calibration targets when stamping this table's
+  # probe laws (width / fine depth / rerank budget). Lower trades recall
+  # for latency: on Cohere-10M, 0.99 serves recall@10 0.997 at 19.4 ms
+  # and 0.93 serves 0.969 at 8.4 ms. Serving recall lands above the
+  # target because the crossings are discrete.
+  target_recall: 0.99
   fine_nprobe_floor: 4
 
   # Proportional fine-probe fraction for UNFILTERED vector search: probe
@@ -155,8 +167,166 @@ vector:
   serve_near_tie_slack: 0.30
 
   # K-means training points per centroid for the drain's per-cell
-  # sub-builds.
+  # sub-builds. (Sizes the k-means training sample, not the fine-cluster
+  # count — cluster size is set by the drain's byte-target n_cent.)
   kmeans_pts_per_centroid: 64
+
+  # Query search mode for the hidden vector index on the UNFILTERED path.
+  # (Filtered queries, pre-drain, and the undrained user arm always use `ivf`.)
+  #   ivf                  — DEFAULT: grid routing to cells, then the manifest's
+  #                          stamped per-cell width. The established scan path,
+  #                          and the automatic fallback for any corpus above
+  #                          hnsw_max_docs. Cache is NVMe-backed and reclaimable
+  #                          (scales down / to zero with activity).
+  #   hnsw_ivf             — OPT-IN: walk a resident in-memory HNSW graph built
+  #                          over every row's Sq16 codes, bypassing the grid,
+  #                          cell selection, and disk reads. Built at drain and
+  #                          held resident (RAM-pinned) for corpora
+  #                          <= hnsw_max_docs; above that ceiling the graph is
+  #                          not built. The `_ivf` suffix names the fallback:
+  #                          a missing graph (pre-drain, above the ceiling, or a
+  #                          different column) serves `ivf` AUTOMATICALLY, so
+  #                          correctness never depends on the graph. Best for
+  #                          single-box, latency-tier, RAM-provisioned tables.
+  #   flat_ivf             — OPT-IN: scan a resident 4-bit plane exhaustively
+  #                          and return the codes' own ranking. No grid, no
+  #                          cells, no graph, and no resident Sq16 plane —
+  #                          0.5 bytes/dim against 2.0 for every other mode.
+  #                          The codec sets the recall ceiling (~0.93 recall@10
+  #                          on dbpedia-1536): a declared trade, gated by
+  #                          flat_register_floor. Per-query work is linear in
+  #                          the corpus, so it is bounded by flat_max_docs;
+  #                          past that ceiling (and pre-drain, filtered, or
+  #                          another column) it serves `ivf`, which is what the
+  #                          `_ivf` suffix names. Cosine columns only. Best for
+  #                          embedded tables sized by resident memory rather
+  #                          than by QPS.
+  search_mode: ivf
+
+  # For search_mode = ivf: the cluster router.
+  #   stamped        — DEFAULT. Grid routing to cells, then the manifest's
+  #                    stamped per-cell width. The established path.
+  #   centroid_graph — EXPERIMENTAL: score fine centroids via an HNSW over the
+  #                    resident fp32 fine centroids and read the top fanout
+  #                    clusters, bypassing the grid. A cold-read win at scale
+  #                    (10M+); opt-in while the per-table fanout stamp is built.
+  ivf_router: stamped
+
+  # For ivf_router = centroid_graph: the NUMBER of fine clusters the
+  # query fans out to (globally scored), clamped to the table's cluster
+  # total. Higher reads more clusters — more cold bytes, higher recall.
+  # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
+  # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
+  # pending a per-table calibrated stamp. Ignored under ivf_router = stamped.
+  global_fine_fanout: 1024
+
+  # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
+  # for this path only (a caller-set rerank_mult still wins). Scoped here so
+  # tuning it never touches the ivf / filtered / user-table defaults.
+  global_fine_rerank_mult: 128
+
+  # For ivf_router = centroid_graph: coalesce the selected clusters within
+  # each cell into contiguous reads. Ignored under ivf_router = stamped.
+  global_fine_coalesce: false
+
+  # For ivf_router = centroid_graph: the centroid-HNSW walk's ef (candidate
+  # breadth). 0 = auto (fanout * 2). Ignored under ivf_router = stamped.
+  global_fine_graph_ef: 0
+
+  # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
+  # sweeps the ef candidates up to this ceiling and stamps the winning per-table
+  # ef into the persisted graph bundle; that stamped value drives every query.
+  # Must be at least the smallest candidate (128). High-dim cosine tables need a
+  # wide beam (e.g. glove-100 clears ~0.99 only at ef=1024), so the ceiling
+  # allows that; easy tables stamp well under it. Ignored under other modes.
+  hnsw_ef_ceil: 2048
+
+  # For search_mode = hnsw_ivf: the ef_construction beam used to BUILD the
+  # resident HNSW (build-time only, not per query). Higher = better-connected
+  # graph => same recall at a smaller search beam => lower query latency, at a
+  # linearly higher one-time build cost and NO extra resident memory. 200 is
+  # the sweet spot for recall ~0.93-0.95; raise it only to push the >0.97 end.
+  hnsw_ef_construction: 200
+
+  # For search_mode = hnsw_ivf: base-layer (layer-0) graph degree — the recall
+  # lever for high-dimensional vectors (the base layer must densify as
+  # dimension grows or greedy search under-finds). 0 lets the drain calibrator
+  # pick it (sweep to target_recall); a positive value overrides per table.
+  # Memory scales with docs x m0 (base layer only), bounded by hnsw_max_docs.
+  hnsw_m0: 0
+
+  # Register floor for the GRAPH index: the recall its calibrated (m0, ef) must
+  # reach before the drain publishes it. Below this, queries serve ivf.
+  hnsw_register_floor: 0.98
+
+  # Register floor for the FLAT index, same contract, its own number. Separate
+  # because the floors answer different questions: the graph is a latency
+  # optimization over a correct scan, so its floor is a quality bar, while a
+  # flat plane is a memory trade the operator chose whose recall ceiling is
+  # set by the codec (16 levels/coordinate measures ~0.93 on dbpedia-1536).
+  # The default is therefore a broken-plane TRIPWIRE, not a bar: a healthy
+  # plane sits well above it, a degenerate ruler or mis-sliced section
+  # collapses toward random and lands far below. Raise it to impose a bar.
+  flat_register_floor: 0.80
+
+  # For search_mode = hnsw_ivf: which resident plane the graph walk scores
+  # candidates on. Every option re-ranks its final beam on the full Sq16 plane
+  # (always resident), so this decides which candidates reach the beam and what
+  # each candidate costs — never the returned order.
+  #
+  #   sq16         walk the Sq16 codes directly. Adds no plane (smallest
+  #                resident footprint), slowest walk.
+  #   sq8          DEFAULT. Int8 plane from the Sq16 high byte (+1 byte/dim),
+  #                scored with an int8-VNNI kernel. Roughly halves warm walk
+  #                latency at unchanged recall. Derived from Sq16 on read when
+  #                absent, so selecting it never needs a rebuild.
+  #   sq4          Fitted 4-bit nibbles in rotated space (+0.5 bytes/dim),
+  #                scored with the AVX-512 / VNNI nibble kernel: half sq8's
+  #                plane bytes and fewer bytes touched per candidate. Cannot be
+  #                derived on read (the fit needs a rotation and a moment pass),
+  #                so it is written at drain and applies at the next full
+  #                rebuild. Incremental drains inherit the prior plane + ruler.
+  #   sq4_residual sq4 plus a residual nibble plane (+1 byte/dim total), which
+  #                recovers most of the 4-bit reconstruction error. Same
+  #                rebuild caveat.
+  hnsw_plane: sq8
+
+  # For search_mode = hnsw_ivf on a coarse walk plane: how many of the walk's
+  # nearest candidates to re-rank on full Sq16 before returning the top k.
+  # Clamped to [k, ef]. Recall saturates well below ef (256 is the knee for
+  # k <= 100); wider only adds tail cost. Ignored when hnsw_plane is sq16.
+  hnsw_refine_k: 256
+
+  # For search_mode = hnsw_ivf: scale ceiling for the per-row DATA graph. The
+  # resident data HNSW is built at drain and persisted only when the table's
+  # doc count is at or below this; above it, only the (much smaller) centroid
+  # graph is built and hnsw queries fall back to the scan path. ~10M
+  # rows of Sq16 codes is the practical single-host resident ceiling.
+  hnsw_max_docs: 10000000
+
+  # For search_mode = flat_ivf: scale ceiling for the resident 4-bit plane. Built
+  # at drain and persisted only when the table's doc count is at or below
+  # this; above it queries fall back to ivf.
+  #
+  # This is a LATENCY bound, not a memory one -- the plane is 0.5 bytes/dim,
+  # so 10M x 1536 would still fit one host at ~7.7 GiB. An exhaustive scan is
+  # linear in the corpus: measured ~1.6 ms at 100K x 1536 and ~20 ms at 1M,
+  # where a warm routed read serves ~2 ms at higher recall. A ceiling, not a
+  # recommendation -- the trade favors the scan up to a few hundred thousand
+  # rows; what it keeps at any scale is the pinned, cache-independent
+  # footprint and a width-invariant worst case.
+  flat_max_docs: 1000000
+
+  # For search_mode = hnsw_ivf: row cap for the cheap calibration probe. On a
+  # larger corpus, calibrate on a subsample of this many rows first. Subsample
+  # recall is optimistic (the m0 requirement grows with N), so a probe that
+  # cannot register is a hard "graph-hostile distribution" signal → skip the
+  # expensive full build and serve ivf; a probe that registers proceeds to the
+  # authoritative full-corpus calibration. Gates on distribution, not size: a
+  # large but graph-friendly corpus (e.g. a low-dim 10M set) passes and keeps
+  # its graph. Re-derived every drain, so no pre-existing table is permanently
+  # locked out — a migrated table is probed and, if friendly, fully built.
+  hnsw_probe_max_docs: 100000
 
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.

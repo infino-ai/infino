@@ -109,7 +109,7 @@ fn build_blob(vectors: &[f32], codec: RerankCodec) -> Vec<u8> {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
         column: "v".into(),
-        dim: corpus::DIM,
+        dim: corpus::dim(),
         rot_seed: 7,
         metric: Metric::Cosine,
         rerank_codec: codec,
@@ -117,8 +117,8 @@ fn build_blob(vectors: &[f32], codec: RerankCodec) -> Vec<u8> {
     })
     .expect("register column");
     for i in 0..N_DOCS {
-        let off = i * corpus::DIM;
-        b.add(0, &vectors[off..off + corpus::DIM])
+        let off = i * corpus::dim();
+        b.add(0, &vectors[off..off + corpus::dim()])
             .expect("add vector");
     }
     b.finish().expect("finish vector builder")
@@ -128,7 +128,7 @@ fn open_reader_from_blob(blob: Vec<u8>) -> VectorReader {
     let n_cent = corpus::n_cent(N_DOCS);
     let json = format!(
         r#"[{{"column":"v","dim":{},"n_cent":{},"rot_seed":7,"metric":"cosine"}}]"#,
-        corpus::DIM,
+        corpus::dim(),
         n_cent
     );
     VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
@@ -841,7 +841,7 @@ fn clipped_sigma_recall(
 
 fn print_quant_error_proxy(vectors: &[f32]) {
     let n_cent = corpus::n_cent(N_DOCS);
-    let dim = corpus::DIM;
+    let dim = corpus::dim();
     let mut min_v = vec![f32::INFINITY; n_cent * dim];
     let mut max_v = vec![f32::NEG_INFINITY; n_cent * dim];
 
@@ -908,7 +908,7 @@ fn print_quant_error_proxy(vectors: &[f32]) {
 async fn compare_fp32_and_sq8_on_1m_bench_workload() {
     eprintln!(
         "debug: generating mmap corpus N_DOCS={N_DOCS}, dim={}, n_cent={}",
-        corpus::DIM,
+        corpus::dim(),
         corpus::n_cent(N_DOCS)
     );
     let corpus_mmap = corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true);
@@ -1028,7 +1028,7 @@ async fn compare_fp32_and_sq8_on_1m_bench_workload() {
 }
 
 fn exact_topn_scores(vectors: &[f32], query: &[f32], n: usize) -> Vec<(u32, f32)> {
-    let dim = corpus::DIM;
+    let dim = corpus::dim();
     let mut scored: Vec<(u32, f32)> = (0..N_DOCS as u32)
         .map(|i| {
             let off = (i as usize) * dim;
@@ -1045,7 +1045,7 @@ fn exact_topn_scores(vectors: &[f32], query: &[f32], n: usize) -> Vec<(u32, f32)
 }
 
 fn exact_distance_for_doc(vectors: &[f32], query: &[f32], doc_id: u32) -> f32 {
-    let dim = corpus::DIM;
+    let dim = corpus::dim();
     let off = doc_id as usize * dim;
     let mut dot = 0.0f32;
     for d in 0..dim {
@@ -1059,7 +1059,7 @@ fn exact_distance_for_doc(vectors: &[f32], query: &[f32], doc_id: u32) -> f32 {
 async fn inspect_sq8_miss_geometry_on_1m_bench_workload() {
     eprintln!(
         "miss-debug: generating mmap corpus N_DOCS={N_DOCS}, dim={}, n_cent={}",
-        corpus::DIM,
+        corpus::dim(),
         corpus::n_cent(N_DOCS)
     );
     let corpus_mmap = corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true);
@@ -1185,7 +1185,7 @@ fn exact_rescore_topk(vectors: &[f32], query: &[f32], candidate_ids: &[u32]) -> 
 async fn sq8_oversampled_exact_rescore_recall_on_1m_bench_workload() {
     eprintln!(
         "rescore-debug: generating mmap corpus N_DOCS={N_DOCS}, dim={}, n_cent={}",
-        corpus::DIM,
+        corpus::dim(),
         corpus::n_cent(N_DOCS)
     );
     let corpus_mmap = corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true);
@@ -1302,7 +1302,7 @@ fn f16_bits_to_f32_debug(h: u16) -> f32 {
 }
 
 fn bf16_rescore_topk(vectors: &[f32], query: &[f32], candidate_ids: &[u32]) -> Vec<u32> {
-    let dim = corpus::DIM;
+    let dim = corpus::dim();
     let mut scored = Vec::with_capacity(candidate_ids.len());
     for &id in candidate_ids {
         let off = id as usize * dim;
@@ -1327,7 +1327,7 @@ fn bf16_rescore_topk(vectors: &[f32], query: &[f32], candidate_ids: &[u32]) -> V
 }
 
 fn f16_rescore_topk(vectors: &[f32], query: &[f32], candidate_ids: &[u32]) -> Vec<u32> {
-    let dim = corpus::DIM;
+    let dim = corpus::dim();
     let mut scored = Vec::with_capacity(candidate_ids.len());
     for &id in candidate_ids {
         let off = id as usize * dim;
@@ -1357,7 +1357,7 @@ fn selected_dim_rescore_topk(
     candidate_ids: &[u32],
     dims: &[usize],
 ) -> Vec<u32> {
-    let dim = corpus::DIM;
+    let dim = corpus::dim();
     let mut scored = Vec::with_capacity(candidate_ids.len());
     for &id in candidate_ids {
         let off = id as usize * dim;
@@ -1382,7 +1382,7 @@ fn selected_dim_rescore_topk(
 }
 
 fn top_variance_dims(vectors: &[f32], n_dims: usize) -> Vec<usize> {
-    let dim = corpus::DIM;
+    let dim = corpus::dim();
     let mut stats = Vec::with_capacity(dim);
     for d in 0..dim {
         let mut sum = 0.0f64;
@@ -1406,7 +1406,7 @@ fn top_variance_dims(vectors: &[f32], n_dims: usize) -> Vec<usize> {
 async fn sq8_top20_cheap_sidecar_rescore_on_1m_bench_workload() {
     eprintln!(
         "sidecar-debug: generating mmap corpus N_DOCS={N_DOCS}, dim={}, n_cent={}",
-        corpus::DIM,
+        corpus::dim(),
         corpus::n_cent(N_DOCS)
     );
     let corpus_mmap = corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true);
@@ -1468,19 +1468,19 @@ async fn sq8_top20_cheap_sidecar_rescore_on_1m_bench_workload() {
         "sidecar-debug: sq8_top20_fp32_rescore hits={fp32_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         fp32_hits as f32 / denom,
-        corpus::DIM * 4
+        corpus::dim() * 4
     );
     eprintln!(
         "sidecar-debug: sq8_top20_bf16_rescore hits={bf16_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         bf16_hits as f32 / denom,
-        corpus::DIM * 2
+        corpus::dim() * 2
     );
     eprintln!(
         "sidecar-debug: sq8_top20_f16_rescore hits={f16_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         f16_hits as f32 / denom,
-        corpus::DIM * 2
+        corpus::dim() * 2
     );
     eprintln!(
         "sidecar-debug: sq8_top20_selected32_fp32_rescore hits={sel32_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
@@ -1661,7 +1661,7 @@ fn int8_residual_corrected_rescore_topk(
 async fn sq8_top20_residual_sidecar_rescore_on_1m_bench_workload() {
     eprintln!(
         "residual-debug: generating mmap corpus N_DOCS={N_DOCS}, dim={}, n_cent={}",
-        corpus::DIM,
+        corpus::dim(),
         corpus::n_cent(N_DOCS)
     );
     let corpus_mmap = corpus::MmapVectorCorpus::generate(N_DOCS, corpus::n_cent(N_DOCS), 1, true);
@@ -1740,42 +1740,42 @@ async fn sq8_top20_residual_sidecar_rescore_on_1m_bench_workload() {
         "residual-debug: sq8_top20_fp32_rescore hits={fp32_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         fp32_hits as f32 / denom,
-        corpus::DIM * 4
+        corpus::dim() * 4
     );
     eprintln!(
         "residual-debug: sq8_top20_fp16_residual_rescore hits={fp16_residual_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         fp16_residual_hits as f32 / denom,
-        corpus::DIM * 2
+        corpus::dim() * 2
     );
     eprintln!(
         "residual-debug: sq8_top20_int8_residual_x2_rescore hits={int8_residual_x2_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         int8_residual_x2_hits as f32 / denom,
-        corpus::DIM
+        corpus::dim()
     );
     eprintln!(
         "residual-debug: sq8_top20_int8_residual_x4_rescore hits={int8_residual_x4_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         int8_residual_x4_hits as f32 / denom,
-        corpus::DIM
+        corpus::dim()
     );
     eprintln!(
         "residual-debug: sq8_top20_int8_residual_x8_rescore hits={int8_residual_x8_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         int8_residual_x8_hits as f32 / denom,
-        corpus::DIM
+        corpus::dim()
     );
     eprintln!(
         "residual-debug: sq8_top20_int8_residual_x16_rescore hits={int8_residual_x16_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         int8_residual_x16_hits as f32 / denom,
-        corpus::DIM
+        corpus::dim()
     );
     eprintln!(
         "residual-debug: sq8_top20_int8_residual_x32_rescore hits={int8_residual_x32_hits}/{} recall={:.4} sidecar_bytes_per_candidate={}",
         N_QUERIES * TOP_K,
         int8_residual_x32_hits as f32 / denom,
-        corpus::DIM
+        corpus::dim()
     );
 }

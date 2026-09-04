@@ -44,6 +44,7 @@ use tokio::{
     sync::oneshot,
     task::block_in_place,
 };
+use tracing::{Instrument, Span};
 
 /// Fallback worker count for [`build_query_runtime`] when the host's available
 /// parallelism can't be determined.
@@ -112,18 +113,39 @@ where
         Ok(handle) if matches!(handle.runtime_flavor(), runtime::RuntimeFlavor::MultiThread) => {
             block_in_place(|| handle.block_on(fut))
         }
-        Ok(_) => thread::spawn(move || build_current_thread_runtime().block_on(fut))
-            .join()
-            .expect("sync→async bridge worker thread panicked"),
+        Ok(_) => {
+            let fut = fut.in_current_span();
+            thread::spawn(move || build_current_thread_runtime().block_on(fut))
+                .join()
+                .expect("sync→async bridge worker thread panicked")
+        }
         Err(_) => build_current_thread_runtime().block_on(fut),
     }
 }
 
 /// Async→rayon bridge: dispatch CPU work onto the configured reader pool
 pub(crate) fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
+    let f = carry_span(f);
     match pool {
         Some(pool) => pool.spawn(f),
         None => rayon::spawn(f),
+    }
+}
+
+/// Wrap `f` so it runs inside the caller's tracing span on whatever thread ends
+/// up executing it.
+///
+/// A pool or thread hop does not carry the span with it, so without this the log
+/// lines a unit of work emits lose the context of the operation that scheduled
+/// it. Use it at every hand-off to another thread.
+pub(crate) fn carry_span<T, F>(f: F) -> impl FnOnce() -> T + Send
+where
+    F: FnOnce() -> T + Send,
+{
+    let span = Span::current();
+    move || {
+        let _entered = span.enter();
+        f()
     }
 }
 
@@ -206,7 +228,62 @@ fn build_current_thread_runtime() -> runtime::Runtime {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
+
+    /// A span is only resolvable from another thread when the subscriber is the
+    /// process-wide default — a thread-local one is invisible to a pool worker,
+    /// which is also why these assertions would pass vacuously without it.
+    /// Installed once for the binary; nothing else here sets one.
+    fn assign_span_ids() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
+    #[test]
+    fn pool_work_runs_inside_the_span_that_dispatched_it() {
+        assign_span_ids();
+        let span = tracing::info_span!("dispatching");
+        let _entered = span.enter();
+        let dispatcher = Span::current().id();
+        assert!(dispatcher.is_some(), "span ids must be assigned");
+
+        let (tx, rx) = mpsc::channel();
+        spawn_on(None, move || {
+            let _ = tx.send(Span::current().id());
+        });
+
+        assert_eq!(
+            rx.recv().expect("pool task ran"),
+            dispatcher,
+            "a rayon hop must not drop the caller's span"
+        );
+    }
+
+    #[test]
+    fn carry_span_restores_the_span_on_a_plain_thread() {
+        assign_span_ids();
+        let span = tracing::info_span!("scheduling");
+        let _entered = span.enter();
+        let scheduler = Span::current().id();
+        assert!(scheduler.is_some(), "span ids must be assigned");
+
+        let observe = carry_span(|| Span::current().id());
+        assert_eq!(
+            thread::spawn(observe).join().expect("thread ran"),
+            scheduler
+        );
+    }
+
+    #[test]
+    fn carry_span_is_harmless_with_no_span_entered() {
+        assign_span_ids();
+        let observe = carry_span(|| Span::current().id());
+        assert_eq!(thread::spawn(observe).join().expect("thread ran"), None);
+    }
 
     /// The regression this pins: `bridge_on_runtime` once preferred the
     /// AMBIENT runtime when one was present, driving the future on a

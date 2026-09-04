@@ -1362,7 +1362,11 @@ pub mod fts {
 }
 
 pub mod vector {
-    use std::{collections::HashMap, hint::black_box};
+    use std::{
+        collections::HashMap,
+        hint::black_box,
+        time::{Duration, Instant},
+    };
 
     use infino::{
         storage::io_counters,
@@ -1389,6 +1393,94 @@ pub mod vector {
     /// Default `(nprobe, rerank)` config gate — lower bar so large-scale
     /// pre-drain staging runs can complete while routing is tuned.
     pub const DEFAULT_CONFIG_RECALL_FLOOR: f32 = 0.80;
+
+    /// Per-tier recall tripwires. These are regression floors, never the
+    /// acceptance bar (0.99 on the standard supertable bench) — they exist
+    /// so a run that has broken badly fails loudly instead of reporting a
+    /// number.
+    ///
+    /// The two tiers legitimately sit at different recall levels, so one
+    /// constant cannot serve both. The supertable tier runs the calibrated
+    /// path — drain-stamped width, fine depth and rerank budget — and is
+    /// where the bar is enforced. The superfile tier is a single-superfile
+    /// micro-bench with NO drain and NO stamped laws: its `default` config
+    /// is a fixed probe width tuned against the synthetic corpus's planted
+    /// clusters, so on a real dataset it under-serves by construction
+    /// (measured at 100K: glove-25-angular 0.740, Cohere 0.660, both ~0.99
+    /// on synthetic). A floor tight enough for the calibrated tier
+    /// therefore fails the uncalibrated one on real data without anything
+    /// being wrong.
+    #[derive(Debug, Clone, Copy)]
+    pub struct RecallFloors {
+        /// Wide-probe sanity gate (`CORRECTNESS_NPROBE` / rerank).
+        pub correctness: f32,
+        /// Shipped-defaults gate.
+        pub default_config: f32,
+    }
+
+    impl RecallFloors {
+        /// Calibrated tier: the drain stamps the serving laws, so the
+        /// tripwires stay where they are.
+        pub const SUPERTABLE: Self = Self {
+            correctness: CORRECTNESS_RECALL_FLOOR,
+            default_config: DEFAULT_CONFIG_RECALL_FLOOR,
+        };
+        /// Uncalibrated single-superfile tier on a REAL corpus: loose
+        /// enough that the legitimately lower default-config recall is
+        /// reported rather than aborting the run, still tight enough that
+        /// a broken index (which collapses toward chance) trips it.
+        const SUPERFILE_REAL: Self = Self {
+            correctness: 0.60,
+            default_config: 0.60,
+        };
+        /// Uncalibrated single-superfile tier on the synthetic corpus: the
+        /// fixed probe width is tuned against the planted clusters, so
+        /// synthetic runs sit ~0.99 and the supertable tripwires keep
+        /// their full sensitivity here — only real corpora need the loose
+        /// floor above.
+        const SUPERFILE_SYNTHETIC: Self = Self {
+            correctness: CORRECTNESS_RECALL_FLOOR,
+            default_config: DEFAULT_CONFIG_RECALL_FLOOR,
+        };
+
+        /// Pre-drain supertable tripwires on a REAL corpus: the incoming
+        /// staging table serves the UNSTAMPED default width (the drain
+        /// hasn't stamped the laws yet), which under-serves real corpora
+        /// by construction exactly like the superfile tier does (measured:
+        /// dbpedia-1536 pre-drain 0.497 at 100K, 0.555 at 1M, against
+        /// ~0.99 on synthetic). Loose enough to report rather than abort,
+        /// still far above chance (~1e-4 at 100K) so a broken index trips.
+        ///
+        /// How low the legitimate value goes is corpus geometry, not
+        /// quality: dbpedia-1536 reads 0.497 at 100K, while the far more
+        /// diffuse glove-200 reads 0.207 on the same code — one cell is
+        /// simply a smaller share of a low-dimensional neighbourhood.
+        /// The floor sits below the worst measured value with room to
+        /// spare and still three orders of magnitude above chance.
+        const SUPERTABLE_PRE_DRAIN_REAL: Self = Self {
+            correctness: 0.05,
+            default_config: 0.05,
+        };
+
+        /// The superfile tier's floors for the active corpus source.
+        pub fn superfile() -> Self {
+            match corpus::corpus_source() {
+                corpus::CorpusSource::Synthetic => Self::SUPERFILE_SYNTHETIC,
+                _ => Self::SUPERFILE_REAL,
+            }
+        }
+
+        /// The supertable tier's PRE-DRAIN floors for the active corpus
+        /// source. Every post-drain phase keeps [`Self::SUPERTABLE`] — the
+        /// stamped laws hold ≥ 0.99 on real corpora too, so only this
+        /// phase loosens, and only off-synthetic.
+        pub fn supertable_pre_drain() -> Self {
+            match corpus::corpus_source() {
+                corpus::CorpusSource::Synthetic => Self::SUPERTABLE,
+                _ => Self::SUPERTABLE_PRE_DRAIN_REAL,
+            }
+        }
+    }
     pub const CORRECTNESS_NPROBE: usize = 64;
     pub const CORRECTNESS_RERANK_MULT: usize = 256;
     pub const N_CORRECTNESS_QUERIES: usize = 20;
@@ -1480,6 +1572,123 @@ pub mod vector {
             _rerank: usize,
         ) -> Option<f64> {
             None
+        }
+    }
+
+    /// One row of [`per_k_sweep`]: recall and latency at a single `k`.
+    #[derive(Clone, Copy, Debug)]
+    pub struct PerKCell {
+        pub k: usize,
+        pub recall: f32,
+        pub p50_ns: f64,
+        pub p95_ns: f64,
+    }
+
+    /// Median percentile rank for [`per_k_sweep`] latency columns.
+    const SWEEP_P50: usize = 50;
+    /// Tail percentile rank for [`per_k_sweep`] latency columns.
+    const SWEEP_P95: usize = 95;
+
+    /// Per-`k` recall/latency sweep over ONE search surface — the single
+    /// measurement loop every comparison arm shares. `search` is the
+    /// engine's own call (its public API where it has one: a supertable
+    /// arm passes a closure over `vector_search` via
+    /// [`SupertableVectorRead`], a library peer passes its `search`);
+    /// this function owns the timing, the recall division against the
+    /// deep oracle's `k`-prefix, and the percentile math, so no battery
+    /// re-implements any of them. `truth_deep` rows are rank-sorted and
+    /// at least as deep as the largest `k`.
+    pub fn per_k_sweep(
+        queries: &[Vec<f32>],
+        truth_deep: &[Vec<u32>],
+        ks: &[usize],
+        mut search: impl FnMut(&[f32], usize) -> Vec<corpus::Hit>,
+    ) -> Vec<PerKCell> {
+        let percentile = |sorted: &[Duration], pct: usize| -> f64 {
+            // Empty input yields 0 rather than an underflowing index: the
+            // recall side already tolerates an empty query set, and a
+            // helper must not have a narrower domain than its caller.
+            if sorted.is_empty() {
+                return 0.0;
+            }
+            let rank = (pct * sorted.len()).div_ceil(100);
+            sorted[rank.saturating_sub(1).min(sorted.len() - 1)].as_nanos() as f64
+        };
+        // Enforced, not just documented: a measurement helper must fail
+        // fast on malformed inputs rather than publish skewed numbers —
+        // zip would silently drop unmatched rows while the division still
+        // used the full count, and clipping a shallow oracle row would
+        // inflate recall at the deep knots.
+        assert_eq!(
+            queries.len(),
+            truth_deep.len(),
+            "one ground-truth row per query"
+        );
+        let max_k = ks.iter().copied().max().unwrap_or(0);
+        assert!(
+            truth_deep.iter().all(|truth| truth.len() >= max_k),
+            "every ground-truth row must be at least as deep as the largest k ({max_k})"
+        );
+        ks.iter()
+            .map(|&k| {
+                let mut latencies = Vec::with_capacity(queries.len());
+                let mut recall_sum = 0.0_f32;
+                for (query, truth) in queries.iter().zip(truth_deep) {
+                    let started = Instant::now();
+                    let hits = search(query, k);
+                    latencies.push(started.elapsed());
+                    recall_sum += corpus::recall_at_k(&hits, &truth[..k]);
+                }
+                latencies.sort_unstable();
+                PerKCell {
+                    k,
+                    recall: recall_sum / queries.len().max(1) as f32,
+                    p50_ns: percentile(&latencies, SWEEP_P50),
+                    p95_ns: percentile(&latencies, SWEEP_P95),
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod per_k_sweep_tests {
+        use super::*;
+
+        /// Queries carry their own index in coordinate 0, so the closure
+        /// can answer each from its matching truth row: an ideal engine,
+        /// which must grade exactly 1.0 at every knot.
+        #[test]
+        fn an_ideal_engine_grades_one_at_every_knot() {
+            let queries: Vec<Vec<f32>> = (0..3).map(|q| vec![q as f32; 4]).collect();
+            let truth: Vec<Vec<u32>> = (0..3u32).map(|q| (q * 10..q * 10 + 10).collect()).collect();
+            let truth_for_closure = truth.clone();
+            let cells = per_k_sweep(&queries, &truth, &[1, 10], |query, k| {
+                let row = &truth_for_closure[query[0] as usize];
+                row[..k].iter().map(|&id| (id, 0.0)).collect()
+            });
+            assert_eq!(cells.len(), 2);
+            for cell in &cells {
+                assert_eq!(cell.recall, 1.0, "ideal engine at k={}", cell.k);
+            }
+        }
+
+        /// The enforced input contract: a ground-truth row shallower than
+        /// the deepest knot must fail fast, never inflate recall.
+        #[test]
+        #[should_panic(expected = "at least as deep")]
+        fn a_shallow_oracle_row_fails_fast() {
+            let queries = vec![vec![0.0f32; 4]];
+            let truth = vec![vec![0u32; 5]];
+            per_k_sweep(&queries, &truth, &[10], |_, _| Vec::new());
+        }
+
+        /// One truth row per query, enforced.
+        #[test]
+        #[should_panic(expected = "one ground-truth row per query")]
+        fn mismatched_lengths_fail_fast() {
+            let queries = vec![vec![0.0f32; 4]; 2];
+            let truth = vec![vec![0u32; 10]];
+            per_k_sweep(&queries, &truth, &[10], |_, _| Vec::new());
         }
     }
 
@@ -2178,6 +2387,7 @@ pub mod vector {
         gt_correct: &[Vec<u32>],
         q_cal: &[Vec<f32>],
         gt_cal: &[Vec<u32>],
+        floors: RecallFloors,
         include_warm: bool,
         include_cold: bool,
         cold_iters: usize,
@@ -2226,15 +2436,17 @@ pub mod vector {
                     default_rerank,
                 );
                 eprintln!(
-                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {DEFAULT_CONFIG_RECALL_FLOOR:.2})",
+                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {:.2})",
+                    floors.default_config,
                 );
                 // The printed floor is a real gate, not decoration — this
                 // was previously print-only, so a recall collapse in skip
                 // mode sailed through green.
                 assert!(
-                    default >= DEFAULT_CONFIG_RECALL_FLOOR,
+                    default >= floors.default_config,
                     "{log_prefix} default-config vector recall@{k} {default:.3} < floor \
-                     {DEFAULT_CONFIG_RECALL_FLOOR:.2}"
+                     {:.2}",
+                    floors.default_config
                 );
                 default_recall = Some(default);
             }
@@ -2254,8 +2466,9 @@ pub mod vector {
                 CORRECTNESS_RERANK_MULT,
             );
             assert!(
-                recall >= CORRECTNESS_RECALL_FLOOR,
-                "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                recall >= floors.correctness,
+                "{log_prefix} vector recall@{k} {recall:.3} < floor {:.2}",
+                floors.correctness
             );
             eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
 
@@ -2273,8 +2486,9 @@ pub mod vector {
                 default_rerank,
             );
             assert!(
-                default >= DEFAULT_CONFIG_RECALL_FLOOR,
-                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {DEFAULT_CONFIG_RECALL_FLOOR:.2}"
+                default >= floors.default_config,
+                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {:.2}",
+                floors.default_config
             );
             eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
             default_recall = Some(default);
@@ -2432,14 +2646,19 @@ pub mod sql {
     /// family split can never drift apart.
     pub const BULK_RANGE_SCAN: &str = "WHERE rating < N (range scan, returns rows)";
     pub const BULK_TOKEN_MATCH_ALL: &str = "token_match (all rows)";
+    /// A substring `LIKE` the default `ascii_lower` analyzer cannot bound:
+    /// a full column scan whose cost is the scan, not the rows it returns.
+    /// Classified with the bulk shapes so it never averages into the
+    /// point-lookup family the serving cost model prices per row.
+    pub const BULK_LIKE_SCAN: &str = "WHERE title LIKE '%term…%' (substring scan, ascii_lower)";
 
-    /// The one classification of a bulk row-set shape by name. Both the
-    /// warm/cold query table (this module) and the serving-cost family
+    /// The one classification of a bulk / scan-priced shape by name. Both
+    /// the warm/cold query table (this module) and the serving-cost family
     /// split (`supertable.rs`) call this rather than each re-deriving the
-    /// same `name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL` check,
-    /// so the two tables can never classify the same shape differently.
+    /// same name check, so the two tables can never classify the same shape
+    /// differently.
     pub fn is_bulk_shape(name: &str) -> bool {
-        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL
+        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL || name == BULK_LIKE_SCAN
     }
 
     /// Scan-backed aggregates — realistic analytics shapes that provably
@@ -2591,6 +2810,10 @@ pub mod sql {
     pub fn scan_battery(sample_key: &str, sample_title: &str) -> Vec<(&'static str, String)> {
         let k = sample_key.replace('\'', "''");
         let t = sample_title.replace('\'', "''");
+        // Titles are `doc{id:07} term… term…`: the leading doc token is
+        // unique per row and space-delimited, so a `LIKE 'doc… %'` pattern
+        // names one complete term the index can resolve directly.
+        let doc_token = t.split(' ').next().unwrap_or(t.as_str());
         vec![
             (
                 "WHERE key = ? (point lookup, unsorted col)",
@@ -2603,6 +2826,23 @@ pub mod sql {
             (
                 BULK_RANGE_SCAN,
                 "SELECT title, rating FROM supertable WHERE rating < 10".to_string(),
+            ),
+            (
+                // The pattern's only token is closed on both sides (pattern
+                // start, then a space), so it is answered from the index
+                // under any analyzer — one row, no column scan.
+                "WHERE title LIKE 'doc… %' (leading complete token, index-bounded)",
+                format!("SELECT key, rating FROM supertable WHERE title LIKE '{doc_token} %'"),
+            ),
+            (
+                // An open-edged token under the default `ascii_lower`
+                // analyzer cannot be bounded (a run holding a non-ASCII byte
+                // is dropped whole), so this stays a DataFusion column scan;
+                // `term09999` sits at the Zipf tail (the FTS battery's
+                // `single_rare` term), so the result stays small and the
+                // cost is the scan itself.
+                BULK_LIKE_SCAN,
+                "SELECT key, rating FROM supertable WHERE title LIKE '%term09999%'".to_string(),
             ),
         ]
     }

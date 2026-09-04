@@ -44,7 +44,7 @@ use infino::{
         },
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
-    test_helpers::{decimal128_ids, default_tokenizer},
+    test_helpers::decimal128_ids,
 };
 use tempfile::TempDir;
 
@@ -141,12 +141,8 @@ fn build_test_bytes() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("builder");
     let ids = decimal128_ids(vec![1u64, 2, 3]);

@@ -28,9 +28,12 @@ mod infino_vector_engine;
 pub mod sql_driver;
 pub mod vector_driver;
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 pub use driver::{
     BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
 };
+use infino::superfile::vector::distance::Metric;
 pub use infino_engine::{
     InfinoFtsEngine, InfinoFtsIndex, build_positionless, parallel_build_positionless,
 };
@@ -41,7 +44,7 @@ pub use infino_sql_engine::{
 pub use infino_vector_engine::{InfinoVectorEngine, InfinoVectorIndex};
 pub use sql_driver::{
     EngineSqlResult, SqlBuildStat, SqlQuery, SqlQueryStats, SqlRunConfig, run_sql,
-    run_sql_with_index,
+    run_sql_batches_with_index, run_sql_with_index,
 };
 pub use vector_driver::{
     EngineVectorResult, VectorBuildStat, VectorMetric, VectorQuery, VectorQueryStats,
@@ -79,6 +82,19 @@ pub struct Capabilities {
     pub vector: bool,
     pub sql: bool,
     pub hybrid: bool,
+    /// Engine can add vectors to an existing index without a full rebuild.
+    /// See [`VectorEngine::insert`] — an immutable-artifact engine may
+    /// still advertise this if it implements `insert` as an honest, if
+    /// heavier, incremental build; the capability flag alone does not
+    /// promise a cheap in-place add.
+    pub vector_insert: bool,
+    /// Engine can remove vectors from an existing index by id, without a
+    /// full rebuild. See [`VectorEngine::remove`].
+    pub vector_remove: bool,
+    /// Engine can serialize its index to bytes and reopen it — i.e. has a
+    /// real save/load boundary distinct from "keep the in-process handle".
+    /// See [`VectorEngine::save`] / [`VectorEngine::load`].
+    pub vector_save_load: bool,
 }
 
 /// A full-text retrieval engine under comparison.
@@ -179,6 +195,43 @@ pub trait VectorEngine {
     fn close(index: &mut Self::Index);
 
     fn delete(index: Self::Index);
+
+    /// Add `vectors` (a flat buffer of `vectors.len() / dim` new rows) to
+    /// an already-built, queryable index. Ids are assigned starting at
+    /// `next_id` (the caller tracks the running id counter so ids stay
+    /// unique across insert calls). Returns `false` if unsupported —
+    /// callers must check [`Capabilities::vector_insert`] before calling
+    /// and treat a `false` return as a harness bug, not a normal outcome.
+    ///
+    /// Deliberately vague about *how* the engine achieves "add to a
+    /// queryable index": an immutable-artifact engine may implement this
+    /// as an incremental rebuild rather than a true append-to-served
+    /// -index. Implementors must document which they do.
+    fn insert(_index: &mut Self::Index, _vectors: &[f32], _next_id: u64) -> bool {
+        false
+    }
+
+    /// Remove the rows named by `ids` from the index. Returns `false` if
+    /// unsupported (see [`VectorEngine::insert`]'s return-value contract).
+    fn remove(_index: &mut Self::Index, _ids: &[u64]) -> bool {
+        false
+    }
+
+    /// Serialize the index to bytes. `None` if unsupported.
+    fn save(_index: &Self::Index) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Reopen an index from bytes previously produced by [`VectorEngine::save`].
+    /// `None` if unsupported.
+    fn load(
+        _column: &str,
+        _dim: usize,
+        _metric: VectorMetric,
+        _bytes: &[u8],
+    ) -> Option<Self::Index> {
+        None
+    }
 }
 
 /// A scalar row ingested by SQL engines.
@@ -196,6 +249,38 @@ pub struct SqlRow<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SqlOutput {
     pub rows: usize,
+}
+
+/// The embedding column of a schema-driven corpus, when it has one.
+#[derive(Clone, Debug)]
+pub struct SqlVectorSpec {
+    pub column: String,
+    pub dim: usize,
+    pub metric: Metric,
+}
+
+/// What a schema-driven corpus tells an engine about its own shape.
+///
+/// `fts_columns` is empty for every corpus this ships with: choosing which
+/// of a dataset's text columns deserve a BM25 index needs a per-dataset
+/// declaration, and indexing all of them would dominate build time for
+/// queries that never use them.
+#[derive(Clone, Debug)]
+pub struct SqlCorpusSpec {
+    pub schema: SchemaRef,
+    pub fts_columns: Vec<String>,
+    pub vector: Option<SqlVectorSpec>,
+}
+
+/// A SQL engine that can ingest a dataset's own schema, rather than the
+/// fixed [`SqlRow`] fixture. Opt-in: an engine that does not implement
+/// this is unaffected by its existence.
+pub trait SchemaDrivenSqlEngine: SqlEngine {
+    fn create_with_spec(spec: &SqlCorpusSpec) -> Self::Index;
+
+    fn write_batches(index: &mut Self::Index, batches: &[RecordBatch]);
+
+    fn parallel_write_batches(spec: &SqlCorpusSpec, batches: &[RecordBatch], writers: usize);
 }
 
 /// A SQL engine under comparison.

@@ -658,6 +658,10 @@ pub mod fts {
         n_docs: usize,
         phases: Phases,
     ) -> (MmapTextCorpus, EngineFtsResult, InfinoFtsIndex) {
+        // This cell has no real-corpus reader — unlike the SQL cell next
+        // door, which is schema-driven. Refuse `corpus=` loudly rather than
+        // silently measuring generated text under the real corpus's label.
+        corpus::require_synthetic("superfile fts");
         eprintln!(
             "[superfile_fts] generating {}-doc Zipfian corpus...",
             fmt_count(n_docs)
@@ -1007,7 +1011,7 @@ pub mod vector {
     };
 
     use crate::{
-        corpus::{self, DIM},
+        corpus::{self, dim},
         cost,
         executors::{vector as exec_vec, vector::VectorRead},
         harness::{
@@ -1071,21 +1075,33 @@ pub mod vector {
                 // normal vector builder/reader paths; the mmap avoids pinning the
                 // synthetic source corpus as heap RAM.
                 let n = n_docs();
-                corpus::MmapVectorCorpus::generate(n, corpus::n_cent(n), CORPUS_ROT_SEED, true)
+                match corpus::corpus_source() {
+                    corpus::CorpusSource::AnnBenchmarks { dir, slug } => {
+                        corpus::MmapVectorCorpus::from_hdf5(dir, slug, n, corpus::dim(), true)
+                            .expect("load real dataset for the superfile tier")
+                    }
+                    corpus::CorpusSource::Synthetic => corpus::MmapVectorCorpus::generate(
+                        n,
+                        corpus::n_cent(n),
+                        CORPUS_ROT_SEED,
+                        true,
+                    ),
+                    // Parquet dataset (downloaded or local).
+                    source => corpus::MmapVectorCorpus::from_parquet_shards(
+                        &corpus::parquet_shards_for(source),
+                        n,
+                        corpus::dim(),
+                        true,
+                    )
+                    .expect("load parquet dataset for the superfile tier"),
+                }
             })
             .as_slice()
     }
 
     pub fn queries_correctness() -> &'static [Vec<f32>] {
         QUERIES_CORRECTNESS.get_or_init(|| {
-            corpus::generate_realistic_queries(
-                vectors(),
-                n_docs(),
-                N_CORRECTNESS_QUERIES,
-                17,
-                true,
-                0.05,
-            )
+            corpus::bench_queries(vectors(), n_docs(), N_CORRECTNESS_QUERIES, 17, true, 0.05)
         })
     }
 
@@ -1094,14 +1110,7 @@ pub mod vector {
     // protocol against the same queries and ground truth.
     pub fn queries_calibration() -> &'static [Vec<f32>] {
         QUERIES_CALIBRATION.get_or_init(|| {
-            corpus::generate_realistic_queries(
-                vectors(),
-                n_docs(),
-                N_CALIBRATION_QUERIES,
-                99,
-                true,
-                0.05,
-            )
+            corpus::bench_queries(vectors(), n_docs(), N_CALIBRATION_QUERIES, 99, true, 0.05)
         })
     }
 
@@ -1270,7 +1279,7 @@ pub mod vector {
         let start_p = sweep_start_probe();
         let start_r = sweep_start_rerank();
         let n_cent = corpus::n_cent(n_docs);
-        let floor = exec_vec::CORRECTNESS_RECALL_FLOOR;
+        let floor = exec_vec::RecallFloors::superfile().correctness;
 
         let (probes, reranks, sweep_label) = if let Some(max_p) = sweep_probe_max() {
             let min_p = sweep_probe_min();
@@ -1355,8 +1364,9 @@ pub mod vector {
         report.emit(&Section {
             anchor: "bench/vector/superfile/sweep".into(),
             title: format!(
-                "Superfile vector — (p, r) sweep from ({start_p}, {start_r}) ({} docs × dim={DIM})",
+                "Superfile vector — (p, r) sweep from ({start_p}, {start_r}) ({} docs × dim={})",
                 fmt_count(n_docs),
+                dim(),
             ),
             note: format!("One build; {sweep_label}. Floor recall@{TOP_K} ≥ {floor:.2}."),
             blocks: vec![Block {
@@ -1424,7 +1434,8 @@ pub mod vector {
         let q0 = &queries_calibration()[0];
 
         eprintln!(
-            "[superfile_vec] latency compare ({}×{DIM}, q=calibration[0], {} iters/query):",
+            "[superfile_vec] latency compare ({}×{}, q=calibration[0], {} iters/query):",
+            dim(),
             fmt_count(n_docs),
             CALIBRATION_P50_ITERS,
         );
@@ -1448,7 +1459,8 @@ pub mod vector {
     pub fn run(phases: Phases) {
         let n_docs = n_docs();
         eprintln!(
-            "[superfile_vec] starting {}×{DIM} (build={}, warm={}, cold={})",
+            "[superfile_vec] starting {}×{} (build={}, warm={}, cold={})",
+            dim(),
             fmt_count(n_docs),
             phases.build,
             phases.warm,
@@ -1511,6 +1523,7 @@ pub mod vector {
                 ground_truth_correctness(),
                 queries_calibration(),
                 gt_cal,
+                exec_vec::RecallFloors::superfile(),
                 phases.warm,
                 phases.cold,
                 3,
@@ -1518,8 +1531,9 @@ pub mod vector {
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(
-                    "Superfile vector — search, single-superfile / in-memory ({} docs × dim={DIM})",
-                    fmt_count(n_docs)
+                    "Superfile vector — search, single-superfile / in-memory ({} docs × dim={})",
+                    fmt_count(n_docs),
+                    dim()
                 ),
                 "Warm search and cold upload reuse the measured 1-writer artifact. The `default` row is the user-facing option baseline, recall-gated; recall-target rows appear only when the calibration grid is explicitly enabled. Δ is vs the previous run.",
             );
@@ -1528,13 +1542,14 @@ pub mod vector {
                     .builds
                     .last()
                     .expect("harness records at least one build row");
-                let corpus_bytes = (n_docs * DIM) as u64 * std::mem::size_of::<f32>() as u64;
+                let corpus_bytes = (n_docs * dim()) as u64 * std::mem::size_of::<f32>() as u64;
                 super::emit_cost_warm(
                     &mut report,
                     "bench/vector/superfile/cost",
                     format!(
-                        "Superfile vector — cost model ({} docs × dim={DIM})",
-                        fmt_count(n_docs)
+                        "Superfile vector — cost model ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        dim()
                     ),
                     b.wall.as_secs_f64(),
                     b.writers as u32,
@@ -1683,8 +1698,9 @@ pub mod vector {
                 report.emit(&Section {
                     anchor: "bench/vector/superfile/filtered".into(),
                     title: format!(
-                        "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={DIM})",
-                        fmt_count(n_docs)
+                        "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        dim()
                     ),
                     note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; recall and p50 over the correctness query battery at the requested `default` config. `effective (p, r)` is the reader's own post-selectivity-boost math (shared helper, caps included). Δ is vs the previous run.".into(),
                     blocks: vec![Block {
@@ -1757,8 +1773,10 @@ pub mod vector {
     /// correctness, warm search, and cold upload.
     fn build_warm_artifact(n_docs: usize) -> (EngineVectorResult, InfinoVectorIndex) {
         eprintln!(
-            "[superfile_vec] generating {}×{DIM} planted-cluster vector corpus...",
-            fmt_count(n_docs)
+            "[superfile_vec] preparing {}×{} {} vector corpus...",
+            fmt_count(n_docs),
+            dim(),
+            corpus::corpus_label()
         );
         let vectors = vectors();
 
@@ -1770,7 +1788,7 @@ pub mod vector {
         let (build_result, index) = run_vector_with_index::<InfinoVectorEngine>(
             VectorRunConfig {
                 column: VEC_COLUMN,
-                dim: DIM,
+                dim: dim(),
                 metric: VectorMetric::Cosine,
                 k: TOP_K,
                 iters: CALIBRATION_P50_ITERS,
@@ -1799,7 +1817,7 @@ pub mod vector {
     ) -> Vec<Vec<Cell>> {
         // Logical input payload: the raw f32 embeddings, identical across
         // every writer count (the parallel build shards the same corpus).
-        let corpus_bytes = (n_docs * DIM * size_of::<f32>()) as u64;
+        let corpus_bytes = (n_docs * dim() * size_of::<f32>()) as u64;
         let mut rows = Vec::new();
         for b in &build_result.builds {
             rows.push(build_row(
@@ -1818,8 +1836,9 @@ pub mod vector {
         report.emit(&Section {
             anchor: "bench/vector/superfile/ingest".into(),
             title: format!(
-                "Superfile vector — ingest, single-superfile / in-memory ({} docs × dim={DIM})",
-                fmt_count(n_docs)
+                "Superfile vector — ingest, single-superfile / in-memory ({} docs × dim={})",
+                fmt_count(n_docs),
+                dim()
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet`, through `VectorEngine`. Rows are by writer count; `1 writer` is the canonical artifact used by correctness/search/cold upload. Δ is vs the previous run.".into(),
             blocks: vec![Block {
@@ -1859,11 +1878,11 @@ pub mod sql {
     use crate::{
         corpus::{self, MmapTextCorpus},
         cost,
-        executors::{sql as exec_sql, sql::SqlRead},
+        executors::{payload_bytes, sql as exec_sql, sql::SqlRead},
         harness::{
-            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SQL_DIM, SqlRow, SqlRunConfig,
-            build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
-            sql_options,
+            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SQL_DIM, SqlQuery, SqlQueryStats,
+            SqlRow, SqlRunConfig, build_supertable_with_options, run_sql_batches_with_index,
+            run_sql_with_index, sample_query_csv, scatter_key, sql_options,
         },
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
@@ -1875,6 +1894,14 @@ pub mod sql {
     /// Deterministic category labels assigned round-robin by doc id, so the
     /// planted distribution is exactly known for the correctness gate.
     const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
+
+    /// Report anchors for the schema-driven (real-corpus) arm. Deliberately
+    /// distinct from the synthetic ones: both arms persist into the same
+    /// `sql.json`, and a shared key would diff a real corpus against the
+    /// synthetic baseline every recorded number in the repo comes from.
+    const REAL_CORPUS_BUILD_ANCHOR: &str = "bench/sql/build/schema-driven";
+    const REAL_CORPUS_QUERY_ANCHOR: &str = "bench/sql/query/schema-driven";
+    const REAL_CORPUS_COST_ANCHOR: &str = "bench/sql/superfile/cost/schema-driven";
 
     /// Build the planted `(doc_id, title, category, score)` rows borrowing
     /// titles from the shared mmap corpus. `category` cycles through
@@ -1902,28 +1929,43 @@ pub mod sql {
             phases.warm,
             phases.cold,
         );
-        let (corpus, query_inputs, result, index) = build_warm_artifact(n_docs, phases);
+        let artifact = build_warm_artifact(n_docs, phases);
 
         let mut report = Report::load("sql");
         if phases.build {
-            let stored = stored_bytes(&index);
-            emit_build(&mut report, n_docs, &corpus, &result, stored);
+            let stored = stored_bytes(&artifact.index);
+            emit_build(
+                &mut report,
+                artifact.actual_docs,
+                artifact.corpus_bytes,
+                &artifact.result,
+                stored,
+                artifact.lossy_rows,
+            );
         }
-        let warm_sets = phases.warm.then(|| {
-            exec_sql::assert_correct(&index, n_docs, "superfile_sql");
-            exec_sql::measure_query_sets(
-                &index,
-                &query_inputs,
-                exec_sql::ITERS,
-                "superfile_sql",
-                exec_sql::HIGH_CARD_SQL,
-            )
-        });
-        let cold = phases.cold.then(|| {
-            let corpus_rows = corpus.rows();
-            let rows = sql_rows(&corpus_rows);
-            measure_cold_queries(&rows)
-        });
+        let warm_sets = phases
+            .warm
+            .then(|| synthetic_extras_for(&artifact.synthetic, "warm"))
+            .flatten()
+            .map(|extras| {
+                exec_sql::assert_correct(&artifact.index, n_docs, "superfile_sql");
+                exec_sql::measure_query_sets(
+                    &artifact.index,
+                    &extras.query_inputs,
+                    exec_sql::ITERS,
+                    "superfile_sql",
+                    exec_sql::HIGH_CARD_SQL,
+                )
+            });
+        let cold = phases
+            .cold
+            .then(|| synthetic_extras_for(&artifact.synthetic, "cold"))
+            .flatten()
+            .map(|extras| {
+                let corpus_rows = extras.corpus.rows();
+                let rows = sql_rows(&corpus_rows);
+                measure_cold_queries(&rows)
+            });
         if let Some(sets) = &warm_sets {
             exec_sql::emit_query(
                 &mut report,
@@ -1936,10 +1978,21 @@ pub mod sql {
                 sets,
                 cold.as_ref(),
             );
-            let b = result
+            let b = artifact
+                .result
                 .builds
                 .last()
                 .expect("harness records at least one build row");
+            // `warm_sets` is `Some` only when `synthetic` is (see
+            // `synthetic_extras_for`): raw text bytes only —
+            // `artifact.corpus_bytes` also carries the emb top-up and the
+            // real-corpus arm's Arrow payload, neither wanted here.
+            let synthetic_corpus_bytes = artifact
+                .synthetic
+                .as_ref()
+                .expect("warm_sets implies synthetic extras")
+                .corpus
+                .total_bytes();
             super::emit_cost_warm(
                 &mut report,
                 "bench/sql/superfile/cost",
@@ -1948,56 +2001,343 @@ pub mod sql {
                 b.writers as u32,
                 b.cpu_s,
                 Some(b.rss.peak_rss_bytes),
-                stored_bytes(&index),
-                corpus.total_bytes(),
+                stored_bytes(&artifact.index),
+                synthetic_corpus_bytes,
                 n_docs,
                 &cost::warm_from_sql(sets),
             );
+        } else if phases.warm {
+            // No synthetic fixture but warm was asked for: a real corpus. Its
+            // own query battery already ran inside the driver, so price the
+            // cell from those measurements rather than dropping them.
+            emit_real_corpus_warm(&mut report, &artifact);
         }
         report.save();
     }
 
-    /// Build the canonical one-writer SQL table and run the warm scalar SQL
-    /// battery through the shared SQL driver.
-    fn build_warm_artifact(
-        n_docs: usize,
-        phases: Phases,
-    ) -> (
-        MmapTextCorpus,
-        exec_sql::QueryInputs,
-        EngineSqlResult,
-        InfinoSqlIndex,
-    ) {
-        eprintln!(
-            "[superfile_sql] generating {}-row Zipfian corpus...",
-            fmt_count(n_docs)
-        );
-        let corpus = MmapTextCorpus::generate(n_docs, 1);
-        let corpus_rows = corpus.rows();
-        let mid = corpus_rows.len() / 2;
-        let query_inputs = exec_sql::QueryInputs {
-            qv: sample_query_csv(),
-            sample_title: corpus_rows[mid].1.replace('\'', "''"),
-            sample_key: scatter_key(corpus_rows[mid].0),
-            n_docs,
-        };
-        let rows = sql_rows(&corpus_rows);
-
-        if phases.build {
+    /// Warm + cost report for a schema-driven corpus, built from the query
+    /// battery the driver already timed. `payload_bytes` needs the returned
+    /// batches, which the driver's row count can't give, so each measured
+    /// query gets one extra untimed call — the same convention the synthetic
+    /// path's `timed` helper uses.
+    fn emit_real_corpus_warm(report: &mut Report, artifact: &SqlBuildArtifact) {
+        let battery = artifact.battery;
+        let warm: Vec<cost::WarmQueryCost> = artifact
+            .result
+            .queries
+            .iter()
+            .map(|stat| warm_cost_for(&artifact.index, stat, battery))
+            .collect();
+        if warm.is_empty() {
             eprintln!(
-                "[superfile_sql] building 1-writer supertable over {} rows...",
-                fmt_count(n_docs),
+                "[superfile_sql] no query in the {} battery produced a timing — nothing to price",
+                corpus::corpus_label(),
+            );
+            return;
+        }
+        eprintln!(
+            "[superfile_sql] pricing {} of {} {} queries ({} skipped, excluded from the cost \
+             model); cold is not measured for this corpus and is reported unmetered",
+            warm.len(),
+            battery.len(),
+            corpus::corpus_label(),
+            artifact.result.skipped.len(),
+        );
+        emit_real_corpus_queries(report, artifact, &warm, battery.len());
+        let b = artifact
+            .result
+            .builds
+            .last()
+            .expect("harness records at least one build row");
+        super::emit_cost_warm(
+            report,
+            REAL_CORPUS_COST_ANCHOR,
+            format!(
+                "Superfile SQL — cost model ({}, {} rows)",
+                corpus::corpus_label(),
+                fmt_count(artifact.actual_docs)
+            ),
+            b.wall.as_secs_f64(),
+            b.writers as u32,
+            b.cpu_s,
+            Some(b.rss.peak_rss_bytes),
+            stored_bytes(&artifact.index),
+            artifact.corpus_bytes,
+            artifact.actual_docs,
+            &warm,
+        );
+    }
+
+    fn warm_cost_for(
+        index: &InfinoSqlIndex,
+        stat: &SqlQueryStats,
+        battery: &[SqlQuery],
+    ) -> cost::WarmQueryCost {
+        let sql = battery
+            .iter()
+            .find(|q| q.name == stat.name)
+            .expect("invariant: every measured stat's name comes from this battery")
+            .sql;
+        let (payload_rows, payload_bytes) = index.query_payload(sql);
+        cost::WarmQueryCost {
+            name: stat.name.to_string(),
+            p50_s: stat.p50.as_secs_f64(),
+            cpu_s: stat.cpu_s,
+            payload_rows,
+            payload_bytes,
+        }
+    }
+
+    /// Per-query warm table for a real corpus. Deliberately narrower than the
+    /// synthetic `emit_query`: the driver samples one percentile and no cold
+    /// path exists here, so p90/p99 and the cold columns are absent rather
+    /// than filled with numbers nothing measured.
+    fn emit_real_corpus_queries(
+        report: &mut Report,
+        artifact: &SqlBuildArtifact,
+        warm: &[cost::WarmQueryCost],
+        planned: usize,
+    ) {
+        let resident = rss::current_anon_rss_bytes().unwrap_or(0);
+        let rows: Vec<Vec<Cell>> = warm
+            .iter()
+            .map(|w| {
+                let p50_ns = w.p50_s * 1e9;
+                vec![
+                    text(w.name.clone()),
+                    text(fmt_count(w.payload_rows as usize)),
+                    text(rss::fmt_bytes(w.payload_bytes)),
+                    text(cost::egress_cell_per_million(w.payload_bytes)),
+                    metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                    text(cost::warm_cell_per_million(
+                        w.cpu_s,
+                        w.p50_s,
+                        resident,
+                        w.payload_bytes,
+                    )),
+                ]
+            })
+            .collect();
+        report.emit(&Section {
+            anchor: REAL_CORPUS_QUERY_ANCHOR.into(),
+            title: format!(
+                "Superfile SQL — {} query battery, single superfile ({} rows)",
+                corpus::corpus_label(),
+                fmt_count(artifact.actual_docs)
+            ),
+            note: lossy_rows_note(
+                skip_note(planned, warm.len(), &artifact.result.skipped),
+                artifact.lossy_rows,
+            ),
+            blocks: vec![Block {
+                subtitle: String::new(),
+                headers: real_corpus_query_headers(),
+                rows,
+            }],
+        });
+    }
+
+    /// The battery's denominator, stated in the report: which queries were
+    /// measured, which were dropped, and why — so a partial battery can never
+    /// read as a complete one.
+    fn skip_note(planned: usize, measured: usize, skipped: &[(&'static str, String)]) -> String {
+        let mut note = format!(
+            "Warm p50 over `query_sql` against the canonical 1-writer table (in-memory). \
+             Cold is NOT MEASURED for this corpus — there is no schema-driven cold path yet, \
+             so the cost model reports it unmetered rather than as a zero. \
+             **{measured} of {planned} queries measured.**"
+        );
+        if skipped.is_empty() {
+            return note;
+        }
+        let names: Vec<&str> = skipped.iter().map(|(name, _)| *name).collect();
+        let mut reasons: Vec<&str> = Vec::new();
+        for (_, reason) in skipped {
+            if !reasons.contains(&reason.as_str()) {
+                reasons.push(reason);
+            }
+        }
+        note.push_str(&format!(
+            " {} skipped and excluded from every figure here and in the cost model: {}. \
+             Reason(s): {}.",
+            skipped.len(),
+            names.join(", "),
+            reasons.join(" | "),
+        ));
+        note
+    }
+
+    /// Appends the dataset's lossy-UTF-8 replacement count to a report note,
+    /// when non-zero — genuinely useful provenance for a real corpus, absent
+    /// for the synthetic arm which never needs the lossy fallback.
+    fn lossy_rows_note(mut note: String, lossy_rows: usize) -> String {
+        if lossy_rows > 0 {
+            note.push_str(&format!(
+                " {} rows contained invalid UTF-8 in a binary column and were replaced lossily.",
+                fmt_count(lossy_rows)
+            ));
+        }
+        note
+    }
+
+    fn real_corpus_query_headers() -> Vec<String> {
+        [
+            "Query",
+            "Rows",
+            "Payload",
+            "Egress $/1M",
+            "warm p50",
+            "Warm $/1M",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// The fixed `SqlRow` fixture + sampled query literals the exec_sql
+    /// warm/cold battery needs — meaningless for a schema-driven real corpus.
+    struct SyntheticSqlExtras {
+        corpus: MmapTextCorpus,
+        query_inputs: exec_sql::QueryInputs,
+    }
+
+    /// exec_sql's warm/cold battery asserts planted counts and samples its
+    /// literals from planted columns; a real corpus has neither, so this logs
+    /// why and returns `None` instead of measuring the wrong columns. Only the
+    /// synthetic battery is skipped — a real corpus is measured through its own
+    /// query battery (see [`emit_real_corpus_warm`]).
+    fn synthetic_extras_for<'a>(
+        synthetic: &'a Option<SyntheticSqlExtras>,
+        phase: &str,
+    ) -> Option<&'a SyntheticSqlExtras> {
+        let extras = synthetic.as_ref();
+        if extras.is_none() {
+            eprintln!(
+                "[superfile_sql] skipping the synthetic {phase} battery: corpus {:?} has no planted \
+                 fixture, so its oracles and sampled literals do not exist",
+                corpus::corpus_label(),
             );
         }
-        let (result, index) = run_sql_with_index::<InfinoSqlEngine>(
-            SqlRunConfig {
-                iters: exec_sql::ITERS,
-                parallel: corpus::parallel_writers(),
-            },
-            &rows,
-            &[], // scalar battery measured via crate::executors::sql
-        );
-        (corpus, query_inputs, result, index)
+        extras
+    }
+
+    /// One one-writer SQL build, plus the exec_sql warm/cold extras when the
+    /// corpus is synthetic (`None` for a schema-driven real corpus).
+    struct SqlBuildArtifact {
+        corpus_bytes: u64,
+        actual_docs: usize,
+        synthetic: Option<SyntheticSqlExtras>,
+        /// The battery the driver was handed — the one place the query text
+        /// behind each `SqlQueryStats.name` can be recovered.
+        battery: &'static [SqlQuery],
+        result: EngineSqlResult,
+        index: InfinoSqlIndex,
+        /// Rows the real-corpus loader replaced lossily (invalid UTF-8 in a
+        /// binary column); always zero for the synthetic arm, which has none.
+        lossy_rows: usize,
+    }
+
+    /// One `building N rows...` progress line, shared by both corpus arms.
+    fn log_build_start(phases: Phases, rows: usize, label: Option<&str>) {
+        if !phases.build {
+            return;
+        }
+        match label {
+            Some(label) => eprintln!(
+                "[superfile_sql] building 1-writer supertable over {} rows ({label})...",
+                fmt_count(rows)
+            ),
+            None => eprintln!(
+                "[superfile_sql] building 1-writer supertable over {} rows...",
+                fmt_count(rows)
+            ),
+        }
+    }
+
+    /// Builds the canonical one-writer SQL table for the active corpus
+    /// source, branching on [`corpus::corpus_source`] (see [`SqlBuildArtifact`]).
+    fn build_warm_artifact(n_docs: usize, phases: Phases) -> SqlBuildArtifact {
+        let cfg = SqlRunConfig {
+            iters: exec_sql::ITERS,
+            parallel: corpus::parallel_writers(),
+        };
+        match corpus::corpus_source() {
+            corpus::CorpusSource::Synthetic => {
+                eprintln!(
+                    "[superfile_sql] generating {}-row Zipfian corpus...",
+                    fmt_count(n_docs)
+                );
+                let corpus = MmapTextCorpus::generate(n_docs, 1);
+                let corpus_rows = corpus.rows();
+                let mid = corpus_rows.len() / 2;
+                let query_inputs = exec_sql::QueryInputs {
+                    qv: sample_query_csv(),
+                    sample_title: corpus_rows[mid].1.replace('\'', "''"),
+                    sample_key: scatter_key(corpus_rows[mid].0),
+                    n_docs,
+                };
+                let rows = sql_rows(&corpus_rows);
+                log_build_start(phases, n_docs, None);
+                let (result, index) = run_sql_with_index::<InfinoSqlEngine>(
+                    cfg,
+                    &rows,
+                    &[], // scalar battery measured via crate::executors::sql
+                );
+                // `emb` is generated inline by the engine (`emb_for`), not
+                // through this `MmapTextCorpus` — top up the text-only
+                // `total_bytes()` or Corpus/Bandwidth/Stored% silently ignore
+                // the largest ingested column.
+                let corpus_bytes =
+                    corpus.total_bytes() + (n_docs * SQL_DIM * size_of::<f32>()) as u64;
+                SqlBuildArtifact {
+                    corpus_bytes,
+                    actual_docs: n_docs,
+                    synthetic: Some(SyntheticSqlExtras {
+                        corpus,
+                        query_inputs,
+                    }),
+                    battery: &[], // scalar battery measured via crate::executors::sql
+                    result,
+                    index,
+                    lossy_rows: 0,
+                }
+            }
+            source => {
+                eprintln!(
+                    "[superfile_sql] loading real corpus ({}) for schema-driven SQL...",
+                    corpus::corpus_label(),
+                );
+                let corpus = corpus::sql::open(source, n_docs);
+                let actual_docs = corpus.n_rows();
+                let lossy_rows = corpus.lossy_rows();
+                let corpus_bytes = payload_bytes(corpus.batches()).1;
+                log_build_start(phases, actual_docs, Some(corpus::corpus_label()));
+                // Empty unless `phases.warm`: this call always runs (warm/cold
+                // need the table too), so an unconditional battery would run
+                // every query on a `build`-only invocation. The battery is
+                // derived from the corpus's own schema — no vendored text.
+                let queries = if phases.warm {
+                    corpus::sql_battery::battery_for(corpus.spec())
+                } else {
+                    &[]
+                };
+                let (result, index) = run_sql_batches_with_index::<InfinoSqlEngine>(
+                    cfg,
+                    corpus.spec(),
+                    corpus.batches(),
+                    queries,
+                );
+                SqlBuildArtifact {
+                    corpus_bytes,
+                    actual_docs,
+                    synthetic: None,
+                    battery: queries,
+                    result,
+                    index,
+                    lossy_rows,
+                }
+            }
+        }
     }
 
     struct ColdSqlArtifact {
@@ -2153,25 +2493,44 @@ pub mod sql {
 
     fn emit_build(
         report: &mut Report,
-        n_docs: usize,
-        corpus: &MmapTextCorpus,
+        actual_docs: usize,
+        corpus_bytes: u64,
         result: &EngineSqlResult,
         stored_bytes: u64,
+        lossy_rows: usize,
     ) {
-        // The ingested schema also carries a `SQL_DIM`-wide `emb` column
-        // (see `harness::infino_sql_engine::sql_schema`) generated inline by
-        // `emb_for`, not through this `MmapTextCorpus` — so the text-only
-        // `total_bytes()` must be topped up with the embedding bytes or
-        // "Corpus"/"Bandwidth"/"Stored %" silently ignore the largest
-        // ingested column.
-        let corpus_bytes = corpus.total_bytes() + (n_docs * SQL_DIM * size_of::<f32>()) as u64;
+        // Real corpus: whatever columns its dataset carries, not the fixed list.
+        // Anchor and "Corpus" meaning both diverge by arm: the real arm's
+        // Corpus is in-memory Arrow batch bytes (see `payload_bytes` at the
+        // call site), the synthetic arm's is raw generated text bytes plus an
+        // `emb` top-up — sharing an anchor would diff one against the other.
+        //
+        // `subtitle` stays empty on both arms: it is part of the report's Δ
+        // delta key (`anchor|subtitle|label|header`), so anything arm-specific
+        // belongs in `note` instead, where it can't break Δ continuity.
+        let (anchor, schema_desc, corpus_note) = match corpus::corpus_source() {
+            corpus::CorpusSource::Synthetic => (
+                "bench/sql/build",
+                format!("title + bucket + key + category + rating + emb[{SQL_DIM}]"),
+                "Corpus is raw generated text bytes (title/bucket/key/category/rating), \
+                 topped up for the inline-generated `emb` column."
+                    .to_string(),
+            ),
+            _ => (
+                REAL_CORPUS_BUILD_ANCHOR,
+                format!("schema-driven from {}", corpus::corpus_label()),
+                "Corpus is the in-memory Arrow `RecordBatch` payload for the loaded dataset, \
+                 not its on-disk parquet size."
+                    .to_string(),
+            ),
+        };
         let rows: Vec<Vec<Cell>> = result
             .builds
             .iter()
             .map(|b| {
                 let secs = b.wall.as_secs_f64();
                 let ns = secs * 1e9;
-                let thr = n_docs as f64 / secs;
+                let thr = actual_docs as f64 / secs;
                 let bw = corpus_bytes as f64 / secs;
                 let [corpus_cell, stored_cell] =
                     super::corpus_stored_cells(corpus_bytes, stored_bytes);
@@ -2187,22 +2546,143 @@ pub mod sql {
                 cells
             })
             .collect();
-        report.emit(&Section {
-            anchor: "bench/sql/build".into(),
-            title: format!(
-                "Superfile SQL — ingest, single superfile / in-memory ({} rows: title + bucket + key + category + rating + emb[{SQL_DIM}])",
-                fmt_count(n_docs)
+        let note = lossy_rows_note(
+            format!(
+                "Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, \
+                 through the engine-generic `run_sql` driver the cross-engine comparison also \
+                 uses. Rows are by writer count: `1 writer` is the canonical build queries run \
+                 against; `N writers` is the sharded parallel build. Δ is vs the previous run. \
+                 {corpus_note}"
             ),
-            note: "Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, through \
-                   the engine-generic `run_sql` driver the cross-engine comparison also uses. Rows are by \
-                   writer count: `1 writer` is the canonical build queries run against; `N writers` is the \
-                   sharded parallel build. Δ is vs the previous run."
-                .into(),
+            lossy_rows,
+        );
+        report.emit(&Section {
+            anchor: anchor.into(),
+            title: format!(
+                "Superfile SQL — ingest, single superfile / in-memory ({} rows: {schema_desc})",
+                fmt_count(actual_docs)
+            ),
+            note,
             blocks: vec![Block {
                 subtitle: String::new(),
                 headers: super::ingest_headers(),
                 rows,
             }],
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::{skip_note, warm_cost_for};
+        use crate::harness::{
+            InfinoSqlEngine, SqlCorpusSpec, SqlQuery, SqlRunConfig, run_sql_batches_with_index,
+        };
+
+        const PLANNED: usize = 43;
+        const MEASURED: usize = 36;
+        /// Rows in the tiny schema-driven fixture the pricing test builds.
+        const PRICING_TEST_ROWS: i64 = 8;
+        const PRICING_TEST_BATTERY: &[SqlQuery] = &[
+            SqlQuery {
+                name: "count_all",
+                sql: "SELECT COUNT(*) FROM supertable",
+            },
+            SqlQuery {
+                name: "filtered",
+                sql: "SELECT n FROM supertable WHERE n < 4",
+            },
+        ];
+
+        fn pricing_test_batch() -> (SqlCorpusSpec, RecordBatch) {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::LargeUtf8, false),
+                Field::new("n", DataType::Int64, false),
+            ]));
+            let names = LargeStringArray::from(
+                (0..PRICING_TEST_ROWS)
+                    .map(|i| format!("row{i}"))
+                    .collect::<Vec<_>>(),
+            );
+            let ns = Int64Array::from((0..PRICING_TEST_ROWS).collect::<Vec<_>>());
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(names), Arc::new(ns)])
+                    .expect("batch");
+            let spec = SqlCorpusSpec {
+                schema,
+                fts_columns: Vec::new(),
+                vector: None,
+            };
+            (spec, batch)
+        }
+
+        /// A measured real-corpus battery prices every surviving query, and
+        /// the measured/skipped split accounts for the whole planned
+        /// battery — the arithmetic the report note's "N of M measured"
+        /// line relies on.
+        #[test]
+        fn warm_cost_for_prices_every_measured_query_and_arithmetic_holds() {
+            let (spec, batch) = pricing_test_batch();
+            let cfg = SqlRunConfig {
+                iters: 1,
+                parallel: 1,
+            };
+            let (result, index) = run_sql_batches_with_index::<InfinoSqlEngine>(
+                cfg,
+                &spec,
+                &[batch],
+                PRICING_TEST_BATTERY,
+            );
+
+            let warm: Vec<_> = result
+                .queries
+                .iter()
+                .map(|stat| warm_cost_for(&index, stat, PRICING_TEST_BATTERY))
+                .collect();
+
+            assert!(
+                !warm.is_empty(),
+                "a measured battery must produce at least one warm cost entry"
+            );
+            assert_eq!(
+                warm.len(),
+                result.queries.len(),
+                "every measured stat must be priced"
+            );
+            assert_eq!(
+                warm.len() + result.skipped.len(),
+                PRICING_TEST_BATTERY.len(),
+                "measured + skipped must equal the planned battery size"
+            );
+        }
+
+        /// A partial battery must state its own denominator, name every
+        /// dropped query, and say the numbers exclude them.
+        #[test]
+        fn skip_note_states_the_denominator_and_names_the_skips() {
+            let skipped = vec![
+                ("q36", "cast error".to_string()),
+                ("q37", "cast error".to_string()),
+            ];
+            let note = skip_note(PLANNED, MEASURED, &skipped);
+            assert!(note.contains("36 of 43 queries measured"), "{note}");
+            assert!(note.contains("2 skipped"), "{note}");
+            assert!(note.contains("q36, q37"), "{note}");
+            // Identical reasons collapse to one — a 7-way repeat of the same
+            // DataFusion error would otherwise bury the note.
+            assert_eq!(note.matches("cast error").count(), 1, "{note}");
+        }
+
+        /// A complete battery says so without a skip clause.
+        #[test]
+        fn skip_note_omits_the_clause_when_nothing_was_skipped() {
+            let note = skip_note(PLANNED, PLANNED, &[]);
+            assert!(note.contains("43 of 43 queries measured"), "{note}");
+            assert!(!note.contains("skipped and excluded"), "{note}");
+        }
     }
 }

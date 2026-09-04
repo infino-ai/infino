@@ -38,7 +38,7 @@ use infino::{
         query::VectorSearchOptions,
         storage::{GcsStorageProvider, StorageProvider},
     },
-    test_helpers::{cas_conformance::cas_conformance, default_disk_cache, default_tokenizer},
+    test_helpers::{cas_conformance::cas_conformance, default_disk_cache},
 };
 use tempfile::TempDir;
 
@@ -75,10 +75,7 @@ fn gcs_options(dim: usize) -> SupertableOptions {
     );
     SupertableOptions::new(
         unified_schema(dim),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![VectorConfig {
             column: "emb".into(),
             dim,
@@ -87,7 +84,6 @@ fn gcs_options(dim: usize) -> SupertableOptions {
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     )
     .expect("gcs test options")
     .with_writer_pool(pool)

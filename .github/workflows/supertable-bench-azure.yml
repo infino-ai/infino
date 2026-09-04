@@ -97,6 +97,15 @@ on:
   workflow_call:
     inputs:
       bench:           { type: string, required: false, default: supertable_all }
+      # Vector corpus source, passed through as the bench's `corpus=` /
+      # `corpus-dir=` arguments. Empty (the default) selects the synthetic
+      # planted-cluster corpus, so every existing leg — and the A/B baseline
+      # it is compared against — is byte-identical to before this input
+      # existed. A real-corpus leg sets e.g. corpus: annb:glove-100-angular;
+      # `realistic` selects the generated text corpus the FTS quality phase
+      # is calibrated on (no corpus_dir needed).
+      corpus:          { type: string, required: false, default: "" }
+      corpus_dir:      { type: string, required: false, default: "" }
       docs:            { type: string, required: false, default: "1000000" }
       # Vector metric: ""/cosine → the cosine Sq16 path; l2sq|negdot → the
       # unbounded metrics whose default codec is Sq16Adaptive. Passed to the
@@ -197,6 +206,25 @@ jobs:
             all)                       args="all";               reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
             *) echo "::error::unknown bench ${{ inputs.bench }}"; exit 1 ;;
           esac
+          # Corpus selection rides the same positional-arg surface as the
+          # cell selectors. Empty corpus => nothing appended => synthetic,
+          # so existing legs and their A/B baselines are unchanged.
+          if [ -n "${{ inputs.corpus }}" ]; then
+            args="$args corpus=${{ inputs.corpus }}"
+            if [ -n "${{ inputs.corpus_dir }}" ]; then
+              args="$args corpus-dir=${{ inputs.corpus_dir }}"
+            else
+              # Generated corpora (`synthetic`, `realistic`) need no staging
+              # dir; every other spec downloads or reads files.
+              case "${{ inputs.corpus }}" in
+                synthetic|realistic) ;;
+                *)
+                  echo "::error::corpus set without corpus_dir; downloadable corpora need a staging dir"
+                  exit 1
+                  ;;
+              esac
+            fi
+          fi
           echo "args=$args"       >> "$GITHUB_OUTPUT"
           echo "reports=$reports" >> "$GITHUB_OUTPUT"
           echo "args=[$args] reports=[$reports]"
@@ -615,6 +643,39 @@ jobs:
           # Error lines captured by the Summarize step (empty file if none).
           ERRORS="$(cat /tmp/bench.errors 2>/dev/null || true)" \
             python3 .github/scripts/bench_summary.py
+
+      # Enforce the merge-blocking benchmark gate: the designated warm gate
+      # metric (`bench_gate_metric`) worse than the same-host main baseline by
+      # BOTH >50% and >5 ms fails this job (bench_summary.py writes the verdict;
+      # the 5% findings stay advisory). Every other time-valued metric — tail
+      # percentiles, cold reads, one-shot transition walls — is reported as a
+      # warning instead: each tracks object-store or run-order variance rather
+      # than the diff, and each was observed failing the gate on main-vs-main
+      # runs. A separate step so the summary still posts on FAIL.
+      - name: Enforce benchmark merge gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          STATUS_FILE=/tmp/bench-gate.status
+          INFO_FILE=/tmp/bench-gate.info
+          if [ -s "$INFO_FILE" ]; then
+            echo "::warning::non-gating movers past >50% AND >5ms vs main (informational):"
+            while IFS= read -r line; do
+              echo "::warning::  $line"
+            done < "$INFO_FILE"
+          fi
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo "no gate verdict produced (no baseline or summary skipped) — pass"
+            exit 0
+          fi
+          if head -1 "$STATUS_FILE" | grep -q '^FAIL'; then
+            echo "::error::benchmark merge gate FAILED (>50% AND >5ms vs main):"
+            tail -n +2 "$STATUS_FILE" | while IFS= read -r line; do
+              echo "::error::  $line"
+            done
+            exit 1
+          fi
+          echo "benchmark merge gate: pass"
 
       - name: Publish benchmark summary to run summary
         if: ${{ !cancelled() && inputs.summary_destination == 'step_summary' }}

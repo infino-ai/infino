@@ -61,7 +61,7 @@ use tempfile::TempDir;
 
 use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
-    corpus::DIM,
+    corpus::dim,
     cost, cpu,
     executors::p50,
     ingest::supertable::{self, Modality, modality_label},
@@ -882,7 +882,7 @@ pub fn run() {
         title: format!(
             "Supertable — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
             fmt_count(n_docs),
-            crate::corpus::DIM,
+            crate::corpus::dim(),
             supertable::n_commits(),
             supertable::n_writers()
         ),
@@ -911,14 +911,16 @@ const TOP_K: usize = 10;
 
 /// Selected phases for a per-modality supertable runner.
 ///
-/// Read phases (`warm`, `cold`) still build the object-store table because
-/// they need the committed artifact; `build` controls whether the ingest
-/// section is emitted.
+/// Read phases (`warm`, `cold`, `quality`) still build the object-store
+/// table because they need the committed artifact; `build` controls whether
+/// the ingest section is emitted. `quality` grades what the FTS search path
+/// returns against a BM25 oracle (FTS only; the other modalities ignore it).
 #[derive(Clone, Copy)]
 pub struct Phases {
     pub build: bool,
     pub warm: bool,
     pub cold: bool,
+    pub quality: bool,
 }
 
 impl Phases {
@@ -926,7 +928,13 @@ impl Phases {
         build: true,
         warm: true,
         cold: true,
+        quality: true,
     };
+
+    /// Whether any read phase needs the built artifact opened in-process.
+    pub fn reads(&self) -> bool {
+        self.warm || self.cold || self.quality
+    }
 }
 
 /// Ingest a prepared corpus, sampling RSS over the build window. Returns the
@@ -981,6 +989,13 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
 /// whole-cell at <5M (cells ~6 MiB), 2–4 islands at 10M.
 const VECTOR_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("post-drain", 4, 8),
+    // post-delta serves the undrained user tail beside the drained bulk,
+    // and the tail INHERITS the table's stamped width law (the delta is
+    // the same distribution the drain measured), so a stamped-1..1 table
+    // reads its delta at one cell and these ceilings hold at their
+    // original calibration. They were briefly rebudgeted to 14/18 while
+    // the tail read at a blanket 8-cell cap that ignored the stamp --
+    // that accommodation is gone with the blanket.
     ("post-delta", 6, 10),
     ("post-compact", 4, 8),
 ];
@@ -993,6 +1008,7 @@ const VECTOR_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 /// shard generations after a budgeted optimize).
 const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("post-drain", 1, 4),
+    // Stamp-inherited tail, as in the first-query table above.
     ("post-delta", 2, 5),
     ("post-compact", 1, 5),
 ];
@@ -1000,6 +1016,18 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 /// bounds). At and above [`COLD_GET_MID_MAX_DOCS`] the grid shape is
 /// still being calibrated, so no ceiling applies yet.
 const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
+/// Multiple of the stamped law width the #515 near-tie serve window may
+/// reach on a real corpus before its fan counts as a regression. See the
+/// derivation at the `law_extra` computation in
+/// [`assert_cold_data_gets`]; synthetic runs keep the 1x model.
+///
+/// Measured on Cohere-9.4M with the laws serving both the unfiltered and
+/// the filtered path: post-drain 53 GETs on the warmup query and 65
+/// steady at law width 23 (2.3x / 2.8x), post-compact 103 at law width 22
+/// (4.7x — compaction reshapes the cells, so the near-tie run is longer
+/// there). 6x covers the widest of those with headroom while still
+/// tripping on a whole-grid 256-cell read.
+const SERVE_WINDOW_WIDTH_MULTIPLE: u64 = 6;
 /// Upper doc bound for the mid-scale ceilings (exclusive).
 const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
 /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
@@ -1311,7 +1339,15 @@ fn emit_transitions_with(
                     let io = transition.io;
                     vec![
                         text(transition.label),
-                        text(fmt_time(transition.wall_ns)),
+                        // Numeric so the CI delta layer can diff and GATE
+                        // transition walls (drain / optimize) against main —
+                        // as text they never reach the report JSON and an
+                        // optimize regression is invisible to the A/B.
+                        metric(
+                            transition.wall_ns,
+                            fmt_time(transition.wall_ns),
+                            Better::Lower,
+                        ),
                         text(
                             io.map(|value| value.put_count.to_string())
                                 .unwrap_or_else(|| "NOT METERED".into()),
@@ -1514,10 +1550,41 @@ fn assert_expected_cold_reads(
     ceilings_second: &[(&str, u64, u64)],
     steady_law_width: u64,
 ) {
+    // The ceiling tables were derived on the synthetic corpus at dim 1024,
+    // where a probed cell is ~6 MiB and so fits inside one 8 MiB cold
+    // coalesce window — one GET per cell. A wider corpus breaks that: at
+    // dim 1536 with p90 cells of ~8.4K rows a single cell spans ~25 MiB,
+    // i.e. several islands, so the per-cell GET cost scales with the row
+    // width. Scale the allowance rather than the measurement (a real
+    // regression still trips it; legitimate geometry no longer does).
+    // Exactly 1 at dim 1024, so every synthetic run is unchanged.
+    let width_scale = (crate::corpus::dim() as u64).div_ceil(1024);
     // The ceiling tables assume a width-1 probe (one coalesced cell-GET);
     // a stamped law width w reads w cells by design, adding w-1 GETs to
     // both cold windows.
-    let law_extra = steady_law_width.saturating_sub(1);
+    //
+    // The law floor is not the whole story on a real corpus: the #515
+    // near-tie serve window keeps following the exact-fine ranking past
+    // the stamped width while scores stay inside
+    // `vector.serve_near_tie_slack`, and the engine deliberately puts no
+    // cap on that extension. Decisive geometry cliffs at the floor and
+    // never extends — which is why the synthetic planted-cluster corpus
+    // has always fit a width-1-plus-law model — while diffuse real
+    // embeddings follow a flat run of near-ties. Measured on Cohere-9.4M
+    // at law width 23: 50 GETs on the first (warmup) query and 66 on the
+    // steady one, i.e. 2.2x and 2.9x the floor, at recall@10 0.995.
+    // Budget that extension for real corpora only, so this gate keeps
+    // catching fan-out regressions (a whole-grid 256-cell read still
+    // trips it) without failing legitimate geometry, and every synthetic
+    // ceiling stays exactly where it was calibrated.
+    let serve_window_multiple = match crate::corpus::corpus_source() {
+        crate::corpus::CorpusSource::Synthetic => 1,
+        _ => SERVE_WINDOW_WIDTH_MULTIPLE,
+    };
+    let law_extra = steady_law_width
+        .saturating_mul(serve_window_multiple)
+        .saturating_sub(1)
+        .saturating_mul(width_scale);
     let user_data = split
         .first_query
         .class_io(storage_meter::UriClass::UserData)
@@ -1526,14 +1593,26 @@ fn assert_expected_cold_reads(
         .first_query
         .class_io(storage_meter::UriClass::HiddenData)
         .get_count;
+    let hidden_manifest = split
+        .first_query
+        .class_io(storage_meter::UriClass::HiddenManifest)
+        .get_count;
     let valid = match expected {
         ExpectedTiers::UserOnly => user_data > 0 && hidden_data == 0,
-        ExpectedTiers::HiddenOnly => user_data == 0 && hidden_data > 0,
-        ExpectedTiers::Both => user_data > 0 && hidden_data > 0,
+        // The registered graph tier hydrates its resident sections from
+        // the content-addressed graph blob on the first query, and that
+        // blob lives under the hidden table's slow-vector-state
+        // (manifest-classed) namespace — so hidden-tier serving is proven
+        // by EITHER hidden data GETs (routed cells) or hidden manifest
+        // GETs (graph hydration). The check this assert exists for —
+        // silent fallback to the user path — still trips on user_data.
+        ExpectedTiers::HiddenOnly => user_data == 0 && (hidden_data > 0 || hidden_manifest > 0),
+        ExpectedTiers::Both => user_data > 0 && (hidden_data > 0 || hidden_manifest > 0),
     };
     assert!(
         valid,
-        "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
+        "{label}: unexpected cold data reads (user data GET={user_data}, \
+         hidden data GET={hidden_data}, hidden manifest GET={hidden_manifest})"
     );
     // Lock in the cold-probe gains, per window: the first query's
     // one-time warmup fan and the second query's steady per-query fetch
@@ -1607,8 +1686,8 @@ pub mod fts {
         let mut report = Report::load("supertable_fts");
 
         // Build-only matches main `supertable_all`: one isolated subprocess
-        // with a clean RSS sample. Warm/cold need the artifact in-process.
-        if phases.build && !phases.warm && !phases.cold {
+        // with a clean RSS sample. Warm/cold/quality need the artifact in-process.
+        if phases.build && !phases.reads() {
             eprintln!(
                 "[supertable_fts] build-only: isolated ingest of {} docs to object storage...",
                 fmt_count(n_docs),
@@ -1639,10 +1718,24 @@ pub mod fts {
         // vector index but is still metered for phase parity.
         let run_lifecycle = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
-        if phases.warm || phases.cold {
+        if phases.reads() {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
             let reader = consumer.reader().expect("reader");
             exec_fts::assert_correct(&reader, supertable::TEXT_COLUMN, n_docs, "supertable_fts");
+            if phases.quality {
+                // Grades the pre-compact layout — the fragmented state a
+                // fresh ingest serves from, and the one where per-superfile
+                // statistics differ most from the corpus-wide oracle.
+                crate::fts_quality::run(
+                    &mut report,
+                    &reader,
+                    supertable::TEXT_COLUMN,
+                    n_docs,
+                    supertable::CORPUS_TEXT_SEED,
+                    "supertable_fts",
+                );
+                report.save();
+            }
             drop(consumer);
             drop(cache_dir);
         }
@@ -2414,6 +2507,16 @@ pub mod vector {
     /// [`WIDTH_SWEEP_MONOTONICITY_SLACK`]; recall gates stay on the
     /// engine default.
     const UNFILTERED_SWEEP_WIDTHS: &[usize] = &[2, 8, 32];
+    /// `k` knots the codec-rung curve is reported at. A coarse rerank
+    /// codec loses the tail of the neighbourhood long before it loses the
+    /// top-1, so recall at a single `k` cannot say whether a rung is
+    /// usable; these are three of the four knots the drain already stamps
+    /// per-`k` laws for. Diagnostic only — the gated floor stays at
+    /// [`TOP_K`].
+    const CURVE_KS: &[usize] = &[1, 10, 100];
+    /// Deepest knot in [`CURVE_KS`]: one exact oracle is computed at this
+    /// depth and every shallower `k` reads its sorted prefix.
+    const CURVE_KS_DEEPEST: usize = 100;
     /// Recall a wider sweep point may lose vs the previous one before the
     /// width-sweep assert trips. The floored core cannot lose recall by
     /// construction; the slack absorbs the residual eviction band above
@@ -2510,14 +2613,19 @@ pub mod vector {
                 None,
             )
             .expect("routing-state vector hits");
+        // The registered graph tier walks the resident plane over the
+        // hidden index and resolves nodes straight to stable ids — no
+        // per-superfile fetch — so its hits carry the nil marker URI
+        // rather than a hidden cell superfile's. Every scan-path hit
+        // (user or hidden) carries the real URI it was scored in, so nil
+        // is unambiguously hidden-tier serving. A silent fallback to the
+        // user path still trips both this assert (real user URIs) and
+        // the per-class cold-GET assert beside it (user-class bytes).
         let user_hits = hits
             .iter()
-            .filter(|hit| !hidden_uris.contains(&hit.superfile))
+            .filter(|hit| !hidden_uris.contains(&hit.superfile) && !hit.superfile.0.is_nil())
             .count();
-        let hidden_hits = hits
-            .iter()
-            .filter(|hit| hidden_uris.contains(&hit.superfile))
-            .count();
+        let hidden_hits = hits.len() - user_hits;
         HitTierStats {
             user_hits,
             hidden_hits,
@@ -2689,7 +2797,7 @@ pub mod vector {
         let grid = global.grid;
         let metric = consumer.options().vector_columns[0].metric;
         let n_cells = grid.n_cent as usize;
-        let n_rows = vectors.len() / DIM;
+        let n_rows = vectors.len() / dim();
 
         let stored_total: usize = cells.iter().map(|(_, ids)| ids.len()).sum();
         let mut stored_by_dense: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -2742,8 +2850,8 @@ pub mod vector {
                         continue;
                     };
                     local_audited += 1;
-                    let start = dense * DIM;
-                    if stored.contains(&nearest_cell(&vectors[start..start + DIM])) {
+                    let start = dense * dim();
+                    if stored.contains(&nearest_cell(&vectors[start..start + dim()])) {
                         local_agree += 1;
                     }
                 }
@@ -2807,12 +2915,12 @@ pub mod vector {
                 n_cells,
             );
             for id in truth {
-                let start = *id as usize * DIM;
-                if start + DIM > vectors.len() {
+                let start = *id as usize * dim();
+                if start + dim() > vectors.len() {
                     continue;
                 }
                 total += 1;
-                let geom_rank = rank_by_cell[nearest_cell(&vectors[start..start + DIM]) as usize];
+                let geom_rank = rank_by_cell[nearest_cell(&vectors[start..start + dim()]) as usize];
                 let (stored_rank, routed_rank) = stored_by_dense
                     .get(id)
                     .map(|stored| {
@@ -2869,8 +2977,8 @@ pub mod vector {
         for (query, truth) in queries.iter().zip(ground_truth) {
             let probed = nearest_cell(query);
             for id in truth {
-                let start = *id as usize * DIM;
-                if start + DIM > vectors.len() {
+                let start = *id as usize * dim();
+                if start + dim() > vectors.len() {
                     continue;
                 }
                 if stored_by_dense
@@ -2879,7 +2987,7 @@ pub mod vector {
                 {
                     continue;
                 }
-                let neighbor = &vectors[start..start + DIM];
+                let neighbor = &vectors[start..start + dim()];
                 let own = nearest_cell(neighbor);
                 let own_score = grid.score_one(metric, own as usize, neighbor);
                 let rescue_score = grid.score_one(metric, probed as usize, neighbor);
@@ -2905,7 +3013,7 @@ pub mod vector {
         let copies: Vec<[usize; CLOSURE_RATIO_CANDIDATES.len()]> = sampled
             .par_iter()
             .map(|&row_idx| {
-                let row = &vectors[row_idx * DIM..(row_idx + 1) * DIM];
+                let row = &vectors[row_idx * dim()..(row_idx + 1) * dim()];
                 // Already ascending — `rank_cells` sorts.
                 let scores: Vec<f32> = grid
                     .rank_cells(metric, row)
@@ -3006,8 +3114,8 @@ pub mod vector {
             }
             let rank_of = rank_map(query_scores, flat_base);
             for id in truth {
-                let start = *id as usize * DIM;
-                if start + DIM > vectors.len() {
+                let start = *id as usize * dim();
+                if start + dim() > vectors.len() {
                     continue;
                 }
                 if !stored_by_dense
@@ -3017,7 +3125,7 @@ pub mod vector {
                     continue;
                 }
                 fine_total += 1;
-                let neighbor = &vectors[start..start + DIM];
+                let neighbor = &vectors[start..start + dim()];
                 let mut best_run = usize::MAX;
                 let mut best_score = f32::INFINITY;
                 let mut flat = 0usize;
@@ -3062,8 +3170,8 @@ pub mod vector {
         let mut self_top10 = 0usize;
         let mut sampled = 0usize;
         for dense in &dense_ids {
-            let start = *dense as usize * DIM;
-            if start + DIM > vectors.len() {
+            let start = *dense as usize * dim();
+            if start + dim() > vectors.len() {
                 continue;
             }
             let Some(&stable) = dense_to_id.get(dense) else {
@@ -3075,7 +3183,7 @@ pub mod vector {
                 .expect("reader")
                 .vector_search(
                     supertable::VEC_COLUMN,
-                    &vectors[start..start + DIM],
+                    &vectors[start..start + dim()],
                     TOP_K,
                     exec_vec::default_search_opts(),
                     None,
@@ -3576,7 +3684,7 @@ pub mod vector {
             format!(
                 "Supertable vector — routing state transitions ({} docs × dim={})",
                 fmt_count(n_docs),
-                DIM
+                dim()
             ),
             format!(
                 "One search configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the same {N_CORRECTNESS_QUERIES}-query brute-force metric in every state; the follow-up commit adds {} normal rows from the corpus distribution.",
@@ -3594,7 +3702,7 @@ pub mod vector {
             format!(
                 "Supertable vector — lifecycle transitions ({} base docs × dim={})",
                 fmt_count(n_docs),
-                DIM
+                dim()
             ),
             transitions,
         );
@@ -3687,7 +3795,7 @@ pub mod vector {
                 title: format!(
                     "Supertable vector — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
                     fmt_count(n_docs),
-                    DIM,
+                    dim(),
                     supertable::n_commits(),
                     supertable::n_writers()
                 ),
@@ -3746,8 +3854,8 @@ pub mod vector {
                         .vectors()
                         .expect("vector modality prepared a vector corpus")
                         .as_slice();
-                    let base_vectors = &vslice[..n_docs * DIM];
-                    let q_correct = corpus::generate_realistic_queries(
+                    let base_vectors = &vslice[..n_docs * dim()];
+                    let q_correct = corpus::bench_queries(
                         base_vectors,
                         n_docs,
                         N_CORRECTNESS_QUERIES,
@@ -3755,7 +3863,7 @@ pub mod vector {
                         true,
                         QUERY_SIGMA,
                     );
-                    let q_cal = corpus::generate_realistic_queries(
+                    let q_cal = corpus::bench_queries(
                         base_vectors,
                         n_docs,
                         N_CALIBRATION_QUERIES,
@@ -3830,7 +3938,7 @@ pub mod vector {
                 format!(
                     "Supertable vector — search {phase}, multi-superfile / object-store ({} docs × dim={})",
                     fmt_count(n_docs),
-                    DIM
+                    dim()
                 )
             };
 
@@ -3936,6 +4044,7 @@ pub mod vector {
                     &gt_correct,
                     &q_cal,
                     &gt_cal,
+                    exec_vec::RecallFloors::supertable_pre_drain(),
                     phases.warm,
                     phases.cold,
                     COLD_ITERS,
@@ -4010,6 +4119,7 @@ pub mod vector {
                     &gt_correct,
                     &q_cal,
                     &gt_cal,
+                    exec_vec::RecallFloors::SUPERTABLE,
                     phases.warm,
                     phases.cold,
                     COLD_ITERS,
@@ -4029,6 +4139,58 @@ pub mod vector {
                         &gt_correct,
                         rerank,
                     );
+                    // Codec-rung curve: recall at every knot in
+                    // [`CURVE_KS`] for whatever rung this run configured,
+                    // so the rungs can be compared at the `k` a workload
+                    // actually reads. `recall_at_k` divides by the truth
+                    // row's length, so each knot needs the oracle
+                    // truncated to exactly `k`; one exact oracle at the
+                    // deepest knot supplies them all by prefix. Search
+                    // runs at the same engine defaults the gated row
+                    // above used, so the @10 line reproduces it.
+                    // The deepest knot needs an oracle deeper than the
+                    // gated one, so it is computed here from the still-
+                    // mmapped corpus. A run that reopened a cached oracle
+                    // has no vectors resident: the knots at or under
+                    // [`TOP_K`] still read the gated oracle's prefix, and
+                    // the deeper knot is skipped rather than guessed.
+                    let gt_deep = corpus.as_ref().map(|prepared| {
+                        let vslice = prepared
+                            .vectors()
+                            .expect("vector modality prepared a vector corpus")
+                            .as_slice();
+                        corpus::ground_truth(
+                            &vslice[..n_docs * dim()],
+                            n_docs,
+                            &q_correct,
+                            CURVE_KS_DEEPEST,
+                        )
+                    });
+                    for &k in CURVE_KS {
+                        let source = match (gt_deep.as_ref(), k <= TOP_K) {
+                            (Some(deep), _) => deep,
+                            (None, true) => &gt_correct,
+                            (None, false) => continue,
+                        };
+                        let truths: Vec<Vec<u32>> = source
+                            .iter()
+                            .map(|t| t[..k.min(t.len())].to_vec())
+                            .collect();
+                        let (recall, p50) = exec_vec::mean_recall_timed(
+                            &warm_reader,
+                            supertable::VEC_COLUMN,
+                            &q_correct,
+                            &truths,
+                            k,
+                            nprobe,
+                            rerank,
+                        );
+                        eprintln!(
+                            "[codec-curve] infino/post-drain recall@{k} = {recall:.3} \
+                             p50 = {:.3} ms",
+                            p50.as_secs_f64() * 1e3,
+                        );
+                    }
                 }
                 routing_states.push(measure_routing_state(
                     "post-drain",
@@ -4057,7 +4219,7 @@ pub mod vector {
                 {
                     report_post_drain_assignment_audit(
                         &consumer,
-                        &vectors.as_slice()[..n_docs * DIM],
+                        &vectors.as_slice()[..n_docs * dim()],
                         &q_correct,
                         &gt_correct,
                         &id_to_dense,
@@ -4094,6 +4256,7 @@ pub mod vector {
                     &gt_correct,
                     &q_cal,
                     &gt_cal,
+                    exec_vec::RecallFloors::SUPERTABLE,
                     phases.warm,
                     phases.cold,
                     COLD_ITERS,
@@ -4257,7 +4420,7 @@ pub mod vector {
                         title: format!(
                             "Supertable vector — filtered search ({} docs × dim={})",
                             fmt_count(n_docs),
-                            DIM
+                            dim()
                         ),
                         note: format!(
                             "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
@@ -4346,7 +4509,7 @@ pub mod vector {
                     .expect("vector benches always prepare a corpus")
                     .vectors()
                     .expect("vector corpus carries vectors");
-                let vslice = &primary_vectors.as_slice()[..n_docs * DIM];
+                let vslice = &primary_vectors.as_slice()[..n_docs * dim()];
                 let gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
 
                 let filter = || VectorFilter {
@@ -4428,7 +4591,7 @@ pub mod vector {
                         title: format!(
                             "Supertable vector — predicate-filtered search ({} docs × dim={})",
                             fmt_count(n_docs),
-                            DIM
+                            dim()
                         ),
                         note: format!(
                             "The PUBLIC filtered path: `vector_search` with a real \
@@ -4864,7 +5027,7 @@ pub mod vector {
                     format!(
                         "Supertable vector — cost model ({} docs × dim={})",
                         fmt_count(cost_n_docs),
-                        DIM
+                        dim()
                     ),
                     &built,
                     ingest_metrics.as_ref(),

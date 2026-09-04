@@ -41,7 +41,7 @@ use infino::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         vector::distance::normalize,
     },
-    test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+    test_helpers::{decimal128_ids, default_vector_config},
 };
 use tempfile::NamedTempFile;
 
@@ -84,12 +84,8 @@ fn build_planted_superfile() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", PARQUET_COMPAT_ROT_SEED)],
-        Some(default_tokenizer()),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 

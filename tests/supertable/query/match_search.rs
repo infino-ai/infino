@@ -37,7 +37,7 @@ use infino::{
             vector::{VectorFilter, VectorSearchOptions},
         },
     },
-    test_helpers::{default_tokenizer, default_vector_config},
+    test_helpers::default_vector_config,
 };
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
@@ -104,12 +104,8 @@ fn options_title_emb() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
     .with_writer_pool(writer_pool)
@@ -195,6 +191,74 @@ fn count_agrees_with_token_match_cardinality() {
     }
 }
 
+/// A token repeated in the query is idempotent for an unranked count —
+/// AND/OR/exclude over the same term twice is the same set — so the
+/// count path drops duplicate tokens, and the count must match the
+/// query with the repeat removed. (Phrase members are exempt: position
+/// matters there.)
+#[test]
+fn count_dedups_repeated_query_tokens() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+    // (mode, query-with-duplicate, equivalent-deduped-query)
+    let cases = [
+        // AND: doc 7 ("rust systems") is the only match either way.
+        (BoolMode::And, "+rust +systems +rust", "+rust +systems"),
+        // OR: the union of {rust, go} is unchanged by repeating `rust`.
+        (BoolMode::Or, "rust rust go", "rust go"),
+    ];
+    for (mode, dup, uniq) in cases {
+        let n_dup = reader.count("title", dup, mode).expect("count dup");
+        let n_uniq = reader.count("title", uniq, mode).expect("count uniq");
+        assert_eq!(n_dup, n_uniq, "dup {dup:?} must count as {uniq:?}");
+        assert!(n_dup > 0, "sanity: {dup:?} should match something");
+    }
+}
+
+/// Dedup on the count path, negative-clause cases: a term required and
+/// excluded matches nothing, a repeated negative dedups to a single one,
+/// and a repeated negation-only query is rejected exactly like the
+/// single-term form.
+#[test]
+fn count_dedups_repeated_negatives_and_required_excluded() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+
+    // A term both required and excluded is a contradiction — count 0.
+    // (`rust` appears in the corpus, so this is 0 by exclusion, not by
+    // the term being absent.)
+    let contradiction = reader
+        .count("title", "+rust -rust", BoolMode::And)
+        .expect("count +rust -rust");
+    assert_eq!(contradiction, 0, "+rust -rust must match nothing");
+
+    // A repeated negative dedups to the single-negative form, and
+    // excluding `go` (which co-occurs with `rust` in "go rust") drops at
+    // least that doc from the `+rust` set.
+    let rust = reader
+        .count("title", "+rust", BoolMode::And)
+        .expect("count +rust");
+    let one_neg = reader
+        .count("title", "+rust -go", BoolMode::And)
+        .expect("count +rust -go");
+    let dup_neg = reader
+        .count("title", "+rust -go -go", BoolMode::And)
+        .expect("count +rust -go -go");
+    assert_eq!(dup_neg, one_neg, "+rust -go -go must count as +rust -go");
+    assert!(one_neg < rust, "excluding `go` must drop the `go rust` doc");
+
+    // A negation-only query is rejected; repeating the negated term
+    // dedups to the same single-term query, so `-rust -rust` is rejected
+    // identically to `-rust` (never a spurious count).
+    let repeated = reader.count("title", "-rust -rust", BoolMode::And);
+    let single = reader.count("title", "-rust", BoolMode::And);
+    assert!(single.is_err(), "negation-only `-rust` is rejected");
+    assert!(
+        repeated.is_err(),
+        "negation-only `-rust -rust` is rejected like `-rust`"
+    );
+}
+
 /// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
 /// across every superfile before scoring. Statistics change SCORES,
 /// never MEMBERSHIP: with `k` covering every match, the global-stats
@@ -262,6 +326,142 @@ fn vector_filter_restricts_hits_to_the_predicate_match_set() {
         got.len(),
         allowed.len(),
         "k covers the whole match set — every predicate row returns"
+    );
+}
+
+/// Notes text for [`two_analyzer_table`], parallel to [`SEG1_TITLES`].
+/// `café` appears in exactly two docs; the accent matters — under the
+/// `standard` analyzer it is a real term, under `ascii_lower` the token
+/// is dropped entirely.
+const NOTES: &[&str] = &[
+    "café menu",     // 0
+    "tea list",      // 1
+    "café hours",    // 2
+    "water only",    // 3
+    "juice board",   // 4
+    "espresso shot", // 5
+    "matcha bowl",   // 6
+    "cold brew",     // 7
+];
+
+/// Schema `[title (ascii_lower FTS), notes (standard FTS), emb (vector)]`
+/// over [`SEG1_TITLES`] × [`NOTES`]: two FTS columns with DIFFERENT
+/// analyzers next to a vector column, one commit, one-hot embeddings.
+fn two_analyzer_table() -> Supertable {
+    let writer_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("writer pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("notes", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(DIM), false),
+    ]));
+    let st = Supertable::create(
+        SupertableOptions::new(
+            schema.clone(),
+            vec![
+                FtsConfig::new("title"),
+                FtsConfig::new("notes").analyzer("standard"),
+            ],
+            vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+        )
+        .expect("valid options")
+        .with_writer_pool(writer_pool),
+    )
+    .expect("create");
+
+    let titles = LargeStringArray::from(SEG1_TITLES.to_vec());
+    let notes = LargeStringArray::from(NOTES.to_vec());
+    let mut flat = Vec::<f32>::with_capacity(NOTES.len() * DIM);
+    for i in 0..NOTES.len() {
+        for d in 0..DIM {
+            flat.push(if d == i { 1.0 } else { 0.0 });
+        }
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(titles), Arc::new(notes), Arc::new(fsl)],
+    )
+    .expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    st
+}
+
+/// Regression: a `VectorFilter` predicate is tokenized with the FILTER
+/// COLUMN's analyzer, not any table-wide default. `café` is a real term
+/// only under the `standard` analyzer, so filtering on `notes`
+/// (standard) must return exactly the café rows, while the same
+/// predicate on `title` (ascii_lower, which drops non-ASCII tokens)
+/// must match nothing. The bug this pins: the predicate used to be
+/// tokenized with a single table-level tokenizer, so a filter on a
+/// standard-analyzer column silently tokenized to nothing and returned
+/// zero rows.
+#[test]
+fn vector_filter_tokenizes_with_the_filter_columns_analyzer() {
+    let st = two_analyzer_table();
+    let reader = st.reader().expect("reader");
+
+    // Ground truth from the engine's own per-column token match.
+    let allowed = stable_ids(
+        &reader
+            .token_match("notes", "café", BoolMode::Or)
+            .expect("token_match on the standard column"),
+    );
+    assert_eq!(allowed.len(), 2, "café appears in exactly two notes");
+
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "notes",
+                query: "café",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search on the standard column");
+    assert_eq!(
+        stable_ids(&hits),
+        allowed,
+        "the filter tokenized café with the notes column's standard \
+         analyzer and matched exactly its rows"
+    );
+
+    // The same predicate against the ascii_lower column tokenizes to
+    // nothing (non-ASCII dropped) — per-column analysis, not a blanket
+    // standard default.
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "café",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search on the ascii column");
+    assert!(
+        hits.is_empty(),
+        "ascii_lower drops the non-ASCII token, so the predicate \
+         matches nothing on the title column"
     );
 }
 

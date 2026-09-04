@@ -44,7 +44,7 @@ use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 use arrow_array::Decimal128Array;
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
-use tracing::trace;
+use tracing::{Instrument, trace};
 use uuid::Uuid;
 
 use super::SuperfileHit;
@@ -90,7 +90,7 @@ pub(crate) async fn open_reader(
         allow_background_fill,
     )
     .await
-    .map_err(|e| QueryError::Store(e.to_string()))
+    .map_err(|e| QueryError::build(e.to_string(), &e))
 }
 
 /// Verify that each configured vector column is present in this superfile and
@@ -178,7 +178,7 @@ pub(crate) async fn open_compaction_input(
             let reader = cache
                 .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
                 .await
-                .map_err(|e| QueryError::Store(e.to_string()));
+                .map_err(|e| QueryError::build(e.to_string(), &e));
             // Fully-resident only: a promoted hybrid reader exposes parquet
             // bytes but leaves the vector blob sparse, and the Sq8 merge
             // below reads real vector bytes synchronously.
@@ -194,8 +194,9 @@ pub(crate) async fn open_compaction_input(
         let (bytes, _) = storage
             .get(&path)
             .await
-            .map_err(|e| QueryError::Store(e.to_string()))?;
-        let reader = SuperfileReader::open(bytes).map_err(|e| QueryError::Store(e.to_string()))?;
+            .map_err(|e| QueryError::build(e.to_string(), &e))?;
+        let reader =
+            SuperfileReader::open(bytes).map_err(|e| QueryError::build(e.to_string(), &e))?;
         return Ok(Arc::new(reader));
     }
     // Compaction is not a query modality; allow fill so inputs can promote.
@@ -234,7 +235,7 @@ pub(crate) fn tombstone_deny_set(
 ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
     let bitmap = cache
         .bitmap_for(superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+        .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
     Ok((!bitmap.is_empty()).then_some(bitmap))
 }
 
@@ -380,7 +381,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
     };
     let bitmap = cache
         .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+        .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
     if bitmap.is_empty() {
         return Ok(());
     }
@@ -597,18 +598,21 @@ where
         let tombstone_cache = tombstone_cache.clone();
         let body = body.clone();
         let vector_columns = Arc::clone(&vector_columns);
-        let handle = tokio::spawn(async move {
-            let r = open_reader(
-                &store,
-                disk_cache.as_ref(),
-                storage.as_ref(),
-                &entry,
-                allow_background_fill,
-            )
-            .await?;
-            verify_superfile_vector_codecs(&r, &vector_columns)?;
-            body(r, entry, tombstone_cache, now, params).await
-        });
+        let handle = tokio::spawn(
+            async move {
+                let r = open_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    &entry,
+                    allow_background_fill,
+                )
+                .await?;
+                verify_superfile_vector_codecs(&r, &vector_columns)?;
+                body(r, entry, tombstone_cache, now, params).await
+            }
+            .in_current_span(),
+        );
         // Flatten the join error into a QueryError so `try_join_all`
         // short-circuits on the first failing superfile.
         async move {
@@ -651,13 +655,7 @@ mod codec_verify_tests {
     /// `codec` under `metric`, and open it as a reader.
     fn build_reader(metric: Metric, codec: RerankCodec) -> SuperfileReader {
         let schema = Arc::new(Schema::new(vec![decimal128_id_field("doc_id")]));
-        let opts = BuilderOptions::new(
-            schema.clone(),
-            "doc_id",
-            vec![],
-            vec![cfg(metric, codec)],
-            None,
-        );
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![cfg(metric, codec)]);
         let mut b = SuperfileBuilder::new(opts).expect("new builder");
         let batch = RecordBatch::try_new(schema, vec![Arc::new(decimal128_ids(vec![10u64, 11]))])
             .expect("batch");

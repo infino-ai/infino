@@ -331,6 +331,11 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
         ObjError::AlreadyExists { .. } | ObjError::Precondition { .. } => {
             StorageError::PreconditionFailed { uri: uri.into() }
         }
+        // Refused credentials, kept apart from `Permanent`: the URI is
+        // fine and the same call with valid credentials can succeed.
+        ObjError::PermissionDenied { .. } | ObjError::Unauthenticated { .. } => {
+            StorageError::PermissionDenied { uri: uri.into() }
+        }
         ObjError::Generic { source, .. } => StorageError::TransientExhausted {
             uri: uri.into(),
             source,
@@ -686,6 +691,26 @@ mod tests {
         match err {
             StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
             other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_refused_credentials_to_permission_denied() {
+        // 403 and 401 both mean the credentials were refused: kept apart from
+        // `Permanent` so a caller can supply fresh ones and reissue instead of
+        // treating the URI as broken.
+        for e in [
+            ObjError::PermissionDenied {
+                path: "k".into(),
+                source: "forbidden".into(),
+            },
+            ObjError::Unauthenticated {
+                path: "k".into(),
+                source: "expired".into(),
+            },
+        ] {
+            let err = translate("k", e);
+            assert!(matches!(err, StorageError::PermissionDenied { uri } if uri == "k"));
         }
     }
 

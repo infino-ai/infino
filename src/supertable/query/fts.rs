@@ -114,12 +114,15 @@ const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
 
 pub use crate::superfile::fts::reader::BoolMode;
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
+        builder::FtsConfig,
         error::{FtsError, ReadError},
         fts::{
             bm25,
@@ -188,6 +191,26 @@ impl UnrankedNegatives {
 /// anchor (e.g. `-foo`). Shared by the scored and unranked FTS paths so
 /// both reject the case identically.
 const NEGATION_ONLY_QUERY_MSG: &str = "only negated terms; at least one positive term is required";
+
+/// Message for a bm25 / token query naming a column that carries no
+/// full-text index. Names the requested column and the searchable set so the
+/// caller can correct the request, rather than failing deep in the scan with
+/// an opaque "missing full-text section" error once a candidate superfile is
+/// opened.
+fn no_fts_index_message(column: &str, fts_columns: &[FtsConfig]) -> String {
+    if fts_columns.is_empty() {
+        return format!(
+            "no full-text index for column {column:?}: this table has no \
+             full-text-indexed columns"
+        );
+    }
+    let available = fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("no full-text index for column {column:?}; full-text-indexed columns: {available}")
+}
 
 /// Cross-segment top-k score sharing for the BM25 fan-out.
 ///
@@ -293,7 +316,7 @@ impl SupertableReader {
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn bm25_search_async(
         &self,
@@ -310,17 +333,26 @@ impl SupertableReader {
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
+        // Resolve the query tokenizer, which doubles as the column's
+        // full-text-index check: a `None` here means `column` carries no
+        // full-text index, so every candidate superfile would lack the
+        // full-text section this scan reads and the low-level reader would
+        // fail deep in the scan with an opaque missing-metadata error. Reject
+        // up front instead, naming the column and the searchable set.
+        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(column) else {
+            return Err(QueryError::InvalidQuery(no_fts_index_message(
+                column,
+                &manifest.options.fts_columns,
+            )));
+        };
+
         // Parse the query once here, not per superfile, resolving the
         // bare tokens' polarity from the default operator (`And` ⇒
         // must, `Or` ⇒ should). The fan-out closures below need owned
         // ('static) data for tokio::spawn, so this is the one place
         // the tokens are copied — the prune and every per-superfile
         // search reuse them.
-        let clauses = manifest
-            .options
-            .fts_tokenizer_for(column)
-            .parse(query)
-            .into_clauses(mode);
+        let clauses = tokenizer.parse(query).into_clauses(mode);
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
@@ -761,6 +793,18 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
+        // As in `bm25_search_async`: a prefix query over a column with no
+        // full-text index would otherwise fail deep in the scan with an opaque
+        // missing-metadata error. Reject up front, naming the searchable set.
+        // Prefix expansion lowercases the prefix bytes directly rather than
+        // tokenizing, so there is no tokenizer lookup to fold this into — but
+        // it is the same single pass over `fts_columns`, once per query.
+        if manifest.options.try_fts_tokenizer_for(column).is_none() {
+            return Err(QueryError::InvalidQuery(no_fts_index_message(
+                column,
+                &manifest.options.fts_columns,
+            )));
+        }
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
@@ -829,7 +873,11 @@ impl SupertableReader {
                         let set = cell
                             .get_or_try_init(|| async {
                                 let set = r
-                                    .bm25_prefix_cursor_set(&column_arc, &prefix_arc)
+                                    .bm25_prefix_cursor_set(
+                                        &column_arc,
+                                        &prefix_arc,
+                                        Some(&reader_pool),
+                                    )
                                     .await
                                     .map_err(fts_read_error)?;
                                 // Flushed inside the OnceCell init so slices
@@ -880,7 +928,7 @@ impl SupertableReader {
                     }
                     None => {
                         let (hits, work) = r
-                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k, Some(&reader_pool))
                             .await
                             .map_err(fts_read_error)?;
                         if let Some(stats) = &op_stats {
@@ -943,9 +991,32 @@ impl SupertableReader {
             .fts_tokenizer_for(column)
             .parse(query)
             .into_clauses(mode);
-        let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
-        let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
-        let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
+        // Drop repeated tokens within each clause role. Unranked
+        // matching is set-valued — an AND/OR/exclude over a term repeated
+        // in the query (e.g. `+to +be +or +not +to +be`) is idempotent —
+        // so a duplicate only adds a redundant cursor that intersects (or
+        // unions) a list with itself. Order-preserving so the rarest-first
+        // cursor ordering downstream is unaffected. Phrase members are
+        // *not* deduped: position matters there. (Count path only; the
+        // scored path must keep repeats, which can affect BM25.)
+        // Linear dedup, not a HashSet: clause token lists are tiny (a
+        // handful of terms), so an O(n²) scan over the already-kept
+        // tokens is cheaper than allocating a set + hashing, and — unlike
+        // the set — it adds no per-query allocation on the overwhelmingly
+        // common no-duplicate query. Order-preserving; only the first
+        // occurrence's `String` is materialized.
+        let dedup = |tokens: Vec<Cow<'_, str>>| -> Vec<String> {
+            let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                if !out.iter().any(|k| k.as_str() == t.as_ref()) {
+                    out.push(t.into_owned());
+                }
+            }
+            out
+        };
+        let musts: Vec<String> = dedup(clauses.musts);
+        let shoulds: Vec<String> = dedup(clauses.shoulds);
+        let negatives: Vec<String> = dedup(clauses.negatives);
         let own_phrases = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
             phrases
                 .into_iter()
@@ -1014,7 +1085,7 @@ impl SupertableReader {
     /// [`SupertableReader::token_match`].
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn token_match_async(
         &self,
@@ -1164,9 +1235,9 @@ impl SupertableReader {
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
                         Some(c) => {
-                            let b = c
-                                .bitmap_for(entry.superfile_id, now)
-                                .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+                            let b = c.bitmap_for(entry.superfile_id, now).map_err(|e| {
+                                QueryError::build(format!("tombstone cache: {e}"), &e)
+                            })?;
                             if b.is_empty() { None } else { Some(b) }
                         }
                         None => None,
@@ -1329,9 +1400,11 @@ impl SupertableReader {
                         .token_match(&column_arc, &refs, BoolMode::And)
                         .await
                         .map_err(fts_read_error)?;
-                    // The prune pass's posting walk. The verify pass's
-                    // row reads count through the take path's own
-                    // collector accounting below.
+                    // The prune pass's posting walk. The verify pass's own
+                    // decode is folded into `rows_materialized` below; its
+                    // byte and range legs are deliberately unpriced — both
+                    // take paths report no planned ranges by design, so the
+                    // counter stays identical warm or cold.
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
                         stats.add_planned_read_ranges(work.planned_ranges);
@@ -1342,37 +1415,69 @@ impl SupertableReader {
                 if candidates.is_empty() {
                     return Ok(Vec::new());
                 }
-                let batch = if r.can_take_by_local_doc_ids() {
-                    r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
-                } else {
-                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
+                // The verify pass — candidate decode + string compare — is
+                // this query's dominant CPU (a token-less value decodes the
+                // whole column), so it is bracketed like any other kernel.
+                // Only the warm take is inside this bracket; the cold arm's
+                // decode is not separable from the fetch it is interleaved
+                // with, which the comment on that arm explains.
+                let warm_batch = op_stats::timed_kernel(&op_stats, || {
+                    if r.can_take_by_local_doc_ids() {
+                        r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
+                            .map(Some)
+                            .map_err(|e| QueryError::Parquet(e.to_string()))
+                    } else {
+                        Ok(None)
+                    }
+                })?;
+                let batch = match warm_batch {
+                    Some(batch) => batch,
+                    // Cold: the fetch and its Parquet decode are interleaved
+                    // inside the async reader, so the decode leg is not
+                    // separable here and goes uncharged. Bracketing the await
+                    // itself would be worse than leaving it at zero — a thread
+                    // clock spanning an await bills whatever else the runtime
+                    // ran on this thread to this query. The verify comparison
+                    // below is charged on both arms.
+                    None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
                         .await
-                        .map_err(|e| QueryError::Execute(e.to_string()))?
+                        .map_err(|e| QueryError::Execute(e.to_string()))?,
                 };
-                let values = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| {
-                        QueryError::Execute(format!(
-                            "exact_match column '{}' is not LargeUtf8",
-                            column_arc
-                        ))
-                    })?;
-                let mut hits: Vec<SuperfileHit> = candidates
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| {
-                        !values.is_null(*index) && values.value(*index) == value_arc.as_str()
-                    })
-                    .map(|(_, &local_doc_id)| SuperfileHit {
-                        superfile: entry.uri,
-                        local_doc_id,
-                        score: 0.0,
-                        stable_id: None,
-                    })
-                    .collect();
+                // The verify decode materialized one row per candidate,
+                // on either arm. Folding it here rather than per-arm keeps
+                // the count invariant to which take served the batch.
+                if let Some(stats) = &op_stats {
+                    stats.add_rows_materialized(candidates.len() as u64);
+                }
+                let hits = op_stats::timed_kernel(&op_stats, || {
+                    let values = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .ok_or_else(|| {
+                            QueryError::Execute(format!(
+                                "exact_match column '{}' is not LargeUtf8",
+                                column_arc
+                            ))
+                        })?;
+                    Ok::<_, QueryError>(
+                        candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| {
+                                !values.is_null(*index)
+                                    && values.value(*index) == value_arc.as_str()
+                            })
+                            .map(|(_, &local_doc_id)| SuperfileHit {
+                                superfile: entry.uri,
+                                local_doc_id,
+                                score: 0.0,
+                                stable_id: None,
+                            })
+                            .collect::<Vec<SuperfileHit>>(),
+                    )
+                });
+                let mut hits: Vec<SuperfileHit> = hits?;
                 dispatch::apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut hits, now)?;
                 Ok(hits)
             }
@@ -1410,9 +1515,7 @@ impl SupertableReader {
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
             // only the projected columns.
-            let batch = resolve_hits_named(self, &hits, projection, "bm25_search")
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let batch = resolve_hits_named(self, &hits, projection).await?;
             Ok(vec![batch])
         })
     }
@@ -1737,7 +1840,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn bm25_search(
         &self,
@@ -1769,7 +1872,7 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn token_match(
         &self,
@@ -1784,13 +1887,8 @@ impl Supertable {
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "token_match",
-            ))
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("token_match", None))?;
+            .block_on_query(resolve_hits_named(&reader, &hits, projection))
+            .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         Ok(vec![batch])
     }
 
@@ -1801,7 +1899,7 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column))
+        tracing::instrument(skip_all, fields(column = column, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn exact_match(
         &self,
@@ -1815,13 +1913,8 @@ impl Supertable {
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "exact_match",
-            ))
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("exact_match", None))?;
+            .block_on_query(resolve_hits_named(&reader, &hits, projection))
+            .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         Ok(vec![batch])
     }
 
@@ -1898,7 +1991,6 @@ mod tests {
             manifest::{SuperfileEntry, SuperfileUri},
             options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         },
-        test_helpers::default_tokenizer as tok,
     };
 
     /// Manifest entry fixture for the work-unit tests. `n_docs` is the
@@ -1949,17 +2041,9 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        SupertableOptions::new(
-            schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool)
+        SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
+            .with_writer_pool(pool)
     }
 
     fn build_batch(_start: u64, titles: &[&str]) -> RecordBatch {
@@ -2145,12 +2229,8 @@ mod tests {
         );
         SupertableOptions::new(
             schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: true,
-            }],
+            vec![FtsConfig::new("title").positions(true)],
             vec![],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -2389,16 +2469,8 @@ mod tests {
             ),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = BuilderOptions::new(
-            schema.clone(),
-            "_id",
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        );
+        let opts =
+            BuilderOptions::new(schema.clone(), "_id", vec![FtsConfig::new("title")], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let n = titles.len();
         let ids = Decimal128Array::from((0..n as i128).collect::<Vec<_>>())
@@ -2515,6 +2587,50 @@ mod tests {
             .bm25_hits("title", "rust", 5, BoolMode::Or)
             .expect("query");
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn bm25_search_unknown_projection_column_is_a_clean_error() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["rust async"])).expect("append");
+        w.commit().expect("commit");
+        let r = st.reader().expect("reader");
+
+        let err = r
+            .bm25_search(
+                "title",
+                "rust",
+                5,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                Some(&["title", "does_not_exist"]),
+            )
+            .expect_err("unknown projection column must error");
+
+        // A bad projection is caller input, not an engine failure: it comes
+        // back as InvalidQuery, names the offending column and the valid set,
+        // and never leaks the query engine's internals into the message. (The
+        // single-table search kernels run without the SQL engine at all, so a
+        // "DataFusion"/"Execution error" phrasing would be doubly misleading.)
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "expected InvalidQuery, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does_not_exist"),
+            "names the bad column: {msg}"
+        );
+        assert!(msg.contains("valid columns"), "lists valid columns: {msg}");
+        assert!(
+            msg.contains("title") && msg.contains("score"),
+            "valid set includes the real columns: {msg}"
+        );
+        assert!(
+            !msg.contains("DataFusion") && !msg.contains("Execution error"),
+            "must not leak query-engine internals: {msg}"
+        );
     }
 
     #[test]
@@ -2675,7 +2791,7 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5))
+        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5, None))
             .expect("oracle")
             .0;
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
@@ -2735,6 +2851,10 @@ mod tests {
     fn bm25_search_unknown_column_errors() {
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
+        // A committed superfile exists, so the query has real data to scan. The
+        // queried column carries no full-text index, though: the reject must
+        // happen up front, not deep in the scan where the low-level reader
+        // would surface an opaque storage-format error.
         w.append(&build_batch(0, &["rust"])).expect("append");
         w.commit().expect("commit");
 
@@ -2742,7 +2862,17 @@ mod tests {
         let err = r
             .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
-        assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+        assert!(matches!(err, QueryError::InvalidQuery(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no full-text index"),
+            "explains the miss: {msg}"
+        );
+        assert!(msg.contains("missing_column"), "names the column: {msg}");
+        assert!(
+            !msg.contains("inf.fts.offset") && !msg.contains("parquet"),
+            "must not leak the storage-format internals: {msg}"
+        );
     }
 
     #[test]
@@ -2886,12 +3016,8 @@ mod tests {
         );
         SupertableOptions::new(
             schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: true,
-            }],
+            vec![FtsConfig::new("title").positions(true)],
             vec![],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)

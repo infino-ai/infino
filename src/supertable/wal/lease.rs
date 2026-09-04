@@ -11,6 +11,21 @@
 //! "this is safe because we hold the lease" are wrong — every
 //! state transition has to surface at the CAS layer.
 //!
+//! ## Where leases come from
+//!
+//! Two places, and only the first one lives in this module:
+//!
+//! - [`try_acquire`], used by the recovery sweep to take over a
+//!   WAL some other process left behind.
+//! - The create itself, for a WAL whose creator is about to drive
+//!   it. The delete path stamps a lease straight into the doc it
+//!   creates: creating and acquiring in one write leaves no window
+//!   for a sweep to pick the WAL up before the writer gets going,
+//!   whereas a `try_acquire` issued after the create would.
+//!
+//! So a `None` lease does not imply "nobody has started this
+//! WAL yet" — it means nobody owns it *now*.
+//!
 //! ## What lives here
 //!
 //! - [`try_acquire`] — vacant or expired → CAS-take. Vacant means
@@ -47,6 +62,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::supertable::wal::{
     persistence::{Etag, WalStore, WalStoreError},
@@ -407,35 +423,38 @@ pub fn spawn_heartbeat(
     let tracker_for_task = Arc::clone(&tracker);
     let stuck_threshold = lease_duration / 2;
 
-    let join = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // First tick fires immediately (default); skip it so
-        // the work thread has a chance to do at least one
-        // storage op before we evaluate progress.
-        ticker.tick().await;
-        loop {
+    let join = tokio::spawn(
+        async move {
+            let mut ticker = tokio::time::interval(interval);
+            // First tick fires immediately (default); skip it so
+            // the work thread has a chance to do at least one
+            // storage op before we evaluate progress.
             ticker.tick().await;
-            if tracker_for_task.stop_requested() {
-                return;
-            }
-            // Stuck-worker check.
-            let last = tracker_for_task.last_progress_at();
-            if let Ok(elapsed) = SystemTime::now().duration_since(last)
-                && elapsed > stuck_threshold
-            {
-                tracker_for_task.request_stop();
-                return;
-            }
-            // Lease extension.
-            match try_heartbeat(&store, wal_id, owner, Utc::now(), lease_duration).await {
-                Ok(_) => {}
-                Err(_) => {
+            loop {
+                ticker.tick().await;
+                if tracker_for_task.stop_requested() {
+                    return;
+                }
+                // Stuck-worker check.
+                let last = tracker_for_task.last_progress_at();
+                if let Ok(elapsed) = SystemTime::now().duration_since(last)
+                    && elapsed > stuck_threshold
+                {
                     tracker_for_task.request_stop();
                     return;
                 }
+                // Lease extension.
+                match try_heartbeat(&store, wal_id, owner, Utc::now(), lease_duration).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracker_for_task.request_stop();
+                        return;
+                    }
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
 
     HeartbeatHandle {
         join: Some(join),

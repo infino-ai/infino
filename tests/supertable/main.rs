@@ -38,6 +38,7 @@ mod manifest;
 mod query;
 mod storage;
 mod update_crash_property;
+mod vector_cosine_normalize;
 mod vector_law_serving;
 mod vector_phase_profile;
 mod writer_mutations;

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="216" viewBox="0 0 880 216" role="img">
+<rect width="880" height="216" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">SQL vs search engines</text>
+<text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">ClickBench · vCPU-sec per query · hot · c6a.4xlarge · lower is faster</text>
+<line x1="232.0" y1="62" x2="232.0" y2="174" stroke="#DCD6C7"/>
+<text x="232.0" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1</text>
+<line x1="370.8" y1="62" x2="370.8" y2="174" stroke="#DCD6C7"/>
+<text x="370.8" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10</text>
+<line x1="509.6" y1="62" x2="509.6" y2="174" stroke="#DCD6C7"/>
+<text x="509.6" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">100</text>
+<line x1="648.3" y1="62" x2="648.3" y2="174" stroke="#DCD6C7"/>
+<text x="648.3" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1000</text>
+<text x="26.0" y="190.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">log scale</text>
+<text x="218.0" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600" text-anchor="end">Infino</text>
+<rect x="232" y="70" width="153.2" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">12.7</text>
+<text x="218.0" y="106.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">ParadeDB</text>
+<rect x="232" y="98" width="181.2" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="106.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">20.2</text>
+<text x="218.0" y="134.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Elasticsearch</text>
+<rect x="232" y="126" width="309.9" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="134.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">171.1</text>
+<text x="218.0" y="162.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">MongoDB</text>
+<rect x="232" y="154" width="535.6" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="162.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">7230</text>
+</svg>

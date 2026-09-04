@@ -91,7 +91,7 @@ Full docs, guides, and the API reference live at **[infino.ai/docs](https://infi
   [Storage & credentials](https://infino.ai/docs/guides/storage)
 - [SQL reference](https://infino.ai/docs/sql-reference) — query tables and the search table-valued functions
 - [API reference](https://infino.ai/docs/api-reference) — the full Python surface, generated from the package
-- [Integrations](https://infino.ai/docs/integrations) — LangChain, CrewAI, Vercel AI SDK, MCP
+- [MCP server](https://infino.ai/docs/integrations/mcp) — expose Infino retrieval to an AI agent (Claude, Cursor, …)
 
 ## Building from source
 

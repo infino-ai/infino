@@ -54,7 +54,7 @@ use infino::{
 use rustix::fs::{Advice, fadvise, sync};
 
 use crate::{
-    corpus::{self, DIM},
+    corpus::{self, dim},
     diag_common::percentile,
     ingest::supertable::{self as ingest, Modality, VEC_COLUMN},
     markdown::{fmt_count, fmt_time},
@@ -114,8 +114,8 @@ pub fn run() {
     let built = ingest::build_on_storage(Modality::Vector, &prepared);
     let queries = {
         let vectors = prepared.vectors().expect("vector corpus");
-        let base = &vectors.as_slice()[..n_docs * DIM];
-        corpus::generate_realistic_queries(base, n_docs, N_QUERIES, QUERY_SEED, true, QUERY_SIGMA)
+        let base = &vectors.as_slice()[..n_docs * dim()];
+        corpus::bench_queries(base, n_docs, N_QUERIES, QUERY_SEED, true, QUERY_SIGMA)
     };
     drop(prepared);
 
@@ -178,8 +178,9 @@ pub fn run() {
     report.emit(&Section {
         anchor: "bench/vector/supertable/disk-warm".into(),
         title: format!(
-            "Disk-warm serving state — supertable vector ({} docs × dim={DIM})",
-            fmt_count(n_docs)
+            "Disk-warm serving state — supertable vector ({} docs × dim={})",
+            fmt_count(n_docs),
+            dim()
         ),
         note: "The serving state between warm and cold: local disk cache fully populated, OS \
                page cache dropped (`fadvise(DONTNEED)` before every disk-warm query). Same \

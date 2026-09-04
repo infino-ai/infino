@@ -171,6 +171,12 @@ pub enum MutationError {
     #[error("new_rows schema does not match the supertable's user schema: {0}")]
     SchemaMismatch(String),
 
+    /// `update()` only: `new_rows` carries a vector column the index can't
+    /// take — a null vector, or a width disagreeing with the declared dim.
+    /// The same check `append` runs, applied before anything is buffered.
+    #[error("new_rows rejected: {0}")]
+    InvalidNewRows(#[source] BuildError),
+
     /// Supertable has no storage attached; WAL pipeline requires
     /// durable storage. In-memory-only supertables can't be
     /// mutated through this API.
@@ -229,6 +235,19 @@ impl MutationError {
             MutationError::WalStore(e) => e.is_conflict(),
             MutationError::AppendPhase(e) => e.is_conflict(),
             MutationError::TombstonePhase(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            MutationError::Storage(e) => e.is_permission_denied(),
+            MutationError::WalStore(e) => e.is_permission_denied(),
+            MutationError::AppendPhase(e) => e.is_permission_denied(),
+            MutationError::TombstonePhase(e) => e.is_permission_denied(),
+            MutationError::PredicateEval(q) => q.is_permission_denied(),
+            MutationError::TargetResolve(e) => e.is_permission_denied(),
             _ => false,
         }
     }
@@ -330,6 +349,16 @@ impl CommitError {
         match self {
             CommitError::AppendFlush(b) => b.is_conflict(),
             CommitError::PartialCommit { cause, .. } => cause.is_conflict(),
+        }
+    }
+
+    /// True when the backend refused the credentials in use. On
+    /// `PartialCommit` this reports the *cause* of the stop, as `is_conflict`
+    /// does.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            CommitError::AppendFlush(b) => b.is_permission_denied(),
+            CommitError::PartialCommit { cause, .. } => cause.is_permission_denied(),
         }
     }
 }

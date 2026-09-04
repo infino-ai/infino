@@ -23,6 +23,10 @@ pub const SIDECAR: &str = "dataset.json";
 /// Env var naming the dataset prefix.
 pub const PREFIX_ENV: &str = "INFINO_BENCH_DATASET_PREFIX";
 
+fn synthetic_corpus_label() -> String {
+    "synthetic".into()
+}
+
 static CONFIGURED_PREFIX: OnceLock<String> = OnceLock::new();
 
 /// Set the dataset prefix for this process. First call wins; overrides the
@@ -41,6 +45,11 @@ pub fn set_prefix(prefix: &str) {
 /// (`ReadError::UnsupportedVersion` on open), not this guard's.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct Knobs {
+    /// Corpus source name ("synthetic" | "cohere"). Datasets written
+    /// before this field existed were all synthetic — the serde default
+    /// keeps their sidecars readable and correctly gated.
+    #[serde(default = "synthetic_corpus_label")]
+    pub corpus: String,
     pub doc_count: usize,
     pub dim: usize,
     pub n_cent_total: usize,
@@ -100,6 +109,7 @@ mod tests {
 
     fn knobs() -> Knobs {
         Knobs {
+            corpus: "synthetic".into(),
             doc_count: 10_000_000,
             dim: 384,
             n_cent_total: 4096,

@@ -18,7 +18,7 @@ use std::{sync::Arc, time::Instant};
 
 use futures::executor::block_on;
 use infino::{roaring::RoaringBitmap, superfile::reader::VectorSearchOptions};
-use infino_bench_utils::corpus::{self, DIM};
+use infino_bench_utils::corpus::{self, dim};
 
 const SEED: u64 = 1;
 const QUERY_SEED: u64 = 17;
@@ -112,7 +112,7 @@ fn filtered_ground_truth(
             let mut dists: Vec<(f32, u32)> = allow
                 .iter()
                 .map(|id| {
-                    let row = &vectors[id as usize * DIM..(id as usize + 1) * DIM];
+                    let row = &vectors[id as usize * dim()..(id as usize + 1) * dim()];
                     let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
                     (-dot, id)
                 })
@@ -179,7 +179,8 @@ fn main() {
     let mode = args.next().unwrap_or_else(|| "sweep-down".into());
 
     eprintln!(
-        "[profile] building 1 superfile: {n_docs} docs, n_cent={n_cent}, dim={DIM}, mode={mode}"
+        "[profile] building 1 superfile: {n_docs} docs, n_cent={n_cent}, dim={}, mode={mode}",
+        dim()
     );
     let t = Instant::now();
     let vectors = corpus::generate_vector_corpus(n_docs, n_cent, SEED, true);

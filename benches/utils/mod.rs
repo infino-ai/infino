@@ -35,9 +35,11 @@ pub mod diag_common;
 #[cfg(target_os = "linux")]
 pub mod disk_warm;
 pub mod fts_diag;
+pub mod fts_quality;
 pub mod recall_while_ingest;
 pub mod scale;
 pub mod sql_diag;
 pub mod supertable_update;
 pub mod tombstone_overhead;
 pub mod unified_object_store;
+pub mod write_diag;

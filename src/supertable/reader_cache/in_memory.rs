@@ -161,7 +161,7 @@ mod tests {
             decimal128_id_field("doc_id"),
             Field::new("title", arrow_schema::DataType::LargeUtf8, false),
         ]));
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let ids = decimal128_ids(vec![1u64, 2, 3]);
         let title = LargeStringArray::from(vec!["a", "b", "c"]);

@@ -79,7 +79,7 @@ use infino::{
         Supertable, SupertableOptions,
         storage::{AzureStorageProvider, StorageProvider},
     },
-    test_helpers::{default_disk_cache, default_tokenizer},
+    test_helpers::default_disk_cache,
 };
 use infino_bench_utils::corpus::generate_text_corpus;
 use rand::{SeedableRng, rngs::StdRng};
@@ -207,10 +207,7 @@ fn options_title_emb() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![VectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
@@ -219,7 +216,6 @@ fn options_title_emb() -> SupertableOptions {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }],
-        Some(default_tokenizer()),
     )
     .expect("SupertableOptions::new with title+emb test fixture args")
     .with_writer_pool(pool)

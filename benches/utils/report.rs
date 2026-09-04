@@ -21,7 +21,38 @@ use std::{collections::HashMap, path::PathBuf};
 
 use serde_json::Value;
 
-use crate::markdown::{self, MarkdownSection};
+use crate::{
+    corpus,
+    markdown::{self, MarkdownSection},
+};
+
+/// Metrics-file key holding [`corpus_fingerprint`]. Underscore-prefixed so
+/// it cannot collide with a metric key, which is always
+/// `anchor|subtitle|label|header`.
+const CORPUS_FINGERPRINT_KEY: &str = "__corpus";
+
+/// FNV-1a 64-bit offset basis and prime — a short, stable, dependency-free
+/// string hash. Only identity matters here (same corpus ⇒ same value), not
+/// distribution.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Bits of a `u64` that survive a round trip through `f64` (and therefore
+/// through JSON) exactly. The fingerprint is masked to this width so the
+/// value read back compares equal to the value written.
+const F64_EXACT_INT_BITS: u32 = 53;
+
+/// Stable fingerprint of the active corpus label, as an integer-valued
+/// `f64` so it rides in the existing `HashMap<String, f64>` metrics map
+/// without widening the file format.
+fn corpus_fingerprint() -> f64 {
+    let mut h = FNV_OFFSET_BASIS;
+    for b in corpus::corpus_label().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    (h & ((1u64 << F64_EXACT_INT_BITS) - 1)) as f64
+}
 
 /// Which direction is an improvement for a metric. Retained as
 /// metric-direction metadata on [`Cell::Metric`]; the report itself no
@@ -192,12 +223,38 @@ impl Report {
     /// Merges over the existing file rather than overwriting, so a
     /// partial run (e.g. `-- superfile_fts_build`) updates only the
     /// metrics it measured and leaves the rest of the file intact.
+    ///
+    /// The merge is only valid within one corpus. Metrics measured on
+    /// different data are not comparable, and merging them silently
+    /// produces a file whose untouched keys still hold the previous
+    /// corpus's numbers — read later as regressions (or improvements)
+    /// that no code change caused. So the file records which corpus wrote
+    /// it, and a run under a different one starts a fresh accumulator
+    /// instead of merging. Keyed by fingerprint rather than by filename
+    /// so the path CI copies for its A/B baseline stays exactly as it is.
     pub fn save(&self) {
-        let mut merged = read_map(&store_path(&self.bench)).unwrap_or_default();
+        let path = store_path(&self.bench);
+        let corpus = corpus_fingerprint();
+        let existing = read_map(&path).unwrap_or_default();
+        let same_corpus = existing
+            .get(CORPUS_FINGERPRINT_KEY)
+            .is_none_or(|&prev| prev == corpus);
+        let mut merged = if same_corpus {
+            existing
+        } else {
+            eprintln!(
+                "[report] {} was last written under a different corpus; starting a \
+                 fresh metrics file for {} rather than merging incomparable numbers",
+                path.display(),
+                corpus::corpus_label()
+            );
+            HashMap::new()
+        };
         for (k, v) in &self.cur {
             merged.insert(k.clone(), *v);
         }
-        if let Err(e) = write_map(&store_path(&self.bench), &merged) {
+        merged.insert(CORPUS_FINGERPRINT_KEY.to_string(), corpus);
+        if let Err(e) = write_map(&path, &merged) {
             eprintln!("[report] failed to persist metrics for {}: {e}", self.bench);
         }
     }
@@ -358,4 +415,84 @@ fn write_map(path: &PathBuf, map: &HashMap<String, f64>) -> std::io::Result<()> 
     }
     let body = serde_json::to_vec_pretty(map).expect("serialize bench metrics");
     std::fs::write(path, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// The metrics file is a merge accumulator, which is only sound within
+    /// one corpus: a run that measures a subset of the keys must not leave
+    /// the rest holding numbers measured on different data. The fingerprint
+    /// gate is what prevents that, so pin both directions.
+    #[test]
+    fn a_corpus_switch_replaces_the_metrics_file_instead_of_merging() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("superfile_fts.json");
+
+        // A first corpus writes two metrics plus its fingerprint.
+        let first_corpus = 111.0;
+        let mut first = HashMap::new();
+        first.insert("anchor|sub|row|warm p50".to_string(), 10.0);
+        first.insert("anchor|sub|row|build".to_string(), 20.0);
+        first.insert(CORPUS_FINGERPRINT_KEY.to_string(), first_corpus);
+        write_map(&path, &first).expect("write first");
+
+        // Same fingerprint ⇒ the accumulator is kept, so a partial run's
+        // untouched keys survive (the behaviour `save` relies on).
+        let existing = read_map(&path).expect("read back");
+        assert!(
+            existing
+                .get(CORPUS_FINGERPRINT_KEY)
+                .is_some_and(|&p| p == first_corpus),
+            "same corpus keeps its accumulator"
+        );
+        assert_eq!(existing.get("anchor|sub|row|build"), Some(&20.0));
+
+        // Different fingerprint ⇒ `save` starts fresh. Emulate that write
+        // and assert the previous corpus's untouched metric is gone rather
+        // than lingering as a stale number.
+        let second_corpus = 222.0;
+        let mut fresh = HashMap::new();
+        fresh.insert("anchor|sub|row|warm p50".to_string(), 99.0);
+        fresh.insert(CORPUS_FINGERPRINT_KEY.to_string(), second_corpus);
+        write_map(&path, &fresh).expect("write second");
+
+        let after = read_map(&path).expect("read back");
+        assert_eq!(after.get("anchor|sub|row|warm p50"), Some(&99.0));
+        assert!(
+            !after.contains_key("anchor|sub|row|build"),
+            "the previous corpus's untouched metric must be gone, not stale"
+        );
+        assert!(
+            after
+                .get(CORPUS_FINGERPRINT_KEY)
+                .is_some_and(|&p| p == second_corpus),
+            "the file records the corpus that wrote it"
+        );
+    }
+
+    /// The fingerprint has to round-trip through JSON's `f64` exactly, or
+    /// the gate would fire on every run and no partial run would ever merge.
+    #[test]
+    fn the_corpus_fingerprint_round_trips_through_the_metrics_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("roundtrip.json");
+        let fp = corpus_fingerprint();
+        assert_eq!(fp, fp.trunc(), "fingerprint must be integer-valued");
+        assert!(
+            (fp as u64) < (1u64 << F64_EXACT_INT_BITS),
+            "fingerprint must fit the exactly-representable width"
+        );
+        let mut m = HashMap::new();
+        m.insert(CORPUS_FINGERPRINT_KEY.to_string(), fp);
+        write_map(&path, &m).expect("write");
+        assert_eq!(
+            read_map(&path).expect("read").get(CORPUS_FINGERPRINT_KEY),
+            Some(&fp),
+            "written and read fingerprints must compare equal"
+        );
+    }
 }

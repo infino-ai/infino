@@ -14,13 +14,10 @@ use std::sync::Arc;
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use infino::{
-    superfile::{
-        SuperfileReader,
-        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::reader::BoolMode as InfinoBoolMode,
-    },
-    test_helpers::default_tokenizer,
+use infino::superfile::{
+    SuperfileReader,
+    builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+    fts::reader::BoolMode as InfinoBoolMode,
 };
 use rayon::prelude::*;
 
@@ -49,12 +46,8 @@ fn build_superfile(column: &str, docs: &[(u64, &str)], positions: bool) -> Vec<u
     let opts = BuilderOptions::new(
         schema.clone(),
         ID_COLUMN,
-        vec![FtsConfig {
-            column: column.to_string(),
-            positions,
-        }],
+        vec![FtsConfig::new(column.to_string()).positions(positions)],
         vec![],
-        Some(default_tokenizer()),
     );
     let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
     for chunk in docs.chunks(WRITE_CHUNK) {
@@ -140,6 +133,7 @@ impl FtsEngine for InfinoFtsEngine {
             vector: true,
             sql: true,
             hybrid: true,
+            ..Default::default()
         }
     }
 

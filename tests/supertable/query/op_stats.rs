@@ -12,23 +12,28 @@
 use std::{sync::Arc, thread};
 
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+    Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+    LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
+    ConnectOptions, Connection, FtsField, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::{
+            reader::{Bm25Stats, BoolMode},
+            tokenize::STANDARD_TOKENIZER,
+        },
         vector::rerank_codec::RerankCodec,
     },
     supertable::{
         Supertable, SupertableOptions,
         query::vector::{VectorFilter, VectorSearchOptions},
     },
-    test_helpers::{default_tokenizer, default_vector_config},
+    test_helpers::default_vector_config,
 };
 use tempfile::TempDir;
 
@@ -56,17 +61,9 @@ fn options_title_only() -> SupertableOptions {
         DataType::LargeUtf8,
         false,
     )]));
-    SupertableOptions::new(
-        schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        Vec::new(),
-        Some(default_tokenizer()),
-    )
-    .expect("valid options")
-    .with_writer_pool(writer_pool)
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], Vec::new())
+        .expect("valid options")
+        .with_writer_pool(writer_pool)
 }
 
 /// One segment's titles: `rust` in every other doc, `async` and `web`
@@ -218,16 +215,21 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
 }
 
 #[test]
-fn work_stats_are_deterministic_across_cache_temperature() {
-    // The first run decodes from a cold state, the repeat hits every
-    // warm structure — the whole point of the counter is that the
-    // reported work is identical either way. Compare the full masked
-    // snapshot (like the vector/SQL siblings), not just posting bytes,
-    // so a warm/cold divergence in any FTS counter is caught.
+fn fts_work_stats_repeat_identically_on_the_same_table_state() {
+    // Named for what it guards. It used to claim the first run decodes
+    // from a cold state and the repeat hits warm structures, but this
+    // fixture has no cache-temperature axis at all: `demo_two_superfiles`
+    // attaches no storage, so every published superfile's bytes sit in
+    // the table's in-memory reader cache for its lifetime and both runs
+    // are served from the same resident reader. What it really pins is
+    // run-to-run repeatability across the full masked snapshot, which is
+    // worth having — the genuine cold-open axis is covered by
+    // `sql_work_stats_do_not_depend_on_reader_open_shape` for SQL and by
+    // the reader-lifetime transposition in the vector sibling.
     let st = demo_two_superfiles();
-    let cold = deterministic(scoped_fts_stats(&st, "rust"));
-    let warm = deterministic(scoped_fts_stats(&st, "rust"));
-    assert_eq!(cold, warm, "same plan, same table state, same work");
+    let first = deterministic(scoped_fts_stats(&st, "rust"));
+    let second = deterministic(scoped_fts_stats(&st, "rust"));
+    assert_eq!(first, second, "same plan, same table state, same work");
 }
 
 #[test]
@@ -488,12 +490,8 @@ fn vector_options() -> SupertableOptions {
     ]));
     SupertableOptions::new(
         schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
-        Some(default_tokenizer()),
     )
     .expect("valid options")
 }
@@ -617,16 +615,8 @@ fn drained_sq16_adaptive_table(dir: &TempDir) -> Supertable {
         metric: Metric::L2Sq,
         ..default_vector_config("emb", VECTOR_ROT_SEED).with_rerank_codec(RerankCodec::Sq16Adaptive)
     };
-    let opts = SupertableOptions::new(
-        schema,
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        vec![vector],
-        Some(default_tokenizer()),
-    )
-    .expect("valid options");
+    let opts = SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![vector])
+        .expect("valid options");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(opts.with_storage(storage)).expect("create");
@@ -781,6 +771,29 @@ fn vector_work_stats_are_deterministic_across_cache_temperature() {
     assert_eq!(cold, warm, "same plan, same table state, same work");
 }
 
+/// The reader-level SQL surface (test/bench only) meters CPU through the
+/// plan root, but its session context is cached and deliberately carries
+/// no collector — so the scan-level wrappers are inert there and the
+/// row count has to come from DataFusion's own leaf metrics. Without
+/// that harvest the benches driving this surface got a CPU number with no
+/// row denominator to divide it by.
+#[test]
+fn the_reader_level_sql_surface_reports_materialized_rows() {
+    let st = demo_two_superfiles();
+    let (batches, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable")
+            .expect("reader-level query_sql")
+    });
+    let returned: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    assert!(returned > 0, "the fixture must return rows");
+    assert_eq!(
+        stats.rows_materialized, returned,
+        "every row the scan decoded must reach the counter"
+    );
+}
+
 // ---- SQL: the per-query channel through the catalog `query_sql` path ----
 
 /// Rows in the SQL fixture.
@@ -822,6 +835,242 @@ fn scoped_sql_stats(db: &Connection, sql: &str) -> OpStats {
     stats
 }
 
+/// Rows in the `LIKE` fixture. The needle term must reach df ≥ 2 in its
+/// superfile: a df = 1 term is stored inline in the dictionary with no
+/// posting bytes, which would make the posting-work assertion vacuous.
+/// One batch this small commits as a single superfile, so the stride
+/// below gives the needle a df well clear of that.
+const LIKE_ROWS: usize = 512;
+/// Every this-many-th row of the `LIKE` fixture carries the needle.
+const LIKE_NEEDLE_STRIDE: usize = 4;
+/// Prose appended to every row of the padded `LIKE` fixture: a handful of
+/// words repeated, so the column's stored text dwarfs its vocabulary and
+/// the whole-dictionary walk passes the walk-vs-scan gate. The unpadded
+/// fixture (one unique filler word per row) sits far under it.
+const LIKE_PADDING: &str = " the quick brown fox jumps over the lazy dog again and again \
+                            the quick brown fox jumps over the lazy dog again and again \
+                            the quick brown fox jumps over the lazy dog again and again";
+
+/// A `standard`-analyzer table for the `LIKE` pushdown: the substring
+/// `nimble` occurs only inside the term `nimblefox`, planted in every
+/// [`LIKE_NEEDLE_STRIDE`]-th row. `padded` appends [`LIKE_PADDING`] to
+/// every row.
+fn sql_like_fixture(dir: &TempDir, padded: bool) -> Connection {
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("rating", DataType::Int64, false),
+    ]));
+    let docs = db
+        .create_table(
+            "docs",
+            schema.clone(),
+            IndexSpec::new().fts(FtsField::new("title").analyzer(STANDARD_TOKENIZER)),
+        )
+        .expect("create_table");
+    let padding = if padded { LIKE_PADDING } else { "" };
+    let titles: Vec<String> = (0..LIKE_ROWS)
+        .map(|i| {
+            if i % LIKE_NEEDLE_STRIDE == 0 {
+                format!("filler{i} nimblefox{padding}")
+            } else {
+                format!("filler{i} rust{padding}")
+            }
+        })
+        .collect();
+    let title_arr: ArrayRef = Arc::new(LargeStringArray::from(
+        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    let ratings: ArrayRef = Arc::new(Int64Array::from((0..LIKE_ROWS as i64).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
+    docs.append(&batch).expect("append");
+    db
+}
+
+#[test]
+fn a_like_predicate_is_answered_from_the_index() {
+    // `%nimble%` widens through each superfile's dictionary to the one
+    // term containing it and the scan decodes only that term's rows —
+    // FTS work the counters must show. The same query used to decode
+    // every row of `title` to test the substring.
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir, true);
+    let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
+    assert!(
+        stats.fts_postings_bytes > 0,
+        "the LIKE resolves through posting lists; got 0"
+    );
+    assert_eq!(
+        stats.rows_materialized,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64,
+        "only the candidate rows decode"
+    );
+
+    // `ILIKE` takes the same path: the token is compared folded against
+    // every dictionary key, and the needle rows are all that decode.
+    let folded = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title ILIKE '%NIMBLE%'");
+    assert!(
+        folded.fts_postings_bytes > 0,
+        "the ILIKE resolves through posting lists; got 0"
+    );
+    assert_eq!(
+        folded.rows_materialized,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64,
+        "only the candidate rows decode under ILIKE"
+    );
+
+    // A prefix pattern widens through the dictionary too. No stored value
+    // starts with `nimble` (they all start with `filler`), so the answer is
+    // empty — but the index still hands the scan the rows holding a term
+    // that starts with it, and only the FilterExec rejects them. Decoding
+    // exactly those candidates is the signature of the index path: a plain
+    // scan with the row filter inside it would decode none.
+    let (batches, prefix) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title LIKE 'nimble%'")
+            .expect("query_sql")
+    });
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert!(
+        prefix.fts_postings_bytes > 0,
+        "the prefix expansion resolves through posting lists; got 0"
+    );
+    assert_eq!(
+        prefix.rows_materialized,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64,
+        "the candidate rows decode before the exact check rejects them"
+    );
+
+    // A substring no indexed term contains expands to nothing: every
+    // superfile's access plan selects no row, so no data page is read.
+    let (batches, none) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title LIKE '%zzq%'")
+            .expect("query_sql")
+    });
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert_eq!(
+        none.sql_page_bytes, 0,
+        "an empty expansion reads no Parquet pages"
+    );
+    assert_eq!(
+        none.rows_materialized, 0,
+        "an empty expansion decodes nothing"
+    );
+}
+
+#[test]
+fn a_whole_dictionary_walk_is_skipped_when_the_scan_is_cheaper() {
+    // One unique word per row makes the vocabulary as large as the column
+    // (a few bytes of text per distinct term), so walking the dictionary
+    // for `%nimble%` would cost more than scanning: the token is left
+    // unbounded, no posting list is read, and the scan still answers
+    // exactly. The prefix `nimble%` walks only its own subtree, which the
+    // gate does not touch, so it stays index-bounded.
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir, false);
+    let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
+    assert_eq!(
+        stats.fts_postings_bytes, 0,
+        "the contains token is not expanded when the walk would not pay"
+    );
+    let (batches, _) = with_op_stats(|| {
+        db.query_sql("SELECT COUNT(*) FROM docs WHERE title LIKE '%nimble%'")
+            .expect("query_sql")
+    });
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0);
+    assert_eq!(count, (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as i64);
+    let (_, prefix) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title LIKE 'nimble%'")
+            .expect("query_sql")
+    });
+    assert!(
+        prefix.fts_postings_bytes > 0,
+        "a prefix token's subtree walk is not gated"
+    );
+}
+
+#[test]
+fn a_like_inside_a_boolean_tree_keeps_its_bound() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir, true);
+    let needle_rows = (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64;
+
+    // Two fragments: `filler1` names the rows whose filler term starts
+    // with 1 (1, 10..19, 100..199), `nimble` the needle rows. The
+    // expansions must intersect — a union would decode 212 rows, either
+    // token alone 111 or 128.
+    let filler1_rows: u64 = (0..LIKE_ROWS)
+        .filter(|i| i.to_string().starts_with('1'))
+        .count() as u64;
+    let both: u64 = (0..LIKE_ROWS)
+        .filter(|i| i.to_string().starts_with('1') && i % LIKE_NEEDLE_STRIDE == 0)
+        .count() as u64;
+    let stats = scoped_sql_stats(
+        &db,
+        "SELECT title FROM docs WHERE title LIKE '%filler1%nimble%'",
+    );
+    assert!(both < filler1_rows && both < needle_rows);
+    assert_eq!(
+        stats.rows_materialized, both,
+        "the two tokens' expansions intersect"
+    );
+
+    // AND with a scalar conjunct the index cannot bound: the LIKE still
+    // bounds the candidates (every needle row decodes), and the rating
+    // check is verified above the scan.
+    let (batches, and_stats) = with_op_stats(|| {
+        db.query_sql(&format!(
+            "SELECT title FROM docs WHERE title LIKE '%nimble%' AND rating >= {}",
+            LIKE_ROWS / 2
+        ))
+        .expect("query_sql")
+    });
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        LIKE_ROWS / 2 / LIKE_NEEDLE_STRIDE
+    );
+    assert_eq!(and_stats.rows_materialized, needle_rows);
+
+    // OR with an equality: both branches bound, the candidates are their
+    // union (the prefix `nimble%` matches no value but its expansion still
+    // names the needle rows), and one row survives the exact check.
+    let (batches, or_stats) = with_op_stats(|| {
+        db.query_sql(&format!(
+            "SELECT title FROM docs WHERE title LIKE 'nimble%' \
+             OR title = 'filler3 rust{LIKE_PADDING}'"
+        ))
+        .expect("query_sql")
+    });
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(or_stats.rows_materialized, needle_rows + 1);
+}
+
+#[test]
+fn an_open_edged_like_under_the_default_analyzer_still_scans() {
+    // Under `ascii_lower` an open-edged token is never required, whatever
+    // the data: the analyzer drops any run holding a non-ASCII byte whole,
+    // so in general a term merely containing `rust` may not exist for a
+    // row that matches. `%rust%` therefore scans here even though this
+    // corpus is pure ASCII. Control for the tests above: no posting work,
+    // same answer.
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%rust%'");
+    assert_eq!(
+        stats.fts_postings_bytes, 0,
+        "no index bound under ascii_lower; got {}",
+        stats.fts_postings_bytes
+    );
+    assert!(
+        stats.sql_page_bytes > 0,
+        "the scan reads the column's pages"
+    );
+}
+
 #[test]
 fn a_scoped_sql_scan_reports_page_bytes() {
     let dir = TempDir::new().expect("tempdir");
@@ -841,9 +1090,63 @@ fn a_scoped_sql_scan_reports_page_bytes() {
         stats.rows_materialized > 0,
         "the scan's decoded rows come from DataFusion's own metrics; got 0"
     );
+}
+
+/// A whole-table aggregate is answerable from statistics the provider
+/// attaches to the scan, so the planner folds it to a constant and never
+/// opens a page. Measuring must not change that. `MeteredExec` sits
+/// directly between the aggregate and the scan, and an `ExecutionPlan`
+/// wrapper that takes the trait defaults reports unknown statistics —
+/// which silently turns an O(1) manifest read into a full columnar scan
+/// that the customer is then billed for. This asserts the billing-visible
+/// consequence rather than a plan string, so it holds whichever rule does
+/// the folding.
+#[test]
+fn a_whole_table_aggregate_folds_instead_of_scanning() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    for sql in [
+        "SELECT COUNT(*) FROM docs",
+        "SELECT MIN(rating), MAX(rating) FROM docs",
+    ] {
+        let stats = scoped_sql_stats(&db, sql);
+        assert_eq!(
+            stats.sql_page_bytes, 0,
+            "{sql} folds from statistics; it must not read Parquet pages"
+        );
+        assert_eq!(
+            stats.planned_read_ranges, 0,
+            "{sql} folds from statistics; it must not plan a read range"
+        );
+        assert_eq!(
+            stats.rows_materialized, 0,
+            "{sql} folds from statistics; it must not decode rows"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+)]
+fn a_scoped_sql_scan_reports_kernel_cpu() {
+    // SQL CPU is bracketed per scan poll on the thread clock, like every
+    // other kernel — not DataFusion's `elapsed_compute`, which is wall
+    // time and omits Parquet decode. Same granularity handling as the
+    // BM25 and vector kernel-CPU tests: schedstat advances at scheduler
+    // events, so one sub-tick scan can legitimately read zero and only a
+    // batch is guaranteed to register.
+    const KERNEL_CPU_BATCH: usize = 200;
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let mut total = 0u64;
+    for _ in 0..KERNEL_CPU_BATCH {
+        total += scoped_sql_stats(&db, "SELECT rating FROM docs WHERE rating > 5").kernel_cpu_ns;
+    }
     assert!(
-        stats.kernel_cpu_ns > 0,
-        "the plan's elapsed compute comes from DataFusion's own metrics; got 0"
+        total > 0,
+        "the bracketed SQL scan reports on-CPU time over {KERNEL_CPU_BATCH} queries; got 0"
     );
 }
 
@@ -1019,4 +1322,230 @@ fn a_search_tvf_inside_sql_reports_fts_work() {
         stats.fts_postings_bytes > 0,
         "the BM25 leg inside SQL indexes posting bytes; got 0"
     );
+}
+
+/// Projecting only `_id` must cost no more than the engine-native
+/// (`None`) result: both columns are produced by the search wave — ids
+/// stamped on the hits, scores from the kernel — so neither needs a
+/// placement resolve or a Parquet decode. Regression for the fast path
+/// that matched only the exact `[_id, score]` pair and sent a bare
+/// `["_id"]` down the scalar-projection path, which resolves placements
+/// (a whole-`_id`-column read per gapped superfile on first touch) and
+/// then decodes rows. `rows_materialized` is the invariant signal: the
+/// native path decodes nothing, so anything above 0 here means the
+/// query fell off the fast path.
+#[test]
+fn id_only_projection_costs_no_more_than_the_native_result() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let search = |projection: Option<&[&str]>| {
+        let (hits, stats) = with_op_stats(|| {
+            st.vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                projection,
+            )
+            .expect("vector search")
+        });
+        assert!(!hits.is_empty(), "fixture vector query must match");
+        stats
+    };
+
+    let native = search(None);
+    let id_only = search(Some(&["_id"]));
+    let id_and_score = search(Some(&["_id", "score"]));
+    let score_only = search(Some(&["score"]));
+
+    assert_eq!(
+        native.rows_materialized, 0,
+        "the engine-native result decodes no stored rows"
+    );
+    for (label, stats) in [
+        ("_id", &id_only),
+        ("_id + score", &id_and_score),
+        ("score", &score_only),
+    ] {
+        assert_eq!(
+            stats.rows_materialized, 0,
+            "projection [{label}] must stay on the id/score fast path \
+             (decoded {} rows)",
+            stats.rows_materialized
+        );
+        assert_eq!(
+            stats.planned_read_ranges, native.planned_read_ranges,
+            "projection [{label}] must plan the same reads as the native result"
+        );
+    }
+}
+
+/// The gapped-placement memo must not pin connection-budget bytes. The
+/// budget gates MANDATORY work — ingest and compaction both hard-fail
+/// when refused — so a discretionary, rebuildable read cache that holds
+/// bytes for as long as its superfile stays live can push those over the
+/// ceiling and keep them there: the only thing that evicts an entry is
+/// its superfile being superseded, which is what compaction does, which
+/// would be the operation denied.
+///
+/// Measured as a DELTA against a warmed native query, because the
+/// transposed-code cache legitimately pins bytes for its reader's
+/// lifetime (`TransposedCluster::_reservation`) — this asserts only that
+/// building the placement memo adds nothing permanent on top.
+#[test]
+fn placement_memo_releases_its_budget_bytes() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let budget = st.options().connection_budget();
+    let query = row_vec(3);
+    let search = |projection: Option<&[&str]>| {
+        let hits = st
+            .vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                projection,
+            )
+            .expect("vector search");
+        assert!(!hits.is_empty(), "fixture vector query must match");
+    };
+
+    // Warm every reader-lifetime cache the query path legitimately pins,
+    // so the only new resident state below is the placement memo.
+    search(None);
+    search(None);
+    let warmed = budget.used_bytes();
+    assert!(
+        budget.peak() > 0,
+        "the query must have exercised the budget at all"
+    );
+
+    // A user-column projection forces placement resolution over the
+    // drained (gapped) superfiles — this is what builds the memo.
+    search(Some(&["title"]));
+
+    assert_eq!(
+        budget.used_bytes(),
+        warmed,
+        "building the placement memo must leave no reserved bytes behind; \
+         {} held beyond the warmed baseline",
+        budget.used_bytes().saturating_sub(warmed)
+    );
+
+    // Liveness: mandatory work still reserves after the memo is warm.
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&vector_batch(schema)).expect("append after memo");
+    w.commit().expect("commit after memo");
+}
+
+/// A FILTERED vector query projecting `_id`/`score` must not return
+/// hidden-deleted rows — and this pins WHY it doesn't.
+///
+/// The fast path returns straight from search-wave stamps, skipping
+/// `user_placement_for_scalar_resolve`, which is where the identity-level
+/// delete filter lives. Unlike the global route, the filtered route has no
+/// retain of its own, so the omission looks unsafe. It is not, for a reason
+/// worth pinning: the filtered route derives its hidden allow-set from the
+/// USER-table allow bitmaps (`stable_ids_from_user_allow_async`), and those
+/// have already had `subtract_tombstones` applied in
+/// `fanout_candidate_bitmaps`. A deleted row is therefore dropped at the
+/// predicate leg and never becomes a candidate id, so no deleted row can
+/// reach the fast path in the first place.
+///
+/// That upstream subtraction is load-bearing and invisible from the
+/// projection code. This test fails if it is ever removed or bypassed.
+#[test]
+fn a_filtered_id_score_query_excludes_deleted_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let opts = VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE);
+    let filter = || VectorFilter {
+        column: "title",
+        query: "vec",
+        mode: BoolMode::Or,
+    };
+
+    // Identify the top-k by BOTH id and title in one pass: the title drives
+    // the delete predicate, the id is what the fast path must stop serving.
+    // This arm projects a scalar column, so it goes through placement — the
+    // arm under test is the `["_id", "score"]` one below.
+    let before = st
+        .vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            opts,
+            Some(filter()),
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("filtered search before delete");
+    let (ids_before, titles) = ids_and_titles(&before);
+    assert_eq!(
+        ids_before.len(),
+        VECTOR_K,
+        "fixture must fill k before any delete"
+    );
+
+    let preds: Vec<Expr> = titles.iter().map(|t| lit(t.as_str())).collect();
+    let stats = st
+        .delete(col("title").in_list(preds, false))
+        .expect("delete");
+    assert_eq!(
+        stats.n_tombstoned() as usize,
+        ids_before.len(),
+        "every top-k row must tombstone"
+    );
+
+    // The arm under test: `["_id", "score"]` takes the fast path.
+    let after = st
+        .vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            opts,
+            Some(filter()),
+            Some(&["_id", "score"]),
+        )
+        .expect("filtered search after delete");
+    let (ids_after, _) = ids_and_titles(&after);
+    for id in &ids_after {
+        assert!(
+            !ids_before.contains(id),
+            "filtered id/score fast path returned deleted _id {id}"
+        );
+    }
+    assert_eq!(
+        ids_after.len(),
+        VECTOR_K,
+        "filtered result underflowed instead of backfilling past tombstones"
+    );
+}
+
+/// `_id`s, and titles when the projection carried them.
+fn ids_and_titles(batches: &[RecordBatch]) -> (Vec<i128>, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut titles = Vec::new();
+    for b in batches {
+        let id_col = b
+            .column_by_name("_id")
+            .expect("_id column")
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is decimal128");
+        ids.extend((0..id_col.len()).map(|i| id_col.value(i)));
+        if let Some(col) = b.column_by_name("title") {
+            let t = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title is large utf8");
+            titles.extend((0..t.len()).map(|i| t.value(i).to_owned()));
+        }
+    }
+    (ids, titles)
 }

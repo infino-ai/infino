@@ -64,6 +64,8 @@ use datafusion::{
 use futures::{future, stream};
 use tracing::debug;
 
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     runtime_metrics::op_stats,
@@ -84,7 +86,10 @@ use crate::{
                 },
                 vector_exec::arg_to_query_vector,
             },
-            vector::{calibrated_query, user_placement_for_scalar_resolve},
+            vector::{
+                calibrated_query, free_columns_unambiguous, hits_id_score_batch,
+                id_score_projection_indices, user_placement_for_scalar_resolve,
+            },
         },
     },
 };
@@ -128,7 +133,7 @@ impl SupertableReader {
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn hybrid_search_async(
         &self,
@@ -191,7 +196,7 @@ impl Supertable {
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn hybrid_search(
         &self,
@@ -211,14 +216,31 @@ impl Supertable {
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let batch = self
             .block_on_query(async {
+                // `_id` + `score` come free with the search wave, so a
+                // projection of just those needs no placement and no
+                // Parquet decode — the same fast path `vector_search`
+                // takes. GUARDED on every hit carrying a stable-id
+                // stamp: hybrid fuses FTS-matched rows that never went
+                // through the hidden vector index, and those reach here
+                // unstamped (`stable_id: None`), which
+                // `hits_id_score_batch` treats as an upstream bug. Any
+                // unstamped hit falls through to the general path,
+                // which resolves ids by placement.
+                let id_column = reader.options().id_column.as_str();
+                if free_columns_unambiguous(&reader.options().schema, id_column)
+                    && let Some(indices) = id_score_projection_indices(projection, id_column)
+                    && hits.iter().all(|h| h.stable_id.is_some())
+                {
+                    return hits_id_score_batch(&reader, &hits)?
+                        .project(&indices)
+                        .map_err(|e| QueryError::Execute(e.to_string()));
+                }
                 // Boundary-replica stubs carry an IVF local that does not
                 // address a Parquet row; remap to the owning placement by
                 // stable id before the scalar decode, exactly as the
                 // hybrid TVF and `vector_search` paths do.
                 let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
-                resolve_hits_named(&reader, &hits, projection, "hybrid_search")
-                    .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))
+                resolve_hits_named(&reader, &hits, projection).await
             })
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
         Ok(vec![batch])
@@ -580,7 +602,6 @@ mod tests {
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{Supertable, SupertableOptions},
-        test_helpers::default_tokenizer as tok,
     };
 
     // ---- supertable harness: title (FTS) + emb (vector) ----
@@ -605,10 +626,7 @@ mod tests {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -617,7 +635,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -1168,10 +1185,7 @@ mod tests {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -1180,7 +1194,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)

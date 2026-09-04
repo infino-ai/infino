@@ -11,17 +11,17 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    config::OptimizeOptions,
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::tokenize::Tokenizer,
         vector::distance::Metric,
     },
-    supertable::{Supertable, SupertableOptions, storage::StorageProvider},
-    test_helpers::default_tokenizer,
+    supertable::{LocalFsStorageProvider, Supertable, SupertableOptions, storage::StorageProvider},
 };
+use tempfile::TempDir;
 
 use crate::{
-    corpus::{self, DIM, MmapTextCorpus, MmapVectorCorpus},
+    corpus::{self, MmapTextCorpus, MmapVectorCorpus, dim},
     harness::{emb_for, scatter_key, sql_options, sql_schema},
     markdown::fmt_count,
     rss::fmt_bytes,
@@ -98,7 +98,7 @@ pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
 
 pub(crate) const CORPUS_VEC_SEED: u64 = 1;
-const CORPUS_TEXT_SEED: u64 = 1;
+pub(crate) const CORPUS_TEXT_SEED: u64 = 1;
 /// Existing base-only vector corpus used instead of synthetic generation.
 const VECTOR_CORPUS_PATH_ENV: &str = "INFINO_BENCH_VECTOR_CORPUS_PATH";
 
@@ -258,7 +258,7 @@ pub(crate) fn schema_for(modality: Modality) -> Arc<Schema> {
             VEC_COLUMN,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
+                dim() as i32,
             ),
             false,
         ));
@@ -304,27 +304,20 @@ pub fn options_for(
             .build()
             .expect("pool"),
     );
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
     let mut fts = Vec::new();
     if modality.has_fts() {
-        fts.push(FtsConfig {
-            column: TEXT_COLUMN.into(),
-            positions: true,
-        });
+        fts.push(FtsConfig::new(TEXT_COLUMN).positions(true));
     }
     if modality.has_vector_filter_bucket() {
         // Single token per row, equality-only predicates — positions buy
         // nothing and would triple the (tiny) index.
-        fts.push(FtsConfig {
-            column: VECTOR_FILTER_COLUMN.into(),
-            positions: false,
-        });
+        fts.push(FtsConfig::new(VECTOR_FILTER_COLUMN));
     }
     let vector = if modality.has_vector() {
         vec![VectorConfig {
             provided_centroids: None,
             column: VEC_COLUMN.into(),
-            dim: DIM,
+            dim: dim(),
             rot_seed: ROT_SEED,
             metric: bench_metric(),
             rerank_codec: corpus::bench_rerank_codec(bench_metric()),
@@ -332,7 +325,7 @@ pub fn options_for(
     } else {
         vec![]
     };
-    let mut opts = SupertableOptions::new(schema_for(modality), fts, vector, Some(tk))
+    let mut opts = SupertableOptions::new(schema_for(modality), fts, vector)
         .expect("opts")
         .with_reader_pool(pool.clone())
         .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
@@ -353,8 +346,9 @@ pub fn combined_options(storage: Option<Arc<dyn StorageProvider>>) -> Supertable
 /// The corpus + index knobs this bench config builds with.
 pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
     crate::dataset::Knobs {
+        corpus: corpus::corpus_label().to_string(),
         doc_count: n_docs(),
-        dim: DIM,
+        dim: dim(),
         n_cent_total: corpus::n_cent(n_docs()),
         vec_seed: CORPUS_VEC_SEED,
         text_seed: CORPUS_TEXT_SEED,
@@ -402,7 +396,7 @@ impl PreparedCorpus {
         let vec = self
             .vectors
             .as_ref()
-            .map(|_| (n_docs() * DIM * size_of::<f32>()) as u64)
+            .map(|_| (n_docs() * dim() * size_of::<f32>()) as u64)
             .unwrap_or(0);
         text + vec + self.sql_embed_bytes
     }
@@ -418,7 +412,28 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     // post-drain → delta → compact). Generate base + that tail once so
     // the delta batch does not regenerate.
     let corpus_docs = n_docs + docs_per_commit();
+    if !corpus::corpus_has_text() && (modality.has_text() || modality.has_sql()) {
+        panic!(
+            "corpus {} carries no text column, so the {} modality cannot run on it — \
+             use a text-bearing dataset (e.g. hf:KShivendu/dbpedia-entities-openai-1M) \
+             or the synthetic corpus",
+            corpus::corpus_label(),
+            modality_label(modality)
+        );
+    }
     let text = modality.has_text().then(|| {
+        if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic) {
+            let source = corpus::corpus_source();
+            eprintln!(
+                "[supertable_ingest] loading {} {} text docs...",
+                fmt_count(corpus_docs),
+                corpus::corpus_label()
+            );
+            let shards = corpus::parquet_shards_for(source);
+            return MmapTextCorpus::from_parquet_shards(&shards, corpus_docs)
+                .or_else(|_| MmapTextCorpus::from_parquet_shards(&shards, n_docs))
+                .unwrap_or_else(|e| panic!("failed to load the dataset's text column: {e}"));
+        }
         eprintln!(
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
             fmt_count(corpus_docs)
@@ -432,7 +447,8 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
             // shape `generate` writes). Accept both; `vector_delta_batch`
             // regenerates the tail when only the base rows are present.
             eprintln!(
-                "[supertable_ingest] opening persisted {} ×{DIM} vector corpus from {}...",
+                "[supertable_ingest] opening persisted {} ×{} vector corpus from {}...",
+                dim(),
                 fmt_count(n_docs),
                 path.display()
             );
@@ -445,10 +461,49 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
                         path.display()
                     )
                 })
+        } else if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic)
+            && !matches!(
+                corpus::corpus_source(),
+                corpus::CorpusSource::AnnBenchmarks { .. }
+            )
+        {
+            // Parquet dataset (downloaded or local): the tail past `n_docs`
+            // stays uningested so it can serve as held-out queries.
+            let source = corpus::corpus_source();
+            eprintln!(
+                "[supertable_ingest] loading {} ×{} {} vectors...",
+                fmt_count(n_docs),
+                dim(),
+                corpus::corpus_label()
+            );
+            let shards = corpus::parquet_shards_for(source);
+            MmapVectorCorpus::from_parquet_shards(&shards, corpus_docs, dim(), true)
+                .or_else(|_| MmapVectorCorpus::from_parquet_shards(&shards, n_docs, dim(), true))
+                .unwrap_or_else(|error| panic!("failed to load the parquet dataset: {error}"))
+        } else if let corpus::CorpusSource::AnnBenchmarks { dir, slug } = corpus::corpus_source() {
+            // Real dataset: base + delta rows when it is deep enough, else
+            // base-only (the delta tail regenerates, the same contract as a
+            // base-only persisted corpus above).
+            eprintln!(
+                "[supertable_ingest] loading {} ×{} {slug} vectors from {}...",
+                fmt_count(n_docs),
+                dim(),
+                dir.display()
+            );
+            MmapVectorCorpus::from_hdf5(dir, slug, corpus_docs, dim(), true)
+                .or_else(|_| MmapVectorCorpus::from_hdf5(dir, slug, n_docs, dim(), true))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to load {slug} from {} with either {corpus_docs} \
+                         (base + delta) or {n_docs} (base-only) rows: {error}",
+                        dir.display()
+                    )
+                })
         } else {
             eprintln!(
-                "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
-                fmt_count(corpus_docs)
+                "[supertable_ingest] generating {} ×{} vector corpus (mmap-backed)...",
+                fmt_count(corpus_docs),
+                dim()
             );
             MmapVectorCorpus::generate(corpus_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
         }
@@ -458,7 +513,7 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     // vector index, so `has_vector()` is false) — sized here so
     // `byte_size()` still counts it.
     let sql_embed_bytes = if modality.has_sql() {
-        (n_docs * DIM * size_of::<f32>()) as u64
+        (n_docs * dim() * size_of::<f32>()) as u64
     } else {
         0
     };
@@ -535,6 +590,77 @@ fn text_delta_batch(modality: Modality, corpus: &PreparedCorpus) -> RecordBatch 
 /// dead weight. SQL's extra columns are derived inline from `doc_id`.
 /// The text/vector corpus is identical across modalities (same seeds),
 /// so each shape is directly comparable to its single-modality competitor.
+/// Build a LOCAL vector supertable from the prepared corpus's first
+/// `n_docs` rows and run the standard lifecycle — chunked appends,
+/// commits, then `optimize()` — so whatever serving index the process
+/// config selects (`vector.search_mode`: the stamped ivf laws, the
+/// resident graph, or the resident flat plane) is built, calibrated,
+/// and serving before the handle is returned.
+///
+/// For in-process comparisons against RAM-resident library peers: the
+/// backing store is a LocalFs tempdir (returned as the guard, dropped
+/// with the table), so the deploy story stays "cargo bench" with no
+/// object-store daemon, while a resident serving index answers from RAM
+/// exactly as it would over any backend.
+pub fn build_local_for_serving(
+    corpus: &PreparedCorpus,
+    n_docs: usize,
+) -> (Supertable, Arc<dyn StorageProvider>, TempDir) {
+    let dir = TempDir::new().expect("local supertable tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("LocalFs provider"));
+    let st = Supertable::create(options_for(Modality::Vector, Some(Arc::clone(&storage))))
+        .expect("create local supertable");
+    let schema = schema_for(Modality::Vector);
+    // A zero-doc build is a caller bug, named here rather than surfacing
+    // as `step_by(0)`'s opaque panic; an empty table also has nothing for
+    // `optimize()` to calibrate, so tolerating it would return a handle
+    // that serves no mode meaningfully.
+    assert!(n_docs > 0, "build_local_for_serving needs at least one row");
+    let commits = n_commits();
+    let chunk_size = n_docs.div_ceil(commits);
+    let mut w = st.writer().expect("writer");
+    for start in (0..n_docs).step_by(chunk_size) {
+        let end = (start + chunk_size).min(n_docs);
+        let batch = chunk_batch(Modality::Vector, corpus, &schema, start, end, end - start);
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+    // The full maintenance pass: drain to the hidden index, compact,
+    // calibrate the serving laws, and build whichever resident index the
+    // config opts into. Serving state after this is what a caller gets.
+    st.optimize(&OptimizeOptions::default())
+        .expect("optimize local supertable");
+    (st, storage, dir)
+}
+
+/// Serialized size of the resident vector-index blob the drain published
+/// (flat plane or graph bundle), by `head()`ing the object the hidden
+/// manifest references — the engine's own accounting, not plane
+/// arithmetic re-derived in bench code. `None` when no resident index
+/// was published (ivf mode, above the scale ceiling, or a declined
+/// register probe).
+pub fn served_index_blob_bytes(st: &Supertable) -> Option<u64> {
+    let hidden = st.vector_index_table()?;
+    let reference = hidden
+        .pinned_reader()
+        .manifest()
+        .resident_vector_index_blob_ref()?;
+    // The ref's URI is relative to the HIDDEN table's (prefixed) provider,
+    // so head through that handle — heading the user-root provider turns
+    // "blob exists" into NotFound. A manifest that names a blob the store
+    // cannot head is corruption, not absence: fail loudly, never `None`.
+    let storage = hidden
+        .options()
+        .storage
+        .as_ref()
+        .expect("hidden table with a published blob has storage attached");
+    let meta = tiers::block_on(storage.head(&reference.uri))
+        .expect("head the resident-index blob the hidden manifest references");
+    Some(meta.size)
+}
+
 pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestResult {
     let n_docs = n_docs();
     let commits = n_commits();
@@ -865,7 +991,7 @@ fn chunk_batch(
             .as_ref()
             .expect("vector modality has a vector corpus")
             .as_slice();
-        let flat = &all[start * DIM..end * DIM];
+        let flat = &all[start * dim()..end * dim()];
         columns.push(vector_array(flat));
     }
     RecordBatch::try_new(schema.clone(), columns).expect("batch")
@@ -875,7 +1001,7 @@ pub(crate) fn vector_array(flat: &[f32]) -> Arc<dyn Array> {
     Arc::new(
         FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, true)),
-            DIM as i32,
+            dim() as i32,
             Arc::new(Float32Array::from(flat.to_vec())) as Arc<dyn Array>,
             None,
         )

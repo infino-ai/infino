@@ -29,7 +29,7 @@ use object_store::{
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider, counting};
-use crate::runtime_metrics::io::UsageMeter;
+use crate::{runtime_bridge::carry_span, runtime_metrics::io::UsageMeter};
 
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
@@ -144,6 +144,11 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
         ObjError::NotFound { .. } => StorageError::NotFound { uri: uri.into() },
         ObjError::AlreadyExists { .. } | ObjError::Precondition { .. } => {
             StorageError::PreconditionFailed { uri: uri.into() }
+        }
+        // Refused credentials, kept apart from `Permanent`: the URI is
+        // fine and the same call with valid credentials can succeed.
+        ObjError::PermissionDenied { .. } | ObjError::Unauthenticated { .. } => {
+            StorageError::PermissionDenied { uri: uri.into() }
         }
         ObjError::Generic { source, .. } => StorageError::TransientExhausted {
             uri: uri.into(),
@@ -331,9 +336,9 @@ impl StorageProvider for LocalFsStorageProvider {
                     })?;
                 // `flock` is a blocking syscall; run it on the
                 // blocking pool so it can't stall a tokio worker.
-                let lock_file = tokio::task::spawn_blocking(move || {
+                let lock_file = tokio::task::spawn_blocking(carry_span(move || {
                     lock_file.lock_exclusive().map(|_| lock_file)
-                })
+                }))
                 .await
                 .map_err(|e| StorageError::Permanent {
                     uri: uri.into(),
@@ -457,6 +462,23 @@ impl StorageProvider for LocalFsStorageProvider {
 
     fn usage_meter(&self) -> Arc<UsageMeter> {
         Arc::clone(&self.meter)
+    }
+
+    fn local_path(&self, uri: &str) -> Option<PathBuf> {
+        // The provider root is baked into the store; the object key is the bare
+        // (normalized) uri. Rebuild the on-disk path so a caller can mmap the
+        // file directly. `object_store`'s `LocalFileSystem` maps each *decoded*
+        // path segment to a filesystem component, so we join the decoded parts
+        // (`PathPart::as_ref`), not `ObjPath::to_string()` (which re-emits the
+        // percent-ENCODED form and would diverge for keys needing encoding).
+        // Parsing through `ObjPath` first applies the same normalization the
+        // read/write paths use.
+        let path = Self::path(uri).ok()?;
+        let mut fs_path = self.root.clone();
+        for part in path.parts() {
+            fs_path.push(part.as_ref());
+        }
+        Some(fs_path)
     }
 }
 
@@ -936,6 +958,26 @@ mod tests {
             matches!(mapped, StorageError::TransientExhausted { .. }),
             "expected TransientExhausted, got {mapped:?}"
         );
+    }
+
+    #[test]
+    fn translate_refused_credentials_to_permission_denied() {
+        // 403 and 401 both mean the credentials were refused: kept apart from
+        // `Permanent` so a caller can supply fresh ones and reissue instead of
+        // treating the URI as broken.
+        for e in [
+            ObjError::PermissionDenied {
+                path: "k".into(),
+                source: "forbidden".into(),
+            },
+            ObjError::Unauthenticated {
+                path: "k".into(),
+                source: "expired".into(),
+            },
+        ] {
+            let err = translate("k", e);
+            assert!(matches!(err, StorageError::PermissionDenied { uri } if uri == "k"));
+        }
     }
 
     #[test]

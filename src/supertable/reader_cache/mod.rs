@@ -135,6 +135,12 @@ mod trait_default_tests {
     fn default_remove_is_a_safe_no_op() {
         let cache = IgnoresRemoval;
         let uri = SuperfileUri::new_v4();
+        // An implementation may accept an insert and still answer misses —
+        // the trait promises nothing about where the bytes went, only that
+        // `remove` is safe to call either way.
+        cache
+            .insert(uri, Bytes::from_static(b"not a superfile"))
+            .expect("this implementation accepts any bytes");
         cache.remove(&uri);
         assert!(
             matches!(cache.reader(&uri), Err(ReaderCacheError::NotFound { .. })),

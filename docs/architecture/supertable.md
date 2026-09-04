@@ -94,9 +94,27 @@ is verified against the raw string — so it never scans the whole
 column. Tokenization is used only to prune; the match itself is a
 raw-string comparison. Also unranked.
 - **SQL.** A SQL query over the table's scalar and full-text columns,
-returning the matching rows. Search is also reachable from SQL
-through table-valued functions, so a query can filter, project, join,
-and order search results alongside scalar columns:
+returning the matching rows. A `WHERE` clause on a full-text column is
+answered from the inverted index wherever the index can bound it
+soundly — equality and `IN` through the literal's terms, `LIKE` through
+the term dictionary (each literal fragment of the pattern is tokenized;
+a token the fragment closes on both sides is required as itself, and a
+token bordering a wildcard is widened to the indexed terms it heads,
+tails, or sits inside) — with the exact predicate re-checked over the
+candidate rows. The default `ascii_lower` analyzer drops any token
+holding a non-ASCII byte, so under it only tokens the pattern closes on
+both sides can be required; the `standard` analyzer supports prefix,
+suffix, and substring patterns. A suffix or substring token needs a walk
+of the column's whole dictionary, taken only where the superfile's
+stored text is large against its vocabulary; otherwise that token is
+left to the scan. `ILIKE` is bounded the same way for ASCII tokens,
+comparing dictionary terms with the two non-ASCII characters Unicode
+case folding places in an ASCII letter's class (the long s `ſ` with
+`s`, the Kelvin sign U+212A with `k`) folded to that letter; non-ASCII
+tokens under `ILIKE`, and `NOT LIKE`, scan. Search is
+also reachable from SQL through table-valued functions, so a query can
+filter, project, join, and order search results alongside scalar
+columns:
   - `vector_search(column, query, k)` — vector kNN as a relation.
   - `bm25_search(column, query, k)` and
   `bm25_search_prefix(column, prefix, k)` — full-text / prefix BM25.

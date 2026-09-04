@@ -56,11 +56,13 @@ use futures::future;
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
+use tracing::warn;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::options::SupertableOptions;
 use crate::{
+    runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::VectorConfig,
@@ -95,12 +97,17 @@ use crate::{
         query::{hierarchical_iter, prune::PruneLeaf},
         slow_vector_state,
     },
+    utils::trace::record,
 };
 
 /// Object-store / LocalFS directory prefix under which committed superfile
 /// bytes live (`<data>/seg-<id>.sf.parquet`). Shared by [`SuperfileUri::storage_path`]
 /// and the GC live-set sweep so both agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
+
+/// Extra extension an in-flight cold-fetch tempfile carries on top of [`SuperfileUri::cache_filename`];
+/// the file is atomically renamed to the bare name once complete.
+pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
 
 /// Legacy storage-subtree prefix for the hidden vector-index sibling
 /// supertable — the commit-time default stamped when a vector table's
@@ -452,6 +459,7 @@ impl ManifestSnapshot {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts,
             tombstone_seqs,
             superseded_cells,
@@ -651,6 +659,23 @@ impl ManifestSnapshot {
     /// the refresh path can read the pointer itself (conditionally,
     /// via [`probe_pointer`]) and still share the list + parts
     /// loading below.
+    // The shared body of both load paths (`load` reads the pointer itself,
+    // the refresh path probes it conditionally), so one span here covers
+    // manifest load cost wherever it is paid. Cost scales with part count,
+    // not table size — `parts` is the field that shows that.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.load",
+            skip_all,
+            fields(
+                manifest_id = pointer.manifest_id,
+                list_bytes = tracing::field::Empty,
+                parts = tracing::field::Empty,
+                superfiles = tracing::field::Empty
+            )
+        )
+    )]
     pub(crate) async fn load_with_pointer(
         current_manifest: Option<Arc<Self>>,
         storage: Arc<dyn StorageProvider>,
@@ -669,6 +694,7 @@ impl ManifestSnapshot {
             .get(&pointer.manifest_uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
+        record("list_bytes", list_bytes.len() as u64);
         let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
 
         let options = if let Some(options) = options {
@@ -912,7 +938,7 @@ impl ManifestSnapshot {
                 prewarm_summary_admit_slabs(&entries, &vector_columns, &pool);
                 entries
             };
-            all_superfiles = match spawn_blocking(prewarm).await {
+            all_superfiles = match spawn_blocking(carry_span(prewarm)).await {
                 Ok(entries) => entries,
                 Err(join_error) => {
                     return Err(ManifestLoadError::SlowStateHydration(format!(
@@ -935,6 +961,11 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
         };
 
+        record("parts", new_manifest.parts.len() as u64);
+        record(
+            "superfiles",
+            new_manifest.superfile_list.superfiles.len() as u64,
+        );
         Ok(Arc::new(new_manifest))
     }
 
@@ -1198,6 +1229,25 @@ impl ManifestSnapshot {
         self.list.as_ref()?.slow_vector_state_centroids.as_ref()
     }
 
+    /// The graph-sections sibling ref (persisted `hnsw` HNSW graphs),
+    /// or `None` on manifests written before it existed or above the
+    /// data-graph scale ceiling. Consumers fall back to the lazy build /
+    /// scan path when absent.
+    pub(crate) fn resident_vector_index_blob(&self) -> Option<&RoutingRef> {
+        self.list.as_ref()?.slow_vector_state_graphs.as_ref()
+    }
+
+    test_visible! {
+        /// Bench/test introspection for the published resident vector-index
+        /// blob (the flat plane or graph bundle the drain persisted): its
+        /// storage ref, so a bench can `head()` the object and report the
+        /// engine's own serialized size instead of re-deriving plane
+        /// arithmetic from internals.
+        fn resident_vector_index_blob_ref(&self) -> Option<RoutingRef> {
+            self.resident_vector_index_blob().cloned()
+        }
+    }
+
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
     /// bytes in the manifest list. Bumps `manifest_id` like a normal commit
     /// without touching superfiles or parts.
@@ -1234,6 +1284,7 @@ impl ManifestSnapshot {
         uri: String,
         hash: part::ContentHash,
         centroids: RoutingRef,
+        graphs: Option<RoutingRef>,
     ) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
@@ -1242,6 +1293,7 @@ impl ManifestSnapshot {
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
             list.slow_vector_state_centroids = Some(centroids);
+            list.slow_vector_state_graphs = graphs;
             list
         });
         let mut superfile_list = self.superfile_list.clone();
@@ -1273,6 +1325,34 @@ impl ManifestSnapshot {
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
             list.slow_vector_state_centroids = Some(centroids);
+            // `slow_vector_state_graphs` is intentionally left as `update`
+            // carried it forward. A drain that (re)builds the graph stamps it
+            // separately via `with_slow_vector_state_graphs` — routed through
+            // `CommitListMetadata` so it lands in the SAME membership commit as
+            // `drained_ranges`, not a later settle.
+            list
+        });
+        Self {
+            superfile_list: self.superfile_list.clone(),
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
+    /// Stamp ONLY the `hnsw` graph ref on an already-built successor, leaving
+    /// the routing blob, centroid section, and every other slow-state field
+    /// exactly as they are — the counterpart to [`with_slow_vector_state_ref`]
+    /// for the one field a drain must land in its membership commit. Does not
+    /// bump `manifest_id` (an overlay, like the other `CommitListMetadata`
+    /// stamps); the successor id is set by the surrounding commit.
+    pub(crate) fn with_slow_vector_state_graphs(&self, graphs: Option<RoutingRef>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.slow_vector_state_graphs = graphs;
             list
         });
         Self {
@@ -1530,7 +1610,7 @@ impl ManifestSnapshot {
                 Some(cache)
             }
             Err(error) => {
-                eprintln!(
+                warn!(
                     "[supertable] full-part centroid hydration unavailable ({error}); falling \
                      back to per-superfile centroid reads"
                 );
@@ -1875,16 +1955,26 @@ impl ManifestSnapshot {
                 .list
                 .as_ref()
                 .and_then(|l| l.deleted_user_ids_inline.clone()),
-            // Slow-CAS section is deliberately NOT carried into the
-            // successor: `update` is the membership-change path (its only
-            // production caller is the commit attempt), and a membership
-            // change invalidates the prior entry blob. The commit attempt
-            // restamps a fresh blob onto this successor via
+            // The routing blob + centroid section are deliberately NOT
+            // carried into the successor: `update` is the membership-change
+            // path, and a membership change invalidates them. The commit
+            // attempt restamps fresh ones via
             // [`Self::with_slow_vector_state_ref`] before the list/pointer
-            // CAS, so membership and the slow-state ref publish together.
+            // CAS, so membership and those refs publish together.
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            // The `hnsw` graph ref, by contrast, IS carried forward:
+            // the graph is a function of which stable doc ids exist, not how
+            // they are packed, so it survives a repack. The post-drain /
+            // post-compaction settle keys on the doc-id watermark to decide
+            // whether the carried graph still covers the population (reuse)
+            // or the rows changed (rebuild). Carrying it forward keeps it
+            // referenced (GC-live) and lets a packing-only settle reuse it.
+            slow_vector_state_graphs: self
+                .list
+                .as_ref()
+                .and_then(|l| l.slow_vector_state_graphs.clone()),
             parts: out_list_entries_after_removal,
         };
         let mut new_superfile_list = self
@@ -2103,6 +2193,19 @@ impl ManifestPartLoader {
         self.load_with_form(part_id, false).await
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.part_load",
+            skip_all,
+            fields(
+                part_id = ?part_id,
+                prefer_routing = prefer_routing,
+                cache_hit = tracing::field::Empty,
+                bytes = tracing::field::Empty
+            )
+        )
+    )]
     async fn load_with_form(
         &self,
         part_id: PartId,
@@ -2124,15 +2227,19 @@ impl ManifestPartLoader {
         if let Some(cache) = &self.manifest_disk_cache
             && let Some(bytes) = cache.get(expected_hash).await
         {
+            record("cache_hit", true);
+            record("bytes", bytes.len() as u64);
             let parsed = decode_part_off_thread(Bytes::from(bytes)).await?;
             return Ok(Arc::new(parsed));
         }
+        record("cache_hit", false);
 
         let (bytes, _) = self
             .storage
             .get(uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
+        record("bytes", bytes.len() as u64);
         // Hash verify runs inside the same blocking task as the decode:
         // blake3 over a multi-hundred-MiB part is CPU the polling task
         // must not absorb (it serializes the nominally-concurrent part
@@ -2202,8 +2309,12 @@ impl UserCentroidCache {
 /// task, so 18 nominally-concurrent part loads decoded one at a time.
 /// `spawn_blocking` keeps the runtime free to drive the remaining
 /// fetches while decodes run in parallel on the blocking pool.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "manifest.part_decode", skip_all, fields(bytes = bytes.len() as u64))
+)]
 async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLoadError> {
-    match spawn_blocking(move || part::decode(&bytes)).await {
+    match spawn_blocking(carry_span(move || part::decode(&bytes))).await {
         Ok(result) => Ok(result?),
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part decode task failed: {join_error}"),
@@ -2214,6 +2325,14 @@ async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLo
 /// [`decode_part_off_thread`] preceded by a blake3 content-hash check on
 /// the same blocking task, for the storage-GET path where the bytes are
 /// not yet verified.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "manifest.part_verify_decode",
+        skip_all,
+        fields(bytes = bytes.len() as u64)
+    )
+)]
 async fn verify_and_decode_part_off_thread(
     bytes: Bytes,
     expected_hash: ContentHash,
@@ -2228,7 +2347,7 @@ async fn verify_and_decode_part_off_thread(
         }
         part::decode(&bytes).map_err(ManifestLoadError::from)
     };
-    match spawn_blocking(verify_then_decode).await {
+    match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part verify/decode task failed: {join_error}"),
@@ -2290,6 +2409,16 @@ pub enum ManifestLoadError {
     /// cycles).
     #[error("slow vector-state hydration failed: {0}")]
     SlowStateHydration(String),
+}
+
+impl ManifestLoadError {
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            ManifestLoadError::Storage(e) => e.is_permission_denied(),
+            _ => false,
+        }
+    }
 }
 
 /// One superfile's metadata + skip-pruning summaries. The bytes that
@@ -2459,7 +2588,7 @@ impl SuperfileUri {
 
     /// Disk-cache tempfile while a cold fetch is in flight.
     pub fn cache_tmp_filename(self) -> String {
-        format!("seg-{}.sf.parquet.tmp", self.0)
+        format!("{}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
     /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk
@@ -2472,6 +2601,18 @@ impl SuperfileUri {
     pub fn from_cache_filename(name: &str) -> Option<Self> {
         let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
+    }
+
+    /// Inverse of [`Self::cache_tmp_filename`]: recover the URI from an in-flight tempfile's name.
+    /// A crash can leave one behind; the disk cache uses this to recognize and delete it.
+    pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
+        Self::from_cache_filename(name.strip_suffix(CACHE_TMP_EXTENSION)?)
+    }
+
+    /// Inverse of [`Self::storage_path`]. Fetches the superfile name from the path.
+    pub fn from_storage_path(key: &str) -> Option<Self> {
+        let name = key.strip_prefix(SUPERFILE_DATA_DIR)?.strip_prefix('/')?;
+        Self::from_cache_filename(name)
     }
 }
 
@@ -3876,6 +4017,37 @@ mod tests {
         assert!(mutated.transposed.get().is_some());
     }
 
+    /// `from_storage_path` recovers a URI from a superfile object key and only
+    /// from one: every other key shape a storage listing can yield (manifest
+    /// parts, tombstone sidecars, in-flight tmps, foreign files) falls through,
+    /// so GC can feed it every candidate it deletes.
+    #[test]
+    fn from_storage_path_parses_only_superfile_keys() {
+        let uri = SuperfileUri::new_v4();
+        assert_eq!(
+            SuperfileUri::from_storage_path(&uri.storage_path()),
+            Some(uri),
+            "round-trips its own storage_path"
+        );
+
+        for key in [
+            "manifests/manifest-42.json",
+            "manifest-parts/ab12cd.part",
+            "superfiles/seg-not-a-uuid.tombstones",
+            &format!("superfiles/seg-{}.tombstones", uri.0), // valid uuid, sidecar dir
+            &format!("data/seg-{}.sf.parquet.tmp", uri.0),
+            &format!("seg-{}.sf.parquet", uri.0), // missing data/ prefix
+            "data/seg-not-a-uuid.sf.parquet",
+            "",
+        ] {
+            assert_eq!(
+                SuperfileUri::from_storage_path(key),
+                None,
+                "must not parse: {key}"
+            );
+        }
+    }
+
     /// The 1-bit admit estimate must prefer the instance holding the
     /// query's true nearest centroid on separated fixtures, for every
     /// metric — the property the exact-rescore cell shortlist rides on.
@@ -4053,18 +4225,10 @@ mod tests {
     }
 
     fn opts() -> Arc<SupertableOptions> {
-        let tk = default_tokenizer();
+        let _tk = default_tokenizer();
         Arc::new(
-            SupertableOptions::new(
-                schema(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
-                vec![],
-                Some(tk),
-            )
-            .expect("valid options"),
+            SupertableOptions::new(schema(), vec![FtsConfig::new("title")], vec![])
+                .expect("valid options"),
         )
     }
 
@@ -4431,6 +4595,7 @@ mod tests {
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
+                slow_vector_state_graphs: None,
                 parts: entries,
             }
         }
@@ -4441,7 +4606,7 @@ mod tests {
                 DataType::LargeUtf8,
                 false,
             )]));
-            Arc::new(SupertableOptions::new(s, vec![], vec![], None).expect("opts"))
+            Arc::new(SupertableOptions::new(s, vec![], vec![]).expect("opts"))
         }
 
         fn build_manifest_with_loader(
@@ -4736,6 +4901,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -4884,7 +5050,7 @@ mod tests {
     }
 
     fn make_opts() -> Arc<SupertableOptions> {
-        SupertableOptions::new(simple_schema(), vec![], vec![], None)
+        SupertableOptions::new(simple_schema(), vec![], vec![])
             .map(Arc::new)
             .expect("valid options")
     }
@@ -4913,6 +5079,7 @@ mod tests {
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
+                slow_vector_state_graphs: None,
                 parts: vec![],
             }),
             parts: DashMap::new(),
@@ -4942,6 +5109,7 @@ mod tests {
             "slow-vector-state/state-x.bin".into(),
             hash,
             centroids.clone(),
+            None,
         );
         let (uri, got_hash) = stamped.slow_vector_state_blob().expect("ref stamped");
         assert_eq!(uri, "slow-vector-state/state-x.bin");
@@ -5047,6 +5215,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![part_entry(pa_id), part_entry(pb_id)],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -5121,6 +5290,7 @@ mod tests {
             slow_vector_state_uri: Some("slow-vector-state/state-abc.bin".into()),
             slow_vector_state_content_hash: Some(ContentHash([7u8; 32])),
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: Vec::new(),
         };
         // Storage must be attached: `new` only keeps the list (and builds
@@ -5246,6 +5416,7 @@ mod tests {
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -5370,7 +5541,7 @@ mod tests {
 
         let consumer_opts = |knob: bool| {
             Arc::new(
-                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                SupertableOptions::new(simple_schema(), vec![], vec![])
                     .expect("valid options")
                     .with_summary_centroids_from_superfiles(knob),
             )
@@ -5455,6 +5626,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: part.part_id,
                 uri: part_uri(&full_hash),
@@ -5498,7 +5670,7 @@ mod tests {
     async fn consumer_mode_hydrates_parts_from_routing_sibling() {
         let consumer_opts = |knob: bool| {
             Arc::new(
-                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                SupertableOptions::new(simple_schema(), vec![], vec![])
                     .expect("valid options")
                     .with_summary_centroids_from_superfiles(knob),
             )
@@ -5714,6 +5886,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -5792,7 +5965,7 @@ mod tests {
         // a loader — the second (removal) phase loads carried-over parts
         // (part_0, part_1) back from storage.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = TARGET_SUPERFILES_PER_PART;
         let opts = Arc::new(base_opts.with_storage(storage.clone()));
 
@@ -5866,6 +6039,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 entry_for(&pw_a_old),
                 entry_for(&pw_a_latest),
@@ -6037,7 +6211,7 @@ mod tests {
     #[tokio::test]
     async fn update_rewrite_partition_within_target() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -6076,6 +6250,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6139,7 +6314,7 @@ mod tests {
     #[tokio::test]
     async fn update_split_partition_exceeds_target() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -6178,6 +6353,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6265,7 +6441,7 @@ mod tests {
     #[tokio::test]
     async fn update_split_partition_exceeds_size_threshold() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 10_000;
         // Any real encoded part is bigger than 1 byte, so the latest part is
         // always considered at-cap.
@@ -6307,6 +6483,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
@@ -6376,7 +6553,7 @@ mod tests {
     #[tokio::test]
     async fn update_older_entry_preserved_when_latest_rewritten() {
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -6426,6 +6603,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_old.part_id,
@@ -6514,7 +6692,7 @@ mod tests {
         // the LAST existing part (the latest); the earlier part carries over
         // unchanged. Each superfile keeps its own partition_hint/partition_key.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -6561,6 +6739,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -6659,7 +6838,7 @@ mod tests {
         // the earlier part carries over with the exact URI and content_hash that
         // were written — no re-encode, no PUT.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -6706,6 +6885,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -6795,7 +6975,7 @@ mod tests {
         // entries. p0..p2 carry over unchanged. Each superfile keeps its own
         // partition_hint.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -6865,6 +7045,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -7000,7 +7181,7 @@ mod tests {
         // Under the default single-bucket Hash strategy the commit-time
         // partition_key stamped on every entry is bucket 0, regardless of hint.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 8;
         let opts = Arc::new(base_opts);
 
@@ -7086,6 +7267,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7146,7 +7328,7 @@ mod tests {
         // in the same partition. The resulting part should contain the
         // surviving existing superfile plus the new one — not the removed one.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
         let opts = Arc::new(base_opts);
 
@@ -7185,6 +7367,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7300,6 +7483,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -7388,7 +7572,7 @@ mod tests {
         // part_a_latest matches and is rewritten with only its surviving
         // superfile.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -7438,6 +7622,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -7573,6 +7758,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7662,6 +7848,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7720,7 +7907,7 @@ mod tests {
         // removed superfile; part_a_latest holds no matching id and carries over
         // unchanged. sf_a_old_keep and sf_a_latest survive.
         let mut base_opts =
-            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
         let opts = Arc::new(base_opts);
 
@@ -7770,6 +7957,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -7901,6 +8089,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts,
         }
     }

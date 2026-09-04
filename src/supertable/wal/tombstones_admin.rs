@@ -15,7 +15,7 @@
 //!   include in the merged target.
 //!
 //! The seal is monotonic by construction: once `seal.is_some()`,
-//! [`super::pipeline::cas_tombstone_bit`] (the writer's CAS
+//! [`super::pipeline::cas_tombstone_bits`] (the writer's CAS
 //! loop) detects it on the next GET and returns `Sealed` to its
 //! caller, which then re-resolves against the manifest.
 //! Compaction completes by publishing the merged superfile +

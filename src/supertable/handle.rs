@@ -27,7 +27,7 @@ use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use tokio::runtime::Runtime;
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, warn};
 
 use super::{
     error::{BuildError, CommitError, OpenError},
@@ -38,6 +38,8 @@ use super::{
     },
     options::SupertableOptions,
 };
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     config,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
@@ -65,6 +67,7 @@ use crate::{
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
     },
+    utils::trace::{TableRole, record},
 };
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
@@ -81,6 +84,14 @@ pub struct Supertable {
 /// commit and to manipulate `writer_outstanding` for the
 /// single-writer slot enforcement.
 pub(super) struct SupertableInner {
+    /// Which of the two tables this handle drives — the user's own rows,
+    /// or the derived vector index. Both run the same code, so without
+    /// this the two are indistinguishable in a trace. Recorded as the
+    /// `role` field on the spans this handle roots. Immutable for the
+    /// handle's lifetime. Only read by the span sites, which are behind
+    /// `detailed-tracing`.
+    #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
+    pub(super) role: TableRole,
     /// Schema, FTS columns, vector columns, tokenizer, thread
     /// pools, superfile store, commit threshold. Immutable for
     /// the supertable's lifetime; shared via Arc so readers,
@@ -266,6 +277,18 @@ impl SupertableInner {
     /// Lives on the inner because the deferred storage reclaim holds only an `Arc<SupertableInner>`
     /// and still has to resolve the committed manifest when it fires.
     /// [`Supertable::refresh`] is the handle-level spelling of the same call.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.refresh",
+            skip_all,
+            fields(
+                role = self.role.as_str(),
+                outcome = tracing::field::Empty,
+                manifest_id = tracing::field::Empty
+            )
+        )
+    )]
     pub(super) async fn refresh(&self) -> Result<bool, ManifestLoadError> {
         let storage = self
             .options
@@ -292,10 +315,15 @@ impl SupertableInner {
             // already has a pointer by then, since `open` fails with `PointerNotFound` without one
             // and `create` publishes an empty manifest first.
             PointerProbe::Absent => {
+                record("outcome", "pointer_vanished");
                 let _ = self.pointer_vanished.set(());
                 return Err(ManifestLoadError::PointerVanished);
             }
-            PointerProbe::NotModified => return Ok(false),
+            // The steady state: one conditional roundtrip, no body, no parse.
+            PointerProbe::NotModified => {
+                record("outcome", "not_modified");
+                return Ok(false);
+            }
             PointerProbe::Read(pointer, meta) => (pointer, meta),
         };
 
@@ -319,6 +347,7 @@ impl SupertableInner {
             // this process's own commit leaves behind. Nothing newer to load, so record the etag
             // and let the next probe be a cheap 304.
             Err(ManifestLoadError::AlreadyLoaded) => {
+                record("outcome", "already_loaded");
                 *self
                     .last_pointer_etag
                     .lock()
@@ -339,10 +368,10 @@ impl SupertableInner {
             .lock()
             .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
 
-        debug!(
-            manifest_id = self.manifest.load().manifest_id,
-            "refreshed manifest"
-        );
+        let manifest_id = self.manifest.load().manifest_id;
+        record("outcome", "advanced");
+        record("manifest_id", manifest_id);
+        debug!(manifest_id, "refreshed manifest");
 
         Ok(true)
     }
@@ -462,7 +491,14 @@ impl Supertable {
                         .await
                     {
                         Ok(hidden_manifest) => {
-                            match open_table_async(hidden_arc, hidden_manifest, None).await {
+                            match open_table_async(
+                                hidden_arc,
+                                hidden_manifest,
+                                None,
+                                TableRole::VectorIndex,
+                            )
+                            .await
+                            {
                                 Ok(t) => (Some(Arc::new(t)), None),
                                 Err(e) => {
                                     warn!(
@@ -485,16 +521,19 @@ impl Supertable {
                 // correct — queries fall back to the user fan until a writer
                 // handle materializes the index.
                 Ok(None) if options_arc.summary_centroids_from_superfiles => (None, None),
-                Ok(None) => match create_table_async(hidden_opts, None, None).await {
-                    Ok(table) => (Some(Arc::new(table)), None),
-                    Err(e) => {
-                        // Surface a genuine bootstrap failure as Broken (carry the
-                        // error) rather than Absent, matching the sibling arms —
-                        // otherwise a storage fault silently degrades to full scan.
-                        warn!("supertable: hidden vector-index bootstrap-create failed: {e}");
-                        (None, Some(e.to_string()))
+                Ok(None) => {
+                    match create_table_async(hidden_opts, None, None, TableRole::VectorIndex).await
+                    {
+                        Ok(table) => (Some(Arc::new(table)), None),
+                        Err(e) => {
+                            // Surface a genuine bootstrap failure as Broken (carry the
+                            // error) rather than Absent, matching the sibling arms —
+                            // otherwise a storage fault silently degrades to full scan.
+                            warn!("supertable: hidden vector-index bootstrap-create failed: {e}");
+                            (None, Some(e.to_string()))
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     warn!("supertable: hidden vector-index pointer unreadable: {e}");
                     (None, Some(e.to_string()))
@@ -503,7 +542,8 @@ impl Supertable {
         } else {
             (None, None)
         };
-        let handle = open_table_async(options_arc, manifest, vector_index_table).await?;
+        let handle =
+            open_table_async(options_arc, manifest, vector_index_table, TableRole::User).await?;
         if let Some(err) = hidden_index_broken {
             let _ = handle.inner.hidden_index_open_error.set(err);
         }
@@ -543,7 +583,13 @@ impl Supertable {
                 build_vector_index_options(&options, None, Some(prefix.as_str()))
             {
                 Some(Arc::new(
-                    create_table_async(hidden_opts, None, Some(prefix.clone())).await?,
+                    create_table_async(
+                        hidden_opts,
+                        None,
+                        Some(prefix.clone()),
+                        TableRole::VectorIndex,
+                    )
+                    .await?,
                 ))
             } else {
                 None
@@ -551,7 +597,13 @@ impl Supertable {
         } else {
             None
         };
-        create_table_async(options, vector_index_table, vector_index_storage_prefix).await
+        create_table_async(
+            options,
+            vector_index_table,
+            vector_index_storage_prefix,
+            TableRole::User,
+        )
+        .await
     }
 
     /// Re-read the manifest pointer from storage and advance this supertable to whatever it names.
@@ -632,6 +684,12 @@ impl Supertable {
             inner: Arc::clone(&self.inner),
             op_stats,
         }
+    }
+
+    /// Which table this handle drives, for the `role` span field.
+    #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
+    pub(crate) fn role(&self) -> TableRole {
+        self.inner.role
     }
 
     test_visible! {
@@ -1076,6 +1134,10 @@ impl Supertable {
     /// `Supertable::open`/`create` and again on every `optimize()` call.
     /// Not public API: exposed only as a manual hook for in-crate tests
     /// that need custom grace windows via `wal::gc::run_sweep` directly.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "wal_gc", skip_all, fields(role = self.role().as_str()))
+    )]
     pub(crate) async fn run_gc_sweep_once(&self) -> Result<gc::GcReport, gc::GcError> {
         gc::run_sweep(
             self,
@@ -1185,7 +1247,7 @@ impl Supertable {
                             true,
                         )
                         .await
-                    })
+                    }.in_current_span())
                 })
                 .collect();
             for h in handles {
@@ -1536,13 +1598,8 @@ fn build_vector_index_options(
             ..vc.clone()
         })
         .collect();
-    let mut hidden_opts = SupertableOptions::new(
-        hidden_schema,
-        vec![],
-        hidden_vector_columns,
-        user_opts.tokenizer.clone(),
-    )
-    .ok()?;
+    let mut hidden_opts =
+        SupertableOptions::new(hidden_schema, vec![], hidden_vector_columns).ok()?;
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
         .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
@@ -1580,16 +1637,25 @@ fn build_vector_index_options(
 }
 
 /// Build one supertable handle. Leaf — never creates a hidden sibling.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        skip_all,
+        fields(role = role.as_str(), origin = OpOrigin::Open.as_str())
+    )
+)]
 async fn build_handle(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let tombstone_cache = build_tombstone_cache(&options, &manifest);
     let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
     let handle_id = crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
     let inner = Arc::new(SupertableInner {
         options,
+        role,
         manifest: ArcSwap::new(manifest),
         writer_outstanding: AtomicBool::new(false),
         compaction_outstanding: AtomicBool::new(false),
@@ -1627,6 +1693,7 @@ async fn create_table_async(
     options: SupertableOptions,
     vector_index_table: Option<Arc<Supertable>>,
     vector_index_storage_prefix: Option<String>,
+    role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let options = Arc::new(options);
     // A durable create *persists* the initial empty manifest — its list plus
@@ -1671,7 +1738,7 @@ async fn create_table_async(
             vector_index_table,
         )
     };
-    build_handle(options, manifest, vector_index_table).await
+    build_handle(options, manifest, vector_index_table, role).await
 }
 
 /// After a lost create-race, open (or bootstrap) the hidden vector-index
@@ -1695,7 +1762,7 @@ async fn reconcile_vector_index_table_to_manifest(
             let hidden_manifest =
                 ManifestSnapshot::load(None, hidden_storage, Some(hidden_arc.clone())).await?;
             Ok(Some(Arc::new(
-                open_table_async(hidden_arc, hidden_manifest, None).await?,
+                open_table_async(hidden_arc, hidden_manifest, None, TableRole::VectorIndex).await?,
             )))
         }
         Ok(None) => {
@@ -1724,7 +1791,7 @@ async fn reconcile_vector_index_table_to_manifest(
                 ))
             };
             Ok(Some(Arc::new(
-                build_handle(hidden_arc, manifest, None).await?,
+                build_handle(hidden_arc, manifest, None, TableRole::VectorIndex).await?,
             )))
         }
         Err(e) => Err(OpenError::Storage(StorageError::Permanent {
@@ -1739,8 +1806,9 @@ async fn open_table_async(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    role: TableRole,
 ) -> Result<Supertable, OpenError> {
-    build_handle(options, manifest, vector_index_table).await
+    build_handle(options, manifest, vector_index_table, role).await
 }
 
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
@@ -1885,6 +1953,12 @@ impl SupertableReader {
         self.manifest.manifest_id
     }
 
+    /// Which table this reader queries, for the `role` span field.
+    #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
+    pub(crate) fn role(&self) -> TableRole {
+        self.inner.role
+    }
+
     /// Sync→async bridge for this reader's public query surface.
     /// Reuses an ambient `multi_thread` runtime via `block_in_place`
     /// when present, otherwise drives on the supertable's lazily-built
@@ -1932,9 +2006,10 @@ impl SupertableReader {
     /// The shared `Arc<SupertableInner>` backing this reader. Used to
     /// build a [`WeakReader`] that retains the snapshot without an
     /// owning cycle through a cached `SessionContext`. Module-private:
-    /// `SupertableInner` is module-private, and the only caller is
-    /// [`WeakReader::from_reader`] in this file.
-    fn inner_arc(&self) -> &Arc<SupertableInner> {
+    /// `SupertableInner` is module-private; callers are
+    /// [`WeakReader::from_reader`] in this file and the query module's
+    /// resident-index cache lookup.
+    pub(super) fn inner_arc(&self) -> &Arc<SupertableInner> {
         &self.inner
     }
 
@@ -2115,17 +2190,9 @@ mod tests {
     }
 
     fn opts() -> SupertableOptions {
-        let tk = default_tokenizer();
-        SupertableOptions::new(
-            schema(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tk),
-        )
-        .expect("valid options")
+        let _tk = default_tokenizer();
+        SupertableOptions::new(schema(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
     }
 
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
@@ -2446,10 +2513,7 @@ mod tests {
         let make_options = || {
             SupertableOptions::new(
                 schema.clone(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
+                vec![FtsConfig::new("title")],
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
@@ -2458,7 +2522,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8FixedResidual,
                     provided_centroids: None,
                 }],
-                Some(crate::test_helpers::default_tokenizer()),
             )
             .expect("valid options")
             .with_storage(Arc::clone(&storage))
@@ -2682,7 +2745,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let base = SupertableOptions::new(schema, vec![], vec![], None).expect("options");
+        let base = SupertableOptions::new(schema, vec![], vec![]).expect("options");
         let overridden = base.with_vector_cell_counts(7, 9);
         assert_eq!(user_vector_cell_count(&overridden), 7);
         assert_eq!(hidden_vector_cell_count(&overridden), 9);
@@ -2739,10 +2802,7 @@ mod tests {
         let make_options = |from_superfiles: bool| {
             SupertableOptions::new(
                 schema.clone(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
+                vec![FtsConfig::new("title")],
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
@@ -2751,7 +2811,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8FixedResidual,
                     provided_centroids: None,
                 }],
-                Some(crate::test_helpers::default_tokenizer()),
             )
             .expect("valid options")
             .with_storage(Arc::clone(&storage))
@@ -2954,10 +3013,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -2966,7 +3022,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8FixedResidual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -3056,10 +3111,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -3068,7 +3120,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -3160,10 +3211,7 @@ mod tests {
         // that routes the drain through materialized_ivf_rows_in_doc_order.
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -3172,7 +3220,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(Arc::clone(&storage))
@@ -3214,6 +3261,110 @@ mod tests {
         assert!(
             max_per_cell > 0 && max_per_cell <= total,
             "max-per-cell {max_per_cell} in 1..={total}",
+        );
+    }
+
+    /// A top-k vector query blended between two axis clusters must return all
+    /// `k` results once the drain has split those axes into separate hidden
+    /// cells. Under default routing (no caller nprobe) the coarse cell cutoff
+    /// widened only by score-slack — probing the single nearest cell and
+    /// returning `k/2`; it must instead probe enough cells to fill `k`.
+    #[test]
+    fn blended_vector_search_fills_topk_across_hidden_cells() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            reader::VectorSearchOptions,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        const DIM: usize = 16;
+        const AXES: usize = 5;
+        const ROWS: usize = 60; // AXES clusters, ROWS / AXES = 12 rows each
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+
+        // Row i is a one-hot vector on axis `i % AXES`, so the drain lands each
+        // axis in its own hidden cell.
+        let titles = LargeStringArray::from((0..ROWS).map(|i| format!("r{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; ROWS * DIM];
+        for i in 0..ROWS {
+            flat[i * DIM + (i % AXES)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+
+        let st = Supertable::create(options).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        // Query blended between axis 0 (weight 1.0) and axis 1 (weight 0.5): the
+        // top `k` spans both axes' rows, which the drain split across two cells.
+        let k = 2 * (ROWS / AXES); // 24
+        let mut q = vec![0.0f32; DIM];
+        q[0] = 1.0;
+        q[1] = 0.5;
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("vector search");
+        assert_eq!(
+            hits.len(),
+            k,
+            "blended top-k must span both hidden cells, got {}",
+            hits.len()
         );
     }
 
@@ -3261,10 +3412,7 @@ mod tests {
 
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -3273,7 +3421,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8FixedResidual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(Arc::clone(&storage))
@@ -3385,7 +3532,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                None,
             )
             .expect("valid options")
             .with_storage(Arc::clone(&storage))
@@ -3508,7 +3654,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                None,
             )
             .expect("valid options")
             .with_storage(Arc::clone(&storage))
@@ -3621,10 +3766,7 @@ mod tests {
         let make_options = || {
             SupertableOptions::new(
                 schema.clone(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
+                vec![FtsConfig::new("title")],
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
@@ -3633,7 +3775,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                Some(crate::test_helpers::default_tokenizer()),
             )
             .expect("valid options")
             .with_storage(Arc::clone(&storage))
@@ -3822,7 +3963,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                None,
             )
             .expect("valid options")
             .with_storage(Arc::clone(&storage))
@@ -3996,22 +4136,10 @@ mod tests {
             SupertableOptions::new(
                 schema.clone(),
                 vec![
-                    FtsConfig {
-                        column: "title".into(),
-                        positions: false,
-                    },
-                    FtsConfig {
-                        column: "bucket".into(),
-                        positions: false,
-                    },
-                    FtsConfig {
-                        column: "key".into(),
-                        positions: false,
-                    },
-                    FtsConfig {
-                        column: "category".into(),
-                        positions: false,
-                    },
+                    FtsConfig::new("title"),
+                    FtsConfig::new("bucket"),
+                    FtsConfig::new("key"),
+                    FtsConfig::new("category"),
                 ],
                 vec![VectorConfig {
                     column: "emb".into(),
@@ -4021,7 +4149,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                Some(default_tokenizer()),
             )
             .expect("valid options")
             .with_storage(Arc::clone(&storage))
@@ -4161,10 +4288,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -4173,7 +4297,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -4255,10 +4378,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -4267,7 +4387,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -4347,10 +4466,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -4359,7 +4475,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -4519,10 +4634,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -4531,7 +4643,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -4720,10 +4831,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -4732,7 +4840,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(Arc::clone(&storage))
@@ -5002,10 +5109,7 @@ mod tests {
         let storage: Arc<dyn StorageProvider> = Arc::clone(&failing) as Arc<dyn StorageProvider>;
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -5014,7 +5118,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -5161,10 +5264,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -5173,7 +5273,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -5264,10 +5363,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -5276,7 +5372,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -5381,10 +5476,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -5393,7 +5485,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -5548,10 +5639,7 @@ mod tests {
                 Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
             SupertableOptions::new(
                 schema.clone(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
+                vec![FtsConfig::new("title")],
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
@@ -5560,7 +5648,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                Some(crate::test_helpers::default_tokenizer()),
             )
             .expect("valid options")
             .with_storage(storage)
@@ -5719,10 +5806,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -5731,7 +5815,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(Arc::clone(&storage))
@@ -5832,6 +5915,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         // The hidden table's own scoped provider — its pointer file, not the
@@ -5944,10 +6028,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -5956,7 +6037,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(Arc::clone(&storage))
@@ -6034,6 +6114,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6109,6 +6190,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let zero_manifest = hidden
             .block_on_query(persist_commit_async(
@@ -6134,6 +6216,49 @@ mod tests {
             !stamped,
             "an all-zero width law must not trigger calibration"
         );
+    }
+
+    /// The derived vector-index table runs the same code as the user table,
+    /// so its spans are only distinguishable by the `role` tag threaded
+    /// through handle construction. Assert the two handles disagree — a
+    /// regression here silently merges both tables into one trace.
+    #[test]
+    fn hidden_vector_index_handle_carries_the_vector_index_role() {
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(item_field, dim as i32),
+            false,
+        )]));
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema,
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_storage(storage);
+
+        let st = Supertable::create(options).expect("create");
+        assert_eq!(st.role(), TableRole::User);
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("a vector column means a hidden index handle")
+            .clone();
+        assert_eq!(hidden.role(), TableRole::VectorIndex);
     }
 
     /// The cleared-law repair, end to end through the PUBLIC `optimize()`:
@@ -6183,10 +6308,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -6195,7 +6317,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(Arc::clone(&storage))
@@ -6270,6 +6391,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6371,10 +6493,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -6383,7 +6502,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -6551,10 +6669,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim: DIM,
@@ -6563,7 +6678,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -6680,10 +6794,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -6692,7 +6803,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -6807,10 +6917,7 @@ mod tests {
                 Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
             let options = SupertableOptions::new(
                 schema.clone(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
+                vec![FtsConfig::new("title")],
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
@@ -6819,7 +6926,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                Some(crate::test_helpers::default_tokenizer()),
             )
             .expect("valid options")
             .with_storage(storage)
@@ -6934,10 +7040,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let mut options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -6946,7 +7049,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -7073,10 +7175,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -7085,7 +7184,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -7205,10 +7303,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -7217,7 +7312,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -7333,10 +7427,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -7345,7 +7436,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -7455,10 +7545,7 @@ mod tests {
                 Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
             SupertableOptions::new(
                 schema.clone(),
-                vec![FtsConfig {
-                    column: "title".into(),
-                    positions: false,
-                }],
+                vec![FtsConfig::new("title")],
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
@@ -7467,7 +7554,6 @@ mod tests {
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
-                Some(crate::test_helpers::default_tokenizer()),
             )
             .expect("valid options")
             .with_storage(storage)
@@ -7633,10 +7719,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -7645,7 +7728,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)
@@ -7772,10 +7854,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -7784,7 +7863,6 @@ mod tests {
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
-            Some(crate::test_helpers::default_tokenizer()),
         )
         .expect("valid options")
         .with_storage(storage)

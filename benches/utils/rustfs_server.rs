@@ -49,6 +49,19 @@ const RUSTFS_REGION: &str = "us-east-1";
 pub const RUSTFS_BENCH_BUCKET: &str = "infino-bench";
 /// Milliseconds between health polls while RustFS starts.
 const HEALTH_POLL_INTERVAL_MS: u64 = 200;
+
+/// How long `CreateBucket` keeps retrying a 5xx before giving up.
+///
+/// `/health` going green means the socket is serving, not that the object
+/// layer finished initializing — rustfs answers `503 Service not ready`
+/// in that window. Under load (a 10M-doc corpus generation immediately
+/// before the spawn) the gap is wide enough that the first bucket create
+/// lands inside it and the whole bench cell is skipped for what is a
+/// startup race, not a failure.
+const BUCKET_READY_TIMEOUT_SECS: u64 = 60;
+
+/// Backoff between `CreateBucket` retries while the object layer warms up.
+const BUCKET_READY_POLL_INTERVAL_MS: u64 = 250;
 /// Maximum time to wait for RustFS `/health` after spawn.
 const HEALTH_TIMEOUT_SECS: u64 = 60;
 /// Grace period after SIGKILL before a second kill attempt during teardown.
@@ -1298,24 +1311,45 @@ fn create_bucket(
         secret_key,
         region,
     })?;
-    let response = client
-        .put(&url)
-        .header("host", &host)
-        .header("x-amz-date", &amz_date)
-        .header("x-amz-content-sha256", &payload_hash)
-        .header("authorization", authorization)
-        .body(Vec::<u8>::new())
-        .send()
-        .map_err(|e| e.to_string())?;
-    let status = response.status();
-    if status.is_success() || status.as_u16() == 409 {
-        return Ok(());
+    // Retry through the post-health startup window: a 5xx here is rustfs
+    // still bringing its object layer up, not a real rejection. 4xx is a
+    // genuine error (bad auth, bad name) and fails immediately — except
+    // 409, which means the bucket already exists and is success for us.
+    let deadline = Instant::now() + Duration::from_secs(BUCKET_READY_TIMEOUT_SECS);
+    loop {
+        let sent = client
+            .put(&url)
+            .header("host", &host)
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("authorization", authorization.clone())
+            .body(Vec::<u8>::new())
+            .send();
+        let response = match sent {
+            Ok(response) => response,
+            // A transport error is the earlier half of the same startup
+            // race: before rustfs is ready enough to answer 503 it can
+            // refuse or reset the connection outright. Retry those on the
+            // same deadline, or the loop still gives up too early.
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(BUCKET_READY_POLL_INTERVAL_MS));
+                continue;
+            }
+            Err(e) => return Err(format!("CreateBucket failed for {bucket}: {e}")),
+        };
+        let status = response.status();
+        if status.is_success() || status.as_u16() == 409 {
+            return Ok(());
+        }
+        if !status.is_server_error() || Instant::now() >= deadline {
+            return Err(format!(
+                "CreateBucket failed for {bucket}: HTTP {} {:?}",
+                status,
+                response.text().ok()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(BUCKET_READY_POLL_INTERVAL_MS));
     }
-    Err(format!(
-        "CreateBucket failed for {bucket}: HTTP {} {:?}",
-        status,
-        response.text().ok()
-    ))
 }
 
 fn delete_bucket(

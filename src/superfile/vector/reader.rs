@@ -12,7 +12,7 @@
 //! eagerly at `open()`; per-query work happens on demand.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt,
     ops::Range,
     sync::{
@@ -358,6 +358,20 @@ pub struct VectorReader {
 }
 
 impl VectorReader {
+    /// The column at `idx`, or a typed error. Cell maps resolve to column
+    /// indices by construction, so a miss is inconsistent index state
+    /// rather than bad input — surfaced as an error, on the same
+    /// reasoning as the warmed survivor spans, so one query fails instead
+    /// of the process panicking on a slice index.
+    fn column_at(&self, idx: usize) -> Result<&ColumnReader, VectorError> {
+        self.columns.get(idx).ok_or_else(|| {
+            VectorError::InconsistentIndex(format!(
+                "cell resolved to column index {idx}, past the {} this superfile carries",
+                self.columns.len()
+            ))
+        })
+    }
+
     /// Test-only accessor: the per-doc dequantized-norm table this
     /// reader loaded from a column's `codec_meta` region (residual
     /// family or `Sq16`). Returns `None` for a codec that carries no
@@ -1847,6 +1861,15 @@ impl VectorReader {
         !self.cell_ids.is_empty()
     }
 
+    /// Whether this blob carries the named vector index column. Mirrors the
+    /// column gate in [`Self::materialized_index_rows_async`] /
+    /// [`Self::materialized_index_rows_excluding_async`] (both return `None`
+    /// when the column is absent), so a metadata-only row count can skip the
+    /// same superfiles the decode passes skip.
+    pub(crate) fn has_index_column(&self, name: &str) -> bool {
+        self.column_id_by_name.contains_key(name)
+    }
+
     /// Map a flat cluster id (manifest / query fan-out) to
     /// `(cell_column_index, local_cluster)` for multi-cell blobs.
     pub(crate) fn resolve_flat_cluster(&self, flat: u32) -> Option<(usize, u32)> {
@@ -1874,6 +1897,76 @@ impl VectorReader {
             }
         }
         Some((lo, flat - bases[lo]))
+    }
+
+    /// Emit the fp32 centroid VECTORS of every fine cluster in this superfile,
+    /// tagged with their per-superfile `flat` cluster ids, from the resident
+    /// centroid `section` (zero superfile opens). Feeds the in-memory centroid
+    /// router (an HNSW over the pooled fine centroids): building the graph from
+    /// these guarantees a graph node maps back to the same `flat` the stamped
+    /// per-cell read plan expects, so the downstream read is identical.
+    /// Cluster-major fp32-LE bytes, `n_cent × dim` per cell.
+    pub(crate) fn global_fine_cluster_vectors(
+        &self,
+        column: &str,
+        section: &crate::supertable::slow_vector_state::CentroidSection,
+        superfile_id: uuid::Uuid,
+    ) -> Result<Vec<(u32, Vec<f32>)>, VectorError> {
+        if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (ci, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 {
+                continue;
+            }
+            let cell_id = self.cell_ids.get(ci).copied();
+            let Some(bytes) = section
+                .read_cell_bytes(superfile_id, column, cell_id)
+                .map_err(|e| VectorError::LazySource(e.to_string()))?
+            else {
+                continue;
+            };
+            let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
+            let dim = col.dim;
+            let stride = dim * 4;
+            for local in 0..col.n_cent as usize {
+                let off = local * stride;
+                let Some(slab) = bytes.get(off..off + stride) else {
+                    break;
+                };
+                let vec: Vec<f32> = slab
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                out.push((base + local as u32, vec));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per-cell coalesced read plan for global-fine (`vector.global_fine_coalesce`):
+    /// given selected flat cluster ids, return every cluster in each touched
+    /// cell's `[min..max]` selected span. Clusters are stored in id order, so
+    /// a span is one CONTIGUOUS byte range that coalesces to a single GET
+    /// per cell — trading a bounded gap over-read (the unselected clusters
+    /// between the first and last selected) for far fewer, larger reads
+    /// instead of scattered per-cluster GETs. Multi-cell readers only.
+    pub(crate) fn coalesce_flats_to_cell_spans(&self, flats: &[u32]) -> Vec<u32> {
+        let mut span: HashMap<usize, (u32, u32)> = HashMap::new();
+        for &f in flats {
+            if let Some((cell, local)) = self.resolve_flat_cluster(f) {
+                let e = span.entry(cell).or_insert((local, local));
+                e.0 = e.0.min(local);
+                e.1 = e.1.max(local);
+            }
+        }
+        let mut out = Vec::new();
+        for (cell, (lo, hi)) in span {
+            let base = self.flat_cluster_base.get(cell).copied().unwrap_or(0);
+            out.extend((lo..=hi).map(|local| base + local));
+        }
+        out
     }
 
     pub fn n_docs(&self) -> u64 {
@@ -2740,6 +2833,51 @@ impl VectorReader {
         self.materialized_cell_rows_async_at(0).await
     }
 
+    /// Like [`Self::materialized_index_rows_async`], but drops the rows of any
+    /// cell whose global id is in `superseded` — the cells an in-place split
+    /// retired, whose rows survive under the split's successor cells. Ingesting
+    /// a retired parent alongside its live successor would put the same
+    /// `stable_id` into the graph twice.
+    ///
+    /// `local_doc_id` still counts file-local across EVERY cell (superseded
+    /// ones included), so a returned row indexes the stable-id vector that
+    /// [`crate::supertable::query::vector::stable_ids_by_local_for_routing`]
+    /// builds over the whole superfile. `None` exactly when
+    /// [`Self::materialized_index_rows_async`] returns `None` (column absent).
+    pub(crate) async fn materialized_index_rows_excluding_async(
+        &self,
+        index_name: &str,
+        superseded: Option<&BTreeSet<u32>>,
+    ) -> Option<Vec<MaterializedIvfRow>> {
+        // No exclusions ⇒ the plain path (also covers v1, whose synthetic cell
+        // id 0 does not correspond to a real split-retired cell).
+        if superseded.is_none_or(|s| s.is_empty()) {
+            return self.materialized_index_rows_async(index_name).await;
+        }
+        if !self.column_id_by_name.contains_key(index_name) {
+            return None;
+        }
+        if !self.is_multi_cell() {
+            return self.materialized_cell_rows_async_at(0).await;
+        }
+        let cells = self.materialized_cells_rows_async(None).await?;
+        let mut out = Vec::new();
+        let mut file_doc_base = 0u32;
+        for (cell_id, rows) in cells {
+            let n = rows.len() as u32;
+            if !superseded.is_some_and(|s| s.contains(&cell_id)) {
+                for mut row in rows {
+                    row.local_doc_id += file_doc_base;
+                    out.push(row);
+                }
+            }
+            // Advance across superseded cells too, so a kept row's file-local
+            // id keeps indexing the whole-superfile stable-id vector.
+            file_doc_base = file_doc_base.saturating_add(n);
+        }
+        Some(out)
+    }
+
     /// Decode every IVF row from `sub` (the full subsection bytes) using the
     /// column's per-cluster Sq8 `scale`/`offset`, carrying the inline stable
     /// `_id` when the subsection has the region. Pure/sync — fed pre-fetched
@@ -3147,8 +3285,11 @@ impl VectorReader {
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
         // 3. Rotate query once for the 1-bit code estimator.
-        let mut q_rot = vec![0f32; col.dim];
-        col.rot.apply(query, &mut q_rot);
+        let (q_rot, rot_ns) = timed_section(|| {
+            let mut q_rot = vec![0f32; col.dim];
+            col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
 
         // 4. Probe the centroid-scored clusters through the shared tail
         //    (also used by the externally-selected
@@ -3167,6 +3308,7 @@ impl VectorReader {
         let (hits, mut tally) = self
             .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await?;
+        tally.kernel_cpu_ns += rot_ns;
         // The centroid + cluster-index span above was one planned range.
         tally.ranges_requested += 1;
         Ok((hits, tally))
@@ -3223,8 +3365,11 @@ impl VectorReader {
             .range_async(idx_start..idx_end)
             .await
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        let mut q_rot = vec![0f32; col.dim];
-        col.rot.apply(query, &mut q_rot);
+        let (q_rot, rot_ns) = timed_section(|| {
+            let mut q_rot = vec![0f32; col.dim];
+            col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
         // No inverse-selectivity rerank inflation on the fan path: the
         // shortlist heap admits MATCHING rows only (the allow test runs
@@ -3249,6 +3394,7 @@ impl VectorReader {
         let (hits, mut tally) = self
             .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await?;
+        tally.kernel_cpu_ns += rot_ns;
         // The cluster-index fetch above was one planned range.
         tally.ranges_requested += 1;
         Ok((hits, tally))
@@ -3318,10 +3464,53 @@ impl VectorReader {
             return Ok((Vec::new(), ProbeTally::default()));
         }
 
-        let per_cell = self.resolve_cells_for_clusters(clusters);
+        // Mapping the selected flat clusters onto cells is a pass over the
+        // selection; at a wide sweep that is the whole probed set.
+        let (per_cell, resolve_ns) = timed_section(|| self.resolve_cells_for_clusters(clusters));
         if per_cell.is_empty() {
-            return Ok((Vec::new(), ProbeTally::default()));
+            // The resolve itself was real work; a zero-hit probe still
+            // reports the CPU it spent finding that out.
+            return Ok((
+                Vec::new(),
+                ProbeTally {
+                    kernel_cpu_ns: resolve_ns,
+                    ..ProbeTally::default()
+                },
+            ));
         }
+
+        // One rotation for every probed cell: it is seeded once per column,
+        // table-wide (that is what makes estimates comparable across cells),
+        // so recomputing it per cell — as this path used to — repeated the
+        // same O(dim^2) transform once per probed cell, unmetered. Hoisted
+        // and bracketed, mirroring the scan path's shared rotation.
+        // `per_cell` is non-empty (guarded above), so [0] is safe; the
+        // column indices it names are not — a corrupt cell map would index
+        // out of range and take the process with it. Validate the whole
+        // set here rather than just the first: the fan-out closure below
+        // indexes `self.columns` per cell and is a `filter_map`, so it has
+        // no way to report an error partway through the wave. Layout
+        // agreement is part of the same validation — sharing one rotated
+        // query across cells is only correct while every cell carries the
+        // column's dim and table-wide rotation seed, and a mismatch would
+        // otherwise score silently wrong rather than fail.
+        let first_col = self.column_at(per_cell[0].0)?;
+        for &(cell_idx, ..) in &per_cell {
+            let cell_col = self.column_at(cell_idx)?;
+            if cell_col.dim != first_col.dim || cell_col.rot_seed != first_col.rot_seed {
+                return Err(VectorError::InconsistentIndex(format!(
+                    "cell {cell_idx} disagrees with the column's layout \
+                     (dim {} seed {}, expected dim {} seed {})",
+                    cell_col.dim, cell_col.rot_seed, first_col.dim, first_col.rot_seed
+                )));
+            }
+        }
+        let (q_rot_shared, rot_ns) = timed_section(|| {
+            let mut q_rot = vec![0f32; first_col.dim];
+            first_col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
+        let q_rot_shared = &q_rot_shared;
 
         // Probe the selected cells CONCURRENTLY — the same wave shape the
         // supertable's cross-superfile fan-out (and FTS) already uses, one
@@ -3356,10 +3545,8 @@ impl VectorReader {
                     .range_async(idx_start..idx_end)
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                let mut q_rot = vec![0f32; col.dim];
-                col.rot.apply(query, &mut q_rot);
                 let ctx = ProbeCtx {
-                    q_rot: &q_rot,
+                    q_rot: q_rot_shared,
                     k,
                     rerank_mult,
                     allow: cell_allow,
@@ -3390,6 +3577,7 @@ impl VectorReader {
             .try_collect()
             .await?;
         let mut tally = ProbeTally::default();
+        tally.kernel_cpu_ns += rot_ns.saturating_add(resolve_ns);
         for (_, cell_tally) in &per_cell {
             tally.cells_scanned += cell_tally.cells_scanned;
             tally.candidates_scanned += cell_tally.candidates_scanned;
@@ -3397,12 +3585,18 @@ impl VectorReader {
             tally.rows_reranked += cell_tally.rows_reranked;
             tally.kernel_cpu_ns += cell_tally.kernel_cpu_ns;
         }
-        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
-        // Distance ascending (smaller = closer), matching every other vector
-        // search path. Descending here kept the farthest k hits and collapsed
-        // packed-shard recall to ~0.
-        merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        merged.truncate(k);
+        // The cross-cell merge is this query's CPU too.
+        let (merged, merge_ns) = timed_section(|| {
+            let mut merged: Vec<(u32, f32)> =
+                per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
+            // Distance ascending (smaller = closer), matching every other
+            // vector search path. Descending here kept the farthest k hits
+            // and collapsed packed-shard recall to ~0.
+            merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            merged.truncate(k);
+            merged
+        });
+        tally.kernel_cpu_ns += merge_ns;
         Ok((merged, tally))
     }
 
@@ -3494,15 +3688,33 @@ impl VectorReader {
         // REQUESTED column's seed (every cell of one column shares it),
         // not `columns[0]`'s — a multi-column file's first column can be
         // a different column with a different rotation.
-        outcome.rot_seed = self.columns[per_cell[0].0].rot_seed;
         // Rotate the query once per superfile: every cell of a column
         // shares the table-wide rotation seed (cross-cell estimate pooling
         // depends on it), so per-cell re-rotation is duplicate work — at a
         // ~60-cell width sweep the repeated 768x768 applies measured
         // ~1.3ms of wall per query.
-        let first_col = &self.columns[per_cell[0].0];
-        let mut q_rot_shared = vec![0f32; first_col.dim];
-        first_col.rot.apply(query, &mut q_rot_shared);
+        // Same reasoning as the multi-cell probe path: the scan closure
+        // below indexes `self.columns` for every cell and cannot return an
+        // error, so the whole resolved set — indices and layout agreement
+        // both — is validated up front.
+        let first_col = self.column_at(per_cell[0].0)?;
+        for &(cell_idx, ..) in &per_cell {
+            let cell_col = self.column_at(cell_idx)?;
+            if cell_col.dim != first_col.dim || cell_col.rot_seed != first_col.rot_seed {
+                return Err(VectorError::InconsistentIndex(format!(
+                    "cell {cell_idx} disagrees with the column's layout \
+                     (dim {} seed {}, expected dim {} seed {})",
+                    cell_col.dim, cell_col.rot_seed, first_col.dim, first_col.rot_seed
+                )));
+            }
+        }
+        outcome.rot_seed = first_col.rot_seed;
+        let (q_rot_shared, rot_ns) = timed_section(|| {
+            let mut q_rot = vec![0f32; first_col.dim];
+            first_col.rot.apply(query, &mut q_rot);
+            q_rot
+        });
+        outcome.kernel_cpu_ns += rot_ns;
         let q_rot_shared = &q_rot_shared;
         let cell_scans = per_cell.into_iter().filter_map(|(cell_idx, base, locals)| {
             let col = &self.columns[cell_idx];
@@ -3526,11 +3738,17 @@ impl VectorReader {
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?;
                 let cb = col.quant.code_bytes();
-                let (cluster_meta, prefix_ranges) = chosen_cluster_meta(col, &cluster_idx, &locals);
+                // Per-cell metadata assembly: a pass over this cell's chosen
+                // clusters, on the worker that probes it. Scales with probe
+                // width, so at a wide sweep it is paid once per cell.
+                let ((cluster_meta, prefix_ranges), meta_ns) =
+                    timed_section(|| chosen_cluster_meta(col, &cluster_idx, &locals));
                 if cluster_meta.is_empty() {
-                    // The cluster-index read itself was one planned range.
+                    // The cluster-index read itself was one planned range,
+                    // and the metadata walk was real CPU.
                     let tally = ProbeTally {
                         ranges_requested: 1,
+                        kernel_cpu_ns: meta_ns,
                         ..ProbeTally::default()
                     };
                     return Ok((Vec::new(), Vec::new(), tally));
@@ -3550,11 +3768,18 @@ impl VectorReader {
                     rows_reranked: 0,
                     kernel_cpu_ns: 0,
                 };
+                tally.kernel_cpu_ns += meta_ns;
                 // Warm fast path: every prefix resident -> defer rerank.
-                let prefix_blocks: Option<Vec<Bytes>> = prefix_ranges
-                    .iter()
-                    .map(|range| self.source.try_get_range_sync(range.clone()))
-                    .collect();
+                // The resident-range assembly is a real memcpy per cell
+                // (codes + doc-ids blocks), so it counts as this query's
+                // CPU like the scan it feeds.
+                let (prefix_blocks, fetch_ns) = timed_section(|| {
+                    prefix_ranges
+                        .iter()
+                        .map(|range| self.source.try_get_range_sync(range.clone()))
+                        .collect::<Option<Vec<Bytes>>>()
+                });
+                tally.kernel_cpu_ns += fetch_ns;
                 let rabitq_only = matches!(col.rerank_codec, RerankCodec::RabitqOnly);
                 if let (Some(blocks), false) = (prefix_blocks, rabitq_only) {
                     let ctx = ProbeCtx {
@@ -3567,9 +3792,20 @@ impl VectorReader {
                         budget,
                     };
                     let coarse_limit = k.saturating_mul(rerank_mult);
+                    // Timed like the immediate path's shortlist below: this
+                    // warm deferred scan is the read the width pin certifies
+                    // (whole-cell depth), which made it the dominant span of
+                    // `vec.fanout_wall` — ~9 of an 11 ms filtered query at
+                    // 9.4M — while carrying no phase label at all, so a
+                    // phase table showed ~2 ms of timed work inside a 10 ms
+                    // wall and read as a scheduling mystery.
+                    let shortlist_t0 = io_counters::phase_start();
                     let (shortlist, scan_kernel_ns) =
                         scan_shortlist(col, cb, &cluster_meta, &blocks, true, coarse_limit, &ctx)
                             .await?;
+                    if let Some(t0) = shortlist_t0 {
+                        io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
+                    }
                     tally.kernel_cpu_ns += scan_kernel_ns;
                     let cands = shortlist
                         .into_iter()
@@ -3747,26 +3983,60 @@ impl VectorReader {
                             .map(|bytes| (cid, (span.start, bytes)))
                     })
                     .collect();
-                let survivor_rows = match spans {
-                    Some(spans) => rerank_cands
-                        .iter()
-                        .zip(&ranges)
-                        .map(|(cand, range)| {
-                            let (base, region) = &spans[&cand.cluster_id];
-                            region.slice(range.start - base..range.end - base)
-                        })
-                        .collect(),
+                let (survivor_rows, gather_ns) = match spans {
+                    // Warm: slice survivors straight out of the spans
+                    // already in hand — a per-survivor pass, so bracketed.
+                    Some(spans) => {
+                        let (rows, ns) = timed_section(|| {
+                            rerank_cands
+                                .iter()
+                                .zip(&ranges)
+                                .map(|(cand, range)| {
+                                    let (base, region) =
+                                        spans.get(&cand.cluster_id).ok_or_else(|| {
+                                            VectorError::InconsistentIndex(format!(
+                                                "no warmed survivor span for cluster {}",
+                                                cand.cluster_id
+                                            ))
+                                        })?;
+                                    // Checked arithmetic for the same reason
+                                    // the lookup is checked: a stale span
+                                    // base underflows the subtraction and a
+                                    // short region fails the slice — both
+                                    // are index inconsistency, not a reason
+                                    // to abort the process.
+                                    let (start, end) = range
+                                        .start
+                                        .checked_sub(*base)
+                                        .zip(range.end.checked_sub(*base))
+                                        .filter(|&(s, e)| s <= e && e <= region.len())
+                                        .ok_or_else(|| {
+                                            VectorError::InconsistentIndex(format!(
+                                                "survivor range {:?} falls outside cluster {}'s \
+                                                 warmed span (base {base}, len {})",
+                                                range,
+                                                cand.cluster_id,
+                                                region.len()
+                                            ))
+                                        })?;
+                                    Ok(region.slice(start..end))
+                                })
+                                .collect::<Result<Vec<_>, VectorError>>()
+                        });
+                        (rows?, ns)
+                    }
                     None => get_survivor_ranges_coalesced_async(&self.source, &ranges)
                         .await
                         .map_err(|e| VectorError::LazySource(e.to_string()))?,
                 };
+
                 if let Some(t0) = survivor_t0 {
                     io_counters::phase_record(
                         "vec.survivor_fetch",
                         t0.elapsed().as_micros() as u64,
                     );
                 }
-                io_counters::phase_timed_async("vec.rerank", async {
+                let (hits, rerank_ns) = io_counters::phase_timed_async("vec.rerank", async {
                     rerank_candidates_from_blocks(
                         &self.source,
                         meta_bytes.as_ref(),
@@ -3780,7 +4050,11 @@ impl VectorReader {
                     )
                     .await
                 })
-                .await
+                .await?;
+                Ok::<(Vec<(u32, f32)>, u64), VectorError>((
+                    hits,
+                    rerank_ns.saturating_add(gather_ns),
+                ))
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
@@ -3789,10 +4063,14 @@ impl VectorReader {
             .try_collect()
             .await?;
         let kernel_ns: u64 = per_cell.iter().map(|(_, ns)| ns).sum();
-        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
-        merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        merged.truncate(k);
-        Ok((merged, kernel_ns))
+        let (merged, merge_ns) = timed_section(|| {
+            let mut merged: Vec<(u32, f32)> =
+                per_cell.into_iter().flat_map(|(hits, _)| hits).collect();
+            merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            merged.truncate(k);
+            merged
+        });
+        Ok((merged, kernel_ns.saturating_add(merge_ns)))
     }
 
     /// Shared async tail of the IVF probe: given a chosen set of cluster
@@ -3813,9 +4091,17 @@ impl VectorReader {
         chosen: &[usize],
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         let cb = col.quant.code_bytes();
-        let (cluster_meta, cluster_prefix_ranges) = chosen_cluster_meta(col, cluster_idx, chosen);
+        let ((cluster_meta, cluster_prefix_ranges), meta_ns) =
+            timed_section(|| chosen_cluster_meta(col, cluster_idx, chosen));
         if cluster_meta.is_empty() {
-            return Ok((Vec::new(), ProbeTally::default()));
+            // The metadata walk was real work; keep its CPU on the tally.
+            return Ok((
+                Vec::new(),
+                ProbeTally {
+                    kernel_cpu_ns: meta_ns,
+                    ..ProbeTally::default()
+                },
+            ));
         }
         // Plan tallies, fixed before the warm/cold fetch branch: both arms
         // scan the same clusters and request one prefix/block range each
@@ -3832,6 +4118,7 @@ impl VectorReader {
             rows_reranked: 0,
             kernel_cpu_ns: 0,
         };
+        tally.kernel_cpu_ns += meta_ns;
         // Warm fast path: every prefix already resident → sync zero-copy.
         let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
             .iter()
@@ -3954,11 +4241,13 @@ impl VectorReader {
         // runtime; warm ranges resolve sync/zero-copy with no await.
         let survivor_t0 = io_counters::phase_start();
         let survivor_full_rows = match survivor_full_ranges {
-            Some(ranges) => Some(
-                get_survivor_ranges_coalesced_async(&self.source, &ranges)
+            Some(ranges) => {
+                let (rows, gather_ns) = get_survivor_ranges_coalesced_async(&self.source, &ranges)
                     .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
-            ),
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                tally.kernel_cpu_ns += gather_ns;
+                Some(rows)
+            }
             None => None,
         };
         if let Some(t0) = survivor_t0 {
@@ -4613,6 +4902,24 @@ pub struct ProbeTally {
     pub kernel_cpu_ns: u64,
 }
 
+impl ScanOutcome {
+    /// The scan's five work tallies in the shared carrier, so every
+    /// supertable fold site prices the same field set through one
+    /// function. A new `ProbeTally` field is a compile error here (this
+    /// literal is exhaustive) and at the fold's destructure; a new
+    /// `ScanOutcome`-side tally still has to be threaded through this one
+    /// mapping, which is the single place to look.
+    pub(crate) fn work(&self) -> ProbeTally {
+        ProbeTally {
+            cells_scanned: self.cells_scanned,
+            candidates_scanned: self.candidates_scanned,
+            ranges_requested: self.ranges_requested,
+            rows_reranked: self.rows_reranked,
+            kernel_cpu_ns: self.kernel_cpu_ns,
+        }
+    }
+}
+
 /// Result of a deferred-rerank scan over one superfile
 /// ([`VectorReader::search_clusters_scan_async`]).
 pub(crate) struct ScanOutcome {
@@ -4697,15 +5004,16 @@ async fn build_shortlist(
         // deterministically here exactly as it does on the multi-cell
         // merge path — otherwise the two paths diverge on top-k for a
         // corrupt/degenerate score.
-        shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let (done, sort_ns) = timed_section(|| {
+            shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            shortlist
+                .into_iter()
+                .map(|(did, est, _pos, _c)| (did, -est))
+                .collect::<Vec<_>>()
+        });
         return Ok((
-            ShortlistOutcome::Done(
-                shortlist
-                    .into_iter()
-                    .map(|(did, est, _pos, _c)| (did, -est))
-                    .collect(),
-            ),
-            scan_kernel_ns,
+            ShortlistOutcome::Done(done),
+            scan_kernel_ns.saturating_add(sort_ns),
         ));
     }
 
@@ -4714,44 +5022,82 @@ async fn build_shortlist(
     // Each block's `full_chunk` follows its `[codes][doc_ids]` prefix;
     // the candidate at cluster-order position `pos` lives at in-block
     // offset `cnt*cb + cnt*4 + local*stride`.
-    let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
-    for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
-        block_by_cid.insert(c as u32, bi);
-    }
     let stride = full_vec_bytes;
-    let mut candidates = Vec::with_capacity(shortlist.len());
-    let mut survivor_full_ranges = if survivor_only_rerank_fetch {
-        Some(Vec::with_capacity(shortlist.len()))
-    } else {
-        None
-    };
-    for &(did, _, pos, cluster_id) in &shortlist {
-        let bi = block_by_cid[&cluster_id];
-        let (_, off, cnt) = cluster_meta[bi];
-        let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
-        let local = (pos - off) as usize;
-        let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
-            let idx = ranges.len();
-            ranges.push(col.cluster_rerank_row_range(off, cnt, local));
-            Some(idx)
+    // One index build + one pass over every survivor, per probed cell. At
+    // a wide sweep that is the cell count times the shortlist width, all of
+    // it this query's CPU.
+    type ShortlistRefs = (Vec<RerankCandidate>, Option<Vec<Range<usize>>>);
+    let (built, refs_ns) = timed_section(|| -> Result<ShortlistRefs, VectorError> {
+        let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
+        for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
+            block_by_cid.insert(c as u32, bi);
+        }
+        let mut candidates = Vec::with_capacity(shortlist.len());
+        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
+            Some(Vec::with_capacity(shortlist.len()))
         } else {
             None
         };
-        candidates.push(RerankCandidate {
-            did,
-            pos,
-            cluster_id,
-            block_idx: bi,
-            full_off: full_start + local * stride,
-            full_idx,
-        });
-    }
+        for &(did, _, pos, cluster_id) in &shortlist {
+            // A shortlist entry naming a cluster the block metadata does
+            // not carry is an index inconsistency, not a user error.
+            let &bi = block_by_cid.get(&cluster_id).ok_or_else(|| {
+                VectorError::InconsistentIndex(format!(
+                    "shortlist cluster {cluster_id} is absent from the block metadata"
+                ))
+            })?;
+            let &(_, off, cnt) = cluster_meta.get(bi).ok_or_else(|| {
+                VectorError::InconsistentIndex(format!(
+                    "block index {bi} out of range for cluster {cluster_id}"
+                ))
+            })?;
+            // `pos` is a cluster-order position and must fall inside this
+            // cluster's own span. These are u32: a position below `off`
+            // wraps to near-u32::MAX instead of going negative, and the
+            // `local * stride` offset built from it then points far past
+            // the block. Checking the lookups is not enough on its own —
+            // the arithmetic derived from them needs the same guard.
+            // Checked, not saturating: a saturated end masks a corrupt
+            // span by letting near-MAX positions pass the very bound the
+            // check exists to enforce.
+            let end = off.checked_add(cnt).ok_or_else(|| {
+                VectorError::InconsistentIndex(format!(
+                    "cluster {cluster_id}'s span overflows: off={off}, cnt={cnt}"
+                ))
+            })?;
+            if pos < off || pos >= end {
+                return Err(VectorError::InconsistentIndex(format!(
+                    "shortlist position {pos} falls outside cluster {cluster_id}'s \
+                     span [{off}, {end})"
+                )));
+            }
+            let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
+            let local = (pos - off) as usize;
+            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
+                let idx = ranges.len();
+                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+                Some(idx)
+            } else {
+                None
+            };
+            candidates.push(RerankCandidate {
+                did,
+                pos,
+                cluster_id,
+                block_idx: bi,
+                full_off: full_start + local * stride,
+                full_idx,
+            });
+        }
+        Ok((candidates, survivor_full_ranges))
+    });
+    let (candidates, survivor_full_ranges) = built?;
     Ok((
         ShortlistOutcome::Rerank {
             candidates,
             survivor_full_ranges,
         },
-        scan_kernel_ns,
+        scan_kernel_ns.saturating_add(refs_ns),
     ))
 }
 
@@ -6021,25 +6367,35 @@ fn get_survivor_ranges_coalesced(
 }
 
 /// Async sibling of [`get_survivor_ranges_coalesced`].
+/// Returns the gathered survivor blocks plus the on-CPU nanoseconds its
+/// synchronous halves cost: planning the coalesce (a sort plus a merge
+/// pass over every survivor range) and restoring per-survivor slices out
+/// of the fetched spans. Both scale with survivor count times probed
+/// cells, so at a wide sweep they are a real share of the query — and
+/// neither is inside the fetch's await, which is I/O wait and correctly
+/// uncounted.
 async fn get_survivor_ranges_coalesced_async(
     source: &Source,
     ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, LazyByteSourceError> {
+) -> Result<(Vec<Bytes>, u64), LazyByteSourceError> {
     if ranges.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     if ranges.len() == 1 {
-        return source.get_ranges_parallel_async(ranges).await;
+        return Ok((source.get_ranges_parallel_async(ranges).await?, 0));
     }
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        SURVIVOR_RANGE_COALESCE_MAX_GAP,
-        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
-    );
+    let (plan, plan_ns) = timed_section(|| {
+        RangeCoalescePlan::new(
+            ranges,
+            SURVIVOR_RANGE_COALESCE_MAX_GAP,
+            SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
+        )
+    });
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
         .await?;
-    Ok(plan.restore(&fetched))
+    let (restored, restore_ns) = timed_section(|| plan.restore(&fetched));
+    Ok((restored, plan_ns.saturating_add(restore_ns)))
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout

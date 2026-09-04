@@ -58,7 +58,7 @@ use super::{
 };
 use crate::{
     config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
-    memory::{ConnectionMemoryBudget, Reservation},
+    memory::ConnectionMemoryBudget,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageProvider,
@@ -66,14 +66,14 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        fts::tokenize::{AsciiLowerTokenizer, Tokenizer, tokenizer_for_name},
         vector::layout::VectorLayout,
     },
     supertable::{
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
-        slow_vector_state::CentroidSection,
+        slow_vector_state::{CentroidSection, ResidentVectorIndex},
     },
 };
 
@@ -87,20 +87,11 @@ use crate::{
 pub(crate) struct GappedPlacementIndex {
     ids: Vec<i128>,
     locals: Vec<u32>,
-    /// Held only for its `Drop`: releases the reserved bytes back to the
-    /// connection budget when this index is evicted. `None` under a
-    /// measure-only budget or when the reservation was declined.
-    #[allow(dead_code)]
-    reservation: Option<Reservation>,
 }
 
 impl GappedPlacementIndex {
-    pub(crate) fn new(ids: Vec<i128>, locals: Vec<u32>, reservation: Option<Reservation>) -> Self {
-        Self {
-            ids,
-            locals,
-            reservation,
-        }
+    pub(crate) fn new(ids: Vec<i128>, locals: Vec<u32>) -> Self {
+        Self { ids, locals }
     }
 
     /// The local row for `id` via binary search, or `None` if this superfile
@@ -238,6 +229,8 @@ const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
 const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+/// Default target buffered bytes per commit shard (in MiB units).
+const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
@@ -318,14 +311,6 @@ pub struct SupertableOptions {
     /// `FixedSizeList<Float32, dim>` with matching `list_size`.
     /// May be empty.
     pub vector_columns: Vec<VectorConfig>,
-    /// Default tokenizer, required iff `fts_columns` is non-empty. Used
-    /// as the per-column default when `fts_tokenizers` is not overridden.
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    /// Per-column tokenizers, aligned to `fts_columns` (one per FTS
-    /// column). Defaults in [`Self::new`] to `tokenizer` applied to
-    /// every column; [`Self::with_fts_tokenizers`] sets per-column
-    /// analyzers (per-field analysis).
-    pub fts_tokenizers: Vec<Arc<dyn Tokenizer>>,
     /// Pool used by reader fan-out (skip + per-superfile fan-out +
     /// top-k merge). Default: every logical core.
     pub reader_pool: Arc<ThreadPool>,
@@ -409,6 +394,27 @@ pub struct SupertableOptions {
     /// it). Serves the stripped-summary admit rescore from a local
     /// temp-file spill instead of per-cell object-store reads.
     pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
+    /// Single-slot cache for the slow-CAS graph sections (the persisted
+    /// `hnsw` data + centroid HNSW graphs), shared by every manifest
+    /// snapshot of this handle and keyed by the section's content-addressed
+    /// URI. Serves the resident graph walk without rebuilding at query time;
+    /// a new drain generation publishes a new URI and replaces it.
+    pub(crate) resident_index_cache: Arc<TokioMutex<Option<Arc<ResidentVectorIndex>>>>,
+    /// Single-flight gate for [`resident_index_cache`] hydration. The graph
+    /// bundle is multi-GiB, so a first-touch miss holds THIS gate (never the
+    /// cache mutex) across the download: exactly one query fetches while
+    /// concurrent misses park here and then find the cache already published.
+    /// Warm queries never touch it — they resolve on the cache mutex's fast
+    /// path — so the download never serializes steady-state serving.
+    pub(crate) graph_hydration_lock: Arc<TokioMutex<()>>,
+    /// Build-once cache for the in-memory centroid-router HNSW (an HNSW over
+    /// the resident fp32 fine centroids, used by `ivf_router = centroid_graph`
+    /// to select clusters). Built from the resident centroid section at the
+    /// first such query, so testing it needs no re-drain; the persisted
+    /// centroid graph is a follow-on. Only populated when the centroid-graph
+    /// router is enabled.
+    pub(crate) centroid_router_cache:
+        Arc<tokio::sync::OnceCell<Arc<crate::supertable::query::vector::CentroidRouterGraph>>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar
     /// projection over gapped user superfiles, so a hit resolves in O(k) after
     /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
@@ -470,6 +476,13 @@ pub struct SupertableOptions {
     /// [`SupertableOptions::apply_config`] copies `vector.drain_batch_superfiles`
     /// into this field; [`Self::with_drain_batch_superfiles`] overrides per table.
     pub drain_batch_superfiles: i64,
+    /// Recall the drain calibration targets when it stamps this table's
+    /// probe laws — the recall/latency lever. Width crosses at this
+    /// value and the depth stages at a padded form of it, so lowering
+    /// it narrows width, fine depth and the rerank budget together.
+    /// [`SupertableOptions::apply_config`] copies `vector.target_recall`
+    /// into this field; [`Self::with_target_recall`] overrides per table.
+    pub target_recall: f64,
     /// Per-cell consolidation op for the hidden-index drain. Default
     /// [`DrainConsolidate::Kmeans`]. [`SupertableOptions::apply_config`] copies
     /// `vector.drain_consolidate`; [`Self::with_drain_consolidate`] overrides
@@ -516,6 +529,19 @@ pub struct SupertableOptions {
     /// caller-driven `commit()` produces superfiles.
     /// Default: 1024 (1 GiB).
     pub commit_threshold_size_mb: u64,
+    /// Target buffered bytes per commit shard, in MiB. A commit splits its buffer into
+    /// `ceil(buffered / target)` shards, capped by the writer pool; each shard builds in
+    /// parallel and becomes one superfile.
+    ///
+    /// A 1 GiB flush therefore lands as ~16 × 64 MiB superfiles whether the host has 16 cores
+    /// or 192: data volume sets the table's file geometry, the pool only caps build
+    /// parallelism. Small superfiles are pure overhead downstream (each one is a footer
+    /// parse and an object-store GET on cold open, a disk-cache entry, a compaction input),
+    /// which is what the target guards against.
+    ///
+    /// `0` removes the target: one shard per pool thread, tying file count to the machine.
+    /// Default: 64.
+    pub superfile_buffer_split_mb: u64,
     /// Superfile size (in bytes) at or above which the writer
     /// routes the storage write through
     /// [`StorageProvider::put_multipart`] instead of
@@ -587,7 +613,6 @@ impl SupertableOptions {
         schema: Arc<Schema>,
         fts_columns: Vec<FtsConfig>,
         vector_columns: Vec<VectorConfig>,
-        tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Result<Self, BuildError> {
         let id_column = default_id_column();
 
@@ -677,9 +702,16 @@ impl SupertableOptions {
             }
         }
 
-        // 5. FTS columns require a tokenizer.
-        if !fts_columns.is_empty() && tokenizer.is_none() {
-            return Err(BuildError::MissingTokenizer);
+        // 5. Each FTS column's analyzer name must resolve. Validating
+        //    here surfaces a typo at construction with a typed error,
+        //    instead of at the first commit's builder construction.
+        for fc in &fts_columns {
+            if tokenizer_for_name(&fc.analyzer).is_none() {
+                return Err(BuildError::UnknownAnalyzer {
+                    column: fc.column.clone(),
+                    analyzer: fc.analyzer.clone(),
+                });
+            }
         }
 
         // 6. Shared thread pools + a fresh store.
@@ -687,21 +719,11 @@ impl SupertableOptions {
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
-        // Default per-column tokenizers: the single tokenizer applied to
-        // every FTS column. `with_fts_tokenizers` overrides for per-field
-        // analyzers.
-        let fts_tokenizers = match &tokenizer {
-            Some(t) => fts_columns.iter().map(|_| Arc::clone(t)).collect(),
-            None => Vec::new(),
-        };
-
         Ok(Self {
             schema,
             id_column,
             fts_columns,
             vector_columns,
-            tokenizer,
-            fts_tokenizers,
             reader_pool,
             writer_pool,
             store,
@@ -714,6 +736,9 @@ impl SupertableOptions {
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
+            resident_index_cache: Arc::new(TokioMutex::new(None)),
+            graph_hydration_lock: Arc::new(TokioMutex::new(())),
+            centroid_router_cache: Arc::new(tokio::sync::OnceCell::new()),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
@@ -722,10 +747,12 @@ impl SupertableOptions {
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
             drain_batch_superfiles: DEFAULT_DRAIN_BATCH_SUPERFILES,
+            target_recall: crate::config::global().vector.target_recall,
             drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
+            superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
@@ -836,24 +863,26 @@ impl SupertableOptions {
         self
     }
 
-    /// Override the per-column FTS tokenizers (per-field analysis). The
-    /// vec must be aligned to `fts_columns` (one tokenizer per FTS
-    /// column, declaration order). Passing a differently-sized vec is a
-    /// caller bug; the builder indexes each column with its own entry.
-    pub fn with_fts_tokenizers(mut self, tokenizers: Vec<Arc<dyn Tokenizer>>) -> Self {
-        self.fts_tokenizers = tokenizers;
-        self
+    /// Tokenizer configured for `column`, or `None` when `column` carries
+    /// no full-text index — a `None` return is exactly the "column is not
+    /// full-text-indexed" signal, which lets a search path reject up front
+    /// instead of failing deep in the scan. Resolves the column's analyzer
+    /// name from its `FtsConfig` (validated at construction, so the
+    /// resolution cannot fail for a registered column). The lookup is a
+    /// single pass over `fts_columns`.
+    pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
+        self.fts_columns
+            .iter()
+            .find(|c| c.column == column)
+            .and_then(|c| tokenizer_for_name(&c.analyzer))
     }
 
     /// Tokenizer configured for `column`, for tokenizing query text so
     /// it matches how the column was indexed. Falls back to the ASCII
-    /// default when `column` is not a registered FTS column (the query
-    /// then fails downstream on the unknown column).
+    /// default when `column` is not a registered FTS column; a caller that
+    /// must distinguish that case uses [`Self::try_fts_tokenizer_for`].
     pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
-        self.fts_columns
-            .iter()
-            .position(|c| c.column == column)
-            .and_then(|i| self.fts_tokenizers.get(i).cloned())
+        self.try_fts_tokenizer_for(column)
             .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer))
     }
 
@@ -938,6 +967,14 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the calibration's recall target for this table. Takes
+    /// effect on the NEXT drain or recalibration: the laws already
+    /// stamped in the manifest keep serving until then.
+    pub fn with_target_recall(mut self, target: f64) -> Self {
+        self.target_recall = target;
+        self
+    }
+
     /// Override the hidden-index drain consolidation op. See
     /// [`Self::drain_consolidate`].
     pub fn with_drain_consolidate(mut self, mode: DrainConsolidate) -> Self {
@@ -975,6 +1012,13 @@ impl SupertableOptions {
     /// Override the auto-flush threshold (MiB).
     pub fn with_commit_threshold_size_mb(mut self, mb: u64) -> Self {
         self.commit_threshold_size_mb = mb;
+        self
+    }
+
+    /// Override the target buffered bytes per commit shard (MiB); see
+    /// [`Self::superfile_buffer_split_mb`].
+    pub fn with_superfile_buffer_split_mb(mut self, mb: u64) -> Self {
+        self.superfile_buffer_split_mb = mb;
         self
     }
 
@@ -1077,8 +1121,10 @@ impl SupertableOptions {
             ),
         };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
+        self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        self.target_recall = cfg.vector.target_recall;
         self.drain_consolidate = cfg.vector.drain_consolidate;
         // The `config.yaml` source for the connection budget; the connect path
         // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.
@@ -1210,21 +1256,21 @@ impl SupertableOptions {
             self.id_column.clone(),
             self.fts_columns.clone(),
             self.vector_columns.clone(),
-            self.tokenizer.clone(),
         )
-        .with_fts_tokenizers(self.fts_tokenizers.clone())
         .with_vector_layout(self.vector_layout)
     }
 
     /// Effective scalar-only schema — the user's columns with
     /// vector columns projected out *and* the supertable-
     /// injected id column prepended. This is what the
-    /// underlying `SuperfileBuilder` sees and what Parquet
-    /// stores.
+    /// underlying `SuperfileBuilder` sees at ingest.
     ///
     /// Vectors live in the embedded vector blob, never in
     /// Parquet, so they don't appear here. The id column is
-    /// always first.
+    /// always first. Index-only FTS columns DO appear here —
+    /// their text must reach the builder to be tokenized —
+    /// but the builder drops them from the Parquet body, so
+    /// the readable shape is [`Self::stored_schema`].
     ///
     /// Cost is one schema-walk + one `Vec::clone` of the
     /// surviving fields per call. Caching on first call is a
@@ -1251,6 +1297,33 @@ impl SupertableOptions {
         );
         Arc::new(Schema::new(kept))
     }
+
+    /// The readable (stored) schema — [`Self::scalar_schema`] minus
+    /// index-only FTS columns (`stored: false`). Index-only text feeds
+    /// the FTS blob at ingest but never lands in Parquet, so it cannot
+    /// be scanned, projected, or filtered on; the SQL scan view and the
+    /// search-result projection surface resolve names against this
+    /// shape so such a column is rejected up front like any unknown
+    /// column, instead of failing mid-decode.
+    pub fn stored_schema(&self) -> Arc<Schema> {
+        let unstored: HashSet<&str> = self
+            .fts_columns
+            .iter()
+            .filter(|fc| !fc.stored)
+            .map(|fc| fc.column.as_str())
+            .collect();
+        let scalar = self.scalar_schema();
+        if unstored.is_empty() {
+            return scalar;
+        }
+        let kept: Vec<Arc<Field>> = scalar
+            .fields()
+            .iter()
+            .filter(|f| !unstored.contains(f.name().as_str()))
+            .cloned()
+            .collect();
+        Arc::new(Schema::new(kept))
+    }
 }
 
 impl fmt::Debug for SupertableOptions {
@@ -1260,7 +1333,6 @@ impl fmt::Debug for SupertableOptions {
             .field("id_column", &self.id_column)
             .field("n_fts_columns", &self.fts_columns.len())
             .field("n_vector_columns", &self.vector_columns.len())
-            .field("has_tokenizer", &self.tokenizer.is_some())
             .finish()
     }
 }
@@ -1320,18 +1392,13 @@ mod tests {
     }
 
     fn fc(name: &str) -> FtsConfig {
-        FtsConfig {
-            column: name.into(),
-            positions: false,
-        }
+        FtsConfig::new(name)
     }
-
-    use crate::test_helpers::default_tokenizer as tok;
 
     #[test]
     fn valid_options_with_fts_and_vector_succeeds() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options should succeed");
         assert_eq!(opts.id_column, "_id");
         assert_eq!(opts.fts_columns.len(), 1);
@@ -1350,16 +1417,16 @@ mod tests {
             Field::new("_id", DataType::UInt64, false),
             Field::new("emb", fixed_list_f32(16), false),
         ]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "_id"));
     }
 
     #[test]
     fn fts_column_missing_from_schema_rejected() {
         let s = schema_with_vector(16);
-        let err = SupertableOptions::new(s, vec![fc("absent")], vec![], Some(tok()))
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![fc("absent")], vec![]).expect_err("expected error");
         assert!(matches!(err, BuildError::FtsColumnMissing { column } if column == "absent"));
     }
 
@@ -1367,8 +1434,7 @@ mod tests {
     fn fts_column_wrong_type_rejected() {
         // `body` is Utf8 not LargeUtf8 — must reject.
         let s = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
-        let err = SupertableOptions::new(s, vec![fc("body")], vec![], Some(tok()))
-            .expect_err("expected error");
+        let err = SupertableOptions::new(s, vec![fc("body")], vec![]).expect_err("expected error");
         assert!(
             matches!(err, BuildError::FtsColumnMustBeLargeUtf8 { column, .. } if column == "body")
         );
@@ -1381,8 +1447,8 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::VectorColumnMissing { column } if column == "emb"));
     }
 
@@ -1394,8 +1460,8 @@ mod tests {
             DataType::Float32,
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorColumnNotFixedSizeList { column, .. } if column == "emb"
@@ -1410,8 +1476,8 @@ mod tests {
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 16),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorColumnNotFixedSizeList { column, .. } if column == "emb"
@@ -1426,8 +1492,8 @@ mod tests {
             fixed_list_f32(8),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 16)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorColumnDimMismatch { expected: 16, actual: 8, column } if column == "emb"
@@ -1441,8 +1507,8 @@ mod tests {
             fixed_list_f32(8),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 8)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 8)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorDimOutOfRange { column, dim: 8 } if column == "emb"
@@ -1456,8 +1522,8 @@ mod tests {
             fixed_list_f32(8192),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("emb", 8192)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("emb", 8192)]).expect_err("expected error");
         assert!(matches!(
             err,
             BuildError::VectorDimOutOfRange { column, dim: 8192 } if column == "emb"
@@ -1472,9 +1538,8 @@ mod tests {
         ]));
         // Duplicate `emb` between two vector_columns entries —
         // hits the cross-list dedup check.
-        let err =
-            SupertableOptions::new(s.clone(), vec![], vec![vc("emb", 16), vc("emb", 16)], None)
-                .expect_err("expected error");
+        let err = SupertableOptions::new(s.clone(), vec![], vec![vc("emb", 16), vc("emb", 16)])
+            .expect_err("expected error");
         assert!(matches!(err, BuildError::DuplicateLogicalName(n) if n == "emb"));
     }
 
@@ -1485,8 +1550,8 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![fc("ti\u{1F}tle")], vec![], Some(tok()))
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![fc("ti\u{1F}tle")], vec![]).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedSeparatorInColumnName(_)));
     }
 
@@ -1497,21 +1562,21 @@ mod tests {
             fixed_list_f32(16),
             false,
         )]));
-        let err = SupertableOptions::new(s, vec![], vec![vc("inf.emb", 16)], None)
-            .expect_err("expected error");
+        let err =
+            SupertableOptions::new(s, vec![], vec![vc("inf.emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
     }
 
     #[test]
-    fn fts_columns_without_tokenizer_rejected() {
+    fn fts_column_with_unknown_analyzer_rejected() {
         let s = Arc::new(Schema::new(vec![Field::new(
             "title",
             DataType::LargeUtf8,
             false,
         )]));
-        let err =
-            SupertableOptions::new(s, vec![fc("title")], vec![], None).expect_err("expected error");
-        assert!(matches!(err, BuildError::MissingTokenizer));
+        let err = SupertableOptions::new(s, vec![fc("title").analyzer("nonesuch")], vec![])
+            .expect_err("expected error");
+        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
     }
 
     #[test]
@@ -1523,13 +1588,13 @@ mod tests {
         )]));
         // No FTS, no vectors, no tokenizer — the supertable becomes
         // a thin wrapper over scalar Parquet data. Must succeed.
-        SupertableOptions::new(s, vec![], vec![], None).expect("empty fts + vector should succeed");
+        SupertableOptions::new(s, vec![], vec![]).expect("empty fts + vector should succeed");
     }
 
     #[test]
     fn scalar_schema_drops_vector_columns_and_prepends_id() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let scalar = opts.scalar_schema();
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
@@ -1549,8 +1614,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![], Some(tok()))
-            .expect("valid options");
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![]).expect("valid options");
         let scalar = opts.scalar_schema();
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title"]);
@@ -1559,7 +1623,7 @@ mod tests {
     #[test]
     fn effective_schema_prepends_id_keeps_vector_columns() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let eff = opts.effective_schema();
         let names: Vec<_> = eff.fields().iter().map(|f| f.name().as_str()).collect();
@@ -1569,13 +1633,8 @@ mod tests {
     #[test]
     fn user_schema_returns_input_schema_unchanged() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(
-            Arc::clone(&s),
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = SupertableOptions::new(Arc::clone(&s), vec![fc("title")], vec![vc("emb", 16)])
+            .expect("valid options");
         let us = opts.user_schema();
         assert_eq!(us.fields().len(), s.fields().len());
         for (a, b) in us.fields().iter().zip(s.fields().iter()) {
@@ -1586,7 +1645,7 @@ mod tests {
     #[test]
     fn with_id_column_overrides_default() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options")
             .with_id_column("row_id")
             .expect("override accepted");
@@ -1599,7 +1658,7 @@ mod tests {
     #[test]
     fn with_id_column_rejects_name_that_collides_with_user_schema() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let err = opts.with_id_column("title").expect_err("collision");
         assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "title"));
@@ -1622,7 +1681,7 @@ supertable:
             Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
 
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options")
             .apply_config(&cfg)
             .expect("apply_config");
@@ -1662,7 +1721,7 @@ supertable:
         let cfg = Config::defaults().expect("embedded default");
 
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options")
             .apply_config(&cfg)
             .expect("apply_config");
@@ -1678,7 +1737,7 @@ supertable:
     #[test]
     fn debug_format_doesnt_explode() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let s = format!("{:?}", opts);
         assert!(s.contains("SupertableOptions"));
@@ -1693,7 +1752,7 @@ supertable:
             DataType::Utf8,
             false,
         )]));
-        SupertableOptions::new(s, vec![], vec![], None).expect("valid options")
+        SupertableOptions::new(s, vec![], vec![]).expect("valid options")
     }
 
     #[test]
@@ -1843,7 +1902,7 @@ supertable:
     #[test]
     fn builder_options_use_scalar_schema_and_id_column() {
         let s = schema_with_vector(16);
-        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
+        let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
         let bo = opts.builder_options();
         // builder_options carries the scalar-only schema (vectors

@@ -28,7 +28,11 @@ use futures::{
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::time;
-use tracing::warn;
+#[cfg(not(feature = "detailed-tracing"))]
+use tracing::Span;
+#[cfg(feature = "detailed-tracing")]
+use tracing::info_span;
+use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -254,6 +258,10 @@ impl Supertable {
         bridge_on_runtime(self.compact_async(cfg), &self.inner().query_runtime())
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
+    )]
     pub(crate) async fn compact_async(
         &self,
         cfg: &CompactionSettings,
@@ -280,6 +288,10 @@ impl Supertable {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "compact_table", skip_all, fields(role = table.role().as_str()))
+    )]
     pub(crate) async fn compact_one_table(
         table: &Supertable,
         cfg: &CompactionSettings,
@@ -420,7 +432,13 @@ impl Supertable {
             None => vec![stats],
         };
         for stats in &stat_groups {
-            for job in select(stats, cfg) {
+            let jobs = select(stats, cfg);
+            info!(
+                role = table.role().as_str(),
+                jobs = jobs.len(),
+                "compaction jobs planned"
+            );
+            for job in jobs {
                 table.run_compaction_job(job, stale_seal_timeout).await?;
                 table
                     .refresh()
@@ -456,17 +474,21 @@ impl Supertable {
 
         let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
         if clamped_components > 0 {
-            eprintln!(
+            warn!(
                 "[supertable compaction] BUG: {clamped_components} component(s) saturated \
-                 their destination Sq8 quantizer during this pass's merges/splits (#512 \
-                 failure mode) — a destination grid failed to cover its inputs; affected \
-                 rows' recall silently degrades.",
+                 their destination quantizer during this pass's merges/splits — a \
+                 destination grid failed to cover its inputs; affected rows' recall \
+                 degrades.",
             );
         }
         Ok(())
     }
 
     /// Merges the given superfiles into one
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "merge_superfiles", skip_all, fields(inputs = superfiles.len()))
+    )]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -494,11 +516,16 @@ impl Supertable {
 
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
+            #[cfg(feature = "detailed-tracing")]
+            let span = info_span!("compaction_input", superfile_id = %entry.superfile_id);
+            #[cfg(not(feature = "detailed-tracing"))]
+            let span = Span::none();
             let open_fut = async {
                 let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
                     .await;
                 (entry.superfile_id, r)
-            };
+            }
+            .instrument(span);
             superfile_readers_fut.push(open_fut);
         }
         let readers = join_all(superfile_readers_fut).await;
@@ -600,6 +627,19 @@ impl Supertable {
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "run_compaction_job",
+            skip_all,
+            fields(
+                role = self.role().as_str(),
+                inputs = job.inputs.len(),
+                partition_key = ?job.partition_key,
+                estimated_output_bytes = job.estimated_output_bytes,
+            )
+        )
+    )]
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
@@ -780,6 +820,12 @@ impl Supertable {
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                    warn!(
+                        superfile_id = %merged_superfile_id,
+                        attempt,
+                        max_retries,
+                        "compaction commit lost race, retrying"
+                    );
                     if let Err(e) = self.refresh().await {
                         unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Refresh(e.to_string()));
@@ -929,9 +975,7 @@ mod tests {
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
-        test_helpers::{
-            build_title_batch, default_supertable_options, default_tokenizer, default_vector_config,
-        },
+        test_helpers::{build_title_batch, default_supertable_options, default_vector_config},
     };
 
     const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
@@ -1836,12 +1880,8 @@ mod tests {
         // non-IVF-mergeable case, so compaction routes to the re-index branch.
         let opts = SupertableOptions::new(
             Arc::clone(&schema),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![default_vector_config("emb", 42)],
-            Some(default_tokenizer()),
         )
         .expect("options with an fp32 vector column")
         // One writer thread ⇒ one superfile per commit (deterministic doc-id
@@ -3196,18 +3236,27 @@ mod tests {
             .await
             .expect("second compact");
 
-        // compact() must have run two jobs (one per file set → manifest +2).
+        // The selector packs the 30 small superfiles into several target-sized
+        // jobs (one manifest commit + one output superfile each), rather than
+        // one oversized merge. The exact job count tracks per-superfile byte
+        // size, which is format-dependent, so assert the invariant — more than
+        // one job — not a pinned number.
+        let jobs = st.manifest_id() - manifest_id_before_first_compact;
         assert!(
-            st.manifest_id() == manifest_id_before_first_compact + 2,
-            "compact must have run two jobs, one per file set"
+            jobs >= 2,
+            "compact must split into multiple size-bounded jobs, got {jobs}"
         );
 
         // All 245760 docs must be visible after compaction.
         let r = st.reader().expect("reader");
         assert_eq!(r.n_docs_total(), 245760, "all docs must be preserved");
+        // One output superfile per job, and fewer than the original 30 — the
+        // 30 inputs consolidated into a handful of target-sized superfiles.
+        let n_superfiles = r.n_superfiles() as u64;
         assert!(
-            r.n_superfiles() == 2,
-            "overall superfile count must have decreased from original 30"
+            n_superfiles == jobs && n_superfiles < 30,
+            "30 inputs must consolidate into `jobs` (< 30) superfiles, \
+             got {n_superfiles} superfiles for {jobs} jobs"
         );
 
         // ManifestSnapshot consistency: per-entry doc counts sum to 245760.

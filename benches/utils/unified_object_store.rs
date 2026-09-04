@@ -112,7 +112,6 @@ use infino::{
         reader_cache::DiskCacheStore,
         storage::{S3StorageProvider, StorageProvider},
     },
-    test_helpers::default_tokenizer,
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -199,7 +198,7 @@ fn query_vector() -> &'static [f32] {
             // Take vector at index 0 as the query — known to
             // exist in the planted-cluster corpus + a real-
             // shape query (not orthogonal to every cluster).
-            v.as_slice()[..crate::corpus::DIM].to_vec()
+            v.as_slice()[..crate::corpus::dim()].to_vec()
         })
         .as_slice()
 }
@@ -215,7 +214,7 @@ fn query_vector() -> &'static [f32] {
 fn build_superfile_bytes() -> Bytes {
     let n = quick_iter_n_docs();
     let n_cent = crate::corpus::n_cent(n);
-    let dim = crate::corpus::DIM;
+    let dim = crate::corpus::dim();
 
     let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, CORPUS_SEED, true);
     let vectors = vectors_mmap.as_slice();
@@ -235,10 +234,7 @@ fn build_superfile_bytes() -> Bytes {
     let opts = BuilderOptions::new(
         schema.clone(),
         ID_COLUMN,
-        vec![FtsConfig {
-            column: FTS_COLUMN.into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new(FTS_COLUMN)],
         vec![VectorConfig {
             provided_centroids: None,
             column: VEC_COLUMN.into(),
@@ -247,7 +243,6 @@ fn build_superfile_bytes() -> Bytes {
             metric: Metric::Cosine,
             rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
         }],
-        Some(default_tokenizer()),
     );
     let mut builder = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
@@ -542,7 +537,7 @@ pub fn run() {
     let nprobe = BENCH_NPROBE;
     eprintln!(
         "[object_store_bench] scale: n_docs={n}, dim={}, superfile_size={} MiB",
-        crate::corpus::DIM,
+        crate::corpus::dim(),
         superfile.len() / BYTES_PER_MIB,
     );
 
@@ -606,7 +601,7 @@ fn emit_object_store(
         report::{Better, Block, Cell, Report, Section, metric, text},
     };
 
-    let dim = crate::corpus::DIM;
+    let dim = crate::corpus::dim();
     let superfile_mib = superfile_bytes().len() as f64 / BYTES_PER_MIB_F64;
 
     let rss_cells = |stats: crate::rss::RssStats| -> Vec<Cell> {
@@ -1677,7 +1672,7 @@ pub(crate) mod diag {
         let cfg = real_s3_supertable_config(&bucket, &prefix, cache_dir.path());
         eprintln!(
             "[diag-real-s3-supertable] bucket={bucket} prefix={prefix} n_docs={n} dim={}",
-            crate::corpus::DIM
+            crate::corpus::dim()
         );
 
         let cleanup_keys = Arc::new(Mutex::new(Vec::new()));
@@ -1857,26 +1852,22 @@ pub(crate) mod diag {
                 VEC_COLUMN,
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
-                    crate::corpus::DIM as i32,
+                    crate::corpus::dim() as i32,
                 ),
                 false,
             ),
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig {
-                column: FTS_COLUMN.into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new(FTS_COLUMN)],
             vec![VectorConfig {
                 provided_centroids: None,
                 column: VEC_COLUMN.into(),
-                dim: crate::corpus::DIM,
+                dim: crate::corpus::dim(),
                 rot_seed: ROT_SEED,
                 metric: Metric::Cosine,
                 rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
             }],
-            Some(default_tokenizer()),
         )
         .expect("real S3 supertable options")
     }
@@ -1886,7 +1877,7 @@ pub(crate) mod diag {
         n: usize,
     ) {
         let n_cent = crate::corpus::n_cent(n);
-        let dim = crate::corpus::DIM;
+        let dim = crate::corpus::dim();
         let vectors_mmap = crate::corpus::MmapVectorCorpus::generate(n, n_cent, CORPUS_SEED, true);
         let vectors = vectors_mmap.as_slice();
         let text = crate::corpus::MmapTextCorpus::generate(n, 1);

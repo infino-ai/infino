@@ -103,11 +103,19 @@ const ALLOWED_LICENSES: &[&str] = &[
 /// that have been individually reviewed and accepted. Each entry
 /// MUST name the actual license in the comment.
 const ALLOWED_PACKAGES: &[(&str, &str, &str)] = &[
-    // Empty: every dependency — including our own crates `infino` and
-    // `infino-bench-utils` — now declares a license in ALLOWED_LICENSES
-    // (Apache-2.0), so no per-package exception is needed. Add an entry
-    // here only for a reviewed dependency whose license falls outside
-    // ALLOWED_LICENSES.
+    // The vendored HDF5 C sources for the bench-utils static build. The
+    // crate declares its license with `license-file` rather than an SPDX
+    // `license` field (the bundled HDF5 license has no SPDX id), so cargo
+    // metadata reports no license string and the class list above cannot
+    // match it. Reviewed: the Rust crate is MIT/Apache-2.0 and the bundled
+    // HDF5 1.14.6 sources carry The HDF Group's BSD-3-Clause-style license
+    // (attribution + no-endorsement; no copyleft, cloud-deploy friendly).
+    // Version-pinned so a bump re-fails the audit and forces re-review.
+    (
+        "hdf5-metno-src",
+        "0.9.5",
+        "license-file: bundled HDF5 BSD-3-Clause-style (THG); crate MIT/Apache-2.0",
+    ),
 ];
 
 /// True iff at least one option in the SPDX expression is exactly

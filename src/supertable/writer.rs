@@ -9,7 +9,7 @@
 //! [`crate::superfile::SuperfileBuilder`], which is a single-shot
 //! factory consuming `self` to produce one immutable artifact.
 //! Each `commit` here internally spawns many superfile builders,
-//! one per shard.
+//! one per piece of the split buffer.
 //!
 //! Acquired via [`Supertable::writer`](super::Supertable::writer);
 //! at most one writer is outstanding per supertable at a time
@@ -28,9 +28,9 @@
 //!   `vector_split`, pushes a `BufferedBatch` onto the writer's
 //!   buffer, and triggers an internal `commit()` if the running
 //!   buffer-byte estimate crosses the configured threshold.
-//! - `commit()` drains the buffer, partitions across the writer
-//!   pool, runs each shard build in parallel, and publishes all
-//!   shards as new superfiles in one manifest swap. Idempotent on
+//! - `commit()` drains the buffer, splits it by buffered bytes (capped
+//!   by the writer pool), builds each piece in parallel, and publishes
+//!   them all as new superfiles in one manifest swap. Idempotent on
 //!   an empty buffer (no-op return Ok). The writer slot is
 //!   released on `Drop`; callers don't need a separate `finish()`
 //!   call.
@@ -73,27 +73,30 @@ use arrow_array::{
 };
 use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
 use futures::{
     future::try_join_all,
-    stream::{self, StreamExt},
+    stream::{self, FuturesUnordered, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use tokio::time::sleep;
+use tokio::{
+    sync::mpsc::{Receiver, Sender, channel},
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
-    build::fanout_shards,
+    build::{fanout_shards, fanout_shards_metered},
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
-        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SubsectionOffsets,
-        SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
+        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, ScalarStatsAgg,
+        SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -106,16 +109,22 @@ use super::{
         WalStore,
         pipeline::{self, TombstonePhaseOutcome},
         state_doc::{
-            IdSpan, OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId,
-            WalState, WalStateDoc,
+            IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
+            TombstoneOutcome, WalId, WalState, WalStateDoc,
         },
     },
 };
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
+    runtime_metrics::{
+        ingest::visible_array_bytes,
+        op_stats::{self, OpStatsCollector},
+    },
     storage::{StorageError, StorageProvider},
     superfile::{
         BuildError as SuperfileBuildError, ReadError, SuperfileReader,
@@ -126,9 +135,9 @@ use crate::{
             fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
-                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, DOC_ID_BYTES,
-                OUTER_HEADER_SIZE, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry,
-                dir_entry, outer_hdr, sub_hdr,
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
+                STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry, dir_entry, outer_hdr,
+                sub_hdr,
             },
         },
         reader::vector_layout_from_kv,
@@ -140,8 +149,10 @@ use crate::{
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow, transcode_clamped_components},
             distance::Metric,
+            hnsw::PayloadKind,
             ivf_merge::{
-                MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
+                MergedIvfSubsection, fine_run_target_n_cent, merge_fragment_subsections,
+                route_clusters_into_cells,
             },
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -168,22 +179,31 @@ use crate::{
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
-            vector::stable_ids_by_local_for_routing,
+            vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
-        slow_vector_state,
-        slow_vector_state::{CentroidSection, fetch_centroid_section},
+        slow_vector_state::{self, CentroidSection, fetch_centroid_section},
+        wal::{
+            Lease,
+            lease::{self, DEFAULT_LEASE_DURATION},
+        },
     },
 };
 
-/// Target bytes per fine IVF run inside one global cell. Fine-centroid count
-/// is derived from this target; it is not copied from the outer/global grid or
-/// repeated as a fixed count for every small commit delta.
-const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 /// Multipart chunk size for large superfile uploads.
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
+
 /// Stable IDs fed to the streamed shard Parquet builder per Arrow batch.
 const DRAIN_ID_BATCH_ROWS: usize = 64 * 1024;
+
+/// One mebibyte; converts `superfile_buffer_split_mb` into bytes.
+const MIB: usize = 1 << 20;
+
+/// Packed-shard count for the update append phase: every cell an update's
+/// replacement rows land in packs into ONE superfile, so the WAL's single
+/// `preallocated_superfile_id` covers the whole build (the recovery contract).
+const UPDATE_PACKED_SHARDS: usize = 1;
+
 pub(in crate::supertable) const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
 /// Local checkpoint filename inside one epoch scratch directory.
 const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
@@ -263,10 +283,19 @@ struct DrainRemoteState {
 }
 
 #[cfg(test)]
+// The shared `After` prefix is the point — each variant names the drain phase
+// the injected failure fires AFTER.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainTestFailurePhase {
     AfterBatch,
     AfterShard,
+    /// Between building the resident graph and the single membership commit
+    /// that stamps cells + `drained_ranges` + the graph together — simulates a
+    /// crash in that gap. Because the commit is atomic, nothing durable
+    /// advanced, so a just-drained row stays visible (served from its user
+    /// superfile) rather than falling into a drained-but-not-yet-in-graph hole.
+    AfterMembershipCommit,
 }
 
 #[cfg(test)]
@@ -349,8 +378,22 @@ pub struct SupertableWriter {
     /// Byte size of the FTS-indexed text columns within `buffer`. A
     /// subset of `buffer_scalar_bytes`, not extra held memory; tracked
     /// only to weight the build-scratch reserve, since the FTS index
-    /// structures built at commit scale with the text input.
+    /// structures built at commit scale with the text input. Measured as
+    /// visible (slice-aware) bytes — what the build will actually index —
+    /// unlike `buffer_scalar_bytes` above, which measures resident
+    /// allocation. (`buffer_vector_bytes` is the exact f32 payload on
+    /// either reading; slices share nothing wider than their rows.)
     buffer_fts_bytes: usize,
+    /// Ingested work for the batches sitting in `buffer`, computed at
+    /// `append` time from the caller's own batch and held here until the
+    /// commit that publishes them returns `Ok`. Counting at append time is
+    /// what keeps the values invariant to the shard split and to OCC
+    /// retries; holding them until the publish succeeds is what keeps a
+    /// failed or abandoned commit from reporting rows nobody stored. Every
+    /// other write counter already follows this discipline — the update
+    /// path stashes on `PendingUpdateEntry`, the commit outputs and
+    /// `rows_tombstoned` flush after `Ok`.
+    pending_ingest: IngestTally,
     /// Pending update entries, in buffer order. Each is
     /// fully-resolved at `update()` call time (predicate
     /// captured, `_id` range minted, IPC sidecar bytes encoded);
@@ -361,6 +404,15 @@ pub struct SupertableWriter {
     /// `wal_id`; `commit()` builds the WAL state doc and drives
     /// the tombstone phase.
     pending_deletes: Vec<PendingDeleteEntry>,
+    /// Per-op work collector, captured at construction — the writer is
+    /// minted on the caller's thread inside its [`with_op_stats`]
+    /// scope (the same pickup contract as the reader), and the write
+    /// counters flush through this `Arc` from wherever the commit
+    /// runs. `None` outside a scope: every flush is one `Option`
+    /// check.
+    ///
+    /// [`with_op_stats`]: crate::runtime_metrics::op_stats::with_op_stats
+    op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 /// One buffered update. Resources here are all reserved at the
@@ -375,6 +427,12 @@ struct PendingUpdateEntry {
     new_row_count: u32,
     new_row_content_hash: String,
     ipc_bytes: Bytes,
+    /// Ingested-byte legs of the replacement batch, measured at call time
+    /// the same way an append measures its own — the batch itself is
+    /// dropped once IPC-encoded, so they cannot be recomputed at commit.
+    scalar_bytes_written: u64,
+    vector_bytes_written: u64,
+    fts_text_bytes_written: u64,
 }
 
 /// One buffered delete. Just the call-time resolved target_ids
@@ -402,6 +460,51 @@ impl fmt::Debug for SupertableWriter {
 struct BufferedBatch {
     scalar: RecordBatch,
     vectors: Vec<Arc<Float32Array>>,
+}
+
+/// Owned `Arc<Float32Array>` handles for each declared vector column of
+/// `batch`. The handles share the batch's underlying Arrow buffers — no bytes
+/// copied — so the result outlives the borrow that `split_vectors`' `&[f32]`
+/// slices are tied to.
+pub(in crate::supertable) fn owned_vector_arrays(
+    batch: &RecordBatch,
+    options: &SupertableOptions,
+) -> Result<Vec<Arc<Float32Array>>, BuildError> {
+    let mut vectors = Vec::with_capacity(options.vector_columns.len());
+    for vc in &options.vector_columns {
+        let col_idx = batch
+            .schema()
+            .index_of(&vc.column)
+            .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
+        let fsl = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or(BuildError::BatchSchemaMismatch)?;
+
+        let values = fsl.values();
+
+        let f32_arr = values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or(BuildError::BatchSchemaMismatch)?
+            .clone();
+
+        vectors.push(Arc::new(f32_arr));
+    }
+    Ok(vectors)
+}
+
+/// Ingested work accumulated across the buffered appends of one commit.
+/// Input-shaped by construction, so it is the same at every writer-pool
+/// width; published into the collector only once the commit succeeds.
+#[derive(Default, Clone, Copy)]
+struct IngestTally {
+    rows: u64,
+    scalar_bytes: u64,
+    vector_bytes: u64,
+    fts_text_bytes: u64,
 }
 
 /// Zero-copy view of one vector column across the buffered batches:
@@ -461,38 +564,57 @@ impl<'a> VectorColumnView<'a> {
     }
 }
 
-/// Row-balanced split of the writer's buffered batches into
-/// `n_shards` shard inputs, each shaped as a `Vec<BufferedBatch>`
-/// that [`build_one_shard_with_layout`] can consume directly. The split walks
-/// rows across the original buffer in order and emits zero-copy
-/// Arrow slices (`RecordBatch::slice` + `Float32Array::slice` —
-/// adjust buffer offsets only; underlying memory stays Arc-counted),
-/// so no payload bytes are copied even when a shard boundary falls
-/// in the middle of a `BufferedBatch`.
+/// How many superfiles one taken buffer becomes: `ceil(buffered_bytes / split_bytes)`, capped by
+/// the pool and the row count.
 ///
-/// Row imbalance across shards is ≤ 1: with `total_rows = q·n + r`,
-/// the first `r` shards get `q+1` rows and the rest get `q`.
+/// A 1 GiB buffer at the default 64 MiB split builds 16 superfiles on a 192-thread pool and 8 on
+/// an 8-thread pool, each carrying between half and one full split's worth of rows. Rounding up
+/// favours parallelism: every piece gets its own thread, since the count is capped by the pool.
+/// `split_bytes == 0` (the [`SupertableOptions::superfile_buffer_split_mb`] escape hatch) caps by
+/// the pool alone. Always at least one.
+fn superfiles_per_commit(
+    total_rows: usize,
+    buffered_bytes: usize,
+    pool_threads: usize,
+    target_bytes: usize,
+) -> usize {
+    let by_bytes = if target_bytes == 0 {
+        usize::MAX
+    } else {
+        buffered_bytes.div_ceil(target_bytes).max(1)
+    };
+    by_bytes.min(pool_threads.max(1)).min(total_rows.max(1))
+}
+
+/// Row-balanced split of the writer's buffered batches into `n_superfiles` build inputs, each
+/// shaped as a `Vec<BufferedBatch>` that [`build_one_shard_with_layout`] can consume directly.
+/// The split walks rows across the original buffer in order and emits zero-copy Arrow slices
+/// (`RecordBatch::slice` + `Float32Array::slice` — adjust buffer offsets only; underlying memory
+/// stays Arc-counted), so no payload bytes are copied even when a split boundary falls in the
+/// middle of a `BufferedBatch`.
 ///
-/// Trailing empty shards (only possible when `total_rows < n_shards`)
-/// are dropped before return; callers see exactly the shards that
-/// will produce a non-empty superfile.
-fn split_buffer_into_row_shards(
+/// Row imbalance across pieces is ≤ 1: with `total_rows = q·n + r`, the first `r` pieces get
+/// `q+1` rows and the rest get `q`.
+///
+/// Trailing empty pieces (only possible when `total_rows < n_superfiles`) are dropped before
+/// return; callers see exactly the pieces that will produce a non-empty superfile.
+fn split_buffer_into_superfile_inputs(
     buffer: Vec<BufferedBatch>,
-    n_shards: usize,
+    n_superfiles: usize,
     vector_dims: &[usize],
 ) -> Vec<Vec<BufferedBatch>> {
-    debug_assert!(n_shards > 0);
+    debug_assert!(n_superfiles > 0);
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
     if total_rows == 0 {
         return Vec::new();
     }
-    let base = total_rows / n_shards;
-    let remainder = total_rows % n_shards;
+    let base = total_rows / n_superfiles;
+    let remainder = total_rows % n_superfiles;
     let target = |i: usize| if i < remainder { base + 1 } else { base };
 
-    let mut shards: Vec<Vec<BufferedBatch>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut shard_idx = 0usize;
-    let mut shard_remaining = target(0);
+    let mut pieces: Vec<Vec<BufferedBatch>> = (0..n_superfiles).map(|_| Vec::new()).collect();
+    let mut piece_idx = 0usize;
+    let mut piece_remaining = target(0);
 
     for batch in buffer {
         let n_rows = batch.scalar.num_rows();
@@ -501,14 +623,14 @@ fn split_buffer_into_row_shards(
         }
         let mut row_cursor = 0;
         while row_cursor < n_rows {
-            // Skip ahead over any zero-target shards (only happens
-            // when total_rows < n_shards, leaving trailing shards
+            // Skip ahead over any zero-target pieces (only happens
+            // when total_rows < n_superfiles, leaving trailing pieces
             // with target == 0).
-            while shard_remaining == 0 && shard_idx + 1 < n_shards {
-                shard_idx += 1;
-                shard_remaining = target(shard_idx);
+            while piece_remaining == 0 && piece_idx + 1 < n_superfiles {
+                piece_idx += 1;
+                piece_remaining = target(piece_idx);
             }
-            let take = cmp::min(shard_remaining, n_rows - row_cursor);
+            let take = cmp::min(piece_remaining, n_rows - row_cursor);
             let scalar = batch.scalar.slice(row_cursor, take);
             let vectors: Vec<Arc<Float32Array>> = batch
                 .vectors
@@ -519,13 +641,13 @@ fn split_buffer_into_row_shards(
                     Arc::new(v.slice(row_cursor * dim, take * dim))
                 })
                 .collect();
-            shards[shard_idx].push(BufferedBatch { scalar, vectors });
+            pieces[piece_idx].push(BufferedBatch { scalar, vectors });
             row_cursor += take;
-            shard_remaining -= take;
+            piece_remaining -= take;
         }
     }
-    shards.retain(|s| !s.is_empty());
-    shards
+    pieces.retain(|s| !s.is_empty());
+    pieces
 }
 
 /// After a manifest swap that drops superfile references, schedule a deferred
@@ -742,7 +864,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(rows = batch.num_rows()))
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         let mut w = self
@@ -781,7 +903,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows()))
+        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn update(
         &self,
@@ -825,7 +947,10 @@ impl Supertable {
     /// assert_eq!(stats.n_tombstoned(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
+    )]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         let mut w = self
             .writer()
@@ -876,8 +1001,10 @@ impl Supertable {
                 buffer_scalar_bytes: 0,
                 buffer_vector_bytes: 0,
                 buffer_fts_bytes: 0,
+                pending_ingest: IngestTally::default(),
                 pending_updates: Vec::new(),
                 pending_deletes: Vec::new(),
+                op_stats: op_stats::current(),
             }),
             Err(_) => Err(BuildError::SupertableInUse),
         }
@@ -957,7 +1084,7 @@ impl SupertableWriter {
     /// id column at position 0.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len()))
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len(), role = self.inner.role.as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         let options = &self.inner.options;
@@ -965,32 +1092,9 @@ impl SupertableWriter {
         // Validate + split. Batch schema is user_schema (no id col).
         let (scalar_no_id, _vector_slices) = split_vectors(batch, options)?;
 
-        // Re-derive owned Arc<Float32Array> handles for each vector column. We can't keep the &[f32] slices from
-        // split_vectors in the buffer (their lifetime is tied to `batch`, which the caller reclaims after this returns).
-        // The Arc<Float32Array> shares the same underlying buffer — no bytes copied.
-        let mut vectors = Vec::with_capacity(options.vector_columns.len());
-        for vc in &options.vector_columns {
-            let col_idx = batch
-                .schema()
-                .index_of(&vc.column)
-                .map_err(|_| BuildError::BatchSchemaMismatch)?;
-
-            let fsl = batch
-                .column(col_idx)
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or(BuildError::BatchSchemaMismatch)?;
-
-            let values = fsl.values();
-
-            let f32_arr = values
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or(BuildError::BatchSchemaMismatch)?
-                .clone();
-
-            vectors.push(Arc::new(f32_arr));
-        }
+        // Owned handles for the buffer: the &[f32] slices from split_vectors
+        // are tied to `batch`, which the caller reclaims after this returns.
+        let vectors = owned_vector_arrays(batch, options)?;
 
         // Mint one id per row and prepend the id column. Lock
         // is uncontended in practice (writer-slot exclusivity
@@ -1025,22 +1129,38 @@ impl SupertableWriter {
         // Arrow buffer allocations (rough but good enough); the vector payload is
         // its exact f32 size. The FTS text columns are a subset of the scalar
         // columns, summed separately only to weight the build-scratch reserve.
+        //
+        // The priced legs measure `scalar_no_id` — the caller's own columns,
+        // without the engine-minted `_id`. `update` meters the same shape, so
+        // an update and an equivalent append report identical payload bytes
+        // instead of the update looking artificially cheaper.
+        let (scalar_bytes_u64, vector_bytes_u64, fts_bytes_u64) = ingested_byte_legs(
+            &scalar_no_id,
+            vectors.iter().map(|v| v.len()).sum(),
+            options,
+        );
+        // Buffer accounting is a different question — held memory — and the
+        // buffer owns `scalar`, ids included, so it measures that instead.
         let scalar_bytes = scalar.get_array_memory_size();
-        let vector_bytes = vectors
-            .iter()
-            .map(|v| v.len() * mem::size_of::<f32>())
-            .sum::<usize>();
-        let fts_bytes = options
-            .fts_columns
-            .iter()
-            .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
-            .map(|idx| scalar.column(idx).get_array_memory_size())
-            .sum::<usize>();
+        let vector_bytes = vector_bytes_u64 as usize;
+        let fts_bytes = fts_bytes_u64 as usize;
 
         self.buffer.push(BufferedBatch { scalar, vectors });
         self.buffer_scalar_bytes += scalar_bytes;
         self.buffer_vector_bytes += vector_bytes;
         self.buffer_fts_bytes += fts_bytes;
+
+        // Per-op work stats: the write's input shape, counted here from
+        // the caller's batch — before any shard split or commit retry — so
+        // the values are deterministic by construction (see the op_stats
+        // module's write-side determinism note). They are held on the
+        // writer rather than published now: nothing is durable until the
+        // commit below returns Ok, and a counter that says "rows written"
+        // must not describe rows that were dropped with the buffer.
+        self.pending_ingest.rows += n_rows as u64;
+        self.pending_ingest.scalar_bytes += scalar_bytes_u64;
+        self.pending_ingest.vector_bytes += vector_bytes_u64;
+        self.pending_ingest.fts_text_bytes += fts_bytes_u64;
 
         // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
         // reserve-time concern, not held memory.
@@ -1162,6 +1282,11 @@ impl SupertableWriter {
             )));
         }
 
+        // The vector check `append` runs, at call time rather than in the
+        // commit's append phase — where it would surface as a partial commit
+        // for a mutation that buffered nothing.
+        split_vectors(&new_rows, &self.inner.options).map_err(MutationError::InvalidNewRows)?;
+
         // Resolve the predicate against the latest committed manifest, not a
         // bounded-staleness snapshot: a stale resolve would miss a row
         // committed after the snapshot and leave the old version live beside
@@ -1219,6 +1344,18 @@ impl SupertableWriter {
         // call time (rather than commit time) means the caller
         // can drop the `RecordBatch` immediately — the buffer
         // owns the bytes from here on.
+        // Measure the replacement payload before the batch is dropped: the
+        // entry keeps only the IPC bytes from here on, so this is the last
+        // point the byte legs can be derived. Same helper `append` uses, so
+        // an updated row is measured exactly like an appended one.
+        let (upd_scalar_bytes, upd_vector_bytes, upd_fts_bytes) = {
+            let options = &self.inner.options;
+            let (scalar_no_id, vector_slices) =
+                split_vectors(&new_rows, options).map_err(MutationError::InvalidNewRows)?;
+            let elems = vector_slices.iter().map(|v| v.len()).sum();
+            ingested_byte_legs(&scalar_no_id, elems, options)
+        };
+
         let ipc_bytes = encode_record_batch_ipc(&new_rows).map_err(|e| {
             MutationError::Storage(StorageError::Permanent {
                 uri: "ipc encode".into(),
@@ -1235,6 +1372,9 @@ impl SupertableWriter {
             new_row_count: matched as u32,
             new_row_content_hash: content_hash,
             ipc_bytes,
+            scalar_bytes_written: upd_scalar_bytes,
+            vector_bytes_written: upd_vector_bytes,
+            fts_text_bytes_written: upd_fts_bytes,
         });
         Ok(PendingUpdate { matched })
     }
@@ -1267,6 +1407,8 @@ impl SupertableWriter {
             buffered = self.buffer.len(),
             updates = self.pending_updates.len(),
             deletes = self.pending_deletes.len(),
+            role = self.inner.role.as_str(),
+            origin = OpOrigin::Ingest.as_str(),
         ))
     )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
@@ -1360,24 +1502,29 @@ impl SupertableWriter {
         })
     }
 
-    /// Drive one pending update entry through its full WAL
-    /// pipeline. Returns the per-op outcome on success.
-    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
-        let storage = self
-            .inner
-            .options
-            .storage
-            .as_ref()
-            .ok_or(MutationError::NoStorageAttached)?
-            .clone();
-
-        let wal_doc = WalStateDoc {
+    /// Build the `Intent` state doc for one buffered update.
+    ///
+    /// Leased at create for the same reason as [`Self::delete_wal_doc`], and
+    /// the window it closes is wider here: an unowned `Intent` UPDATE is
+    /// drivable by a sweep from its very first step, so a peer would run the
+    /// append phase — building and publishing the replacement superfile —
+    /// against the same preallocated id while this writer was doing it too.
+    ///
+    /// One `now` stamps `created_at` and both lease timestamps.
+    fn update_wal_doc(&self, entry: &PendingUpdateEntry, now: DateTime<Utc>) -> WalStateDoc {
+        let lease_span = ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+            .expect("default lease duration should be a valid chronoduration");
+        WalStateDoc {
             wal_id: entry.wal_id,
             schema_version: SCHEMA_VERSION,
             op_kind: OpKind::Update,
             state: WalState::Intent,
-            created_at: Utc::now(),
-            lease: None,
+            created_at: now,
+            lease: Some(Lease {
+                owner: self.inner.handle_id,
+                acquired_at: now,
+                expires_at: now + lease_span,
+            }),
             predicate_repr: "writer.update()".into(),
             target_ids: entry.target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: Some(entry.new_row_count),
@@ -1393,12 +1540,28 @@ impl SupertableWriter {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
-        };
+        }
+    }
+
+    /// Drive one pending update entry through its full WAL
+    /// pipeline. Returns the per-op outcome on success.
+    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        let wal_doc = self.update_wal_doc(entry, Utc::now());
 
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let wal_id = entry.wal_id;
         let ipc_bytes = entry.ipc_bytes.clone();
+        let owner = self.inner.handle_id;
+        let drive_op_stats = self.op_stats.clone();
         let drive = async move {
             wal_store
                 .put_arrow(wal_id, ipc_bytes)
@@ -1408,15 +1571,35 @@ impl SupertableWriter {
                 .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let (_outcome, doc_after_append, etag_after_append) =
-                pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await?;
-            let (outcome, _post, _post_etag) = pipeline::run_tombstone_phase(
+            let append = pipeline::run_append_phase(
+                &supertable,
+                &wal_store,
+                &wal_doc,
+                &etag,
+                drive_op_stats,
+            )
+            .await;
+            let (_outcome, doc_after_append, etag_after_append) = match append {
+                Ok(appended) => appended,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
+            let tombstone = pipeline::run_tombstone_phase(
                 &supertable,
                 &wal_store,
                 &doc_after_append,
                 &etag_after_append,
             )
-            .await?;
+            .await;
+            let (outcome, _post, _post_etag) = match tombstone {
+                Ok(applied) => applied,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
             let (n_t, n_nf) = match outcome {
                 TombstonePhaseOutcome::Applied {
                     n_tombstoned,
@@ -1433,6 +1616,26 @@ impl SupertableWriter {
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        // Per-op work stats: the update's replacement rows are appended
+        // through the WAL pipeline (not the buffered append above), so
+        // they count here — after the drive returns Ok — alongside the
+        // rows its tombstone phase retired.
+        if let Some(stats) = &self.op_stats {
+            stats.add_ingested_write(
+                u64::from(entry.new_row_count),
+                entry.scalar_bytes_written,
+                entry.vector_bytes_written,
+                entry.fts_text_bytes_written,
+            );
+            stats.add_rows_tombstoned(n_tombstoned as u64);
+            // An update commits a manifest (replacement superfile +
+            // manifest json + pointer); a pure delete does not — its
+            // tombstone CAS-writes stay recorded-only, see
+            // `add_planned_commit_requests`.
+            if entry.new_row_count > 0 {
+                stats.add_planned_commit_requests(UPDATE_PLANNED_DATA_OBJECTS);
+            }
+        }
         Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -1441,24 +1644,39 @@ impl SupertableWriter {
         })
     }
 
-    /// Drive one pending delete entry through its tombstone
-    /// phase. Returns the per-op outcome on success.
-    fn drive_one_delete(&self, entry: &PendingDeleteEntry) -> Result<MutationStats, MutationError> {
-        let storage = self
-            .inner
-            .options
-            .storage
-            .as_ref()
-            .ok_or(MutationError::NoStorageAttached)?
-            .clone();
-
-        let wal_doc = WalStateDoc {
+    /// Build the `Intent` state doc for one buffered delete.
+    ///
+    /// The doc is born already leased to this handle. `create` is the WAL's
+    /// first appearance on storage, so stamping the lease into the created
+    /// bytes leaves no window in which a peer's recovery sweep could see an
+    /// unowned `Intent` doc and start driving the same tombstone phase
+    /// underneath us — a `try_acquire` issued after `create` would leave
+    /// exactly that window, and losing the race there costs the caller its
+    /// whole delete (the peer's CAS invalidates our etag, so every
+    /// subsequent per-target write fails and `commit` reports a partial
+    /// commit for work that actually landed).
+    ///
+    /// The lease stays advisory: the etag CAS chain in the tombstone phase
+    /// is what keeps concurrent drivers correct. This only keeps a peer
+    /// from duplicating the work and knocking us off our etag.
+    ///
+    /// One `now` stamps `created_at` and both lease timestamps so the
+    /// doc's creation time and its lease window come from a single clock
+    /// reading.
+    fn delete_wal_doc(&self, entry: &PendingDeleteEntry, now: DateTime<Utc>) -> WalStateDoc {
+        let lease_span = ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+            .expect("default lease duration should be a valid chronoduration");
+        WalStateDoc {
             wal_id: entry.wal_id,
             schema_version: SCHEMA_VERSION,
             op_kind: OpKind::Delete,
             state: WalState::Intent,
-            created_at: Utc::now(),
-            lease: None,
+            created_at: now,
+            lease: Some(Lease {
+                owner: self.inner.handle_id,
+                acquired_at: now,
+                expires_at: now + lease_span,
+            }),
             predicate_repr: "writer.delete()".into(),
             target_ids: entry.target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: None,
@@ -1474,7 +1692,21 @@ impl SupertableWriter {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
-        };
+        }
+    }
+
+    /// Drive one pending delete entry through its tombstone
+    /// phase. Returns the per-op outcome on success.
+    fn drive_one_delete(&self, entry: &PendingDeleteEntry) -> Result<MutationStats, MutationError> {
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        let wal_doc = self.delete_wal_doc(entry, Utc::now());
 
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
@@ -1489,13 +1721,21 @@ impl SupertableWriter {
             .as_ref()
             .map(|vit| Arc::clone(vit.inner()));
         let deleted_ids: Vec<i128> = entry.target_ids.clone();
+        let owner = self.inner.handle_id;
         let drive = async move {
             let etag = wal_store
                 .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let (outcome, _post, _post_etag) =
-                pipeline::run_tombstone_phase(&supertable, &wal_store, &wal_doc, &etag).await?;
+            let phase =
+                pipeline::run_tombstone_phase(&supertable, &wal_store, &wal_doc, &etag).await;
+            let (outcome, _post, _post_etag) = match phase {
+                Ok(applied) => applied,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
             let (n_t, n_nf) = match outcome {
                 TombstonePhaseOutcome::Applied {
                     n_tombstoned,
@@ -1519,6 +1759,11 @@ impl SupertableWriter {
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        // Per-op work stats: rows this delete retired, after the drive
+        // returns Ok.
+        if let Some(stats) = &self.op_stats {
+            stats.add_rows_tombstoned(n_tombstoned as u64);
+        }
         Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -1558,18 +1803,33 @@ impl SupertableWriter {
         let saved_scalar = self.buffer_scalar_bytes;
         let saved_vector = self.buffer_vector_bytes;
         let saved_fts = self.buffer_fts_bytes;
+        let saved_ingest = mem::take(&mut self.pending_ingest);
         let buffer = mem::take(&mut self.buffer);
         self.buffer_scalar_bytes = 0;
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
 
         match self.commit_appends_with_taken_buffer(&buffer) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Durable now, so the ingested work is real work. An
+                // all-empty-batch commit publishes nothing and reports
+                // nothing.
+                if let (Some(stats), true) = (&self.op_stats, saved_ingest.rows > 0) {
+                    stats.add_ingested_write(
+                        saved_ingest.rows,
+                        saved_ingest.scalar_bytes,
+                        saved_ingest.vector_bytes,
+                        saved_ingest.fts_text_bytes,
+                    );
+                }
+                Ok(())
+            }
             Err(e) => {
                 self.buffer = buffer;
                 self.buffer_scalar_bytes = saved_scalar;
                 self.buffer_vector_bytes = saved_vector;
                 self.buffer_fts_bytes = saved_fts;
+                self.pending_ingest = saved_ingest;
                 Err(e)
             }
         }
@@ -1614,11 +1874,24 @@ impl SupertableWriter {
             return Ok(());
         }
 
+        // The commit's payload, read off the taken buffer before either
+        // shard-count helper is consulted, so both arms price the same
+        // number. Deliberately not the sealed output: every shard carries
+        // its own dictionary, FST and index headers, so sealed bytes scale
+        // with the shard split — and the split follows the writer pool's
+        // width. On a shared-vocabulary corpus the same input seals to
+        // roughly four times more bytes at width 16 than at width 1, so
+        // pricing off sealed bytes makes an identical append plan more
+        // requests on a wider host, which is precisely what the write-side
+        // determinism contract forbids.
+        let payload_bytes = buffered_payload_bytes(buffer);
+
         let list_metadata = CommitListMetadata {
             partition_strategy: None,
             global_vector_index: pending_gvi.clone(),
             drained_ranges: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
 
         // Vector commit: same row-shard fanout as the legacy path. Each writer
@@ -1646,28 +1919,142 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            let (outputs, cell_hints) =
-                commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric)?;
-            let build_elapsed = commit_t0.elapsed();
-            let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
-            let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-            let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
-            let data_put_bytes: usize = user_batch
-                .pending_storage_writes
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum();
+            // Pipelined publish on storage-backed tables: shards stream
+            // to the uploader as each finishes packing, so the commit
+            // pays ~max(pack, PUT) instead of pack + PUT. The manifest
+            // CAS below still runs strictly after every byte is durable —
+            // the durability boundary is unmoved. The in-memory path
+            // keeps the collected build: there is no upload to overlap.
+            let piped_storage = self.inner.options.storage.as_ref().cloned();
+            let (
+                user_batch,
+                build_elapsed,
+                upload_drain_elapsed,
+                prepare_elapsed,
+                output_bytes,
+                data_put_bytes,
+            ) = if let Some(storage) = piped_storage {
+                let (tx, rx) =
+                    channel::<(u32, PreparedSuperfile)>(commit_write_concurrency().get());
+                let runtime = self.inner.query_runtime();
+                let uploader = runtime.spawn(upload_prepared_shards(
+                    storage,
+                    self.inner.options.put_multipart_threshold_bytes,
+                    rx,
+                ));
+                let built = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    Some(&tx),
+                );
+                // Stamped where the pack ends, not after the join below:
+                // every shard has been handed off by now, so this is the
+                // pack's own cost. Charging the join to it would bury the
+                // upload time that did NOT fit under the pack inside the
+                // build number — which is the one number that would show
+                // this change failing to overlap anything.
+                let build_elapsed = commit_t0.elapsed();
+                // Close the channel even on a build error so the
+                // uploader terminates; join it BEFORE surfacing the
+                // build result so no upload outlives this commit.
+                drop(tx);
+                let uploaded = bridge_on_runtime(
+                    async move {
+                        uploader.await.map_err(|join| {
+                            BuildError::Store(format!("pipelined uploader: {join}"))
+                        })?
+                    },
+                    &runtime,
+                );
+                // The upload tail: PUTs still in flight when the last
+                // shard finished packing. Zero here means the network kept
+                // up with the pack entirely.
+                let upload_drain_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let (outputs, _hints) = built?;
+                // A real error, not a `debug_assert`: on the piped path
+                // every shard leaves through the channel, so a collected
+                // shard here is one the uploader never saw. Releasing it
+                // would publish a manifest entry whose bytes were never
+                // PUT, so the commit must fail instead.
+                if !outputs.is_empty() {
+                    return Err(BuildError::Store(
+                        "pipelined drain-commit returned collected shards".into(),
+                    ));
+                }
+                let (prepared, uploaded_bytes) = uploaded?;
+                let user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
+                let prepare_elapsed = commit_t0
+                    .elapsed()
+                    .saturating_sub(build_elapsed)
+                    .saturating_sub(upload_drain_elapsed);
+                let bytes = uploaded_bytes as usize;
+                (
+                    user_batch,
+                    build_elapsed,
+                    upload_drain_elapsed,
+                    prepare_elapsed,
+                    bytes,
+                    bytes,
+                )
+            } else {
+                let (outputs, cell_hints) = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    None,
+                )?;
+                let build_elapsed = commit_t0.elapsed();
+                let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
+                let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+                let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let data_put_bytes: usize = user_batch
+                    .pending_storage_writes
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .sum();
+                (
+                    user_batch,
+                    build_elapsed,
+                    // The unpiped path uploads in the publish wave, so it
+                    // has no tail to drain here.
+                    time::Duration::ZERO,
+                    prepare_elapsed,
+                    output_bytes,
+                    data_put_bytes,
+                )
+            };
+            // Computed before the batch moves into the publish future;
+            // flushed only after Ok below, so a failed or retried commit
+            // never counts.
+            let output_stats = self
+                .op_stats
+                .as_ref()
+                .map(|_| commit_output_stats(&user_batch));
             let publish_t0 = time::Instant::now();
             bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, user_batch, list_metadata),
                 &self.inner.query_runtime(),
             )?;
+            if let (Some(stats), Some((superfiles, bytes, fts_terms))) =
+                (&self.op_stats, output_stats)
+            {
+                stats.add_commit_outputs(superfiles, bytes, fts_terms);
+                stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
+            }
             if crate::storage::io_counters::timeline_enabled() {
-                eprintln!(
-                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
-                     publish {:.1}ms ({:.1} MiB data PUT)",
+                info!(
+                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + upload drain \
+                     {:.1}ms + prepare {:.1}ms + publish {:.1}ms ({:.1} MiB data PUT)",
                     build_elapsed.as_secs_f64() * 1e3,
                     output_bytes as f64 / (1u64 << 20) as f64,
+                    upload_drain_elapsed.as_secs_f64() * 1e3,
                     prepare_elapsed.as_secs_f64() * 1e3,
                     publish_t0.elapsed().as_secs_f64() * 1e3,
                     data_put_bytes as f64 / (1u64 << 20) as f64,
@@ -1681,7 +2068,18 @@ impl SupertableWriter {
 
         let writer_pool = Arc::clone(&self.inner.options.writer_pool);
         let n_threads = writer_pool.current_num_threads().max(1);
-        let n_shards = n_threads.min(total_rows);
+
+        // `scalar` is the whole buffer here: vector tables took the drain branch above, and text
+        // columns live inside `scalar`. Arrow reports capacity, not logical bytes — fine for a
+        // fanout heuristic that is clamped to the pool anyway.
+        let buffered_bytes: usize = buffer
+            .iter()
+            .map(|b| b.scalar.get_array_memory_size())
+            .sum();
+        let target_bytes =
+            (self.inner.options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
+        let n_superfiles =
+            superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
 
         let vector_dims: Vec<usize> = self
             .inner
@@ -1736,12 +2134,13 @@ impl SupertableWriter {
                         .collect();
                     (shards, hints)
                 } else {
-                    let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
+                    let shards =
+                        split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
                     let hints = vec![None; shards.len()];
                     (shards, hints)
                 }
             } else {
-                let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
+                let shards = split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
                 let hints = vec![None; shards.len()];
                 (shards, hints)
             };
@@ -1767,7 +2166,9 @@ impl SupertableWriter {
         // Phase B: user-only build + publish. No hidden incoming build/publish;
         // the hidden cell index is drained later straight from these user
         // superfiles, and pre-drain queries fall back to them.
-        let outputs = fanout_shards(&writer_pool, &shards, |slice| {
+        // The shard build is the append's own CPU — measured on the pool
+        // threads that run it, folded into the op's collector.
+        let outputs = fanout_shards_metered(&writer_pool, &self.op_stats, &shards, |slice| {
             build_one_shard_with_layout(
                 slice.as_slice(),
                 &user_options,
@@ -1777,10 +2178,21 @@ impl SupertableWriter {
         })?;
         let superfiles = outputs.len();
         let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+        // Same pre-move / post-Ok discipline as the vector arm above.
+        let output_stats = self
+            .op_stats
+            .as_ref()
+            .map(|_| commit_output_stats(&user_batch));
         bridge_on_runtime(
             persist_superfile_publish_batch_async(&user_inner, user_batch, list_metadata),
             &self.inner.query_runtime(),
         )?;
+        if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
+            (&self.op_stats, output_stats)
+        {
+            stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
+            stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
+        }
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
@@ -2583,6 +2995,132 @@ fn collect_prepared_superfiles(
     })
 }
 
+/// The three ingested-byte legs of one caller batch: scalar footprint,
+/// exact vector payload, and the FTS text subset of the scalar columns.
+///
+/// Shared by `append` and `update` so a replacement batch is measured the
+/// same way an appended one is — the update path reported zeros for all
+/// three before this existed, which under-counted every non-empty update.
+/// `vector_elems` is the total f32 count across the batch's vector
+/// columns — taken as a count rather than the arrays themselves because
+/// the two callers hold different representations of the same payload
+/// (`append` has built `Float32Array`s, `update` still has raw slices).
+fn ingested_byte_legs(
+    scalar: &RecordBatch,
+    vector_elems: usize,
+    options: &SupertableOptions,
+) -> (u64, u64, u64) {
+    // Visible bytes, not buffer capacity. `get_array_memory_size` sums
+    // `Buffer::capacity()` — the whole shared allocation — and is blind to
+    // an array's offset and length, so a zero-copy slice reports its
+    // parent's footprint. Chunked ingest (read one large batch, append it
+    // as N slices) is the ordinary pattern arrow-rs makes cheap precisely
+    // because slices share buffers, and it would bill N times the whole
+    // batch. Capacity remains right for `buffer_scalar_bytes`, which
+    // measures resident allocation and keeps `get_array_memory_size`;
+    // `buffer_vector_bytes` was never capacity-based — it reuses this
+    // function's exact f32 payload (`elems * 4`). The FTS leg moves with
+    // the priced legs deliberately: it weights the build-scratch reserve,
+    // and the builder's scratch scales with the text it will actually
+    // index — a slice's visible rows — not with the parent allocation the
+    // slice shares.
+    let scalar_bytes = scalar
+        .columns()
+        .iter()
+        .map(|c| visible_array_bytes(c.as_ref()))
+        .sum::<u64>();
+    let vector_bytes = (vector_elems * mem::size_of::<f32>()) as u64;
+    let fts_bytes = options
+        .fts_columns
+        .iter()
+        .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
+        .map(|idx| visible_array_bytes(scalar.column(idx).as_ref()))
+        .sum::<u64>();
+    (scalar_bytes, vector_bytes, fts_bytes)
+}
+
+/// The object size a table's data converges to — compaction's target, in
+/// bytes. The divisor that turns a commit's ingested payload into the
+/// number of objects the data itself occupies, independent of how many
+/// shards this particular commit happened to split into.
+fn commit_target_object_bytes() -> u64 {
+    crate::config::global()
+        .compaction
+        .target_superfile_size_mb
+        .saturating_mul(1024 * 1024)
+}
+
+/// Data objects a buffered append's plan implies: the objects its
+/// ingested payload occupies at the target object size.
+///
+/// Takes the payload, never the sealed output. Sealed bytes are a
+/// function of the shard split, which follows the writer pool's width, so
+/// pricing off them would make the same append cost different amounts on
+/// different hosts. See [`buffered_payload_bytes`].
+fn planned_data_objects(payload_bytes: u64) -> u64 {
+    if payload_bytes == 0 {
+        return 0;
+    }
+    let target = commit_target_object_bytes();
+    if target == 0 {
+        // A zero target is a misconfiguration, not a license to write for
+        // free: any committed payload occupies at least one object.
+        1
+    } else {
+        payload_bytes.div_ceil(target)
+    }
+}
+
+/// Bytes a taken buffer will write: the Arrow scalar footprint (the
+/// engine-minted `_id` included — it is stored too) plus the exact f32
+/// vector payload. Input-shaped, so it reads the same at every
+/// writer-pool width and across an OCC retry, which re-uses this buffer.
+fn buffered_payload_bytes(buffer: &[BufferedBatch]) -> u64 {
+    buffer
+        .iter()
+        .map(|b| {
+            b.scalar
+                .columns()
+                .iter()
+                .map(|c| visible_array_bytes(c.as_ref()))
+                .sum::<u64>()
+                + b.vectors
+                    .iter()
+                    .map(|v| (v.len() * mem::size_of::<f32>()) as u64)
+                    .sum::<u64>()
+        })
+        .sum()
+}
+
+/// Data objects an update's plan implies: its replacement rows land in
+/// the WAL's single preallocated superfile, always exactly one.
+const UPDATE_PLANNED_DATA_OBJECTS: u64 = 1;
+
+/// One committed publish batch's output shape for the per-op work stats:
+/// superfile count, sealed on-storage bytes (from each entry's own
+/// `SubsectionOffsets::total_size`, so the figure is identical across
+/// storage backends), and the distinct-FTS-term sum across the new
+/// entries. All three are width-dependent and recorded-only — the shard
+/// split decides them. Callers compute this before the batch moves into
+/// the publish future and flush it only after the commit returns Ok, so a
+/// failed or retried publish never counts.
+fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
+    let superfiles = batch.new_entries.len() as u64;
+    let bytes: u64 = batch
+        .new_entries
+        .iter()
+        .filter_map(|entry| entry.subsection_offsets.as_ref())
+        .map(|offsets| offsets.total_size)
+        .sum();
+    let fts_terms: u64 = batch
+        .new_entries
+        .iter()
+        .flat_map(|entry| entry.fts_summary.values())
+        .map(|agg| agg.n_terms_distinct)
+        .sum();
+    (superfiles, bytes, fts_terms)
+}
+
 fn apply_pending_store_inserts(inner: &SupertableInner, inserts: Vec<(SuperfileUri, Bytes)>) {
     for (uri, bytes) in inserts {
         // Non-fatal: bytes are durable (or local-appended) and a later
@@ -3111,6 +3649,24 @@ async fn materialized_user_rows_for_drain(
     materialized_ivf_rows_in_doc_order(vec_reader, column, stable_ids, tombstones).await
 }
 
+/// Drain user superfiles into the hidden cell index.
+///
+/// A drain lands in TWO manifest commits:
+///   - **A (membership)** — activates the new cells, advances `drained_ranges`,
+///     and stamps ANY state that gates whether a row is VISIBLE (the resident
+///     `hnsw` graph included, built here against the prospective membership).
+///   - **B (settle)** — recall-quality slow serving state ONLY (routing / probe
+///     law / centroid section); a query is already correct without it.
+///
+/// The split is the invariant, not an accident: visibility-gating state MUST be
+/// atomic with `drained_ranges` (commit A), or a just-drained row falls into a
+/// window where it is drained out of the user arm but not yet in the graph —
+/// invisible to both. Recall-quality overlays belong in B, where lagging only
+/// costs a temporarily wider serving law, never a missing row. Origin: OPANN #422.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "drain", skip_all)
+)]
 pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     user_inner: Arc<SupertableInner>,
     hidden_inner: Arc<SupertableInner>,
@@ -3175,7 +3731,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     }
     let batch_cfg = drain_batch_superfiles(&user_inner.options);
     if batch_cfg == 0 {
-        eprintln!("[supertable drain] skipped (drain_batch_superfiles = 0)");
+        info!("[supertable drain] skipped (drain_batch_superfiles = 0)");
         return Ok(());
     }
 
@@ -3285,7 +3841,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .cloned()
             .collect();
         if selected.is_empty() {
-            eprintln!(
+            info!(
                 "[supertable drain] nothing to drain: all {} user superfile(s) already drained",
                 sources.len()
             );
@@ -3428,8 +3984,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let clean_uncheckpointed_drain = local_checkpoint.batches_done == 0
         && completed_shards.is_empty()
         && local_checkpoint.spills.is_empty();
-    let mut width_law = clean_uncheckpointed_drain
-        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
+    let mut width_law = clean_uncheckpointed_drain.then(|| {
+        opann::WidthLawCalibration::new(
+            running_clusters.dim as usize,
+            metric,
+            user_inner.options.target_recall,
+        )
+    });
     // #512 invariant tripwire: no re-encode in this drain may saturate its
     // destination quantizer — cosine rows are unit (ingest-normalized) so
     // the fixed grid covers them, and data-derived grids are built to cover
@@ -3578,7 +4139,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             } else {
                 0.0
             };
-            eprintln!(
+            info!(
                 "[supertable drain] batch {}/{} materialize I/O: {} object reads, {:.1} MiB, wall {:.1}ms, Σdur {:.1}ms, implied concurrency {:.1}x ({} range-gets)",
                 batch_idx + 1,
                 n_batches,
@@ -3679,7 +4240,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             }
                         },
                     ))
-                    .buffered(commit_write_concurrency())
+                    .buffered(commit_write_concurrency().get())
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
@@ -3834,7 +4395,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             DrainTestFailurePhase::AfterBatch,
             local_checkpoint.batches_done,
         )?;
-        eprintln!(
+        info!(
             "[supertable drain] batch {}/{} ({} sf, {batch_log})",
             batch_idx + 1,
             n_batches,
@@ -3850,11 +4411,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let scratch = drain_scratch.as_path();
         let n_cells_total = added_per_cell.len();
         let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
-        let n_shards = shard_count;
+        let n_superfiles = shard_count;
 
         let mut cell_counts_by_shard: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
         for (&cell, &count) in &added_per_cell {
-            let shard = packed_cell_shard(cell, n_shards) as u32;
+            let shard = packed_cell_shard(cell, n_superfiles) as u32;
             cell_counts_by_shard
                 .entry(shard)
                 .or_default()
@@ -3897,7 +4458,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 "drain has cell counts but no cell build sources".into(),
             ));
         }
-        let mut shard_sources = group_cells_by_packed_shard(sources, n_shards);
+        let mut shard_sources = group_cells_by_packed_shard(sources, n_superfiles);
         shard_sources.retain(|(shard_id, _)| !completed_shards.contains(shard_id));
         let checkpoint = Arc::new(Mutex::new(local_checkpoint));
         let vector_config = hidden_inner
@@ -4019,9 +4580,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map_err(|_| BuildError::Store("drain checkpoint lock poisoned".into()))?
             .clone();
 
-        if prepared_shards.len() + completed_shards.len() > n_shards {
+        if prepared_shards.len() + completed_shards.len() > n_superfiles {
             return Err(BuildError::Store(format!(
-                "drain produced {} packed shards for {n_shards} workers",
+                "drain produced {} packed shards for {n_superfiles} workers",
                 prepared_shards.len() + completed_shards.len()
             )));
         }
@@ -4036,7 +4597,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .iter()
             .map(|entry| (entry.uri, Arc::clone(entry)))
             .collect();
-        let pending_cache_inserts = publish.pending_cache_inserts;
+        let mut pending_cache_inserts = publish.pending_cache_inserts;
         let pending_store_inserts = publish.pending_store_inserts;
         let multipart_threshold = hidden_inner.options.put_multipart_threshold_bytes;
         let put_futures = publish
@@ -4051,7 +4612,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
-        let mut uploads = stream::iter(put_futures).buffer_unordered(commit_write_concurrency());
+        let mut uploads =
+            stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
         while let Some(uploaded) = uploads.next().await {
             let uri = uploaded?;
             let entry = entry_by_uri.get(&uri).cloned().ok_or_else(|| {
@@ -4191,7 +4753,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 routing.rerank_for_k
             );
         }
-        let list_metadata = CommitListMetadata {
+        let mut list_metadata = CommitListMetadata {
             partition_strategy: Some(PartitionStrategy::VectorCell {
                 column: column.clone(),
                 clusters: running_clusters.clone(),
@@ -4200,8 +4762,68 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             drained_ranges: Some(new_drained),
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        // Build the resident `hnsw` graph NOW, against a PROSPECTIVE manifest
+        // that already carries this drain's new cells + advanced watermark, and
+        // stamp its ref INTO this membership commit (Commit A) — never in the
+        // later settle. The graph gates query visibility (the hidden arm serves
+        // it), so it MUST land atomically with `drained_ranges`; a lag between
+        // the watermark and the graph is a window where a just-drained row is
+        // invisible to both arms. The cells are already durable objects
+        // (uploaded above), so the prospective's readers can score them; the
+        // graph blob is PUT here and orphaned harmlessly if the commit loses
+        // the CAS. The settle then reuses it (population key matches) → no-op.
+        let old_hidden = hidden_inner.manifest.load_full();
+        let (prospective, _parts) = list_metadata
+            .apply(&old_hidden)
+            .update(&new_entries, &no_removals)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        // Opt-in gate: only build the resident data graph when queries will
+        // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` the drain
+        // skips the build — no build tax, no RAM-pinned graph — and queries
+        // serve ivf. Gating here (not inside
+        // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
+        // build step.
+        // Which resident index this drain builds, if any. One manifest slot
+        // carries whichever it is, and the envelope states its kind, so adding
+        // a kind here does not widen the manifest.
+        let index_mode = crate::config::global().vector.search_mode;
+        let building_graph = index_mode == crate::config::VectorSearchMode::HnswIvf;
+        let building_flat = index_mode == crate::config::VectorSearchMode::FlatIvf;
+        // Warm the DISK CACHE with the just-drained cell bytes — already
+        // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
+        // full re-read of these same cells is served from the local cache
+        // instead of a cold GET of data we wrote seconds ago (the dominant
+        // drain-time cost on object-store deployments). This pre-build warm
+        // exists ONLY to serve that re-read, so it is gated on the graph path:
+        // under `ivf`/`gfc` there is no re-read, and warming here would just
+        // overlap the warmed bytes with the commit's own buffers (higher peak
+        // file memory) for no benefit — those modes warm AFTER the commit
+        // below, matching the non-graph baseline. The disk cache is URI-keyed
+        // and LRU-bounded, so if the membership CAS below loses, these entries
+        // are unreferenced and evicted under budget pressure. The in-memory
+        // store tier is NOT warmed here: it has no eviction, so pre-committing
+        // to it would pin bytes on a failed drain.
+        if building_graph
+            && !pending_cache_inserts.is_empty()
+            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
+        {
+            warm_cache_after_commit(&hidden_inner, cache, mem::take(&mut pending_cache_inserts));
+        }
+        let graph_ref = if building_graph {
+            build_hnsw_graph_ref(storage.as_ref(), &prospective).await
+        } else if building_flat {
+            build_flat_index_ref(storage.as_ref(), &prospective).await
+        } else {
+            None
+        };
+        list_metadata.graph_ref = Some(graph_ref);
+        // Commit A (membership). Visibility-gating state MUST land here,
+        // atomically with `drained_ranges`: cells, watermark, and the resident
+        // graph in one CAS. Do not defer any of it to the settle below.
         let new_manifest = persist_commit_async(
             &hidden_inner,
             Arc::clone(&storage),
@@ -4214,7 +4836,25 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .await
         .map_err(BuildError::from)?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
+        // Simulate a crash AFTER the membership commit landed but BEFORE settle.
+        // With the atomic fix the commit already carries the graph, so the
+        // just-drained rows stay visible without the settle; a test asserts
+        // that here. Pre-fix, the graph lagged in settle and the rows were
+        // invisible in exactly this gap.
+        #[cfg(test)]
+        maybe_fail_drain_for_test(
+            &remote_state.checkpoint.epoch_id,
+            DrainTestFailurePhase::AfterMembershipCommit,
+            0,
+        )?;
+        // In-memory store tier (cache-less deployments only): warmed after the
+        // commit succeeds, so a lost CAS never pins bytes in the non-evicting
+        // store.
         apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
+        // Disk-cache warm for the non-graph path (`ivf`/`gfc`): after the
+        // commit, matching the baseline ordering (lower peak file memory than
+        // warming before the commit). A no-op when the graph path already
+        // consumed the inserts in the pre-build warm above.
         if !pending_cache_inserts.is_empty()
             && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
         {
@@ -4225,24 +4865,24 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         {
             tracing::warn!("drain local checkpoint cleanup failed: {error}");
         }
-        eprintln!(
+        info!(
             "[supertable drain] cell build: {} row(s), {} cell(s) -> {} packed shard superfile(s) for {} worker(s), {:.1}ms",
             total_rows,
             n_cells_total,
             n_shard_files,
-            n_shards,
+            n_superfiles,
             build_t0.elapsed().as_secs_f64() * 1e3,
         );
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
             let (train_ms, assign_ms, calib_ms) =
                 crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
-            eprintln!(
+            info!(
                 "[supertable drain] cell build phases (summed CPU, {n_cells_total} cells): train {train_ms:.1}ms + assign {assign_ms:.1}ms + calibrate {calib_ms:.1}ms",
             );
         }
     }
 
-    eprintln!(
+    info!(
         "[supertable drain] done ({}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
         match consolidate {
             DrainConsolidate::Kmeans => "kmeans",
@@ -4260,12 +4900,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     );
     let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
     if clamped_components > 0 {
-        eprintln!(
+        warn!(
             "[supertable drain] BUG: {clamped_components} component(s) saturated their \
-             destination Sq8 quantizer during this drain's re-encodes (#512 failure \
-             mode). Cosine: an ingest path bypassed normalization; L2/NegDot: a \
-             destination grid failed to cover its inputs. Affected rows' recall \
-             silently degrades — find the source and rebuild the table.",
+             destination quantizer during this drain's re-encodes. Cosine: an ingest \
+             path bypassed normalization; L2/NegDot: a destination grid failed to \
+             cover its inputs. Affected rows' recall degrades — find the source and \
+             rebuild the table.",
         );
     }
     // Membership has settled: publish the slow-CAS entry blob and stamp its
@@ -4914,28 +5554,19 @@ fn assign_cells<'a>(
     Ok(out)
 }
 
-/// Size one cell's fine IVF so one run is approximately
-/// [`DRAIN_FINE_RUN_TARGET_BYTES`]. The stride counts every per-row byte in
-/// the packed IVF: RaBitQ estimate code, local id, Sq8+epsilon rerank bytes,
-/// inline stable id, and the conservative norm word.
 /// Per-cell drain config plus the centroid count derived for that cell. The
-/// count sizes each fine run to ~`DRAIN_FINE_RUN_TARGET_BYTES` of encoded
-/// rows against the cell's row count (independent of any caller knob), and is
-/// passed alongside the config into the cell-pack build.
+/// count sizes each fine run to the fine-run byte target of encoded rows against
+/// the cell's row count (independent of any caller knob), via the shared
+/// [`fine_run_target_n_cent`] — the same sizing merge re-applies, so a cell's
+/// fine runs stay near target through drains and compactions alike.
 fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig, usize) {
     debug_assert!(n_rows > 0);
-    let dim = cfg.dim;
     let rerank_codec = if cfg.rerank_codec.is_ivf_mergeable() {
         cfg.rerank_codec
     } else {
         RerankCodec::Sq8Residual
     };
-    let rabitq_bytes = dim.div_ceil(u8::BITS as usize);
-    let rerank_bytes = rerank_codec.per_vector_bytes(dim);
-    let row_stride =
-        rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
-    let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
-    let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
+    let n_cent = fine_run_target_n_cent(cfg.dim, rerank_codec, n_rows);
     let cell_cfg = VectorConfig {
         rerank_codec,
         provided_centroids: None,
@@ -5177,19 +5808,113 @@ fn build_prepared_from_spilled_cells(
 ///
 /// 1. assign the **whole buffer** to global cells in one pass (drain's core;
 ///    the boundary-replica budget is batch-global, exactly like drain),
-/// 2. group whole cells into ≤ `n_writers` shard files (`cell % N` — drain's
-///    [`group_cells_by_packed_shard`]),
+/// 2. group whole cells into ≤ `n_packed_shards` shard files (`cell % N` —
+///    drain's [`group_cells_by_packed_shard`]; the commit path passes
+///    [`packed_cell_shard_count`], the update append phase passes 1 so its
+///    single preallocated superfile id covers every cell),
 /// 3. each writer: `rayon::join` — drain pack (fp32→Sq8→materialized fine
 ///    IVF) ‖ Parquet+FTS for that shard's primary rows — then splice + finish.
 ///
 /// Rows are resharded by centroid distance instead of arrival time; drain
 /// never writes superfiles or touches S3 here — the writer publishes through
 /// the normal batch path.
+/// Streaming handoff for the pipelined commit publish: each pool task
+/// sends its shard the moment prepare finishes, so the uploader has the
+/// storage bytes in flight while the remaining shards are still packing.
+///
+/// Bounded, and sent to with `blocking_send` from the pack's pool threads:
+/// an unbounded queue would let a fast pack outrun a slow object store and
+/// hold every sealed shard at once, which is the peak memory the pipeline
+/// exists to avoid. At this depth the bytes in memory are what the uploader
+/// has in flight plus one queued shard per upload slot.
+type PipelinedShardTx = Sender<(u32, PreparedSuperfile)>;
+
+/// Drain `rx`, PUTting each shard's storage bytes as it arrives, at most
+/// [`commit_write_concurrency`] uploads in flight. Returns the prepared
+/// shards in shard-id order (manifest entry order must not depend on
+/// upload completion order) with their storage bytes taken, plus the
+/// uploaded byte total.
+///
+/// The manifest CAS runs strictly after this completes, so the
+/// durability boundary is unmoved. A failure after some PUTs leaves
+/// orphans that gc reaps past its reclaim grace — the same recovery as a
+/// crash between the batch upload wave and the CAS on the unpiped path.
+async fn upload_prepared_shards(
+    storage: Arc<dyn StorageProvider>,
+    multipart_threshold: u64,
+    mut rx: Receiver<(u32, PreparedSuperfile)>,
+) -> Result<(Vec<PreparedSuperfile>, u64), BuildError> {
+    let cap = commit_write_concurrency().get();
+    let mut in_flight = FuturesUnordered::new();
+    let mut done: Vec<(u32, PreparedSuperfile)> = Vec::new();
+    let mut uploaded_bytes: u64 = 0;
+    let mut open = true;
+    // The first upload error, held until every PUT already started has
+    // settled. Returning at the first failure would drop the other futures
+    // mid-request: a cancelled multipart leaves its uploaded parts behind
+    // with no abort, and those parts are not an orphaned superfile that gc
+    // reclaims. Draining also keeps receiving, so a packing thread parked on
+    // a full queue is never left there.
+    let mut failure: Option<BuildError> = None;
+    while open || !in_flight.is_empty() {
+        tokio::select! {
+            received = rx.recv(), if open && in_flight.len() < cap => match received {
+                Some((shard_id, mut prepared)) => {
+                    if failure.is_some() {
+                        // The commit is already lost; take the shard off the
+                        // queue and drop it rather than starting a PUT whose
+                        // bytes nothing will reference.
+                        continue;
+                    }
+                    let Some((uri, bytes)) = prepared.bytes_for_storage.take() else {
+                        // Unreachable as written: `prepare_superfile` fills
+                        // `bytes_for_storage` whenever the table has storage,
+                        // and this path runs only when it does. Fail closed
+                        // regardless — accepting the shard would hand
+                        // `collect_prepared_superfiles` an entry to publish
+                        // for an object nothing ever PUT, which is the same
+                        // hazard the collected-shards guard above refuses.
+                        failure.get_or_insert_with(|| {
+                            BuildError::Store(format!(
+                                "pipelined shard {shard_id} carries no storage bytes"
+                            ))
+                        });
+                        continue;
+                    };
+                    uploaded_bytes += bytes.len() as u64;
+                    let storage = Arc::clone(&storage);
+                    in_flight.push(async move {
+                        put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                            .await
+                            .map(|()| (shard_id, prepared))
+                            .map_err(|error| BuildError::Store(error.to_string()))
+                    });
+                }
+                None => open = false,
+            },
+            Some(finished) = in_flight.next(), if !in_flight.is_empty() => match finished {
+                Ok(shard) => done.push(shard),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    done.sort_by_key(|(shard_id, _)| *shard_id);
+    Ok((done.into_iter().map(|(_, p)| p).collect(), uploaded_bytes))
+}
+
 fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
     clusters: &ClusterCentroids,
     metric: Metric,
+    n_packed_shards: usize,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    pipeline: Option<&PipelinedShardTx>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -5279,28 +6004,66 @@ fn commit_shards_via_drain(
         .into_iter()
         .map(|group| (group.cell_id, group))
         .collect();
-    let packed_shards =
-        group_cells_by_packed_shard(assigned_cells, packed_cell_shard_count(&inner.options));
+    let packed_shards = group_cells_by_packed_shard(assigned_cells, n_packed_shards);
 
     let options = &inner.options;
-    let shard_outputs = fanout_shards(&inner.options.writer_pool, &packed_shards, |task| {
-        let (shard_id, cells) = task;
-        build_one_packed_shard_via_drain(
-            cells,
-            &source_scalar,
-            &vector_views,
-            &local_by_id,
-            options,
-            &vc,
-        )
-        .map(|output| output.map(|output| (*shard_id, output)))
-    })?;
+    let shard_outputs = fanout_shards_metered(
+        &inner.options.writer_pool,
+        op_stats,
+        &packed_shards,
+        |task| -> Result<Option<(u32, ShardOutput)>, BuildError> {
+            let (shard_id, cells) = task;
+            let output = build_one_packed_shard_via_drain(
+                cells,
+                &source_scalar,
+                &vector_views,
+                &local_by_id,
+                options,
+                &vc,
+            )?;
+            let Some(tx) = pipeline else {
+                return Ok(output.map(|output| (*shard_id, output)));
+            };
+            // Pipelined publish: prepare on this pool thread and hand the
+            // shard to the uploader NOW, so its storage bytes go out while
+            // the remaining shards are still packing — sealed bytes never
+            // accumulate across the fan-out.
+            let Some(output) = output else {
+                return Ok(None);
+            };
+            let Some(prepared) = prepare_superfile(inner, output)? else {
+                return Ok(None);
+            };
+            let PreparedSuperfile {
+                entry,
+                bytes_for_store,
+                bytes_for_storage,
+                bytes_for_cache,
+            } = prepared;
+            let entry = finish_superfile_entry(entry, Some(*shard_id))?;
+            // `blocking_send`, not `send`: this runs on a rayon pool thread
+            // (the fan-out is a `pool.install`), never a tokio worker, so
+            // parking here parks the pack — which is the backpressure. The
+            // uploader is a separate runtime task and keeps draining.
+            tx.blocking_send((
+                *shard_id,
+                PreparedSuperfile {
+                    entry,
+                    bytes_for_store,
+                    bytes_for_storage,
+                    bytes_for_cache,
+                },
+            ))
+            .map_err(|_| BuildError::Store("pipelined commit uploader closed mid-build".into()))?;
+            Ok(None)
+        },
+    )?;
     let fanout_elapsed = stage_t0
         .elapsed()
         .saturating_sub(flatten_elapsed)
         .saturating_sub(assign_elapsed);
     if crate::storage::io_counters::timeline_enabled() {
-        eprintln!(
+        info!(
             "[supertable commit] flatten {:.1}ms + assign {:.1}ms + shard pack/finish {:.1}ms",
             flatten_elapsed.as_secs_f64() * 1e3,
             assign_elapsed.as_secs_f64() * 1e3,
@@ -5315,6 +6078,68 @@ fn commit_shards_via_drain(
         outputs.push(entry.1);
     }
     Ok((outputs, cell_hints))
+}
+
+/// Build ONE cell-directory-packed superfile from an update's replacement
+/// rows — the WAL append phase's counterpart of [`commit_shards_via_drain`].
+///
+/// A single packed shard keeps the WAL's one-`preallocated_superfile_id`
+/// recovery contract: every cell the rows land in packs into the same file
+/// behind its cell directory. Routing through the commit path's build keeps
+/// update superfiles on the committed vector shape (cell routing + boundary
+/// replicas included); an unpacked plain build here is not a valid
+/// drained-side maintenance input — the drain materializer and the per-cell
+/// compaction merges both fail closed on it.
+pub(in crate::supertable) fn build_packed_update_superfile(
+    inner: &SupertableInner,
+    scalar_with_id: RecordBatch,
+    vectors: Vec<Arc<Float32Array>>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Bytes, BuildError> {
+    let pack_grid = inner
+        .manifest
+        .load()
+        .get_global_vector_index()
+        .ok_or_else(|| {
+            BuildError::Store(
+                "vector columns present but global cell grid missing for the update append phase"
+                    .into(),
+            )
+        })?
+        .into_user_grid();
+    let metric = inner
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.metric)
+        .unwrap_or(Metric::L2Sq);
+    let expected_rows = scalar_with_id.num_rows() as u64;
+    let buffer = [BufferedBatch {
+        scalar: scalar_with_id,
+        vectors,
+    }];
+    let (mut outputs, _cell_hints) = commit_shards_via_drain(
+        &buffer,
+        inner,
+        &pack_grid,
+        metric,
+        UPDATE_PACKED_SHARDS,
+        op_stats,
+        None,
+    )?;
+    let output = outputs.pop().ok_or(BuildError::NoDocsToBuild)?;
+    if !outputs.is_empty() || output.n_docs != expected_rows {
+        // Every replacement row is a primary of exactly one cell, so the
+        // single-shard build must return one output carrying every row;
+        // anything else would corrupt the WAL's row accounting.
+        return Err(BuildError::Store(format!(
+            "packed update build must emit one superfile with all rows: \
+             {} extra output(s), {} of {expected_rows} row(s) packed",
+            outputs.len(),
+            output.n_docs,
+        )));
+    }
+    Ok(output.bytes)
 }
 
 /// One writer, one packed shard (a group of whole cells): drain pack of the
@@ -6231,7 +7056,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(upload) = in_flight.next().await {
         if let Err(error) = upload {
             drop(in_flight);
@@ -6260,6 +7085,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         drained_ranges: None,
         global_vector_index: None,
         superseded_cells_additions: Some(superseded_additions),
+        graph_ref: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -6718,7 +7544,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(landed) = in_flight.next().await {
         if let Err(error) = landed {
             drop(in_flight);
@@ -6740,6 +7566,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         drained_ranges: None,
         global_vector_index: None,
         superseded_cells_additions: Some(superseded_additions),
+        graph_ref: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -7139,7 +7966,8 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // this scan measures. A drain that commits between the scan and the
     // stamp adds rows this evidence never saw.
     let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
-    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
+    let mut cal =
+        opann::WidthLawCalibration::new(clusters.dim as usize, metric, inner.options.target_recall);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
     // evenly spaced ordinals over the cell-ordered live-row enumeration —
     // the law's noise floor is set by evidence size, and any fixed stride
@@ -7406,6 +8234,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let base = Arc::new(list_metadata.apply(&manifest));
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -7526,6 +8355,10 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// already durable), then a list+pointer etag-CAS stamp with refresh-and-retry
 /// on contention — so a lost race rebuilds the blob from the winning
 /// membership, never stamping stale state.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(name = "refresh_vector_state", skip_all)
+)]
 pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -7567,6 +8400,294 @@ async fn previous_centroid_section(
     }
 }
 
+/// One-`u64` population key for the persisted `hnsw` graph — a
+/// digest of *which rows exist*, independent of how they are packed into
+/// superfiles. Built from repack-invariant aggregates (row count, min and
+/// max stable id) plus the consolidated delete generation (the manifest's
+/// deleted-id bytes), so:
+///   - a compaction that only repacks the same rows keeps the key stable →
+///     the settle reuses the existing graph (no rebuild);
+///   - any add or delete moves the key → rebuild.
+/// It stays one value (not per-node) and does not assume monotonic ids:
+/// min, max, and count together move under non-monotonic inserts and
+/// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
+/// correctness — the copy-flip and query-time doc-id dedup are the
+/// correctness guards.
+fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
+    let entries = manifest.get_all_superfiles();
+    let count: u64 = entries.iter().map(|e| e.n_docs).sum();
+    let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
+    let max_id = entries.iter().map(|e| e.id_max).max().unwrap_or(0);
+    // FNV-1a: deterministic across processes (unlike the std hasher), so a
+    // key recomputed at open matches one persisted at drain.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(&count.to_le_bytes());
+    mix(&min_id.to_le_bytes());
+    mix(&max_id.to_le_bytes());
+    if let Some(deleted) = manifest.deleted_user_ids_inline() {
+        mix(deleted);
+    }
+    h
+}
+
+/// Encode + PUT a data bundle as the generation's resident index section,
+/// logging the outcome under the kind actually published.
+///
+/// The kind is in the message because this function serves both index types:
+/// a flat publish logging as a graph publish is the same class of confusion
+/// the reasoned declines exist to remove — the log saying the mode you did not
+/// ask for.
+async fn publish_resident_index(
+    storage: &dyn StorageProvider,
+    population_key: u64,
+    high_water: i128,
+    kind: PayloadKind,
+    data_bundle: &[u8],
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let blob = crate::superfile::vector::hnsw::encode_resident_envelope(
+        population_key,
+        high_water,
+        &[],
+        Some((kind, data_bundle)),
+    );
+    let blob_mib = blob.len() / (1024 * 1024);
+    let label = kind.label();
+    match slow_vector_state::write_resident_index_blob(storage, blob).await {
+        Ok(reference) => {
+            tracing::debug!(uri = %reference.uri, blob_mib, "{label}: published resident index");
+            Some(reference)
+        }
+        Err(error) => {
+            tracing::warn!("{label}: publish failed: {error}");
+            None
+        }
+    }
+}
+
+/// Build and publish the persisted `hnsw` graph blob for a settled
+/// generation, returning its manifest ref (`None` when nothing is
+/// persisted). Best-effort: any read/build/publish problem logs and
+/// returns `None` so the drain stamp is never blocked and the query falls
+/// back to the lazy build or scan path.
+///
+/// When the prior generation already persisted a graph and this settle only
+/// **appended** rows, the delta is inserted into a copy of that graph
+/// ([`assemble_hnsw_incremental`]). The graph insert is ∝ new rows, and the
+/// post-insert recall recheck is bounded to a strided probe subsample once
+/// the grown corpus exceeds `hnsw_probe_max_docs` — so neither scales with
+/// the whole population (only the scan that locates the append delta does).
+/// Otherwise (no prior graph, or a non-append change) it does a full
+/// rebuild. PUT-before-CAS: the blob is durable before the caller stamps the
+/// manifest ref, so a crash before the manifest CAS just orphans the blob
+/// (GC-reclaimed) and keeps serving the prior generation.
+///
+/// Scope: the per-row **data** graph for the first vector column, gated here
+/// by `vector.hnsw_max_docs` (RAM ceiling). The opt-in `vector.search_mode =
+/// hnsw_ivf` gate lives at the sole caller (the drain), so this stays a pure
+/// build step — directly callable in tests without touching global config. The
+/// scale-free **centroid** graph is not yet built here — the bundle carries an
+/// empty centroid section.
+/// Build and publish the resident flat 4-bit index, returning the routing ref
+/// the manifest stamps. `None` means no index — the query serves `ivf`.
+///
+/// Peer of [`build_hnsw_graph_ref`], and shorter for two reasons that are worth
+/// stating rather than inferring from the absence of code.
+///
+/// There is no incremental arm. Extending a flat index would mean appending
+/// rows to a plane whose ruler was fitted over the previous population, which
+/// is exactly the first-input-ruler rule the graph's walk plane follows — but
+/// there it buys consistency with neighbour lists that already exist, and a
+/// scan has no neighbour lists. A rebuild is simply the correct answer, and it
+/// costs one pass over the corpus.
+///
+/// There is no calibration arm either: [`assemble_flat_sections`] owns the doc
+/// ceiling and the register gate, because both are decisions about the fitted
+/// plane rather than about publication.
+async fn build_flat_index_ref(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let column = manifest
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())?;
+    let population_key = resident_index_population_key(manifest);
+    let high_water_now = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.id_max)
+        .max()
+        .unwrap_or(0);
+    let t0 = std::time::Instant::now();
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_flat_sections(manifest, &column, &None)
+            .await
+        {
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("flat build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
+            Err(error) => {
+                tracing::warn!("flat build: assemble failed: {error}");
+                return None;
+            }
+        };
+    tracing::debug!(
+        data_bundle_mib = data_bundle.len() / (1024 * 1024),
+        wall_s = t0.elapsed().as_secs_f64(),
+        "flat: built index"
+    );
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Flat,
+        &data_bundle,
+    )
+    .await
+}
+
+async fn build_hnsw_graph_ref(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let Some(column) = manifest
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())
+    else {
+        tracing::debug!("hnsw: build skipped — no vector columns on this manifest");
+        return None;
+    };
+    let total_docs: u64 = manifest.get_all_superfiles().iter().map(|e| e.n_docs).sum();
+    let max_docs = crate::config::global().vector.hnsw_max_docs;
+    tracing::debug!(
+        column,
+        total_docs,
+        max_docs,
+        superfiles = manifest.get_all_superfiles().len(),
+        "hnsw: build hook"
+    );
+    if total_docs > max_docs {
+        tracing::info!(
+            total_docs,
+            max_docs,
+            "hnsw: build skipped — docs exceed hnsw_max_docs (data graph would exceed RAM)"
+        );
+        return None;
+    }
+    let population_key = resident_index_population_key(manifest);
+    let high_water_now = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.id_max)
+        .max()
+        .unwrap_or(0);
+    let t0 = std::time::Instant::now();
+
+    // Incremental append: extend the prior persisted graph with only the new
+    // rows, cloning it (fetch + decode) rather than mutating a serving graph.
+    if let Some(prior_ref) = manifest.resident_vector_index_blob()
+        && let Ok(sections) = slow_vector_state::hydrate_resident_index(
+            storage,
+            prior_ref,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        && let Some(prior_data) = sections.data.and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
+    {
+        let prior_count = prior_data.doc_ids.len();
+        match crate::supertable::query::vector::assemble_hnsw_incremental(
+            manifest,
+            &column,
+            &None,
+            prior_data,
+            sections.high_water_id,
+        )
+        .await
+        {
+            Ok(IndexOutcome::Ready((data_bundle, new_high_water, inserted))) => {
+                tracing::debug!(
+                    inserted,
+                    nodes = prior_count + inserted,
+                    data_bundle_mib = data_bundle.len() / (1024 * 1024),
+                    wall_s = t0.elapsed().as_secs_f64(),
+                    "hnsw: incremental insert into prior graph"
+                );
+                return publish_resident_index(
+                    storage,
+                    population_key,
+                    new_high_water,
+                    PayloadKind::Graph,
+                    &data_bundle,
+                )
+                .await;
+            }
+            Ok(IndexOutcome::Unavailable(reason)) => {
+                tracing::debug!("hnsw incremental: not applicable ({reason}); full rebuild");
+            }
+            Err(error) => {
+                tracing::debug!("hnsw: incremental error ({error}); full rebuild");
+            }
+        }
+    }
+
+    // Full rebuild.
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_hnsw_sections(manifest, &column, &None)
+            .await
+        {
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("hnsw build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
+            Err(error) => {
+                tracing::warn!("hnsw build: assemble failed: {error}");
+                return None;
+            }
+        };
+    tracing::debug!(
+        total_docs,
+        data_bundle_mib = data_bundle.len() / (1024 * 1024),
+        wall_s = t0.elapsed().as_secs_f64(),
+        "hnsw: built graph (full)"
+    );
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Graph,
+        &data_bundle,
+    )
+    .await
+}
+
+/// Publish/refresh the slow-CAS serving state (Commit B, "settle").
+///
+/// ONLY recall-quality overlay state belongs here — the routing blob, probe
+/// law, and centroid section. Between the membership commit (A) and this
+/// settle, a just-drained row is still VISIBLE (served from its cells under the
+/// default routing); B only UPGRADES the serving law. NEVER stamp anything here
+/// that gates visibility — it opens a window where the row is invisible to both
+/// arms across the A→B gap and durably so across a crash between them. The
+/// resident `hnsw` graph is visibility-critical, so it is stamped in Commit A
+/// (against the prospective membership), not here; this pass finds it already
+/// present with a matching population key and reuses it (a no-op).
 pub(in crate::supertable) async fn stamp_slow_vector_state(
     inner: &SupertableInner,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
@@ -7587,8 +8708,9 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         };
         let entries = old.get_all_superfiles();
         if entries.is_empty() && pending_drain.is_none() {
-            // Nothing to describe (pre-drain / empty table); the ref is
-            // already absent because `update` never carries it forward.
+            // Nothing to describe (pre-drain / empty table): no routing blob
+            // or centroid section to stamp, and a never-drained table has no
+            // graph ref either.
             return Ok(());
         }
         // Carried-forward entries are stripped (routing-shaped hydration);
@@ -7615,16 +8737,36 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             }
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
+        // The `hnsw` graph is built and stamped ONLY in the membership commit
+        // (Commit A), atomically with `drained_ranges`. This settle carries the
+        // prior ref forward untouched and NEVER builds. The graph is
+        // packing-invariant (keyed by `stable_id`), so the prior ref is correct
+        // in every case that reaches here: a drain already rebuilt it in
+        // Commit A; a compaction / merge / split repacks the same id population,
+        // so the same graph still covers it; a legacy generation carries no ref
+        // and stays on ivf until its next drain rebuilds one.
+        //
+        // Building here would let the graph be stamped outside the membership
+        // commit — a lag between the watermark and the graph is a window where a
+        // just-drained row is invisible to both arms, the exact visibility gap
+        // the atomic-drain stamp closes.
+        let graphs_ref = old.resident_vector_index_blob().cloned();
+        // No-op only when NOTHING changed — routing blob, centroid section,
+        // and the resolved graph ref all already stamped.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
+            && old.resident_vector_index_blob() == graphs_ref.as_ref()
         {
-            // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest =
-            old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
+        let new_manifest = old.with_slow_vector_state(
+            published.uri,
+            published.content_hash,
+            published.centroids,
+            graphs_ref,
+        );
         let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
@@ -7652,6 +8794,30 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     Err(BuildError::Store(
         "slow vector-state refresh: write contention exhausted".into(),
     ))
+}
+
+/// Best-effort lease hand-back after a mutation drive failed part-way.
+///
+/// The WAL itself stays on storage: its per-target progress is the recovery
+/// cursor, and a sweep finishes what we started. Clearing our lease first is
+/// what lets that sweep act on its very next pass — a sweep that finds a
+/// still-live lease counts the WAL as held-by-peer and skips it, and sweeps
+/// only run when a handle opens, so "skip this pass" can mean the tombstones
+/// wait a long while for another one.
+///
+/// Every failure here is a no-op we can ignore: a lease already preempted or
+/// cleared surfaces `Preempted` / `LeaseMissing` (a peer owns the WAL now, so
+/// it is exactly as recoverable as we wanted), a lost CAS means somebody else
+/// just wrote the doc, and a storage error leaves the lease to expire on its
+/// own. Logged at debug because none of it is actionable.
+async fn release_mutation_lease(wal_store: &WalStore, wal_id: WalId, owner: SupertableHandleId) {
+    if let Err(e) = lease::try_release(wal_store, wal_id, owner).await {
+        debug!(
+            error = %e,
+            "supertable: could not hand back the WAL lease after a failed mutation; \
+             recovery picks the WAL up once the lease expires"
+        );
+    }
 }
 
 async fn record_hidden_deleted_ids(
@@ -7730,6 +8896,15 @@ pub(crate) struct CommitListMetadata {
     /// superfiles here so their now-dead blocks are excluded from reads,
     /// counts, and merges without rewriting the parents.
     pub(crate) superseded_cells_additions: Option<BTreeMap<Uuid, BTreeSet<u32>>>,
+    /// The resident `hnsw` graph ref to stamp in THIS commit (`Some(inner)`
+    /// where `inner` is the built ref, or `None` if the graph declined). The
+    /// graph gates query visibility, so a drain builds it against the
+    /// prospective post-drain membership and stamps it HERE, atomically with
+    /// `drained_ranges` — never in a later settle, which would open a window
+    /// where a just-drained row is invisible to both serving arms. `None`
+    /// (the outer option) leaves the graph ref as `update` carried it forward
+    /// — the only correct value for every non-drain commit.
+    pub(crate) graph_ref: Option<Option<RoutingRef>>,
 }
 
 impl CommitListMetadata {
@@ -7742,6 +8917,7 @@ impl CommitListMetadata {
             && self.global_vector_index.is_none()
             && self.drained_ranges.is_none()
             && self.superseded_cells_additions.is_none()
+            && self.graph_ref.is_none()
     }
 
     /// Overlay stamped fields onto `base`. `ManifestSnapshot` is not
@@ -7760,6 +8936,13 @@ impl CommitListMetadata {
         }
         if let Some(additions) = &self.superseded_cells_additions {
             out = out.with_superseded_cells_added(additions);
+        }
+        if let Some(graphs) = &self.graph_ref {
+            // Stamp the graph ref so it lands atomically with membership +
+            // `drained_ranges`. `update` (in `try_commit_attempt`) carries this
+            // field forward and `with_slow_vector_state_ref` preserves it, so
+            // the graph ref survives to the durable list/pointer CAS.
+            out = out.with_slow_vector_state_graphs(graphs.clone());
         }
         out
     }
@@ -7900,11 +9083,14 @@ async fn put_superfile_replace(
 /// maintenance compaction each fan out their PUTs at this width, so keeping
 /// each at ~50% of cores bounds the combined in-flight PUTs to roughly the
 /// core count rather than a multiple of it.
-fn commit_write_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
-        .unwrap_or(1)
-        .max(1)
+///
+/// Returns `NonZeroUsize` because several callers are unsound at zero — a
+/// zero-capacity `channel` panics, and a zero-width `buffered` stalls — and
+/// a single-core host divides to zero before the floor applies. Carrying the
+/// floor in the type means no caller has to restate it.
+fn commit_write_concurrency() -> NonZeroUsize {
+    let half = available_parallelism().map(|n| n.get() / 2).unwrap_or(1);
+    NonZeroUsize::new(half).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// Upper bound on the drain's auto-sized read fan-out — keeps a very large box
@@ -7987,7 +9173,7 @@ async fn write_superfile_list_with_threshold(
     // fanout from each stacks and starves the connection pool until requests
     // hit the per-request timeout. Capping each operation at ~50% of cores
     // leaves headroom for a concurrent maintenance pass without saturation.
-    let write_concurrency = commit_write_concurrency();
+    let write_concurrency = commit_write_concurrency().get();
 
     let replace_futs = pending_storage_replaces
         .iter()
@@ -8166,6 +9352,10 @@ pub(crate) async fn try_commit_attempt(
                     ManifestLoadError::SlowStateHydration(e.to_string()),
                 ))
             })?;
+            // Membership-commit path: the graph ref is left as `update`
+            // carried it forward (the settle's `stamp_slow_vector_state` pass
+            // keys on the doc-id population to reuse or rebuild it); the
+            // membership commit itself never touches it.
             new_manifest = new_manifest.with_slow_vector_state_ref(
                 published.uri,
                 published.content_hash,
@@ -8474,7 +9664,7 @@ async fn put_superfile_multipart(
 
     let mut upload = storage.put_multipart(path).await?;
     let total = bytes.len();
-    let part_concurrency = commit_write_concurrency().max(1);
+    let part_concurrency = commit_write_concurrency().get();
     let mut parts: Vec<UploadPart> = Vec::with_capacity(part_concurrency);
     let mut offset = 0;
     while offset < total {
@@ -8595,6 +9785,7 @@ mod tests {
         Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
     use figment::{
         Figment,
         providers::{Format, Yaml},
@@ -8607,11 +9798,19 @@ mod tests {
         config::Config,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::BoolMode,
+            fts::reader::{Bm25Stats, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{SupertableOptions, handle::Supertable, storage::LocalFsStorageProvider},
-        test_helpers::default_tokenizer as tok,
+        supertable::{
+            SupertableOptions,
+            handle::Supertable,
+            storage::LocalFsStorageProvider,
+            wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
+        },
+        test_helpers::{
+            build_title_batch, default_supertable_options, distinct_unit_vectors,
+            fault_storage::{FaultKind, FaultOp, FaultStorage},
+        },
     };
 
     /// Small fixed vector dimension accepted by the vector builder.
@@ -8622,6 +9821,461 @@ mod tests {
     const COMMIT_AS_DRAIN_TEST_ROT_SEED: u64 = 7;
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
+
+    /// End-to-end coverage of the opt-in `hnsw_ivf` drain-build path, which the
+    /// default `ivf` mode no longer exercises (the caller now gates the build).
+    /// Drives the caller-gated build step directly on the drained cells
+    /// (`build_hnsw_graph_ref` → the full `assemble_hnsw_sections` build +
+    /// `publish_resident_index` internally), fetches the published graph back, and
+    /// asserts it actually SERVES — a query on the batch's axis finds its exact
+    /// row through the fetched graph. Behavioral coverage, not a
+    /// build-and-forget stub: it would catch a wrong node→id map or a build
+    /// whose rows are unreachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hnsw_drain_full_build_serves_its_rows() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let dim = 32usize;
+        let rows = 256usize;
+        let half = dim / 2;
+        let table = Supertable::create(
+            options_title_emb_sq16(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+
+        let nearest = |data: &crate::superfile::vector::hnsw::HnswIndex, axis: usize| -> f32 {
+            let mut q = vec![0.0f32; dim];
+            q[axis] = 1.0;
+            data.graph
+                .search(&data.scorer, &q, 5, 128)
+                .into_iter()
+                .map(|(_, d)| d)
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        // Batch 1 on axes [0, half): append + drain (cells only — the default
+        // ivf caller-gate skips the graph build).
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch_range(rows, dim, 0, half))
+                .expect("append batch 1");
+            writer.commit().expect("commit batch 1");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("first drain");
+
+        // Full build directly off the drained cells (the now caller-gated step).
+        let reader1 = hidden.reader().expect("hidden reader");
+        let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
+            .await
+            .expect("full build registers a graph");
+        let prior = slow_vector_state::hydrate_resident_index(
+            storage.as_ref(),
+            &ref1,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        .expect("fetch built graph")
+        .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
+        .expect("data graph present after full build");
+        assert!(
+            nearest(&prior, 1) < 0.05,
+            "full-build graph must serve a batch-1 row"
+        );
+    }
+
+    /// Rows in the flat drain-build fixture — enough that the register gate's
+    /// held-out queries rank against a real corpus.
+    const FLAT_DRAIN_ROWS: usize = 512;
+    /// Dimension for the flat drain-build fixture.
+    const FLAT_DRAIN_DIM: usize = 32;
+    /// Seed for the fixture corpus, fixed so a failure reproduces.
+    const FLAT_DRAIN_SEED: u64 = 0x51A7_1DEA;
+    /// Separation the probe row must win its own query by, on the scan's
+    /// `-dot` scale. Random unit directions at this dimension sit well below
+    /// it, so a smaller margin would mean the scan found the wrong row.
+    const FLAT_DRAIN_MIN_MARGIN: f32 = 0.2;
+
+    /// A batch of [`distinct_unit_vectors`], returned alongside the vectors
+    /// themselves so one row can be replayed as a query.
+    ///
+    /// Not [`build_axis_vector_batch_range`]: the flat index's register gate
+    /// grades its scan against an exhaustive Sq16 one, and one-hot rows put a
+    /// block of exact ties at the head of every ground-truth list.
+    fn build_distinct_vector_batch(n: usize, dim: usize, seed: u64) -> (RecordBatch, Vec<f32>) {
+        let vectors = distinct_unit_vectors(n, dim, seed);
+        let titles =
+            LargeStringArray::from((0..n).map(|i| format!("doc {i} beta")).collect::<Vec<_>>());
+        let values = Arc::new(Float32Array::from(vectors.clone()));
+        let list = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            values,
+            None,
+        )
+        .expect("fixed-size list");
+        let batch = RecordBatch::try_new(
+            schema_id_title_emb(dim),
+            vec![Arc::new(titles), Arc::new(list)],
+        )
+        .expect("vector batch");
+        (batch, vectors)
+    }
+
+    /// End-to-end coverage of the opt-in `flat` drain-build path, the peer of
+    /// [`hnsw_drain_full_build_serves_its_rows`]. Drives the caller-gated
+    /// build step on the drained cells (`build_flat_index_ref` → the register
+    /// gate → `publish_resident_index` with [`PayloadKind::Flat`]), hydrates
+    /// the published blob back, and asserts it SERVES: a query replaying a
+    /// corpus row finds that row and wins by a margin.
+    ///
+    /// Behavioral, not build-and-forget. A build that published a plane whose
+    /// node→id map was misaligned, or an envelope whose kind tag said graph,
+    /// would still produce bytes and a plausible top-k.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flat_drain_build_publishes_an_index_that_serves() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_sq16(FLAT_DRAIN_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+        let (batch, vectors) =
+            build_distinct_vector_batch(FLAT_DRAIN_ROWS, FLAT_DRAIN_DIM, FLAT_DRAIN_SEED);
+        {
+            let mut writer = table.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("drain");
+
+        let reader = hidden.reader().expect("hidden reader");
+        let reference = build_flat_index_ref(storage.as_ref(), reader.manifest())
+            .await
+            .expect("a drained Sq16 corpus must register a flat index");
+        let index = slow_vector_state::hydrate_resident_index(
+            storage.as_ref(),
+            &reference,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        .expect("fetch the published index")
+        .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Flat(f) => Some(f),
+            slow_vector_state::ResidentIndexKind::Graph(_) => None,
+        })
+        .expect("the envelope must state Flat, and the payload decode as one");
+
+        assert_eq!(
+            index.len(),
+            FLAT_DRAIN_ROWS,
+            "the plane holds one node per drained row"
+        );
+        assert_eq!(index.dim(), FLAT_DRAIN_DIM);
+        assert_eq!(index.column(), "emb");
+
+        let probe = &vectors[..FLAT_DRAIN_DIM];
+        let top = index.search(probe, 2);
+        assert_eq!(top.len(), 2, "an exhaustive scan fills k");
+        assert!(
+            index.doc_id(top[0].0).is_some(),
+            "the nearest node must resolve to a stable id"
+        );
+        assert!(
+            top[0].1 + FLAT_DRAIN_MIN_MARGIN < top[1].1,
+            "a row queried with its own vector must win by a clear margin, \
+             got {} against runner-up {}",
+            top[0].1,
+            top[1].1
+        );
+    }
+
+    /// Payload size for the pipelined-uploader tests. Small enough to stay
+    /// under any multipart threshold, large enough to be a real object.
+    const UPLOAD_TEST_BYTES: usize = 64;
+    /// Shard ids the uploader tests send, deliberately out of order so the
+    /// returned order cannot accidentally match the arrival order.
+    const UPLOAD_TEST_SHARD_IDS: [u32; 3] = [2, 0, 1];
+    /// Base uuid for the uploader tests' superfiles; the shard id occupies
+    /// the low byte, so a returned entry names the shard that produced it.
+    const UPLOAD_TEST_UUID_BASE: u128 = 0x5D40_0000_0000_0000_0000_0000_0000_0000;
+
+    /// A minimal entry for the uploader tests: the uploader only moves
+    /// `bytes_for_storage` and orders by shard id, so the entry's contents
+    /// are irrelevant beyond identifying the superfile.
+    fn upload_test_prepared(shard_id: u32) -> (SuperfileUri, PreparedSuperfile) {
+        let uuid = Uuid::from_u128(UPLOAD_TEST_UUID_BASE + u128::from(shard_id));
+        let uri = SuperfileUri(uuid);
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uuid,
+            uri,
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        });
+        let bytes = Bytes::from(vec![shard_id as u8; UPLOAD_TEST_BYTES]);
+        (
+            uri,
+            PreparedSuperfile {
+                entry,
+                bytes_for_store: None,
+                bytes_for_storage: Some((uri, bytes)),
+                bytes_for_cache: None,
+            },
+        )
+    }
+
+    /// The uploader returns shards in shard-id order no matter what order
+    /// they finish uploading in — manifest entry order must not depend on
+    /// the network. Fed deliberately out of order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_returns_shard_id_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        for shard_id in UPLOAD_TEST_SHARD_IDS {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let (prepared, uploaded) = upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx)
+            .await
+            .expect("all uploads succeed");
+        let ids: Vec<u32> = prepared
+            .iter()
+            .map(|p| p.entry.superfile_id.as_u128() as u32 & 0xFF)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            UPLOAD_TEST_SHARD_IDS.len(),
+            "every shard comes back"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "returned in shard-id order, not arrival order");
+        assert_eq!(
+            uploaded as usize,
+            UPLOAD_TEST_SHARD_IDS.len() * UPLOAD_TEST_BYTES,
+            "uploaded byte total counts every shard"
+        );
+    }
+
+    /// A failed PUT must not cancel the PUTs already in flight. Cancelling a
+    /// multipart upload mid-request leaves its parts stored with no abort,
+    /// and parts are not an orphaned superfile that gc reclaims — so the
+    /// uploader records the first error, lets every started request settle,
+    /// and only then reports the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_settles_started_puts_before_reporting_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+
+        // Fail exactly one shard, named by its own URI so the other two are
+        // untouched whatever order the uploads are dispatched in.
+        let (doomed_uri, doomed) = upload_test_prepared(0);
+        faults.fail(FaultOp::PutAtomic, &doomed_uri.0.to_string(), 1);
+
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        tx.send((0, doomed)).await.expect("send");
+        for shard_id in [1u32, 2] {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let err = match upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx).await {
+            Err(error) => error,
+            Ok(_) => panic!("a failed shard PUT must fail the batch"),
+        };
+        assert!(
+            format!("{err:?}").contains("injected"),
+            "the injected fault is what surfaces: {err:?}"
+        );
+        assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+        // The uploader drained rather than returning at the first error, so
+        // the doomed shard is the only one missing from storage.
+        assert!(
+            !storage
+                .head(&superfile_storage_path(&doomed_uri))
+                .await
+                .is_ok_and(|meta| meta.size > 0),
+            "the faulted shard must not be durable"
+        );
+    }
+
+    /// The commit write fanout is a `NonZeroUsize` because a zero would
+    /// panic the uploader's channel and stall `buffered`; a single-core host
+    /// divides to zero before the floor applies.
+    #[test]
+    fn commit_write_concurrency_is_never_zero() {
+        assert!(commit_write_concurrency().get() >= 1);
+    }
+
+    /// Default shard target for the fanout unit tests, in bytes — mirrors the shipped
+    /// `superfile_buffer_split_mb` default (64 MiB).
+    const TEST_SPLIT_BYTES: usize = 64 * MIB;
+
+    /// Shard fanout follows buffered bytes (one shard per target's worth, rounded up), capped
+    /// by the pool and the row count — a big pool must not fragment a small buffer.
+    #[test]
+    fn superfiles_per_commit_follows_bytes_capped_by_pool() {
+        const T: usize = TEST_SPLIT_BYTES;
+        // 10 MiB buffer on a 192-thread pool: one shard, not 192.
+        assert_eq!(superfiles_per_commit(1_000_000, 10 << 20, 192, T), 1);
+        // 1 GiB buffer: 16 shards by bytes, capped by a smaller pool.
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 192, T), 16);
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 8, T), 8);
+        // Never more shards than rows, and never zero.
+        assert_eq!(superfiles_per_commit(3, 1 << 30, 192, T), 3);
+        assert_eq!(superfiles_per_commit(1, 1, 0, T), 1);
+    }
+
+    /// Boundary behavior of the ceiling division: a buffer at the target is one shard, one
+    /// byte over splits, and each shard always carries at least half a target.
+    #[test]
+    fn superfiles_per_commit_split_boundaries() {
+        const T: usize = TEST_SPLIT_BYTES;
+        // Exactly one target: one shard. One byte over: two.
+        assert_eq!(superfiles_per_commit(1_000_000, T, 192, T), 1);
+        assert_eq!(superfiles_per_commit(1_000_000, T + 1, 192, T), 2);
+        // Exactly k targets: k shards. One byte over: k + 1.
+        assert_eq!(superfiles_per_commit(1_000_000, 4 * T, 192, T), 4);
+        assert_eq!(superfiles_per_commit(1_000_000, 4 * T + 1, 192, T), 5);
+        // Zero bytes still yields one shard (rows exist; bytes is a heuristic).
+        assert_eq!(superfiles_per_commit(10, 0, 192, T), 1);
+        // Documented lower bound: bytes-per-shard never drops below half a
+        // target while the pool cap is not binding.
+        for bytes in [T + 1, 2 * T - 1, 3 * T + T / 2, 10 * T + 1] {
+            let n = superfiles_per_commit(1_000_000, bytes, 192, T);
+            assert!(bytes.div_ceil(n) >= T / 2, "bytes={bytes} n={n}");
+        }
+    }
+
+    /// `target_bytes == 0` is the configured escape hatch back to thread-count fanout:
+    /// shards = pool width (still capped by rows).
+    #[test]
+    fn superfiles_per_commit_zero_split_restores_thread_fanout() {
+        assert_eq!(superfiles_per_commit(1_000_000, 10 << 20, 192, 0), 192);
+        assert_eq!(superfiles_per_commit(1_000_000, 1 << 30, 8, 0), 8);
+        assert_eq!(superfiles_per_commit(3, 1 << 30, 192, 0), 3);
+    }
+
+    /// The configured `superfile_buffer_split_mb` reaches the commit fanout: a 1 MiB target splits
+    /// a small buffer, `0` restores thread fanout, a large target keeps one file.
+    #[test]
+    fn superfile_buffer_split_config_knob_reaches_commit_fanout() {
+        let batch = build_simple_batch(0, 50_000); // ~a few MiB in-memory
+        for (target_mb, expect) in [(1u64, 2usize), (0, 2)] {
+            let opts = options_id_title()
+                .with_writer_pool(writer_pool_with(2))
+                .with_superfile_buffer_split_mb(target_mb);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            let r = st.reader().expect("reader");
+            assert_eq!(
+                r.n_superfiles(),
+                expect,
+                "target_mb={target_mb} should shard to the 2-thread pool cap"
+            );
+        }
+        // Large target: the same buffer stays one superfile.
+        let opts = options_id_title()
+            .with_writer_pool(writer_pool_with(2))
+            .with_superfile_buffer_split_mb(4096);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 1);
+    }
+
+    /// Fanout never spans commit boundaries: three small commits produce exactly one
+    /// superfile each on a wide pool.
+    #[test]
+    fn each_small_commit_produces_exactly_one_superfile() {
+        let opts = options_id_title().with_writer_pool(writer_pool_with(4));
+        let st = Supertable::create(opts).expect("create");
+        for round in 0..3u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_simple_batch(round * 10, 5))
+                .expect("append");
+            w.commit().expect("commit");
+            let r = st.reader().expect("reader");
+            assert_eq!(
+                r.n_superfiles(),
+                (round + 1) as usize,
+                "one new superfile per small commit"
+            );
+        }
+        let r = st.reader().expect("reader");
+        assert_eq!(r.n_docs_total(), 15);
+    }
+
+    /// A one-piece FTS commit produces a queryable index, not just a counted superfile.
+    #[test]
+    fn single_piece_fts_commit_is_searchable() {
+        let opts = options_id_title().with_writer_pool(writer_pool_with(4));
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 100)).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let r = st.reader().expect("reader");
+        assert_eq!(r.n_superfiles(), 1, "small FTS commit stays one piece");
+        // Every doc's title contains "alpha" (see build_simple_batch); a match-all term must
+        // surface hits from the one-piece index.
+        let hits = st
+            .bm25_search(
+                "title",
+                "alpha",
+                10,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("bm25 over one-piece commit");
+        let n: usize = hits.iter().map(|b| b.num_rows()).sum();
+        assert!(n > 0, "single-shard FTS index must return hits");
+    }
 
     /// `SupertableWriter`'s `Debug` impl renders its buffered-batch summary.
     #[test]
@@ -8803,6 +10457,121 @@ mod tests {
         );
     }
 
+    /// A crash in the drain WINDOW — after the membership commit (cells +
+    /// `drained_ranges` + graph) but before the settle — must NOT hide the
+    /// just-drained rows. With the graph stamped atomically in the membership
+    /// commit, a batch-2 row (its `_id` past batch 1's) is served by the hidden
+    /// graph even though the settle never ran. Pre-fix (graph stamped only at
+    /// settle) the second drain advanced `drained_ranges` past batch 2 while the
+    /// graph still covered batch 1 only, so batch-2 rows were invisible to both
+    /// arms in exactly this gap — this test FAILS on that behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_window_keeps_just_drained_rows_visible() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let dim = 32usize;
+        let rows = 256usize;
+        let options = options_title_emb_sq16(dim)
+            .with_storage(storage)
+            .with_drain_batch_superfiles(1);
+        let table = Supertable::create(options).expect("create");
+        // Batch 1 occupies axes [0, dim/2); batch 2 the DISJOINT [dim/2, dim).
+        // A query on a batch-2 axis has an EXACT match (distance ~0) only if the
+        // batch-2 rows are visible; if only batch-1 is served, the nearest row
+        // is orthogonal (cosine distance ~1).
+        let half = dim / 2;
+        let batch2_axis = half + 3;
+
+        // Batch 1: append + commit, then drain FULLY so the graph (G1, batch-1
+        // rows only) is built and settled.
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch_range(rows, dim, 0, half))
+                .expect("append batch 1");
+            writer.commit().expect("commit batch 1");
+        }
+        {
+            let (hidden, _epoch) = current_drain_epoch(&table).await;
+            drain_user_superfiles_to_hidden_cells(
+                Arc::clone(table.inner()),
+                Arc::clone(hidden.inner()),
+            )
+            .await
+            .expect("first drain settles G1");
+        }
+
+        // Batch 2: append + commit — DISJOINT axes [dim/2, dim).
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch_range(rows, dim, half, dim))
+                .expect("append batch 2");
+            writer.commit().expect("commit batch 2");
+        }
+
+        // Second drain: crash AFTER the membership commit, BEFORE the settle.
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(
+            epoch_id.clone(),
+            DrainTestFailurePhase::AfterMembershipCommit,
+            0,
+        );
+        let crashed = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(
+            crashed.is_err(),
+            "the injected crash must stop the second drain before settle"
+        );
+
+        // The just-drained batch-2 rows must still be visible: the membership
+        // commit carried the graph, so a query on a batch-2 axis finds its exact
+        // match even though the settle never ran.
+        let mut q = vec![0.0f32; dim];
+        q[batch2_axis] = 1.0;
+        let batch2_visible = |label: &str| {
+            let hits = table
+                .reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    2 * rows,
+                    crate::superfile::reader::VectorSearchOptions::new().with_nprobe(32),
+                    None,
+                )
+                .expect("vector search");
+            // Cosine distance ~0 means an exact batch-2 direction match was
+            // found; ~1 means only orthogonal batch-1 rows are served.
+            let best = hits
+                .iter()
+                .map(|h| h.score)
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap_or(f32::INFINITY);
+            assert!(
+                best < 0.05,
+                "{label}: a just-drained batch-2 row (axis {batch2_axis}) must be visible in \
+                 the drain window; nearest distance {best} (>= 1 means batch-2 was invisible), \
+                 {} hits",
+                hits.len()
+            );
+        };
+        batch2_visible("after mid-drain crash");
+
+        // A subsequent drain settles cleanly; the rows stay visible.
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume drain settles");
+        batch2_visible("after settle");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_resumes_from_last_local_batch_checkpoint() {
         let directory = TempDir::new().expect("tempdir");
@@ -8951,16 +10720,8 @@ mod tests {
     }
 
     fn options_id_title() -> SupertableOptions {
-        SupertableOptions::new(
-            schema_id_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
+        SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+            .expect("valid options")
     }
 
     /// Force a single-threaded writer pool for deterministic
@@ -9133,19 +10894,47 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(writer_pool_with(1))
+    }
+
+    /// Like [`options_title_emb_serial`] but Sq16-coded, so the drain builds and
+    /// serves the resident `hnsw` graph (the graph is only assembled over Sq16
+    /// rows) — required to exercise the graph serving path.
+    fn options_title_emb_sq16(dim: usize) -> SupertableOptions {
+        SupertableOptions::new(
+            schema_id_title_emb(dim),
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq16,
+                provided_centroids: None,
+            }],
         )
         .expect("valid options")
         .with_writer_pool(writer_pool_with(1))
     }
 
     fn build_axis_vector_batch(n: usize, dim: usize) -> RecordBatch {
+        build_axis_vector_batch_range(n, dim, 0, dim)
+    }
+
+    /// `n` one-hot rows whose active axis cycles over `[lo, hi)` — lets two
+    /// batches occupy DISJOINT direction ranges so a query on one range's axis
+    /// distinguishes which batch's rows are visible.
+    fn build_axis_vector_batch_range(n: usize, dim: usize, lo: usize, hi: usize) -> RecordBatch {
+        let span = (hi - lo).max(1);
         let titles =
             LargeStringArray::from((0..n).map(|i| format!("doc {i} beta")).collect::<Vec<_>>());
         let mut flat = Vec::with_capacity(n * dim);
         for row in 0..n {
+            let active = lo + (row % span);
             for d in 0..dim {
-                flat.push(if d == row % dim { 1.0 } else { 0.0 });
+                flat.push(if d == active { 1.0 } else { 0.0 });
             }
         }
         let values = Arc::new(Float32Array::from(flat));
@@ -9261,6 +11050,54 @@ mod tests {
             scalar_plus_fts > scalar_only,
             "the FTS term is additive on top of scalar ({scalar_plus_fts} vs {scalar_only})"
         );
+    }
+
+    #[test]
+    fn planned_data_objects_counts_objects_at_the_target_boundary() {
+        // Every integration fixture seals three orders of magnitude below
+        // the shipped target, so `div_ceil` is 1 at every writer-pool width
+        // there and the arithmetic itself never runs. Pin it directly, or
+        // the counter could be replaced by a hardcoded 1 and every
+        // width-invariance assertion would still pass.
+        let target = commit_target_object_bytes();
+        assert!(target > 0, "the shipped config defines a target size");
+        assert_eq!(
+            planned_data_objects(0),
+            0,
+            "an empty payload plans no data object"
+        );
+        assert_eq!(planned_data_objects(1), 1);
+        assert_eq!(
+            planned_data_objects(target),
+            1,
+            "exactly one target's worth fills exactly one object"
+        );
+        assert_eq!(
+            planned_data_objects(target + 1),
+            2,
+            "one byte past the target spills into a second object"
+        );
+        assert_eq!(planned_data_objects(target.saturating_mul(3)), 3);
+    }
+
+    #[test]
+    fn a_refused_append_reports_no_ingested_work() {
+        // `rows_written` means rows the op durably indexed. A commit that
+        // never published must report nothing, or a failed write counts
+        // rows that do not exist. The 1-byte budget floors the build gate
+        // to 0, so the buffered commit is refused before anything seals.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+        let (result, stats) = op_stats::with_op_stats(|| st.append(&build_simple_batch(0, 8)));
+        assert!(result.is_err(), "a 0-byte gate refuses the build");
+        assert_eq!(
+            stats.rows_written, 0,
+            "a refused append durably indexed no rows"
+        );
+        assert_eq!(stats.scalar_bytes_written, 0);
+        assert_eq!(stats.vector_bytes_written, 0);
+        assert_eq!(stats.fts_text_bytes_written, 0);
     }
 
     #[test]
@@ -9605,7 +11442,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            None,
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -9812,15 +11648,13 @@ mod tests {
     // ---- rayon-shard parallelism -------------------------------------
 
     #[test]
-    fn commit_produces_one_superfile_per_writer_pool_thread() {
-        // With N writer-pool threads and a buffer of M >= N
-        // batches, commit should emit N superfiles (one per
-        // shard).
+    fn commit_superfile_count_follows_bytes_not_pool_size() {
+        // A small buffer commits as one superfile no matter how wide the pool is — pool width
+        // alone must not fragment the table.
         for n_threads in [1usize, 2, 4] {
             let opts = options_id_title().with_writer_pool(writer_pool_with(n_threads));
             let st = Supertable::create(opts).expect("create");
             let mut w = st.writer().expect("writer");
-            // Push enough batches to fill every shard.
             for i in 0..n_threads * 2 {
                 w.append(&build_simple_batch(i as u64 * 10, 3))
                     .expect("append");
@@ -9830,32 +11664,45 @@ mod tests {
             let r = st.reader().expect("reader");
             assert_eq!(
                 r.n_superfiles(),
-                n_threads,
-                "expected {n_threads} superfiles for {n_threads}-thread pool",
+                1,
+                "small buffer must stay one superfile on a {n_threads}-thread pool",
             );
             assert_eq!(r.n_docs_total(), (n_threads * 2 * 3) as u64);
         }
     }
 
     #[test]
-    fn commit_with_fewer_batches_than_threads_skips_empty_shards() {
-        // 4 threads, only 2 batches — chunk_size = 1, two chunks
-        // get one batch each, the other two get nothing.
-        // Should produce 2 superfiles, not 4.
-        let opts = options_id_title().with_writer_pool(writer_pool_with(4));
+    fn commit_splits_wide_buffer_up_to_pool_width() {
+        // A buffer over the shard target splits, capped by the pool. Arrow reports capacity
+        // (not logical bytes), so the ~100 MiB buffer wants 2-3 shards; the 2-thread pool pins
+        // it to exactly 2.
+        const ROWS: usize = 100_000;
+        let opts = options_id_title()
+            .with_writer_pool(writer_pool_with(2))
+            .with_commit_threshold_size_mb(4096);
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
-        w.append(&build_simple_batch(0, 1)).expect("a");
-        w.append(&build_simple_batch(1, 1)).expect("b");
+        // ~1 KiB per title × 100K rows ≈ 100 MiB buffered.
+        let titles = LargeStringArray::from(
+            (0..ROWS)
+                .map(|i| format!("doc {i} {}", "x".repeat(1024)))
+                .collect::<Vec<_>>(),
+        );
+        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
+        w.append(&batch).expect("append");
         w.commit().expect("commit");
 
         let r = st.reader().expect("reader");
-        assert_eq!(r.n_superfiles(), 2);
-        assert_eq!(r.n_docs_total(), 2);
+        assert_eq!(
+            r.n_superfiles(),
+            2,
+            "~100 MiB buffer splits, pinned to 2 by the pool cap"
+        );
+        assert_eq!(r.n_docs_total(), ROWS as u64);
     }
 
     #[test]
-    fn apply_config_with_fixed_writer_threads_emits_that_many_superfiles() {
+    fn apply_config_with_fixed_writer_threads_sizes_the_pool() {
         let yaml = r#"
 commit_threshold_size_mb: 1024
 supertable:
@@ -9865,10 +11712,16 @@ supertable:
         let cfg =
             Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
 
-        // End-to-end: build options, route them through apply_config,
-        // and verify the writer pool actually sized to the config's
-        // 4 threads (one superfile per shard).
+        // End-to-end: build options, route them through apply_config, and
+        // verify the writer pool actually sized to the config's 4 threads.
+        // The pool caps shard fanout but no longer sets it — a small buffer
+        // stays one superfile (geometry follows bytes, not thread count).
         let opts = options_id_title().apply_config(&cfg).expect("apply_config");
+        assert_eq!(
+            opts.writer_pool.current_num_threads(),
+            4,
+            "writer_threads=4 should size the pool to 4"
+        );
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         for i in 0..8u64 {
@@ -9877,11 +11730,7 @@ supertable:
         w.commit().expect("commit");
 
         let r = st.reader().expect("reader");
-        assert_eq!(
-            r.n_superfiles(),
-            4,
-            "writer_threads=4 should yield 4 shards"
-        );
+        assert_eq!(r.n_superfiles(), 1, "small buffer stays one superfile");
         assert_eq!(r.n_docs_total(), 24);
     }
 
@@ -10315,6 +12164,422 @@ supertable:
         assert_ne!(
             read_second, read_first,
             "object content actually changed between writes"
+        );
+    }
+
+    // ---- delete-WAL lease ownership ----------------------------------
+
+    /// WAL id for the delete-lease tests below. Fixed so the state-doc
+    /// path is predictable; nothing else writes this prefix here.
+    const DELETE_LEASE_WAL_ID: i128 = 0x0DE1_5EA5;
+    /// `_id` the seeded delete targets. No superfile claims it, so a sweep
+    /// that did drive this WAL would resolve it as `NotFound` and still
+    /// march the WAL to `Complete` — which is what the sweep assertions
+    /// below detect.
+    const DELETE_LEASE_TARGET_ID: i128 = 42;
+    /// Owner id of the peer running the recovery sweep. Distinct from the
+    /// writer handle's own id: `try_acquire` treats a same-owner lease as
+    /// a renewal, so only a foreign owner exercises the conflict path.
+    const DELETE_LEASE_PEER_OWNER: i128 = 0x0BAD_0BAD;
+
+    fn delete_lease_test_table(directory: &TempDir) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create")
+    }
+
+    fn delete_lease_test_entry() -> PendingDeleteEntry {
+        PendingDeleteEntry {
+            wal_id: WalId(DELETE_LEASE_WAL_ID),
+            target_ids: vec![DELETE_LEASE_TARGET_ID],
+        }
+    }
+
+    /// A delete's WAL state doc is born holding a live lease owned by the
+    /// handle that is about to drive it, and `created_at` + both lease
+    /// timestamps come from the single clock reading passed in.
+    #[test]
+    fn delete_wal_doc_is_born_leased_by_this_handle() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let writer = table.writer().expect("writer");
+
+        let now = Utc::now();
+        let doc = writer.delete_wal_doc(&delete_lease_test_entry(), now);
+
+        assert_eq!(doc.op_kind, OpKind::Delete);
+        assert_eq!(doc.state, WalState::Intent);
+        assert_eq!(
+            doc.created_at, now,
+            "created_at must come from the passed clock reading, not a second sample"
+        );
+        let lease = doc
+            .lease
+            .expect("a delete WAL must be born leased, not left unowned until a later acquire");
+        assert_eq!(
+            lease.owner,
+            table.handle_id(),
+            "the lease must name the handle that will drive the tombstone phase"
+        );
+        assert_eq!(
+            lease.acquired_at, now,
+            "acquired_at must share created_at's clock reading"
+        );
+        assert_eq!(
+            lease.expires_at,
+            now + ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+                .expect("default lease duration converts"),
+            "the lease must run a full default duration from the same reading"
+        );
+    }
+
+    /// Regression: a peer's recovery sweep must not take a delete WAL away
+    /// from the writer that just created it. The creating handle holds a
+    /// live lease from the moment the doc lands, so the sweep counts it as
+    /// held-by-peer and leaves the bytes alone. Before the lease was
+    /// stamped at create time the sweep drove the WAL to `Complete`, which
+    /// invalidated the writer's etag and turned an in-flight delete into a
+    /// partial-commit failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_sweep_skips_a_freshly_created_delete_wal() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let storage = table
+            .inner()
+            .options
+            .storage
+            .as_ref()
+            .expect("storage attached")
+            .clone();
+        let writer = table.writer().expect("writer");
+
+        // The doc as `drive_one_delete` writes it, at the point where the
+        // create has landed but the tombstone phase hasn't started.
+        let wal_store = WalStore::new(storage);
+        let doc = writer.delete_wal_doc(&delete_lease_test_entry(), Utc::now());
+        let etag_before = wal_store.create(&doc).await.expect("create wal state doc");
+
+        let report = scan_and_recover(
+            &table,
+            SupertableHandleId(DELETE_LEASE_PEER_OWNER),
+            DEFAULT_LEASE_DURATION,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(report.n_scanned, 1, "the sweep must see the seeded WAL");
+        assert_eq!(
+            report.n_held_by_peer, 1,
+            "the writer's live lease must fence the sweep off this WAL"
+        );
+        assert_eq!(
+            report.n_tombstone_only_completed, 0,
+            "the sweep must not drive a delete the writer is still holding"
+        );
+
+        let (after, etag_after) = wal_store
+            .read(WalId(DELETE_LEASE_WAL_ID))
+            .await
+            .expect("read back");
+        assert_eq!(
+            etag_after, etag_before,
+            "etag unchanged → the sweep never wrote the state doc"
+        );
+        assert_eq!(
+            after.state,
+            WalState::Intent,
+            "the WAL must still be waiting for its owner's tombstone phase"
+        );
+        assert_eq!(
+            after.lease.expect("lease survives the sweep").owner,
+            table.handle_id(),
+            "ownership must still sit with the creating handle"
+        );
+    }
+
+    /// Rule budget for the sidecar-CAS fault: comfortably above the
+    /// tombstone loop's own per-sidecar retry budget, so every attempt in
+    /// that loop loses its race and the phase gives up.
+    const DELETE_LEASE_SIDECAR_FAULTS: usize = 64;
+    /// Suffix of the per-superfile tombstone sidecars the delete path
+    /// CAS-writes. Faulting it leaves superfile, manifest, and WAL-state
+    /// writes alone — including the release this test is watching for.
+    const DELETE_LEASE_TOMBSTONES_SUFFIX: &str = ".tombstones";
+
+    /// A delete that fails part-way hands its lease back, so the next
+    /// recovery sweep can finish the WAL on its very first pass instead of
+    /// counting it held-by-peer and skipping until the lease expires. The
+    /// WAL itself must stay put — its per-target progress is the cursor
+    /// recovery resumes from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_delete_hands_back_its_wal_lease() {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+
+        // Resolve the predicate while storage is healthy, then break every
+        // sidecar CAS so the tombstone phase exhausts its retries.
+        writer
+            .delete(col("title").eq(lit("alpha")))
+            .expect("buffer delete");
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            DELETE_LEASE_TOMBSTONES_SUFFIX,
+            DELETE_LEASE_SIDECAR_FAULTS,
+        );
+        let err = writer
+            .commit()
+            .expect_err("a sidecar CAS that never lands must fail the delete");
+        assert!(
+            matches!(err, CommitError::PartialCommit { .. }),
+            "the failed delete must surface as a partial commit, got {err:?}"
+        );
+        assert!(
+            faults.fired() > 1,
+            "the failure must come from the injected sidecar faults, fired {}",
+            faults.fired()
+        );
+
+        // The WAL is still there for recovery, and it is unowned.
+        faults.clear();
+        let wal_store = WalStore::new(storage);
+        let wal_ids = wal_store.list_wal_ids().await.expect("list wal ids");
+        assert_eq!(
+            wal_ids.len(),
+            1,
+            "the failed delete must leave its WAL for recovery, found {wal_ids:?}"
+        );
+        let (doc, _etag) = wal_store.read(wal_ids[0]).await.expect("read wal doc");
+        assert_eq!(
+            doc.state,
+            WalState::Intent,
+            "the WAL must still be waiting for its tombstone phase"
+        );
+        assert!(
+            doc.lease.is_none(),
+            "a failed delete must release its lease so the next sweep can take \
+             the WAL immediately, still held by {:?}",
+            doc.lease
+        );
+    }
+
+    // ---- update-WAL lease ownership ----------------------------------
+
+    /// Owner id of the peer running the recovery sweep in the update-lease
+    /// tests. Distinct from the writer handle's own id, since `try_acquire`
+    /// treats a same-owner lease as a renewal rather than a conflict.
+    const UPDATE_LEASE_PEER_OWNER: i128 = 0x0BAD_CAFE;
+
+    /// A writer holding one buffered update against a committed row, so the
+    /// tests can inspect the exact entry — and therefore the exact state
+    /// doc — that `commit` would drive.
+    fn writer_with_buffered_update(table: &Supertable) -> SupertableWriter {
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+        writer
+            .update(col("title").eq(lit("alpha")), build_title_batch(&["gamma"]))
+            .expect("buffer update");
+        writer
+    }
+
+    /// An update's WAL state doc is born holding a live lease owned by the
+    /// handle about to drive it, from a single clock reading — and it still
+    /// carries the append-phase fields that make the WAL drivable.
+    #[test]
+    fn update_wal_doc_is_born_leased_by_this_handle() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let writer = writer_with_buffered_update(&table);
+        let entry = writer
+            .pending_updates
+            .first()
+            .expect("update() must buffer an entry");
+
+        let now = Utc::now();
+        let doc = writer.update_wal_doc(entry, now);
+
+        assert_eq!(doc.op_kind, OpKind::Update);
+        assert_eq!(doc.state, WalState::Intent);
+        assert_eq!(
+            doc.created_at, now,
+            "created_at must come from the passed clock reading, not a second sample"
+        );
+        let lease = doc
+            .lease
+            .expect("an update WAL must be born leased, not left unowned until a later acquire");
+        assert_eq!(
+            lease.owner,
+            table.handle_id(),
+            "the lease must name the handle that will drive the pipeline"
+        );
+        assert_eq!(
+            lease.acquired_at, now,
+            "acquired_at must share created_at's clock reading"
+        );
+        assert_eq!(
+            lease.expires_at,
+            now + ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+                .expect("default lease duration converts"),
+            "the lease must run a full default duration from the same reading"
+        );
+
+        // The append phase reads these off the doc; a lease that arrived by
+        // clobbering them would be no fix at all.
+        assert_eq!(doc.new_row_count, Some(1));
+        assert!(doc.preallocated_superfile_id.is_some());
+        assert_eq!(doc.tombstone_progress.len(), 1);
+    }
+
+    /// Regression: a peer's recovery sweep must not take an update WAL away
+    /// from the writer that just created it. The window is wider than the
+    /// delete case — an unowned `Intent` UPDATE is drivable from its first
+    /// step, so a sweep would run the append phase and publish the
+    /// replacement superfile while this writer was doing the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_sweep_skips_a_freshly_created_update_wal() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let storage = table
+            .inner()
+            .options
+            .storage
+            .as_ref()
+            .expect("storage attached")
+            .clone();
+        let writer = writer_with_buffered_update(&table);
+        let entry = writer
+            .pending_updates
+            .first()
+            .expect("update() must buffer an entry");
+        let wal_id = entry.wal_id;
+
+        // The WAL exactly as `drive_one_update` leaves it after its create:
+        // payload sidecar uploaded, `Intent` doc leased to this handle. The
+        // sidecar matters — without it the sweep could not run the append
+        // phase even if the lease were missing, and the test would pass for
+        // the wrong reason.
+        let wal_store = WalStore::new(storage);
+        wal_store
+            .put_arrow(wal_id, entry.ipc_bytes.clone())
+            .await
+            .expect("put arrow payload");
+        let doc = writer.update_wal_doc(entry, Utc::now());
+        let etag_before = wal_store.create(&doc).await.expect("create wal state doc");
+
+        let report = scan_and_recover(
+            &table,
+            SupertableHandleId(UPDATE_LEASE_PEER_OWNER),
+            DEFAULT_LEASE_DURATION,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(report.n_scanned, 1, "the sweep must see the seeded WAL");
+        assert_eq!(
+            report.n_held_by_peer, 1,
+            "the writer's live lease must fence the sweep off this WAL"
+        );
+        assert_eq!(
+            report.n_full_pipeline_completed, 0,
+            "the sweep must not run the append phase for an update the writer holds"
+        );
+
+        let (after, etag_after) = wal_store.read(wal_id).await.expect("read back");
+        assert_eq!(
+            etag_after, etag_before,
+            "etag unchanged → the sweep never wrote the state doc"
+        );
+        assert_eq!(
+            after.state,
+            WalState::Intent,
+            "the WAL must still be waiting for its owner's append phase"
+        );
+        assert_eq!(
+            after.lease.expect("lease survives the sweep").owner,
+            table.handle_id(),
+            "ownership must still sit with the creating handle"
+        );
+    }
+
+    /// An update that fails in its *tombstone* phase — after the append
+    /// phase has landed — hands its lease back too, so recovery can finish
+    /// the WAL from `Appended` on its next pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_update_hands_back_its_wal_lease() {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+
+        // Buffer while storage is healthy, then break every sidecar CAS.
+        // The append phase writes superfile + manifest and is untouched, so
+        // the failure lands in the tombstone phase that follows it.
+        writer
+            .update(col("title").eq(lit("alpha")), build_title_batch(&["gamma"]))
+            .expect("buffer update");
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            DELETE_LEASE_TOMBSTONES_SUFFIX,
+            DELETE_LEASE_SIDECAR_FAULTS,
+        );
+        let err = writer
+            .commit()
+            .expect_err("a sidecar CAS that never lands must fail the update");
+        assert!(
+            matches!(err, CommitError::PartialCommit { .. }),
+            "the failed update must surface as a partial commit, got {err:?}"
+        );
+        assert!(
+            faults.fired() > 1,
+            "the failure must come from the injected sidecar faults, fired {}",
+            faults.fired()
+        );
+
+        faults.clear();
+        let wal_store = WalStore::new(storage);
+        let wal_ids = wal_store.list_wal_ids().await.expect("list wal ids");
+        assert_eq!(
+            wal_ids.len(),
+            1,
+            "the failed update must leave its WAL for recovery, found {wal_ids:?}"
+        );
+        let (doc, _etag) = wal_store.read(wal_ids[0]).await.expect("read wal doc");
+        assert_eq!(
+            doc.state,
+            WalState::Appended,
+            "the append phase landed; only the tombstone phase is left"
+        );
+        assert!(
+            doc.lease.is_none(),
+            "a failed update must release its lease so the next sweep can take \
+             the WAL immediately, still held by {:?}",
+            doc.lease
         );
     }
 }

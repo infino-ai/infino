@@ -529,7 +529,7 @@ export class Connection {
  * // local
  * const db = connect("./data");
  * // Infino Cloud
- * const cloud = connect("https://api.platform.infino.ai/my-app", { apiKey: "inf_…" });
+ * const cloud = connect("https://api.platform.infino.ws/my-app", { apiKey: "inf_…" });
  * ```
  */
 export function connect(uri: string, options?: ConnectOptions): Connection {

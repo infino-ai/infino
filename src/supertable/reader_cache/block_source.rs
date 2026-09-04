@@ -26,13 +26,15 @@
 //! land — so eviction sees a lazy entry's true footprint. On budget
 //! exhaustion, or once this source's cache entry has been replaced (eviction
 //! / mmap promotion), reads degrade to plain uncached passthrough instead of
-//! failing. The source releases its accounted bytes and unlinks its file on
-//! `Drop` (i.e. when the last in-flight reader over it goes away).
+//! failing. The source releases its accounted bytes on `Drop` (i.e. when the
+//! last in-flight reader over it goes away); the sparse file and its persisted
+//! index stay on disk so a later generation can adopt them.
 
 use std::{
     fs,
     os::unix::fs::FileExt,
     path::PathBuf,
+    process,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
@@ -57,7 +59,13 @@ use crate::{
 /// ~55K). Post-drain vector queries read ~0.25–2 MiB scan ranges, so
 /// 512 KiB keeps first-touch overshoot well under 2× while still
 /// coalescing a multi-MiB scan into a handful of blocks.
-const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
+pub(super) const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
+
+const IDX_HEADER: [u8; 8] = CACHE_BLOCK_BYTES.to_le_bytes();
+
+const PERSIST_BYTES_THRESHOLD: u64 = 32 * 1024 * 1024;
+
+static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Lazily-initialized sparse backing file. Created on the first cached read
 /// (the object size may only be known after the open-time `tail()` on
@@ -98,6 +106,7 @@ pub(crate) struct BlockCachedSource {
     /// `size_bytes`, so eviction candidates report a lazy entry's real
     /// footprint as it grows.
     filled_bytes: Arc<AtomicU64>,
+    persisted_bytes: AtomicU64,
 }
 
 impl BlockCachedSource {
@@ -124,7 +133,7 @@ impl BlockCachedSource {
         Self::new_with_accounting(inner, store, uri, path, false, passthrough)
     }
 
-    fn new_with_accounting(
+    pub(crate) fn new_with_accounting(
         inner: Arc<dyn LazyByteSource>,
         store: Weak<DiskCacheStore>,
         uri: SuperfileUri,
@@ -143,6 +152,7 @@ impl BlockCachedSource {
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
+            persisted_bytes: AtomicU64::new(0),
         })
     }
 
@@ -161,7 +171,6 @@ impl BlockCachedSource {
 
     /// Shared filled-bytes counter, installed as the cache entry's
     /// `size_bytes` so accounting and eviction see live growth.
-    #[cfg(test)]
     pub(crate) fn filled_bytes_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.filled_bytes)
     }
@@ -176,14 +185,11 @@ impl BlockCachedSource {
         }
         self.state
             .get_or_init(|| {
-                // Publish a FRESH inode rather than truncating in place. Remove
-                // the old name first: a reader still holding the previous
-                // `.blocks` inode keeps its bytes (POSIX unlink-while-open),
-                // while this source gets its own inode to fill. `create_new`
-                // then refuses to reopen an existing inode, so a concurrent
-                // same-path source fails cleanly (degrading to a passthrough
-                // read) instead of truncating a live reader's blocks.
+                if let Some(adopted) = self.try_adopt(size) {
+                    return Some(adopted);
+                }
                 let _ = fs::remove_file(&self.path);
+                let _ = fs::remove_file(self.idx_path());
                 let file = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -198,6 +204,68 @@ impl BlockCachedSource {
                 })
             })
             .as_ref()
+    }
+
+    fn idx_path(&self) -> PathBuf {
+        let mut p = self.path.clone().into_os_string();
+        p.push(".idx");
+        PathBuf::from(p)
+    }
+
+    /// Adopt a prior generation's sparse file when its persisted index proves
+    /// which ranges are valid (immutable superfile, so size-match is enough).
+    fn try_adopt(&self, size: u64) -> Option<BlockFile> {
+        let meta = fs::metadata(&self.path).ok()?;
+        if meta.len() != size {
+            return None;
+        }
+        let idx_bytes = fs::read(self.idx_path()).ok()?;
+        let (bitmap, adopted_bytes) = indexed_filled_bytes(size, &idx_bytes)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .ok()?;
+        if let Some(store) = self.store.upgrade() {
+            if self.owns_accounting {
+                store.account_adopted_bytes(&self.uri, adopted_bytes);
+            } else {
+                store.release_scanned_block_file(&self.uri);
+            }
+        }
+        self.filled_bytes.store(adopted_bytes, Ordering::Release);
+        self.persisted_bytes.store(adopted_bytes, Ordering::Release);
+        *self.filled.lock().expect("filled bitmap mutex poisoned") = bitmap;
+        Some(BlockFile {
+            file,
+            size,
+            mmap: OnceLock::new(),
+        })
+    }
+
+    /// Serialize the filled-block bitmap for persistence. Taken before the
+    /// `sync_data()` barrier so the persisted index only ever names blocks whose
+    /// writes the fsync already flushed — a concurrent fill that marks a new
+    /// block after this snapshot is simply absent (a safe undercount), never a
+    /// durably-claimed hole.
+    fn snapshot_index(&self) -> Vec<u8> {
+        let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
+        serialize_index(&filled)
+    }
+
+    /// Write a pre-serialized index snapshot, only after its blocks are durable.
+    fn persist_idx(&self, snapshot: &[u8]) {
+        if !self.path.exists() {
+            return;
+        }
+        let idx = self.idx_path();
+        let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut tmp = idx.clone().into_os_string();
+        tmp.push(format!(".tmp.{}.{seq}", process::id()));
+        let tmp = PathBuf::from(tmp);
+        if fs::write(&tmp, snapshot).is_ok() {
+            let _ = fs::rename(&tmp, &idx);
+        }
     }
 
     /// Byte length of block `b` (the trailing block may be partial).
@@ -303,6 +371,7 @@ impl BlockCachedSource {
         if !store.lazy_block_entry_is_current(&self.uri, &self.entry_token) {
             return Ok(false);
         }
+        let mut filled_any = false;
         for (rb0, rb1) in self.missing_runs(b0, b1) {
             let run_start = u64::from(rb0) * CACHE_BLOCK_BYTES;
             let run_end = (u64::from(rb1) + 1) * CACHE_BLOCK_BYTES;
@@ -328,21 +397,61 @@ impl BlockCachedSource {
             }
             let newly = self.mark_filled(bf.size, rb0, rb1);
             self.filled_bytes.fetch_add(newly, Ordering::AcqRel);
+            filled_any = true;
             if self.owns_accounting && newly < run_len {
                 // A concurrent filler beat us to some blocks; its accounting
                 // stands, ours is released.
                 store.release_block_bytes(run_len - newly);
             }
         }
+        if filled_any {
+            let filled = self.filled_bytes.load(Ordering::Acquire);
+            let unpersisted = filled.saturating_sub(self.persisted_bytes.load(Ordering::Acquire));
+            if unpersisted >= PERSIST_BYTES_THRESHOLD {
+                let snapshot = self.snapshot_index();
+                if bf.file.sync_data().is_ok() {
+                    self.persist_idx(&snapshot);
+                    self.persisted_bytes.store(filled, Ordering::Release);
+                }
+            }
+        }
         Ok(true)
     }
 }
 
+pub(super) fn serialize_index(bitmap: &RoaringBitmap) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(IDX_HEADER.len() + bitmap.serialized_size());
+    buf.extend_from_slice(&IDX_HEADER);
+    let _ = bitmap.serialize_into(&mut buf);
+    buf
+}
+
+pub(super) fn indexed_filled_bytes(size: u64, idx_bytes: &[u8]) -> Option<(RoaringBitmap, u64)> {
+    let body = idx_bytes.strip_prefix(&IDX_HEADER)?;
+    let bitmap = RoaringBitmap::deserialize_from(body).ok()?;
+    let n_blocks = size.div_ceil(CACHE_BLOCK_BYTES);
+    if bitmap.max().is_some_and(|m| u64::from(m) >= n_blocks) {
+        return None;
+    }
+    let filled = bitmap
+        .iter()
+        .map(|b| BlockCachedSource::block_len(size, b))
+        .sum();
+    Some((bitmap, filled))
+}
+
 impl Drop for BlockCachedSource {
     fn drop(&mut self) {
-        // Last reader over this source is gone (entry evicted/replaced and
-        // no in-flight queries): release the accounted bytes and remove the
-        // sparse file. The store may already be gone at process teardown.
+        if let Some(Some(bf)) = self.state.get() {
+            let filled = self.filled_bytes.load(Ordering::Acquire);
+            if filled > self.persisted_bytes.load(Ordering::Acquire) {
+                let snapshot = self.snapshot_index();
+                if bf.file.sync_data().is_ok() {
+                    self.persist_idx(&snapshot);
+                }
+            }
+        }
+        // Release accounted bytes only; the file and index persist for adoption.
         if self.owns_accounting
             && let Some(store) = self.store.upgrade()
         {
@@ -350,9 +459,6 @@ impl Drop for BlockCachedSource {
             if filled > 0 {
                 store.release_block_bytes(filled);
             }
-        }
-        if self.state.get().is_some_and(|s| s.is_some()) {
-            let _ = fs::remove_file(&self.path);
         }
     }
 }
@@ -596,13 +702,150 @@ mod tests {
             "trailing partial block accounts its real length"
         );
 
-        // Drop the source: accounting released, blocks file unlinked.
+        // Drop the source: accounting released, but the sparse file and its
+        // index persist for a later generation to adopt.
         let path = dir.path().join("t.blocks");
         assert!(path.exists());
         store.remove_block_entry_for_test(&uri);
         drop(src);
         assert_eq!(store.stats().current_bytes, 0);
-        assert!(!path.exists());
+        assert!(path.exists(), "blocks file survives drop for adoption");
+        let mut idx = path.clone().into_os_string();
+        idx.push(".idx");
+        assert!(
+            std::path::PathBuf::from(idx).exists(),
+            "index sidecar persisted alongside the blocks file"
+        );
+    }
+
+    /// Reopen/reconnect warm survival: a fresh source adopts a prior
+    /// generation's persisted blocks and serves filled ranges with zero refetch.
+    #[tokio::test]
+    async fn adopt_reuses_blocks_across_source_generations() {
+        const OBJ: usize = 3 * CACHE_BLOCK_BYTES as usize + 1000;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let path = dir.path().join("t.blocks");
+
+        let inner1 = Arc::new(CountingSource::new(OBJ));
+        let src1 = BlockCachedSource::new(
+            Arc::clone(&inner1) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, src1.filled_bytes_handle(), src1.entry_token());
+        let start = 100u64;
+        let len = 2 * CACHE_BLOCK_BYTES + 500;
+        let first = src1.range(start, len).await.expect("gen1 read");
+        assert_eq!(inner1.calls(), 1);
+        let filled = src1.filled_bytes_handle().load(Ordering::Acquire);
+
+        store.remove_block_entry_for_test(&uri);
+        drop(src1);
+        assert_eq!(store.stats().current_bytes, 0);
+        assert!(path.exists());
+
+        let inner2 = Arc::new(CountingSource::new(OBJ));
+        let src2 = BlockCachedSource::new(
+            Arc::clone(&inner2) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, src2.filled_bytes_handle(), src2.entry_token());
+
+        let again = src2.range(start, len).await.expect("gen2 read");
+        assert_eq!(again, first);
+        assert_eq!(inner2.calls(), 0, "adopted blocks serve without refetch");
+        assert_eq!(
+            src2.filled_bytes_handle().load(Ordering::Acquire),
+            filled,
+            "adopted footprint re-accounted"
+        );
+        assert_eq!(store.stats().current_bytes, filled);
+
+        let tail_start = 3 * CACHE_BLOCK_BYTES + 10;
+        let _ = src2.range(tail_start, 50).await.expect("gen2 tail");
+        assert_eq!(inner2.calls(), 1, "an unfilled range still fetches");
+    }
+
+    /// An absent index sidecar makes adoption fall back to a fresh file rather
+    /// than trust the sparse bytes blindly.
+    #[tokio::test]
+    async fn adopt_falls_back_to_fresh_when_index_is_missing() {
+        const OBJ: usize = 3 * CACHE_BLOCK_BYTES as usize + 1000;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let path = dir.path().join("t.blocks");
+
+        let inner1 = Arc::new(CountingSource::new(OBJ));
+        let src1 = BlockCachedSource::new(
+            Arc::clone(&inner1) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, src1.filled_bytes_handle(), src1.entry_token());
+        let _ = src1
+            .range(100, 2 * CACHE_BLOCK_BYTES + 500)
+            .await
+            .expect("gen1");
+        store.remove_block_entry_for_test(&uri);
+        drop(src1);
+
+        let mut idx = path.clone().into_os_string();
+        idx.push(".idx");
+        std::fs::remove_file(PathBuf::from(idx)).expect("drop the index");
+
+        let inner2 = Arc::new(CountingSource::new(OBJ));
+        let src2 = BlockCachedSource::new(
+            Arc::clone(&inner2) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, src2.filled_bytes_handle(), src2.entry_token());
+        let _ = src2
+            .range(100, 2 * CACHE_BLOCK_BYTES + 500)
+            .await
+            .expect("gen2");
+        assert_eq!(
+            inner2.calls(),
+            1,
+            "no index means fresh fetch, not stale reuse"
+        );
+    }
+
+    #[test]
+    fn indexed_filled_bytes_rejects_a_block_id_past_the_file() {
+        let size = 2 * CACHE_BLOCK_BYTES;
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(2);
+        assert!(indexed_filled_bytes(size, &serialize_index(&bitmap)).is_none());
+    }
+
+    #[test]
+    fn indexed_filled_bytes_sums_in_range_blocks() {
+        let size = 2 * CACHE_BLOCK_BYTES + 100;
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0);
+        bitmap.insert(2);
+        let (_, filled) =
+            indexed_filled_bytes(size, &serialize_index(&bitmap)).expect("valid index");
+        assert_eq!(filled, CACHE_BLOCK_BYTES + 100);
+    }
+
+    #[test]
+    fn indexed_filled_bytes_rejects_a_mismatched_header() {
+        let size = 2 * CACHE_BLOCK_BYTES;
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0);
+        let mut bytes = serialize_index(&bitmap);
+        bytes[0] ^= 0xFF;
+        assert!(indexed_filled_bytes(size, &bytes).is_none());
     }
 
     /// Regression for the transient `Required field type_ is missing` decode

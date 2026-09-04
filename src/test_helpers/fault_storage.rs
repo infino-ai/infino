@@ -57,6 +57,11 @@ pub enum FaultKind {
     /// allowed to treat as contention, so tests use it to drive a CAS-loss
     /// to its retry budget and check what the caller finally sees.
     Precondition,
+    /// [`StorageError::PermissionDenied`] — the backend refused the
+    /// credentials in use. Neither a retry nor a reissue helps, so tests use
+    /// it to check that the condition survives every wrapper it passes
+    /// through instead of arriving as a generic fault.
+    PermissionDenied,
 }
 
 /// One armed fault: the next `remaining` calls of `op` whose URI
@@ -146,6 +151,9 @@ impl FaultStorage {
                         source: Box::new(IoError::other("injected fault")),
                     },
                     FaultKind::Precondition => StorageError::PreconditionFailed {
+                        uri: uri.to_string(),
+                    },
+                    FaultKind::PermissionDenied => StorageError::PermissionDenied {
                         uri: uri.to_string(),
                     },
                 });

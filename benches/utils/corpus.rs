@@ -28,18 +28,21 @@ use std::{
     cmp::Ordering,
     env,
     fs::File,
-    io::{Error, ErrorKind, Result as IoResult, Write},
+    io::{BufWriter, Error, ErrorKind, Result as IoResult, Write},
     mem::size_of,
     os::unix::fs::FileExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray,
+    LargeStringArray, ListArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
@@ -59,10 +62,13 @@ use infino::{
     test_helpers::default_tokenizer,
 };
 use memmap2::Mmap;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 use tempfile::TempDir;
+
+use crate::rss;
 
 // ─── Async bridge for in-memory bench helpers ─────────────────────────
 
@@ -160,6 +166,9 @@ pub(crate) const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
 /// file. This keeps memory bounded by roughly `rayon_threads × 8 MiB` while
 /// still issuing large writes to NVMe.
 const PARALLEL_CORPUS_WRITE_BUF_CAPACITY: usize = 8 << 20;
+/// Pre-sizing estimate for one realistic doc's bytes (mean ~295 tokens at
+/// ~5.5 bytes each); only a capacity hint, never a bound.
+const REALISTIC_DOC_BYTES_ESTIMATE: usize = 1600;
 /// Odd 64-bit multiplier (fractional golden ratio) used to derive a
 /// distinct, deterministic RNG seed per chunk from `(seed, chunk_index)`,
 /// so a parallelized corpus is still reproducible for a given `seed`.
@@ -177,10 +186,139 @@ pub(crate) fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
     )
 }
 
-/// Vector dimension — matches modern large embedding models
-/// (OpenAI text-embedding-3-small = 1536 truncates to 1024,
-/// BGE-large = 1024, E5-large = 1024).
-pub const DIM: usize = 1024;
+/// Synthetic-corpus vector dimension — matches modern large embedding
+/// models (OpenAI text-embedding-3-small = 1536 truncates to 1024,
+/// BGE-large = 1024, E5-large = 1024). Runtime code reads [`dim`], which
+/// resolves to this for the synthetic corpus and to the dataset's own
+/// dimension for a real corpus.
+pub const SYNTHETIC_DIM: usize = 1024;
+
+/// Vector corpus source, selected by the `corpus=<spec>` bench argument
+/// (see [`set_source`]). Deliberately NOT an env var: the bench tier's
+/// only env-tunable knobs are the two doc counts, and a corpus that can
+/// silently change from the environment is exactly the class of drift
+/// that makes two runs incomparable.
+///
+/// Specs:
+///
+/// * `synthetic` — the seeded planted-cluster generator (the default).
+/// * `realistic` — the same generator with the text column switched to
+///   the realistic flavour ([`text_gen::TextFlavor::Realistic`]:
+///   variable-length, open-vocabulary, bursty docs calibrated to real
+///   text). Vectors and SQL columns are unchanged; only the text
+///   generator differs, so this is a text flavour of `synthetic`, not a
+///   separate source.
+/// * `annb:<slug>` — a published ann-benchmarks dataset
+///   (`annb:glove-100-angular`). One HDF5 file carries corpus rows, the
+///   official query set, and official top-k neighbour ids, so ground
+///   truth needs no recompute and recall is comparable to published
+///   numbers.
+/// * `hf:<repo>` — a Hugging Face parquet dataset
+///   (`hf:KShivendu/dbpedia-entities-openai-1M`). Real embeddings at
+///   scale (that one is 1M x 1536) and, when the repo carries text
+///   columns, the only source that can feed FTS and SQL as well as
+///   vectors. No shipped ground truth: truth is computed over the rows
+///   actually ingested.
+/// * `parquet:<dir>` — every `*.parquet` in a local directory, read in
+///   sorted name order. No download and no naming convention: a directory
+///   of shards from any producer works, including one a `hf:` run already
+///   staged.
+///
+/// Real corpora are vector-only today except where a source carries text
+/// columns; FTS / SQL / combined modalities otherwise keep the synthetic
+/// corpus and say so rather than silently mixing corpora.
+#[derive(Debug, Clone)]
+pub enum CorpusSource {
+    /// Seeded planted-cluster generator (the historical default).
+    Synthetic,
+    /// Published ann-benchmarks dataset `slug`, staged under `dir`.
+    AnnBenchmarks { dir: PathBuf, slug: String },
+    /// Hugging Face parquet dataset `repo`, staged under `dir`.
+    HuggingFace { dir: PathBuf, repo: String },
+    /// Local directory of parquet shards.
+    LocalParquet { dir: PathBuf },
+}
+
+/// Where downloaded corpora are staged, set alongside the spec.
+static SOURCE: OnceLock<CorpusSource> = OnceLock::new();
+
+/// Text flavour of the synthetic source; [`TextFlavor::Uniform`] until
+/// `corpus=realistic` sets it. Only consulted when the source is
+/// [`CorpusSource::Synthetic`] — a real corpus brings its own text.
+static TEXT_FLAVOR: OnceLock<TextFlavor> = OnceLock::new();
+
+/// The synthetic text flavour for this process.
+pub fn text_flavor() -> TextFlavor {
+    *TEXT_FLAVOR.get_or_init(|| TextFlavor::Uniform)
+}
+
+/// Parse and install the corpus source for this process. First call wins,
+/// mirroring [`crate::dataset::set_prefix`]. `dir` is where downloadable
+/// sources stage their files. Returns an error string for an unparseable
+/// spec so the caller can fail with usage rather than panicking deep in a
+/// build.
+pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
+    let staged = |what: &str| -> Result<PathBuf, String> {
+        dir.map(PathBuf::from)
+            .ok_or_else(|| format!("corpus={spec} needs corpus-dir=<path> to stage {what}"))
+    };
+    let source = match spec.split_once(':') {
+        None if spec == "synthetic" => CorpusSource::Synthetic,
+        None if spec == "realistic" => {
+            let _ = TEXT_FLAVOR.set(TextFlavor::Realistic);
+            CorpusSource::Synthetic
+        }
+        Some(("annb", slug)) if !slug.is_empty() => CorpusSource::AnnBenchmarks {
+            dir: staged("the dataset file")?,
+            slug: slug.to_string(),
+        },
+        Some(("hf", repo)) if repo.contains('/') => CorpusSource::HuggingFace {
+            dir: staged("the dataset shards")?,
+            repo: repo.to_string(),
+        },
+        Some(("parquet", d)) if !d.is_empty() => CorpusSource::LocalParquet {
+            dir: PathBuf::from(d),
+        },
+        _ => {
+            return Err(format!(
+                "unknown corpus spec {spec:?} (expected synthetic | realistic | annb:<slug> | \
+                 hf:<owner/repo> | parquet:<dir>)"
+            ));
+        }
+    };
+    let _ = SOURCE.set(source);
+    Ok(())
+}
+
+/// The process-wide corpus source; [`CorpusSource::Synthetic`] until set.
+pub fn corpus_source() -> &'static CorpusSource {
+    SOURCE.get_or_init(|| CorpusSource::Synthetic)
+}
+
+/// Short corpus name for reports and dataset sidecars.
+pub fn corpus_label() -> &'static str {
+    match corpus_source() {
+        CorpusSource::Synthetic => text_flavor().label(),
+        CorpusSource::AnnBenchmarks { slug, .. } => slug,
+        CorpusSource::HuggingFace { repo, .. } => repo,
+        CorpusSource::LocalParquet { dir } => dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("parquet"),
+    }
+}
+
+/// Vector dimension of the active corpus: the synthetic constant for
+/// the generator, the dataset's own embedding width for a real corpus
+/// (read once from the parquet schema).
+pub fn dim() -> usize {
+    static DIM_ONCE: OnceLock<usize> = OnceLock::new();
+    *DIM_ONCE.get_or_init(|| match corpus_source() {
+        CorpusSource::Synthetic => SYNTHETIC_DIM,
+        CorpusSource::AnnBenchmarks { dir, slug } => real_corpus_dim(dir, slug),
+        source => parquet_dim(&parquet_shards_for(source)),
+    })
+}
 
 /// One `(local_doc_id, distance)` hit — same shape `VectorReader::search`
 /// returns. Re-exported here so recall helpers stay engine-agnostic.
@@ -204,7 +342,7 @@ pub const SUPERTABLE_DOCS: usize = 10_000_000;
 /// [`SUPERFILE_DOCS`] (1M); override with `INFINO_BENCH_SUPERFILE_DOCS`
 /// for a quicker local loop or a larger stress run.
 pub fn superfile_docs() -> usize {
-    docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS)
+    clamp_docs_to_corpus(docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS))
 }
 
 /// Document count for the **supertable** test — a multi-superfile table
@@ -212,7 +350,62 @@ pub fn superfile_docs() -> usize {
 /// [`SUPERTABLE_DOCS`] (10M); override with
 /// `INFINO_BENCH_SUPERTABLE_DOCS`.
 pub fn supertable_docs() -> usize {
-    docs_from_env("INFINO_BENCH_SUPERTABLE_DOCS", SUPERTABLE_DOCS)
+    clamp_docs_to_corpus(docs_from_env(
+        "INFINO_BENCH_SUPERTABLE_DOCS",
+        SUPERTABLE_DOCS,
+    ))
+}
+
+/// Cap a requested doc count at what a real corpus actually holds (the
+/// synthetic generator has no cap). Loud when it bites: a clamped run
+/// measures a different scale than the caller asked for.
+fn clamp_docs_to_corpus(n: usize) -> usize {
+    match corpus_source() {
+        CorpusSource::Synthetic => n,
+        CorpusSource::AnnBenchmarks { dir, slug } => {
+            let rows = real_corpus_rows(dir, slug);
+            if n > rows {
+                eprintln!("[corpus] requested {n} docs but the real corpus holds {rows}; clamping");
+            }
+            n.min(rows)
+        }
+        source => {
+            // Queries are the rows past the ingested prefix, so the ingest
+            // must stop short of the dataset's end or there is nothing held
+            // out to query with.
+            // Budget: ingest + delta commit + held-out queries must all fit
+            // inside the dataset. The delta is a fraction of the ingest, so
+            // solve for the ingest rather than subtracting a constant — a
+            // shortfall here previously surfaced as an opaque ground-truth
+            // size assertion after a full ingest had already run.
+            let rows = parquet_rows(&parquet_shards_for(source));
+            let usable = rows.saturating_sub(PARQUET_QUERY_RESERVE_ROWS);
+            let ingestable = (usable as f64 / (1.0 + PARQUET_DELTA_HEADROOM)) as usize;
+            assert!(
+                ingestable > 0,
+                "dataset holds {rows} rows, fewer than the {PARQUET_QUERY_RESERVE_ROWS}-row \
+                 query reserve"
+            );
+            if n > ingestable {
+                eprintln!(
+                    "[corpus] requested {n} docs; dataset holds {rows}, reserving \
+                     {PARQUET_QUERY_RESERVE_ROWS} rows for held-out queries plus delta \
+                     headroom — clamping to {ingestable}"
+                );
+            }
+            n.min(ingestable)
+        }
+    }
+}
+
+/// Human name of a source kind, for the not-yet-wired reports above.
+fn corpus_kind(source: &CorpusSource) -> &'static str {
+    match source {
+        CorpusSource::Synthetic => "synthetic",
+        CorpusSource::AnnBenchmarks { .. } => "ann-benchmarks",
+        CorpusSource::HuggingFace { .. } => "hugging-face parquet",
+        CorpusSource::LocalParquet { .. } => "local parquet",
+    }
 }
 
 /// Parse a positive doc-count override from `var`, falling back to
@@ -362,7 +555,85 @@ pub struct MmapTextCorpus {
 }
 
 impl MmapTextCorpus {
+    /// Generate the text corpus in the process's configured flavour
+    /// ([`text_flavor`]).
     pub fn generate(n_docs: usize, seed: u64) -> Self {
+        Self::generate_flavor(n_docs, seed, text_flavor())
+    }
+
+    /// Generate the text corpus in an explicit flavour.
+    pub fn generate_flavor(n_docs: usize, seed: u64, flavor: TextFlavor) -> Self {
+        match flavor {
+            TextFlavor::Uniform => Self::generate_uniform(n_docs, seed),
+            TextFlavor::Realistic => Self::generate_realistic(n_docs, seed),
+        }
+    }
+
+    /// The realistic flavour: byte lengths depend on the RNG, so a chunk's
+    /// bytes are generated into memory and appended in chunk order. Chunks
+    /// are small ([`text_gen::REALISTIC_CHUNK_DOCS`]) and processed in
+    /// windows of two per worker, so the in-flight buffer stays around
+    /// `2 × workers × ~50 MB` regardless of corpus size.
+    fn generate_realistic(n_docs: usize, seed: u64) -> Self {
+        let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
+        let path = tmp.path().join("corpus.txt");
+        let generator = TextDocGen::new(TextFlavor::Realistic);
+        let chunk_docs = generator.chunk_docs();
+        let n_chunks = n_docs.div_ceil(chunk_docs);
+        let window = parallel_writers().max(1) * 2;
+
+        let mut writer = BufWriter::new(File::create(&path).expect("create text corpus file"));
+        let mut offsets = Vec::with_capacity(n_docs + 1);
+        let mut pos = 0u64;
+        offsets.push(pos);
+        for window_start in (0..n_chunks).step_by(window) {
+            let window_end = (window_start + window).min(n_chunks);
+            let chunks: Vec<(Vec<u32>, Vec<u8>)> = (window_start..window_end)
+                .into_par_iter()
+                .map(|c| {
+                    let start = c * chunk_docs;
+                    let end = ((c + 1) * chunk_docs).min(n_docs);
+                    let mut rng = generator.chunk_rng(seed, c);
+                    let mut doc = String::new();
+                    let mut lens = Vec::with_capacity(end - start);
+                    let mut bytes =
+                        Vec::with_capacity((end - start) * REALISTIC_DOC_BYTES_ESTIMATE);
+                    for doc_id in start..end {
+                        doc.clear();
+                        generator.write_doc(&mut rng, doc_id, &mut doc);
+                        lens.push(doc.len() as u32);
+                        bytes.extend_from_slice(doc.as_bytes());
+                    }
+                    (lens, bytes)
+                })
+                .collect();
+            for (lens, bytes) in chunks {
+                writer.write_all(&bytes).expect("write text corpus chunk");
+                for len in lens {
+                    pos += u64::from(len);
+                    offsets.push(pos);
+                }
+            }
+        }
+        let file = writer.into_inner().expect("flush text corpus");
+        file.sync_all().expect("sync text corpus");
+        drop(file);
+
+        let file = File::open(&path).expect("reopen text corpus");
+        // SAFETY: this helper owns the temp file and never writes to it after
+        // the fsync above, so the read-only mmap cannot observe mutation.
+        let map = unsafe { Mmap::map(&file).expect("mmap text corpus") };
+        Self {
+            _tmp: tmp,
+            map,
+            offsets,
+        }
+    }
+
+    /// The uniform flavour: every doc's byte length is RNG-independent, so
+    /// the offset table is computed up front and each chunk writes to its
+    /// own disjoint byte range in parallel.
+    fn generate_uniform(n_docs: usize, seed: u64) -> Self {
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
 
@@ -521,17 +792,23 @@ fn page_floor(off: usize) -> usize {
 
 pub mod combined;
 pub mod grading;
+pub mod sql;
+pub mod sql_battery;
+pub mod text_gen;
 
 pub use combined::SequentialSyntheticCorpus;
+pub use text_gen::{
+    TextDocGen, TextFlavor, for_each_doc_in_chunk, for_each_generated_doc, generated_chunk_count,
+};
 
 // ─── Vector corpus ────────────────────────────────────────────────────
 
-/// Generate `n_docs` planted-cluster vectors of [`DIM`] dimensions,
+/// Generate `n_docs` planted-cluster vectors of [`dim()`] dimensions,
 /// optionally per-doc normalized for cosine. `n_cent` planted centers
 /// drawn from `3·N(0, 1)` per dim; each doc lives near a center with
 /// `sigma = 0.3` per-dim Gaussian noise.
 ///
-/// **Centers are intentionally NOT normalized.** At `DIM=384` the
+/// **Centers are intentionally NOT normalized.** At `dim()=384` the
 /// un-normalized center magnitude is ~58 and per-doc noise norm is
 /// ~5.9 (about 10% of center magnitude), so docs sit tightly around
 /// their planted center direction. If centers were unit-normalized
@@ -550,7 +827,7 @@ pub fn generate_vector_corpus(
 
     let centers: Vec<Vec<f32>> = (0..n_cent)
         .map(|_| {
-            (0..DIM)
+            (0..dim())
                 .map(|_| {
                     let s: f64 = dist.sample(&mut rng);
                     (s as f32) * CENTER_GAUSSIAN_SCALE
@@ -559,7 +836,7 @@ pub fn generate_vector_corpus(
         })
         .collect();
 
-    let mut out: Vec<f32> = Vec::with_capacity(n_docs * DIM);
+    let mut out: Vec<f32> = Vec::with_capacity(n_docs * dim());
     for i in 0..n_docs {
         let center = &centers[i % n_cent];
         let mut v: Vec<f32> = center
@@ -628,7 +905,7 @@ impl MmapVectorCorpus {
         let cdist = StandardNormal;
         let centers: Vec<Vec<f32>> = (0..n_cent)
             .map(|_| {
-                (0..DIM)
+                (0..dim())
                     .map(|_| {
                         let s: f64 = cdist.sample(&mut crng);
                         (s as f32) * CENTER_GAUSSIAN_SCALE
@@ -637,7 +914,7 @@ impl MmapVectorCorpus {
             })
             .collect();
 
-        let row_bytes = DIM * size_of::<f32>();
+        let row_bytes = dim() * size_of::<f32>();
         let total = vector_corpus_byte_len(n_docs).expect("vector corpus byte length");
         let file = File::create(&path).expect("create corpus file");
         file.set_len(total).expect("set_len vector corpus");
@@ -674,11 +951,11 @@ impl MmapVectorCorpus {
             // any preceding vectors so the requested rows remain bit-identical
             // to a full corpus generated with the same knobs.
             for _ in chunk_start..start {
-                for _ in 0..DIM {
+                for _ in 0..dim() {
                     let _: f64 = dist.sample(&mut rng);
                 }
             }
-            let mut row = vec![0.0f32; DIM];
+            let mut row = vec![0.0f32; dim()];
             for i in start..end {
                 let center = &centers_ref[i % n_cent];
                 for (j, slot) in row.iter_mut().enumerate() {
@@ -706,14 +983,29 @@ impl MmapVectorCorpus {
 
     /// Open an existing raw f32 corpus without copying or modifying it.
     ///
-    /// The file must contain exactly `n_docs * DIM` native-endian f32 values.
+    /// The file must contain exactly `n_docs * dim()` native-endian f32 values.
     pub fn open(path: &Path, n_docs: usize) -> IoResult<Self> {
         let file = File::open(path)?;
         Self::from_file(file, n_docs, None)
     }
 
     fn from_file(file: File, n_docs: usize, tmp: Option<TempDir>) -> IoResult<Self> {
-        let expected = vector_corpus_byte_len(n_docs)?;
+        Self::from_file_with_dim(file, n_docs, dim(), tmp)
+    }
+
+    /// As [`Self::from_file`] but with the row width passed in rather than
+    /// read from the process-wide [`dim`]. Real-dataset loads use this: the
+    /// dataset's own width is known from its file, and `dim()` resolves once
+    /// per process from env — so validating against it would reject a
+    /// correctly-sized corpus whenever the two disagree (which is precisely
+    /// what happens in tests, and would happen for any second dataset).
+    fn from_file_with_dim(
+        file: File,
+        n_docs: usize,
+        dim: usize,
+        tmp: Option<TempDir>,
+    ) -> IoResult<Self> {
+        let expected = vector_corpus_byte_len_for_dim(n_docs, dim)?;
         let actual = file.metadata()?.len();
         if actual != expected {
             return Err(Error::new(
@@ -729,7 +1021,7 @@ impl MmapVectorCorpus {
             _tmp: tmp,
             map,
             n_docs,
-            dim: DIM,
+            dim,
         })
     }
 
@@ -768,7 +1060,11 @@ impl MmapVectorCorpus {
 }
 
 fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
-    let row_bytes = DIM
+    vector_corpus_byte_len_for_dim(n_docs, dim())
+}
+
+fn vector_corpus_byte_len_for_dim(n_docs: usize, dim: usize) -> IoResult<u64> {
+    let row_bytes = dim
         .checked_mul(size_of::<f32>())
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "vector corpus row size overflow"))?;
     let total = n_docs.checked_mul(row_bytes).ok_or_else(|| {
@@ -785,6 +1081,739 @@ fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
     })
 }
 
+// ─── Real-corpus (ann-benchmarks HDF5) source ─────────────────────────
+
+/// Row-slab size for streaming a real corpus into the mmap: bounded peak
+/// memory (slab x dim x 4 bytes) rather than the whole dataset, which is
+/// multi-GB for the larger datasets.
+const H5_SLAB_ROWS: usize = 8_192;
+
+/// Connect timeout for a dataset download.
+const CORPUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whole-download deadline: generous enough for the largest published
+/// dataset on a slow link, finite so a half-open connection cannot hang a
+/// bench run forever.
+const CORPUS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
+
+/// Canonical ann-benchmarks dataset host: the academic, vendor-neutral
+/// mirror serving the `*-angular.hdf5` / `*-euclidean.hdf5` files the
+/// published ANN benchmarks are run against.
+const DEFAULT_CORPUS_URL_BASE: &str = "https://ann-benchmarks.com";
+
+/// Corpus rows dataset inside the HDF5 file.
+const H5_TRAIN: &str = "train";
+/// Query rows dataset.
+const H5_TEST: &str = "test";
+/// Official top-k neighbour ids per query (dataset row indices) — the
+/// published ground truth, so recall needs no brute-force recompute and
+/// the numbers are directly comparable to ann-benchmarks results.
+const H5_NEIGHBORS: &str = "neighbors";
+
+/// Resolve the dataset file, downloading it once when absent. The file name
+/// is the dataset slug plus `.hdf5` (`glove-25-angular` ->
+/// `glove-25-angular.hdf5`), matching the host's own layout, so a slug is
+/// the only thing a caller configures. Present files are used as-is.
+/// Streams to `<file>.part` and renames, so an interrupted download never
+/// leaves a truncated file under the real name, and verifies the received
+/// length against `Content-Length` when the server provides one.
+fn real_corpus_file(dir: &Path, slug: &str) -> PathBuf {
+    let name = format!("{slug}.hdf5");
+    let url = format!("{DEFAULT_CORPUS_URL_BASE}/{name}");
+    download_if_absent(dir, &name, &url)
+}
+
+/// Shared blocking HTTP client for corpus downloads: bounded connect and
+/// whole-transfer deadlines, so a dead host fails fast and a half-open
+/// connection to a multi-GB file cannot hang a run forever.
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(CORPUS_CONNECT_TIMEOUT)
+        .timeout(CORPUS_DOWNLOAD_TIMEOUT)
+        .build()
+        .expect("build http client")
+}
+
+/// Fetch `url` into `dir/name` unless already present. Streams to
+/// `<name>.part` and renames, so an interrupted transfer never leaves a
+/// truncated file under the real name, and verifies the received length
+/// against `Content-Length` when the server sends one — a
+/// truncated-but-200 response would otherwise be accepted silently and
+/// then surface as a confusing parse error deep in a run.
+fn download_if_absent(dir: &Path, name: &str, url: &str) -> PathBuf {
+    let path = dir.join(name);
+    if path.exists() {
+        return path;
+    }
+    eprintln!(
+        "[corpus] {name} missing from {}; downloading {url}...",
+        dir.display()
+    );
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let mut resp = http_client()
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .unwrap_or_else(|e| {
+            panic!(
+                "download {url} failed: {e}\nstage {name} in {} manually instead",
+                dir.display()
+            )
+        });
+    let expected = resp.content_length();
+    if let Some(len) = expected {
+        eprintln!("[corpus]   size: {}", rss::fmt_bytes(len));
+    }
+    let tmp = dir.join(format!("{name}.part"));
+    let mut out = BufWriter::new(
+        File::create(&tmp).unwrap_or_else(|e| panic!("create {}: {e}", tmp.display())),
+    );
+    let written = std::io::copy(&mut resp, &mut out)
+        .and_then(|n| {
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            Ok(n)
+        })
+        .unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            panic!("stream {url} to {}: {e}", tmp.display())
+        });
+    // Integrity: a truncated-but-200 response is otherwise accepted
+    // silently and then fails as a confusing parse error deep in a run.
+    if let Some(len) = expected
+        && written != len
+    {
+        let _ = std::fs::remove_file(&tmp);
+        panic!(
+            "{url}: received {written} bytes, Content-Length said {len} — refusing partial data"
+        );
+    }
+    std::fs::rename(&tmp, &path).unwrap_or_else(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        panic!("finalize {}: {e}", path.display())
+    });
+    eprintln!("[corpus]   downloaded {}", path.display());
+    path
+}
+
+/// Open the dataset file for `slug` under `dir`, fetching it if needed.
+fn open_h5(dir: &Path, slug: &str) -> hdf5::File {
+    let path = real_corpus_file(dir, slug);
+    hdf5::File::open(&path).unwrap_or_else(|e| panic!("open HDF5 dataset {}: {e}", path.display()))
+}
+
+/// Shape of one 2-D dataset: `(rows, cols)`.
+fn h5_shape(file: &hdf5::File, name: &str) -> (usize, usize) {
+    let ds = file
+        .dataset(name)
+        .unwrap_or_else(|e| panic!("dataset {name:?} missing from the HDF5 file: {e}"));
+    let shape = ds.shape();
+    assert_eq!(
+        shape.len(),
+        2,
+        "dataset {name:?} must be 2-D, got shape {shape:?}"
+    );
+    (shape[0], shape[1])
+}
+
+/// Corpus row count of the real dataset (metadata only, no data read).
+pub fn real_corpus_rows(dir: &Path, slug: &str) -> usize {
+    h5_shape(&open_h5(dir, slug), H5_TRAIN).0
+}
+
+/// Embedding width of the real dataset.
+pub fn real_corpus_dim(dir: &Path, slug: &str) -> usize {
+    h5_shape(&open_h5(dir, slug), H5_TRAIN).1
+}
+
+impl MmapVectorCorpus {
+    /// Materialize the first `n_docs` corpus rows of a real dataset into the
+    /// standard corpus mmap. Rows stream in row-slabs, so peak memory is one
+    /// slab rather than the dataset. `dim` is passed explicitly (not read
+    /// from the process-wide [`dim`]) so the write/normalize path is
+    /// exercisable offline in tests.
+    pub fn from_hdf5(
+        dir: &Path,
+        slug: &str,
+        n_docs: usize,
+        dim: usize,
+        normalize_each: bool,
+    ) -> IoResult<Self> {
+        let file = open_h5(dir, slug);
+        let (rows, cols) = h5_shape(&file, H5_TRAIN);
+        if cols != dim {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("dataset {slug} is {cols}-dim; {dim} requested"),
+            ));
+        }
+        if rows < n_docs {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("dataset {slug} holds {rows} rows; {n_docs} requested"),
+            ));
+        }
+        let ds = file
+            .dataset(H5_TRAIN)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+        let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
+        let path = tmp.path().join("corpus.bin");
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let mut done = 0usize;
+        while done < n_docs {
+            let take = (n_docs - done).min(H5_SLAB_ROWS);
+            let slab: ndarray::Array2<f32> =
+                ds.read_slice_2d(ndarray::s![done..done + take, ..])
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            for mut row in slab.outer_iter().map(|r| r.to_vec()) {
+                if normalize_each {
+                    normalize(&mut row);
+                }
+                let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+                writer.write_all(&bytes)?;
+            }
+            done += take;
+        }
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        Self::from_file_with_dim(File::open(&path)?, n_docs, dim, Some(tmp))
+    }
+}
+
+// ─── Real-corpus (parquet) source ─────────────────────────────────────
+
+/// Text column names accepted in a parquet dataset, in priority order.
+/// A dataset carrying one of these can drive the FTS and SQL tiers on the
+/// same rows the vector tier ingests — the reason real corpora belong in
+/// `benches/` rather than in a vector-only harness.
+const PARQUET_TEXT_COLUMNS: [&str; 3] = ["text", "title", "body"];
+
+/// Refuse a real corpus for a bench cell that only generates synthetic
+/// data. Falling back silently would measure generated data under the
+/// real corpus's label — and worse, `clamp_docs_to_corpus` sizes the run
+/// to the real dataset's row count, so the report would be shaped by rows
+/// the cell never read. Real-corpus text lives on the supertable tier;
+/// the superfile SQL cell reads real corpora through its schema-driven
+/// path, and the superfile FTS cell stays synthetic until it grows a
+/// reader of its own.
+pub fn require_synthetic(cell: &str) {
+    if !matches!(corpus_source(), CorpusSource::Synthetic) {
+        panic!(
+            "corpus {} is not supported by the `{cell}` cell: it measures its \
+             synthetic corpus only, so running it under a real corpus label \
+             would report numbers for data it never read — drop `corpus=` for \
+             this cell, or run the supertable tier, which consumes real corpora",
+            corpus_label()
+        );
+    }
+}
+
+/// Whether the active corpus can supply text (and therefore feed FTS /
+/// SQL). Synthetic always can; a parquet dataset can when it carries one
+/// of [`PARQUET_TEXT_COLUMNS`]; an ann-benchmarks dataset never can — its
+/// HDF5 files hold vectors only.
+pub fn corpus_has_text() -> bool {
+    match corpus_source() {
+        CorpusSource::Synthetic => true,
+        CorpusSource::AnnBenchmarks { .. } => false,
+        source => {
+            let shards = parquet_shards_for(source);
+            let first = shards.first().expect("at least one shard");
+            let f = File::open(first).unwrap_or_else(|e| panic!("open {}: {e}", first.display()));
+            let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+                .unwrap_or_else(|e| panic!("read {}: {e}", first.display()));
+            let schema = reader.schema();
+            PARQUET_TEXT_COLUMNS
+                .iter()
+                .any(|n| schema.column_with_name(n).is_some())
+        }
+    }
+}
+
+/// The text column of one batch as owned strings.
+fn parquet_text_rows(batch: &RecordBatch) -> Vec<String> {
+    let col = PARQUET_TEXT_COLUMNS
+        .iter()
+        .find_map(|name| batch.column_by_name(name))
+        .unwrap_or_else(|| {
+            panic!("parquet batch has none of the text columns {PARQUET_TEXT_COLUMNS:?}")
+        });
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else {
+        panic!(
+            "text column must be Utf8 or LargeUtf8, got {:?}",
+            col.data_type()
+        )
+    }
+}
+
+impl MmapTextCorpus {
+    /// Materialize the first `n_docs` text rows of a parquet dataset into
+    /// the standard text-corpus mmap, streaming batch by batch. Newlines in
+    /// the source are replaced with spaces: the mmap format is one document
+    /// per line, so an embedded newline would split one document into two.
+    pub fn from_parquet_shards(shards: &[PathBuf], n_docs: usize) -> IoResult<Self> {
+        let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
+        let path = tmp.path().join("corpus.txt");
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let mut offsets: Vec<u64> = Vec::with_capacity(n_docs + 1);
+        let mut pos = 0u64;
+        offsets.push(0);
+        let mut written = 0usize;
+        'outer: for shard in shards {
+            let f = File::open(shard)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+                .and_then(|b| b.with_batch_size(PARQUET_BATCH_ROWS).build())
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            for batch in reader {
+                let batch = batch.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+                for doc in parquet_text_rows(&batch) {
+                    let line = doc.replace(['\n', '\r'], " ");
+                    writer.write_all(line.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    pos += line.len() as u64 + 1;
+                    offsets.push(pos);
+                    written += 1;
+                    if written == n_docs {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if written < n_docs {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("parquet dataset holds {written} text rows; {n_docs} requested"),
+            ));
+        }
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        let file = File::open(&path)?;
+        // SAFETY: read-only mapping of a file this function just wrote and
+        // fsynced, and which nothing mutates while the corpus owns it.
+        let map = unsafe { Mmap::map(&file)? };
+        Ok(Self {
+            _tmp: tmp,
+            map,
+            offsets,
+        })
+    }
+}
+
+/// Hugging Face resolve base. Only the file endpoint is used — the `/api/`
+/// metadata endpoint requires credentials, so shard names come from a
+/// manifest read (below) rather than a directory listing.
+const HF_RESOLVE_BASE: &str = "https://huggingface.co";
+
+/// Vector column names accepted in a parquet dataset, in priority order.
+/// Datasets name the embedding column differently (`openai` in
+/// dbpedia-entities-openai-1M, `emb` elsewhere); both are read.
+const PARQUET_VECTOR_COLUMNS: [&str; 2] = ["openai", "emb"];
+
+/// Rows held back from the end of a parquet dataset to serve as queries.
+/// Generous relative to any battery's query count, and small relative to
+/// the datasets this source is for.
+const PARQUET_QUERY_RESERVE_ROWS: usize = 8_192;
+
+/// Headroom the ingest needs BEYOND its doc count, as a fraction: the
+/// supertable battery's delta phase appends exactly ONE more commit's
+/// worth of rows (`n_docs / n_commits`), and its lifecycle ground truth
+/// requires the corpus to contain them. The commit count never drops below
+/// `ingest::supertable::MIN_COMMIT_CHUNKS` (16) and only rises with scale,
+/// so one sixteenth is the exact worst case, not an estimate. Sized for the smallest commit count the
+/// bench uses, so the reserve is never short.
+const PARQUET_DELTA_HEADROOM: f64 = 1.0 / 16.0;
+
+/// Rows kept in memory while converting a parquet batch.
+const PARQUET_BATCH_ROWS: usize = 1_024;
+
+/// One parquet dataset's shard files, in ingest order. A `hf:` source
+/// downloads any that are missing first; both then read the directory, so
+/// there is no naming convention to satisfy and no producer-specific
+/// layout in this code.
+pub fn parquet_shards_for(source: &CorpusSource) -> Vec<PathBuf> {
+    if let CorpusSource::HuggingFace { dir, repo } = source {
+        hf_download_shards(dir, repo);
+    }
+    let dir = match source {
+        CorpusSource::LocalParquet { dir } | CorpusSource::HuggingFace { dir, .. } => dir,
+        other => panic!("{} is not a parquet source", corpus_kind(other)),
+    };
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
+    shards.sort();
+    assert!(
+        !shards.is_empty(),
+        "{} holds no *.parquet shards",
+        dir.display()
+    );
+    shards
+}
+
+/// Resolve a Hugging Face dataset's shard files, downloading any that are
+/// absent. Shard names follow the Hub's own convention
+/// (`data/train-<i>-of-<n>-<hash>.parquet`), which cannot be derived — so
+/// the first shard's name is required once via [`HF_SHARDS_ENV`]-free
+/// discovery: we read the local directory when it already holds shards,
+/// and otherwise ask the Hub's tree endpoint for the file list. The tree
+/// endpoint is the one metadata route that answers unauthenticated.
+fn hf_download_shards(dir: &Path, repo: &str) {
+    // Reconcile against the Hub's shard list rather than treating any
+    // parquet file as "already staged": a partially downloaded directory
+    // would otherwise be accepted, silently shrinking the corpus to
+    // whatever happened to be present (measured: one shard's 38,462 rows
+    // standing in for a 1M-row dataset).
+    let url = format!("{HF_RESOLVE_BASE}/api/datasets/{repo}/tree/main/data");
+    let client = http_client();
+    let listing = client
+        .get(&url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(|r| r.text())
+        .unwrap_or_else(|e| {
+            panic!(
+                "list {repo} shards via {url} failed: {e}\nstage the dataset's \
+                 data/*.parquet files in {} manually instead",
+                dir.display()
+            )
+        });
+    // Minimal extraction: the listing is JSON objects each carrying a
+    // "path" field; no JSON dependency needed for one field.
+    let mut names: Vec<String> = listing
+        .split("\"path\":\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .filter(|n| n.ends_with(".parquet"))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    assert!(
+        !names.is_empty(),
+        "{repo} listing returned no parquet shards: {}",
+        &listing[..listing.len().min(200)]
+    );
+    let missing = names
+        .iter()
+        .filter(|n| !dir.join(n.rsplit('/').next().unwrap_or(n)).exists())
+        .count();
+    if missing > 0 {
+        eprintln!(
+            "[corpus] {repo}: {}/{} shards staged, fetching {missing}...",
+            names.len() - missing,
+            names.len()
+        );
+    }
+    for name in &names {
+        let leaf = name.rsplit('/').next().unwrap_or(name);
+        download_if_absent(
+            dir,
+            leaf,
+            &format!("{HF_RESOLVE_BASE}/datasets/{repo}/resolve/main/{name}"),
+        );
+    }
+}
+
+/// Row count of a parquet dataset, from footer metadata only.
+fn parquet_rows(shards: &[PathBuf]) -> usize {
+    shards
+        .iter()
+        .map(|p| {
+            let f = File::open(p).unwrap_or_else(|e| panic!("open {}: {e}", p.display()));
+            ParquetRecordBatchReaderBuilder::try_new(f)
+                .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+                .metadata()
+                .file_metadata()
+                .num_rows() as usize
+        })
+        .sum()
+}
+
+/// Vector width of a parquet dataset, from its first row.
+fn parquet_dim(shards: &[PathBuf]) -> usize {
+    let first = shards.first().expect("at least one shard");
+    let f = File::open(first).unwrap_or_else(|e| panic!("open {}: {e}", first.display()));
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)
+        .and_then(|b| b.with_batch_size(1).build())
+        .unwrap_or_else(|e| panic!("read {}: {e}", first.display()));
+    let batch = reader
+        .next()
+        .expect("shard has at least one row")
+        .unwrap_or_else(|e| panic!("decode {}: {e}", first.display()));
+    parquet_vector_rows(&batch)
+        .first()
+        .map(Vec::len)
+        .expect("non-empty batch")
+}
+
+/// The vector column of one batch as owned fp32 rows. Accepts the list
+/// encodings these datasets use and downcasts f64 values (the
+/// dbpedia-entities-openai-1M column is `list<double>`, 12 KB a row on the
+/// wire) to the f32 the engine ingests.
+fn parquet_vector_rows(batch: &RecordBatch) -> Vec<Vec<f32>> {
+    let col = PARQUET_VECTOR_COLUMNS
+        .iter()
+        .find_map(|name| batch.column_by_name(name))
+        .unwrap_or_else(|| {
+            panic!(
+                "parquet batch has none of the vector columns {PARQUET_VECTOR_COLUMNS:?}; \
+                 columns are {:?}",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>()
+            )
+        });
+    let values_at = |values: &dyn Array, start: usize, len: usize| -> Vec<f32> {
+        if let Some(f) = values.as_any().downcast_ref::<Float32Array>() {
+            (start..start + len).map(|i| f.value(i)).collect()
+        } else if let Some(d) = values.as_any().downcast_ref::<Float64Array>() {
+            (start..start + len).map(|i| d.value(i) as f32).collect()
+        } else {
+            panic!(
+                "vector values must be f32 or f64, got {:?}",
+                values.data_type()
+            )
+        }
+    };
+    if let Some(l) = col.as_any().downcast_ref::<ListArray>() {
+        (0..l.len())
+            .map(|i| {
+                let (s, e) = (
+                    l.value_offsets()[i] as usize,
+                    l.value_offsets()[i + 1] as usize,
+                );
+                values_at(l.values().as_ref(), s, e - s)
+            })
+            .collect()
+    } else if let Some(l) = col.as_any().downcast_ref::<LargeListArray>() {
+        (0..l.len())
+            .map(|i| {
+                let (s, e) = (
+                    l.value_offsets()[i] as usize,
+                    l.value_offsets()[i + 1] as usize,
+                );
+                values_at(l.values().as_ref(), s, e - s)
+            })
+            .collect()
+    } else if let Some(l) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        let w = l.value_length() as usize;
+        (0..l.len())
+            .map(|i| values_at(l.values().as_ref(), i * w, w))
+            .collect()
+    } else {
+        panic!("unsupported vector encoding {:?}", col.data_type())
+    }
+}
+
+impl MmapVectorCorpus {
+    /// Materialize the first `n_docs` rows of a parquet dataset into the
+    /// standard corpus mmap, streaming batch by batch so peak memory is one
+    /// batch. `dim` is explicit for the same reason as [`Self::from_hdf5`].
+    pub fn from_parquet_shards(
+        shards: &[PathBuf],
+        n_docs: usize,
+        dim: usize,
+        normalize_each: bool,
+    ) -> IoResult<Self> {
+        let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
+        let path = tmp.path().join("corpus.bin");
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let mut written = 0usize;
+        'outer: for shard in shards {
+            let f = File::open(shard)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+                .and_then(|b| b.with_batch_size(PARQUET_BATCH_ROWS).build())
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            for batch in reader {
+                let batch = batch.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+                for mut row in parquet_vector_rows(&batch) {
+                    if row.len() != dim {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("row width {} != {dim} in {}", row.len(), shard.display()),
+                        ));
+                    }
+                    if normalize_each {
+                        normalize(&mut row);
+                    }
+                    let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    writer.write_all(&bytes)?;
+                    written += 1;
+                    if written == n_docs {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if written < n_docs {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("parquet dataset holds {written} rows; {n_docs} requested"),
+            ));
+        }
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        Self::from_file_with_dim(File::open(&path)?, n_docs, dim, Some(tmp))
+    }
+}
+
+/// Held-out query rows for a parquet dataset: the rows immediately PAST
+/// the ingested prefix. They are in the dataset and never in the table, so
+/// they are genuinely held out rather than self-queries, and no dataset
+/// needs to ship a separate query file.
+pub fn parquet_queries(
+    source: &CorpusSource,
+    n_docs: usize,
+    n_queries: usize,
+    normalize_each: bool,
+) -> Vec<Vec<f32>> {
+    let shards = parquet_shards_for(source);
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(n_queries);
+    let mut seen = 0usize;
+    for shard in &shards {
+        let f = File::open(shard).unwrap_or_else(|e| panic!("open {}: {e}", shard.display()));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .and_then(|b| b.with_batch_size(PARQUET_BATCH_ROWS).build())
+            .unwrap_or_else(|e| panic!("read {}: {e}", shard.display()));
+        for batch in reader {
+            for mut row in parquet_vector_rows(&batch.expect("decode batch")) {
+                if seen >= n_docs {
+                    if out.len() == n_queries {
+                        return out;
+                    }
+                    if normalize_each {
+                        normalize(&mut row);
+                    }
+                    out.push(row);
+                }
+                seen += 1;
+            }
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "no rows past {n_docs} to query with; ingest fewer rows or use a deeper dataset"
+    );
+    out
+}
+
+/// The dataset's own query vectors (`test`), first `n_queries` in file
+/// order — the published query set, so the neighbour ids below line up with
+/// them by index.
+pub fn real_queries(
+    dir: &Path,
+    slug: &str,
+    n_queries: usize,
+    normalize_each: bool,
+) -> Vec<Vec<f32>> {
+    let file = open_h5(dir, slug);
+    let (rows, _) = h5_shape(&file, H5_TEST);
+    let take = n_queries.min(rows);
+    let ds = file.dataset(H5_TEST).expect("test dataset");
+    let slab: ndarray::Array2<f32> = ds
+        .read_slice_2d(ndarray::s![0..take, ..])
+        .unwrap_or_else(|e| panic!("read {H5_TEST}: {e}"));
+    slab.outer_iter()
+        .map(|r| {
+            let mut v = r.to_vec();
+            if normalize_each {
+                normalize(&mut v);
+            }
+            v
+        })
+        .collect()
+}
+
+/// The dataset's OFFICIAL top-`k` neighbour ids for the first `n_queries`
+/// queries, as corpus row indices. Published ground truth: no brute-force
+/// recompute, and recall computed against it is directly comparable to
+/// ann-benchmarks numbers.
+///
+/// **Only valid for a FULL-corpus ingest.** The published neighbours are the
+/// true top-k over every row of the dataset; on a truncated corpus a query's
+/// true neighbours are generally different rows, so the published list is
+/// simply the wrong answer — dropping the out-of-range ids would leave a
+/// short list that silently overstates recall. Callers ingesting a subset
+/// must compute ground truth over the rows they actually ingested
+/// ([`brute_force_topk`]). This asserts rather than degrading, because a
+/// wrong ground truth produces a plausible number that is not measuring
+/// anything.
+pub fn real_ground_truth(
+    dir: &Path,
+    slug: &str,
+    n_queries: usize,
+    k: usize,
+    n_docs: usize,
+) -> Vec<Vec<u32>> {
+    let rows = real_corpus_rows(dir, slug);
+    assert_eq!(
+        n_docs, rows,
+        "official ground truth for {slug} covers all {rows} rows; it cannot grade a \
+         {n_docs}-row ingest — recompute truth over the ingested rows instead"
+    );
+    let file = open_h5(dir, slug);
+    let (rows, cols) = h5_shape(&file, H5_NEIGHBORS);
+    let take = n_queries.min(rows);
+    assert!(
+        k <= cols,
+        "dataset {slug} ships {cols} neighbours per query; k={k} requested"
+    );
+    let ds = file.dataset(H5_NEIGHBORS).expect("neighbors dataset");
+    let slab: ndarray::Array2<i32> = ds
+        .read_slice_2d(ndarray::s![0..take, 0..k])
+        .unwrap_or_else(|e| panic!("read {H5_NEIGHBORS}: {e}"));
+    slab.outer_iter()
+        .map(|r| {
+            r.iter()
+                .filter(|&&id| id >= 0 && (id as usize) < n_docs)
+                .map(|&id| id as u32)
+                .collect()
+        })
+        .collect()
+}
+
+/// The bench query battery for the MAIN vector corpus: dataset test
+/// queries for a real corpus, perturbed corpus members for the
+/// synthetic one. Diagnostics that plant their own private corpora keep
+/// calling [`generate_realistic_queries`] directly.
+pub fn bench_queries(
+    vectors: &[f32],
+    n_docs: usize,
+    n_queries: usize,
+    seed: u64,
+    normalize_each: bool,
+    sigma: f32,
+) -> Vec<Vec<f32>> {
+    match corpus_source() {
+        CorpusSource::Synthetic => {
+            generate_realistic_queries(vectors, n_docs, n_queries, seed, normalize_each, sigma)
+        }
+        CorpusSource::AnnBenchmarks { dir, slug } => {
+            real_queries(dir, slug, n_queries, normalize_each)
+        }
+        // Parquet sources hold back the rows past the ingested prefix, so
+        // `n_docs` must be the ingested count, not the dataset's size.
+        source => parquet_queries(source, n_docs, n_queries, normalize_each),
+    }
+}
+
 // ─── Query batteries ──────────────────────────────────────────────────
 
 /// `n_queries` deterministic Gaussian queries (no corpus dependency),
@@ -796,7 +1825,7 @@ pub fn generate_queries(n_queries: usize, seed: u64) -> Vec<Vec<f32>> {
     let dist = StandardNormal;
     (0..n_queries)
         .map(|_| {
-            let mut q: Vec<f32> = (0..DIM)
+            let mut q: Vec<f32> = (0..dim())
                 .map(|_| {
                     let s: f64 = dist.sample(&mut rng);
                     (s as f32) * QUERY_GAUSSIAN_SCALE
@@ -828,8 +1857,8 @@ pub fn generate_realistic_queries(
         // Coprime stride so consecutive queries don't all sit in the
         // first planted cluster.
         let base_idx = (i * QUERY_BASE_DOC_STRIDE) % n_docs;
-        let off = base_idx * DIM;
-        let mut q: Vec<f32> = (0..DIM)
+        let off = base_idx * dim();
+        let mut q: Vec<f32> = (0..dim())
             .map(|d| {
                 let s: f64 = dist.sample(&mut rng);
                 vectors[off + d] + (s as f32) * sigma
@@ -854,12 +1883,12 @@ pub fn brute_force_topk(
     metric: Metric,
     k: usize,
 ) -> Vec<u32> {
-    assert_eq!(vectors.len(), n_docs * DIM);
-    assert_eq!(query.len(), DIM);
+    assert_eq!(vectors.len(), n_docs * dim());
+    assert_eq!(query.len(), dim());
     let mut scored: Vec<(u32, f32)> = (0..n_docs as u32)
         .map(|i| {
-            let off = (i as usize) * DIM;
-            (i, distance(metric, query, &vectors[off..off + DIM]))
+            let off = (i as usize) * dim();
+            (i, distance(metric, query, &vectors[off..off + dim()]))
         })
         .collect();
     scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -876,14 +1905,14 @@ pub fn brute_force_topk_cosine(
     query: &[f32],
     k: usize,
 ) -> Vec<u32> {
-    assert_eq!(vectors.len(), n_docs * DIM);
-    assert_eq!(query.len(), DIM);
+    assert_eq!(vectors.len(), n_docs * dim());
+    assert_eq!(query.len(), dim());
     // For L2-normalized inputs cosine distance is monotone in -dot.
     let mut scored: Vec<(u32, f32)> = (0..n_docs as u32)
         .map(|i| {
-            let off = (i as usize) * DIM;
+            let off = (i as usize) * dim();
             let mut dot = 0f32;
-            for d in 0..DIM {
+            for d in 0..dim() {
                 dot += vectors[off + d] * query[d];
             }
             (i, -dot)
@@ -982,9 +2011,9 @@ fn ground_truth_ids(tops: Vec<Vec<GroundTruthCandidate>>) -> Vec<Vec<u32>> {
 }
 
 fn transpose_queries(queries: &[Vec<f32>]) -> Vec<f32> {
-    let mut transposed = vec![0.0; DIM * queries.len()];
+    let mut transposed = vec![0.0; dim() * queries.len()];
     for (query_index, query) in queries.iter().enumerate() {
-        assert_eq!(query.len(), DIM);
+        assert_eq!(query.len(), dim());
         for (dimension, value) in query.iter().enumerate() {
             transposed[dimension * queries.len() + query_index] = *value;
         }
@@ -1044,23 +2073,23 @@ pub fn ground_truth(
     queries: &[Vec<f32>],
     k: usize,
 ) -> Vec<Vec<u32>> {
-    assert_eq!(vectors.len(), n_docs * DIM);
+    assert_eq!(vectors.len(), n_docs * dim());
     if queries.is_empty() || n_docs == 0 || k == 0 {
         return vec![Vec::new(); queries.len()];
     }
 
     let tops = vectors
-        .par_chunks(GT_DOC_CHUNK * DIM)
+        .par_chunks(GT_DOC_CHUNK * dim())
         .enumerate()
         .map(|(chunk_idx, chunk)| {
             let base = (chunk_idx * GT_DOC_CHUNK) as u32;
             let mut tops: Vec<Vec<GroundTruthCandidate>> =
                 vec![Vec::with_capacity(k + 1); queries.len()];
-            for (j, doc) in chunk.chunks_exact(DIM).enumerate() {
+            for (j, doc) in chunk.chunks_exact(dim()).enumerate() {
                 let id = base + j as u32;
                 for (top, q) in tops.iter_mut().zip(queries) {
                     let mut dot = 0f32;
-                    for d in 0..DIM {
+                    for d in 0..dim() {
                         dot += doc[d] * q[d];
                     }
                     insert_ground_truth_candidate(top, (-dot, id), k);
@@ -1092,7 +2121,7 @@ pub fn lifecycle_ground_truth(
     filter_keep_every: usize,
     k: usize,
 ) -> LifecycleGroundTruth {
-    assert_eq!(vectors.len(), augmented_docs * DIM);
+    assert_eq!(vectors.len(), augmented_docs * dim());
     assert!(n_docs <= augmented_docs);
     assert!(augmented_docs <= u32::MAX as usize);
     assert!(n_correctness_queries <= queries.len());
@@ -1111,13 +2140,13 @@ pub fn lifecycle_ground_truth(
         .then(|| augmented_docs.div_ceil(GT_PROGRESS_STEPS));
     let next_report = AtomicUsize::new(progress_stride.unwrap_or(usize::MAX));
     let tops = vectors
-        .par_chunks(GT_DOC_CHUNK * DIM)
+        .par_chunks(GT_DOC_CHUNK * dim())
         .enumerate()
         .map(|(chunk_index, chunk)| {
             let base = chunk_index * GT_DOC_CHUNK;
             let mut tops = LifecycleTopLists::empty(queries.len(), n_correctness_queries);
             let mut dots = vec![0.0f32; queries.len()];
-            for (local_doc, doc) in chunk.chunks_exact(DIM).enumerate() {
+            for (local_doc, doc) in chunk.chunks_exact(dim()).enumerate() {
                 let doc_id = base + local_doc;
                 let query_count = if doc_id < n_docs {
                     queries.len()
@@ -1164,7 +2193,7 @@ pub fn lifecycle_ground_truth(
                     &next_report,
                     augmented_docs,
                     stride,
-                    chunk.len() / DIM,
+                    chunk.len() / dim(),
                 );
             }
             tops
@@ -1197,7 +2226,7 @@ pub fn filtered_ground_truth(
             let mut dists: Vec<(f32, u32)> = allow
                 .iter()
                 .map(|id| {
-                    let row = &vectors[id as usize * DIM..(id as usize + 1) * DIM];
+                    let row = &vectors[id as usize * dim()..(id as usize + 1) * dim()];
                     let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
                     (-dot, id)
                 })
@@ -1501,7 +2530,7 @@ pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
     b
 }
 
-/// Build a stand-alone vector index. `vectors` is flat `n_docs * DIM`.
+/// Build a stand-alone vector index. `vectors` is flat `n_docs * dim()`.
 ///
 /// Bench harness picks `Sq8` by default to match the on-disk
 /// default for production superfiles. Per-cluster scale/offset
@@ -1515,15 +2544,15 @@ pub fn build_vector_index(vectors: &[f32], n_docs: usize, metric: Metric) -> Vec
     b.register_column(VectorConfig {
         provided_centroids: None,
         column: "v".into(),
-        dim: DIM,
+        dim: dim(),
         rot_seed: ROT_SEED,
         metric,
         rerank_codec: bench_rerank_codec(metric),
     })
     .expect("register column");
     for i in 0..n_docs {
-        let off = i * DIM;
-        b.add(0, &vectors[off..off + DIM])
+        let off = i * dim();
+        b.add(0, &vectors[off..off + dim()])
             .expect("add to vector builder");
     }
     b
@@ -1537,7 +2566,10 @@ pub fn open_vector_reader(blob: Vec<u8>, metric: Metric) -> VectorReader {
         Metric::Cosine => "cosine",
         Metric::NegDot => "negdot",
     };
-    let json = format!(r#"[{{"column":"v","dim":{DIM},"rot_seed":7,"metric":"{metric_str}"}}]"#);
+    let json = format!(
+        r#"[{{"column":"v","dim":{},"rot_seed":7,"metric":"{metric_str}"}}]"#,
+        dim()
+    );
     VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
         .expect("open VectorReader")
 }
@@ -1559,19 +2591,15 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![SfVectorConfig {
             provided_centroids: None,
             column: "emb".into(),
-            dim: DIM,
+            dim: dim(),
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: bench_rerank_codec(Metric::Cosine),
         }],
-        Some(default_tokenizer()),
     );
 
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -1601,19 +2629,15 @@ pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Met
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![SfVectorConfig {
             provided_centroids: None,
             column: "emb".into(),
-            dim: DIM,
+            dim: dim(),
             rot_seed: ROT_SEED,
             metric,
             rerank_codec: bench_rerank_codec(metric),
         }],
-        Some(default_tokenizer()),
     );
 
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -1674,7 +2698,7 @@ mod tests {
     fn mmap_vector_corpus_opens_only_the_exact_expected_size() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("vectors.bin");
-        let values: Vec<f32> = (0..MMAP_OPEN_TEST_DOCS * DIM)
+        let values: Vec<f32> = (0..MMAP_OPEN_TEST_DOCS * dim())
             .map(|value| value as f32)
             .collect();
         let bytes: &[u8] = bytemuck::cast_slice(&values);
@@ -1682,7 +2706,7 @@ mod tests {
 
         let corpus = MmapVectorCorpus::open(&path, MMAP_OPEN_TEST_DOCS).expect("open exact corpus");
         assert_eq!(corpus.n_docs(), MMAP_OPEN_TEST_DOCS);
-        assert_eq!(corpus.dim(), DIM);
+        assert_eq!(corpus.dim(), dim());
         assert_eq!(corpus.as_slice(), values);
 
         let wrong_path = directory.path().join("wrong-size.bin");
@@ -1715,8 +2739,8 @@ mod tests {
             MMAP_RANGE_TEST_SEED,
             true,
         );
-        let start = MMAP_RANGE_TEST_START * DIM;
-        let end = full_docs * DIM;
+        let start = MMAP_RANGE_TEST_START * dim();
+        let end = full_docs * dim();
         let tail_bytes: &[u8] = bytemuck::cast_slice(tail.as_slice());
         let expected_bytes: &[u8] = bytemuck::cast_slice(&full.as_slice()[start..end]);
 
@@ -1727,12 +2751,12 @@ mod tests {
     #[test]
     fn transposed_ground_truth_matches_reference() {
         let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
-        let mut vectors = vec![0f32; GT_TEST_DOCS * DIM];
+        let mut vectors = vec![0f32; GT_TEST_DOCS * dim()];
         for v in vectors.iter_mut() {
             *v = rng.random::<f32>() - 0.5;
         }
         let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
-            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .map(|_| (0..dim()).map(|_| rng.random::<f32>() - 0.5).collect())
             .collect();
 
         let transposed = ground_truth(&vectors, GT_TEST_DOCS, &queries, GT_TEST_K);
@@ -1748,14 +2772,14 @@ mod tests {
     #[test]
     fn lifecycle_ground_truth_matches_three_reference_oracles() {
         let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
-        let mut vectors = vec![0f32; LIFECYCLE_GT_TEST_AUGMENTED_DOCS * DIM];
+        let mut vectors = vec![0f32; LIFECYCLE_GT_TEST_AUGMENTED_DOCS * dim()];
         for value in &mut vectors {
             *value = rng.random::<f32>() - 0.5;
         }
         let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
-            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .map(|_| (0..dim()).map(|_| rng.random::<f32>() - 0.5).collect())
             .collect();
-        let base_vectors = &vectors[..LIFECYCLE_GT_TEST_DOCS * DIM];
+        let base_vectors = &vectors[..LIFECYCLE_GT_TEST_DOCS * dim()];
         let base = ground_truth(base_vectors, LIFECYCLE_GT_TEST_DOCS, &queries, GT_TEST_K);
         let mut allow = RoaringBitmap::new();
         for id in (0..LIFECYCLE_GT_TEST_DOCS as u32).step_by(LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY) {
@@ -1786,5 +2810,111 @@ mod tests {
         assert_eq!(combined.base, base);
         assert_eq!(combined.filtered, filtered);
         assert_eq!(combined.augmented, augmented);
+    }
+
+    /// `from_hdf5` and the query / ground-truth readers round-trip a fixture
+    /// this test writes itself, so the write + normalize path is exercised
+    /// offline — no network, no staged dataset. `dim` is passed explicitly
+    /// for exactly this reason: the process-wide `dim()` resolves once from
+    /// env and would pin whatever the first caller in the process asked for.
+    #[test]
+    fn real_corpus_hdf5_round_trip() {
+        const ROWS: usize = 40;
+        const TEST_DIM: usize = 4;
+        const QUERIES: usize = 6;
+        const NEIGHBORS: usize = 5;
+
+        let dir = TempDir::new().expect("fixture dir");
+        let slug = "fixture-4-angular";
+        let train: Vec<f32> = (0..ROWS * TEST_DIM).map(|i| 1.0 + i as f32).collect();
+        let test: Vec<f32> = (0..QUERIES * TEST_DIM).map(|i| 100.0 + i as f32).collect();
+        // Includes one out-of-range id to pin the truncated-corpus filter.
+        let neigh: Vec<i32> = (0..QUERIES * NEIGHBORS)
+            .map(|i| {
+                if i == 0 {
+                    ROWS as i32 + 1
+                } else {
+                    (i % ROWS) as i32
+                }
+            })
+            .collect();
+        {
+            let f = hdf5::File::create(dir.path().join(format!("{slug}.hdf5"))).expect("create");
+            f.new_dataset::<f32>()
+                .shape([ROWS, TEST_DIM])
+                .create(H5_TRAIN)
+                .expect("train ds")
+                .write(
+                    &ndarray::Array2::from_shape_vec((ROWS, TEST_DIM), train.clone())
+                        .expect("shape"),
+                )
+                .expect("write train");
+            f.new_dataset::<f32>()
+                .shape([QUERIES, TEST_DIM])
+                .create(H5_TEST)
+                .expect("test ds")
+                .write(
+                    &ndarray::Array2::from_shape_vec((QUERIES, TEST_DIM), test.clone())
+                        .expect("shape"),
+                )
+                .expect("write test");
+            f.new_dataset::<i32>()
+                .shape([QUERIES, NEIGHBORS])
+                .create(H5_NEIGHBORS)
+                .expect("neighbors ds")
+                .write(
+                    &ndarray::Array2::from_shape_vec((QUERIES, NEIGHBORS), neigh).expect("shape"),
+                )
+                .expect("write neighbors");
+        }
+
+        assert_eq!(real_corpus_rows(dir.path(), slug), ROWS);
+        assert_eq!(real_corpus_dim(dir.path(), slug), TEST_DIM);
+
+        // Un-normalized load preserves row order and values exactly.
+        let raw =
+            MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS, TEST_DIM, false).expect("load raw");
+        assert_eq!(raw.as_slice(), train.as_slice());
+
+        // Normalized load makes every row unit, same order.
+        let unit = MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS, TEST_DIM, true)
+            .expect("load normalized");
+        for (i, row) in unit.as_slice().chunks_exact(TEST_DIM).enumerate() {
+            let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "row {i} norm {norm}");
+            let want = &train[i * TEST_DIM..(i + 1) * TEST_DIM];
+            let want_norm: f32 = want.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for (d, v) in row.iter().enumerate() {
+                assert!((v - want[d] / want_norm).abs() < 1e-5, "row {i} dim {d}");
+            }
+        }
+
+        // Row shortfall and dim mismatch are errors, never silent loads.
+        assert!(
+            MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS + 1, TEST_DIM, false).is_err(),
+            "row shortfall must be an error"
+        );
+        assert!(
+            MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS, TEST_DIM + 1, false).is_err(),
+            "dim mismatch must be an error"
+        );
+
+        // Queries in file order, normalized on request.
+        let qs = real_queries(dir.path(), slug, 3, false);
+        assert_eq!(qs.len(), 3);
+        assert_eq!(qs[0], test[..TEST_DIM].to_vec());
+        let qn = real_queries(dir.path(), slug, 1, true);
+        let norm: f32 = qn[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "query norm {norm}");
+
+        // Official ground truth: out-of-corpus ids dropped, rest in range.
+        let gt = real_ground_truth(dir.path(), slug, QUERIES, NEIGHBORS, ROWS);
+        assert_eq!(gt.len(), QUERIES);
+        assert_eq!(
+            gt[0].len(),
+            NEIGHBORS - 1,
+            "the planted out-of-range id must be filtered"
+        );
+        assert!(gt.iter().flatten().all(|&id| (id as usize) < ROWS));
     }
 }

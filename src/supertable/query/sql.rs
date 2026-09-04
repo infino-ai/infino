@@ -59,15 +59,19 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::SchemaRef;
 use datafusion::{
+    dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    execution::context::SessionContext,
+    execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, LogicalPlan},
 };
 
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     memory::budgeted_session_context,
-    runtime_metrics::op_stats,
+    runtime_metrics::op_stats::{self, OpStatsCollector},
+    storage::permission_denied_in_chain,
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -75,8 +79,9 @@ use crate::{
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
-                fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
-                match_exec::register_match, vector_exec::register_vector_search,
+                common::collect_plan_metered, fts_exec::register_bm25,
+                hybrid_exec::register_hybrid_search, match_exec::register_match,
+                vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
@@ -112,7 +117,10 @@ impl SqlSchemas {
 /// cached on the handle. This is the one place that walks the full column set,
 /// so a wide (thousands of columns) table pays it once, not per query.
 pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
-    let scalar = options.scalar_schema();
+    // Stored shape: index-only FTS columns are absent from Parquet, so
+    // SQL never sees them — selecting or filtering one fails at plan
+    // time like any unknown column.
+    let scalar = options.stored_schema();
     let fts: HashSet<&str> = options
         .fts_columns
         .iter()
@@ -155,10 +163,18 @@ fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
 }
 
 /// Classify a SQL execution error: budget exhaustion -> [`QueryError::OverBudget`]
-/// (the catalog surfaces it as `InfinoError::OverBudget`), else an execute error.
+/// (the catalog surfaces it as `InfinoError::OverBudget`), refused credentials
+/// -> [`QueryError::PermissionDenied`], else an execute error.
+///
+/// The credential check reads the error's source chain rather than its message:
+/// a scan failure reaches DataFusion wrapped, and the underlying storage error
+/// is still typed inside it.
 fn exec_query_error(e: DataFusionError) -> QueryError {
     match e {
         DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg),
+        other if permission_denied_in_chain(&other) => {
+            QueryError::PermissionDenied(other.to_string())
+        }
         other => QueryError::Execute(other.to_string()),
     }
 }
@@ -211,15 +227,16 @@ impl SupertableReader {
     /// Not metered: this entry runs on the cached, collector-detached
     /// [`SessionContext`] (see [`Self::sql_session_context`]), so a
     /// surrounding `with_op_stats` scope reports zero SQL work for it.
-    /// The metered SQL surface is the catalog `Connection::query_sql`,
-    /// which builds a fresh per-query provider that carries the scope's
-    /// collector.
+    /// The metered SQL surfaces are the catalog `Connection::query_sql`,
+    /// which builds a fresh per-query provider carrying the scope's
+    /// collector, and mutation predicate resolves, which go through
+    /// [`Self::metered_session_context`] for the same reason.
     // Single-table SQL — off the public surface; catalog-level SQL is the
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(sql = sql))
+        tracing::instrument(skip_all, fields(sql = sql, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
@@ -238,6 +255,12 @@ impl SupertableReader {
         });
         let cached_plan = self.cached_sql_logical_plan(sql);
         let cache_reader = self.clone();
+        // Picked up on the caller's thread, like reader mint: the drive
+        // future polls on runtime threads where the scope's slot is
+        // invisible. This is what lets the cached, collector-detached
+        // context still report the plan's CPU — the meter rides the
+        // wrapper below, not the context.
+        let op_stats = op_stats::current();
 
         let sql = sql.to_owned();
         let drive = async move {
@@ -269,7 +292,11 @@ impl SupertableReader {
                     df
                 }
             };
-            df.collect().await.map_err(exec_query_error)
+            // Meter the executed plan on the thread-CPU clock, the same
+            // way the catalog path does. The context is cached and
+            // deliberately carries no collector, so without this the
+            // reader-level SQL surface reports nothing at all.
+            Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
 
         // Drive through the shared sync→async bridge: ambient
@@ -318,20 +345,49 @@ impl SupertableReader {
             return Ok(ctx.clone());
         }
 
+        let ctx = op_stats::suppressed(|| self.build_session_context(reader))?;
+        *guard = Some((Arc::clone(&manifest), ctx.clone()));
+        Ok(ctx)
+    }
+
+    /// A context bound to **this** reader, collector and all, built fresh
+    /// on every call and never cached.
+    ///
+    /// [`Self::sql_session_context`] detaches the collector because its
+    /// context is shared across queries, and one that captured a live
+    /// collector would attribute later queries' work back into an old
+    /// scope. That makes it unusable for anything whose work should be
+    /// reported: a caller running through it measures zero no matter how
+    /// much it scans.
+    ///
+    /// Not caching is what makes carrying the collector safe — nothing
+    /// outlives the scope that created it — and it is the same trade the
+    /// catalog's `Connection::query_sql` already makes, building a fresh
+    /// provider per query so the scope's collector rides along.
+    fn metered_session_context(&self) -> Result<SessionContext, QueryError> {
+        self.build_session_context(Arc::new(self.clone()))
+    }
+
+    /// Assemble a context over `reader`'s pinned snapshot: pushdown-aware
+    /// provider, the covered-aggregate rewrite, and the search TVFs.
+    ///
+    /// Whether the result may be cached is the caller's call, and it turns
+    /// entirely on whether `reader` carries a work collector — see the two
+    /// callers above.
+    fn build_session_context(&self, reader: Arc<Self>) -> Result<SessionContext, QueryError> {
+        let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         // Cached per-table schemas: the provider scans the string-viewed `scan`
         // schema; the TVFs bind to the plain `scalar` schema.
         let schemas = self.sql_schemas();
-        let provider = op_stats::suppressed(|| {
-            SupertableProvider::new(
-                schemas.scan().clone(),
-                Arc::clone(&manifest),
-                store,
-                disk_cache,
-                reader.tombstone_cache.clone(),
-            )
-        });
+        let provider = SupertableProvider::new(
+            schemas.scan().clone(),
+            Arc::clone(&manifest),
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
 
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).
@@ -355,9 +411,24 @@ impl SupertableReader {
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
 
-        *guard = Some((Arc::clone(&manifest), ctx.clone()));
-
         Ok(ctx)
+    }
+
+    /// Plan one DataFrame, then run it through the shared
+    /// meter-collect-harvest step every SQL execution site uses
+    /// ([`collect_plan_metered`]).
+    async fn collect_metered_df(
+        df: DataFrame,
+        task_ctx: Arc<TaskContext>,
+        op_stats: &Option<Arc<OpStatsCollector>>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        collect_plan_metered(&plan, task_ctx, op_stats)
+            .await
+            .map_err(exec_query_error)
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -380,11 +451,17 @@ impl SupertableReader {
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
     pub(crate) fn scan_ids_matching(&self, expr: Expr) -> Result<Vec<i128>, QueryError> {
+        // Picked up on the caller's thread, before any runtime hop, so the
+        // harvest below folds into this op's collector.
+        let op_stats = op_stats::current();
         let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
         // invoking this helper.
-        let ctx = self.sql_session_context()?;
+        // Metered deliberately: this scan is real read work the caller
+        // asked for, and routing it through the cached context would
+        // report zero for an arbitrarily large table scan.
+        let ctx = self.metered_session_context()?;
         let id_column = self.options().id_column.clone();
 
         let drive = async move {
@@ -396,7 +473,12 @@ impl SupertableReader {
                 .map_err(|e| QueryError::Plan(e.to_string()))?
                 .select_columns(&[id_column.as_str()])
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
-            let batches = df.collect().await.map_err(exec_query_error)?;
+            // Same three steps as `query_sql`, and for the same reason:
+            // this scan's rows are real decoded rows. Collecting the
+            // DataFrame directly reported CPU, page bytes and ranges for a
+            // mutation's predicate resolve while leaving its row count at
+            // zero.
+            let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
             extract_id_column(&batches)
         };
 
@@ -469,29 +551,184 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
-        RecordBatch, StringArray, StringViewArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::{datasource::MemTable, prelude::SessionContext};
+    use tokio::runtime::Runtime;
 
     use crate::{
         memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
-            Supertable, SupertableOptions, error::QueryError, query::sql::build_sql_schemas,
+            Supertable, SupertableOptions,
+            error::QueryError,
+            query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
-        test_helpers::default_tokenizer as tok,
     };
 
     /// One more than the manifest's exact-value cardinality cap.
     const HIGH_CARDINALITY_ROWS: usize = 257;
+
+    /// Titles for the `LIKE` oracle, chosen so the index superset and the
+    /// exact match differ: `fox` as a whole word, as a head (`foxes`), a
+    /// tail (`firefox`), an infix (`outfoxed`), glued to punctuation the
+    /// analyzers treat differently (`a.fox.b`, `don't`), capitalised
+    /// (`LIKE` is case-sensitive, the index is not), inside a run the
+    /// default analyzer drops (`Firefox—the`), and a Greek word whose final
+    /// sigma lowercases by position.
+    const LIKE_TITLES: &[&str] = &[
+        "firefox browser",
+        "the fox jumped",
+        "foxes are quick",
+        "Firefox—the browser",
+        "fox",
+        "outfoxed again",
+        "a.fox.b",
+        "don't stop",
+        "100% sure",
+        "quick brown fox",
+        "nothing here",
+        "ΟΔΟΣ ΟΔΟΣΑ",
+    ];
+
+    /// Patterns for the `LIKE` oracle: prefix, suffix, infix, case, an
+    /// interior complete token, `_`, joiner punctuation, no match, match
+    /// all, no wildcard, Greek, two fragments, and parenthesised.
+    const LIKE_PATTERNS: &[&str] = &[
+        "fox%",
+        "%fox",
+        "%fox%",
+        "%Fox%",
+        "% fox %",
+        "%fox jumped",
+        "fo_ %",
+        "%foxe_%",
+        "%don'%",
+        "%.fox.%",
+        "%zzq%",
+        "%",
+        "fox",
+        "%ΟΔΟΣ%",
+        "%ΟΔΟΣ",
+        "%brown%fox%",
+        "%(fox)%",
+        "%100%",
+    ];
+
+    /// Titles whose case-folding is where `ILIKE` and lowercasing part
+    /// ways: a long s (`ſun riſe`, which Arrow matches against `sun`), a
+    /// Kelvin sign U+212A (written as an escape — the glyph passes for an
+    /// ASCII `K`, which would make every Kelvin case here vacuous: `Kelvin
+    /// K`, matched against `k`; `K b`, whose only `k` is the sign — under
+    /// `ascii_lower` that run is dropped and only `b` is indexed, so
+    /// requiring `k` of the row would lose it), and Greek with a final
+    /// sigma, beside plain mixed case.
+    const FOLD_TITLES: &[&str] = &[
+        "sun set",
+        "SUN RISE",
+        "ſun riſe",
+        "Kelvin \u{212A}",
+        "\u{212A} b",
+        "sunset boulevard",
+        "a sun",
+        "Peter Parker",
+        "PETER PARKER",
+        "nothing here",
+        "ΟΔΟΣ ΟΔΟΣΑ",
+        "οδος",
+    ];
+
+    /// The row committed as a second superfile of the `ILIKE` oracle:
+    /// `ſun ſet`, spelled only in forms an ASCII token never names. Every
+    /// term of the file sorts after `sun`, so a term-range leaf asked
+    /// about `sun` would prune the file, and a bloom asked for `sun` or
+    /// `set` finds neither — either unsound leaf loses a row Arrow
+    /// matches. Nothing here may put a term below `sun` into the file's
+    /// range, which is why `K b` sits in [`FOLD_TITLES`] instead.
+    const FOLD_TITLES_APART: &[&str] = &["ſun ſet"];
+
+    /// Filler words for that second superfile (see [`filler_rows`]): each
+    /// sorts after every probed ASCII prefix and holds neither `s` nor
+    /// `k`, so the rows keep the file's whole term range clear of `sun`
+    /// while still letting its dictionary walk pay.
+    const FOLD_FILLER_WORDS: &[&str] = &[
+        "tango", "tempo", "tiger", "timber", "toga", "torch", "total", "tower", "trade", "treaty",
+        "trophy", "tulip", "tundra", "tunnel", "turbo", "ultra", "umbra", "uncle", "under",
+        "union", "unity", "upper", "urban", "utter", "valley", "vapor", "velvet", "venue",
+        "verdant", "vertex", "violet", "viper",
+    ];
+
+    /// `(operator, pattern)` pairs judged against DataFusion itself.
+    const FOLD_PATTERNS: &[(&str, &str)] = &[
+        ("LIKE", "sun%"),
+        ("LIKE", "%\u{212A}"),
+        ("ILIKE", "sun%"),
+        ("ILIKE", "%sun%"),
+        ("ILIKE", "%sun"),
+        ("ILIKE", "sun set"),
+        ("ILIKE", "SUN SET"),
+        ("ILIKE", "% sun %"),
+        ("ILIKE", "%SUN RISE"),
+        ("ILIKE", "k %"),
+        ("ILIKE", "%kelvin%"),
+        ("ILIKE", "%k"),
+        ("ILIKE", "peter %"),
+        ("ILIKE", "%parker"),
+        ("ILIKE", "%PARKER"),
+        ("ILIKE", "%ri_e"),
+        ("ILIKE", "%riſe"),
+        ("ILIKE", "%ſet"),
+        ("LIKE", "ſun%"),
+        ("ILIKE", "%οδος%"),
+        ("ILIKE", "%οδοσ%"),
+        ("ILIKE", "ΟΔΟΣ%"),
+        ("ILIKE", "%"),
+        ("ILIKE", "%zzq%"),
+    ];
+
+    /// The `title` values across `batches`, as a set.
+    fn title_set(batches: &[RecordBatch]) -> HashSet<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let titles = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title column");
+                (0..titles.len())
+                    .map(|i| titles.value(i).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Textbook `LIKE`: `%` any run, `_` one character, everything else
+    /// byte-exact (the fixture patterns carry no escapes). Deliberately
+    /// shares nothing with the engine's lowering.
+    fn like_oracle(value: &str, pattern: &str) -> bool {
+        fn go(v: &[char], p: &[char]) -> bool {
+            match p.split_first() {
+                None => v.is_empty(),
+                Some(('%', rest)) => (0..=v.len()).any(|i| go(&v[i..], rest)),
+                Some(('_', rest)) => !v.is_empty() && go(&v[1..], rest),
+                Some((c, rest)) => v.first() == Some(c) && go(&v[1..], rest),
+            }
+        }
+        let v: Vec<char> = value.chars().collect();
+        let p: Vec<char> = pattern.chars().collect();
+        go(&v, &p)
+    }
 
     /// Schema with id + scalar + FTS column. No vector; query_sql
     /// is scalar-only by design.
@@ -503,6 +740,11 @@ mod tests {
     }
 
     fn options_id_cat_title() -> SupertableOptions {
+        options_id_cat_title_with(ASCII_LOWER_TOKENIZER)
+    }
+
+    /// [`options_id_cat_title`] with `title` analyzed by the named analyzer.
+    fn options_id_cat_title_with(analyzer: &str) -> SupertableOptions {
         // Single-threaded writer pool so each commit produces
         // exactly one superfile — keeps assertions on per-superfile
         // counts deterministic.
@@ -514,12 +756,8 @@ mod tests {
         );
         SupertableOptions::new(
             schema_id_cat_title(),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title").analyzer(analyzer)],
             vec![],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)
@@ -583,7 +821,7 @@ mod tests {
                 .build()
                 .expect("rayon pool"),
         );
-        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![])
             .expect("rating options")
             .with_writer_pool(pool);
         let table = Supertable::create(options).expect("create rating table");
@@ -612,6 +850,88 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("count column is Int64");
         n.value(0)
+    }
+
+    /// Value `i` of a string column of whichever Arrow string width
+    /// DataFusion chose for it (EXPLAIN's columns are not coerced the way
+    /// user columns are).
+    fn string_at(column: &ArrayRef, i: usize) -> String {
+        let any = column.as_any();
+        if let Some(a) = any.downcast_ref::<StringArray>() {
+            a.value(i).to_owned()
+        } else if let Some(a) = any.downcast_ref::<LargeStringArray>() {
+            a.value(i).to_owned()
+        } else if let Some(a) = any.downcast_ref::<StringViewArray>() {
+            a.value(i).to_owned()
+        } else {
+            panic!("not a string column: {:?}", column.data_type());
+        }
+    }
+
+    /// The physical plan DataFusion prints for `sql`.
+    fn explain_physical(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain");
+        for batch in &batches {
+            for i in 0..batch.num_rows() {
+                if string_at(batch.column(0), i) == "physical_plan" {
+                    return string_at(batch.column(1), i);
+                }
+            }
+        }
+        panic!("no physical plan in EXPLAIN output");
+    }
+
+    #[test]
+    fn query_sql_row_filter_carries_the_predicate_once() {
+        // A predicate the index cannot bound (a scalar column) runs as a
+        // Parquet row filter: DataFusion's filter pushdown offers the
+        // `FilterExec` predicate to the scan, the scan accepts it, and the
+        // node is dropped. The provider used to attach its own copy of the
+        // same conjunction first, so the row filter read `p AND p` and
+        // evaluated the predicate twice. The scan line must carry exactly
+        // one `predicate=` with no self-conjunction, and the `FilterExec`
+        // must be gone.
+        let st = seeded(&["x", "y", "y"], &["alpha", "beta", "gamma"]);
+        let plan = explain_physical(&st, "SELECT title FROM supertable WHERE category = 'y'");
+        let scan = plan
+            .lines()
+            .find(|l| l.contains("DataSourceExec"))
+            .expect("a DataSourceExec in the physical plan");
+        assert!(!plan.contains("FilterExec"), "{plan}");
+        // The row-filter predicate prints as `, predicate=<expr>`, ahead of
+        // the statistics `pruning_predicate=` DataFusion derives from it.
+        let predicate = scan
+            .split_once(", predicate=")
+            .map(|(_, rest)| rest.split(", pruning_predicate=").next().unwrap_or(rest))
+            .expect("a predicate on the scan");
+        assert!(
+            predicate.starts_with("category@")
+                && predicate.ends_with("= y")
+                && !predicate.contains(" AND "),
+            "{scan}"
+        );
+        // The single-copy row filter still returns exactly the matching
+        // rows. (A `COUNT(*)` would not do here: the covered-aggregate
+        // rewrite answers it from manifest value counts without a scan.)
+        let rows: HashSet<String> = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable WHERE category = 'y'")
+            .expect("query")
+            .iter()
+            .flat_map(|b| (0..b.num_rows()).map(|i| string_at(b.column(0), i)))
+            .collect();
+        assert_eq!(rows, HashSet::from(["beta".to_owned(), "gamma".to_owned()]));
+
+        // Control: an index-bounded predicate keeps the `FilterExec` and
+        // the scan gets no row filter of ours; the `predicate=` DataFusion
+        // stores there is for statistics pruning only.
+        let bounded = explain_physical(&st, "SELECT title FROM supertable WHERE title = 'beta'");
+        assert!(bounded.contains("FilterExec"), "{bounded}");
     }
 
     /// `extract_id_column` collects non-null Decimal128 `_id`s from single-column
@@ -870,20 +1190,9 @@ mod tests {
             .expect("count is Int64");
         // DataFusion may materialize the GROUP BY key as Utf8,
         // LargeUtf8, or StringView depending on hash-aggregate
-        // type promotion; accept all three.
-        let extract = |i: usize| -> String {
-            if let Some(a) = cat_col.as_any().downcast_ref::<LargeStringArray>() {
-                a.value(i).to_string()
-            } else if let Some(a) = cat_col.as_any().downcast_ref::<StringArray>() {
-                a.value(i).to_string()
-            } else if let Some(a) = cat_col.as_any().downcast_ref::<StringViewArray>() {
-                a.value(i).to_string()
-            } else {
-                panic!("unexpected category column type: {:?}", cat_col.data_type())
-            }
-        };
+        // type promotion; `string_at` accepts all three.
         let mut got: Vec<(String, i64)> = (0..cat_col.len())
-            .map(|i| (extract(i), counts.value(i)))
+            .map(|i| (string_at(cat_col, i), counts.value(i)))
             .collect();
         got.sort();
         assert_eq!(
@@ -1050,17 +1359,10 @@ mod tests {
                 .build()
                 .expect("rayon pool"),
         );
-        let opts = SupertableOptions::new(
-            Arc::clone(&schema),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool);
+        let opts =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
+                .expect("valid options")
+                .with_writer_pool(pool);
 
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
@@ -1103,17 +1405,10 @@ mod tests {
                 .build()
                 .expect("rayon pool"),
         );
-        let opts = SupertableOptions::new(
-            Arc::clone(&schema),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
-            vec![],
-            Some(tok()),
-        )
-        .expect("valid options")
-        .with_writer_pool(pool);
+        let opts =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
+                .expect("valid options")
+                .with_writer_pool(pool);
 
         let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
@@ -1302,7 +1597,7 @@ mod tests {
             DataType::LargeUtf8,
             true,
         )]));
-        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![])
             .expect("nullable category options");
         let table = Supertable::create(options).expect("create");
         let mut writer = table.writer().expect("writer");
@@ -1516,6 +1811,282 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_like_matches_a_brute_force_oracle_under_both_analyzers() {
+        // The index bounds a LIKE differently per analyzer (the default
+        // one only through complete tokens, `standard` through prefix /
+        // suffix / infix expansion), and every bound is a superset the
+        // FilterExec narrows. Whatever the plan, the rows must be exactly
+        // the textbook LIKE matches — checked against an independent
+        // oracle for every pattern under both analyzers.
+        let analyzers = [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER];
+        for name in analyzers {
+            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+            let mut w = st.writer().expect("writer");
+            let titles = with_walk_filler(LIKE_TITLES);
+            let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
+            w.append(&build_cat_batch(0, &cats, &title_refs))
+                .expect("append");
+            w.commit().expect("commit");
+            for pattern in LIKE_PATTERNS {
+                let expected: HashSet<&str> = title_refs
+                    .iter()
+                    .copied()
+                    .filter(|title| like_oracle(title, pattern))
+                    .collect();
+                let quoted = pattern.replace('\'', "''");
+                let batches = st
+                    .reader()
+                    .expect("reader")
+                    .query_sql(&format!(
+                        "SELECT title FROM supertable WHERE title LIKE '{quoted}'"
+                    ))
+                    .expect("query");
+                let got = title_set(&batches);
+                let got: HashSet<&str> = got.iter().map(String::as_str).collect();
+                assert_eq!(got, expected, "LIKE {pattern:?} under {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn query_sql_like_and_ilike_match_datafusion_on_a_memtable() {
+        // The oracle here is DataFusion itself over the same rows in a
+        // plain in-memory table: whatever Arrow's `LIKE` / `ILIKE` kernels
+        // decide — including the long s and the Kelvin sign that Unicode
+        // case folding matches against `s` and `k` — the index-bounded
+        // plan must return exactly that, under both analyzers.
+        let rt = Runtime::new().expect("runtime");
+        let analyzers = [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER];
+        for name in analyzers {
+            let titles = with_walk_filler(FOLD_TITLES);
+            let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
+            let batch = build_cat_batch(0, &cats, &title_refs);
+            let apart = with_filler_rows(FOLD_TITLES_APART, FOLD_FILLER_WORDS);
+            let apart_refs: Vec<&str> = apart.iter().map(String::as_str).collect();
+            let apart_cats: Vec<&str> = apart_refs.iter().map(|_| "x").collect();
+            let apart_batch = build_cat_batch(0, &apart_cats, &apart_refs);
+
+            // Two superfiles: the second holds only rows whose every
+            // spelling an ASCII token misses, so an unsound term-bloom or
+            // term-range leaf would prune it whole and lose its rows.
+            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            w.append(&apart_batch).expect("append apart");
+            w.commit().expect("commit apart");
+            assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
+
+            let ctx = SessionContext::new();
+            let mem = MemTable::try_new(schema_id_cat_title(), vec![vec![batch, apart_batch]])
+                .expect("mem");
+            ctx.register_table("supertable", Arc::new(mem))
+                .expect("register");
+
+            for (op, pattern) in FOLD_PATTERNS {
+                let quoted = pattern.replace('\'', "''");
+                let sql = format!("SELECT title FROM supertable WHERE title {op} '{quoted}'");
+                let expected = title_set(
+                    &rt.block_on(async { ctx.sql(&sql).await?.collect().await })
+                        .expect("datafusion oracle"),
+                );
+                let got = title_set(&st.reader().expect("reader").query_sql(&sql).expect("query"));
+                assert_eq!(got, expected, "{op} {pattern:?} under {name}");
+            }
+        }
+    }
+
+    /// Rows of the wide superfile in [`mixed_like_table`]: more distinct
+    /// terms containing `zz` than a LIKE token may widen to.
+    const OVER_CAP_ROWS: usize = LIKE_MAX_TERMS + 76;
+
+    /// Prose words appended to every wide-superfile title, and making up
+    /// the filler rows of [`with_walk_filler`], so a superfile's stored
+    /// text dwarfs its vocabulary and a suffix or substring token takes
+    /// the whole-dictionary walk (the walk-vs-scan gate compares the two;
+    /// a handful of short titles on their own sit far under it and would
+    /// only ever exercise the scan).
+    const WALK_FILLER_WORDS: &[&str] = &[
+        "lorem",
+        "ipsum",
+        "dolor",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "eiusmod",
+        "tempor",
+        "incididunt",
+        "labore",
+        "dolore",
+        "magna",
+        "aliqua",
+        "enim",
+        "minim",
+        "veniam",
+        "quis",
+        "nostrud",
+        "exercitation",
+        "ullamco",
+        "laboris",
+        "nisi",
+        "aliquip",
+        "commodo",
+        "consequat",
+        "duis",
+        "aute",
+        "irure",
+        "reprehenderit",
+        "voluptate",
+        "velit",
+    ];
+
+    /// Filler rows [`filler_rows`] builds: enough to hold well over the
+    /// gate's bytes-per-term floor against the fixture titles' vocabulary.
+    /// Twice the word count, so every row is a distinct ordering.
+    const WALK_FILLER_ROWS: usize = 64;
+
+    /// [`WALK_FILLER_ROWS`] rows over `words`, each a different ordering
+    /// (the rotations, then the reversed rotations). The rows must differ:
+    /// Parquet dictionary-encodes a repeated string as one entry and the
+    /// gate reads the column's encoded size, so identical rows would
+    /// weigh as one. Real prose rows are distinct; these are too.
+    fn filler_rows(words: &[&str]) -> Vec<String> {
+        assert!(WALK_FILLER_ROWS <= 2 * words.len(), "orderings run out");
+        (0..WALK_FILLER_ROWS)
+            .map(|i| {
+                let mut row = words.to_vec();
+                row.rotate_left(i % words.len());
+                if i >= words.len() {
+                    row.reverse();
+                }
+                row.join(" ")
+            })
+            .collect()
+    }
+
+    /// `titles` followed by the [`filler_rows`] over `words`. The oracles
+    /// judge the filler rows like any other, so they may add to a
+    /// pattern's expected set (`%` matches them all).
+    fn with_filler_rows(titles: &[&str], words: &[&str]) -> Vec<String> {
+        titles
+            .iter()
+            .map(|t| (*t).to_owned())
+            .chain(filler_rows(words))
+            .collect()
+    }
+
+    /// [`with_filler_rows`] over the [`WALK_FILLER_WORDS`] prose.
+    fn with_walk_filler(titles: &[&str]) -> Vec<String> {
+        with_filler_rows(titles, WALK_FILLER_WORDS)
+    }
+
+    /// Two superfiles under the `standard` analyzer: a wide one whose
+    /// `q{i}zz` titles hold more distinct `zz` terms than the cap, and a
+    /// narrow one with two such terms (plus the filler rows that let it
+    /// walk its dictionary).
+    fn mixed_like_table() -> Supertable {
+        let st = Supertable::create(options_id_cat_title_with(STANDARD_TOKENIZER)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let filler = WALK_FILLER_WORDS.join(" ");
+        let wide: Vec<String> = (0..OVER_CAP_ROWS)
+            .map(|i| format!("q{i}zz {filler}"))
+            .collect();
+        let wide_refs: Vec<&str> = wide.iter().map(String::as_str).collect();
+        let cats: Vec<&str> = wide_refs.iter().map(|_| "x").collect();
+        w.append(&build_cat_batch(0, &cats, &wide_refs))
+            .expect("append wide");
+        w.commit().expect("commit wide");
+        let narrow = with_walk_filler(&["buzz lightyear", "fizz", "plain"]);
+        let narrow_refs: Vec<&str> = narrow.iter().map(String::as_str).collect();
+        let cats: Vec<&str> = narrow_refs.iter().map(|_| "y").collect();
+        w.append(&build_cat_batch(0, &cats, &narrow_refs))
+            .expect("append narrow");
+        w.commit().expect("commit narrow");
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
+        st
+    }
+
+    #[test]
+    fn query_sql_like_mixes_bounded_and_unbounded_superfiles() {
+        // The first superfile holds more distinct terms containing `zz`
+        // than a LIKE token may widen to, so `%zz%` is unbounded there and
+        // that superfile scans with the row filter; the second holds two
+        // such terms and is bounded. One query spans both paths and must
+        // still be exact. A prefix pattern flips the roles: bounded in the
+        // first, empty in the second (no term starts with `q1`), which
+        // skips it outright.
+        let st = mixed_like_table();
+
+        // Contains: unbounded in the wide superfile, bounded in the narrow.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title LIKE '%zz%'"
+            ),
+            (OVER_CAP_ROWS + 2) as i64,
+        );
+        // Prefix: `q1`, `q10`..`q19`, `q100`..`q199`, `q1000`..`q1099`.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title LIKE 'q1%'"
+            ),
+            1 + 10 + 100 + 100,
+        );
+        // Both, with a scalar conjunct the index cannot bound.
+        assert_eq!(
+            run_count(
+                &st,
+                "SELECT COUNT(*) FROM supertable WHERE title LIKE '%zz%' AND category = 'y'"
+            ),
+            2,
+        );
+    }
+
+    #[test]
+    fn query_sql_row_filter_attaches_only_where_a_plan_is_unbounded() {
+        // DataFusion's Parquet row filter pays only when the index found
+        // no bound: a LIKE token past the cap in some superfile, or a plan
+        // that was never bounded. A bounded plan leaves it off, and so
+        // does a plan the selectivity gate sends to a scan for being
+        // dense — there the filter would keep nearly every row and only
+        // add its own decode pass.
+        //
+        // The witness is the `FilterExec` node: with the row filter on,
+        // DataFusion pushes the filter into the scan (the source accepts
+        // row filters) and drops the node; with it off the node stays
+        // above the scan. The scan prints `predicate=` either way — every
+        // filter is kept there for statistics pruning — so that text
+        // proves nothing. The probes project a column so no query folds
+        // to a manifest count without a scan.
+        let st = mixed_like_table();
+        let expect_row_filter = |sql: &str, on: bool| {
+            let plan = explain_physical(&st, sql);
+            assert!(plan.contains("DataSourceExec"), "{sql}\n{plan}");
+            assert_eq!(!plan.contains("FilterExec"), on, "{sql}\n{plan}");
+        };
+        // Over the cap in the wide superfile ⇒ on.
+        expect_row_filter("SELECT title FROM supertable WHERE title LIKE '%zz%'", true);
+        // Bounded in both superfiles (prefix subtree walk; empty in the
+        // narrow one) ⇒ off.
+        expect_row_filter("SELECT title FROM supertable WHERE title LIKE 'q1%'", false);
+        // Equality on the FTS column, bounded ⇒ off.
+        expect_row_filter("SELECT title FROM supertable WHERE title = 'fizz'", false);
+        // A dense predicate nearly every row of both superfiles satisfies
+        // (`lorem` is in every filler row): the gate sends them to a scan,
+        // and the row filter stays off.
+        expect_row_filter(
+            "SELECT title FROM supertable WHERE title IN ('lorem', 'plain')",
+            false,
+        );
+        // Never bounded (a non-FTS column) ⇒ on, as before.
+        expect_row_filter("SELECT title FROM supertable WHERE category = 'y'", true);
+    }
+
+    #[test]
     fn query_sql_not_predicates_are_exact() {
         // NOT / != aren't index-prefiltered (Unbounded → scan), but must
         // still be exact; and `= AND !=` prefilters on the `=` branch
@@ -1713,10 +2284,7 @@ mod tests {
         );
         SupertableOptions::new(
             schema_with_vector(dim),
-            vec![FtsConfig {
-                column: "title".into(),
-                positions: false,
-            }],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -1725,7 +2293,6 @@ mod tests {
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
-            Some(tok()),
         )
         .expect("valid options")
         .with_writer_pool(pool)

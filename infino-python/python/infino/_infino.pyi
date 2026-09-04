@@ -31,6 +31,20 @@ def connect(
     api_key: str | None = ...,
 ) -> Connection: ...
 
+def bench_serve_tcp(
+    data_path: str,
+    table: str,
+    col: str,
+    addr: str,
+    cache_bytes: int,
+    id_col: str = ...,
+) -> None:
+    """EXPERIMENTAL benchmark serve mode (raw-TCP). Blocks forever serving the
+    given table. Not a production server (no auth/TLS/durability). When
+    ``id_col`` is non-empty, that scalar int64 column is projected and returned
+    as the result id (dataset id, 8-byte LE); otherwise the engine ``_id``
+    (16-byte)."""
+
 class InfinoError(Exception):
     """Base class for infino's errors. Catch it to handle any infino failure."""
 
@@ -48,7 +62,7 @@ class Connection:
     def create_database(self) -> None: ...
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
     def open_table(self, name: str) -> Table: ...
-    def drop_table(self, name: str, purge: bool = ...) -> None: ...
+    def drop_table(self, name: str, purge: bool = True) -> None: ...
     def list_tables(self) -> list[str]: ...
     def query_sql(self, sql: str) -> ArrowTable: ...
 
@@ -79,6 +93,16 @@ class Table:
         filter_mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
+    def vector_search_ids(
+        self,
+        column: str,
+        query: Sequence[float],
+        k: int,
+    ) -> Any:
+        """Top-k engine ``_id`` keys as a numpy ``uint8`` array of shape
+        ``[k, 16]`` (big-endian). Lean marshalling for concurrent search: the
+        only GIL-held step is the array creation. Use ``vector_search`` for
+        Arrow rows or projections."""
     def token_match(
         self,
         column: str,

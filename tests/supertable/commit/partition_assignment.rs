@@ -266,7 +266,7 @@ fn time_range_assigns_int64_superfiles_to_bucket_zero() {
         arrow_schema::Field::new("ts_secs", arrow_schema::DataType::Int64, false),
         arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
     ]));
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
+    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
@@ -275,12 +275,8 @@ fn time_range_assigns_int64_superfiles_to_bucket_zero() {
     );
     let opts = infino::supertable::SupertableOptions::new(
         schema.clone(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(tk),
     )
     .expect("opts")
     .with_writer_pool(pool)
@@ -344,7 +340,7 @@ fn time_range_superfile_spanning_two_buckets_errors() {
         arrow_schema::Field::new("ts_secs", arrow_schema::DataType::Int64, false),
         arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
     ]));
-    let tk: Arc<dyn Tokenizer> = default_tokenizer();
+    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
@@ -353,12 +349,8 @@ fn time_range_superfile_spanning_two_buckets_errors() {
     );
     let opts = infino::supertable::SupertableOptions::new(
         schema.clone(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
+        vec![FtsConfig::new("title")],
         vec![],
-        Some(tk),
     )
     .expect("opts")
     .with_writer_pool(pool)

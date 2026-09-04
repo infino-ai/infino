@@ -54,7 +54,7 @@ use rayon::prelude::*;
 
 use crate::{
     corpus::{
-        self, DIM, SequentialSyntheticCorpus,
+        self, SequentialSyntheticCorpus, dim,
         grading::{read_f32, read_u32, read_u64},
     },
     diag_common::{env_bool_default_true, env_u64, env_usize},
@@ -173,9 +173,9 @@ fn update_heaps(heaps: &mut [HeldTopK], queries: &[Vec<f32>], flat: &[f32], base
         .zip(queries.par_iter())
         .for_each(|(heap, q)| {
             for j in 0..len {
-                let v = &flat[j * DIM..(j + 1) * DIM];
+                let v = &flat[j * dim()..(j + 1) * dim()];
                 let mut dot = 0f32;
-                for d in 0..DIM {
+                for d in 0..dim() {
                     dot += v[d] * q[d];
                 }
                 heap.offer(dot, base + j as u32);
@@ -229,7 +229,7 @@ fn gt_bin_write(
     b.extend_from_slice(&(m as u64).to_le_bytes());
     b.extend_from_slice(&(n_queries as u64).to_le_bytes());
     b.extend_from_slice(&(n_cent as u64).to_le_bytes());
-    b.extend_from_slice(&(DIM as u32).to_le_bytes());
+    b.extend_from_slice(&(dim() as u32).to_le_bytes());
     b.extend_from_slice(&(K as u32).to_le_bytes());
     b.extend_from_slice(&VEC_SEED.to_le_bytes());
     b.extend_from_slice(&QUERY_SEED.to_le_bytes());
@@ -318,15 +318,20 @@ fn gt_bin_read(path: &str, n_queries: usize) -> Result<GtBin, GtBinError> {
         )));
     }
     if p.n_queries != n_queries
-        || p.dim != DIM
+        || p.dim != dim()
         || p.k != K
         || p.vec_seed != VEC_SEED
         || p.query_seed != QUERY_SEED
     {
         return Err(GtBinError::Incompatible(format!(
             "{path}: built with n_queries={} dim={} k={} vseed={} qseed={}; \
-             this run uses n_queries={n_queries} dim={DIM} k={K} vseed={VEC_SEED} qseed={QUERY_SEED}",
-            p.n_queries, p.dim, p.k, p.vec_seed, p.query_seed
+             this run uses n_queries={n_queries} dim={} k={K} vseed={VEC_SEED} qseed={QUERY_SEED}",
+            p.n_queries,
+            p.dim,
+            p.k,
+            p.vec_seed,
+            p.query_seed,
+            dim()
         )));
     }
     Ok(GtBin {
@@ -427,7 +432,7 @@ fn vector_batch(schema: &Arc<Schema>, flat: &[f32], len: usize, doc_base: usize)
     )) as Arc<dyn Array>;
     RecordBatch::try_new(
         schema.clone(),
-        vec![bucket_col, ingest::vector_array(&flat[..len * DIM])],
+        vec![bucket_col, ingest::vector_array(&flat[..len * dim()])],
     )
     .expect("vector RecordBatch")
 }
@@ -630,7 +635,7 @@ fn trace_misses(
 ) {
     let reader = consumer.reader().expect("reader");
     let opts = exec_vec::search_opts(exec_vec::ENGINE_DEFAULT, exec_vec::ENGINE_DEFAULT);
-    let n_retained = retained.len() / DIM;
+    let n_retained = retained.len() / dim();
 
     // Measurement soundness: a PURE bench-side exact brute-force (dot over every
     // retained vector, no engine/codec/IVF) vs the GT heap. It MUST be ~1.0 — if
@@ -642,7 +647,7 @@ fn trace_misses(
         .map(|(q, heap)| {
             let mut top: Vec<(f32, u32)> = (0..n_retained)
                 .map(|d| {
-                    let v = &retained[d * DIM..(d + 1) * DIM];
+                    let v = &retained[d * dim()..(d + 1) * dim()];
                     let dot: f32 = v.iter().zip(q).map(|(a, b)| a * b).sum();
                     (dot, d as u32)
                 })
@@ -676,7 +681,7 @@ fn trace_misses(
                 continue;
             }
             total_miss += 1;
-            let dv = &retained[gt_id as usize * DIM..(gt_id as usize + 1) * DIM];
+            let dv = &retained[gt_id as usize * dim()..(gt_id as usize + 1) * dim()];
             let sb = reader
                 .vector_search(VEC_COLUMN, dv, K, opts, None, None)
                 .expect("self-query");
@@ -992,7 +997,7 @@ pub fn run() {
                 update_heaps(
                     &mut heaps,
                     &queries,
-                    &flat[skip * DIM..sub * DIM],
+                    &flat[skip * dim()..sub * dim()],
                     (pos + skip) as u32,
                     sub - skip,
                 );
@@ -1036,7 +1041,7 @@ pub fn run() {
             let sub = MAX_INGEST_BATCH_DOCS.min(checkpoint_len - off);
             stream.fill_chunk_modality(sub, &mut titles, &mut flat, false, true);
             if miss_trace {
-                retained.extend_from_slice(&flat[..sub * DIM]);
+                retained.extend_from_slice(&flat[..sub * dim()]);
             }
             update_heaps(&mut heaps, &queries, &flat, (n + off) as u32, sub);
             let batch = vector_batch(&schema, &flat, sub, n + off);

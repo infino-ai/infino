@@ -162,6 +162,40 @@ impl CellPostingBuilder {
     }
 }
 
+/// Tolerance on `‖x‖` for the cosine unit-input tripwire below. Wide
+/// enough that fp32 accumulation over thousands of dims never trips it,
+/// tight enough that genuinely un-normalized input always does (raw
+/// embedding norms are O(1..100), not 1 ± 0.01).
+#[cfg(debug_assertions)]
+const COSINE_UNIT_NORM_TOLERANCE: f32 = 1e-2;
+
+/// Debug-only guard that cosine rows reach the encoder already unit
+/// (issue #512). Both ingest seams normalize — `VectorBuilder::add` and
+/// `CellPostingBuilder::add` — but the failure this guards is a NEW path
+/// bypassing them: the fixed cosine grid then clamps out-of-range
+/// components at encode with no error and no counter, which measured
+/// −10 pts recall@10 the last time it shipped. A `debug_assert` means
+/// the next such path fails in tests instead of silently degrading data,
+/// and costs release builds nothing.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+fn debug_assert_cosine_rows_unit(metric: Metric, dim: usize, vectors: &[f32]) {
+    #[cfg(debug_assertions)]
+    if metric == Metric::Cosine {
+        for (row, chunk) in vectors.chunks_exact(dim).enumerate() {
+            let norm_sq: f32 = chunk.iter().map(|v| v * v).sum();
+            // A zero row is legitimate (degenerate input the normalizer
+            // leaves alone); anything else must be unit.
+            debug_assert!(
+                norm_sq == 0.0 || (norm_sq.sqrt() - 1.0).abs() <= COSINE_UNIT_NORM_TOLERANCE,
+                "cosine row {row} reached the cell-posting encoder with norm {} — an ingest \
+                 path skipped the unit-normalize seam (#512); the fixed grid would clamp it \
+                 silently",
+                norm_sq.sqrt()
+            );
+        }
+    }
+}
+
 pub fn encode_blob(
     metric: Metric,
     dim: usize,
@@ -187,6 +221,7 @@ pub fn encode_blob(
             codec.name()
         ));
     }
+    debug_assert_cosine_rows_unit(metric, dim, vectors);
     let rows: Vec<usize> = (0..ids.len()).collect();
     let posting = encode_rows(metric, vectors, ids, dim, &rows, codec)?;
     let mut out = MAGIC.to_vec();

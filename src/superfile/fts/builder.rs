@@ -88,6 +88,7 @@ use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
+use tracing::debug;
 
 use crate::superfile::{
     BuildError,
@@ -100,7 +101,7 @@ use crate::superfile::{
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
-        posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
+        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
 };
@@ -163,6 +164,11 @@ const CHAIN_END: u32 = u32::MAX;
 #[derive(Default)]
 struct FinishProfile {
     enabled: bool,
+    /// Set once any posting block is emitted in the bitset encoding, so
+    /// the blob header is written as `VERSION_V4`. Not a profiling counter
+    /// — reused here because this struct already threads from term emit to
+    /// the final header write.
+    saw_bitset_block: bool,
     encode_calls: u64,
     encode_df1: u64,
     encode_pfor: u64,
@@ -1216,6 +1222,11 @@ pub struct FtsBuilder {
     /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
     /// ::Spilled`) keyed by `term_id` instead.
     bump: Bump,
+    /// Whether to write the V5 per-term coarse block-max table (and stamp
+    /// the blob V5). Always `true` in production; test-only builds set it
+    /// `false` to emit a legacy (V2–V4, no coarse) blob for the
+    /// backwards-compatibility tests.
+    write_coarse: bool,
 }
 
 impl FtsBuilder {
@@ -1270,6 +1281,7 @@ impl FtsBuilder {
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
             bump: Bump::new(),
+            write_coarse: true,
         }
     }
 
@@ -1772,23 +1784,26 @@ impl FtsBuilder {
         Ok(())
     }
 
-    /// Set a column's per-doc lengths directly (the compaction merge feeds the
-    /// inputs' already-clamped stored lengths rather than recomputing them
+    /// Append a run of per-doc lengths to a column (the compaction merge feeds
+    /// the inputs' already-clamped stored lengths rather than recomputing them
     /// from text) and advance the builder's doc count so `finish` sizes the
-    /// doc-lengths table and `n_docs` correctly.
+    /// doc-lengths table and `n_docs` correctly. Append (not replace) so the
+    /// prebuilt feed composes: with lengths a prior input already carried
+    /// across, and with lengths `add_doc` accumulated for docs tokenized into
+    /// the same builder — the merged lengths axis stays aligned with the
+    /// column's ascending local-doc-id axis either way.
     ///
-    /// Also recomputes `total_tokens` as the sum of the lengths. `finish`
+    /// Also accumulates `total_tokens` as the sum of the lengths. `finish`
     /// derives `avgdl = total_tokens / n_docs` from it, and a doc length *is*
     /// its token count (`add_doc` clamps only at `u32::MAX`, never reached in
     /// practice), so this sum equals what re-indexing the same corpus would
     /// accumulate — keeping merged BM25 scores identical to a fresh build.
-    pub(crate) fn set_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: Vec<u32>) {
-        let n = doc_lengths.len() as u32;
+    pub(crate) fn append_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: &[u32]) {
         let total_tokens: u64 = doc_lengths.iter().map(|&dl| u64::from(dl)).sum();
         let col = &mut self.columns[column_id as usize];
-        col.total_tokens = total_tokens;
-        col.doc_lengths = doc_lengths;
-        self.n_docs = self.n_docs.max(n);
+        col.total_tokens += total_tokens;
+        col.doc_lengths.extend_from_slice(doc_lengths);
+        self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
     }
 
     /// Spilled-mode hot path. Per-token cost: intern lookup + dense-
@@ -2395,6 +2410,7 @@ impl FtsBuilder {
             pos_scratch: _,
             run_scratch: _,
             bump,
+            write_coarse,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2511,6 +2527,7 @@ impl FtsBuilder {
                     term_positions,
                     &mut finish_profile,
                     &mut term_scratch,
+                    write_coarse,
                 )?;
                 n_terms_total_usize += 1;
             }
@@ -2533,6 +2550,7 @@ impl FtsBuilder {
                 doc_lengths_by_orig_col,
                 scratch_dir,
                 finish_profile,
+                write_coarse,
             },
             &mut w,
         )
@@ -2563,6 +2581,7 @@ impl FtsBuilder {
             pos_scratch: _,
             run_scratch: _,
             bump,
+            write_coarse,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2713,6 +2732,7 @@ impl FtsBuilder {
                             term_positions,
                             &mut finish_profile,
                             &mut term_scratch,
+                            write_coarse,
                         )?;
                         n_terms_total_usize += 1;
                     }
@@ -2858,6 +2878,7 @@ impl FtsBuilder {
                             &mut positions_sink,
                             &mut finish_profile,
                             &mut term_scratch,
+                            write_coarse,
                         )?,
                         SpillStore::Positional { blobs, .. } => {
                             // mmap each partition's positions blob so
@@ -2894,6 +2915,7 @@ impl FtsBuilder {
                                 &mut positions_sink,
                                 &mut finish_profile,
                                 &mut term_scratch,
+                                write_coarse,
                             )?
                         }
                     };
@@ -2902,7 +2924,7 @@ impl FtsBuilder {
                         let merge_total = merge_profile_start.elapsed();
                         let encode_total = finish_profile.encode_total - encode_total_before;
                         let non_encode = merge_total.saturating_sub(encode_total);
-                        eprintln!(
+                        debug!(
                             "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s fst_insert={:.3}s",
                             col_name,
                             merge_total.as_secs_f64(),
@@ -2988,6 +3010,7 @@ impl FtsBuilder {
                 doc_lengths_by_orig_col,
                 scratch_dir,
                 finish_profile,
+                write_coarse,
             },
             &mut w,
         )
@@ -3064,6 +3087,9 @@ struct BlobAssemblyInputs {
     /// Profile accumulator — final block of `[fts-finish]` timings
     /// is emitted at the bottom of assembly.
     finish_profile: FinishProfile,
+    /// Whether the per-term coarse block-max table was written (V5). When
+    /// false the blob is a legacy V2–V4 (no coarse) — test-only.
+    write_coarse: bool,
 }
 
 /// FST emission sink picked by the active finish path.
@@ -3105,6 +3131,7 @@ fn assemble_and_write_blob<W: Write>(
         mut doc_lengths_by_orig_col,
         scratch_dir,
         mut finish_profile,
+        write_coarse,
     } = inputs;
 
     debug_assert!(
@@ -3259,7 +3286,28 @@ fn assemble_and_write_blob<W: Write>(
     let blob_copy_start = finish_profile.enabled.then(Instant::now);
     let mut header = Vec::with_capacity(header_size as usize);
     header.extend_from_slice(format::fts::MAGIC); // 8
-    header.extend_from_slice(&format::fts::VERSION_V2.to_le_bytes()); // 4
+    // V4 when any block took the bitset encoding. Otherwise V3 when the
+    // positions region has a real body (beyond its 4-byte CRC) — a
+    // non-empty body means a non-inline positional term wrote position runs
+    // and therefore a run-offset sub-index — else V2 (positionless, or a
+    // positional blob whose terms all inlined), byte-identical to before.
+    // Readers accept all of these.
+    // New code always writes V5: every PFOR term carries a coarse block-max
+    // table, and V5 subsumes the earlier eras (positions region iff positional
+    // with the V3 sub-index; bitset blocks self-describing per block as in V4).
+    // The legacy ladder (V2/V3/V4) is written only when the coarse table is
+    // suppressed (test-only), so the backwards-compat tests can produce a
+    // genuine pre-086 blob.
+    let fts_version = if write_coarse {
+        format::fts::VERSION_V5
+    } else if finish_profile.saw_bitset_block {
+        format::fts::VERSION_V4
+    } else if positions_region.1 > format::CRC_BYTES as u64 {
+        format::fts::VERSION_V3
+    } else {
+        format::fts::VERSION_V2
+    };
+    header.extend_from_slice(&fts_version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4
     header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
@@ -3303,7 +3351,7 @@ fn assemble_and_write_blob<W: Write>(
     }
 
     if finish_profile.enabled {
-        eprintln!(
+        debug!(
             "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
             finish_profile.partition_flush.as_secs_f64(),
             finish_profile.lex_rank_build.as_secs_f64(),
@@ -3342,11 +3390,13 @@ struct TermScratch {
     doc_ids: Vec<u32>,
     /// Per-block tf column, same lifecycle as `doc_ids`.
     tfs: Vec<u32>,
-    /// Per-block BM25 upper bound for the skip table — the **exact**
-    /// maximum per-doc contribution over the block's docs (not the looser
-    /// `score(max_tf, min_dl)`, whose best-case tf and best-case dl need
-    /// not co-occur in one doc). A tighter bound lets the reader's
-    /// block-skip fire more often.
+    /// Per-block BM25 upper bound for the skip table — the maximum per-doc
+    /// contribution over the block's docs, scored with the same quantized
+    /// document length the reader uses (not the looser `score(max_tf,
+    /// min_dl)`, whose best-case tf and best-case dl need not co-occur in
+    /// one doc). Scoring against the quantized length keeps the bound a
+    /// true upper bound over query-time scores; a tighter bound lets the
+    /// reader's block-skip fire more often.
     block_ub_per_block: Vec<f32>,
     /// Per-term list of encoded blocks held across the meta + skip-
     /// table + block-bytes emit stages.
@@ -3359,6 +3409,13 @@ struct TermScratch {
     /// offset of the block's first run within the term's positions
     /// bytes) for positional columns. Reused like the other buffers.
     pos_block_offsets: Vec<u32>,
+    /// Per-term position run-offset sub-index (VERSION_V3, positional
+    /// columns): `ENTRIES_PER_BLOCK` byte offsets per block — one every
+    /// `POSITION_SUBINDEX_STRIDE` pairs — each relative to the term's
+    /// positions bytes. Padded to a whole `ENTRIES_PER_BLOCK` per block
+    /// so entry `(block, slot)` sits at a flat `block * ENTRIES_PER_BLOCK
+    /// + slot`. Reused like the other buffers.
+    pos_subindex_offsets: Vec<u32>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -3387,6 +3444,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
+    write_coarse: bool,
 ) -> Result<usize, BuildError> {
     let mmap_start = finish_profile.enabled.then(Instant::now);
     let mut mmaps: Vec<Mmap> = Vec::with_capacity(sorted_files.len());
@@ -3498,6 +3556,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             term_positions,
             finish_profile,
             term_scratch,
+            write_coarse,
         )?;
         n_emitted += 1;
     }
@@ -3538,6 +3597,7 @@ fn encode_and_emit_term<W: Write>(
     mut term_positions: Option<(&mut PositionsSink, &[u8])>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
+    write_coarse: bool,
 ) -> Result<(), BuildError> {
     let encode_start = profile.enabled.then(Instant::now);
     profile.encode_calls += 1;
@@ -3612,16 +3672,29 @@ fn encode_and_emit_term<W: Write>(
             block_tfs.clear();
             block_doc_ids.extend(chunk.iter().map(|&(d, _)| d));
             block_tfs.extend(chunk.iter().map(|&(_, t)| t));
-            // Exact per-block BM25 upper bound: the max actual per-doc
-            // contribution over the block. score() rises with tf and falls
-            // with dl, so the looser `score(max_tf, min_dl)` over-estimates
-            // when the highest-tf doc isn't also the shortest. Computing the
-            // real max here (build-time, off the query path) tightens the
-            // skip-table bound so the reader skips more blocks.
+            // Tight per-block BM25 upper bound: the max per-doc contribution
+            // over the block. score() rises with tf and falls with dl, so the
+            // looser `score(max_tf, min_dl)` over-estimates when the
+            // highest-tf doc isn't also the shortest. Computing the real max
+            // here (build-time, off the query path) tightens the skip-table
+            // bound so the reader skips more blocks.
+            //
+            // Score against the *quantized* length the reader scores with —
+            // the resident norm table stores each length as a one-byte
+            // bucket and scores from its dequantized representative, which
+            // truncates the length downward. A shorter length means a
+            // smaller norm and thus a *higher* BM25 score, so bounding
+            // against the exact length would leave the stored max below the
+            // query-time score of that same doc and let the block-max skip
+            // drop a qualifying document.
             let block_ub = block_doc_ids
                 .iter()
                 .zip(block_tfs.iter())
-                .map(|(&d, &t)| bm25::score(idf_t, t, col_doc_lengths[d as usize], avgdl))
+                .map(|(&d, &t)| {
+                    let reader_dl =
+                        bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
+                    bm25::score(idf_t, t, reader_dl, avgdl)
+                })
                 .fold(0.0f32, f32::max);
             block_ub_per_block.push(block_ub);
             let block = Block {
@@ -3638,6 +3711,10 @@ fn encode_and_emit_term<W: Write>(
         if let Some(start) = block_build_start {
             profile.encode_block_build += start.elapsed();
         }
+        // A block emitted in the bitset encoding bumps the blob to v4.
+        if encoded_blocks.iter().any(|b| b.bytes[3] == ENCODING_BITSET) {
+            profile.saw_bitset_block = true;
+        }
         let num_blocks = encoded_blocks.len() as u32;
         let metadata_offset = *postings_len;
         let skip_table_size = encoded_blocks.len() * SKIP_ENTRY_SIZE;
@@ -3646,14 +3723,40 @@ fn encode_and_emit_term<W: Write>(
             Some(_) => TERM_META_POSITIONAL_SIZE,
             None => TERM_META_SIZE,
         };
-        let postings_length = (term_meta_size + skip_table_size + blocks_total_size) as u64;
+        // VERSION_V3 position sub-index (positional terms only): one run
+        // offset every `POSITION_SUBINDEX_STRIDE` pairs, padded to a whole
+        // `ENTRIES_PER_BLOCK` per block, written between the skip table and
+        // the posting blocks. Zero-sized on positionless terms, which keep
+        // the V2 layout byte-for-byte.
+        let entries_per_block = format::fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK;
+        let subindex_size = match term_positions {
+            Some(_) => num_blocks as usize * entries_per_block * format::fts::U32_BYTES,
+            None => 0,
+        };
+        // Coarse block-max table at the tail of the term region: one
+        // `f32` per `COARSE_BLOCK_MAX_SPAN` blocks (the span's max block-max),
+        // giving the ranked walk a second skip level. Appended last so no
+        // existing block offset moves.
+        let num_coarse = match write_coarse {
+            true => (num_blocks as usize).div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN),
+            false => 0,
+        };
+        let coarse_table_size = num_coarse * format::fts::U32_BYTES;
+        let postings_length = (term_meta_size
+            + skip_table_size
+            + subindex_size
+            + blocks_total_size
+            + coarse_table_size) as u64;
 
-        // Per-block byte offsets into this term's position runs: walk
-        // the runs once, recording where each 128-doc block's first
-        // run starts, so the reader can fetch/decode one block's
-        // positions without touching its predecessors.
+        // Walk the runs once, recording where each 128-doc block's first
+        // run starts (the skip table's per-block offset) and, every
+        // `POSITION_SUBINDEX_STRIDE` pairs, a finer sub-index offset — so
+        // the reader reaches a pair's positions by skipping `< STRIDE`
+        // runs rather than every run from the block start.
         let pos_block_offsets = &mut scratch.pos_block_offsets;
+        let pos_subindex_offsets = &mut scratch.pos_subindex_offsets;
         pos_block_offsets.clear();
+        pos_subindex_offsets.clear();
         if let Some((_, runs)) = &term_positions {
             debug_assert!(
                 runs.len() <= u32::MAX as usize,
@@ -3661,12 +3764,28 @@ fn encode_and_emit_term<W: Write>(
             );
             let mut at: usize = 0;
             for (i, &(_, tf)) in pairs.iter().enumerate() {
-                if i % BLOCK_LEN == 0 {
+                let in_block = i % BLOCK_LEN;
+                if in_block == 0 {
                     pos_block_offsets.push(at as u32);
+                }
+                if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
+                    pos_subindex_offsets.push(at as u32);
                 }
                 skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
             }
             debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+            // Pad the final (partial) block's sub-index up to a whole
+            // `entries_per_block`, so entry `(block, slot)` is a flat
+            // `block * entries_per_block + slot`. The pad offsets point at
+            // the run end and are never read (no pair maps to them).
+            while !pos_subindex_offsets.len().is_multiple_of(entries_per_block) {
+                pos_subindex_offsets.push(at as u32);
+            }
+            debug_assert_eq!(
+                pos_subindex_offsets.len() * format::fts::U32_BYTES,
+                subindex_size,
+                "sub-index must hold entries_per_block offsets per block"
+            );
         }
 
         debug_assert!(df <= u32::MAX as u64, "df overflows u32");
@@ -3705,36 +3824,69 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_meta_write += start.elapsed();
         }
 
-        let mut block_offset: u32 = (term_meta_size + skip_table_size) as u32;
+        // Blocks follow the meta, the skip table, and the (V3-only)
+        // position sub-index, so their offsets start past all three.
+        let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
+        // Coarse span-maxes (V5 only), filled alongside the per-block skip
+        // entries and appended after the blocks below. Each entry is the
+        // span's max of the per-block `f32` maxes, stored as `f32` bits — a
+        // true upper bound over the span.
+        let mut coarse_maxes: Vec<u32> = Vec::with_capacity(num_coarse);
+        let mut span_max: f32 = 0.0;
+        let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
             let max_bm25 = block_ub_per_block[i];
-            // ceil(): the stored fixed-point value must stay a true
-            // UPPER bound after quantization — truncation would round
-            // it below the real block max and let BMW / floor skips
-            // drop blocks that still hold qualifying docs. (The reader
-            // additionally adds one step on decode to cover files
-            // written before this rounding fix.)
-            let max_bm25_x1000 = (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
-                .ceil()
-                .max(0.0)
-                .min(u32::MAX as f32) as u32;
+            // The 4-byte block-max slot. V5 stores the exact `f32` bits: it
+            // equals the reader's per-doc score for the block's max doc (same
+            // quantized-length scoring), so it is an exact upper bound with no
+            // fixed-point slack. Legacy V1-V4 store `ceil(max_bm25 × scale)`
+            // as a `u32`; `ceil` keeps it a true upper bound after truncation
+            // (the reader adds one more step on decode).
+            let block_max_encoded: u32 = if write_coarse {
+                max_bm25.to_bits()
+            } else {
+                (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
+                    .ceil()
+                    .max(0.0)
+                    .min(u32::MAX as f32) as u32
+            };
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
             term_buf.extend_from_slice(&block_offset.to_le_bytes());
-            term_buf.extend_from_slice(&max_bm25_x1000.to_le_bytes());
+            term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
             // Positionless columns keep writing zero here —
             // byte-identical to the field's reserved era.
             let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
             term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
             block_offset += blk.bytes.len() as u32;
+
+            if write_coarse {
+                // Coarse (V5) tracks the float max, stored as f32 bits.
+                span_max = span_max.max(max_bm25);
+                if (i + 1).is_multiple_of(coarse_span) || i + 1 == encoded_blocks.len() {
+                    coarse_maxes.push(span_max.to_bits());
+                    span_max = 0.0;
+                }
+            }
         }
+        debug_assert_eq!(coarse_maxes.len(), num_coarse);
         if let Some(start) = skip_write_start {
             profile.encode_skip_write += start.elapsed();
+        }
+
+        // Position sub-index (VERSION_V3, positional terms): sits between
+        // the skip table and the blocks. Empty on positionless terms.
+        for &off in pos_subindex_offsets.iter() {
+            term_buf.extend_from_slice(&off.to_le_bytes());
         }
 
         let block_write_start = profile.enabled.then(Instant::now);
         for blk in encoded_blocks.iter() {
             term_buf.extend_from_slice(&blk.bytes);
+        }
+        // Coarse block-max table: the term region's tail.
+        for &cm in &coarse_maxes {
+            term_buf.extend_from_slice(&cm.to_le_bytes());
         }
         debug_assert_eq!(term_buf.len(), postings_length as usize);
         write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
@@ -4061,9 +4213,9 @@ mod tests {
 
         // Magic.
         assert_eq!(&blob[0..8], format::fts::MAGIC);
-        // Version — new code always writes the v2 (positions) layout.
+        // Version — new code always writes V5 (coarse block-max table).
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_V2);
+        assert_eq!(version, format::fts::VERSION_V5);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -4586,7 +4738,15 @@ mod tests {
 
         let read_u64 = |at: usize| u64::from_le_bytes(v2[at..at + 8].try_into().expect("8 bytes"));
         let read_u32 = |at: usize| u32::from_le_bytes(v2[at..at + 4].try_into().expect("4 bytes"));
-        assert_eq!(read_u32(8), format::fts::VERSION_V2);
+        // Accept any 56-byte-header version (v2/v3/v4) as the downgrade
+        // source — they share the header layout this synthesizer edits.
+        let src_version = read_u32(8);
+        assert!(
+            src_version == format::fts::VERSION_V2
+                || src_version == format::fts::VERSION_V3
+                || src_version == format::fts::VERSION_V4,
+            "unexpected source version {src_version}"
+        );
         let fst_off = read_u64(24);
         let postings_off = read_u64(32);
         let doc_lengths_off = read_u64(40);
@@ -4646,6 +4806,8 @@ mod tests {
         if let Some(m) = max_partition_bytes {
             b.set_max_partition_bytes(m);
         }
+        // Legacy (no-coarse) blob — see `build_title_blob`.
+        b.write_coarse = false;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
@@ -4697,9 +4859,10 @@ mod tests {
         let docs = positional_corpus();
         let k = docs.len();
         let spilled_pos = build_title_blob_spilled(&docs, true, None);
+        // A positional build carries position runs ⇒ a sub-index ⇒ v3.
         assert_eq!(
             u32::from_le_bytes(spilled_pos[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V2
+            format::fts::VERSION_V4
         );
         let inram_pos = build_title_blob(&docs, true);
         let inram_plain = build_title_blob(&docs, false);
@@ -4765,6 +4928,104 @@ mod tests {
         );
     }
 
+    /// Backwards compatibility: the new reader must read a **v2 positional**
+    /// blob — every already-written positional index — through the
+    /// block-start walk fallback, giving results identical to the v3
+    /// sub-index fast path on the same corpus. A positional build is v3;
+    /// downgrade its version byte to v2 so the reader ignores the sub-index
+    /// and takes the fallback (the sub-index bytes become dead space the
+    /// walk never reads, since blocks are located from the skip table).
+    #[tokio::test]
+    async fn new_code_reads_v2_positional_via_fallback() {
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
+
+        let docs = positional_corpus();
+        let v3_blob = build_title_blob(&docs, true);
+        assert_eq!(
+            u32::from_le_bytes(v3_blob[8..12].try_into().expect("version bytes")),
+            format::fts::VERSION_V4,
+            "this positional corpus is dense ⇒ v4"
+        );
+        // Downgrade the version field only; the header is not itself
+        // CRC-covered, and the positions region + skip offsets are
+        // byte-identical to v2, so the fallback path reads it correctly.
+        let mut v2_bytes = v3_blob.to_vec();
+        v2_bytes[8..12].copy_from_slice(&format::fts::VERSION_V2.to_le_bytes());
+        let v2_blob = bytes::Bytes::from(v2_bytes);
+
+        let v3 = FtsReader::open(v3_blob, title_json(true)).expect("v3 opens");
+        let v2 = FtsReader::open(v2_blob, title_json(true)).expect("v2 opens");
+        // Phrases exercise the position decode. `common filler` matches in
+        // every one of the 391 docs (spanning 4 posting blocks), so
+        // `common`'s decode runs at pairs across many blocks and non-
+        // checkpoint offsets — exactly the sub-index path. The fast path
+        // (v3) and the block-start walk (v2 fallback) must agree exactly,
+        // and match a nonzero count so the decode really ran.
+        let phrases: &[(&[&str], u64)] = &[
+            (&["common", "filler"], 391),
+            (&["medium", "medium"], 79),
+            (&["filler", "medium"], 79),
+        ];
+        for (terms, want) in phrases {
+            let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
+            let a = v3
+                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .await
+                .expect("v3 phrase count")
+                .0;
+            let b = v2
+                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .await
+                .expect("v2 phrase count")
+                .0;
+            assert_eq!(a, b, "v3 fast path vs v2 fallback diverged for {terms:?}");
+            assert_eq!(a, *want, "unexpected phrase count for {terms:?}");
+        }
+    }
+
+    /// The V5 reader reads a legacy V4 blob (no coarse table) and returns the
+    /// identical ranked top-k as it does for the V5 blob of the same corpus —
+    /// the backwards-compatibility contract for the coarse-table format bump.
+    #[tokio::test]
+    async fn v5_reader_reads_legacy_v4_blob_identically() {
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
+
+        let docs = positional_corpus();
+
+        // Legacy V4 (no coarse) via the helper; V5 (coarse) via the default.
+        let legacy = build_title_blob(&docs, false);
+        let v5 = {
+            let mut b = FtsBuilder::new(tokenizer());
+            b.register_column("title".into(), false).expect("register");
+            for (i, t) in docs.iter().enumerate() {
+                b.add_doc(0, i as u32, t).expect("add doc");
+            }
+            bytes::Bytes::from(b.finish().expect("finish"))
+        };
+        let ver = |b: &bytes::Bytes| u32::from_le_bytes(b[8..12].try_into().expect("version"));
+        assert!(
+            ver(&legacy) < format::fts::VERSION_V5,
+            "legacy must be < V5"
+        );
+        assert_eq!(ver(&v5), format::fts::VERSION_V5);
+
+        let r_legacy = FtsReader::open(legacy, title_json(false)).expect("legacy opens");
+        let r_v5 = FtsReader::open(v5, title_json(false)).expect("v5 opens");
+        // Single-term (the coarse/seed path) and a union — both must agree.
+        let queries: &[&[&str]] = &[&["common"], &["common", "medium"], &["uniqueonce"]];
+        for terms in queries {
+            let a = r_legacy
+                .search("title", terms, docs.len(), BoolMode::Or)
+                .await
+                .expect("legacy search");
+            let b = r_v5
+                .search("title", terms, docs.len(), BoolMode::Or)
+                .await
+                .expect("v5 search");
+            assert_eq!(a, b, "legacy vs V5 results diverged for {terms:?}");
+        }
+    }
+
     /// Column-json for the single "title" column, with or without the
     /// positions flag — matching what `fts_columns_json` emits.
     fn title_json(positional: bool) -> &'static str {
@@ -4777,6 +5038,10 @@ mod tests {
     /// Build a one-column blob from `docs`, positional or not.
     fn build_title_blob(docs: &[String], positional: bool) -> bytes::Bytes {
         let mut b = FtsBuilder::new(tokenizer());
+        // These tests cover the legacy (V1–V4, no coarse table) format and
+        // the reader's backwards-compatibility with it; the production V5
+        // path is covered by the FTS integration suite.
+        b.write_coarse = false;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
@@ -4809,7 +5074,7 @@ mod tests {
     }
 
     #[test]
-    fn every_build_writes_v2_and_positionless_region_is_empty() {
+    fn positionless_is_v2_positional_is_v3_and_positionless_region_is_empty() {
         let docs = positional_corpus();
         let plain = build_title_blob(&docs, false);
         let positional = build_title_blob(&docs, true);
@@ -4817,9 +5082,11 @@ mod tests {
         let version_of = |blob: &bytes::Bytes| {
             u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
         };
-        // New code always writes v2; v1 is a read-only legacy format.
-        assert_eq!(version_of(&plain), format::fts::VERSION_V2);
-        assert_eq!(version_of(&positional), format::fts::VERSION_V2);
+        // This corpus is dense enough that some block takes the bitset
+        // encoding, so both builds are v4 (v4 subsumes the v3 positions
+        // sub-index). v1 is a read-only legacy format.
+        assert_eq!(version_of(&plain), format::fts::VERSION_V4);
+        assert_eq!(version_of(&positional), format::fts::VERSION_V4);
 
         // A positionless build's region is just the CRC-of-empty.
         let read_u64_plain =
@@ -4902,8 +5169,8 @@ mod tests {
     async fn mixed_columns_only_positional_column_pays() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
-        // Two columns, one positional: the blob is v2, and both
-        // columns keep answering queries (each with its own term-meta
+        // Two columns, one positional: the blob is V5 (coarse table), and
+        // both columns keep answering queries (each with its own term-meta
         // stride).
         let mut b = FtsBuilder::new(tokenizer());
         b.register_column("body".into(), false).expect("register");
@@ -4916,7 +5183,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V2
+            format::fts::VERSION_V5
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");
