@@ -225,6 +225,80 @@ JSON metrics land in `target/infino-bench/<bench>.json` (local only).
 <!-- END: bench/fts/supertable/search -->
 
 <!-- BEGIN: bench/fts/supertable/quality -->
+### Supertable FTS — BM25 top-k parity vs textbook oracle (10M docs, realistic corpus)
+
+_Host: unknown CPU · 16C/16T · macos/aarch64_
+
+Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). `recall vs BM25` = `Bm25Stats::Global` against textbook BM25 with exact doc lengths — the user-facing quality, which pays for the one-byte length quantization and per-superfile avgdl. `recall (default stats)` = the same under the default `PerSuperfile` idf. `recall vs engine BM25` = `Global` against BM25 with the engine's stored (quantized) lengths, a hit allowed to fall short of the k-th score by the avgdl residual (5.0% at this scale: the oracle normalizes with the corpus-wide average length, the engine with each superfile's own) — gated at 0.99: below it the kernels disagree with their own formula. `max score Δ` = largest relative gap between an engine score and that reference for the same doc — gated at the same 5.0%.
+
+**k = 10**
+
+| Query | matches | recall vs BM25 | recall (default stats) | recall vs engine BM25 | max score Δ |
+| --- | --- | --- | --- | --- | --- |
+| stopword | 8.4M | 0.9000 | 0.0000 | 1.0000 | 0.02% |
+| common | 2.1M | 1.0000 | 0.1000 | 1.0000 | 0.04% |
+| mid | 59.3K | 1.0000 | 0.5000 | 1.0000 | 0.05% |
+| rare | 628 | 1.0000 | 0.6000 | 1.0000 | 0.23% |
+| singleton | 1 | 1.0000 | 1.0000 | 1.0000 | 1.10% |
+| stopword_common_or | 8.4M | 0.9000 | 0.2000 | 1.0000 | 0.03% |
+| stopword_rare_or | 8.4M | 0.9000 | 0.6000 | 1.0000 | 0.23% |
+| three_stopword_or | 9.1M | 0.8000 | 0.1000 | 1.0000 | 0.05% |
+| three_mid_or | 169.8K | 1.0000 | 0.9000 | 1.0000 | 0.35% |
+| ten_common_or | 6.2M | 0.9000 | 0.9000 | 1.0000 | 1.10% |
+| stopword_rare_and | 613 | 1.0000 | 0.7000 | 1.0000 | 0.23% |
+| common_mid_and | 38.7K | 1.0000 | 1.0000 | 1.0000 | 0.12% |
+| three_mid_and | 360 | 1.0000 | 1.0000 | 1.0000 | 2.42% |
+| must_rare_should_common | 628 | 1.0000 | 0.9000 | 1.0000 | 0.06% |
+| must_two_should_two | 1.0M | 1.0000 | 0.8000 | 1.0000 | 0.18% |
+| common_not_stopword | 45.8K | 1.0000 | 0.6000 | 1.0000 | 0.02% |
+| phrase_stopwords | 2.8M | 0.8000 | 0.3000 | 1.0000 | 0.05% |
+| phrase_common_mid | 223 | 1.0000 | 0.9000 | 1.0000 | 0.31% |
+
+**k = 100**
+
+| Query | matches | recall vs BM25 | recall (default stats) | recall vs engine BM25 | max score Δ |
+| --- | --- | --- | --- | --- | --- |
+| stopword | 8.4M | 0.8800 | 0.0300 | 1.0000 | 0.03% |
+| common | 2.1M | 0.9500 | 0.4000 | 1.0000 | 0.05% |
+| mid | 59.3K | 0.9800 | 0.7400 | 1.0000 | 0.09% |
+| rare | 628 | 0.9900 | 0.9500 | 1.0000 | 0.79% |
+| singleton | 1 | 1.0000 | 1.0000 | 1.0000 | 1.10% |
+| stopword_common_or | 8.4M | 0.9300 | 0.4600 | 1.0000 | 0.07% |
+| stopword_rare_or | 8.4M | 0.9900 | 0.9500 | 1.0000 | 0.77% |
+| three_stopword_or | 9.1M | 0.8700 | 0.2000 | 1.0000 | 0.11% |
+| three_mid_or | 169.8K | 0.9700 | 0.9800 | 1.0000 | 0.98% |
+| ten_common_or | 6.2M | 0.8500 | 0.8500 | 1.0000 | 1.38% |
+| stopword_rare_and | 613 | 0.9800 | 0.9400 | 1.0000 | 0.77% |
+| common_mid_and | 38.7K | 0.9800 | 0.9200 | 1.0000 | 0.28% |
+| three_mid_and | 360 | 0.9900 | 0.9900 | 1.0000 | 3.45% |
+| must_rare_should_common | 628 | 0.9900 | 0.9200 | 1.0000 | 0.84% |
+| must_two_should_two | 1.0M | 0.9700 | 0.9400 | 1.0000 | 0.85% |
+| common_not_stopword | 45.8K | 0.9800 | 0.7100 | 1.0000 | 0.05% |
+| phrase_stopwords | 2.8M | 0.9700 | 0.6600 | 1.0000 | 0.12% |
+| phrase_common_mid | 223 | 1.0000 | 0.9900 | 1.0000 | 1.65% |
+
+**k = 1000**
+
+| Query | matches | recall vs BM25 | recall (default stats) | recall vs engine BM25 | max score Δ |
+| --- | --- | --- | --- | --- | --- |
+| stopword | 8.4M | 0.9160 | 0.0620 | 1.0000 | 0.05% |
+| common | 2.1M | 0.9750 | 0.6860 | 1.0000 | 0.10% |
+| mid | 59.3K | 0.9870 | 0.9280 | 1.0000 | 0.50% |
+| rare | 628 | 1.0000 | 1.0000 | 1.0000 | 3.28% |
+| singleton | 1 | 1.0000 | 1.0000 | 1.0000 | 1.10% |
+| stopword_common_or | 8.4M | 0.9550 | 0.7040 | 1.0000 | 0.13% |
+| stopword_rare_or | 8.4M | 0.9760 | 0.6480 | 1.0000 | 2.79% |
+| three_stopword_or | 9.1M | 0.8700 | 0.3170 | 1.0000 | 0.17% |
+| three_mid_or | 169.8K | 0.9750 | 0.8830 | 1.0000 | 1.50% |
+| ten_common_or | 6.2M | 0.8780 | 0.8860 | 1.0000 | 1.75% |
+| stopword_rare_and | 613 | 1.0000 | 1.0000 | 1.0000 | 2.79% |
+| common_mid_and | 38.7K | 0.9750 | 0.9580 | 1.0000 | 1.11% |
+| three_mid_and | 360 | 1.0000 | 1.0000 | 1.0000 | 4.06% |
+| must_rare_should_common | 628 | 1.0000 | 1.0000 | 1.0000 | 2.91% |
+| must_two_should_two | 1.0M | 0.9670 | 0.9660 | 1.0000 | 1.33% |
+| common_not_stopword | 45.8K | 0.9960 | 0.8740 | 1.0000 | 0.08% |
+| phrase_stopwords | 2.8M | 0.9470 | 0.7600 | 1.0000 | 0.27% |
+| phrase_common_mid | 223 | 1.0000 | 1.0000 | 1.0000 | 3.61% |
 <!-- END: bench/fts/supertable/quality -->
 
 ### Superfile vector
