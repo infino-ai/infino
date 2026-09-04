@@ -7982,8 +7982,10 @@ mod tests {
     #[test]
     fn auto_calibrates_then_routes_centroid_graph_end_to_end() {
         use super::{auto_router_choice, select_eager_router_column};
-        use crate::config::{IvfRouter, VectorSearchMode};
-        use crate::supertable::manifest::list::{CellRoutingParams, WIDTH_LAW_KS};
+        use crate::{
+            config::{IvfRouter, VectorSearchMode},
+            supertable::manifest::list::{CellRoutingParams, WIDTH_LAW_KS},
+        };
 
         let cols = vec![VectorConfig {
             column: "emb".to_string(),
