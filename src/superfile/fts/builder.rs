@@ -984,20 +984,27 @@ mod finish_debug {
 ///    `0..vocab_size`. The bench Zipfian column has ~10K vocab; even
 ///    a 10M-doc supertable column tops out around a few million —
 ///    the counts table fits comfortably in L2 either way.
-/// 2. The secondary key is *free*. Within a partition file, all
-///    triples for a fixed `term_id` are appended in strictly
-///    increasing `doc_id` order (`add_doc` is called with monotonic
-///    `local_doc_id` per `column_id`, and each call emits one
-///    triple per unique term in iteration order over
+/// 2. The secondary key is *almost* free. For the tokenizing ingest
+///    feed, all triples for a fixed `term_id` are appended in
+///    strictly increasing `doc_id` order (`add_doc` is called with
+///    monotonic `local_doc_id` per `column_id`, and each call emits
+///    one triple per unique term in iteration order over
 ///    `updated_terms`, with all triples for that doc emitted
-///    contiguously). So a *stable* sort on `lex_rank[term_id]`
-///    leaves the within-rank order as the original `doc_id` order
-///    — exactly the `(lex_rank, doc_id)` order the finish-time
-///    lex-order partition traversal needs.
+///    contiguously), so the *stable* scatter on `lex_rank[term_id]`
+///    already leaves the within-rank order as `doc_id` order. The
+///    compaction carry paths may not arrive ascending — the
+///    multi-cell merge remaps postings through the packed stable-id
+///    row order — so a verification pass (pass 4 below) scans each
+///    rank run and sorts only the runs with an inversion, restoring
+///    the `(lex_rank, doc_id)` order the finish-time lex-order
+///    partition traversal needs.
 /// 3. Counting sort is **one pass to histogram + one pass to
 ///    scatter**. No `O(log n)` compare chain (pdqsort), no 5–8
 ///    LSB-byte passes (radix), no comparator chasing `lex_rank`
-///    twice per call. Two reads of every triple and one write.
+///    twice per call. Three reads of every triple and one write
+///    (histogram, scatter, order verification) — the verification
+///    read is sequential and measured within noise on the 1M
+///    superfile build.
 ///
 /// **Memory shape**: `counts: Vec<u32>` of length
 /// `vocab_size + 1` (~40 KiB at 10K vocab), plus the `out: Vec
@@ -1055,10 +1062,11 @@ fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, l
 
     // Pass 3: scatter into `out`. Each triple lands at
     // `offsets[rank]`, then we bump that slot so the next triple
-    // for the same rank lands immediately after. Because we walk
-    // `triples` in arrival order and arrival order is `(doc_id,
-    // term_id_within_doc)`, the within-rank order in `out` is the
-    // partition's `doc_id` order — i.e. `(lex_rank, doc_id)`.
+    // for the same rank lands immediately after. The scatter is
+    // stable, so within a rank `out` holds arrival order — which is
+    // `doc_id` order for the tokenizing ingest feed, but not
+    // necessarily for the compaction carry feeds; pass 4 repairs
+    // any run that needs it.
     let mut out: Vec<[u32; N]> = vec![[0u32; N]; n];
     for t in triples.iter() {
         let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
@@ -1595,12 +1603,17 @@ impl FtsBuilder {
     /// column's accumulator without tokenizing — the FTS-compaction-merge
     /// counterpart of [`add_doc`]. `positions` is empty for a non-positional
     /// column; otherwise it holds the `tf` token offsets for this `(term,
-    /// doc)`. Callers feed postings with each term's docs in ascending doc-id
-    /// order (the merge reads them that way), so a term's posting list stays
-    /// sorted — matching what `add_doc` produces. Mirrors the in-RAM drain in
-    /// [`add_doc_inram`], minus the tokenize + per-doc position-chain walk.
+    /// doc)`. The concatenating merges feed each term's docs in ascending
+    /// doc-id order (sequential inputs, dense remap), matching what
+    /// `add_doc` produces. The multi-cell merge does not — it remaps
+    /// postings through the packed stable-id row order — so it forces the
+    /// column into spill mode first, where the finish restores per-term
+    /// doc order (see `radix_sort_records_by_lex_rank`); the in-RAM
+    /// accumulator preserves insertion order and must only be fed
+    /// ascending. Mirrors the in-RAM drain in [`add_doc_inram`], minus the
+    /// tokenize + per-doc position-chain walk.
     ///
-    /// Doc lengths are fed separately via [`set_prebuilt_doc_lengths`] — the
+    /// Doc lengths are fed separately via [`append_prebuilt_doc_lengths`] — the
     /// merge carries the inputs' stored lengths rather than recomputing them.
     ///
     /// Memory-bounded: while in-RAM, a push that crosses `spill_threshold_bytes`
