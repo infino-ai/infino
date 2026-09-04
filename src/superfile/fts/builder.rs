@@ -1086,7 +1086,7 @@ fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, l
         let boundary = i == n || rank_at(&out[i]) != run_rank;
         if boundary {
             if !run_sorted {
-                out[run_start..i].sort_unstable_by_key(|t| triple_doc_id(t));
+                out[run_start..i].sort_unstable_by_key(triple_doc_id);
             }
             if i < n {
                 run_rank = rank_at(&out[i]);
