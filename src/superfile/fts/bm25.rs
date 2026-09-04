@@ -92,6 +92,17 @@ pub(super) fn dequantize_len(b: u8) -> u32 {
     }
 }
 
+/// The document length the scorer actually sees for a doc of `len`
+/// tokens: the one-byte stored representative ([`quantize_len`] then
+/// [`dequantize_len`]). Exact below 16 tokens, truncated downward by up to
+/// one bucket (≤ 12.5%) above. A reference scorer that wants to reproduce
+/// the engine's scores — rather than textbook BM25 on exact lengths — feeds
+/// this length into its normalization.
+#[inline]
+pub fn stored_len(len: u32) -> u32 {
+    dequantize_len(quantize_len(len))
+}
+
 /// BM25 inverse-document-frequency. Plus-half smoothing keeps the log
 /// argument ≥ 1, so `idf(N, df) >= 0` for all valid `(N, df)`.
 ///
