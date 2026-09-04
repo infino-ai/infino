@@ -2266,9 +2266,11 @@ pub mod fts {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
-                (cache_dir, consumer)
+                // Consumer first: it must shut down before the cache dir's
+                // removal starts — see `RetryingTempDir`.
+                (consumer, tiers::RetryingTempDir::from(cache_dir))
             },
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2284,7 +2286,7 @@ pub mod fts {
                     )
                     .expect("metered cold bm25_search");
             },
-            |(_cache, consumer), i| {
+            |(consumer, _cache), i| {
                 let q = steady[i % steady.len()];
                 let terms = q.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(q.mode);
@@ -2302,7 +2304,7 @@ pub mod fts {
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2328,16 +2330,18 @@ pub mod fts {
     /// no `open_all_superfiles`. Timed search is the first
     /// `bm25_search`, which opens prune survivors itself.
     struct SupertableColdGuard {
-        _cache_dir: TempDir,
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
         consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
     }
 
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
             Self {
-                _cache_dir: cache_dir,
                 consumer,
+                _cache_dir: cache_dir.into(),
             }
         }
     }
@@ -2639,8 +2643,10 @@ pub mod vector {
     }
 
     struct SupertableVecColdGuard {
-        _cache_dir: TempDir,
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
         consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
         id_to_dense: Arc<std::collections::HashMap<i128, u32>>,
     }
 
@@ -2651,8 +2657,8 @@ pub mod vector {
         ) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
             Self {
-                _cache_dir: cache_dir,
                 consumer,
+                _cache_dir: cache_dir.into(),
                 id_to_dense,
             }
         }
@@ -3537,9 +3543,11 @@ pub mod vector {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
-                (cache_dir, consumer)
+                // Consumer first: it must shut down before the cache dir's
+                // removal starts — see `RetryingTempDir`.
+                (consumer, tiers::RetryingTempDir::from(cache_dir))
             },
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 if trace_enabled {
                     meter.start_trace();
                 }
@@ -3559,7 +3567,7 @@ pub mod vector {
                     first_query_trace = Some(meter.take_trace());
                 }
             },
-            |(_cache, consumer), i| {
+            |(consumer, _cache), i| {
                 let q = &steady_queries[i % steady_queries.len()];
                 if trace_enabled && i == 0 {
                     meter.start_trace();
@@ -3581,7 +3589,7 @@ pub mod vector {
                 }
             },
             steady_queries.len().min(STEADY_COLD_SAMPLES),
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 let _ = consumer
                     .reader()
                     .expect("reader")
@@ -5499,12 +5507,14 @@ pub mod sql {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
-                (cache_dir, consumer)
+                // Consumer first: it must shut down before the cache dir's
+                // removal starts — see `RetryingTempDir`.
+                (consumer, tiers::RetryingTempDir::from(cache_dir))
             },
             // First/repeat probe the by-key point lookup, which returns the
             // sample row — require a hit so a wrong predicate can't look like
             // success (`query_rows` already `.expect`s on plan/exec failure).
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 assert!(
                     consumer.query_rows(first) > 0,
                     "metered first cold SQL returned no rows: {first}"
@@ -5516,11 +5526,11 @@ pub mod sql {
             // the wall-median (and its GET count) down. The range predicate
             // may legitimately match zero rows yet still scans row groups
             // (real GETs), so it carries no non-empty assertion.
-            |(_cache, consumer), i| {
+            |(consumer, _cache), i| {
                 let _ = consumer.query_rows(&scan[1 + (i % (scan.len() - 1))].1);
             },
             (scan.len() - 1).min(STEADY_COLD_SAMPLES),
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 assert!(
                     consumer.query_rows(first) > 0,
                     "metered repeat cold SQL returned no rows: {first}"
@@ -5538,15 +5548,17 @@ pub mod sql {
     /// postings; SQL covered aggregates do not, and pre-open made "cold
     /// open" look like a full table fetch.)
     struct SupertableSqlColdGuard {
-        _cache_dir: TempDir,
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
         consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
     }
     impl SupertableSqlColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
             Self {
-                _cache_dir: cache_dir,
                 consumer,
+                _cache_dir: cache_dir.into(),
             }
         }
     }
