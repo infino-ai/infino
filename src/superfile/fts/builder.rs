@@ -289,7 +289,7 @@ const ACCUM_POSTING_BYTES: usize = 8;
 /// `sort_unstable_by` instead of the counting/radix variant: under
 /// this count the histogram allocation outweighs the algorithmic
 /// savings.
-const RADIX_SORT_MIN_TRIPLES: usize = 256;
+pub(crate) const RADIX_SORT_MIN_TRIPLES: usize = 256;
 
 /// Upper bound on the initial in-RAM chunk capacity (in triples)
 /// during external merge sort. Caps the up-front `Vec` reservation

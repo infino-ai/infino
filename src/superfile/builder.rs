@@ -2399,7 +2399,7 @@ mod tests {
         runtime_bridge::bridge_sync_to_async,
         superfile::{
             format::footer::read_kv_metadata,
-            fts::reader::BoolMode,
+            fts::{builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode},
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
         test_helpers::{decimal128_ids, default_vector_config},
@@ -2836,7 +2836,7 @@ mod tests {
         // cell 3 interleaves both inputs after the cell-id sort.
         let a = pack_cells_superfile_with_body(1000, &[(1, 3, 2), (3, 2, 2)], false);
         let b = pack_cells_superfile_with_body(2000, &[(2, 2, 2), (3, 3, 2)], false);
-        assert_multi_cell_merge_fts(&a, &b).await;
+        assert_multi_cell_merge_fts(&a, &b, 10).await;
     }
 
     /// Same reorder coverage with the FTS column index-only: the merge
@@ -2846,14 +2846,46 @@ mod tests {
     async fn multi_cell_merge_carries_unstored_fts_postings() {
         let a = pack_cells_superfile_with_body(1000, &[(1, 3, 2), (3, 2, 2)], true);
         let b = pack_cells_superfile_with_body(2000, &[(2, 2, 2), (3, 3, 2)], true);
-        assert_multi_cell_merge_fts(&a, &b).await;
+        assert_multi_cell_merge_fts(&a, &b, 10).await;
+    }
+
+    /// The reorder coverage above stays under `RADIX_SORT_MIN_TRIPLES`,
+    /// so the spilled finish sorts those merges with the comparison
+    /// fallback — which is how a term-order bug in the radix path once
+    /// shipped despite these tests passing. This variant pushes the
+    /// shared tokens past the threshold (4 cells × 90 rows = 360
+    /// triples per shared term) so the end-to-end contract is pinned on
+    /// the radix path itself. The feed order makes the inversion real:
+    /// input A's cell-3 rows remap to packed positions *after* input
+    /// B's cell-2 rows, so B's postings arrive below A's tail.
+    #[tokio::test]
+    async fn multi_cell_merge_radix_path_carries_unstored_fts_postings() {
+        const ROWS_PER_CELL: usize = 90;
+        // Compile-time tie to the threshold: shared-term triples
+        // (4 cells × ROWS_PER_CELL) must land on the radix path.
+        const _: () = assert!(4 * ROWS_PER_CELL > RADIX_SORT_MIN_TRIPLES);
+        let a = pack_cells_superfile_with_body(
+            1000,
+            &[(1, ROWS_PER_CELL, 2), (3, ROWS_PER_CELL, 2)],
+            true,
+        );
+        let b = pack_cells_superfile_with_body(
+            2000,
+            &[(2, ROWS_PER_CELL, 2), (3, ROWS_PER_CELL, 2)],
+            true,
+        );
+        assert_multi_cell_merge_fts(&a, &b, 4 * ROWS_PER_CELL).await;
     }
 
     /// Merge `a` + `b` and assert every doc's unique body token finds
     /// exactly its own row (postings remapped correctly), the shared
     /// token finds every row (doc set complete), and the phrase probe
     /// respects positions carried through the reorder.
-    async fn assert_multi_cell_merge_fts(a: &Arc<SuperfileReader>, b: &Arc<SuperfileReader>) {
+    async fn assert_multi_cell_merge_fts(
+        a: &Arc<SuperfileReader>,
+        b: &Arc<SuperfileReader>,
+        expected_rows: usize,
+    ) {
         let (merged, _) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
             &[(Arc::clone(a), None), (Arc::clone(b), None)],
             &[BTreeSet::new(), BTreeSet::new()],
@@ -2871,7 +2903,7 @@ mod tests {
             .clone();
         let stable_of_local: Vec<i128> = (0..ids.len()).map(|i| ids.value(i)).collect();
         let n = stable_of_local.len();
-        assert_eq!(n, 10, "3+2 + 2+3 rows survive the merge");
+        assert_eq!(n, expected_rows, "every input row survives the merge");
 
         // Every row's unique token resolves to exactly its own stable id.
         for (local, &sid) in stable_of_local.iter().enumerate() {
@@ -2885,16 +2917,16 @@ mod tests {
                 "tok{sid} must land on merged-local row {local}"
             );
         }
-        // The shared token finds every row.
+        // The shared token finds every row (k = n so nothing truncates).
         let hits = merged
-            .bm25_hits_async("body", "shared", 16, BoolMode::Or)
+            .bm25_hits_async("body", "shared", n, BoolMode::Or)
             .await
             .expect("shared-token search");
         assert_eq!(hits.len(), n, "shared token spans the whole merged corpus");
         // Phrase probe: "alpha beta" was written contiguously only for
         // even stable ids; positions must survive the reorder.
         let hits = merged
-            .bm25_hits_async("body", "\"alpha beta\"", 16, BoolMode::Or)
+            .bm25_hits_async("body", "\"alpha beta\"", n, BoolMode::Or)
             .await
             .expect("phrase search");
         let mut got: Vec<i128> = hits
