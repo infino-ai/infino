@@ -166,6 +166,9 @@ pub(crate) const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
 /// file. This keeps memory bounded by roughly `rayon_threads × 8 MiB` while
 /// still issuing large writes to NVMe.
 const PARALLEL_CORPUS_WRITE_BUF_CAPACITY: usize = 8 << 20;
+/// Pre-sizing estimate for one realistic doc's bytes (mean ~295 tokens at
+/// ~5.5 bytes each); only a capacity hint, never a bound.
+const REALISTIC_DOC_BYTES_ESTIMATE: usize = 1600;
 /// Odd 64-bit multiplier (fractional golden ratio) used to derive a
 /// distinct, deterministic RNG seed per chunk from `(seed, chunk_index)`,
 /// so a parallelized corpus is still reproducible for a given `seed`.
@@ -199,6 +202,12 @@ pub const SYNTHETIC_DIM: usize = 1024;
 /// Specs:
 ///
 /// * `synthetic` — the seeded planted-cluster generator (the default).
+/// * `realistic` — the same generator with the text column switched to
+///   the realistic flavour ([`text_gen::TextFlavor::Realistic`]:
+///   variable-length, open-vocabulary, bursty docs calibrated to real
+///   text). Vectors and SQL columns are unchanged; only the text
+///   generator differs, so this is a text flavour of `synthetic`, not a
+///   separate source.
 /// * `annb:<slug>` — a published ann-benchmarks dataset
 ///   (`annb:glove-100-angular`). One HDF5 file carries corpus rows, the
 ///   official query set, and official top-k neighbour ids, so ground
@@ -233,6 +242,16 @@ pub enum CorpusSource {
 /// Where downloaded corpora are staged, set alongside the spec.
 static SOURCE: OnceLock<CorpusSource> = OnceLock::new();
 
+/// Text flavour of the synthetic source; [`TextFlavor::Uniform`] until
+/// `corpus=realistic` sets it. Only consulted when the source is
+/// [`CorpusSource::Synthetic`] — a real corpus brings its own text.
+static TEXT_FLAVOR: OnceLock<TextFlavor> = OnceLock::new();
+
+/// The synthetic text flavour for this process.
+pub fn text_flavor() -> TextFlavor {
+    *TEXT_FLAVOR.get_or_init(|| TextFlavor::Uniform)
+}
+
 /// Parse and install the corpus source for this process. First call wins,
 /// mirroring [`crate::dataset::set_prefix`]. `dir` is where downloadable
 /// sources stage their files. Returns an error string for an unparseable
@@ -245,6 +264,10 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
     };
     let source = match spec.split_once(':') {
         None if spec == "synthetic" => CorpusSource::Synthetic,
+        None if spec == "realistic" => {
+            let _ = TEXT_FLAVOR.set(TextFlavor::Realistic);
+            CorpusSource::Synthetic
+        }
         Some(("annb", slug)) if !slug.is_empty() => CorpusSource::AnnBenchmarks {
             dir: staged("the dataset file")?,
             slug: slug.to_string(),
@@ -258,7 +281,7 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
         },
         _ => {
             return Err(format!(
-                "unknown corpus spec {spec:?} (expected synthetic | annb:<slug> | \
+                "unknown corpus spec {spec:?} (expected synthetic | realistic | annb:<slug> | \
                  hf:<owner/repo> | parquet:<dir>)"
             ));
         }
@@ -275,7 +298,7 @@ pub fn corpus_source() -> &'static CorpusSource {
 /// Short corpus name for reports and dataset sidecars.
 pub fn corpus_label() -> &'static str {
     match corpus_source() {
-        CorpusSource::Synthetic => "synthetic",
+        CorpusSource::Synthetic => text_flavor().label(),
         CorpusSource::AnnBenchmarks { slug, .. } => slug,
         CorpusSource::HuggingFace { repo, .. } => repo,
         CorpusSource::LocalParquet { dir } => dir
@@ -532,7 +555,85 @@ pub struct MmapTextCorpus {
 }
 
 impl MmapTextCorpus {
+    /// Generate the text corpus in the process's configured flavour
+    /// ([`text_flavor`]).
     pub fn generate(n_docs: usize, seed: u64) -> Self {
+        Self::generate_flavor(n_docs, seed, text_flavor())
+    }
+
+    /// Generate the text corpus in an explicit flavour.
+    pub fn generate_flavor(n_docs: usize, seed: u64, flavor: TextFlavor) -> Self {
+        match flavor {
+            TextFlavor::Uniform => Self::generate_uniform(n_docs, seed),
+            TextFlavor::Realistic => Self::generate_realistic(n_docs, seed),
+        }
+    }
+
+    /// The realistic flavour: byte lengths depend on the RNG, so a chunk's
+    /// bytes are generated into memory and appended in chunk order. Chunks
+    /// are small ([`text_gen::REALISTIC_CHUNK_DOCS`]) and processed in
+    /// windows of two per worker, so the in-flight buffer stays around
+    /// `2 × workers × ~50 MB` regardless of corpus size.
+    fn generate_realistic(n_docs: usize, seed: u64) -> Self {
+        let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
+        let path = tmp.path().join("corpus.txt");
+        let generator = TextDocGen::new(TextFlavor::Realistic);
+        let chunk_docs = generator.chunk_docs();
+        let n_chunks = n_docs.div_ceil(chunk_docs);
+        let window = parallel_writers().max(1) * 2;
+
+        let mut writer = BufWriter::new(File::create(&path).expect("create text corpus file"));
+        let mut offsets = Vec::with_capacity(n_docs + 1);
+        let mut pos = 0u64;
+        offsets.push(pos);
+        for window_start in (0..n_chunks).step_by(window) {
+            let window_end = (window_start + window).min(n_chunks);
+            let chunks: Vec<(Vec<u32>, Vec<u8>)> = (window_start..window_end)
+                .into_par_iter()
+                .map(|c| {
+                    let start = c * chunk_docs;
+                    let end = ((c + 1) * chunk_docs).min(n_docs);
+                    let mut rng = generator.chunk_rng(seed, c);
+                    let mut doc = String::new();
+                    let mut lens = Vec::with_capacity(end - start);
+                    let mut bytes =
+                        Vec::with_capacity((end - start) * REALISTIC_DOC_BYTES_ESTIMATE);
+                    for doc_id in start..end {
+                        doc.clear();
+                        generator.write_doc(&mut rng, doc_id, &mut doc);
+                        lens.push(doc.len() as u32);
+                        bytes.extend_from_slice(doc.as_bytes());
+                    }
+                    (lens, bytes)
+                })
+                .collect();
+            for (lens, bytes) in chunks {
+                writer.write_all(&bytes).expect("write text corpus chunk");
+                for len in lens {
+                    pos += u64::from(len);
+                    offsets.push(pos);
+                }
+            }
+        }
+        let file = writer.into_inner().expect("flush text corpus");
+        file.sync_all().expect("sync text corpus");
+        drop(file);
+
+        let file = File::open(&path).expect("reopen text corpus");
+        // SAFETY: this helper owns the temp file and never writes to it after
+        // the fsync above, so the read-only mmap cannot observe mutation.
+        let map = unsafe { Mmap::map(&file).expect("mmap text corpus") };
+        Self {
+            _tmp: tmp,
+            map,
+            offsets,
+        }
+    }
+
+    /// The uniform flavour: every doc's byte length is RNG-independent, so
+    /// the offset table is computed up front and each chunk writes to its
+    /// own disjoint byte range in parallel.
+    fn generate_uniform(n_docs: usize, seed: u64) -> Self {
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
 
@@ -693,8 +794,12 @@ pub mod combined;
 pub mod grading;
 pub mod sql;
 pub mod sql_battery;
+pub mod text_gen;
 
 pub use combined::SequentialSyntheticCorpus;
+pub use text_gen::{
+    TextDocGen, TextFlavor, for_each_doc_in_chunk, for_each_generated_doc, generated_chunk_count,
+};
 
 // ─── Vector corpus ────────────────────────────────────────────────────
 
