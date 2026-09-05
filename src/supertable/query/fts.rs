@@ -79,7 +79,7 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     slice,
     sync::{
         Arc, Mutex, RwLock,
@@ -127,8 +127,8 @@ use crate::{
         fts::{
             bm25,
             reader::{
-                Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet,
-                PreparedClauses,
+                Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf, OR_WINDOW_MIN_TERMS,
+                OrCursorSet, PreparedClauses,
             },
         },
     },
@@ -145,6 +145,12 @@ use crate::{
         tombstones::SidecarCache,
     },
 };
+
+/// Per-superfile open-wave fetches for one global-stats query, keyed by
+/// superfile id — `None` when every scored term came from the idf cache
+/// (or the query is per-superfile), in which case the walk wave fetches
+/// for itself exactly as before.
+type PrefetchMemos = Option<Arc<HashMap<Uuid, Arc<FetchedTermMemo>>>>;
 
 /// Cap on cached (column, term) global-idf entries. Past it the map is
 /// cleared and repopulates from subsequent queries — an epoch reset
@@ -503,16 +509,21 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Under global stats, gather corpus-wide idf per scored term once
-        // (global N from the manifest + df summed across the superfiles
-        // that contain the term), then score every superfile against it
-        // instead of its own per-superfile idf. The scored set is every
+        // Under global stats, corpus-wide idf per scored term comes from an
+        // OPEN WAVE fused with the query's own reads: each kept superfile
+        // fetches its scored terms' dictionary slots and postings ranges —
+        // exactly the reads its walk needs, handed back to it via a memo —
+        // and reports df; superfiles that may contain a scored term but were
+        // pruned from scoring (the AND-shape residual) contribute df through
+        // a dict-only probe in the same wave. Repeat terms skip the wave
+        // entirely via the per-generation idf cache. The scored set is every
         // term that contributes to a score: the bare musts + shoulds, plus
         // each member of a scored (must/should) phrase — a phrase's score
         // is Σ member idf. Negated terms/phrases are pure exclusions, so
-        // their idf never matters and they stay out of the gather.
-        let global_idf: Option<Arc<GlobalTermIdf>> = match stats {
-            Bm25Stats::PerSuperfile => None,
+        // their idf never matters and they stay out of the wave.
+        let (global_idf, prefetch_memos): (Option<Arc<GlobalTermIdf>>, PrefetchMemos) = match stats
+        {
+            Bm25Stats::PerSuperfile => (None, None),
             Bm25Stats::Global => {
                 let mut scored: Vec<String> = Vec::new();
                 let mut add = |t: &String| {
@@ -529,11 +540,13 @@ impl SupertableReader {
                     }
                 }
                 match scored.is_empty() {
-                    true => None,
-                    false => Some(Arc::new(
-                        self.gather_global_term_idf(manifest.as_ref(), column, &scored)
-                            .await?,
-                    )),
+                    true => (None, None),
+                    false => {
+                        let (map, memos) = self
+                            .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept)
+                            .await?;
+                        (Some(Arc::new(map)), memos)
+                    }
                 }
             }
         };
@@ -615,8 +628,14 @@ impl SupertableReader {
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
             let global_idf = global_idf.clone();
+            let prefetch_memos = prefetch_memos.clone();
             let op_stats = op_stats.clone();
             async move {
+                // This superfile's open-wave fetches (global stats): the
+                // cursor builds below serve the scored terms from the memo
+                // instead of re-reading what the df wave already fetched.
+                let memo: Option<Arc<FetchedTermMemo>> =
+                    prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned();
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
                 // scan against the running top-k instead of returning a full
@@ -652,6 +671,7 @@ impl SupertableReader {
                                         &column_arc,
                                         &should_refs,
                                         global_idf.as_deref(),
+                                        memo.as_deref(),
                                     )
                                     .await
                                     .map_err(fts_read_error)?;
@@ -713,6 +733,7 @@ impl SupertableReader {
                                     should_phrases: &should_ph_arc,
                                     negative_phrases: &neg_ph_arc,
                                     global_idf: global_idf.as_deref(),
+                                    prefetched: memo.as_deref(),
                                 },
                                 k,
                                 floor,
@@ -782,92 +803,127 @@ impl SupertableReader {
         Ok(hits)
     }
 
-    /// Gather global BM25 idf per scored term for [`Bm25Stats::Global`]:
-    /// corpus-wide `N` from the manifest, plus each term's `df` summed
-    /// across the superfiles that contain it (bloom-pruned — a superfile
-    /// absent the term contributes `df = 0`, so the pruned set covers
-    /// every term's postings). The `df` read is `O(1)` per superfile
-    /// from the stored dictionary value.
-    async fn gather_global_term_idf(
+    /// Global BM25 idf per scored term for [`Bm25Stats::Global`], via the
+    /// fused open wave: corpus-wide `N` from the manifest, df per term
+    /// summed across (a) the scoring-kept superfiles — which fetch their
+    /// scored terms' postings ranges here, the very reads their walks
+    /// need, returned to them as per-superfile memos — and (b) the
+    /// presence residual (superfiles that may contain a scored term but
+    /// were pruned from scoring), which contribute df through a
+    /// dict-only probe in the same wave. Terms already cached for this
+    /// manifest generation skip the wave entirely.
+    ///
+    /// Work accounting: memo fetches are NOT flushed here — the walk
+    /// wave's cursors report them, keeping per-query stats equal to the
+    /// per-superfile plan. Residual probes flush here (they have no
+    /// walk), bounded by presence − kept superfiles, dict-only.
+    async fn global_idf_open_wave(
         &self,
         manifest: &ManifestSnapshot,
         column: &str,
         terms: &[String],
-    ) -> Result<GlobalTermIdf, QueryError> {
+        kept: &[Arc<SuperfileEntry>],
+    ) -> Result<(GlobalTermIdf, PrefetchMemos), QueryError> {
         let mut map = GlobalTermIdf::with_capacity(terms.len());
         let global_n = manifest.n_docs_total();
         if terms.is_empty() || global_n == 0 {
-            return Ok(map);
+            return Ok((map, None));
         }
         // Idf is a pure function of the snapshot, so serve repeat terms
-        // from the per-generation cache and fan only over the misses.
+        // from the per-generation cache and run the wave only for misses.
         let manifest_id = manifest.manifest_id;
         let cache = self.global_idf_cache();
         let cached = cache.get(manifest_id, column, terms);
+        for (t, c) in terms.iter().zip(cached.iter()) {
+            if let Some(idf) = c {
+                map.insert(t.clone(), *idf);
+            }
+        }
         let misses: Vec<String> = terms
             .iter()
             .zip(cached.iter())
             .filter(|(_, c)| c.is_none())
             .map(|(t, _)| t.clone())
             .collect();
-        for (t, c) in terms.iter().zip(cached) {
-            if let Some(idf) = c {
-                map.insert(t.clone(), idf);
-            }
-        }
         if misses.is_empty() {
-            return Ok(map);
+            return Ok((map, None));
         }
-        let terms = &misses;
+
+        // Presence prune over the missing terms: every superfile whose
+        // bloom may contain any of them owes a df contribution.
         let prune = PruneLeaf::TermPresence {
             column: column.to_owned(),
-            terms: terms.to_vec(),
+            terms: misses.clone(),
             mode: BoolMode::Or,
         };
-        let kept = select_superfiles(manifest, slice::from_ref(&prune)).await?;
+        let presence = select_superfiles(manifest, slice::from_ref(&prune)).await?;
+        let kept_ids: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
         let column_arc = Arc::new(column.to_owned());
-        let terms_arc: Arc<Vec<String>> = Arc::new(terms.to_vec());
-        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let terms_arc: Arc<Vec<String>> = Arc::new(misses.clone());
+        let units: Vec<(Arc<SuperfileEntry>, (Uuid, bool))> = presence
+            .into_iter()
+            .map(|e| {
+                let suid = e.superfile_id;
+                let full = kept_ids.contains(&suid);
+                (e, (suid, full))
+            })
+            .collect();
         let op_stats = self.op_stats.clone();
-        let per_sf: Vec<Vec<u64>> = dispatch::fanout_with(
+        let per_sf: Vec<(Uuid, Vec<u64>, Option<Arc<FetchedTermMemo>>)> = dispatch::fanout_with(
             self,
             units,
             false,
             true,
-            move |r, _entry, _sidecars, _now, _params: ()| {
+            move |r, _entry, _sidecars, _now, (suid, full): (Uuid, bool)| {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
                 let op_stats = op_stats.clone();
                 async move {
-                    // One FST parse + one coalesced header fetch for all
-                    // scored terms in this superfile, rather than a parse
-                    // and fetch per term.
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
-                    let (dfs, work) = r
-                        .term_dfs(&column_arc, &refs)
-                        .await
-                        .map_err(fts_read_error)?;
-                    // The global-stats pre-pass reads real header ranges;
-                    // it is part of the query's plan and counts like any
-                    // other posting work.
-                    if let Some(stats) = &op_stats {
-                        stats.add_fts_postings_bytes(work.postings_bytes);
-                        stats.add_planned_read_ranges(work.planned_ranges);
-                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                    if full {
+                        // Scoring superfile: fetch the scored terms outright
+                        // — dictionary + postings ranges, the walk's own
+                        // reads — and hand them back through the memo. The
+                        // walk wave flushes this work when it builds the
+                        // cursors, so nothing is flushed here.
+                        let memo = r
+                            .fetch_scored_terms(&column_arc, &refs)
+                            .await
+                            .map_err(fts_read_error)?;
+                        let dfs: Vec<u64> = refs.iter().map(|t| memo.df(t)).collect();
+                        Ok::<_, QueryError>((suid, dfs, Some(Arc::new(memo))))
+                    } else {
+                        // Residual superfile (contains a scored term, pruned
+                        // from scoring): df only, from the dictionary value
+                        // + header hint — no postings body.
+                        let (dfs, work) = r
+                            .term_dfs(&column_arc, &refs)
+                            .await
+                            .map_err(fts_read_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(work.postings_bytes);
+                            stats.add_planned_read_ranges(work.planned_ranges);
+                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                        }
+                        Ok((suid, dfs, None))
                     }
-                    Ok::<Vec<u64>, QueryError>(dfs)
                 }
             },
         )
         .await?;
-        let mut global_df = vec![0u64; terms.len()];
-        for sf in per_sf {
-            for (i, d) in sf.into_iter().enumerate() {
+
+        let mut global_df = vec![0u64; misses.len()];
+        let mut memos: HashMap<Uuid, Arc<FetchedTermMemo>> = HashMap::new();
+        for (suid, dfs, memo) in per_sf {
+            for (i, d) in dfs.into_iter().enumerate() {
                 global_df[i] += d;
             }
+            if let Some(m) = memo {
+                memos.insert(suid, m);
+            }
         }
-        let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(terms.len());
-        for (i, t) in terms.iter().enumerate() {
+        let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
+        for (i, t) in misses.iter().enumerate() {
             // df can't exceed the collection size; clamp so idf's
             // df <= n_docs invariant holds under gross-vs-live counts.
             let df = global_df[i].min(global_n);
@@ -876,7 +932,7 @@ impl SupertableReader {
             fresh.push((t.as_str(), idf));
         }
         cache.insert(manifest_id, column, &fresh);
-        Ok(map)
+        Ok((map, Some(Arc::new(memos))))
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's

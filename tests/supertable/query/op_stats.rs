@@ -256,41 +256,54 @@ fn fts_work_stats_repeat_identically_on_the_same_table_state() {
     assert_eq!(first, second, "same plan, same table state, same work");
 }
 
-/// Under `Bm25Stats::Global` the idf gather fans over the superfiles'
-/// term dictionaries — but idf is a pure function of the snapshot, so
-/// only the FIRST query per (generation, column, term) may pay that
-/// fan. A repeat query must plan exactly the per-superfile work, and a
-/// commit (new manifest generation) must bring the fan back once.
-#[test]
-fn global_stats_gather_fans_once_per_manifest_generation() {
-    let st = demo_two_superfiles();
-    let global = |st: &Supertable, q: &str| {
-        let (hits, stats) = with_op_stats(|| {
-            st.reader()
-                .expect("reader")
-                .bm25_hits_stats("title", q, TOP_K, BoolMode::Or, Bm25Stats::Global)
-                .expect("bm25")
-        });
-        assert!(!hits.is_empty(), "fixture query {q:?} must match");
-        stats.planned_read_ranges
-    };
-    let per_superfile = scoped_fts_stats(&st, "rust").planned_read_ranges;
+/// One scoped global-stats BM25 query's planned ranges.
+fn global_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits_stats("title", q, TOP_K, mode, Bm25Stats::Global)
+            .expect("bm25")
+    });
+    assert!(!hits.is_empty(), "fixture query {q:?} must match");
+    stats.planned_read_ranges
+}
 
-    let first = global(&st, "rust");
-    let repeat = global(&st, "rust");
-    assert!(
-        first > per_superfile,
-        "first global query pays the gather fan on top of the \
-         per-superfile plan ({first} vs {per_superfile})"
+/// One scoped per-superfile BM25 query's planned ranges.
+fn per_superfile_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits_stats("title", q, TOP_K, mode, Bm25Stats::PerSuperfile)
+            .expect("bm25")
+    });
+    assert!(!hits.is_empty(), "fixture query {q:?} must match");
+    stats.planned_read_ranges
+}
+
+/// Under `Bm25Stats::Global`, an OR query's df gather is FUSED with the
+/// query's own reads: the scoring prune set IS the presence set, so the
+/// open wave fetches exactly the dictionary + postings ranges the walk
+/// needs and df rides along for free. The pinned contract: a global OR
+/// query — first for its terms or cache-served — plans EXACTLY the
+/// per-superfile work, on every manifest generation.
+#[test]
+fn global_stats_or_query_plans_exactly_the_per_superfile_work() {
+    let st = demo_two_superfiles();
+    let per_superfile = per_superfile_ranges(&st, "rust", BoolMode::Or);
+
+    let first = global_ranges(&st, "rust", BoolMode::Or);
+    let repeat = global_ranges(&st, "rust", BoolMode::Or);
+    assert_eq!(
+        first, per_superfile,
+        "fused open wave: the first global OR query plans no extra ranges"
     );
     assert_eq!(
         repeat, per_superfile,
-        "repeat query serves idf from the cache: per-superfile plan only"
+        "cache-served repeat plans the per-superfile work too"
     );
 
-    // A commit publishes a new generation: the gather returns exactly
-    // once, then the repeat is cache-served again. The fixture grows a
-    // third superfile, so per-superfile work is re-measured too.
+    // A new manifest generation re-runs the (still fused) wave once and
+    // re-serves from the cache after — the plan equality holds on both.
     let schema = st.options().schema.clone();
     let mut w = st.writer().expect("writer");
     w.append(&title_batch(&segment_titles(0), schema))
@@ -298,16 +311,54 @@ fn global_stats_gather_fans_once_per_manifest_generation() {
     w.commit().expect("commit seg3");
     drop(w);
 
-    let per_superfile_after = scoped_fts_stats(&st, "rust").planned_read_ranges;
-    let first_after = global(&st, "rust");
-    let repeat_after = global(&st, "rust");
-    assert!(
-        first_after > per_superfile_after,
-        "new generation re-gathers ({first_after} vs {per_superfile_after})"
+    let per_superfile_after = per_superfile_ranges(&st, "rust", BoolMode::Or);
+    assert_eq!(
+        global_ranges(&st, "rust", BoolMode::Or),
+        per_superfile_after,
+        "new generation: fused wave still plans no extra ranges"
     );
     assert_eq!(
-        repeat_after, per_superfile_after,
+        global_ranges(&st, "rust", BoolMode::Or),
+        per_superfile_after,
         "cache re-serves under the new generation"
+    );
+}
+
+/// An AND query's presence set can exceed its scoring prune set: a
+/// superfile containing SOME scored term still owes that term's df even
+/// though scoring skips it. That residual is dict-only — bounded, and
+/// gone on the cache-served repeat.
+#[test]
+fn global_stats_and_residual_is_dict_only_and_cached() {
+    let st = demo_two_superfiles();
+    // `filler0x0` lives only in segment 0's superfiles, `rust` in every
+    // superfile — so the AND prune keeps segment 0 only, while segment
+    // 1's superfiles owe `rust`'s df through the residual probe.
+    let q = "rust filler0x0";
+    let per_superfile = per_superfile_ranges(&st, q, BoolMode::And);
+
+    let first = global_ranges(&st, q, BoolMode::And);
+    let repeat = global_ranges(&st, q, BoolMode::And);
+    assert!(
+        first > per_superfile,
+        "the residual superfiles' df probes plan real ranges \
+         ({first} vs {per_superfile})"
+    );
+    // Residual cost: per residual superfile a dictionary fetch plus one
+    // coalesced header fetch — never a postings-body plan. Bounding by
+    // 2 ranges × residual superfiles pins the dict-only shape.
+    let n_superfiles = st.reader().expect("reader").n_superfiles() as u64;
+    let kept_upper_bound = per_superfile / 2; // ≥ dict + 1 range per kept superfile
+    let residual_superfiles = n_superfiles - kept_upper_bound.max(1);
+    assert!(
+        first - per_superfile <= 2 * residual_superfiles,
+        "residual is dict-only, not a postings re-fetch \
+         (extra {} over {residual_superfiles} residual superfiles)",
+        first - per_superfile
+    );
+    assert_eq!(
+        repeat, per_superfile,
+        "cache-served repeat plans the per-superfile work only"
     );
 }
 
