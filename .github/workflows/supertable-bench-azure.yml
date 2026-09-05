@@ -431,12 +431,21 @@ jobs:
 
       # Run the main arm; its metric JSONs stay in place as the PR arm's
       # baseline (Report::load reads them as `prev`).
+      #
+      # A baseline-arm failure is a WARNING, not a step failure: the gate
+      # compares the PR against main, and when main itself cannot complete
+      # the bench (a bug this PR may be fixing), no comparison is possible —
+      # the PR arm still runs and renders "(new)", and the merge gate
+      # already passes with "no gate verdict produced" when baseline
+      # metrics are absent. A red baseline must not block the fixing PR;
+      # a broken PR arm still fails its own (fatal) step below.
       - name: Same-host baseline (A/B main arm)
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          baseline_status=0
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
@@ -447,7 +456,7 @@ jobs:
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
-             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build-main.log
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build-main.log || baseline_status=$?
           set -euo pipefail
           cd "$HOME/infino-src"
           export INFINO_BENCH_STORE=azure
@@ -462,8 +471,13 @@ jobs:
           taskset -c "$CPUSET" "$HOME/bench-main" $BENCH_ARGS 2>&1
           echo "===== BASELINE (main arm) END ====="
           REMOTE
+          if [ "$baseline_status" -ne 0 ]; then
+            echo "::warning::main-arm baseline bench failed (exit ${baseline_status}) — \
+          main is likely broken; the PR arm runs without a comparison and shapes render (new)"
+          fi
           # Stage the main-arm JSONs on the runner too — the AI-summary step
-          # diffs them against the PR arm's metrics (collected later).
+          # diffs them against the PR arm's metrics (collected later). Shapes
+          # that completed before a baseline failure still stage and diff.
           mkdir -p baseline
           for j in $REPORTS; do
             scp $SSH_OPTS \

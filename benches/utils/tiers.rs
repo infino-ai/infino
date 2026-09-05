@@ -11,7 +11,12 @@
 //! `s3` reads `INFINO_REAL_S3_BUCKET`, `azure` reads
 //! `INFINO_REAL_AZURE_CONTAINER`, `gcs` reads `INFINO_REAL_GCS_BUCKET`.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    fs,
+    sync::{Arc, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use infino::{
@@ -54,6 +59,62 @@ const BENCH_COLD_FETCH_CHUNK_BYTES: u64 = 8 * MIB_BYTES;
 const MMAP_TIMER_DISABLED_SECS: u64 = 0;
 
 const SUPERFILE_BENCH_PREFIX: &str = "infino-superfile-bench";
+
+/// How long [`RetryingTempDir`] keeps retrying removal before giving up.
+const CACHE_DIR_REMOVE_MAX_WAIT: Duration = Duration::from_secs(60);
+/// Pause between [`RetryingTempDir`] removal attempts.
+const CACHE_DIR_REMOVE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cache tempdir whose removal survives in-flight background writes.
+///
+/// `TempDir`'s `Drop` swallows `remove_dir_all` errors. A cold-tier
+/// consumer's disk cache can still be flushing fetched ranges to disk when
+/// its guard drops, so a one-shot removal races the cache's file creation,
+/// fails with "directory not empty", and silently leaves a multi-gigabyte
+/// cache tree behind — repeated fresh-cache iterations then fill the disk
+/// until the run dies of `StorageFull`. Guards must declare this field
+/// *after* the consumer (fields drop in declaration order) so the cache is
+/// shut down first; the retry loop then absorbs any writes still landing
+/// from background tasks that outlive the consumer handle.
+pub struct RetryingTempDir(Option<TempDir>);
+
+impl From<TempDir> for RetryingTempDir {
+    fn from(dir: TempDir) -> Self {
+        Self(Some(dir))
+    }
+}
+
+impl Drop for RetryingTempDir {
+    fn drop(&mut self) {
+        let Some(dir) = self.0.take() else { return };
+        let path = dir.keep();
+        let deadline = Instant::now() + CACHE_DIR_REMOVE_MAX_WAIT;
+        loop {
+            // Keep the last outcome for the give-up warning: a persistent
+            // error (e.g. permissions) reads very differently from an `Ok`
+            // whose tree reappeared under a still-running fill.
+            let last = fs::remove_dir_all(&path);
+            if !path.exists() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let outcome = match &last {
+                    Ok(()) => "last removal returned Ok but the tree persisted \
+                               (still being recreated by a live fill?)"
+                        .to_string(),
+                    Err(e) => format!("last removal error: {e}"),
+                };
+                eprintln!(
+                    "[bench] WARNING: cache dir {} still present after {}s of removal retries; {outcome}",
+                    path.display(),
+                    CACHE_DIR_REMOVE_MAX_WAIT.as_secs()
+                );
+                return;
+            }
+            thread::sleep(CACHE_DIR_REMOVE_RETRY_INTERVAL);
+        }
+    }
+}
 
 /// Storage tier exercised by a search bench row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,7 +780,7 @@ pub fn open_superfile_cold_reader(
     storage: Arc<dyn StorageProvider>,
     uri: &SuperfileUri,
     known_size: u64,
-) -> (TempDir, Arc<SuperfileReader>) {
+) -> (RetryingTempDir, Arc<SuperfileReader>) {
     let (cache_dir, cache) = fresh_superfile_cache(storage);
     let offsets = superfile_cold_size_hint(known_size);
     let reader = block_on(async move {
@@ -728,7 +789,9 @@ pub fn open_superfile_cold_reader(
             .await
             .expect("cold reader")
     });
-    (cache_dir, reader)
+    // The open above starts background section fills; hand callers a
+    // removal that survives writes landing after the reader drops.
+    (cache_dir.into(), reader)
 }
 
 fn fresh_disk_cache_with_mode(

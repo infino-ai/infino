@@ -805,8 +805,10 @@ pub mod fts {
     /// the production `DiskCacheStore` path), so the timed `bm25_rows`
     /// pays only the cold search — open and search report separately.
     struct SuperfileColdGuard {
-        _cache_dir: tempfile::TempDir,
+        // Declared before the cache dir so the reader (and its disk cache's
+        // background fills) shuts down before removal — see `RetryingTempDir`.
         reader: Arc<infino::superfile::SuperfileReader>,
+        _cache_dir: tiers::RetryingTempDir,
     }
 
     impl SuperfileColdGuard {
@@ -817,8 +819,8 @@ pub mod fts {
         ) -> Self {
             let (cache_dir, reader) = tiers::open_superfile_cold_reader(storage, &uri, known_size);
             Self {
-                _cache_dir: cache_dir,
                 reader,
+                _cache_dir: cache_dir,
             }
         }
     }
@@ -1719,8 +1721,10 @@ pub mod vector {
             }
 
             struct SuperfileVecColdGuard {
-                _cache_dir: tempfile::TempDir,
+                // Reader first: its cache's background fills must stop
+                // before dir removal — see `RetryingTempDir`.
                 reader: Arc<infino::superfile::SuperfileReader>,
+                _cache_dir: tiers::RetryingTempDir,
             }
             impl SuperfileVecColdGuard {
                 /// The reader open (footer + KV fetch over the object
@@ -1737,8 +1741,8 @@ pub mod vector {
                     let (cache_dir, reader) =
                         tiers::open_superfile_cold_reader(storage, &uri, known_size);
                     Self {
-                        _cache_dir: cache_dir,
                         reader,
+                        _cache_dir: cache_dir,
                     }
                 }
             }
@@ -2358,6 +2362,9 @@ pub mod sql {
         );
         let fixture = tiers::block_on(tiers::superfile_storage_fixture());
         let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&fixture.storage));
+        // Same removal discipline as the guards: the build's cache can
+        // still be flushing when we tear down below.
+        let cache_dir = tiers::RetryingTempDir::from(cache_dir);
         let opts = sql_options()
             .with_storage(std::sync::Arc::clone(&fixture.storage))
             .with_disk_cache(cache.clone())
@@ -2381,7 +2388,7 @@ pub mod sql {
         }
     }
 
-    fn open_cold_consumer(artifact: &ColdSqlArtifact) -> (tempfile::TempDir, Supertable) {
+    fn open_cold_consumer(artifact: &ColdSqlArtifact) -> (tiers::RetryingTempDir, Supertable) {
         let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
             std::sync::Arc::clone(&artifact.fixture.storage),
             Some(artifact.total_index_bytes),
@@ -2389,7 +2396,7 @@ pub mod sql {
         let opts = sql_options()
             .with_storage(std::sync::Arc::clone(&artifact.fixture.storage))
             .with_disk_cache(cache);
-        (cache_dir, tiers::open_consumer(opts))
+        (cache_dir.into(), tiers::open_consumer(opts))
     }
 
     fn measure_cold_queries(
@@ -2413,8 +2420,8 @@ pub mod sql {
                 let (cache_dir, table) = open_cold_consumer(&artifact);
                 crate::executors::open_all_superfiles(&table);
                 SqlColdGuard {
-                    _cache_dir: cache_dir,
                     table,
+                    _cache_dir: cache_dir,
                 }
             },
             &battery,
@@ -2430,8 +2437,10 @@ pub mod sql {
     /// Cold-tier guard: holds the fresh cache dir + reopened table so the
     /// shared SQL executor can time one `query_sql` per fresh open.
     struct SqlColdGuard {
-        _cache_dir: tempfile::TempDir,
+        // Table first: its cache's background fills must stop before dir
+        // removal — see `RetryingTempDir`.
         table: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
     }
     impl SqlRead for SqlColdGuard {
         fn query_rows(&self, sql: &str) -> usize {
