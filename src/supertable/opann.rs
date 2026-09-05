@@ -774,6 +774,106 @@ pub(crate) fn rerank_pool_hint(width_for_k: &[u32; WIDTH_LAW_KS.len()], n_cent: 
         .min(n_cent.max(1))
 }
 
+/// First-order centroid-graph router fanout prior, per `k` — a STARTING point
+/// for the measured-recall sweep, NOT a cap. The stamped grid path reads
+/// `width_for_k` cells at `fine_for_k` fine runs each to cover the exact top-k,
+/// so `width × fine` fine clusters is a natural anchor for how many the global
+/// centroid-graph selection reads. The recall calibrator seeds its ascending
+/// ladder around this value and is free to climb well PAST it (reading more
+/// fine clusters than the grid's `W × F` is still cheaper than the grid's
+/// whole-cell reads, so exceeding the prior is not a loss — the old cap that
+/// treated it as one under-stamped the fanout). Clamped to
+/// `total_fine_clusters` (selecting more clusters than exist is a full scan). A
+/// `k` with an uncalibrated width or fine point (`0`), or a table with no fine
+/// clusters, yields `0`, and the sweep falls back to a scale-derived ladder
+/// there.
+pub(crate) fn fanout_prior_for_k(
+    width_for_k: &[u32; WIDTH_LAW_KS.len()],
+    fine_for_k: &[u32; WIDTH_LAW_KS.len()],
+    total_fine_clusters: u32,
+) -> [u32; WIDTH_LAW_KS.len()] {
+    let mut out = [0u32; WIDTH_LAW_KS.len()];
+    if total_fine_clusters == 0 {
+        return out;
+    }
+    for (slot, (&w, &f)) in out
+        .iter_mut()
+        .zip(width_for_k.iter().zip(fine_for_k.iter()))
+    {
+        if w == 0 || f == 0 {
+            continue;
+        }
+        let prior = (u64::from(w) * u64::from(f)).min(u64::from(total_fine_clusters));
+        *slot = prior.max(1) as u32;
+    }
+    out
+}
+
+/// Pick the per-`k` router fanout from a MEASURED-recall ladder — the third
+/// calibration stage's core policy, mirroring the HNSW `ef` calibrator's knee
+/// rule (`hnsw::calibrate_ef_curve`). `ladder` is a set of `(fanout, recall@k
+/// per [`WIDTH_LAW_KS`] anchor)` observations, each `recall_by_k[ki]` the real
+/// measured recall@`WIDTH_LAW_KS[ki]` of the router reading that many global
+/// fine clusters (the actual selection → scan → shortlist → rerank the reader
+/// serves, so within-path loss is captured — unlike the old centroid-coverage
+/// proxy). For each `k` this stamps the SMALLEST fanout whose measured recall
+/// clears `register_floor` (the configured graceful recall bar). When no
+/// observed fanout clears it — the recall PLATEAUS below the floor even at the
+/// widest (full-fanout) rung — the point stays `0`, the "GFC can't reach the
+/// floor here" sentinel, which resolves to `None` in
+/// [`CellRoutingParams::fanout_for_k_at`] so the reader falls back to the
+/// constant and `auto` picks stamped. The result is floored monotone in `k` (a
+/// larger `k` never asks for a narrower fanout than a smaller one — measurement
+/// noise near the floor can otherwise invert two adjacent anchors). The ladder
+/// is expected ASCENDING in fanout; it is sorted defensively.
+///
+/// The bar is `register_floor` (default 0.98) by design, NOT the full
+/// `target_recall`: the global-fine path's recall ceiling sits around 0.99, so
+/// grading each rung against the full target would leave every fanout short of
+/// the bar, stamp the sentinel `0` everywhere, and keep `auto` from ever
+/// engaging the graph. Whether 0.98 leaves the graph at recall parity with the
+/// stamped grid is a tracked follow-up (infino#714); this policy deliberately
+/// keeps the 0.98 acceptance bar until then.
+///
+/// [`CellRoutingParams::fanout_for_k_at`]: crate::supertable::manifest::list::CellRoutingParams::fanout_for_k_at
+pub(crate) fn fanout_knee_from_recalls(
+    ladder: &[(u32, [f64; WIDTH_LAW_KS.len()])],
+    register_floor: f64,
+) -> [u32; WIDTH_LAW_KS.len()] {
+    let floor = register_floor.max(0.0);
+    let mut rungs: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder.to_vec();
+    rungs.sort_by_key(|(f, _)| *f);
+    let mut out = [0u32; WIDTH_LAW_KS.len()];
+    for (ki, slot) in out.iter_mut().enumerate() {
+        // An anchor with no positive measured recall at ANY rung is
+        // corpus-unsupported (k > the calibrated corpus, or every probe missed)
+        // — it must stay the sentinel `0`, never take a spurious fanout. This
+        // also guards the degenerate `floor <= 0` config below, where every rung
+        // would otherwise "clear" a 0-recall anchor.
+        let best = rungs
+            .iter()
+            .map(|(_, recall_by_k)| recall_by_k[ki])
+            .fold(f64::MIN, f64::max);
+        if best <= 0.0 {
+            *slot = 0;
+            continue;
+        }
+        // Smallest fanout whose measured recall@k clears the graceful floor.
+        // A finite floor of 0 is cleared by the first rung.
+        if floor <= 0.0 {
+            *slot = rungs.first().map(|(f, _)| *f).unwrap_or(0);
+            continue;
+        }
+        *slot = rungs
+            .iter()
+            .find(|(_, recall_by_k)| recall_by_k[ki] >= floor)
+            .map(|(f, _)| *f)
+            .unwrap_or(0);
+    }
+    floor_monotone(&mut out);
+    out
+}
+
 /// Rerank-law estimate histogram resolution: per-query counts of pool-row
 /// 1-bit estimates, binned linearly over `[-Σ|q_rot|, +Σ|q_rot|]` (the
 /// sign-dot estimator's exact range). A candidate's distractor count reads
@@ -939,6 +1039,129 @@ mod pool_hint_tests {
         assert_eq!(rerank_pool_hint(&[33, 79, 97, 104], 150), 150);
         // Tiny grids never zero the pool.
         assert_eq!(rerank_pool_hint(&[1, 0, 0, 0], 0), 1);
+    }
+
+    /// The fanout prior is `width × fine` per k, clamped to the total fine
+    /// clusters, with uncalibrated points (either factor zero, or no clusters)
+    /// staying zero so the reader falls back to the constant.
+    #[test]
+    fn fanout_prior_is_width_times_fine_clamped_to_total() {
+        // width × fine per point, all below the total.
+        assert_eq!(
+            fanout_prior_for_k(&[1, 8, 30, 40], &[1, 4, 8, 8], 4000),
+            [1, 32, 240, 320],
+        );
+        // The clamp binds at small scale: width × fine exceeds the table's
+        // cluster count, so each point caps at the total (never a
+        // larger-than-full-scan fanout — the ~1M failure the constant hits).
+        assert_eq!(
+            fanout_prior_for_k(&[10, 20, 30, 40], &[8, 8, 8, 8], 64),
+            [64, 64, 64, 64],
+        );
+        // An uncalibrated width or fine point stays zero (falls back).
+        assert_eq!(
+            fanout_prior_for_k(&[0, 8, 0, 40], &[1, 0, 8, 8], 4000),
+            [0, 0, 0, 320],
+        );
+        // No fine clusters (degenerate) → all zero.
+        assert_eq!(
+            fanout_prior_for_k(&[1, 8, 30, 40], &[1, 4, 8, 8], 0),
+            [0; 4]
+        );
+        // A nonzero product with total 1 floors at 1, never below.
+        assert_eq!(
+            fanout_prior_for_k(&[1, 0, 0, 0], &[1, 0, 0, 0], 1),
+            [1, 0, 0, 0]
+        );
+    }
+
+    /// The measured-recall knee: for each `k`, the SMALLEST ladder fanout whose
+    /// real recall@k clears the register floor; `0` when nothing clears (plateau
+    /// below the floor); floored monotone in `k`.
+    #[test]
+    fn fanout_knee_picks_smallest_clearing_rung() {
+        // Recall climbs with fanout; register floor 0.98.
+        // The knee is the first rung at/above 0.98 for each anchor.
+        let ladder = [
+            (16u32, [0.90, 0.85, 0.70, 0.50]),
+            (64, [0.99, 0.95, 0.88, 0.75]),
+            (256, [0.995, 0.985, 0.95, 0.90]),
+            (1024, [0.999, 0.995, 0.985, 0.97]),
+        ];
+        // k=1 clears at 64 (0.99≥0.98); k=10 at 256 (0.985); k=100 at 1024
+        // (0.985); k=1000 never clears (max 0.97 < 0.98) → sentinel 0. The
+        // monotone floor then lifts nothing (0 stays 0; the sequence is
+        // already non-decreasing 64,256,1024).
+        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [64, 256, 1024, 0]);
+    }
+
+    /// A ladder whose recall plateaus below the floor at every anchor — even at
+    /// the widest (full-fanout) rung — stamps the all-zero sentinel: GFC cannot
+    /// reach the target here, so the reader falls back to the constant and
+    /// `auto` picks stamped.
+    #[test]
+    fn fanout_knee_plateau_below_target_is_sentinel() {
+        let ladder = [
+            (32u32, [0.80, 0.70, 0.60, 0.40]),
+            (128, [0.90, 0.85, 0.75, 0.55]),
+            // Widest rung still short of floor 0.98 at every anchor.
+            (512, [0.94, 0.92, 0.88, 0.70]),
+        ];
+        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [0, 0, 0, 0]);
+    }
+
+    /// The stamped knee may EXCEED the old `width × fine` prior — reading more
+    /// fine clusters than the grid's `W × F` is still cheaper than the grid's
+    /// whole-cell reads, so the sweep is free to climb past the prior. Here the
+    /// W×F prior for k=10 would have been 32, but real recall only clears at
+    /// fanout 512.
+    #[test]
+    fn fanout_knee_may_exceed_width_times_fine_prior() {
+        let prior = fanout_prior_for_k(&[1, 8, 30, 40], &[1, 4, 8, 8], 4000);
+        assert_eq!(prior[1], 32, "the old W×F cap for k=10");
+        let ladder = [
+            (32u32, [0.99, 0.90, 0.80, 0.70]),
+            (512, [0.999, 0.99, 0.95, 0.90]),
+        ];
+        let knee = fanout_knee_from_recalls(&ladder, 0.98);
+        assert_eq!(knee[1], 512, "measured recall pushes k=10 well past W×F=32");
+        assert!(
+            knee[1] > prior[1],
+            "the calibrated fanout is allowed to exceed the old cap"
+        );
+    }
+
+    /// Measurement noise can invert two adjacent anchors' knees; the monotone
+    /// floor lifts a later `k` to at least the earlier one so a larger `k`
+    /// never asks for a narrower fanout.
+    #[test]
+    fn fanout_knee_is_floored_monotone_in_k() {
+        // k=10 clears only at 256 while k=100 (noisily) clears at 64 — inverted.
+        let ladder = [
+            (64u32, [0.99, 0.97, 0.99, 0.60]),
+            (256, [0.999, 0.99, 0.995, 0.75]),
+        ];
+        let knee = fanout_knee_from_recalls(&ladder, 0.98);
+        // k=1→64, k=10→256, k=100 measured 64 but floored up to 256, k=1000→0.
+        assert_eq!(knee, [64, 256, 256, 0]);
+    }
+
+    /// An anchor the corpus can't support (recall stays 0 at every rung) must
+    /// stay the sentinel `0`, even under a degenerate zero-floor config where
+    /// the floor collapses to 0 — a 0-recall anchor must never be handed the
+    /// first rung's fanout, or the reader would route a `k` GFC cannot serve.
+    #[test]
+    fn fanout_knee_unsupported_anchor_stays_sentinel_at_zero_floor() {
+        // k=1 and k=10 are measured; k=100 and k=1000 were never observed (0).
+        let ladder = [
+            (16u32, [0.90, 0.80, 0.0, 0.0]),
+            (64, [0.999, 0.99, 0.0, 0.0]),
+        ];
+        // Degenerate floor: a register floor of 0 clears the first supported rung.
+        let knee = fanout_knee_from_recalls(&ladder, 0.0);
+        // Supported anchors clear at the first rung (floor 0); unsupported ones
+        // (all-zero recall) stay 0 despite the collapsed floor.
+        assert_eq!(knee, [16, 16, 0, 0]);
     }
 }
 
@@ -1580,6 +1803,15 @@ impl WidthLawCalibration {
         floor_monotone(&mut law);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
+        // The centroid-graph router fanout is NOT calibrated here. Its coverage
+        // proxy (home-cluster within the top-fanout centroids) is an upper bound
+        // on real recall — it ignores the within-cluster Sq16 + shortlist +
+        // rerank loss — so it under-stamps the fanout. The fanout is now measured
+        // by real recall at the router's post-commit build stage (see
+        // `crate::supertable::query::vector::calibrate_centroid_router_fanout`),
+        // which runs the actual selection → per-cluster scan → shortlist →
+        // rerank the reader serves and stamps the knee into
+        // `CellRoutingParams::fanout_for_k`.
         (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
             width_for_k: law,
             fine_for_k: fine_law,

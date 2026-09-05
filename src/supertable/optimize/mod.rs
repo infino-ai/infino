@@ -33,6 +33,10 @@ impl Supertable {
         self.drain_hidden_vector_cells_sync()
             .map_err(|e| OptimizeError::Build(e.to_string()))?;
         self.compact(&opts.compaction)?;
+        // Centroids have settled at the final generation (drain + compaction);
+        // pre-build the centroid-router graph so the next centroid-graph query
+        // loads it instead of building on the hot path. Best-effort.
+        self.refresh_centroid_router_cache();
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}
             Err(e) => return Err(OptimizeError::Gc(e)),

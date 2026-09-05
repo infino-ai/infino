@@ -889,6 +889,62 @@ impl Supertable {
         Ok(())
     }
 
+    /// Eagerly (re)build the centroid-router graph once a mutation has settled
+    /// the hidden centroids, publishing it stamped with the resulting hidden
+    /// manifest generation so a steady-state `ivf_router = centroid_graph`
+    /// query loads a matching-generation graph instead of building on the hot
+    /// path. Gated on the router being enabled, so a table that never uses it
+    /// pays nothing. Best-effort: the stamp + lazy query rebuild remain the
+    /// correctness guarantee, so a build failure here is logged, not
+    /// propagated. Call at the OUTERMOST settle point of a mutation cycle — a
+    /// standalone drain after the drain, `optimize` after its compaction — so
+    /// the graph is built once, at the final generation, and an
+    /// intermediate-generation graph is not built only to be superseded.
+    pub(crate) fn refresh_centroid_router_cache(&self) {
+        let vcfg = &config::global().vector;
+        let Some(column) = crate::supertable::query::vector::select_eager_router_column(
+            vcfg.search_mode,
+            vcfg.ivf_router,
+            vcfg.global_fine_fanout,
+            &self.inner.options.vector_columns,
+        ) else {
+            return;
+        };
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return;
+        };
+        // Under `auto`, only pin the resident graph when the table actually
+        // resolves to `centroid_graph`. The settle-side calibration ran (the
+        // column gate above fires for `auto` too, so the fanout is stamped), but
+        // an `auto` table that routes `stamped` never consults the resident
+        // graph — building and holding it would be pure wasted memory. Explicit
+        // `centroid_graph` always pins. Skipping is never a correctness risk:
+        // the query path rebuilds the router lazily if it ever needs it.
+        if config::global().vector.ivf_router == config::IvfRouter::Auto {
+            let manifest = hidden.inner.manifest.load_full();
+            if !crate::supertable::query::vector::auto_prefers_centroid_graph(
+                &manifest,
+                &column,
+                &config::global().vector,
+            ) {
+                return;
+            }
+        }
+        let reader = match hidden.reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                warn!(%error, "eager centroid-router build: hidden reader unavailable");
+                return;
+            }
+        };
+        if let Err(error) = bridge_on_runtime(
+            reader.build_and_cache_centroid_router(&column),
+            &self.query_runtime(),
+        ) {
+            warn!(%error, "eager centroid-router build failed; query path will rebuild lazily");
+        }
+    }
+
     /// Total on-storage bytes of the committed superfiles across the user
     /// table and the hidden vector-index table.
     ///
@@ -971,7 +1027,13 @@ impl Supertable {
     /// (it owns the hidden `vector_index_table`); benches invoke it between the
     /// pre-drain and post-drain search phases.
     fn drain_vectors_to_cells_sync(&self) -> Result<(), BuildError> {
-        self.drain_hidden_vector_cells_sync()
+        self.drain_hidden_vector_cells_sync()?;
+        // Standalone drain is the outermost settle point here (no compaction
+        // follows), so pre-warm the centroid router at the post-drain
+        // generation. `optimize` instead warms after its compaction, so the
+        // graph is never built at an intermediate generation.
+        self.refresh_centroid_router_cache();
+        Ok(())
     }
     }
 
@@ -6756,6 +6818,150 @@ mod tests {
             }
             other => panic!("hidden stays VectorCell after optimize, got {other:?}"),
         }
+    }
+
+    /// The centroid-router graph is cached stamped with the hidden manifest
+    /// generation it was built against, and a query reuses it only while that
+    /// stamp matches its own pinned generation. Both a drain and a compaction
+    /// advance the hidden manifest generation and renumber the fine clusters,
+    /// so an entry stamped at an older generation is rejected and rebuilt. This
+    /// pins: (1) `manifest_id` advances on BOTH a drain and a compaction, so it
+    /// is a sound generation key; (2) the eager drain/optimize build stamps the
+    /// current generation; (3) after a later compaction the cached stamp no
+    /// longer matches, which is what forces the query-path rebuild; (4) an
+    /// eager rebuild restamps to the new generation so the next query loads it.
+    #[test]
+    fn centroid_router_cache_rebuilds_across_drain_and_compaction() {
+        const DIM: usize = 16;
+        const MODES: usize = 8;
+        const DOCS_PER_MODE: usize = 64;
+        const N: usize = MODES * DOCS_PER_MODE;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        // One hidden cell drained into, then split by the modality plan under
+        // optimize — the cluster renumbering the stamp must invalidate across.
+        .with_vector_cell_counts(1, 1);
+        let st = Supertable::create(options).expect("create");
+
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * DIM];
+        for r in 0..N {
+            let mode = r / DOCS_PER_MODE;
+            flat[r * DIM + mode] = 1.0;
+            flat[r * DIM + MODES + mode] = ((r % 5) as f32 - 2.0) * 1e-3;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        let hidden = st
+            .inner
+            .vector_index_table
+            .as_ref()
+            .expect("hidden index")
+            .clone();
+        // The stamped cache slot, shared across every manifest generation.
+        let cache = Arc::clone(&hidden.inner.options.centroid_router_cache);
+        let hidden_gen = || hidden.reader().expect("reader").manifest().manifest_id;
+        // Drive the eager drain-build path directly (the process-global router
+        // config can't be flipped to `centroid_graph` per-test, so the gated
+        // `refresh_centroid_router_cache` is exercised via its inner builder).
+        let eager_build = || {
+            let reader = hidden.reader().expect("reader");
+            bridge_sync_to_async(reader.build_and_cache_centroid_router("emb"))
+                .expect("eager centroid-router build");
+        };
+
+        let gen_before_drain = hidden_gen();
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+        let gen_after_drain = hidden_gen();
+        assert!(
+            gen_after_drain > gen_before_drain,
+            "a drain must advance the hidden manifest generation ({gen_before_drain} -> \
+             {gen_after_drain})"
+        );
+
+        // Eager build at the post-drain generation.
+        eager_build();
+        let after_drain = cache
+            .load_full()
+            .expect("router cached after the eager drain-build");
+        assert_eq!(
+            after_drain.generation, gen_after_drain,
+            "the eager build stamps the current (post-drain) generation"
+        );
+
+        // A compaction (the split `optimize` runs) advances the generation and
+        // renumbers the fine clusters.
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        let gen_after_compaction = hidden_gen();
+        assert!(
+            gen_after_compaction > gen_after_drain,
+            "a compaction must advance the hidden manifest generation ({gen_after_drain} -> \
+             {gen_after_compaction})"
+        );
+
+        // The default router config is `stamped`, so `optimize`'s gated eager
+        // build is a no-op here and the pre-compaction entry is still cached —
+        // now stamped at a generation the current manifest no longer matches.
+        // A query pinned to the new generation therefore rebuilds instead of
+        // routing off the stale graph.
+        let stale = cache
+            .load_full()
+            .expect("pre-compaction entry still present");
+        assert_eq!(stale.generation, gen_after_drain);
+        assert_ne!(
+            stale.generation, gen_after_compaction,
+            "the stamp mismatch is what forces the query-path rebuild after a compaction"
+        );
+
+        // Eager rebuild at the new generation restamps to match, so the next
+        // query loads it rather than rebuilding.
+        eager_build();
+        let rebuilt = cache.load_full().expect("router cached after the rebuild");
+        assert_eq!(
+            rebuilt.generation, gen_after_compaction,
+            "the rebuild stamps the current generation so the next query loads it"
+        );
     }
 
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most

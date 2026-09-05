@@ -205,11 +205,16 @@ vector:
 
   # For search_mode = ivf: the cluster router.
   #   stamped        — DEFAULT. Grid routing to cells, then the manifest's
-  #                    stamped per-cell width. The established path.
+  #                    stamped per-cell width. The established path. Honored
+  #                    verbatim (no per-table gating).
   #   centroid_graph — EXPERIMENTAL: score fine centroids via an HNSW over the
   #                    resident fp32 fine centroids and read the top fanout
   #                    clusters, bypassing the grid. A cold-read win at scale
-  #                    (10M+); opt-in while the per-table fanout stamp is built.
+  #                    (10M+). Forced verbatim on every table.
+  #   auto           — EXPERIMENTAL: pick per hidden-vector table at query time
+  #                    — centroid_graph only where it wins (a concentrated
+  #                    calibrated fanout at large scale), else stamped. See the
+  #                    two centroid_graph_* thresholds below.
   ivf_router: stamped
 
   # For ivf_router = centroid_graph: the NUMBER of fine clusters the
@@ -232,6 +237,25 @@ vector:
   # For ivf_router = centroid_graph: the centroid-HNSW walk's ef (candidate
   # breadth). 0 = auto (fanout * 2). Ignored under ivf_router = stamped.
   global_fine_graph_ef: 0
+
+  # For ivf_router = auto: the concentration threshold. auto uses centroid_graph
+  # only when the calibrated fanout selects a real SUBSET of the fine clusters,
+  # stamped_fanout < ratio * total_fine_clusters. A fanout clamped to ~ the
+  # total leaves nothing for the graph to concentrate on -> stamped. Documented
+  # starting point; final value from a real-corpus sweep.
+  centroid_graph_concentration_ratio: 0.5
+
+  # For ivf_router = auto: the scale floor (hidden-table doc count) below which
+  # auto picks stamped. The selected clusters coalesce into a cold-read win only
+  # at large N (measured win at 10M+, loss at 1M). Documented starting point.
+  centroid_graph_scale_floor_docs: 10000000
+
+  # Ceiling on the fanout the router's recall calibration considers: the widest
+  # number of global fine clusters the calibration selects + scores per query,
+  # and thus the deepest fanout it can stamp. Bounds calibration cost regardless
+  # of corpus size (total fine clusters grow with N); the width x fine prior
+  # stays the sweep's lower seed. Default 4096 (~= 512 * sqrt(N/1e6) at 100M).
+  centroid_graph_max_fanout: 4096
 
   # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table

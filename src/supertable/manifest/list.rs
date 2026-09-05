@@ -170,6 +170,16 @@ pub struct Manifest {
     /// manifests and above the scale ceiling (consumers fall back to the
     /// lazy build or the scan path).
     pub slow_vector_state_graphs: Option<RoutingRef>,
+    /// Centroid-router-graph sibling of the slow-CAS state: one
+    /// content-addressed blob holding the HNSW over the fp32 fine centroids
+    /// (topology + `(superfile, flat cluster)` node map) used by
+    /// `ivf_router = centroid_graph`. Membership-dependent — its node map
+    /// indexes the visible superfile set — so it is CLEARED on every
+    /// membership change (like the centroid section) and the settle restamps
+    /// it for the new generation, never carried forward. Absent on older
+    /// manifests, when the router is off at drain, or on a build failure
+    /// (consumers reconstruct it in memory).
+    pub slow_vector_state_centroid_graph: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -415,6 +425,22 @@ pub struct CellRoutingParams {
     /// surviving next to fresh wide-pool ones). Pre-provenance
     /// manifests decode to the legacy floor.
     pub rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
+    /// Per-table centroid-graph router fanout: the number of fine clusters the
+    /// `ivf_router = centroid_graph` selection reads GLOBALLY, per `k`,
+    /// calibrated at the same [`WIDTH_LAW_KS`] points. The drain's third
+    /// calibration stage measures it directly — the smallest number of nearest
+    /// GLOBAL fine centroids whose coverage of the exact top-k meets the recall
+    /// target — capped at the `width_for_k × fine_for_k` prior. A `0` means "no
+    /// fanout at this `k`": EITHER uncalibrated (older manifests, router off at
+    /// drain, or a `k` the sample can't support) OR "GFC loses" (the crossing
+    /// needs more than the prior — the grid already routes at least as tightly).
+    /// Both resolve to `None` in [`Self::fanout_for_k_at`], so the reader falls
+    /// back to the `vector.global_fine_fanout` constant and `auto` picks
+    /// stamped. Set only by a FULL calibration (which overwrites in either
+    /// direction, clearing a stale win or loss); an incremental drain, whose
+    /// partial centroid set can't measure a global fanout, carries it forward.
+    /// The router derives its graph `ef` from a positive fanout (×2).
+    pub fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 impl Default for CellRoutingParams {
@@ -428,6 +454,7 @@ impl Default for CellRoutingParams {
             fine_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_pool_cells: [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
+            fanout_for_k: [0; WIDTH_LAW_KS.len()],
         }
     }
 }
@@ -467,6 +494,45 @@ impl CellRoutingParams {
     /// interpolation and clamping as [`Self::width_for_k_at`].
     pub(crate) fn fine_for_k_at(&self, k: usize) -> Option<usize> {
         Self::law_at(&self.fine_for_k, k)
+    }
+
+    /// The stamped centroid-graph router fanout at this query's `k` — same
+    /// log-linear interpolation and clamping as [`Self::width_for_k_at`].
+    /// `None` when uncalibrated (all-zero), so the router falls back to the
+    /// `vector.global_fine_fanout` constant.
+    pub(crate) fn fanout_for_k_at(&self, k: usize) -> Option<usize> {
+        // Unlike width/fine, the fanout law does NOT skip zeros: a `0` at (or
+        // bracketing) the query's `k` means "no fanout applies at this k" —
+        // either uncalibrated or "GFC loses" — so it must resolve to `None`
+        // (reader → constant, `auto` → stamped), never interpolate a positive
+        // value across the gap. Only a k whose bracketing knots are BOTH
+        // calibrated returns an interpolated fanout.
+        let law = &self.fanout_for_k;
+        let k = k.max(1);
+        // An exact knot match resolves to that knot directly.
+        if let Some(i) = WIDTH_LAW_KS.iter().position(|&kp| kp == k) {
+            return (law[i] > 0).then_some(law[i] as usize);
+        }
+        // At/below the first knot, or at/above the last: clamp to that knot.
+        if k <= WIDTH_LAW_KS[0] {
+            return (law[0] > 0).then_some(law[0] as usize);
+        }
+        let last = WIDTH_LAW_KS.len() - 1;
+        if k >= WIDTH_LAW_KS[last] {
+            return (law[last] > 0).then_some(law[last] as usize);
+        }
+        // Strictly between two knots: log-linear interpolation, but only when
+        // BOTH ends of the bracket are calibrated.
+        let hi = WIDTH_LAW_KS.iter().position(|&kp| kp >= k)?;
+        let (w0, w1) = (law[hi - 1], law[hi]);
+        if w0 == 0 || w1 == 0 {
+            return None;
+        }
+        let x = (k as f64).ln();
+        let x0 = (WIDTH_LAW_KS[hi - 1] as f64).ln();
+        let x1 = (WIDTH_LAW_KS[hi] as f64).ln();
+        let t = (x - x0) / (x1 - x0);
+        Some((f64::from(w0) + t * (f64::from(w1) - f64::from(w0))).ceil() as usize)
     }
 
     /// The rerank law at this query's `k` — same log-linear interpolation
@@ -1236,6 +1302,10 @@ struct ManifestDto {
     slow_vector_state_graphs_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_graphs_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroid_graph_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroid_graph_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1340,6 +1410,10 @@ struct CellRoutingParamsDto {
     /// them).
     #[serde(default = "legacy_rerank_pool")]
     rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
+    /// Centroid-graph router fanout law; absent on manifests stamped before
+    /// it existed (all-zero = no stamp, reader falls back to the constant).
+    #[serde(default)]
+    fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 /// Serde default for [`CellRoutingParamsDto::rerank_pool_cells`]: every
@@ -1359,6 +1433,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             fine_for_k: r.fine_for_k,
             rerank_for_k: r.rerank_for_k,
             rerank_pool_cells: r.rerank_pool_cells,
+            fanout_for_k: r.fanout_for_k,
         }
     }
 }
@@ -1382,6 +1457,7 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.fine_for_k = d.fine_for_k;
         r.rerank_for_k = d.rerank_for_k;
         r.rerank_pool_cells = d.rerank_pool_cells.map(|p| p.max(1));
+        r.fanout_for_k = d.fanout_for_k;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -1806,6 +1882,14 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_graphs
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
+        slow_vector_state_centroid_graph_uri: l
+            .slow_vector_state_centroid_graph
+            .as_ref()
+            .map(|r| r.uri.clone()),
+        slow_vector_state_centroid_graph_content_hash: l
+            .slow_vector_state_centroid_graph
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1914,6 +1998,17 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
         slow_vector_state_graphs: match (
             d.slow_vector_state_graphs_uri,
             d.slow_vector_state_graphs_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        // Same both-halves discipline as the refs above.
+        slow_vector_state_centroid_graph: match (
+            d.slow_vector_state_centroid_graph_uri,
+            d.slow_vector_state_centroid_graph_content_hash.as_deref(),
         ) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
@@ -2529,6 +2624,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             parts: vec![],
         }
     }
@@ -2791,6 +2887,7 @@ mod tests {
                 width_for_k: [1, 2, 30, 48],
                 fine_for_k: [1, 3, 6, 9],
                 rerank_for_k: [2, 20, 200, 2000],
+                fanout_for_k: [1, 6, 180, 432],
                 ..CellRoutingParams::default()
             },
         };
@@ -2802,12 +2899,18 @@ mod tests {
         assert_eq!(routing.width_for_k, [1, 2, 30, 48]);
         assert_eq!(routing.fine_for_k, [1, 3, 6, 9]);
         assert_eq!(routing.rerank_for_k, [2, 20, 200, 2000]);
+        assert_eq!(routing.fanout_for_k, [1, 6, 180, 432]);
 
         // Strip the whole `"width_for_k": [...]` member (the encoder
         // pretty-prints, so cut structurally: from the comma preceding the
         // key through the closing bracket).
         let mut stripped = from_utf8(&bytes).expect("utf8").to_string();
-        for field in ["\"width_for_k\"", "\"fine_for_k\"", "\"rerank_for_k\""] {
+        for field in [
+            "\"width_for_k\"",
+            "\"fine_for_k\"",
+            "\"rerank_for_k\"",
+            "\"fanout_for_k\"",
+        ] {
             let key = stripped.find(field).expect("field present in encoding");
             let comma = stripped[..key].rfind(',').expect("preceding member comma");
             let close = key + stripped[key..].find(']').expect("array close") + 1;
@@ -2832,6 +2935,11 @@ mod tests {
             [0; WIDTH_LAW_KS.len()],
             "absent rerank law decodes to all-zero (no law)"
         );
+        assert_eq!(
+            routing.fanout_for_k,
+            [0; WIDTH_LAW_KS.len()],
+            "absent fanout law decodes to all-zero (falls back to the constant)"
+        );
         assert_eq!(routing.width_for_k_at(100), None, "no law resolves None");
         assert_eq!(
             routing.fine_for_k_at(100),
@@ -2842,6 +2950,11 @@ mod tests {
             routing.rerank_for_k_at(100),
             None,
             "no rerank law resolves None"
+        );
+        assert_eq!(
+            routing.fanout_for_k_at(100),
+            None,
+            "no fanout law resolves None (reader falls back to the constant)"
         );
     }
 
@@ -2896,6 +3009,80 @@ mod tests {
         assert_eq!(full.fine_for_k_at(100_000), Some(12), "clamps above range");
         assert_eq!(law([0, 0, 8, 0]).fine_for_k_at(1), Some(8), "zeros skip");
         assert_eq!(law([0; WIDTH_LAW_KS.len()]).fine_for_k_at(10), None);
+    }
+
+    /// The read side resolves fanout as
+    /// `fanout_for_k_at(k).unwrap_or(global_fine_fanout)`: a stamped law wins,
+    /// an unstamped (all-zero) one falls back to the constant.
+    #[test]
+    fn fanout_for_k_at_resolves_and_falls_back() {
+        const CONSTANT: usize = 512;
+        let stamped = CellRoutingParams {
+            fanout_for_k: [1, 6, 180, 432],
+            ..CellRoutingParams::default()
+        };
+        // Stamped: the per-table value is used, not the constant.
+        assert_eq!(stamped.fanout_for_k_at(1), Some(1));
+        assert_eq!(stamped.fanout_for_k_at(1000), Some(432));
+        assert_eq!(
+            stamped.fanout_for_k_at(100).unwrap_or(CONSTANT),
+            180,
+            "stamp wins over the constant"
+        );
+        // Unstamped: resolution yields None → the constant.
+        let bare = CellRoutingParams::default();
+        assert_eq!(bare.fanout_for_k_at(100), None);
+        assert_eq!(
+            bare.fanout_for_k_at(100).unwrap_or(CONSTANT),
+            CONSTANT,
+            "no stamp falls back to the constant"
+        );
+
+        // A per-k `0` (uncalibrated or "GFC loses") is HONORED at that k — it
+        // must NOT interpolate/clamp into a positive value across the gap.
+        let partial = CellRoutingParams {
+            fanout_for_k: [2, 5, 0, 0],
+            ..CellRoutingParams::default()
+        };
+        assert_eq!(partial.fanout_for_k_at(1), Some(2), "calibrated knot k=1");
+        assert_eq!(partial.fanout_for_k_at(10), Some(5), "calibrated knot k=10");
+        assert_eq!(
+            partial.fanout_for_k_at(100),
+            None,
+            "a 0 at knot k=100 resolves None, not clamped to k=10's 5"
+        );
+        assert_eq!(
+            partial.fanout_for_k_at(1000),
+            None,
+            "a 0 at knot k=1000 resolves None, not clamped up"
+        );
+        assert_eq!(
+            partial.fanout_for_k_at(50),
+            None,
+            "a bracket [k=10:5, k=100:0] with a 0 end resolves None"
+        );
+        // A leading 0 at the first knot: below/at k=1 resolves None; the
+        // bracket to the next knot also has a 0 end.
+        let leading_zero = CellRoutingParams {
+            fanout_for_k: [0, 5, 30, 48],
+            ..CellRoutingParams::default()
+        };
+        assert_eq!(leading_zero.fanout_for_k_at(1), None, "0 at the first knot");
+        assert_eq!(
+            leading_zero.fanout_for_k_at(5),
+            None,
+            "bracket [k=1:0, k=10:5] with a 0 end resolves None"
+        );
+        assert_eq!(leading_zero.fanout_for_k_at(10), Some(5), "calibrated knot");
+        // Fully calibrated: interpolation still works between two nonzero knots.
+        let full = CellRoutingParams {
+            fanout_for_k: [2, 6, 30, 48],
+            ..CellRoutingParams::default()
+        };
+        assert!(
+            matches!(full.fanout_for_k_at(50), Some(v) if (6..=30).contains(&v)),
+            "interpolates between calibrated knots"
+        );
     }
 
     /// The repair predicate fires exactly on the cleared-law signature:

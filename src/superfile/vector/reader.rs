@@ -1945,6 +1945,44 @@ impl VectorReader {
         Ok(out)
     }
 
+    /// Every resident row of `column` tagged with its GLOBAL flat fine-cluster
+    /// id — the id the centroid router's node map uses — plus its stable id and
+    /// Sq16 rerank codes. The fanout calibrator needs each row's fine cluster to
+    /// attribute it to the cluster the router selects (by rank), so it can score
+    /// recall at each candidate fanout as a PREFIX of one corpus scan rather
+    /// than re-reading per fanout. `flat = flat_cluster_base[cell] + row.cluster`
+    /// matches [`Self::global_fine_cluster_vectors`]'s node numbering exactly.
+    /// Superseded cells are dropped (their rows survive under the split
+    /// successors). Multi-cell (v2) readers only — the router requires them;
+    /// `None` for v1 or an absent column. Reads one superfile's plane, so peak
+    /// memory is bounded to a single superfile.
+    pub(crate) async fn calibration_flat_cluster_rows(
+        &self,
+        column: &str,
+        superseded: Option<&BTreeSet<u32>>,
+    ) -> Option<Vec<(u32, EncodedCellRow)>> {
+        if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
+            return None;
+        }
+        let cells = self.materialized_cells_rows_async(None).await?;
+        let mut out = Vec::new();
+        for (ci, (cell_id, rows)) in cells.into_iter().enumerate() {
+            if superseded.is_some_and(|s| s.contains(&cell_id)) {
+                continue;
+            }
+            let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
+            for row in rows {
+                // Carry the row's full encoded body (codec + per-cluster ruler),
+                // not just the raw codes: the calibrator decodes each row against
+                // its own quantizer, so an adaptive-grid (L2Sq/NegDot) row is
+                // measured in the space the served path scores it in. The stable
+                // id rides along inside `EncodedCellRow`.
+                out.push((base + row.cluster, row.encoded));
+            }
+        }
+        Some(out)
+    }
+
     /// Per-cell coalesced read plan for global-fine (`vector.global_fine_coalesce`):
     /// given selected flat cluster ids, return every cluster in each touched
     /// cell's `[min..max]` selected span. Clusters are stored in id order, so
