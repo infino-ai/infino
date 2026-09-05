@@ -447,6 +447,16 @@
                 }
               }
             }
+          },
+          "410": {
+            "description": "The database is being purged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -476,7 +486,7 @@
           },
           {
             "name": "table",
-            "in": "path",
+            "in": "query",
             "required": true,
             "schema": {
               "type": "string"
@@ -484,7 +494,7 @@
           },
           {
             "name": "predicate",
-            "in": "path",
+            "in": "query",
             "required": true,
             "schema": {
               "type": "string"
@@ -872,7 +882,7 @@
           },
           {
             "name": "table",
-            "in": "path",
+            "in": "query",
             "required": true,
             "schema": {
               "type": "string"
@@ -880,7 +890,7 @@
           },
           {
             "name": "predicate",
-            "in": "path",
+            "in": "query",
             "required": true,
             "schema": {
               "type": "string"
@@ -1282,7 +1292,7 @@
           },
           "verified": {
             "type": "boolean",
-            "description": "Always `false` at create. Call `POST /v1/databases/{name}/storage/verify`\nonce the grant is in place; workers will not start for this database\nuntil the binding verifies."
+            "description": "Whether the bind-time probe already passed. GCS and Azure try the\nprobe at create when the grant is already in place. AWS is always\n`false` here: the external id did not exist until this response, so\nthe customer cannot have written the trust policy yet — call\n`POST /v1/databases/{name}/storage/verify` (or the first query, which\nre-probes) once it is."
           }
         }
       },
@@ -1315,12 +1325,12 @@
         "type": "object",
         "description": "`POST /v1/drop_table/{database}`.",
         "required": [
-          "table_name",
-          "purge"
+          "table_name"
         ],
         "properties": {
           "purge": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Also delete the table's storage subtree after the catalog commit.\nDefaults to `true` (reclaim storage); pass `false` to only unregister\nthe table from the catalog and leave the bytes in place."
           },
           "table_name": {
             "type": "string"
@@ -1343,19 +1353,21 @@
       },
       "ExactMatchRequest": {
         "type": "object",
-        "description": "`POST /v1/exact_match/{database}`. Unranked; projection required.",
+        "description": "`POST /v1/exact_match/{database}`. Unranked; projection is optional\n(absent ⇒ the engine-native `_id` + `score`).",
         "required": [
           "table_name",
           "field_name",
-          "value",
-          "projection"
+          "value"
         ],
         "properties": {
           "field_name": {
             "type": "string"
           },
           "projection": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "type": "string"
             }
@@ -1368,6 +1380,39 @@
           }
         },
         "additionalProperties": false
+      },
+      "FtsColumn": {
+        "type": "object",
+        "description": "One FTS index declaration under `indexes.fts` — a column plus the analyzer\nits text is tokenized with (`{\"column\": \"body\", \"analyzer\": \"standard\"}`).\n`analyzer` is optional and, when omitted, the engine's default `ascii_lower`\napplies — the same default a bare-string entry gets (see [`FtsIndex`]).",
+        "required": [
+          "column"
+        ],
+        "properties": {
+          "analyzer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Analyzer name (`\"ascii_lower\"` or `\"standard\"`). Omitted means the\nengine default, `ascii_lower`."
+          },
+          "column": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FtsIndex": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "`\"body\"` — index the column with the default analyzer."
+          },
+          {
+            "$ref": "#/components/schemas/FtsColumn",
+            "description": "`{\"column\": \"body\", \"analyzer\": \"standard\"}`."
+          }
+        ],
+        "description": "One entry in `indexes.fts`. Either a bare column name — which uses the\nengine's default `ascii_lower` analyzer — or a `{column, analyzer}` object\nthat names the analyzer explicitly. The bare-string form keeps clients that\nsend `\"fts\": [\"body\"]` working unchanged. An analyzer applies per column,\nnot per table."
       },
       "HybridSearchRequest": {
         "type": "object",
@@ -1430,9 +1475,9 @@
               "null"
             ],
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/FtsIndex"
             },
-            "description": "FTS-indexed column names."
+            "description": "FTS index declarations — a bare column name (default `ascii_lower`\nanalyzer) or a `{column, analyzer}` object per column."
           },
           "vector": {
             "type": [
@@ -1582,13 +1627,12 @@
       },
       "TokenMatchRequest": {
         "type": "object",
-        "description": "`POST /v1/token_match/{database}`. Unranked; projection required.",
+        "description": "`POST /v1/token_match/{database}`. Unranked; projection is optional\n(absent ⇒ the engine-native `_id` + `score`).",
         "required": [
           "table_name",
           "field_name",
           "query",
-          "mode",
-          "projection"
+          "mode"
         ],
         "properties": {
           "field_name": {
@@ -1598,7 +1642,10 @@
             "$ref": "#/components/schemas/Mode"
           },
           "projection": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "type": "string"
             }
@@ -1660,13 +1707,12 @@
       },
       "VectorSearchRequest": {
         "type": "object",
-        "description": "`POST /v1/vector_search/{database}`. Projection required; `filter` is an\noptional pushdown text pre-filter. Probe width and rerank budget are\nengine-decided (drain-time calibration) — there are no tuning knobs.",
+        "description": "`POST /v1/vector_search/{database}`. Projection is optional (absent ⇒ the\nengine-native `_id` + `score`); `filter` is an optional pushdown text\npre-filter. Probe width and rerank budget are engine-decided (drain-time\ncalibration) — there are no tuning knobs.",
         "required": [
           "table_name",
           "field_name",
           "query",
-          "k",
-          "projection"
+          "k"
         ],
         "properties": {
           "field_name": {
@@ -1687,7 +1733,10 @@
             "minimum": 0
           },
           "projection": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "type": "string"
             }
