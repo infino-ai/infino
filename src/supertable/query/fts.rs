@@ -20,6 +20,13 @@
 //! // Unranked candidate sets (Arrow rows, score == 0.0).
 //! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
 //! let exact = table.exact_match("title", "rust async", None)?;
+//!
+//! // A query-time vocabulary — stop terms and term groups — registered
+//! // once per column and applied by every full-text query over it (and
+//! // by the SQL functions); `exact_match` never expands.
+//! table.set_query_expansion("title", Some(Arc::new(
+//!     QueryExpansion::new().stop(["the"]).group("run", ["runs", "running", "ran"]),
+//! )))?;
 //! ```
 //!
 //! Internally these drive the async kernel on the snapshot-pinned
@@ -127,9 +134,10 @@ use crate::{
         fts::{
             bm25,
             reader::{
-                Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet,
-                PreparedClauses,
+                Bm25SearchOptions, Bm25Stats, ClauseLists, GlobalTermIdf, NormalizedExpansion,
+                OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryExpansion,
             },
+            tokenize::QueryClauses,
         },
     },
     supertable::{
@@ -146,14 +154,16 @@ use crate::{
     },
 };
 
-/// An unranked query's match set: the terms and exact phrases every
-/// (`And`) or any (`Or`) of which a doc must contain. Produced by
+/// An unranked query's match set: the terms, exact phrases and term
+/// groups every (`And`) or any (`Or`) of which a doc must contain (a
+/// group is satisfied by any of its members). Produced by
 /// `parse_and_prune` from the clause model — the must side when any
 /// must exists (shoulds have no scores to raise unranked), the bare
 /// side under the default operator otherwise.
 struct UnrankedMatchSet {
     terms: Vec<String>,
     phrases: Vec<Vec<String>>,
+    groups: Vec<Vec<String>>,
     mode: BoolMode,
 }
 
@@ -162,28 +172,101 @@ impl Default for UnrankedMatchSet {
         Self {
             terms: Vec::new(),
             phrases: Vec::new(),
+            groups: Vec::new(),
             mode: BoolMode::Or,
         }
     }
 }
 
 impl UnrankedMatchSet {
-    fn has_phrases(&self) -> bool {
-        !self.phrases.is_empty()
+    /// Any phrase or group takes the atom-aware walk; a term-only set
+    /// keeps the optimized token kernels.
+    fn has_atoms(&self) -> bool {
+        !self.phrases.is_empty() || !self.groups.is_empty()
     }
 }
 
+/// A ranked query's term groups per polarity, frozen for the fan-out
+/// closures. Built only when the query has at least one group, so an
+/// unexpanded query allocates nothing extra on its way to the kernels.
+struct QueryGroups {
+    must: Vec<Vec<String>>,
+    should: Vec<Vec<String>>,
+    negative: Vec<Vec<String>>,
+}
+
 /// An unranked query's negated atoms (docs containing any are
-/// excluded).
+/// excluded; a negated group excludes on any member).
 #[derive(Default)]
 struct UnrankedNegatives {
     terms: Vec<String>,
     phrases: Vec<Vec<String>>,
+    groups: Vec<Vec<String>>,
 }
 
 impl UnrankedNegatives {
     fn is_empty(&self) -> bool {
-        self.terms.is_empty() && self.phrases.is_empty()
+        self.terms.is_empty() && self.phrases.is_empty() && self.groups.is_empty()
+    }
+
+    /// See [`UnrankedMatchSet::has_atoms`].
+    fn has_atoms(&self) -> bool {
+        !self.phrases.is_empty() || !self.groups.is_empty()
+    }
+}
+
+/// Bloom-prune leaves for one match set over `column`: the plain `terms`
+/// (phrase members already folded in by the caller) and the term
+/// `groups`, under `mode`.
+///
+/// A doc satisfies a group when it holds **any** member, so under a
+/// conjunctive match set each group becomes its own `Or` leaf — a
+/// superfile is pruned only when it holds none of that group's members —
+/// and the leaves AND together across groups and the plain-term leaf.
+/// Pruning on the head alone, or on the members conjunctively, would
+/// silently drop a superfile that holds only a rarer surface form. Under a
+/// disjunctive match set the members simply join the single `Or` leaf.
+/// With no groups this is exactly the one leaf the paths built before
+/// groups existed.
+fn term_presence_leaves(
+    column: &str,
+    terms: Vec<String>,
+    groups: &[Vec<String>],
+    mode: BoolMode,
+) -> Vec<PruneLeaf> {
+    match mode {
+        BoolMode::Or => {
+            let mut any_of = terms;
+            for group in groups {
+                any_of.extend(group.iter().cloned());
+            }
+            match any_of.is_empty() {
+                true => Vec::new(),
+                false => vec![PruneLeaf::TermPresence {
+                    column: column.to_owned(),
+                    terms: any_of,
+                    mode: BoolMode::Or,
+                }],
+            }
+        }
+        BoolMode::And => {
+            let mut leaves = Vec::with_capacity(groups.len() + 1);
+            if !terms.is_empty() {
+                leaves.push(PruneLeaf::TermPresence {
+                    column: column.to_owned(),
+                    terms,
+                    mode: BoolMode::And,
+                });
+            }
+            for group in groups {
+                leaves.push(PruneLeaf::TermPresence {
+                    column: column.to_owned(),
+                    terms: group.clone(),
+                    mode: BoolMode::Or,
+                });
+            }
+            leaves
+        }
     }
 }
 
@@ -316,19 +399,19 @@ impl SupertableReader {
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?opts.mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
     pub(crate) async fn bm25_search_async(
         &self,
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: &Bm25SearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let mode = opts.mode;
         let manifest = self.manifest();
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
@@ -346,13 +429,37 @@ impl SupertableReader {
             )));
         };
 
-        // Parse the query once here, not per superfile, resolving the
-        // bare tokens' polarity from the default operator (`And` ⇒
-        // must, `Or` ⇒ should). The fan-out closures below need owned
-        // ('static) data for tokio::spawn, so this is the one place
-        // the tokens are copied — the prune and every per-superfile
-        // search reuse them.
-        let clauses = tokenizer.parse(query).into_clauses(mode);
+        // Resolve the query-time expansion: a per-call vocabulary wins
+        // over the column's registration. The per-call one is normalized
+        // through the column's analyzer here; the registered one was
+        // normalized once at registration. A query with neither takes the
+        // exact code it always took.
+        let per_call = match &opts.expansion {
+            None => None,
+            Some(expansion) => Some(
+                NormalizedExpansion::normalize(expansion, tokenizer.as_ref()).map_err(|e| {
+                    QueryError::InvalidQuery(format!("query expansion for column {column:?}: {e}"))
+                })?,
+            ),
+        };
+        let expansion: Option<&NormalizedExpansion> = per_call
+            .as_ref()
+            .or(self.query_expansion_for(column).map(Arc::as_ref));
+
+        // Parse the query once here, not per superfile, apply the
+        // expansion at this one parse point (the same step the unranked
+        // paths take, so `token_match` and `count` agree with the ranked
+        // search on what a query means), then resolve the bare tokens'
+        // polarity from the default operator (`And` ⇒ must, `Or` ⇒
+        // should). The fan-out closures below need owned ('static) data
+        // for tokio::spawn, so this is the one place the tokens are
+        // copied — the prune and every per-superfile search reuse them.
+        let parsed = tokenizer.parse(query);
+        let parsed = match expansion {
+            Some(expansion) => expansion.apply(parsed),
+            None => parsed,
+        };
+        let clauses = parsed.into_clauses(mode);
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
@@ -365,18 +472,29 @@ impl SupertableReader {
         let must_phrases = own_phrases(clauses.must_phrases);
         let should_phrases = own_phrases(clauses.should_phrases);
         let negative_phrases = own_phrases(clauses.negative_phrases);
-        let has_musts = !musts.is_empty() || !must_phrases.is_empty();
+        // Term groups arrive owned from the expansion; nothing to copy.
+        let QueryClauses {
+            must_groups,
+            should_groups,
+            negative_groups,
+            ..
+        } = clauses;
+        let has_musts = !musts.is_empty() || !must_phrases.is_empty() || !must_groups.is_empty();
         let has_phrases =
             !must_phrases.is_empty() || !should_phrases.is_empty() || !negative_phrases.is_empty();
+        let has_groups =
+            !must_groups.is_empty() || !should_groups.is_empty() || !negative_groups.is_empty();
 
-        if !has_musts && shoulds.is_empty() && should_phrases.is_empty() {
+        if !has_musts && shoulds.is_empty() && should_phrases.is_empty() && should_groups.is_empty()
+        {
             // No scorable clause at all. Empty / punctuation-only
             // queries match nothing (not an error); negation-only
-            // (e.g. `-foo`) has no anchor to rank — reject up front so
-            // the per-superfile kernel never has to, and so the
-            // unranked count / token_match path surfaces the identical
-            // error (see `parse_and_prune`).
-            if negatives.is_empty() && negative_phrases.is_empty() {
+            // (e.g. `-foo`, or a query that is all `-groups` after
+            // expansion) has no anchor to rank — reject up front so the
+            // per-superfile kernel never has to, and so the unranked
+            // count / token_match path surfaces the identical error (see
+            // `parse_and_prune`).
+            if negatives.is_empty() && negative_phrases.is_empty() && negative_groups.is_empty() {
                 return Ok(Vec::new());
             }
             return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
@@ -389,12 +507,14 @@ impl SupertableReader {
         // lacking any is skipped regardless of `mode`. A pure should
         // query prunes as the flat term list did (phrase members join
         // the union: a doc matching the phrase contains each member).
-        // Negated atoms never prune, and shoulds never prune once a
-        // must exists, since they only affect scores.
-        let (mut prune_terms, prune_mode) = if !has_musts {
-            (shoulds.clone(), mode)
+        // A group is satisfied by any member, so it prunes as its own
+        // any-member leaf (see `term_presence_leaves`). Negated atoms
+        // never prune, and shoulds never prune once a must exists,
+        // since they only affect scores.
+        let (mut prune_terms, prune_groups, prune_mode) = if !has_musts {
+            (shoulds.clone(), &should_groups, mode)
         } else {
-            (musts.clone(), BoolMode::And)
+            (musts.clone(), &must_groups, BoolMode::And)
         };
         match has_musts {
             true => {
@@ -408,12 +528,8 @@ impl SupertableReader {
                 }
             }
         }
-        let prune_leaf = PruneLeaf::TermPresence {
-            column: column_owned.clone(),
-            terms: prune_terms,
-            mode: prune_mode,
-        };
-        let kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
+        let leaves = term_presence_leaves(column, prune_terms, prune_groups, prune_mode);
+        let kept = select_superfiles(manifest.as_ref(), &leaves).await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -422,11 +538,14 @@ impl SupertableReader {
         // (global N from the manifest + df summed across the superfiles
         // that contain the term), then score every superfile against it
         // instead of its own per-superfile idf. The scored set is every
-        // term that contributes to a score: the bare musts + shoulds, plus
-        // each member of a scored (must/should) phrase — a phrase's score
-        // is Σ member idf. Negated terms/phrases are pure exclusions, so
+        // term that contributes to a score: the bare musts + shoulds, each
+        // member of a scored (must/should) phrase — a phrase's score is Σ
+        // member idf — and each member of a scored group, whose idf is the
+        // table-wide commonest member's; gathering every member is what
+        // lets a superfile that lacks that member still score the group
+        // with it. Negated terms/phrases/groups are pure exclusions, so
         // their idf never matters and they stay out of the gather.
-        let global_idf: Option<Arc<GlobalTermIdf>> = match stats {
+        let global_idf: Option<Arc<GlobalTermIdf>> = match opts.stats {
             Bm25Stats::PerSuperfile => None,
             Bm25Stats::Global => {
                 let mut scored: Vec<String> = Vec::new();
@@ -440,6 +559,11 @@ impl SupertableReader {
                 }
                 for phrase in must_phrases.iter().chain(should_phrases.iter()) {
                     for member in phrase {
+                        add(member);
+                    }
+                }
+                for group in must_groups.iter().chain(should_groups.iter()) {
+                    for member in group {
                         add(member);
                     }
                 }
@@ -460,9 +584,9 @@ impl SupertableReader {
         // Single-term OR, AND, and any query with a must or negated
         // clause stay on the un-ranged call.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        // Phrase-bearing queries stay per-superfile: the ranged
-        // kernel is the pure term-union fast path.
-        let fanout = match has_phrases {
+        // Phrase- and group-bearing queries stay per-superfile: the
+        // ranged kernel is the pure term-union fast path.
+        let fanout = match has_phrases || has_groups {
             true => FanOut::PerSuperfile,
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
         };
@@ -481,6 +605,15 @@ impl SupertableReader {
         let must_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(must_phrases);
         let should_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(should_phrases);
         let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negative_phrases);
+        // Frozen only when the query has groups, so an unexpanded query
+        // allocates nothing it did not allocate before.
+        let groups_arc: Option<Arc<QueryGroups>> = has_groups.then(|| {
+            Arc::new(QueryGroups {
+                must: must_groups,
+                should: should_groups,
+                negative: negative_groups,
+            })
+        });
         let column_arc = Arc::new(column_owned);
 
         // Cross-segment threshold sharing: each unit reads the global
@@ -525,6 +658,7 @@ impl SupertableReader {
             let must_ph_arc = Arc::clone(&must_ph_arc);
             let should_ph_arc = Arc::clone(&should_ph_arc);
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
+            let groups_arc = groups_arc.clone();
             let shared = Arc::clone(&shared);
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
@@ -617,6 +751,14 @@ impl SupertableReader {
                         let should_refs: Vec<&str> =
                             should_arc.iter().map(|s| s.as_str()).collect();
                         let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        let (must_groups, should_groups, negative_groups): (
+                            &[Vec<String>],
+                            &[Vec<String>],
+                            &[Vec<String>],
+                        ) = match groups_arc.as_deref() {
+                            Some(g) => (&g.must, &g.should, &g.negative),
+                            None => (&[], &[], &[]),
+                        };
                         let prep = r
                             .prepare_clauses(
                                 &column_arc,
@@ -627,6 +769,9 @@ impl SupertableReader {
                                     must_phrases: &must_ph_arc,
                                     should_phrases: &should_ph_arc,
                                     negative_phrases: &neg_ph_arc,
+                                    must_groups,
+                                    should_groups,
+                                    negative_groups,
                                     global_idf: global_idf.as_deref(),
                                 },
                                 k,
@@ -971,6 +1116,12 @@ impl SupertableReader {
     /// scored search returns. With no musts, the bare terms match
     /// under `mode` exactly as before.
     ///
+    /// The column's registered query-time expansion applies right after
+    /// the parse and before the default operator resolves polarity — the
+    /// one step this path shares with the scored search, so
+    /// `token_match`, `count` and `bm25_search` can never disagree on
+    /// what a query means.
+    ///
     /// Returns `(match_set, negatives, kept)`.
     async fn parse_and_prune(
         &self,
@@ -985,12 +1136,13 @@ impl SupertableReader {
         ),
         QueryError,
     > {
-        let clauses = self
-            .manifest()
-            .options
-            .fts_tokenizer_for(column)
-            .parse(query)
-            .into_clauses(mode);
+        let tokenizer = self.manifest().options.fts_tokenizer_for(column);
+        let parsed = tokenizer.parse(query);
+        let parsed = match self.query_expansion_for(column) {
+            Some(expansion) => expansion.apply(parsed),
+            None => parsed,
+        };
+        let clauses = parsed.into_clauses(mode);
         // Drop repeated tokens within each clause role. Unranked
         // matching is set-valued — an AND/OR/exclude over a term repeated
         // in the query (e.g. `+to +be +or +not +to +be`) is idempotent —
@@ -1026,13 +1178,30 @@ impl SupertableReader {
         let must_phrases = own_phrases(clauses.must_phrases);
         let should_phrases = own_phrases(clauses.should_phrases);
         let negative_phrases = own_phrases(clauses.negative_phrases);
+        // A term group repeated in the query (the same head twice) is as
+        // idempotent for an unranked match as a repeated term, so it is
+        // dropped the same way. Groups are already owned; nothing to copy.
+        let dedup_groups = |groups: Vec<Vec<String>>| -> Vec<Vec<String>> {
+            let mut out: Vec<Vec<String>> = Vec::with_capacity(groups.len());
+            for g in groups {
+                if !out.contains(&g) {
+                    out.push(g);
+                }
+            }
+            out
+        };
+        let must_groups = dedup_groups(clauses.must_groups);
+        let should_groups = dedup_groups(clauses.should_groups);
+        let negative_groups = dedup_groups(clauses.negative_groups);
         let negs = UnrankedNegatives {
             terms: negatives,
             phrases: negative_phrases,
+            groups: negative_groups,
         };
-        let has_musts = !musts.is_empty() || !must_phrases.is_empty();
-        if !has_musts && shoulds.is_empty() && should_phrases.is_empty() {
-            if negs.terms.is_empty() && negs.phrases.is_empty() {
+        let has_musts = !musts.is_empty() || !must_phrases.is_empty() || !must_groups.is_empty();
+        if !has_musts && shoulds.is_empty() && should_phrases.is_empty() && should_groups.is_empty()
+        {
+            if negs.is_empty() {
                 // No tokens at all (empty/whitespace query) — nothing to
                 // match, not an error.
                 return Ok((UnrankedMatchSet::default(), negs, Vec::new()));
@@ -1047,27 +1216,25 @@ impl SupertableReader {
             true => UnrankedMatchSet {
                 terms: musts,
                 phrases: must_phrases,
+                groups: must_groups,
                 mode: BoolMode::And,
             },
             false => UnrankedMatchSet {
                 terms: shoulds,
                 phrases: should_phrases,
+                groups: should_groups,
                 mode,
             },
         };
         // Prune on the match set's terms plus its phrases' members —
-        // a phrase match requires every member present.
+        // a phrase match requires every member present — with each
+        // group as its own any-member leaf (see `term_presence_leaves`).
         let mut prune_terms = match_set.terms.clone();
         for p in &match_set.phrases {
             prune_terms.extend(p.iter().cloned());
         }
-        let prune_leaf = PruneLeaf::TermPresence {
-            column: column.to_owned(),
-            terms: prune_terms,
-            mode: match_set.mode,
-        };
-        let kept =
-            select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
+        let leaves = term_presence_leaves(column, prune_terms, &match_set.groups, match_set.mode);
+        let kept = select_superfiles(self.manifest().as_ref(), &leaves).await?;
         Ok((match_set, negs, kept))
     }
 
@@ -1099,29 +1266,31 @@ impl SupertableReader {
         }
         let match_mode = match_set.mode;
         let has_negatives = !negatives.is_empty();
-        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
+        let atoms_involved = match_set.has_atoms() || negatives.has_atoms();
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
-        let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
-        let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
-        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
+        let set_arc = Arc::new(match_set);
+        let neg_arc = Arc::new(negatives);
         let op_stats = self.op_stats.clone();
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
             let column_arc = Arc::clone(&column_arc);
-            let term_arc = Arc::clone(&term_arc);
-            let phrase_arc = Arc::clone(&phrase_arc);
+            let set_arc = Arc::clone(&set_arc);
             let neg_arc = Arc::clone(&neg_arc);
-            let neg_ph_arc = Arc::clone(&neg_ph_arc);
             let op_stats = op_stats.clone();
             async move {
-                let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                // Any phrase atom (match or negated) takes the
-                // phrase-aware walk; plain-token queries keep the
-                // optimized token_match path unchanged.
-                let (docs, mut work) = match phrase_involved {
+                let refs: Vec<&str> = set_arc.terms.iter().map(String::as_str).collect();
+                // Any phrase or group atom (match or negated) takes the
+                // atom-aware walk; plain-token queries keep the optimized
+                // token_match path unchanged.
+                let (docs, mut work) = match atoms_involved {
                     true => r
-                        .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                        .atoms_match_ids(
+                            &column_arc,
+                            &refs,
+                            &set_arc.phrases,
+                            &set_arc.groups,
+                            match_mode,
+                        )
                         .await
                         .map_err(fts_read_error)?,
                     false => r
@@ -1134,14 +1303,20 @@ impl SupertableReader {
                 // paths can't express exclusion, so negation forces a
                 // materialized walk over both sets.
                 let docs = if has_negatives {
-                    let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                    let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
-                        true => r
+                    let neg_refs: Vec<&str> = neg_arc.terms.iter().map(String::as_str).collect();
+                    let (neg_docs, neg_work) = match neg_arc.has_atoms() {
+                        false => r
                             .token_match(&column_arc, &neg_refs, BoolMode::Or)
                             .await
                             .map_err(fts_read_error)?,
-                        false => r
-                            .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
+                        true => r
+                            .atoms_match_ids(
+                                &column_arc,
+                                &neg_refs,
+                                &neg_arc.phrases,
+                                &neg_arc.groups,
+                                BoolMode::Or,
+                            )
                             .await
                             .map_err(fts_read_error)?,
                     };
@@ -1204,14 +1379,12 @@ impl SupertableReader {
         }
 
         let match_mode = match_set.mode;
-        let single_term = match_set.terms.len() == 1 && !match_set.has_phrases();
+        let single_term = match_set.terms.len() == 1 && !match_set.has_atoms();
         let has_negatives = !negatives.is_empty();
-        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
+        let atoms_involved = match_set.has_atoms() || negatives.has_atoms();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
-        let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
-        let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
-        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
+        let set_arc = Arc::new(match_set);
+        let neg_arc = Arc::new(negatives);
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
 
         // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
@@ -1227,10 +1400,8 @@ impl SupertableReader {
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
                 let column_arc = Arc::clone(&column_arc);
-                let term_arc = Arc::clone(&term_arc);
-                let phrase_arc = Arc::clone(&phrase_arc);
+                let set_arc = Arc::clone(&set_arc);
                 let neg_arc = Arc::clone(&neg_arc);
-                let neg_ph_arc = Arc::clone(&neg_ph_arc);
                 async move {
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
@@ -1242,7 +1413,7 @@ impl SupertableReader {
                         }
                         None => None,
                     };
-                    let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                    let refs: Vec<&str> = set_arc.terms.iter().map(String::as_str).collect();
                     // Negated terms or deletes both force materialization:
                     // Deletes force materialization: a tombstone bitmap can
                     // only be subtracted from an explicit id set, so when this
@@ -1251,9 +1422,15 @@ impl SupertableReader {
                     // negatives) or a tombstone. Negation *without* deletes
                     // takes the skip-based counting path below instead.
                     if tomb.is_some() {
-                        let (docs, mut work) = match phrase_involved {
+                        let (docs, mut work) = match atoms_involved {
                             true => r
-                                .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                                .atoms_match_ids(
+                                    &column_arc,
+                                    &refs,
+                                    &set_arc.phrases,
+                                    &set_arc.groups,
+                                    match_mode,
+                                )
                                 .await
                                 .map_err(fts_read_error)?,
                             false => r
@@ -1262,17 +1439,19 @@ impl SupertableReader {
                                 .map_err(fts_read_error)?,
                         };
                         let excluded: RoaringBitmap = if has_negatives {
-                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                            let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
-                                true => r
+                            let neg_refs: Vec<&str> =
+                                neg_arc.terms.iter().map(String::as_str).collect();
+                            let (neg_docs, neg_work) = match neg_arc.has_atoms() {
+                                false => r
                                     .token_match(&column_arc, &neg_refs, BoolMode::Or)
                                     .await
                                     .map_err(fts_read_error)?,
-                                false => r
+                                true => r
                                     .atoms_match_ids(
                                         &column_arc,
                                         &neg_refs,
-                                        &neg_ph_arc,
+                                        &neg_arc.phrases,
+                                        &neg_arc.groups,
                                         BoolMode::Or,
                                     )
                                     .await
@@ -1302,28 +1481,40 @@ impl SupertableReader {
                     let (n, work) = if has_negatives {
                         // Negation, delete-free: walk the positive atoms and
                         // skip-exclude the negated ones — the negated union is
-                        // never materialized. Covers term-only and phrase
-                        // positives alike.
-                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        // never materialized. Covers term-only, phrase and
+                        // group positives alike.
+                        let neg_refs: Vec<&str> =
+                            neg_arc.terms.iter().map(String::as_str).collect();
                         r.atoms_match_count(
                             &column_arc,
                             &refs,
-                            &phrase_arc,
+                            &set_arc.phrases,
+                            &set_arc.groups,
                             match_mode,
                             &neg_refs,
-                            &neg_ph_arc,
+                            &neg_arc.phrases,
+                            &neg_arc.groups,
                         )
                         .await
                         .map_err(fts_read_error)?
                     } else if single_term {
                         // A single token resolves O(1) from the stored df.
-                        r.term_df(&column_arc, &term_arc[0])
+                        r.term_df(&column_arc, &set_arc.terms[0])
                             .await
                             .map_err(fts_read_error)?
-                    } else if phrase_involved {
-                        r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode, &[], &[])
-                            .await
-                            .map_err(fts_read_error)?
+                    } else if atoms_involved {
+                        r.atoms_match_count(
+                            &column_arc,
+                            &refs,
+                            &set_arc.phrases,
+                            &set_arc.groups,
+                            match_mode,
+                            &[],
+                            &[],
+                            &[],
+                        )
+                        .await
+                        .map_err(fts_read_error)?
                     } else {
                         // Multi-token AND/OR tallies through the counting sink.
                         r.token_match_count(&column_arc, &refs, match_mode)
@@ -1506,11 +1697,24 @@ impl SupertableReader {
         stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        let opts = Bm25SearchOptions::new().with_mode(mode).with_stats(stats);
+        self.bm25_search_with_options(column, query, k, &opts, projection)
+    }
+
+    /// [`Self::bm25_search`] taking the full [`Bm25SearchOptions`] —
+    /// mode, statistics, and an optional per-call query expansion that
+    /// overrides the column's registered one.
+    pub fn bm25_search_with_options(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        opts: &Bm25SearchOptions,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
-            let hits = self
-                .bm25_search_async(column, query, k, mode, stats)
-                .await?;
+            let hits = self.bm25_search_async(column, query, k, opts).await?;
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
@@ -1545,7 +1749,8 @@ impl SupertableReader {
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.bm25_search_async(column, query, k, mode, Bm25Stats::PerSuperfile))
+        let opts = Bm25SearchOptions::new().with_mode(mode);
+        self.block_on(self.bm25_search_async(column, query, k, &opts))
     }
 
     /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
@@ -1630,7 +1835,9 @@ fn fts_read_error(e: ReadError) -> QueryError {
         ReadError::Fts(fts)
             if matches!(
                 fts.as_ref(),
-                FtsError::PositionsUnavailable { .. } | FtsError::NegationOnly
+                FtsError::PositionsUnavailable { .. }
+                    | FtsError::NegationOnly
+                    | FtsError::Expansion(_)
             ) =>
         {
             QueryError::InvalidQuery(e.to_string())
@@ -1851,9 +2058,26 @@ impl Supertable {
         stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        debug!(column, k, mode = ?mode, "bm25_search");
+        let opts = Bm25SearchOptions::new().with_mode(mode).with_stats(stats);
+        self.bm25_search_with_options(column, query, k, &opts, projection)
+    }
+
+    /// [`Self::bm25_search`] taking the full [`Bm25SearchOptions`]: the
+    /// boolean mode, the corpus statistics, and an optional per-call
+    /// query expansion (stop terms and term groups). A call with no
+    /// expansion applies the one registered for `column` through
+    /// [`Self::set_query_expansion`], if any.
+    pub fn bm25_search_with_options(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        opts: &Bm25SearchOptions,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        debug!(column, k, mode = ?opts.mode, "bm25_search");
         self.reader()?
-            .bm25_search(column, query, k, mode, stats, projection)
+            .bm25_search_with_options(column, query, k, opts, projection)
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("bm25_search", None))
     }
@@ -1959,6 +2183,49 @@ impl Supertable {
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("count", None))
     }
+
+    /// Register — or with `None`, clear — the query-time expansion (stop
+    /// terms and term groups) the full-text paths apply to `column`:
+    /// `bm25_search` when the call itself carries no expansion,
+    /// `token_match`, `count`, `hybrid_search`, and the SQL `bm25_search`
+    /// / `token_match` table functions. `exact_match` never expands.
+    ///
+    /// Every entry is normalized through the column's analyzer here,
+    /// once, so a query never pays for it; an entry that does not come out
+    /// as exactly one term is rejected with [`InfinoError::Config`] naming
+    /// the column and the entry, as is a column with no full-text index.
+    /// The registration lives on this open handle only — nothing is
+    /// persisted, a reopened table starts with none — and a query pins the
+    /// registrations it sees together with its manifest snapshot. An
+    /// expansion that changes nothing (empty, or groups that reduce to
+    /// their heads) is stored as no registration, so such a column keeps
+    /// running the unexpanded code exactly.
+    pub fn set_query_expansion(
+        &self,
+        column: &str,
+        expansion: Option<Arc<QueryExpansion>>,
+    ) -> Result<(), InfinoError> {
+        let options = self.options();
+        let Some(tokenizer) = options.try_fts_tokenizer_for(column) else {
+            return Err(
+                InfinoError::Config(no_fts_index_message(column, &options.fts_columns))
+                    .with_context("set_query_expansion", None),
+            );
+        };
+        let normalized = match expansion {
+            None => None,
+            Some(expansion) => {
+                let normalized = NormalizedExpansion::normalize(&expansion, tokenizer.as_ref())
+                    .map_err(|e| {
+                        InfinoError::Config(format!("query expansion for column {column:?}: {e}"))
+                            .with_context("set_query_expansion", None)
+                    })?;
+                (!normalized.is_empty()).then(|| Arc::new(normalized))
+            }
+        };
+        self.replace_query_expansion(column, normalized);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1966,6 +2233,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         future::Future,
+        slice,
         sync::Arc,
     };
 
@@ -1976,8 +2244,12 @@ mod tests {
     use tokio::runtime::Builder;
     use uuid::Uuid;
 
-    use super::{Bm25Stats, BoolMode, FanOut, build_work_units, fanout_for};
+    use super::{
+        Bm25Stats, BoolMode, FanOut, PruneLeaf, QueryExpansion, build_work_units, fanout_for,
+        term_presence_leaves,
+    };
     use crate::{
+        InfinoError,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -2234,6 +2506,105 @@ mod tests {
         )
         .expect("valid options")
         .with_writer_pool(pool)
+    }
+
+    /// `Bm25Stats::Global` with term groups: a fragmented table must rank
+    /// grouped queries identically to a single superfile. A group's idf is
+    /// its commonest member's, and under global statistics that member is
+    /// chosen table-wide — including in a superfile that does not hold it
+    /// — so every superfile scores the group with one idf. The corpus
+    /// spreads the surface forms unevenly across the commits, so each
+    /// superfile's own commonest present form differs from the table's
+    /// and per-superfile statistics visibly diverge.
+    #[test]
+    fn global_stats_grouped_queries_match_single_superfile() {
+        /// The family's surface forms.
+        const FORMS: [&str; 4] = ["run", "runs", "running", "ran"];
+        /// Docs per commit on the fragmented table.
+        const CHUNK: usize = 6;
+        // 24 uniform-length (4-token) docs: `<form> <topic> shared dNN`.
+        // The form index advances every five docs, so each six-doc commit
+        // sees a different mix (`run` dominates the table at 9 docs while
+        // the second commit holds none of it).
+        let titles: Vec<String> = (0..24)
+            .map(|i| {
+                let form = FORMS[(i / 5) % FORMS.len()];
+                let topic = ["alpha", "beta", "gamma"][i % 3];
+                format!("{form} {topic} shared d{i:02}")
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
+        let vocab = Arc::new(QueryExpansion::new().group(FORMS[0], FORMS[1..].iter().copied()));
+
+        let single = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = single.writer().expect("writer");
+            w.append(&build_batch(0, &refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        single
+            .set_query_expansion("title", Some(Arc::clone(&vocab)))
+            .expect("register on single");
+        let multi = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = multi.writer().expect("writer");
+            for chunk in refs.chunks(CHUNK) {
+                w.append(&build_batch(0, chunk)).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+        multi
+            .set_query_expansion("title", Some(vocab))
+            .expect("register on multi");
+        assert!(
+            multi
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_all_superfiles()
+                .len()
+                > 1,
+            "multi table must be fragmented across superfiles"
+        );
+
+        let score_map =
+            |hits: Vec<(String, f32)>| -> HashMap<String, f32> { hits.into_iter().collect() };
+        // A bare group, a group beside a term, a must group with a
+        // should term, and a group under negation.
+        for q in ["run", "run alpha", "+run alpha", "run -beta"] {
+            let single_ref = score_map(all_scored(&single, q, Bm25Stats::PerSuperfile));
+            let multi_global = score_map(all_scored(&multi, q, Bm25Stats::Global));
+            let multi_local = score_map(all_scored(&multi, q, Bm25Stats::PerSuperfile));
+            assert!(!single_ref.is_empty(), "query {q:?} matched nothing");
+            assert_eq!(
+                single_ref.len(),
+                multi_global.len(),
+                "hit count mismatch for {q:?}"
+            );
+            for (title, s_score) in &single_ref {
+                let g_score = multi_global
+                    .get(title)
+                    .unwrap_or_else(|| panic!("global result missing {title:?} for {q:?}"));
+                assert!(
+                    (s_score - g_score).abs() <= 1e-5 * s_score.abs().max(1.0),
+                    "global score {g_score} != single score {s_score} for {title:?} / {q:?}"
+                );
+            }
+            // Per-superfile statistics genuinely differ here — each
+            // commit's commonest present form is not the table's — or the
+            // test would pass without `Global` doing anything.
+            if q == "run" {
+                let local_diverges = single_ref.iter().any(|(title, s)| {
+                    multi_local
+                        .get(title)
+                        .is_none_or(|l| (s - l).abs() > 1e-4 * s.abs().max(1.0))
+                });
+                assert!(
+                    local_diverges,
+                    "per-superfile group stats unexpectedly matched single-superfile for {q:?}"
+                );
+            }
+        }
     }
 
     /// A.1 oracle: `Bm25Stats::Global` must rank phrase-bearing queries
@@ -3720,6 +4091,111 @@ mod tests {
             st.count("title", "alpha -beta", BoolMode::Or)
                 .expect("count after delete"),
             2
+        );
+    }
+
+    /// The bloom-prune leaves a match set produces. A term group needs an
+    /// any-member leaf: under a conjunctive set each group is its own `Or`
+    /// leaf ANDed with the plain-term leaf, under a disjunctive set the
+    /// members join the single `Or` leaf. Without groups the output is the
+    /// one leaf the paths always built.
+    #[test]
+    fn term_presence_leaves_make_each_must_group_an_any_member_leaf() {
+        let terms = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let leaf = |l: &PruneLeaf| match l {
+            PruneLeaf::TermPresence {
+                column,
+                terms,
+                mode,
+            } => (column.clone(), terms.clone(), *mode),
+            _ => panic!("term presence leaf expected"),
+        };
+        let run = terms(&["run", "runs", "ran"]);
+        let fail = terms(&["fail", "failed"]);
+
+        // No groups: exactly the single leaf, both modes.
+        for mode in [BoolMode::And, BoolMode::Or] {
+            let leaves = term_presence_leaves("t", terms(&["a", "b"]), &[], mode);
+            assert_eq!(leaves.len(), 1);
+            assert_eq!(
+                leaf(&leaves[0]),
+                ("t".to_string(), terms(&["a", "b"]), mode)
+            );
+        }
+        // Conjunctive: plain terms stay `And`; each group is an `Or` leaf.
+        let leaves = term_presence_leaves(
+            "t",
+            terms(&["a"]),
+            &[run.clone(), fail.clone()],
+            BoolMode::And,
+        );
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(
+            leaf(&leaves[0]),
+            ("t".to_string(), terms(&["a"]), BoolMode::And)
+        );
+        assert_eq!(
+            leaf(&leaves[1]),
+            ("t".to_string(), run.clone(), BoolMode::Or)
+        );
+        assert_eq!(
+            leaf(&leaves[2]),
+            ("t".to_string(), fail.clone(), BoolMode::Or)
+        );
+        // Conjunctive with groups only: no empty `And` leaf is emitted.
+        let leaves = term_presence_leaves("t", Vec::new(), slice::from_ref(&run), BoolMode::And);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            leaf(&leaves[0]),
+            ("t".to_string(), run.clone(), BoolMode::Or)
+        );
+        // Disjunctive: everything joins one `Or` leaf.
+        let leaves = term_presence_leaves("t", terms(&["a"]), &[run, fail], BoolMode::Or);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            leaf(&leaves[0]),
+            (
+                "t".to_string(),
+                terms(&["a", "run", "runs", "ran", "fail", "failed"]),
+                BoolMode::Or
+            )
+        );
+        // Nothing to prune on keeps every superfile (no leaf at all).
+        assert!(term_presence_leaves("t", Vec::new(), &[], BoolMode::Or).is_empty());
+    }
+
+    #[test]
+    fn set_query_expansion_validates_the_column_and_every_entry() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let vocab = Arc::new(
+            QueryExpansion::new()
+                .stop(["the"])
+                .group("run", ["runs", "ran"]),
+        );
+        st.set_query_expansion("title", Some(Arc::clone(&vocab)))
+            .expect("a vocabulary of single terms registers on an FTS column");
+        st.set_query_expansion("title", None)
+            .expect("clearing a registration always succeeds");
+
+        // A column with no full-text index is a configuration error that
+        // names the column, not a silent no-op.
+        let err = st
+            .set_query_expansion("nope", Some(Arc::clone(&vocab)))
+            .expect_err("no FTS index on `nope`");
+        assert!(
+            matches!(&err, InfinoError::Config(m) if m.contains("nope")),
+            "got {err:?}"
+        );
+
+        // So is an entry the column's analyzer does not turn into exactly
+        // one term; the message names the column and the entry.
+        let two_words = Arc::new(QueryExpansion::new().group("run", ["new york"]));
+        let err = st
+            .set_query_expansion("title", Some(two_words))
+            .expect_err("a two-word member is refused");
+        assert!(
+            matches!(&err, InfinoError::Config(m) if m.contains("new york") && m.contains("title")),
+            "got {err:?}"
         );
     }
 }

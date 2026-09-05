@@ -9,7 +9,9 @@ mod core;
 mod count;
 mod cursor;
 mod expand;
+mod expansion;
 mod filter;
+mod group;
 mod metadata;
 mod options;
 mod phrase;
@@ -23,6 +25,8 @@ mod work;
 pub use core::*;
 
 pub(crate) use expand::{LONG_S_ASCII, TermPattern, has_fold_partner};
+pub(crate) use expansion::NormalizedExpansion;
+pub use expansion::{ExpansionError, QueryExpansion};
 pub use metadata::{ColumnMeta, OpenOptions};
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub use work::MatchWork;

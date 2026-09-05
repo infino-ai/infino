@@ -20,7 +20,7 @@ use datafusion::prelude::Expr;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, VectorFilter, superfile::VectorSearchOptions,
+    OptimizeOptions, QueryExpansion, VectorFilter, superfile::VectorSearchOptions,
     supertable::Supertable as SupertableHandle,
 };
 
@@ -55,6 +55,11 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
+    fn set_query_expansion(
+        &self,
+        column: &str,
+        expansion: Option<Arc<QueryExpansion>>,
+    ) -> Result<(), InfinoError>;
     fn vector_search(
         &self,
         column: &str,
@@ -111,7 +116,7 @@ impl Table for SupertableHandle {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        SupertableHandle::bm25_search(self, column, query, k, opts.mode, opts.stats, projection)
+        SupertableHandle::bm25_search_with_options(self, column, query, k, &opts, projection)
     }
     fn token_match(
         &self,
@@ -132,6 +137,13 @@ impl Table for SupertableHandle {
     }
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
+    }
+    fn set_query_expansion(
+        &self,
+        column: &str,
+        expansion: Option<Arc<QueryExpansion>>,
+    ) -> Result<(), InfinoError> {
+        SupertableHandle::set_query_expansion(self, column, expansion)
     }
     fn vector_search(
         &self,
@@ -272,6 +284,55 @@ impl Supertable {
     /// Count rows matching a token query over one FTS column.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         self.inner.count(column, query, mode)
+    }
+
+    /// Register — or with `None`, clear — the query-time expansion (stop
+    /// terms and term groups, see [`QueryExpansion`]) applied to every
+    /// full-text query over `column`: [`bm25_search`](Self::bm25_search)
+    /// unless the call carries its own
+    /// [`Bm25SearchOptions::with_expansion`],
+    /// [`token_match`](Self::token_match), [`count`](Self::count),
+    /// [`hybrid_search`](Self::hybrid_search), and the SQL `bm25_search` /
+    /// `token_match` table functions, whose SQL does not change.
+    /// [`exact_match`](Self::exact_match) never expands. The index is not
+    /// touched; postings stay keyed by the surface form.
+    ///
+    /// Every entry is run through the column's analyzer once, here; an
+    /// entry that does not come out as exactly one term is rejected with
+    /// [`InfinoError::Config`] naming the column and the entry, as is a
+    /// column with no full-text index. The registration lives on this
+    /// open handle only — it is not persisted, so a reopened table starts
+    /// with none — and a query sees the registrations pinned with its
+    /// snapshot. Not available on a hosted table in this version.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, Bm25SearchOptions, IndexSpec, QueryExpansion};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema,
+    /// #     vec![Arc::new(LargeStringArray::from(vec!["the tests ran", "run the tests", "tests pass"]))],
+    /// # )?)?;
+    /// let vocab = QueryExpansion::new()
+    ///     .stop(["the"])
+    ///     .group("run", ["runs", "running", "ran"]);
+    /// posts.set_query_expansion("body", Some(Arc::new(vocab)))?;
+    /// // `run` now matches `ran` too, scored as one term; `the` is dropped.
+    /// let hits = posts.bm25_search("body", "the run", 10, Bm25SearchOptions::new(), None)?;
+    /// assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    /// posts.set_query_expansion("body", None)?; // back to literal matching
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn set_query_expansion(
+        &self,
+        column: &str,
+        expansion: Option<Arc<QueryExpansion>>,
+    ) -> Result<(), InfinoError> {
+        self.inner.set_query_expansion(column, expansion)
     }
 
     /// Vector (IVF kNN) search over one vector column.

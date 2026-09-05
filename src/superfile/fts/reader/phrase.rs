@@ -3,14 +3,15 @@
 
 //! Exact-phrase matching: a multi-term [`PhraseCursor`] over
 //! [`PhraseMember`] atoms with positional verification, and the
-//! [`AnyCursor`] enum that lets the atom walks treat a plain term and a
-//! phrase uniformly. Drives both scored phrase search and phrase count.
-//! Scoped `pub(super)` to the `reader/` module.
+//! [`AnyCursor`] enum that lets the atom walks treat a plain term, a
+//! phrase and a term group uniformly. Drives both scored phrase search
+//! and phrase count. Scoped `pub(super)` to the `reader/` module.
 
 use bytes::Bytes;
 
 use super::{
     cursor::{TermCursor, TermMeta},
+    group::GroupCursor,
     metadata::NormTable,
 };
 use crate::superfile::{
@@ -41,8 +42,6 @@ pub(super) struct PhraseMember {
     /// inline FST value's slot carries it instead of a tf. `None` for
     /// PFOR members.
     pub(super) inline_position: Option<u32>,
-    /// The member's bare idf (the cursor stores only `idf × (K1+1)`).
-    pub(super) idf: f32,
     /// Byte offset of each decoded-block pair's run within
     /// `positions`, valid for `run_offsets_block`. Rebuilt on block
     /// crossings by one `skip_run` walk over the block's runs. Used by
@@ -218,15 +217,13 @@ impl PhraseCursor {
             .zip(positions)
             .zip(positional)
             .map(|((cursor, positions), (term_meta, inline_position))| {
-                let idf = cursor.idf_x_k1p1 / (bm25::K1 + 1.0);
-                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
-                idf_sum += idf;
+                min_scaled_bound = min_scaled_bound.min(cursor.term_max_tf_factor());
+                idf_sum += cursor.idf();
                 PhraseMember {
                     cursor,
                     positions,
                     term_meta,
                     inline_position,
-                    idf,
                     run_offsets: Vec::new(),
                     run_offsets_block: NO_BLOCK_CACHED,
                     cached_pair: NO_BLOCK_CACHED,
@@ -525,28 +522,32 @@ impl PhraseCursor {
     }
 
     /// Phrase-scaled block-level upper bound over `[range_start,
-    /// range_end]` — the block analog of `term_max_bm25`.
+    /// range_end]` — the block analog of `term_max_bm25`: the smallest
+    /// member bound with its idf divided out, times the phrase idf.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
         let mut min_scaled = f32::INFINITY;
         for m in self.members.iter_mut() {
-            let b = m.cursor.block_max_in_range(range_start, range_end);
-            min_scaled = min_scaled.min(b / m.idf);
+            let b = m
+                .cursor
+                .block_max_tf_factor_in_range(range_start, range_end);
+            min_scaled = min_scaled.min(b);
         }
         let idf_sum = self.idf_x_k1p1 / (bm25::K1 + 1.0);
         idf_sum * min_scaled
     }
 }
 
-/// A query atom's cursor: a plain term or an exact phrase. The atom
-/// walks below are heterogeneous doc-at-a-time loops over this enum —
-/// deliberately separate from the field-level optimized kernels
-/// (flat-merge AND, MaxScore/BMM, windowed union), which keep serving
-/// term-only queries unchanged. A query containing any phrase routes
-/// here: correctness-first walks whose per-doc cost is dominated by
-/// the phrase verification itself.
+/// A query atom's cursor: a plain term, an exact phrase, or a term
+/// group. The atom walks below are heterogeneous doc-at-a-time loops
+/// over this enum — deliberately separate from the field-level optimized
+/// kernels (flat-merge AND, MaxScore/BMM, windowed union), which keep
+/// serving term-only queries unchanged. A query containing any phrase or
+/// group routes here: correctness-first walks whose per-doc cost is
+/// dominated by the phrase verification itself.
 pub(super) enum AnyCursor {
     Term(TermCursor),
     Phrase(PhraseCursor),
+    Group(GroupCursor),
 }
 
 impl AnyCursor {
@@ -555,6 +556,7 @@ impl AnyCursor {
         match self {
             AnyCursor::Term(c) => c.is_exhausted(),
             AnyCursor::Phrase(c) => c.is_exhausted(),
+            AnyCursor::Group(c) => c.is_exhausted(),
         }
     }
 
@@ -563,6 +565,7 @@ impl AnyCursor {
         match self {
             AnyCursor::Term(c) => c.current_doc_id(),
             AnyCursor::Phrase(c) => c.current_doc_id(),
+            AnyCursor::Group(c) => c.current_doc_id(),
         }
     }
 
@@ -574,40 +577,47 @@ impl AnyCursor {
                 Ok(())
             }
             AnyCursor::Phrase(c) => c.skip_to(target),
+            AnyCursor::Group(c) => {
+                c.skip_to(target);
+                Ok(())
+            }
         }
     }
 
     /// Two-phase alignment for the AND walk: advance to the atom's next
     /// *candidate* doc ≥ `target` without paying for a phrase's positions. A
-    /// term atom is exact (its doc *is* a match); a phrase atom advances to the
-    /// next doc holding all its members ([`PhraseCursor::approx_seek`]), leaving
-    /// adjacency for [`Self::verify_at`]. Pairs with [`Self::approx_current_doc`].
+    /// term or group atom is exact (its doc *is* a match); a phrase atom
+    /// advances to the next doc holding all its members
+    /// ([`PhraseCursor::approx_seek`]), leaving adjacency for
+    /// [`Self::verify_at`]. Pairs with [`Self::approx_current_doc`].
     pub(super) fn approx_skip_to(&mut self, target: u32) {
         match self {
             AnyCursor::Term(c) => c.skip_to(target),
             AnyCursor::Phrase(c) => c.approx_seek(target),
+            AnyCursor::Group(c) => c.skip_to(target),
         }
     }
 
     /// The atom's current *candidate* doc (see [`Self::approx_skip_to`]): a term
-    /// atom's decoded doc, or a phrase atom's member-aligned doc (`u32::MAX`
-    /// when exhausted).
+    /// or group atom's decoded doc, or a phrase atom's member-aligned doc
+    /// (`u32::MAX` when exhausted).
     pub(super) fn approx_current_doc(&self) -> u32 {
         match self {
             AnyCursor::Term(c) => c.current_doc_id(),
             AnyCursor::Phrase(c) => c.current_doc,
+            AnyCursor::Group(c) => c.current_doc_id(),
         }
     }
 
     /// Confirm the atom actually matches at `doc` — the doc its approximation
-    /// has already reached. A term atom trivially matches; a phrase atom decodes
-    /// positions and checks adjacency ([`PhraseCursor::verify_at_aligned`]). The
-    /// expensive half of the two-phase split, run by the AND walk only on docs
-    /// where every atom's approximation agrees, so a rare co-clause prunes the
-    /// position work.
+    /// has already reached. A term or group atom trivially matches; a phrase
+    /// atom decodes positions and checks adjacency
+    /// ([`PhraseCursor::verify_at_aligned`]). The expensive half of the
+    /// two-phase split, run by the AND walk only on docs where every atom's
+    /// approximation agrees, so a rare co-clause prunes the position work.
     pub(super) fn verify_at(&mut self, doc: u32) -> Result<bool, FtsError> {
         match self {
-            AnyCursor::Term(_) => Ok(true),
+            AnyCursor::Term(_) | AnyCursor::Group(_) => Ok(true),
             AnyCursor::Phrase(c) => Ok(c.verify_at_aligned(doc)? > 0),
         }
     }
@@ -615,8 +625,8 @@ impl AnyCursor {
     /// [`Self::skip_to`] with the ranked walks' pruning bar: a phrase
     /// atom skips docs it provably can't lift over the bar without
     /// doing any position work (see [`PhraseCursor::skip_to_pruned`]).
-    /// Term atoms ignore the bar — their per-doc score costs nothing
-    /// beyond the postings walk itself.
+    /// Term and group atoms ignore the bar — their per-doc score costs
+    /// nothing beyond the postings walk itself.
     pub(super) fn skip_to_pruned(
         &mut self,
         target: u32,
@@ -629,6 +639,10 @@ impl AnyCursor {
                 Ok(())
             }
             AnyCursor::Phrase(c) => c.skip_to_pruned(target, bar, dl_norm_k1),
+            AnyCursor::Group(c) => {
+                c.skip_to(target);
+                Ok(())
+            }
         }
     }
 
@@ -640,6 +654,7 @@ impl AnyCursor {
                 bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), dl_norm_k1)
             }
             AnyCursor::Phrase(c) => c.score_current(dl_norm_k1),
+            AnyCursor::Group(c) => c.score_current(dl_norm_k1),
         }
     }
 
@@ -649,6 +664,7 @@ impl AnyCursor {
         match self {
             AnyCursor::Term(c) => c.term_max_bm25,
             AnyCursor::Phrase(c) => c.term_max_bm25,
+            AnyCursor::Group(c) => c.term_max_bm25(),
         }
     }
 
@@ -658,6 +674,7 @@ impl AnyCursor {
         match self {
             AnyCursor::Term(c) => c.block_max_in_range(range_start, range_end),
             AnyCursor::Phrase(c) => c.block_max_in_range(range_start, range_end),
+            AnyCursor::Group(c) => c.block_max_in_range(range_start, range_end),
         }
     }
 }

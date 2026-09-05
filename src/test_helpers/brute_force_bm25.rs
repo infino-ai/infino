@@ -61,6 +61,23 @@ struct DocStats {
     tokens: Vec<String>,
 }
 
+/// Every clause list a query can carry, for
+/// [`BruteForceBm25::top_k_expanded`]: terms, exact phrases and term
+/// groups in each polarity. Fields are public so a test fills only the
+/// ones it uses and defaults the rest.
+#[derive(Debug, Default, Clone)]
+pub struct OracleQuery {
+    pub musts: Vec<String>,
+    pub must_phrases: Vec<Vec<String>>,
+    pub must_groups: Vec<Vec<String>>,
+    pub shoulds: Vec<String>,
+    pub should_phrases: Vec<Vec<String>>,
+    pub should_groups: Vec<Vec<String>>,
+    pub negatives: Vec<String>,
+    pub negative_phrases: Vec<Vec<String>>,
+    pub negative_groups: Vec<Vec<String>>,
+}
+
 /// Pre-tokenized corpus + per-term df + corpus avgdl. Construct
 /// once per fixture, query many times.
 pub struct BruteForceBm25 {
@@ -245,6 +262,7 @@ impl BruteForceBm25 {
     /// contiguously in order; its per-doc tf is the number of
     /// occurrence starts, and it scores as one BM25 atom with
     /// `idf = Σ member idf` — mirroring the production phrase atom.
+    /// A thin wrapper over [`Self::top_k_expanded`] with no term groups.
     #[allow(clippy::too_many_arguments)]
     pub fn top_k_atoms(
         &self,
@@ -256,10 +274,34 @@ impl BruteForceBm25 {
         negative_phrases: &[Vec<String>],
         k: usize,
     ) -> Vec<(u64, f32)> {
-        let no_positive = musts.is_empty()
-            && must_phrases.is_empty()
-            && shoulds.is_empty()
-            && should_phrases.is_empty();
+        self.top_k_expanded(
+            &OracleQuery {
+                musts: musts.to_vec(),
+                must_phrases: must_phrases.to_vec(),
+                shoulds: shoulds.to_vec(),
+                should_phrases: should_phrases.to_vec(),
+                negatives: negatives.to_vec(),
+                negative_phrases: negative_phrases.to_vec(),
+                ..OracleQuery::default()
+            },
+            k,
+        )
+    }
+
+    /// Clause-model top-k over every atom kind, term groups included. A
+    /// group matches a doc when **any** member is present, its per-doc
+    /// `tf` is the sum of the members' frequencies, and it scores as one
+    /// BM25 atom whose `idf` is that of the member with the largest
+    /// document frequency — the stemmed-index equivalent the production
+    /// group atom mirrors. Phrases and plain terms behave exactly as in
+    /// [`Self::top_k_atoms`].
+    pub fn top_k_expanded(&self, q: &OracleQuery, k: usize) -> Vec<(u64, f32)> {
+        let no_positive = q.musts.is_empty()
+            && q.must_phrases.is_empty()
+            && q.must_groups.is_empty()
+            && q.shoulds.is_empty()
+            && q.should_phrases.is_empty()
+            && q.should_groups.is_empty();
         if k == 0 || no_positive || self.n == 0 {
             return Vec::new();
         }
@@ -273,32 +315,56 @@ impl BruteForceBm25 {
             }
         };
         let phrase_idf = |p: &Vec<String>| -> f32 { p.iter().map(idf_of).sum() };
+        // The commonest member sets the group's rarity; members absent
+        // from the corpus (df 0) never win the max.
+        let group_idf = |g: &Vec<String>| -> f32 {
+            g.iter()
+                .max_by_key(|m| *self.df.get(*m).unwrap_or(&0))
+                .map(idf_of)
+                .unwrap_or(0.0)
+        };
+        let group_tf = |doc: &DocStats, g: &Vec<String>| -> u32 {
+            g.iter().map(|m| *doc.tf.get(m).unwrap_or(&0)).sum()
+        };
 
         let avgdl = self.avgdl;
         let mut scored: Vec<(u64, f32)> = Vec::with_capacity(self.docs.len());
         'docs: for doc in &self.docs {
-            for neg in negatives {
+            for neg in &q.negatives {
                 if doc.tf.contains_key(neg) {
                     continue 'docs;
                 }
             }
-            for p in negative_phrases {
+            for p in &q.negative_phrases {
                 if phrase_tf(&doc.tokens, p) > 0 {
                     continue 'docs;
                 }
             }
-            for must in musts {
+            for g in &q.negative_groups {
+                if group_tf(doc, g) > 0 {
+                    continue 'docs;
+                }
+            }
+            for must in &q.musts {
                 if !doc.tf.contains_key(must) {
                     continue 'docs;
                 }
             }
-            let mut must_phrase_tfs: Vec<u32> = Vec::with_capacity(must_phrases.len());
-            for p in must_phrases {
+            let mut must_phrase_tfs: Vec<u32> = Vec::with_capacity(q.must_phrases.len());
+            for p in &q.must_phrases {
                 let tf = phrase_tf(&doc.tokens, p);
                 if tf == 0 {
                     continue 'docs;
                 }
                 must_phrase_tfs.push(tf);
+            }
+            let mut must_group_tfs: Vec<u32> = Vec::with_capacity(q.must_groups.len());
+            for g in &q.must_groups {
+                let tf = group_tf(doc, g);
+                if tf == 0 {
+                    continue 'docs;
+                }
+                must_group_tfs.push(tf);
             }
 
             let dl = doc.dl as f32;
@@ -307,27 +373,38 @@ impl BruteForceBm25 {
 
             let mut score: f32 = 0.0;
             let mut matched_any_should = false;
-            for term in musts {
+            for term in &q.musts {
                 score += idf_of(term) * tf_factor(doc.tf[term]);
             }
-            for (p, tf) in must_phrases.iter().zip(&must_phrase_tfs) {
+            for (p, tf) in q.must_phrases.iter().zip(&must_phrase_tfs) {
                 score += phrase_idf(p) * tf_factor(*tf);
             }
-            for term in shoulds {
+            for (g, tf) in q.must_groups.iter().zip(&must_group_tfs) {
+                score += group_idf(g) * tf_factor(*tf);
+            }
+            for term in &q.shoulds {
                 if let Some(&tf) = doc.tf.get(term) {
                     matched_any_should = true;
                     score += idf_of(term) * tf_factor(tf);
                 }
             }
-            for p in should_phrases {
+            for p in &q.should_phrases {
                 let tf = phrase_tf(&doc.tokens, p);
                 if tf > 0 {
                     matched_any_should = true;
                     score += phrase_idf(p) * tf_factor(tf);
                 }
             }
+            for g in &q.should_groups {
+                let tf = group_tf(doc, g);
+                if tf > 0 {
+                    matched_any_should = true;
+                    score += group_idf(g) * tf_factor(tf);
+                }
+            }
 
-            let has_musts = !musts.is_empty() || !must_phrases.is_empty();
+            let has_musts =
+                !q.musts.is_empty() || !q.must_phrases.is_empty() || !q.must_groups.is_empty();
             if has_musts || matched_any_should {
                 scored.push((doc.doc_id, score));
             }

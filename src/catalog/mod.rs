@@ -1235,7 +1235,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency,
+        Bm25SearchOptions, BoolMode, Consistency, QueryExpansion,
         supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
     };
@@ -1245,6 +1245,198 @@ mod tests {
     /// Total rows across the materialized search batches.
     fn n_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// The `title` values across the returned batches, sorted.
+    fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            let idx = b.schema().index_of("title").expect("title projected");
+            let col = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title is LargeUtf8");
+            for i in 0..col.len() {
+                out.push(col.value(i).to_string());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A registered query-time expansion reaches every full-text entry
+    /// point on the public handle — `bm25_search`, `token_match`, `count`
+    /// and the SQL table functions — while `exact_match` never expands,
+    /// and clearing it restores literal matching everywhere.
+    #[test]
+    fn set_query_expansion_reaches_every_fts_entry_point_but_exact_match() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+        docs.append(&build_title_batch(&[
+            "running fails on the login page",
+            "the job ran and failed",
+            "run the tests",
+            "login page redesign",
+        ]))
+        .expect("append");
+
+        let vocab = Arc::new(
+            QueryExpansion::new()
+                .stop(["the", "and", "on"])
+                .group("run", ["runs", "running", "ran"]),
+        );
+        // Before: the literal token only.
+        let literal = docs
+            .bm25_search(
+                "title",
+                "run",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                Some(&["title"]),
+            )
+            .expect("bm25_search");
+        assert_eq!(titles_of(&literal), vec!["run the tests".to_string()]);
+
+        docs.set_query_expansion("title", Some(Arc::clone(&vocab)))
+            .expect("register");
+        let expanded_titles = vec![
+            "run the tests".to_string(),
+            "running fails on the login page".into(),
+            "the job ran and failed".into(),
+        ];
+        let ranked = docs
+            .bm25_search(
+                "title",
+                "run",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                Some(&["title"]),
+            )
+            .expect("bm25_search");
+        assert_eq!(titles_of(&ranked), expanded_titles, "bm25_search");
+        let matched = docs
+            .token_match("title", "run", BoolMode::Or, Some(&["title"]))
+            .expect("token_match");
+        assert_eq!(titles_of(&matched), expanded_titles, "token_match");
+        assert_eq!(docs.count("title", "run", BoolMode::Or).expect("count"), 3);
+        // The SQL table functions resolve the same handle and pick the
+        // registration up without any change to the SQL.
+        let sql_ranked = conn
+            .query_sql("SELECT title FROM bm25_search('docs', 'title', 'run', 10)")
+            .expect("bm25_search tvf");
+        assert_eq!(titles_of(&sql_ranked), expanded_titles, "bm25_search tvf");
+        let sql_matched = conn
+            .query_sql("SELECT title FROM token_match('docs', 'title', 'run', 'and')")
+            .expect("token_match tvf");
+        assert_eq!(titles_of(&sql_matched), expanded_titles, "token_match tvf");
+        // Stop terms vanish from bare queries: `the run` is `run`.
+        assert_eq!(
+            docs.count("title", "the run", BoolMode::And)
+                .expect("count"),
+            3
+        );
+
+        // `exact_match` compares the stored value and never expands: the
+        // registered vocabulary changes nothing about it.
+        let exact = docs
+            .exact_match("title", "run the tests", Some(&["title"]))
+            .expect("exact_match");
+        assert_eq!(titles_of(&exact), vec!["run the tests".to_string()]);
+        let none = docs
+            .exact_match("title", "the tests", Some(&["title"]))
+            .expect("exact_match");
+        assert_eq!(
+            n_rows(&none),
+            0,
+            "stop terms are not removed from an exact_match value"
+        );
+
+        // Clearing restores the literal search on every entry point.
+        docs.set_query_expansion("title", None).expect("clear");
+        let ranked = docs
+            .bm25_search(
+                "title",
+                "run",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                Some(&["title"]),
+            )
+            .expect("bm25_search");
+        assert_eq!(titles_of(&ranked), vec!["run the tests".to_string()]);
+        assert_eq!(docs.count("title", "run", BoolMode::Or).expect("count"), 1);
+        assert_eq!(
+            n_rows(
+                &conn
+                    .query_sql("SELECT title FROM bm25_search('docs', 'title', 'run', 10)")
+                    .expect("bm25_search tvf")
+            ),
+            1
+        );
+    }
+
+    /// A per-call expansion on `Bm25SearchOptions` overrides the
+    /// registration for that call only, and registration errors are
+    /// configuration errors naming the column.
+    #[test]
+    fn per_call_expansion_overrides_the_registration() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+        docs.append(&build_title_batch(&[
+            "run fast",
+            "runs faster",
+            "ran fastest",
+        ]))
+        .expect("append");
+        docs.set_query_expansion(
+            "title",
+            Some(Arc::new(
+                QueryExpansion::new().group("run", ["runs", "ran"]),
+            )),
+        )
+        .expect("register");
+        let registered = docs
+            .bm25_search("title", "run", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&registered),
+            3,
+            "the registered family finds every form"
+        );
+        let narrower = Bm25SearchOptions::new()
+            .with_expansion(Some(Arc::new(QueryExpansion::new().group("run", ["runs"]))));
+        let overridden = docs
+            .bm25_search("title", "run", TOP_K, narrower, None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&overridden),
+            2,
+            "the per-call family wins for this call"
+        );
+        let again = docs
+            .bm25_search("title", "run", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(n_rows(&again), 3, "the registration is untouched");
+
+        let err = docs
+            .set_query_expansion("nope", Some(Arc::new(QueryExpansion::new().stop(["the"]))))
+            .expect_err("no FTS index on `nope`");
+        assert!(matches!(err, InfinoError::Config(_)), "got {err:?}");
+        assert!(err.to_string().contains("set_query_expansion"), "got {err}");
+        let err = docs
+            .set_query_expansion(
+                "title",
+                Some(Arc::new(QueryExpansion::new().group("run", ["new york"]))),
+            )
+            .expect_err("a two-word member");
+        assert!(
+            matches!(&err, InfinoError::Config(m) if m.contains("new york") && m.contains("title")),
+            "got {err:?}"
+        );
     }
 
     /// `create_database` is a no-op success on a local backend (the catalog

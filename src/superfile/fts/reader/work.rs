@@ -17,7 +17,8 @@ pub(super) fn term_cursor_bytes(cursors: &[TermCursor]) -> u64 {
 
 /// [`term_cursor_bytes`] for heterogeneous atoms: a phrase member counts
 /// its posting bytes **and** its position runs — positional verification
-/// is exactly the work that separates phrase cost from term cost.
+/// is exactly the work that separates phrase cost from term cost — and a
+/// group counts every member's postings.
 pub(super) fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
     atoms
         .iter()
@@ -28,6 +29,7 @@ pub(super) fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
                 .iter()
                 .map(|m| m.cursor.bytes.len() as u64 + m.positions.len() as u64)
                 .sum(),
+            AnyCursor::Group(g) => term_cursor_bytes(&g.members),
         })
         .sum()
 }
@@ -45,7 +47,8 @@ pub(super) fn term_cursor_ranges(cursors: &[TermCursor]) -> u64 {
 
 /// Byte-source ranges the atoms' builds requested: one per PFOR term's
 /// posting range; a phrase member adds one for its postings and one for
-/// its position runs. Inline legs (empty buffers) plan no fetch.
+/// its position runs; a group adds one per present member. Inline legs
+/// (empty buffers) plan no fetch.
 pub(super) fn atom_planned_ranges(atoms: &[AnyCursor]) -> u64 {
     let term_ranges = |c: &TermCursor| {
         if c.bytes.is_empty() {
@@ -63,6 +66,7 @@ pub(super) fn atom_planned_ranges(atoms: &[AnyCursor]) -> u64 {
                 .iter()
                 .map(|m| term_ranges(&m.cursor) + u64::from(!m.positions.is_empty()))
                 .sum(),
+            AnyCursor::Group(g) => term_cursor_ranges(&g.members),
         })
         .sum()
 }

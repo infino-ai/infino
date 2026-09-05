@@ -181,9 +181,12 @@ pub use error::InfinoError;
 // the `cargo-public-api` snapshot excludes — users cannot set these.
 #[cfg(feature = "test-helpers")]
 pub use superfile::VectorSearchOptions;
-/// Value types named by the public method signatures.
+/// Value types named by the public method signatures. `QueryExpansion`
+/// is the query-time vocabulary (stop terms + term groups) a caller
+/// registers per column with `Supertable::set_query_expansion` or passes
+/// per call through `Bm25SearchOptions::with_expansion`.
 pub use superfile::{
-    fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+    fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode, QueryExpansion},
     vector::distance::Metric,
 };
 pub use supertable::{

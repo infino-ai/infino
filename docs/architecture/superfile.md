@@ -120,10 +120,26 @@ counting verifies every candidate, so phrase counts are exact. On a
 column built without positions, a phrase query is a typed error, never
 a silent bag-of-words approximation.
 
+A caller may also supply a **query-time expansion**: stop terms and
+**term groups** — a word plus the surface forms that should count as it
+(`run`, `runs`, `running`, `ran`). Stop terms are dropped from a query's
+bare words at the parse step (quoted phrases and explicitly signed `+` /
+`-` words are the caller's intent and are left alone; a query that
+would become empty keeps its words). A group is scored as one BM25 atom
+over the unstemmed postings: its term frequency is the sum of the
+members' frequencies and its idf is the commonest member's, so a rare
+inflection cannot outscore the base form and a document holding two
+forms is credited for one term — the ranking a stemmed index would have
+given for the shared stem. Its block-level bound is the members' bounds
+summed under the group idf, which BM25's concave saturation keeps
+sound, so the pruning walks stay exact. The index itself is never
+changed and the same postings still answer literal matches.
+
 The same inverted index also answers **unranked token matching**:
 resolve the query tokens to their posting lists and intersect them (all
 tokens present) or union them (any token present) to get the matching
-document set, with no BM25 scoring. This is the boolean retrieval the
+document set, with no BM25 scoring; a term group is present wherever any
+of its members is. This is the boolean retrieval the
 table layer's SQL `WHERE` pushdown builds on; ranking and matching share
 one set of posting lists. The ordered term dictionary adds **term
 expansion**: a walk over one column's keys widens a prefix, suffix, or

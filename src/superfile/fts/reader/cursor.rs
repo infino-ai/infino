@@ -1055,6 +1055,36 @@ impl TermCursor {
             None => false,
         }
     }
+
+    // The three accessors below serve the composite atoms (phrase, group),
+    // which score several member terms as one BM25 atom under their own idf
+    // and therefore need each member's bounds with the member's idf divided
+    // out. They live past the hot doc-cursor methods for the same layout
+    // reason as `tf_at_contained`.
+
+    /// This cursor's bare idf — the scoring constant with the `(K1 + 1)`
+    /// factor removed (a query-term-frequency weight or a global-stats
+    /// override is already folded in).
+    #[inline]
+    pub(super) fn idf(&self) -> f32 {
+        self.idf_x_k1p1 / (bm25::K1 + 1.0)
+    }
+
+    /// The term-level upper bound with the idf divided out: the largest
+    /// saturated tf/length factor any of this term's docs reaches. A
+    /// composite atom combines these across its members (a phrase takes the
+    /// minimum, a group the sum) and multiplies its own idf back in.
+    #[inline]
+    pub(super) fn term_max_tf_factor(&self) -> f32 {
+        self.term_max_bm25 / self.idf()
+    }
+
+    /// [`Self::block_max_in_range`] with the idf divided out — the
+    /// range-level counterpart of [`Self::term_max_tf_factor`].
+    #[inline]
+    pub(super) fn block_max_tf_factor_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        self.block_max_in_range(range_start, range_end) / self.idf()
+    }
 }
 
 #[cfg(test)]

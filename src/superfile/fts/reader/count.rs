@@ -117,21 +117,23 @@ impl FtsReader {
         }
     }
 
-    /// Phrase-aware unranked match: the `local_doc_id`s matching the
-    /// terms + phrases under `mode`, ascending — the atoms sibling of
-    /// [`Self::token_match`], used whenever the match set contains a
-    /// phrase. Under `And`, a missing atom empties the set.
+    /// Atom-aware unranked match: the `local_doc_id`s matching the terms
+    /// + phrases + term groups under `mode`, ascending — the atoms sibling
+    /// of [`Self::token_match`], used whenever the match set contains a
+    /// phrase or a group. A group is present at a doc when any of its
+    /// members is. Under `And`, a missing atom empties the set.
     pub(crate) async fn atoms_match_ids(
         &self,
         column: &str,
         terms: &[&str],
         phrases: &[Vec<String>],
+        groups: &[Vec<String>],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None)
+            .build_atom_cursors(column_id, terms, phrases, groups, None)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -151,21 +153,26 @@ impl FtsReader {
         Ok((walk?, work))
     }
 
-    /// Phrase-aware unranked match **count** — the atoms sibling of
-    /// [`Self::token_match_count`].
+    /// Atom-aware unranked match **count** — the atoms sibling of
+    /// [`Self::token_match_count`]. Negated terms, phrases and groups
+    /// (a doc holding any member of a negated group is excluded) become a
+    /// skip-based exclusion gate; pass empty slices for an unnegated
+    /// count.
     pub(crate) async fn atoms_match_count(
         &self,
         column: &str,
         terms: &[&str],
         phrases: &[Vec<String>],
+        groups: &[Vec<String>],
         mode: BoolMode,
         neg_terms: &[&str],
         neg_phrases: &[Vec<String>],
+        neg_groups: &[Vec<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None)
+            .build_atom_cursors(column_id, terms, phrases, groups, None)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -180,9 +187,9 @@ impl FtsReader {
         // is only partially decoded. Empty ⇒ `None`, the same walk as an
         // unnegated count.
         let mut filter = None;
-        if !neg_terms.is_empty() || !neg_phrases.is_empty() {
+        if !neg_terms.is_empty() || !neg_phrases.is_empty() || !neg_groups.is_empty() {
             let (neg_built, neg_dict_ranges) = self
-                .build_atom_cursors(column_id, neg_terms, neg_phrases, None)
+                .build_atom_cursors(column_id, neg_terms, neg_phrases, neg_groups, None)
                 .await?;
             let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
             // Count the negated clause's posting work the same way the
@@ -463,6 +470,80 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    /// A term group is present at a doc when **any** member is; that is
+    /// the unranked semantics behind `token_match` / `count` once a
+    /// query token expands to its surface forms.
+    #[tokio::test]
+    async fn atoms_match_groups_are_any_member_in_both_modes() {
+        // build_blob: doc0 "rust async runtime", doc1 "tokio is a rust
+        // runtime", doc2 "java spring boot".
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        // A "language" group whose members span all three docs, plus an
+        // absent member that must be dropped silently.
+        let langs = vec![vec!["rust".to_string(), "java".into(), "kotlin".into()]];
+
+        // Or: the union of the members' postings.
+        let (ids, _) = r
+            .atoms_match_ids("body", &[], &[], &langs, BoolMode::Or)
+            .await
+            .expect("group or");
+        assert_eq!(ids, vec![0, 1, 2]);
+        // And with a term: docs holding `runtime` AND any member.
+        let (ids, _) = r
+            .atoms_match_ids("body", &["runtime"], &[], &langs, BoolMode::And)
+            .await
+            .expect("group and term");
+        assert_eq!(ids, vec![0, 1]);
+        // And with a term only `java`'s doc has: any-member still applies.
+        let (ids, _) = r
+            .atoms_match_ids("body", &["spring"], &[], &langs, BoolMode::And)
+            .await
+            .expect("group and rare term");
+        assert_eq!(ids, vec![2]);
+        // A group none of whose members exist is absent: under And it
+        // empties the set, under Or it contributes nothing.
+        let ghosts = vec![vec!["zzz".to_string(), "yyy".into()]];
+        let (ids, _) = r
+            .atoms_match_ids("body", &["rust"], &[], &ghosts, BoolMode::And)
+            .await
+            .expect("absent group and");
+        assert!(ids.is_empty());
+        let (ids, _) = r
+            .atoms_match_ids("body", &["rust"], &[], &ghosts, BoolMode::Or)
+            .await
+            .expect("absent group or");
+        assert_eq!(ids, vec![0, 1]);
+
+        // Counts agree with the materialized ids, negated group included:
+        // `runtime` docs minus any doc holding a member of {java, tokio}.
+        let neg = vec![vec!["java".to_string(), "tokio".into()]];
+        let (n, _) = r
+            .atoms_match_count("body", &["runtime"], &[], &[], BoolMode::Or, &[], &[], &neg)
+            .await
+            .expect("count with negated group");
+        assert_eq!(n, 1, "doc 1 holds `tokio`, doc 0 survives");
+        let (n, _) = r
+            .atoms_match_count("body", &[], &[], &langs, BoolMode::Or, &[], &[], &[])
+            .await
+            .expect("count group or");
+        assert_eq!(n, 3);
+        let (n, _) = r
+            .atoms_match_count(
+                "body",
+                &["runtime"],
+                &[],
+                &langs,
+                BoolMode::And,
+                &[],
+                &[],
+                &[],
+            )
+            .await
+            .expect("count group and");
+        assert_eq!(n, 2);
     }
 
     #[tokio::test]

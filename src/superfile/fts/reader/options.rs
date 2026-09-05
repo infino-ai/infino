@@ -5,6 +5,10 @@
 //! the [`Bm25Stats`] idf-source selector, and the [`Bm25SearchOptions`]
 //! builder. Part of the `fts::reader::*` public surface.
 
+use std::sync::Arc;
+
+use super::expansion::QueryExpansion;
+
 /// Default operator for a query's bare (sigil-less) terms. Terms
 /// carrying an explicit clause sigil keep their polarity regardless
 /// of mode: `+term` is a must (every hit contains it), `-term` a
@@ -52,26 +56,35 @@ impl From<&str> for Bm25Stats {
     }
 }
 
-/// Options for a BM25 search: the boolean `mode` and the corpus-statistics
-/// `stats`. Set fields with the `with_*` builders; [`Default`] is
-/// [`BoolMode::Or`] with [`Bm25Stats::PerSuperfile`].
+/// Options for a BM25 search: the boolean `mode`, the corpus-statistics
+/// `stats`, and an optional per-call query `expansion`. Set fields with
+/// the `with_*` builders; [`Default`] is [`BoolMode::Or`] with
+/// [`Bm25Stats::PerSuperfile`] and no expansion.
 ///
 /// ```ignore
 /// // OR mode, per-superfile stats (the defaults):
 /// Bm25SearchOptions::new()
 /// // AND mode, global stats:
 /// Bm25SearchOptions::new().with_mode(BoolMode::And).with_stats(Bm25Stats::Global)
+/// // A vocabulary for this call only:
+/// Bm25SearchOptions::new().with_expansion(Some(Arc::new(QueryExpansion::new().stop(["the"]))))
 /// ```
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct Bm25SearchOptions {
     /// Boolean mode for the query's bare terms (`Or` = should, `And` = must).
     pub mode: BoolMode,
     /// Which BM25 corpus statistics to score with.
     pub stats: Bm25Stats,
+    /// Stop terms and term groups applied to this call's query. `None`
+    /// (the default) applies whatever expansion is registered on the
+    /// table for the searched column; `Some` overrides that registration
+    /// for this call. See [`QueryExpansion`].
+    pub expansion: Option<Arc<QueryExpansion>>,
 }
 
 impl Bm25SearchOptions {
-    /// Default options: `Or` mode, per-superfile statistics.
+    /// Default options: `Or` mode, per-superfile statistics, no
+    /// per-call expansion.
     pub fn new() -> Self {
         Self::default()
     }
@@ -85,6 +98,13 @@ impl Bm25SearchOptions {
     /// Set which BM25 corpus statistics to score with.
     pub fn with_stats(mut self, stats: Bm25Stats) -> Self {
         self.stats = stats;
+        self
+    }
+
+    /// Apply a query-time expansion to this call only, overriding the
+    /// column's registration; `None` (the default) falls back to it.
+    pub fn with_expansion(mut self, expansion: Option<Arc<QueryExpansion>>) -> Self {
+        self.expansion = expansion;
         self
     }
 }

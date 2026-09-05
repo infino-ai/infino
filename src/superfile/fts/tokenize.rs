@@ -476,6 +476,11 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
 /// `+term` → `musts`, bare `term` → `positives`, `-term` →
 /// `negatives`. Tokens may borrow the query string, so this can't
 /// outlive the query.
+///
+/// The three group lists are empty straight out of the parser; a
+/// query-time expansion fills them by moving tokens that head a term
+/// group out of the term lists, so the parser itself never knows about
+/// vocabularies.
 #[derive(Debug, Default)]
 pub struct ParsedQuery<'q> {
     /// `+`-sigiled tokens: the doc must contain every one.
@@ -497,6 +502,16 @@ pub struct ParsedQuery<'q> {
     /// `-"…"`-quoted multi-token runs: any doc containing the exact
     /// sequence is excluded.
     pub negative_phrases: Vec<Vec<Cow<'q, str>>>,
+    /// `+`-sigiled tokens a query-time expansion turned into term
+    /// groups — each entry a head followed by its surface forms. The
+    /// doc must contain some member of every group.
+    pub must_groups: Vec<Vec<String>>,
+    /// Bare tokens turned into term groups; polarity resolved from the
+    /// default operator like bare terms.
+    pub positive_groups: Vec<Vec<String>>,
+    /// `-`-sigiled tokens turned into term groups: any doc containing
+    /// any member is excluded.
+    pub negative_groups: Vec<Vec<String>>,
 }
 
 /// A query's clause lists with the default operator already applied —
@@ -518,12 +533,21 @@ pub struct QueryClauses<'q> {
     pub should_phrases: Vec<Vec<Cow<'q, str>>>,
     /// Docs containing any of these exact sequences are excluded.
     pub negative_phrases: Vec<Vec<Cow<'q, str>>>,
+    /// Term groups every doc in the result must satisfy (some member
+    /// present). Empty unless a query-time expansion produced groups.
+    pub must_groups: Vec<Vec<String>>,
+    /// Scoring-only groups when `musts` / `must_phrases` / `must_groups`
+    /// is non-empty; otherwise part of the union match.
+    pub should_groups: Vec<Vec<String>>,
+    /// Docs containing any member of any of these are excluded.
+    pub negative_groups: Vec<Vec<String>>,
 }
 
 impl<'q> ParsedQuery<'q> {
     /// Resolve the bare tokens' polarity from the default operator
     /// `mode`: `And` folds them into `musts`, `Or` makes them
-    /// `shoulds`. Sigiled tokens keep their explicit polarity.
+    /// `shoulds`. Sigiled tokens keep their explicit polarity. Bare
+    /// phrases and bare term groups resolve the same way as bare terms.
     pub fn into_clauses(self, mode: BoolMode) -> QueryClauses<'q> {
         let ParsedQuery {
             mut musts,
@@ -532,6 +556,9 @@ impl<'q> ParsedQuery<'q> {
             mut must_phrases,
             positive_phrases,
             negative_phrases,
+            mut must_groups,
+            positive_groups,
+            negative_groups,
         } = self;
         let shoulds = match mode {
             BoolMode::And => {
@@ -547,6 +574,13 @@ impl<'q> ParsedQuery<'q> {
             }
             BoolMode::Or => positive_phrases,
         };
+        let should_groups = match mode {
+            BoolMode::And => {
+                must_groups.extend(positive_groups);
+                Vec::new()
+            }
+            BoolMode::Or => positive_groups,
+        };
         QueryClauses {
             musts,
             shoulds,
@@ -554,6 +588,9 @@ impl<'q> ParsedQuery<'q> {
             must_phrases,
             should_phrases,
             negative_phrases,
+            must_groups,
+            should_groups,
+            negative_groups,
         }
     }
 }

@@ -20,7 +20,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError,
-    OptimizeOptions, VectorFilter, VectorSearchOptions,
+    OptimizeOptions, QueryExpansion, VectorFilter, VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -393,6 +393,46 @@ async fn vector_tuning_overrides_are_rejected_on_the_remote_transport() {
     })
     .await;
     assert!(err.to_string().contains("remote transport"), "got: {err}");
+}
+
+#[tokio::test]
+async fn query_expansion_is_rejected_on_the_remote_transport() {
+    // A query-time vocabulary has no wire representation in this version:
+    // both registering one and carrying one per call must fail loudly
+    // before any wire I/O rather than silently serve the literal search.
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+
+    let vocab = Arc::new(QueryExpansion::new().stop(["the"]));
+    let (registered, per_call) = with_connection(server.uri(), |db| {
+        let table = db.open_table("posts").expect("open");
+        let registered = table
+            .set_query_expansion("id", Some(Arc::clone(&vocab)))
+            .expect_err("registration must be refused");
+        let per_call = table
+            .bm25_search(
+                "id",
+                "hello",
+                10,
+                Bm25SearchOptions::new().with_expansion(Some(vocab)),
+                None,
+            )
+            .expect_err("a per-call expansion must be refused");
+        (registered, per_call)
+    })
+    .await;
+    assert!(
+        matches!(registered, InfinoError::Query(_)),
+        "got: {registered:?}"
+    );
+    assert!(
+        registered.to_string().contains("remote transport"),
+        "got: {registered}"
+    );
+    assert!(
+        per_call.to_string().contains("remote transport"),
+        "got: {per_call}"
+    );
 }
 
 #[tokio::test]

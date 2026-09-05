@@ -5043,12 +5043,12 @@ mod tests {
         for (terms, want) in phrases {
             let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
             let a = v3
-                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .atoms_match_count("title", &[], &phrase, &[], BoolMode::And, &[], &[], &[])
                 .await
                 .expect("v3 phrase count")
                 .0;
             let b = v2
-                .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
+                .atoms_match_count("title", &[], &phrase, &[], BoolMode::And, &[], &[], &[])
                 .await
                 .expect("v2 phrase count")
                 .0;

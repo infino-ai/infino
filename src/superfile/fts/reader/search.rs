@@ -412,10 +412,16 @@ impl FtsReader {
         }
         let floor_eff = floor.next_down();
 
-        if lists.has_phrases() {
-            // Phrase-bearing query: the heterogeneous atom walks.
+        if lists.needs_atom_walk() {
+            // Phrase- or group-bearing query: the heterogeneous atom walks.
             let (must_atoms, must_dict) = self
-                .build_atom_cursors(column_id, lists.musts, lists.must_phrases, lists.global_idf)
+                .build_atom_cursors(
+                    column_id,
+                    lists.musts,
+                    lists.must_phrases,
+                    lists.must_groups,
+                    lists.global_idf,
+                )
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
                 // A must atom can never match in this superfile. The
@@ -434,6 +440,7 @@ impl FtsReader {
                     column_id,
                     lists.shoulds,
                     lists.should_phrases,
+                    lists.should_groups,
                     lists.global_idf,
                 )
                 .await?;
@@ -441,7 +448,13 @@ impl FtsReader {
             // Negatives are a hard exclusion filter, not scored, so their
             // idf is irrelevant — always build them local.
             let (negative_built, negative_dict) = self
-                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases, None)
+                .build_atom_cursors(
+                    column_id,
+                    lists.negatives,
+                    lists.negative_phrases,
+                    lists.negative_groups,
+                    None,
+                )
                 .await?;
             let negative_atoms: Vec<AnyCursor> = negative_built.into_iter().flatten().collect();
             let postings_bytes = atom_cursor_bytes(&must_atoms)
@@ -1474,6 +1487,66 @@ mod tests {
             .expect("search excluding");
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(ids, vec![1], "doc 0 excluded by negated 'async'");
+    }
+
+    /// Under table-wide statistics a group scores with the smallest idf
+    /// among **all** its members' global values — the table's commonest
+    /// form — even when that form is absent from this superfile, and
+    /// even when the members present here are all rarer. The gather
+    /// stamps every member, so the map is the whole story.
+    #[tokio::test]
+    async fn group_under_global_idf_scores_with_the_table_wide_commonest_member() {
+        // build_blob: doc 2 "java spring boot" holds `java` once; `kotlin`
+        // appears nowhere in this superfile.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let group = vec![vec!["java".to_string(), "kotlin".into()]];
+        // Table-wide, `kotlin` is (hypothetically) far commoner than `java`.
+        let common_kotlin: f32 = 0.05;
+        let mut global: GlobalTermIdf = GlobalTermIdf::new();
+        global.insert("java".into(), 0.5);
+        global.insert("kotlin".into(), common_kotlin);
+        let hits = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    should_groups: &group,
+                    global_idf: Some(&global),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("group search under global idf");
+        assert_eq!(hits.len(), 1, "only doc 2 holds a member");
+        let (doc, score) = hits[0];
+        assert_eq!(doc, 2);
+        let dl_norm_k1 = r.columns[0].dl_norm_k1.get(doc);
+        let want = bm25::score_with_dl_norm_k1(common_kotlin * (bm25::K1 + 1.0), 1, dl_norm_k1);
+        assert!(
+            (score - want).abs() < 1e-6,
+            "group must score with the absent commonest member's idf: got {score}, want {want}"
+        );
+        // Without a global map the same group takes the smallest idf among
+        // the members present here — `java`'s local idf — which is larger.
+        let local = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    should_groups: &group,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("group search under local idf");
+        assert!(
+            local[0].1 > score,
+            "local idf ({}) must exceed the table-wide commonest member's ({score})",
+            local[0].1
+        );
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ use rustc_hash::FxHashMap;
 use super::{
     cursor::{TermCursor, TermMeta},
     filter::ExcludeFilter,
+    group::GroupCursor,
     metadata::{ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
     sink::{TopKEntry, drain_top_k_desc},
@@ -65,9 +66,9 @@ const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 pub(crate) type GlobalTermIdf = std::collections::HashMap<String, f32>;
 
 /// A query's parsed clause lists, borrowed for one search call —
-/// terms and phrases per polarity, with the default operator already
-/// resolved (see `ParsedQuery::into_clauses`). Grouped so the search
-/// entry points don't take nine parallel parameters.
+/// terms, phrases and term groups per polarity, with the default
+/// operator already resolved (see `ParsedQuery::into_clauses`). Grouped
+/// so the search entry points don't take a dozen parallel parameters.
 #[derive(Default)]
 pub(crate) struct ClauseLists<'a> {
     pub musts: &'a [&'a str],
@@ -76,17 +77,27 @@ pub(crate) struct ClauseLists<'a> {
     pub must_phrases: &'a [Vec<String>],
     pub should_phrases: &'a [Vec<String>],
     pub negative_phrases: &'a [Vec<String>],
+    /// Term groups (a head plus its surface forms, from a query-time
+    /// expansion), one scoring unit each: any member present satisfies
+    /// a must group, any member present excludes under a negative one.
+    pub must_groups: &'a [Vec<String>],
+    pub should_groups: &'a [Vec<String>],
+    pub negative_groups: &'a [Vec<String>],
     /// Per-term global idf for [`Bm25Stats::Global`]; `None` scores
     /// with per-superfile local idf (the default).
     pub global_idf: Option<&'a GlobalTermIdf>,
 }
 
 impl ClauseLists<'_> {
-    /// Any phrase atom anywhere routes the query to the atom walks.
-    pub(super) fn has_phrases(&self) -> bool {
+    /// Any phrase or group atom anywhere routes the query to the atom
+    /// walks; a term-only query keeps the field-level kernels.
+    pub(super) fn needs_atom_walk(&self) -> bool {
         !self.must_phrases.is_empty()
             || !self.should_phrases.is_empty()
             || !self.negative_phrases.is_empty()
+            || !self.must_groups.is_empty()
+            || !self.should_groups.is_empty()
+            || !self.negative_groups.is_empty()
     }
 
     /// Nothing to rank or match on the positive side.
@@ -95,11 +106,15 @@ impl ClauseLists<'_> {
             && self.shoulds.is_empty()
             && self.must_phrases.is_empty()
             && self.should_phrases.is_empty()
+            && self.must_groups.is_empty()
+            && self.should_groups.is_empty()
     }
 
     /// Nothing negated either.
     pub(super) fn no_negative_atoms(&self) -> bool {
-        self.negatives.is_empty() && self.negative_phrases.is_empty()
+        self.negatives.is_empty()
+            && self.negative_phrases.is_empty()
+            && self.negative_groups.is_empty()
     }
 }
 
@@ -1099,10 +1114,11 @@ impl FtsReader {
     }
 
     /// Build one [`AnyCursor`] per requested atom, preserving input
-    /// order: first the `terms`, then the `phrases`. An atom whose
-    /// term (or any phrase member) is absent from the column yields
-    /// `None` — the caller applies polarity semantics (a missing must
-    /// empties the result; a missing should or negative is dropped).
+    /// order: first the `terms`, then the `phrases`, then the `groups`.
+    /// An atom whose term (or any phrase member, or every group member)
+    /// is absent from the column yields `None` — the caller applies
+    /// polarity semantics (a missing must empties the result; a missing
+    /// should or negative is dropped).
     ///
     /// Multi-token phrases require the column to be positional;
     /// otherwise [`FtsError::PositionsUnavailable`].
@@ -1115,6 +1131,7 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         phrases: &[Vec<String>],
+        groups: &[Vec<String>],
         global_idf: Option<&GlobalTermIdf>,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
@@ -1124,7 +1141,8 @@ impl FtsReader {
             });
         }
         let mut dict_ranges = 0u64;
-        let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
+        let mut out: Vec<Option<AnyCursor>> =
+            Vec::with_capacity(terms.len() + phrases.len() + groups.len());
         // All bare terms in one FST open + one parallel postings fan-out
         // (arity-preserving: each term maps to its own slot, `None` when
         // absent), rather than a serial per-term build that re-fetched the
@@ -1207,6 +1225,35 @@ impl FtsReader {
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
                 cursors, positions, positional,
             )?)));
+        }
+        for group in groups {
+            let member_refs: Vec<&str> = group.iter().map(String::as_str).collect();
+            // Members this superfile lacks are dropped exactly as absent
+            // single terms are; a group with no member present is absent.
+            let cursors = self
+                .build_term_cursors(column_id, &member_refs, global_idf, false, None)
+                .await?;
+            dict_ranges += 1;
+            if cursors.is_empty() {
+                out.push(None);
+                continue;
+            }
+            // Under table-wide statistics the group scores with one idf
+            // everywhere: its commonest member's table-wide idf, counting
+            // members this particular superfile happens to lack. The gather
+            // stamped every member, so the smallest mapped idf is that
+            // value; per-superfile stats leave the choice to the cursor
+            // (smallest idf among the members present here).
+            let group_global_idf = global_idf.and_then(|map| {
+                member_refs
+                    .iter()
+                    .filter_map(|member| map.get(*member).copied())
+                    .reduce(f32::min)
+            });
+            out.push(Some(AnyCursor::Group(GroupCursor::new(
+                cursors,
+                group_global_idf,
+            ))));
         }
         Ok((out, dict_ranges))
     }
