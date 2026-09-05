@@ -499,22 +499,23 @@ impl FtsReader {
         // Single-atom fast path: BlockMaxWAND-driven block skipping.
         // One term scores identically whichever clause list it sits
         // in (a lone must and a lone should both rank that term's
-        // postings), so both shapes take it. Skipped under global stats
-        // — the bespoke single-term BMW does not take an idf override,
-        // so route a lone term through the general cursor path (which
-        // does) instead; correctness over the single-term micro-opt.
-        if lists.global_idf.is_none() && lists.musts.len() + lists.shoulds.len() == 1 {
+        // postings), so both shapes take it. A global-idf override rides
+        // along: the walk scores with it and rescales its stored bounds
+        // by the exact linear ratio, so the skip decisions stay as tight
+        // as the per-superfile path's.
+        if lists.musts.len() + lists.shoulds.len() == 1 {
             let term = lists
                 .musts
                 .iter()
                 .chain(lists.shoulds)
                 .next()
                 .expect("one atom");
+            let gidf = lists.global_idf.and_then(|m| m.get(*term).copied());
             let mut filter = neg_filter;
             let filter_postings_bytes = filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
             let filter_ranges = filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
             let (result, term_work, kernel_cpu_ns) = self
-                .search_single_term_bmw(column_id, term, k, filter.as_mut(), floor_eff)
+                .search_single_term_bmw(column_id, term, k, filter.as_mut(), floor_eff, gidf)
                 .await?;
             // +1: the BMW walk's own dictionary fetch.
             dict_ranges += 1;
@@ -833,6 +834,7 @@ impl FtsReader {
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
+        global_idf: Option<f32>,
     ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = Self::open_dict(&fst_bytes)?;
@@ -855,7 +857,7 @@ impl FtsReader {
                     true => 1,
                     false => tf,
                 };
-                let idf_t = bm25::idf(self.n_docs as u64, 1);
+                let idf_t = global_idf.unwrap_or_else(|| bm25::idf(self.n_docs as u64, 1));
                 let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
                 // The inline slot read no postings-region bytes; the
@@ -906,8 +908,19 @@ impl FtsReader {
             self.has_coarse_block_max,
         )?;
 
-        let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
+        let local_idf = bm25::idf(self.n_docs as u64, term_meta.df);
+        let idf_t = global_idf.unwrap_or(local_idf);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
+        // Stored block-max and coarse entries bake in the LOCAL idf. Scores
+        // below use the (possibly overridden) effective idf, and the score
+        // is linear in idf, so rescaling every stored bound by the ratio
+        // keeps bounds exactly as tight as the per-superfile path — the
+        // same exact rescale `TermCursor::new` applies (see cursor.rs).
+        let bound_rescale = if local_idf > 0.0 && idf_t != local_idf {
+            idf_t / local_idf
+        } else {
+            1.0
+        };
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
@@ -955,7 +968,7 @@ impl FtsReader {
             // Gather enough top spans to contain the top `m_want` blocks
             // (over-cover: worst case each is in its own span).
             let mut spans: Vec<(f32, usize)> = (0..num_coarse)
-                .map(|g| (term_meta.coarse_entry(postings, g), g))
+                .map(|g| (term_meta.coarse_entry(postings, g) * bound_rescale, g))
                 .collect();
             let s = m_want.max(seed::TOP_SPANS).min(spans.len());
             spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
@@ -967,7 +980,7 @@ impl FtsReader {
                 let end = (start + coarse_span).min(term_meta.num_blocks);
                 for bi in start..end {
                     let (_, _, bm) = term_meta.skip_entry(postings, bi);
-                    cand.push((bm, bi));
+                    cand.push((bm * bound_rescale, bi));
                 }
             }
             let m = m_want.min(cand.len());
@@ -1023,7 +1036,7 @@ impl FtsReader {
         let mut i = 0usize;
         while i < term_meta.num_blocks {
             if coarse_enabled && i.is_multiple_of(coarse_span) {
-                let coarse_max = term_meta.coarse_entry(postings, i / coarse_span);
+                let coarse_max = term_meta.coarse_entry(postings, i / coarse_span) * bound_rescale;
                 let span_end = (i + coarse_span).min(term_meta.num_blocks);
                 // Seed skip, span-wide (strict): no block in the span can
                 // reach the seeded lower bound on the k-th, so none can be
@@ -1052,7 +1065,8 @@ impl FtsReader {
 
             // last_doc_id (first tuple slot) is unused here — it serves
             // AND-merge seeks, which single-term never does.
-            let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
+            let (_, block_offset_in_term, raw_block_max) = term_meta.skip_entry(postings, i);
+            let block_max_bm25 = raw_block_max * bound_rescale;
 
             // Seed skip (strict): block can't reach the seeded lower bound
             // on the k-th, so it holds no top-k doc.
