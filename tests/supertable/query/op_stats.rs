@@ -256,6 +256,61 @@ fn fts_work_stats_repeat_identically_on_the_same_table_state() {
     assert_eq!(first, second, "same plan, same table state, same work");
 }
 
+/// Under `Bm25Stats::Global` the idf gather fans over the superfiles'
+/// term dictionaries — but idf is a pure function of the snapshot, so
+/// only the FIRST query per (generation, column, term) may pay that
+/// fan. A repeat query must plan exactly the per-superfile work, and a
+/// commit (new manifest generation) must bring the fan back once.
+#[test]
+fn global_stats_gather_fans_once_per_manifest_generation() {
+    let st = demo_two_superfiles();
+    let global = |st: &Supertable, q: &str| {
+        let (hits, stats) = with_op_stats(|| {
+            st.reader()
+                .expect("reader")
+                .bm25_hits_stats("title", q, TOP_K, BoolMode::Or, Bm25Stats::Global)
+                .expect("bm25")
+        });
+        assert!(!hits.is_empty(), "fixture query {q:?} must match");
+        stats.planned_read_ranges
+    };
+    let per_superfile = scoped_fts_stats(&st, "rust").planned_read_ranges;
+
+    let first = global(&st, "rust");
+    let repeat = global(&st, "rust");
+    assert!(
+        first > per_superfile,
+        "first global query pays the gather fan on top of the \
+         per-superfile plan ({first} vs {per_superfile})"
+    );
+    assert_eq!(
+        repeat, per_superfile,
+        "repeat query serves idf from the cache: per-superfile plan only"
+    );
+
+    // A commit publishes a new generation: the gather returns exactly
+    // once, then the repeat is cache-served again. The fixture grows a
+    // third superfile, so per-superfile work is re-measured too.
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&title_batch(&segment_titles(0), schema))
+        .expect("append seg3");
+    w.commit().expect("commit seg3");
+    drop(w);
+
+    let per_superfile_after = scoped_fts_stats(&st, "rust").planned_read_ranges;
+    let first_after = global(&st, "rust");
+    let repeat_after = global(&st, "rust");
+    assert!(
+        first_after > per_superfile_after,
+        "new generation re-gathers ({first_after} vs {per_superfile_after})"
+    );
+    assert_eq!(
+        repeat_after, per_superfile_after,
+        "cache re-serves under the new generation"
+    );
+}
+
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),

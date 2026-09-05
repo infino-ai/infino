@@ -54,6 +54,7 @@ use crate::{
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         query::{
+            fts::GlobalIdfCache,
             scalar_cache::DecodedScalarCache,
             sql::{SqlSchemas, build_sql_schemas},
         },
@@ -147,6 +148,11 @@ pub(super) struct SupertableInner {
     /// Bounded decoded-row cache shared by all readers of this immutable
     /// supertable handle.
     pub(super) decoded_scalar_cache: DecodedScalarCache,
+    /// Per-generation cache of global BM25 idf per (column, term),
+    /// shared by every reader minted from this handle so repeat
+    /// queries under `Bm25Stats::Global` skip the dictionary gather
+    /// fan — see [`GlobalIdfCache`].
+    pub(super) global_idf_cache: GlobalIdfCache,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -1663,6 +1669,7 @@ async fn build_handle(
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
+        global_idf_cache: GlobalIdfCache::default(),
         tombstone_cache,
         handle_id,
         vector_index_table,
@@ -2001,6 +2008,12 @@ impl SupertableReader {
 
     pub(crate) fn decoded_scalar_cache(&self) -> &DecodedScalarCache {
         &self.inner.decoded_scalar_cache
+    }
+
+    /// Per-generation global BM25 idf cache shared across every reader
+    /// minted from this supertable — see [`GlobalIdfCache`].
+    pub(crate) fn global_idf_cache(&self) -> &GlobalIdfCache {
+        &self.inner.global_idf_cache
     }
 
     /// The shared `Arc<SupertableInner>` backing this reader. Used to

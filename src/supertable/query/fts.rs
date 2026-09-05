@@ -82,7 +82,7 @@ use std::{
     collections::{BinaryHeap, HashMap},
     slice,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{self, AtomicU32},
     },
     time::Instant,
@@ -145,6 +145,91 @@ use crate::{
         tombstones::SidecarCache,
     },
 };
+
+/// Cap on cached (column, term) global-idf entries. Past it the map is
+/// cleared and repopulates from subsequent queries — an epoch reset
+/// instead of LRU bookkeeping, sized far above any realistic distinct
+/// scored-term working set.
+const GLOBAL_IDF_CACHE_MAX_TERMS: usize = 65_536;
+
+/// Process-lifetime cache of global BM25 idf per `(column, term)`,
+/// valid for exactly one manifest generation.
+///
+/// Global idf is a pure function of the pinned snapshot (corpus-wide
+/// `N` plus the term's summed `df`), so without a cache every query
+/// under [`Bm25Stats::Global`] re-runs the dictionary gather fan over
+/// all unpruned superfiles — measured as a flat ~0.3–1.7 ms added to
+/// every warm query at 10M docs / 256 superfiles. Caching per
+/// generation makes only the first query for a term pay the fan.
+///
+/// One generation at a time: a commit publishes a higher
+/// `manifest_id`, and the first query against the newer snapshot
+/// resets the map. A reader still pinned to an older snapshot bypasses
+/// the cache (never repopulates backwards), so mixed-generation
+/// readers stay correct at the cost of gathering uncached.
+pub(crate) struct GlobalIdfCache {
+    state: RwLock<GlobalIdfCacheState>,
+}
+
+struct GlobalIdfCacheState {
+    manifest_id: u64,
+    idf: HashMap<(Box<str>, Box<str>), f32>,
+}
+
+impl Default for GlobalIdfCache {
+    fn default() -> Self {
+        Self {
+            state: RwLock::new(GlobalIdfCacheState {
+                manifest_id: 0,
+                idf: HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl GlobalIdfCache {
+    /// Cached idf per term under `manifest_id`, `None` per miss. Every
+    /// slot is a miss when the cache tracks a different generation.
+    fn get(&self, manifest_id: u64, column: &str, terms: &[String]) -> Vec<Option<f32>> {
+        let state = self.state.read().expect("global idf cache lock");
+        if state.manifest_id != manifest_id {
+            return vec![None; terms.len()];
+        }
+        terms
+            .iter()
+            .map(|t| {
+                state
+                    .idf
+                    .get(&(Box::from(column), Box::from(t.as_str())))
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// Record gathered idfs under `manifest_id`. A newer generation
+    /// resets the map to it; an older one is dropped (a pinned
+    /// old-snapshot reader must not clobber current-generation
+    /// entries).
+    fn insert(&self, manifest_id: u64, column: &str, entries: &[(&str, f32)]) {
+        let mut state = self.state.write().expect("global idf cache lock");
+        match manifest_id.cmp(&state.manifest_id) {
+            Ordering::Less => return,
+            Ordering::Greater => {
+                state.manifest_id = manifest_id;
+                state.idf.clear();
+            }
+            Ordering::Equal => {}
+        }
+        if state.idf.len() + entries.len() > GLOBAL_IDF_CACHE_MAX_TERMS {
+            state.idf.clear();
+        }
+        for (term, idf) in entries {
+            state
+                .idf
+                .insert((Box::from(column), Box::from(*term)), *idf);
+        }
+    }
+}
 
 /// An unranked query's match set: the terms and exact phrases every
 /// (`And`) or any (`Or`) of which a doc must contain. Produced by
@@ -714,6 +799,26 @@ impl SupertableReader {
         if terms.is_empty() || global_n == 0 {
             return Ok(map);
         }
+        // Idf is a pure function of the snapshot, so serve repeat terms
+        // from the per-generation cache and fan only over the misses.
+        let manifest_id = manifest.manifest_id;
+        let cache = self.global_idf_cache();
+        let cached = cache.get(manifest_id, column, terms);
+        let misses: Vec<String> = terms
+            .iter()
+            .zip(cached.iter())
+            .filter(|(_, c)| c.is_none())
+            .map(|(t, _)| t.clone())
+            .collect();
+        for (t, c) in terms.iter().zip(cached) {
+            if let Some(idf) = c {
+                map.insert(t.clone(), idf);
+            }
+        }
+        if misses.is_empty() {
+            return Ok(map);
+        }
+        let terms = &misses;
         let prune = PruneLeaf::TermPresence {
             column: column.to_owned(),
             terms: terms.to_vec(),
@@ -761,12 +866,16 @@ impl SupertableReader {
                 global_df[i] += d;
             }
         }
+        let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(terms.len());
         for (i, t) in terms.iter().enumerate() {
             // df can't exceed the collection size; clamp so idf's
             // df <= n_docs invariant holds under gross-vs-live counts.
             let df = global_df[i].min(global_n);
-            map.insert(t.clone(), bm25::idf(global_n, df));
+            let idf = bm25::idf(global_n, df);
+            map.insert(t.clone(), idf);
+            fresh.push((t.as_str(), idf));
         }
+        cache.insert(manifest_id, column, &fresh);
         Ok(map)
     }
 
@@ -2120,6 +2229,53 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The per-generation global-idf cache must refresh when a commit
+    /// publishes a new manifest: raising a term's corpus-wide df must
+    /// lower its global idf on the SAME handle whose earlier queries
+    /// populated the cache. A stale cache would keep the old idf and
+    /// this score would not move.
+    #[test]
+    fn global_idf_refreshes_after_commit_raises_df() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        // Segment 1: "alpha" is rare (1 of 4 uniform-length docs).
+        let seg1 = [
+            "alpha shared red d00",
+            "beta shared red d01",
+            "beta shared green d02",
+            "beta shared green d03",
+        ];
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(0, &seg1)).expect("append seg1");
+            w.commit().expect("commit seg1");
+        }
+        let before = all_scored(&st, "alpha", Bm25Stats::Global);
+        let repeat = all_scored(&st, "alpha", Bm25Stats::Global);
+        assert_eq!(before, repeat, "same snapshot must score identically");
+        let before_top = before[0].1;
+
+        // Segment 2: every doc carries "alpha" — global df rises, so
+        // global idf (and every alpha score) must drop after the commit.
+        let seg2 = [
+            "alpha shared red d10",
+            "alpha shared red d11",
+            "alpha shared green d12",
+            "alpha shared green d13",
+        ];
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(0, &seg2)).expect("append seg2");
+            w.commit().expect("commit seg2");
+        }
+        let after = all_scored(&st, "alpha", Bm25Stats::Global);
+        let after_top = after.iter().map(|(_, s)| *s).fold(f32::MIN, f32::max);
+        assert!(
+            after_top < before_top,
+            "df went 1/4 -> 5/8: global idf must drop \
+             (top before {before_top}, top after {after_top})"
+        );
     }
 
     /// Oracle for `Bm25Stats::Global`: a table split across many
