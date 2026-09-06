@@ -849,14 +849,41 @@ impl SupertableReader {
             return Ok((map, None));
         }
 
+        // Maintenance-published corpus stats first: the sidecar sums gross
+        // df over its covered superfiles, so the wave below shrinks to the
+        // uncovered tail (recent commits) — and vanishes entirely on a
+        // table whose maintenance is current, restoring the single fully
+        // overlapped dispatch of the per-superfile plan. A load failure
+        // degrades to the full query-time wave.
+        let sidecar = self.term_stats_sidecar().await;
+        let covered: HashSet<Uuid> = sidecar
+            .as_ref()
+            .map(|s| s.covered().iter().copied().collect())
+            .unwrap_or_default();
+        debug_assert!(
+            {
+                let current: HashSet<Uuid> =
+                    manifest.superfiles.iter().map(|e| e.superfile_id).collect();
+                covered.iter().all(|id| current.contains(id))
+            },
+            "term-stats sidecar covers a removed superfile — the manifest \
+             carry rule must drop the ref on any removal"
+        );
+
         // Presence prune over the missing terms: every superfile whose
-        // bloom may contain any of them owes a df contribution.
+        // bloom may contain any of them owes a df contribution — minus the
+        // sidecar-covered set, whose contribution is already summed.
         let prune = PruneLeaf::TermPresence {
             column: column.to_owned(),
             terms: misses.clone(),
             mode: BoolMode::Or,
         };
-        let presence = select_superfiles(manifest, slice::from_ref(&prune)).await?;
+        let presence: Vec<Arc<SuperfileEntry>> =
+            select_superfiles(manifest, slice::from_ref(&prune))
+                .await?
+                .into_iter()
+                .filter(|e| !covered.contains(&e.superfile_id))
+                .collect();
         let kept_ids: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
         let column_arc = Arc::new(column.to_owned());
         let terms_arc: Arc<Vec<String>> = Arc::new(misses.clone());
@@ -924,9 +951,12 @@ impl SupertableReader {
         }
         let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
         for (i, t) in misses.iter().enumerate() {
-            // df can't exceed the collection size; clamp so idf's
-            // df <= n_docs invariant holds under gross-vs-live counts.
-            let df = global_df[i].min(global_n);
+            // Sidecar-covered superfiles' contribution rides the artifact;
+            // the wave above summed only the uncovered tail. df can't
+            // exceed the collection size; clamp so idf's df <= n_docs
+            // invariant holds under gross-vs-live counts.
+            let sidecar_df = sidecar.as_ref().map_or(0, |s| s.df(column, t));
+            let df = (global_df[i] + sidecar_df).min(global_n);
             let idf = bm25::idf(global_n, df);
             map.insert(t.clone(), idf);
             fresh.push((t.as_str(), idf));
