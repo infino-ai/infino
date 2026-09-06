@@ -50,7 +50,7 @@ use std::{
 };
 
 use infino::{
-    OptimizeOptions,
+    CompactionSettings, OptimizeOptions,
     supertable::{
         Supertable,
         manifest::{ClusterCentroids, SuperfileEntry},
@@ -526,7 +526,9 @@ fn listed_objects_under(table: &Supertable, prefix: &str) -> Option<Vec<(String,
 
 /// Cap on printed first-cold-query trace lines; the tail is summarized so a
 /// pre-drain fan (hundreds of GETs) can't flood the log.
-const COLD_TRACE_PRINT_MAX: usize = 12;
+// Raised (from 12) while the trace is forced on: the anomalous post-compact
+// open fans ~25 requests and the whole fan is the evidence.
+const COLD_TRACE_PRINT_MAX: usize = 40;
 /// Opt-in request-level cold trace; normal reports show only aggregate tables.
 const COLD_TRACE_ENV: &str = "INFINO_TRACE_VECTOR_COLD_FAN";
 
@@ -603,8 +605,14 @@ fn log_query_read_trace(prefix: &str, phase: &str, trace: &[storage_meter::Trace
     }
 }
 
+/// Temporarily forced on: the post-compact cold fan reads user data only
+/// on the CI VM, and the per-request trace is the diagnostic that names
+/// the exact objects. Revert to the env opt-in once that run is
+/// understood.
+const FORCE_COLD_TRACE: bool = true;
+
 fn cold_trace_enabled() -> bool {
-    env::var_os(COLD_TRACE_ENV).is_some()
+    FORCE_COLD_TRACE || env::var_os(COLD_TRACE_ENV).is_some()
 }
 
 /// Spread one cold consumer's metered + timed windows into the cost model's
@@ -1716,6 +1724,30 @@ pub mod fts {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
+        // Maintenance parity for the global-stats default: publish the
+        // term-stats sidecar over the fresh fragmented layout via a
+        // stats-only optimize (both merge triggers disabled, so the
+        // superfile layout is untouched). The read phases then measure
+        // the maintained shape a production table sits in. On an engine
+        // without the sidecar this is a no-op maintenance pass.
+        if corpus.is_some() && phases.reads() {
+            let (cache_dir, admin) = open_consumer(Modality::Fts, &built);
+            let stats_only = OptimizeOptions::compact(CompactionSettings {
+                min_fill_percent: 100,
+                min_superfiles_for_merge: u64::MAX,
+                ..CompactionSettings::default()
+            });
+            let (result, wall, _cpu) = cpu::timed(|| admin.optimize(&stats_only));
+            result.expect("stats-only optimize");
+            eprintln!(
+                "[supertable_fts] term-stats maintenance (stats-only optimize): {:.1}s, {} superfiles",
+                wall.as_secs_f64(),
+                admin.reader().expect("reader").n_superfiles()
+            );
+            drop(admin);
+            drop(cache_dir);
+        }
+
         // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
         // → compact → post-compact) on a fresh ingest in this process —
         // same gate as the vector cell. Drain is a no-op without a hidden
@@ -1900,7 +1932,7 @@ pub mod fts {
                                 &query,
                                 TOP_K,
                                 exec_fts::to_infino_mode(q.mode),
-                                infino::Bm25Stats::PerSuperfile,
+                                infino::Bm25Stats::default(),
                                 None,
                             )
                             .expect("serving working-set bm25_search");
@@ -2113,7 +2145,7 @@ pub mod fts {
                             &query,
                             TOP_K,
                             mode,
-                            infino::Bm25Stats::PerSuperfile,
+                            infino::Bm25Stats::default(),
                             None,
                         )
                         .expect("routing-state warm bm25 search"),
@@ -2165,7 +2197,7 @@ pub mod fts {
                     &query,
                     TOP_K,
                     exec_fts::to_infino_mode(q.mode),
-                    infino::Bm25Stats::PerSuperfile,
+                    infino::Bm25Stats::default(),
                     None,
                 )
                 .expect("warm prewarm bm25_search");
@@ -2285,7 +2317,7 @@ pub mod fts {
                         &terms,
                         TOP_K,
                         mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        infino::Bm25Stats::default(),
                         None,
                     )
                     .expect("metered cold bm25_search");
@@ -2302,7 +2334,7 @@ pub mod fts {
                         &terms,
                         TOP_K,
                         mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        infino::Bm25Stats::default(),
                         None,
                     )
                     .expect("metered steady cold bm25_search");
@@ -2319,7 +2351,7 @@ pub mod fts {
                         &terms,
                         TOP_K,
                         mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        infino::Bm25Stats::default(),
                         None,
                     )
                     .expect("metered repeat cold bm25_search");
@@ -2361,14 +2393,7 @@ pub mod fts {
             self.consumer
                 .reader()
                 .expect("reader")
-                .bm25_search(
-                    column,
-                    query,
-                    k,
-                    mode,
-                    infino::Bm25Stats::PerSuperfile,
-                    None,
-                )
+                .bm25_search(column, query, k, mode, infino::Bm25Stats::default(), None)
                 .expect("cold bm25_search")
                 .iter()
                 .map(|b| b.num_rows())
@@ -2390,7 +2415,7 @@ pub mod fts {
                     query,
                     k,
                     mode,
-                    infino::Bm25Stats::PerSuperfile,
+                    infino::Bm25Stats::default(),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("cold bm25_search fetched")
@@ -3532,11 +3557,18 @@ pub mod vector {
         );
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let trace_enabled = cold_trace_enabled();
+        let mut open_trace = None;
         let mut first_query_trace = None;
         let mut steady_trace = None;
         let measured = cold_store::measure_cold_store(
             &meter,
             || {
+                // Arm the trace across the open itself: an open that reads
+                // data-class bytes is exactly the anomaly the per-request
+                // listing needs to name.
+                if trace_enabled {
+                    meter.start_trace();
+                }
                 let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
                     meter.provider(),
                     Some(cache_budget_bytes),
@@ -3553,6 +3585,7 @@ pub mod vector {
             },
             |(consumer, _cache)| {
                 if trace_enabled {
+                    open_trace = Some(meter.take_trace());
                     meter.start_trace();
                 }
                 let _ = consumer
@@ -3609,6 +3642,9 @@ pub mod vector {
             },
         );
         log_cold_split(label, &measured.split);
+        if let Some(trace) = open_trace {
+            log_query_read_trace(label, "cold open", &trace);
+        }
         if let Some(trace) = first_query_trace {
             log_query_read_trace(label, "first cold query", &trace);
         }

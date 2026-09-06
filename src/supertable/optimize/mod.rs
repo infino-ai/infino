@@ -33,6 +33,12 @@ impl Supertable {
         self.drain_hidden_vector_cells_sync()
             .map_err(|e| OptimizeError::Build(e.to_string()))?;
         self.compact(&opts.compaction)?;
+        // Refresh the global term-stats sidecar over the post-merge
+        // membership (compaction's removals dropped any prior reference —
+        // see the manifest carry rule). Runs before gc so the sweep's live
+        // set names the fresh artifact.
+        self.refresh_term_stats_sync()
+            .map_err(|e| OptimizeError::Build(e.to_string()))?;
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}
             Err(e) => return Err(OptimizeError::Gc(e)),

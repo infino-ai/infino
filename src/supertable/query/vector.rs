@@ -5733,6 +5733,18 @@ impl SupertableReader {
         let mut hidden_hits = hidden_hits?;
         let deleted = deleted?;
         let user_entries = user_entries.map_err(QueryError::ManifestLoad)?;
+        // Temporary diagnostic (remove once the post-compact tail fan is
+        // understood): when the undrained fan fires, print which superfile
+        // birth versions the hidden index's drained ranges fail to cover,
+        // so a run that unexpectedly reads user data names the exact gap.
+        if !user_entries.is_empty() {
+            let births: Vec<u64> = user_entries.iter().map(|e| e.birth_version).collect();
+            eprintln!(
+                "[vector-tail] manifest_id={} tail={} births={births:?} drained={drained:?}",
+                self.manifest().get_manifest_id(),
+                user_entries.len(),
+            );
+        }
 
         // Wave 2 only when the resident user list identifies files newer than
         // the hidden watermark.

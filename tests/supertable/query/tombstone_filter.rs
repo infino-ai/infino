@@ -34,7 +34,10 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::FtsConfig,
-        fts::{reader::BoolMode, tokenize::Tokenizer},
+        fts::{
+            reader::{Bm25Stats, BoolMode},
+            tokenize::Tokenizer,
+        },
     },
     supertable::{
         Supertable, SupertableOptions,
@@ -706,5 +709,136 @@ async fn vector_query_backfills_across_superfiles_after_deletes() {
             !deleted_set.contains(title),
             "a tombstoned row ({title}) resurfaced after delete"
         );
+    }
+}
+
+// ---- tombstones and the fan-out's shared score floor ---------------
+//
+// The fan-out shares a top-k floor across superfile kernels, and the
+// phrase (atom) walks both prune against it live and publish their
+// local kth-best into it. A kernel's heap is filtered for tombstones
+// only AFTER the kernel returns — so a superfile whose top phrase docs
+// are all deleted holds a local kth that overstates anything a reader
+// may return, and letting it publish would prune the true survivors in
+// every other superfile. The gate under test: a superfile with any
+// tombstoned row never publishes into the live floor.
+
+/// Phrase repeats in one high-tf title: enough anchors that the doomed
+/// segment's scores tower over every surviving doc's single anchor.
+const DOOMED_PHRASE_REPEATS: usize = 6;
+/// Surviving phrase docs — more than [`FLOOR_TOP_K`], so the expected
+/// result set is full-k even with the doomed segment gone.
+const SURVIVOR_PHRASE_DOCS: usize = 8;
+/// Top-k for the floor-soundness phrase query.
+const FLOOR_TOP_K: usize = 5;
+/// Query repetitions: the unsound publish is a race (the doomed
+/// segment's walk must finish before a survivor's), so the assertion
+/// loops enough times that a regression cannot hide behind scheduling.
+const FLOOR_QUERY_ITERS: usize = 30;
+
+/// Deleting every high-scoring phrase doc in one superfile must not
+/// depress other superfiles' results through the shared floor — under
+/// either BM25 stats mode.
+#[test]
+fn tombstoned_superfile_does_not_raise_the_shared_phrase_floor() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "title",
+        DataType::LargeUtf8,
+        false,
+    )]));
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("pool"),
+    );
+    let opts = SupertableOptions::new(
+        Arc::clone(&schema),
+        vec![FtsConfig::new("title").positions(true)],
+        vec![],
+    )
+    .expect("options")
+    .with_writer_pool(pool)
+    .with_storage(storage);
+    let st = Supertable::create(opts).expect("create");
+
+    // Segment A (doomed): identical titles stacking the phrase, so its
+    // kernel-local top-k dwarfs every survivor score AND one predicate
+    // deletes the whole segment.
+    let doomed_title = ["alpha beta"; DOOMED_PHRASE_REPEATS].join(" ");
+    let doomed: Vec<&str> = vec![doomed_title.as_str(); FLOOR_TOP_K];
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(LargeStringArray::from(doomed)) as ArrayRef],
+    )
+    .expect("doomed batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append doomed");
+    w.commit().expect("commit doomed");
+
+    // Segment B (survivors): the phrase once per doc, distinct tails.
+    let survivor_titles: Vec<String> = (0..SURVIVOR_PHRASE_DOCS)
+        .map(|i| format!("alpha beta tail{i:02}"))
+        .collect();
+    let survivors: Vec<&str> = survivor_titles.iter().map(String::as_str).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(LargeStringArray::from(survivors)) as ArrayRef],
+    )
+    .expect("survivor batch");
+    w.append(&batch).expect("append survivors");
+    w.commit().expect("commit survivors");
+
+    let pending = w
+        .delete(col("title").eq(lit(doomed_title.as_str())))
+        .expect("delete doomed segment");
+    assert_eq!(pending.matched, FLOOR_TOP_K);
+    w.commit().expect("commit delete");
+    drop(w);
+
+    for stats in [Bm25Stats::Global, Bm25Stats::PerSuperfile] {
+        for _ in 0..FLOOR_QUERY_ITERS {
+            let batches = st
+                .reader()
+                .expect("reader")
+                .bm25_search(
+                    "title",
+                    "\"alpha beta\"",
+                    FLOOR_TOP_K,
+                    BoolMode::Or,
+                    stats,
+                    Some(&["title"]),
+                )
+                .expect("phrase search");
+            let titles: Vec<String> = batches
+                .iter()
+                .flat_map(|b| {
+                    let arr = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .expect("title column");
+                    (0..b.num_rows())
+                        .map(|i| arr.value(i).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                titles.len(),
+                FLOOR_TOP_K,
+                "phrase top-k underflowed ({stats:?}): a tombstoned segment's \
+                 kernel scores leaked into the shared floor and pruned the \
+                 surviving docs"
+            );
+            for t in &titles {
+                assert_ne!(
+                    t, &doomed_title,
+                    "a tombstoned row resurfaced in the phrase top-k ({stats:?})"
+                );
+            }
+        }
     }
 }

@@ -1130,7 +1130,7 @@ mod tests {
         let reader = FtsReader::open(bytes, json).expect("open FtsReader");
 
         let mut cursors = reader
-            .build_term_cursors(0, &["common"], None, false, None)
+            .build_term_cursors(0, &["common"], None, false, None, None)
             .await
             .expect("build term cursors");
         let cursor = cursors.first_mut().expect("`common` present in dictionary");

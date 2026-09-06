@@ -328,7 +328,7 @@ async fn reader_loop(
                     QUERY_TERM,
                     TOP_K,
                     BoolMode::Or,
-                    Bm25Stats::PerSuperfile,
+                    Bm25Stats::default(),
                     None,
                 )
                 .expect("bm25_search"),

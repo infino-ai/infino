@@ -250,7 +250,7 @@ fn measure_fts(st: &Supertable) -> Duration {
             QUERY_TERM,
             TOP_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::default(),
             None,
         )
         .expect("fts");
@@ -266,7 +266,7 @@ fn measure_fts(st: &Supertable) -> Duration {
                 black_box(QUERY_TERM),
                 black_box(TOP_K),
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::default(),
                 None,
             )
             .expect("fts");

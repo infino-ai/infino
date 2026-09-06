@@ -54,7 +54,7 @@
 //! drifts as the table fragments. [`Bm25Stats`] selects how a query
 //! handles this:
 //!
-//!  - [`Bm25Stats::PerSuperfile`] (default) scores each superfile
+//!  - [`Bm25Stats::PerSuperfile`] scores each superfile
 //!    against its own local statistics — no extra pass, fastest. For
 //!    `k ≥ 10` and reasonably balanced superfiles the top-k *set* still
 //!    converges to the global answer even if score *order* within the
@@ -79,12 +79,9 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     slice,
-    sync::{
-        Arc, Mutex,
-        atomic::{self, AtomicU32},
-    },
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
@@ -127,8 +124,8 @@ use crate::{
         fts::{
             bm25,
             reader::{
-                Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet,
-                PreparedClauses,
+                Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf, LiveFloor,
+                OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
             },
         },
     },
@@ -145,6 +142,97 @@ use crate::{
         tombstones::SidecarCache,
     },
 };
+
+/// Per-superfile open-wave fetches for one global-stats query, keyed by
+/// superfile id — `None` when every scored term came from the idf cache
+/// (or the query is per-superfile), in which case the walk wave fetches
+/// for itself exactly as before.
+type PrefetchMemos = Option<Arc<HashMap<Uuid, Arc<FetchedTermMemo>>>>;
+
+/// Cap on cached (column, term) global-idf entries. Past it the map is
+/// cleared and repopulates from subsequent queries — an epoch reset
+/// instead of LRU bookkeeping, sized far above any realistic distinct
+/// scored-term working set.
+const GLOBAL_IDF_CACHE_MAX_TERMS: usize = 65_536;
+
+/// Process-lifetime cache of global BM25 idf per `(column, term)`,
+/// valid for exactly one manifest generation.
+///
+/// Global idf is a pure function of the pinned snapshot (corpus-wide
+/// `N` plus the term's summed `df`), so without a cache every query
+/// under [`Bm25Stats::Global`] re-runs the dictionary gather fan over
+/// all unpruned superfiles — measured as a flat ~0.3–1.7 ms added to
+/// every warm query at 10M docs / 256 superfiles. Caching per
+/// generation makes only the first query for a term pay the fan.
+///
+/// One generation at a time: a commit publishes a higher
+/// `manifest_id`, and the first query against the newer snapshot
+/// resets the map. A reader still pinned to an older snapshot bypasses
+/// the cache (never repopulates backwards), so mixed-generation
+/// readers stay correct at the cost of gathering uncached.
+pub(crate) struct GlobalIdfCache {
+    state: RwLock<GlobalIdfCacheState>,
+}
+
+struct GlobalIdfCacheState {
+    manifest_id: u64,
+    idf: HashMap<(Box<str>, Box<str>), f32>,
+}
+
+impl Default for GlobalIdfCache {
+    fn default() -> Self {
+        Self {
+            state: RwLock::new(GlobalIdfCacheState {
+                manifest_id: 0,
+                idf: HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl GlobalIdfCache {
+    /// Cached idf per term under `manifest_id`, `None` per miss. Every
+    /// slot is a miss when the cache tracks a different generation.
+    fn get(&self, manifest_id: u64, column: &str, terms: &[String]) -> Vec<Option<f32>> {
+        let state = self.state.read().expect("global idf cache lock");
+        if state.manifest_id != manifest_id {
+            return vec![None; terms.len()];
+        }
+        terms
+            .iter()
+            .map(|t| {
+                state
+                    .idf
+                    .get(&(Box::from(column), Box::from(t.as_str())))
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// Record gathered idfs under `manifest_id`. A newer generation
+    /// resets the map to it; an older one is dropped (a pinned
+    /// old-snapshot reader must not clobber current-generation
+    /// entries).
+    fn insert(&self, manifest_id: u64, column: &str, entries: &[(&str, f32)]) {
+        let mut state = self.state.write().expect("global idf cache lock");
+        match manifest_id.cmp(&state.manifest_id) {
+            Ordering::Less => return,
+            Ordering::Greater => {
+                state.manifest_id = manifest_id;
+                state.idf.clear();
+            }
+            Ordering::Equal => {}
+        }
+        if state.idf.len() + entries.len() > GLOBAL_IDF_CACHE_MAX_TERMS {
+            state.idf.clear();
+        }
+        for (term, idf) in entries {
+            state
+                .idf
+                .insert((Box::from(column), Box::from(*term)), *idf);
+        }
+    }
+}
 
 /// An unranked query's match set: the terms and exact phrases every
 /// (`And`) or any (`Or`) of which a doc must contain. Produced by
@@ -235,9 +323,11 @@ struct SharedTopK {
     k: usize,
     /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
     heap: Mutex<BinaryHeap<Reverse<OrdScore>>>,
-    /// f32 bits of the current floor; `NEG_INFINITY` until `k` scores
-    /// have been seen. Monotonically non-decreasing.
-    floor_bits: AtomicU32,
+    /// The current floor — `NEG_INFINITY` until `k` scores have been
+    /// seen, monotone after. Shared with the atom walks as their live
+    /// mid-walk bar (see [`LiveFloor`]), so it rises both from finished
+    /// segments' merges and from running walks' local kth-bests.
+    floor: LiveFloor,
 }
 
 /// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
@@ -261,13 +351,19 @@ impl SharedTopK {
         Arc::new(Self {
             k,
             heap: Mutex::new(BinaryHeap::new()),
-            floor_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            floor: LiveFloor::new(),
         })
     }
 
     /// The current global floor — `NEG_INFINITY` until k scores merged.
     fn floor(&self) -> f32 {
-        f32::from_bits(self.floor_bits.load(atomic::Ordering::Acquire))
+        self.floor.load()
+    }
+
+    /// The floor as the live handle the atom walks read and raise
+    /// mid-walk.
+    fn live_floor(&self) -> &LiveFloor {
+        &self.floor
     }
 
     /// Merge one finished segment's (tombstone-surviving) scores and
@@ -287,10 +383,10 @@ impl SharedTopK {
         if heap.len() == self.k
             && let Some(Reverse(OrdScore(min))) = heap.peek()
         {
-            // The heap min only rises, so a plain store stays monotone
-            // under the lock.
-            self.floor_bits
-                .store(min.to_bits(), atomic::Ordering::Release);
+            // `raise` rather than a plain store: running walks may have
+            // published a higher local kth than this merge's heap min,
+            // and the floor must never move down.
+            self.floor.raise(*min);
         }
     }
 }
@@ -418,16 +514,21 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Under global stats, gather corpus-wide idf per scored term once
-        // (global N from the manifest + df summed across the superfiles
-        // that contain the term), then score every superfile against it
-        // instead of its own per-superfile idf. The scored set is every
+        // Under global stats, corpus-wide idf per scored term comes from an
+        // OPEN WAVE fused with the query's own reads: each kept superfile
+        // fetches its scored terms' dictionary slots and postings ranges —
+        // exactly the reads its walk needs, handed back to it via a memo —
+        // and reports df; superfiles that may contain a scored term but were
+        // pruned from scoring (the AND-shape residual) contribute df through
+        // a dict-only probe in the same wave. Repeat terms skip the wave
+        // entirely via the per-generation idf cache. The scored set is every
         // term that contributes to a score: the bare musts + shoulds, plus
         // each member of a scored (must/should) phrase — a phrase's score
         // is Σ member idf. Negated terms/phrases are pure exclusions, so
-        // their idf never matters and they stay out of the gather.
-        let global_idf: Option<Arc<GlobalTermIdf>> = match stats {
-            Bm25Stats::PerSuperfile => None,
+        // their idf never matters and they stay out of the wave.
+        let (global_idf, prefetch_memos): (Option<Arc<GlobalTermIdf>>, PrefetchMemos) = match stats
+        {
+            Bm25Stats::PerSuperfile => (None, None),
             Bm25Stats::Global => {
                 let mut scored: Vec<String> = Vec::new();
                 let mut add = |t: &String| {
@@ -444,11 +545,13 @@ impl SupertableReader {
                     }
                 }
                 match scored.is_empty() {
-                    true => None,
-                    false => Some(Arc::new(
-                        self.gather_global_term_idf(manifest.as_ref(), column, &scored)
-                            .await?,
-                    )),
+                    true => (None, None),
+                    false => {
+                        let (map, memos) = self
+                            .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept)
+                            .await?;
+                        (Some(Arc::new(map)), memos)
+                    }
                 }
             }
         };
@@ -530,8 +633,14 @@ impl SupertableReader {
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
             let global_idf = global_idf.clone();
+            let prefetch_memos = prefetch_memos.clone();
             let op_stats = op_stats.clone();
             async move {
+                // This superfile's open-wave fetches (global stats): the
+                // cursor builds below serve the scored terms from the memo
+                // instead of re-reading what the df wave already fetched.
+                let memo: Option<Arc<FetchedTermMemo>> =
+                    prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned();
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
                 // scan against the running top-k instead of returning a full
@@ -544,6 +653,19 @@ impl SupertableReader {
                 // included — matches an uncoordinated run; only the amount
                 // of skipped work depends on segment completion order.
                 let floor = shared.floor();
+                // The atom walks may also read the floor LIVE mid-walk and
+                // publish their own local kth into it — but a kernel heap
+                // is pre-tombstone-filter, so only a superfile with no
+                // tombstoned rows may participate: its local kth is a
+                // floor the merge (which sees only surviving scores) can
+                // never contradict. The sidecars were warmed by the
+                // dispatcher, so this lookup is an in-memory hit; on a
+                // miss/error the unit just keeps the snapshot floor.
+                let live_floor = match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                    Some(Ok(bitmap)) if !bitmap.is_empty() => None,
+                    Some(Err(_)) => None,
+                    _ => Some(shared.live_floor()),
+                };
                 let hits = match range {
                     // Ranged units exist only for pure multi-should
                     // queries (`fanout_for` never slices when a must
@@ -567,6 +689,7 @@ impl SupertableReader {
                                         &column_arc,
                                         &should_refs,
                                         global_idf.as_deref(),
+                                        memo.as_deref(),
                                     )
                                     .await
                                     .map_err(fts_read_error)?;
@@ -628,6 +751,8 @@ impl SupertableReader {
                                     should_phrases: &should_ph_arc,
                                     negative_phrases: &neg_ph_arc,
                                     global_idf: global_idf.as_deref(),
+                                    prefetched: memo.as_deref(),
+                                    live_floor,
                                 },
                                 k,
                                 floor,
@@ -697,77 +822,166 @@ impl SupertableReader {
         Ok(hits)
     }
 
-    /// Gather global BM25 idf per scored term for [`Bm25Stats::Global`]:
-    /// corpus-wide `N` from the manifest, plus each term's `df` summed
-    /// across the superfiles that contain it (bloom-pruned — a superfile
-    /// absent the term contributes `df = 0`, so the pruned set covers
-    /// every term's postings). The `df` read is `O(1)` per superfile
-    /// from the stored dictionary value.
-    async fn gather_global_term_idf(
+    /// Global BM25 idf per scored term for [`Bm25Stats::Global`], via the
+    /// fused open wave: corpus-wide `N` from the manifest, df per term
+    /// summed across (a) the scoring-kept superfiles — which fetch their
+    /// scored terms' postings ranges here, the very reads their walks
+    /// need, returned to them as per-superfile memos — and (b) the
+    /// presence residual (superfiles that may contain a scored term but
+    /// were pruned from scoring), which contribute df through a
+    /// dict-only probe in the same wave. Terms already cached for this
+    /// manifest generation skip the wave entirely.
+    ///
+    /// Work accounting: memo fetches are NOT flushed here — the walk
+    /// wave's cursors report them, keeping per-query stats equal to the
+    /// per-superfile plan. Residual probes flush here (they have no
+    /// walk), bounded by presence − kept superfiles, dict-only.
+    async fn global_idf_open_wave(
         &self,
         manifest: &ManifestSnapshot,
         column: &str,
         terms: &[String],
-    ) -> Result<GlobalTermIdf, QueryError> {
+        kept: &[Arc<SuperfileEntry>],
+    ) -> Result<(GlobalTermIdf, PrefetchMemos), QueryError> {
         let mut map = GlobalTermIdf::with_capacity(terms.len());
         let global_n = manifest.n_docs_total();
         if terms.is_empty() || global_n == 0 {
-            return Ok(map);
+            return Ok((map, None));
         }
+        // Idf is a pure function of the snapshot, so serve repeat terms
+        // from the per-generation cache and run the wave only for misses.
+        let manifest_id = manifest.manifest_id;
+        let cache = self.global_idf_cache();
+        let cached = cache.get(manifest_id, column, terms);
+        for (t, c) in terms.iter().zip(cached.iter()) {
+            if let Some(idf) = c {
+                map.insert(t.clone(), *idf);
+            }
+        }
+        let misses: Vec<String> = terms
+            .iter()
+            .zip(cached.iter())
+            .filter(|(_, c)| c.is_none())
+            .map(|(t, _)| t.clone())
+            .collect();
+        if misses.is_empty() {
+            return Ok((map, None));
+        }
+
+        // Maintenance-published corpus stats first: the sidecar sums gross
+        // df over its covered superfiles, so the wave below shrinks to the
+        // uncovered tail (recent commits) — and vanishes entirely on a
+        // table whose maintenance is current, restoring the single fully
+        // overlapped dispatch of the per-superfile plan. A load failure
+        // degrades to the full query-time wave.
+        let sidecar = self.term_stats_sidecar().await;
+        let covered: HashSet<Uuid> = sidecar
+            .as_ref()
+            .map(|s| s.covered().iter().copied().collect())
+            .unwrap_or_default();
+        debug_assert!(
+            {
+                let current: HashSet<Uuid> =
+                    manifest.superfiles.iter().map(|e| e.superfile_id).collect();
+                covered.iter().all(|id| current.contains(id))
+            },
+            "term-stats sidecar covers a removed superfile — the manifest \
+             carry rule must drop the ref on any removal"
+        );
+
+        // Presence prune over the missing terms: every superfile whose
+        // bloom may contain any of them owes a df contribution — minus the
+        // sidecar-covered set, whose contribution is already summed.
         let prune = PruneLeaf::TermPresence {
             column: column.to_owned(),
-            terms: terms.to_vec(),
+            terms: misses.clone(),
             mode: BoolMode::Or,
         };
-        let kept = select_superfiles(manifest, slice::from_ref(&prune)).await?;
+        let presence: Vec<Arc<SuperfileEntry>> =
+            select_superfiles(manifest, slice::from_ref(&prune))
+                .await?
+                .into_iter()
+                .filter(|e| !covered.contains(&e.superfile_id))
+                .collect();
+        let kept_ids: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
         let column_arc = Arc::new(column.to_owned());
-        let terms_arc: Arc<Vec<String>> = Arc::new(terms.to_vec());
-        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let terms_arc: Arc<Vec<String>> = Arc::new(misses.clone());
+        let units: Vec<(Arc<SuperfileEntry>, (Uuid, bool))> = presence
+            .into_iter()
+            .map(|e| {
+                let suid = e.superfile_id;
+                let full = kept_ids.contains(&suid);
+                (e, (suid, full))
+            })
+            .collect();
         let op_stats = self.op_stats.clone();
-        let per_sf: Vec<Vec<u64>> = dispatch::fanout_with(
+        let per_sf: Vec<(Uuid, Vec<u64>, Option<Arc<FetchedTermMemo>>)> = dispatch::fanout_with(
             self,
             units,
             false,
             true,
-            move |r, _entry, _sidecars, _now, _params: ()| {
+            move |r, _entry, _sidecars, _now, (suid, full): (Uuid, bool)| {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
                 let op_stats = op_stats.clone();
                 async move {
-                    // One FST parse + one coalesced header fetch for all
-                    // scored terms in this superfile, rather than a parse
-                    // and fetch per term.
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
-                    let (dfs, work) = r
-                        .term_dfs(&column_arc, &refs)
-                        .await
-                        .map_err(fts_read_error)?;
-                    // The global-stats pre-pass reads real header ranges;
-                    // it is part of the query's plan and counts like any
-                    // other posting work.
-                    if let Some(stats) = &op_stats {
-                        stats.add_fts_postings_bytes(work.postings_bytes);
-                        stats.add_planned_read_ranges(work.planned_ranges);
-                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                    if full {
+                        // Scoring superfile: fetch the scored terms outright
+                        // — dictionary + postings ranges, the walk's own
+                        // reads — and hand them back through the memo. The
+                        // walk wave flushes this work when it builds the
+                        // cursors, so nothing is flushed here.
+                        let memo = r
+                            .fetch_scored_terms(&column_arc, &refs)
+                            .await
+                            .map_err(fts_read_error)?;
+                        let dfs: Vec<u64> = refs.iter().map(|t| memo.df(t)).collect();
+                        Ok::<_, QueryError>((suid, dfs, Some(Arc::new(memo))))
+                    } else {
+                        // Residual superfile (contains a scored term, pruned
+                        // from scoring): df only, from the dictionary value
+                        // + header hint — no postings body.
+                        let (dfs, work) = r
+                            .term_dfs(&column_arc, &refs)
+                            .await
+                            .map_err(fts_read_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(work.postings_bytes);
+                            stats.add_planned_read_ranges(work.planned_ranges);
+                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                        }
+                        Ok((suid, dfs, None))
                     }
-                    Ok::<Vec<u64>, QueryError>(dfs)
                 }
             },
         )
         .await?;
-        let mut global_df = vec![0u64; terms.len()];
-        for sf in per_sf {
-            for (i, d) in sf.into_iter().enumerate() {
+
+        let mut global_df = vec![0u64; misses.len()];
+        let mut memos: HashMap<Uuid, Arc<FetchedTermMemo>> = HashMap::new();
+        for (suid, dfs, memo) in per_sf {
+            for (i, d) in dfs.into_iter().enumerate() {
                 global_df[i] += d;
             }
+            if let Some(m) = memo {
+                memos.insert(suid, m);
+            }
         }
-        for (i, t) in terms.iter().enumerate() {
-            // df can't exceed the collection size; clamp so idf's
-            // df <= n_docs invariant holds under gross-vs-live counts.
-            let df = global_df[i].min(global_n);
-            map.insert(t.clone(), bm25::idf(global_n, df));
+        let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
+        for (i, t) in misses.iter().enumerate() {
+            // Sidecar-covered superfiles' contribution rides the artifact;
+            // the wave above summed only the uncovered tail. df can't
+            // exceed the collection size; clamp so idf's df <= n_docs
+            // invariant holds under gross-vs-live counts.
+            let sidecar_df = sidecar.as_ref().map_or(0, |s| s.df(column, t));
+            let df = (global_df[i] + sidecar_df).min(global_n);
+            let idf = bm25::idf(global_n, df);
+            map.insert(t.clone(), idf);
+            fresh.push((t.as_str(), idf));
         }
-        Ok(map)
+        cache.insert(manifest_id, column, &fresh);
+        Ok((map, Some(Arc::new(memos))))
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
@@ -1544,8 +1758,23 @@ impl SupertableReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.bm25_hits_stats(column, query, k, mode, Bm25Stats::default())
+    }
+
+    /// [`bm25_hits`](Self::bm25_hits) with an explicit statistics
+    /// scope. Callers that pin mode-specific behavior (the
+    /// per-superfile fan shape, or local-idf scoring parity) select it
+    /// here instead of relying on the crate default.
+    pub fn bm25_hits_stats(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+        stats: Bm25Stats,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.bm25_search_async(column, query, k, mode, Bm25Stats::PerSuperfile))
+        self.block_on(self.bm25_search_async(column, query, k, mode, stats))
     }
 
     /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
@@ -2107,6 +2336,53 @@ mod tests {
         out
     }
 
+    /// The per-generation global-idf cache must refresh when a commit
+    /// publishes a new manifest: raising a term's corpus-wide df must
+    /// lower its global idf on the SAME handle whose earlier queries
+    /// populated the cache. A stale cache would keep the old idf and
+    /// this score would not move.
+    #[test]
+    fn global_idf_refreshes_after_commit_raises_df() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        // Segment 1: "alpha" is rare (1 of 4 uniform-length docs).
+        let seg1 = [
+            "alpha shared red d00",
+            "beta shared red d01",
+            "beta shared green d02",
+            "beta shared green d03",
+        ];
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(0, &seg1)).expect("append seg1");
+            w.commit().expect("commit seg1");
+        }
+        let before = all_scored(&st, "alpha", Bm25Stats::Global);
+        let repeat = all_scored(&st, "alpha", Bm25Stats::Global);
+        assert_eq!(before, repeat, "same snapshot must score identically");
+        let before_top = before[0].1;
+
+        // Segment 2: every doc carries "alpha" — global df rises, so
+        // global idf (and every alpha score) must drop after the commit.
+        let seg2 = [
+            "alpha shared red d10",
+            "alpha shared red d11",
+            "alpha shared green d12",
+            "alpha shared green d13",
+        ];
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(0, &seg2)).expect("append seg2");
+            w.commit().expect("commit seg2");
+        }
+        let after = all_scored(&st, "alpha", Bm25Stats::Global);
+        let after_top = after.iter().map(|(_, s)| *s).fold(f32::MIN, f32::max);
+        assert!(
+            after_top < before_top,
+            "df went 1/4 -> 5/8: global idf must drop \
+             (top before {before_top}, top after {after_top})"
+        );
+    }
+
     /// Oracle for `Bm25Stats::Global`: a table split across many
     /// superfiles, scored with global stats, must rank identically to
     /// the same docs in a single superfile (where per-superfile stats
@@ -2603,7 +2879,7 @@ mod tests {
                 "rust",
                 5,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["title", "does_not_exist"]),
             )
             .expect_err("unknown projection column must error");
@@ -2910,14 +3186,7 @@ mod tests {
 
         // Bare call → `_id` + `score` only (no scalar decode).
         let bare = st
-            .bm25_search(
-                "title",
-                "fox",
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "fox", 10, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 rows");
         assert_eq!(bare.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(bare[0].num_columns(), 2, "_id + score");
@@ -2929,7 +3198,7 @@ mod tests {
                 "fox",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["_id", "title", "score"]),
             )
             .expect("bm25 projected rows");

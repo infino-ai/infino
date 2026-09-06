@@ -782,18 +782,11 @@ pub mod fts {
 
     impl FtsRead for SupertableReader {
         fn bm25_rows(&self, column: &str, query: &str, k: usize, mode: InfinoBoolMode) -> usize {
-            self.bm25_search(
-                column,
-                query,
-                k,
-                mode,
-                infino::Bm25Stats::PerSuperfile,
-                None,
-            )
-            .expect("supertable bm25_search")
-            .iter()
-            .map(|b| b.num_rows())
-            .sum()
+            self.bm25_search(column, query, k, mode, infino::Bm25Stats::default(), None)
+                .expect("supertable bm25_search")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum()
         }
 
         fn bm25_rows_fetched(
@@ -808,7 +801,7 @@ pub mod fts {
                 query,
                 k,
                 mode,
-                infino::Bm25Stats::PerSuperfile,
+                infino::Bm25Stats::default(),
                 Some(&["_id", column, "score"]),
             )
             .expect("supertable bm25_search fetched")
@@ -825,14 +818,7 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> ((u64, u64), (u64, u64)) {
             let search = self
-                .bm25_search(
-                    column,
-                    query,
-                    k,
-                    mode,
-                    infino::Bm25Stats::PerSuperfile,
-                    None,
-                )
+                .bm25_search(column, query, k, mode, infino::Bm25Stats::default(), None)
                 .expect("supertable bm25_search payload");
             let fetched = self
                 .bm25_search(
@@ -840,7 +826,7 @@ pub mod fts {
                     query,
                     k,
                     mode,
-                    infino::Bm25Stats::PerSuperfile,
+                    infino::Bm25Stats::default(),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("supertable bm25_search fetched payload");

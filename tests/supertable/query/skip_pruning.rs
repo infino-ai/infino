@@ -316,11 +316,12 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_superfile() {
 
     let before = store.snapshot();
     let _hits = r
-        .bm25_hits(
+        .bm25_hits_stats(
             "title",
             "alpha beta",
             BM25_TOP_K,
             infino::supertable::query::fts::BoolMode::And,
+            infino::Bm25Stats::PerSuperfile,
         )
         .expect("AND query");
 

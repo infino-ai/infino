@@ -29,7 +29,8 @@ use super::{
     filter::ExcludeFilter,
     metadata::{ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
-    sink::{TopKEntry, drain_top_k_desc},
+    search::FetchedTermMemo,
+    sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
 };
 use crate::superfile::{
@@ -79,6 +80,18 @@ pub(crate) struct ClauseLists<'a> {
     /// Per-term global idf for [`Bm25Stats::Global`]; `None` scores
     /// with per-superfile local idf (the default).
     pub global_idf: Option<&'a GlobalTermIdf>,
+    /// Open-wave fetches for the scored terms (global stats): the
+    /// cursor builds serve these terms from the memo instead of
+    /// re-reading the dictionary and postings ranges the df gather
+    /// already fetched. `None` on the single-pass path.
+    pub prefetched: Option<&'a FetchedTermMemo>,
+    /// The query fan-out's live cross-segment floor (see [`LiveFloor`]):
+    /// the atom walks re-read it per candidate — pruning phrase verify
+    /// work against every segment's published kth-best, not just the
+    /// snapshot taken at segment start — and publish their own local
+    /// kth into it as their heaps fill. `None` on single-superfile
+    /// entry points, where there is no fan-out to share with.
+    pub live_floor: Option<&'a LiveFloor>,
 }
 
 impl ClauseLists<'_> {
@@ -1116,6 +1129,7 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         global_idf: Option<&GlobalTermIdf>,
+        prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         if !phrases.is_empty() && !col_meta.positions {
@@ -1132,7 +1146,7 @@ impl FtsReader {
         // dictionary range for the whole batch.
         if !terms.is_empty() {
             let term_cursors = self
-                .build_term_cursors_opt(column_id, terms, global_idf, false, None)
+                .build_term_cursors_opt(column_id, terms, global_idf, false, None, prefetched)
                 .await?;
             dict_ranges += 1;
             for cursor in term_cursors {
@@ -1146,7 +1160,7 @@ impl FtsReader {
             // per-member rescale ratio cancels out of the phrase's tf/length
             // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, global_idf, false, None)
+                .build_term_cursors(column_id, &member_refs, global_idf, false, None, prefetched)
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {

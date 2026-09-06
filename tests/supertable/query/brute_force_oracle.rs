@@ -37,7 +37,10 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use infino::{
     superfile::{
         builder::FtsConfig,
-        fts::{reader::BoolMode, tokenize::Tokenizer},
+        fts::{
+            reader::{Bm25Stats, BoolMode},
+            tokenize::Tokenizer,
+        },
     },
     supertable::{Supertable, SupertableOptions, query::SuperfileHit},
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer, schema_id_title},
@@ -189,10 +192,24 @@ fn supertable_to_global_ids(
 }
 
 fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
+    supertable_search_stats(st, query, k, chunk_size, Bm25Stats::PerSuperfile)
+}
+
+/// OR-mode supertable search under an explicit statistics scope. The
+/// per-superfile oracles below model local-idf scoring, so tests
+/// comparing against them pin `PerSuperfile`; the whole-corpus oracle
+/// arm compares against `Global`.
+fn supertable_search_stats(
+    st: &Supertable,
+    query: &str,
+    k: usize,
+    chunk_size: usize,
+    stats: Bm25Stats,
+) -> Vec<u64> {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", query, k, BoolMode::Or)
+        .bm25_hits_stats("title", query, k, BoolMode::Or, stats)
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -206,7 +223,7 @@ fn supertable_search_and_global(
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", query, k, BoolMode::And)
+        .bm25_hits_stats("title", query, k, BoolMode::And, Bm25Stats::PerSuperfile)
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -590,6 +607,9 @@ fn oracle_zipfian_corpus_query_shapes_match() {
     let corp = zipfian_corpus(n_docs, 42);
     let infino = build_supertable(&corp, SUPERFILES);
     let oracles = build_oracles(&corp, SUPERFILES);
+    // One oracle over the WHOLE corpus = textbook BM25 with global idf —
+    // the ground truth for the `Global` (default) statistics scope.
+    let global_oracle = build_oracles(&corp, 1);
     let k = ZIPFIAN_TOP_K;
 
     let queries = [
@@ -604,7 +624,10 @@ fn oracle_zipfian_corpus_query_shapes_match() {
     ];
 
     for (label, q) in queries {
-        let inf = supertable_search_global(&infino, q, k, n_docs / SUPERFILES);
+        // Per-superfile arm: local-idf scoring parity against the
+        // per-shard oracles that model it.
+        let inf =
+            supertable_search_stats(&infino, q, k, n_docs / SUPERFILES, Bm25Stats::PerSuperfile);
         let ora = brute_force_top_k(&oracles, q, k);
         let inf_set: HashSet<u64> = inf.iter().copied().collect();
         let ora_set: HashSet<u64> = ora.iter().copied().collect();
@@ -619,6 +642,25 @@ fn oracle_zipfian_corpus_query_shapes_match() {
             common >= threshold,
             "{label}: top-{k} overlap {common}/{target} below 60% threshold; \
              supertable={inf:?} oracle={ora:?}",
+        );
+
+        // Global arm (the default): table-wide idf against the
+        // whole-corpus textbook oracle. Tighter threshold than the
+        // per-superfile arm — global idf matches the oracle exactly and
+        // this corpus has fixed-length docs, so per-superfile avgdl
+        // equals corpus avgdl; only the one-byte doc-length
+        // quantization and tie order remain.
+        let inf_g = supertable_search_stats(&infino, q, k, n_docs / SUPERFILES, Bm25Stats::Global);
+        let ora_g = brute_force_top_k(&global_oracle, q, k);
+        let inf_g_set: HashSet<u64> = inf_g.iter().copied().collect();
+        let ora_g_set: HashSet<u64> = ora_g.iter().copied().collect();
+        let common_g = inf_g_set.intersection(&ora_g_set).count();
+        let target_g = inf_g_set.len().min(ora_g_set.len());
+        let threshold_g = (target_g * 9) / 10;
+        assert!(
+            common_g >= threshold_g,
+            "{label} (global): top-{k} overlap {common_g}/{target_g} below 90% threshold; \
+             supertable={inf_g:?} oracle={ora_g:?}",
         );
     }
 }

@@ -349,6 +349,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            term_stats: None,
             parts,
         }
     }

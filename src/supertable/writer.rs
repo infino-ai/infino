@@ -176,6 +176,7 @@ use crate::{
             },
             options_hash,
             part::{self as part_mod, PartId},
+            term_stats,
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
@@ -8677,6 +8678,93 @@ async fn build_hnsw_graph_ref(
     .await
 }
 
+/// Build and publish the global term-stats sidecar over the CURRENT
+/// membership, stamping its reference on a successor manifest (see
+/// `manifest::term_stats` for artifact semantics and the carry rule).
+/// Maintenance-only: optimize calls it after compaction settles, so the
+/// artifact always describes the post-merge superfile set. Safe to lose
+/// to contention — queries fall back to the fused query-time gather
+/// until the next maintenance pass republishes.
+pub(in crate::supertable) async fn stamp_term_stats(
+    inner: &SupertableInner,
+) -> Result<(), BuildError> {
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    if inner.options.fts_columns.is_empty() {
+        return Ok(());
+    }
+    let max_retries = inner.options.max_commit_retries.max(1);
+    let mut next_id_floor: u64 = 0;
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        let old = if next_id_floor > 0 {
+            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+        } else {
+            old
+        };
+        let entries = old.get_all_superfiles();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Rebuilt per attempt: a competing commit may have changed the
+        // membership, and the artifact must describe exactly the set the
+        // successor manifest publishes.
+        let store = Arc::clone(&old.options.store);
+        let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
+        let opt_storage = old.options.storage.as_ref().map(Arc::clone);
+        let mut readers: Vec<(Uuid, Arc<SuperfileReader>)> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let reader = open_reader(
+                &store,
+                disk_cache.as_ref(),
+                opt_storage.as_ref(),
+                entry,
+                true,
+            )
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+            readers.push((entry.superfile_id, reader));
+        }
+        let bytes = term_stats::build(&readers)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let reference = term_stats::write(storage.as_ref(), bytes)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        if old.term_stats_blob() == Some(&reference) {
+            return Ok(());
+        }
+        let new_manifest = old.with_term_stats(reference);
+        let attempted_id = new_manifest.get_manifest_id();
+        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
+            .await
+            .inspect_err(|e| inner.note_commit_error(e))
+            .map_err(BuildError::from)?;
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                next_id_floor = next_id_floor.max(
+                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(BuildError::Store(e.to_string())),
+        }
+    }
+    Err(BuildError::Store(
+        "term-stats publish lost every commit race".into(),
+    ))
+}
+
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
 ///
 /// ONLY recall-quality overlay state belongs here — the routing blob, probe
@@ -10264,14 +10352,7 @@ mod tests {
         // Every doc's title contains "alpha" (see build_simple_batch); a match-all term must
         // surface hits from the one-piece index.
         let hits = st
-            .bm25_search(
-                "title",
-                "alpha",
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "alpha", 10, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 over one-piece commit");
         let n: usize = hits.iter().map(|b| b.num_rows()).sum();
         assert!(n > 0, "single-shard FTS index must return hits");

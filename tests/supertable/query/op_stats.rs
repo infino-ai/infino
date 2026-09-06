@@ -127,7 +127,7 @@ fn scoped_fts_stats(st: &Supertable, query: &str) -> OpStats {
     let (hits, stats) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits("title", query, TOP_K, BoolMode::Or)
+            .bm25_hits_stats("title", query, TOP_K, BoolMode::Or, Bm25Stats::PerSuperfile)
             .expect("bm25")
     });
     assert!(!hits.is_empty(), "fixture query {query:?} must match");
@@ -155,13 +155,25 @@ fn a_scoped_bm25_query_reports_its_planned_ranges() {
     let (_, one_term) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+            .bm25_hits_stats(
+                "title",
+                "rust",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+            )
             .expect("bm25")
     });
     let (_, three_terms) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust async web", TOP_K, BoolMode::Or)
+            .bm25_hits_stats(
+                "title",
+                "rust async web",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+            )
             .expect("bm25")
     });
     assert!(
@@ -191,7 +203,13 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
     let (_, one_term) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+            .bm25_hits_stats(
+                "title",
+                "rust",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+            )
             .expect("bm25")
     });
     // Per superfile: one dictionary fetch + one PFOR posting range.
@@ -203,7 +221,13 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
     let (_, three_terms) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust async web", TOP_K, BoolMode::Or)
+            .bm25_hits_stats(
+                "title",
+                "rust async web",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+            )
             .expect("bm25")
     });
     // Per superfile: one dictionary fetch + three PFOR posting ranges.
@@ -232,6 +256,112 @@ fn fts_work_stats_repeat_identically_on_the_same_table_state() {
     assert_eq!(first, second, "same plan, same table state, same work");
 }
 
+/// One scoped global-stats BM25 query's planned ranges.
+fn global_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits_stats("title", q, TOP_K, mode, Bm25Stats::Global)
+            .expect("bm25")
+    });
+    assert!(!hits.is_empty(), "fixture query {q:?} must match");
+    stats.planned_read_ranges
+}
+
+/// One scoped per-superfile BM25 query's planned ranges.
+fn per_superfile_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits_stats("title", q, TOP_K, mode, Bm25Stats::PerSuperfile)
+            .expect("bm25")
+    });
+    assert!(!hits.is_empty(), "fixture query {q:?} must match");
+    stats.planned_read_ranges
+}
+
+/// Under `Bm25Stats::Global`, an OR query's df gather is FUSED with the
+/// query's own reads: the scoring prune set IS the presence set, so the
+/// open wave fetches exactly the dictionary + postings ranges the walk
+/// needs and df rides along for free. The pinned contract: a global OR
+/// query — first for its terms or cache-served — plans EXACTLY the
+/// per-superfile work, on every manifest generation.
+#[test]
+fn global_stats_or_query_plans_exactly_the_per_superfile_work() {
+    let st = demo_two_superfiles();
+    let per_superfile = per_superfile_ranges(&st, "rust", BoolMode::Or);
+
+    let first = global_ranges(&st, "rust", BoolMode::Or);
+    let repeat = global_ranges(&st, "rust", BoolMode::Or);
+    assert_eq!(
+        first, per_superfile,
+        "fused open wave: the first global OR query plans no extra ranges"
+    );
+    assert_eq!(
+        repeat, per_superfile,
+        "cache-served repeat plans the per-superfile work too"
+    );
+
+    // A new manifest generation re-runs the (still fused) wave once and
+    // re-serves from the cache after — the plan equality holds on both.
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&title_batch(&segment_titles(0), schema))
+        .expect("append seg3");
+    w.commit().expect("commit seg3");
+    drop(w);
+
+    let per_superfile_after = per_superfile_ranges(&st, "rust", BoolMode::Or);
+    assert_eq!(
+        global_ranges(&st, "rust", BoolMode::Or),
+        per_superfile_after,
+        "new generation: fused wave still plans no extra ranges"
+    );
+    assert_eq!(
+        global_ranges(&st, "rust", BoolMode::Or),
+        per_superfile_after,
+        "cache re-serves under the new generation"
+    );
+}
+
+/// An AND query's presence set can exceed its scoring prune set: a
+/// superfile containing SOME scored term still owes that term's df even
+/// though scoring skips it. That residual is dict-only — bounded, and
+/// gone on the cache-served repeat.
+#[test]
+fn global_stats_and_residual_is_dict_only_and_cached() {
+    let st = demo_two_superfiles();
+    // `filler0x0` lives only in segment 0's superfiles, `rust` in every
+    // superfile — so the AND prune keeps segment 0 only, while segment
+    // 1's superfiles owe `rust`'s df through the residual probe.
+    let q = "rust filler0x0";
+    let per_superfile = per_superfile_ranges(&st, q, BoolMode::And);
+
+    let first = global_ranges(&st, q, BoolMode::And);
+    let repeat = global_ranges(&st, q, BoolMode::And);
+    assert!(
+        first > per_superfile,
+        "the residual superfiles' df probes plan real ranges \
+         ({first} vs {per_superfile})"
+    );
+    // Residual cost: per residual superfile a dictionary fetch plus one
+    // coalesced header fetch — never a postings-body plan. Bounding by
+    // 2 ranges × residual superfiles pins the dict-only shape.
+    let n_superfiles = st.reader().expect("reader").n_superfiles() as u64;
+    let kept_upper_bound = per_superfile / 2; // ≥ dict + 1 range per kept superfile
+    let residual_superfiles = n_superfiles - kept_upper_bound.max(1);
+    assert!(
+        first - per_superfile <= 2 * residual_superfiles,
+        "residual is dict-only, not a postings re-fetch \
+         (extra {} over {residual_superfiles} residual superfiles)",
+        first - per_superfile
+    );
+    assert_eq!(
+        repeat, per_superfile,
+        "cache-served repeat plans the per-superfile work only"
+    );
+}
+
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -253,7 +383,7 @@ fn a_scoped_bm25_query_reports_kernel_cpu() {
             let query = if i % 2 == 0 { "rust" } else { "rust async web" };
             st.reader()
                 .expect("reader")
-                .bm25_hits("title", query, TOP_K, BoolMode::Or)
+                .bm25_hits_stats("title", query, TOP_K, BoolMode::Or, Bm25Stats::PerSuperfile)
                 .expect("bm25");
         }
     });
@@ -283,7 +413,13 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
     let reader = st.reader().expect("reader");
     let (hits, stats) = with_op_stats(|| {
         reader
-            .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+            .bm25_hits_stats(
+                "title",
+                "rust",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+            )
             .expect("bm25")
     });
     assert!(!hits.is_empty());
@@ -303,13 +439,25 @@ fn an_inline_df1_term_plans_no_posting_range() {
     let (_, base) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+            .bm25_hits_stats(
+                "title",
+                "rust",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+            )
             .expect("bm25")
     });
     let (_, with_inline) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust filler0x0", TOP_K, BoolMode::Or)
+            .bm25_hits_stats(
+                "title",
+                "rust filler0x0",
+                TOP_K,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+            )
             .expect("bm25")
     });
     assert_eq!(
@@ -425,7 +573,7 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "rust",
                 TOP_K,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["title"]),
             )
             .expect("projected search")
@@ -444,7 +592,7 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "rust",
                 TOP_K,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 None,
             )
             .expect("bare search")

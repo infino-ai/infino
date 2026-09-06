@@ -35,7 +35,7 @@ const SEARCH_TOP_K: usize = 10;
 const FIRST_BATCH: &[&str] = &["the quick brown fox", "a lazy sleeping dog"];
 /// Titles committed in the second batch, so maintenance has two
 /// superfiles to compact.
-const SECOND_BATCH: &[&str] = &["a red clever fox", "an old grey wolf"];
+const SECOND_BATCH: &[&str] = &["a red clever fox fox", "an old grey wolf"];
 
 fn vector_field(dim: usize) -> DataType {
     DataType::FixedSizeList(
@@ -142,8 +142,10 @@ fn public_surface_search_maintain_query_and_drop() {
         .expect("vector_search");
     assert_eq!(first_title(&knn), FIRST_BATCH[0]);
 
-    // Hybrid: the text leg pins "fox" rows, the vector leg (row 2's
-    // embedding) ranks the second-batch fox above the first.
+    // Hybrid: the text leg pins "fox" rows — the second-batch fox
+    // carries tf=2 so BM25 ranks it first under corpus-wide (global)
+    // statistics — and the vector leg (row 2's own embedding) agrees,
+    // so the combined ranking puts the second-batch fox on top.
     let hybrid = docs
         .hybrid_search(
             "title",

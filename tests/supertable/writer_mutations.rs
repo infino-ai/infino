@@ -189,7 +189,7 @@ async fn writer_delete_tombstones_matching_rows() {
             "bravo",
             FTS_TOP_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             None,
         )
         .expect("fts");
@@ -272,7 +272,7 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
             "bravo",
             FTS_TOP_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             None,
         )
         .expect("pre-delete fts")
@@ -301,7 +301,7 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
             "bravo",
             FTS_TOP_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             None,
         )
         .expect("post-delete fts")

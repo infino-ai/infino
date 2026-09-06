@@ -18,7 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -35,6 +35,7 @@ use super::{
     manifest::{
         ManifestSnapshot,
         list::{CellRoutingParams, PartitionStrategy},
+        term_stats::{self, TermStatsSidecar},
     },
     options::SupertableOptions,
 };
@@ -54,6 +55,7 @@ use crate::{
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         query::{
+            fts::GlobalIdfCache,
             scalar_cache::DecodedScalarCache,
             sql::{SqlSchemas, build_sql_schemas},
         },
@@ -147,6 +149,16 @@ pub(super) struct SupertableInner {
     /// Bounded decoded-row cache shared by all readers of this immutable
     /// supertable handle.
     pub(super) decoded_scalar_cache: DecodedScalarCache,
+    /// Per-generation cache of global BM25 idf per (column, term),
+    /// shared by every reader minted from this handle so repeat
+    /// queries under `Bm25Stats::Global` skip the dictionary gather
+    /// fan — see [`GlobalIdfCache`].
+    pub(super) global_idf_cache: GlobalIdfCache,
+    /// Lazily loaded + verified global term-stats sidecar, keyed by its
+    /// content-addressed URI so appends (which carry the same ref) reuse
+    /// the parsed artifact and a maintenance republish swaps it. `None`
+    /// until first use or when the manifest carries no ref.
+    pub(super) term_stats_cache: StdRwLock<Option<(String, Arc<TermStatsSidecar>)>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -866,6 +878,14 @@ impl Supertable {
     /// per call.
     pub(crate) fn block_on_query<F: Future>(&self, fut: F) -> F::Output {
         bridge_on_runtime(fut, &self.query_runtime())
+    }
+
+    /// Build and publish the global term-stats sidecar over the current
+    /// membership (see `manifest::term_stats`). Not part of the public
+    /// API — [`Supertable::optimize`] calls this after compaction so the
+    /// artifact describes the post-merge superfile set.
+    pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
+        self.block_on_query(super::writer::stamp_term_stats(&self.inner))
     }
 
     /// Route undrained user superfiles into the hidden per-cell index. Not part
@@ -1663,6 +1683,8 @@ async fn build_handle(
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
+        global_idf_cache: GlobalIdfCache::default(),
+        term_stats_cache: StdRwLock::new(None),
         tombstone_cache,
         handle_id,
         vector_index_table,
@@ -2001,6 +2023,51 @@ impl SupertableReader {
 
     pub(crate) fn decoded_scalar_cache(&self) -> &DecodedScalarCache {
         &self.inner.decoded_scalar_cache
+    }
+
+    /// Per-generation global BM25 idf cache shared across every reader
+    /// minted from this supertable — see [`GlobalIdfCache`].
+    pub(crate) fn global_idf_cache(&self) -> &GlobalIdfCache {
+        &self.inner.global_idf_cache
+    }
+
+    /// The manifest-referenced global term-stats sidecar, loaded (and
+    /// hash-verified) once per artifact and cached on the handle by its
+    /// content-addressed URI. Returns `None` when the manifest carries
+    /// no reference, when no storage is attached, or when the load
+    /// fails — global-stats queries then fall back to the query-time
+    /// gather wave, trading latency for availability.
+    pub(crate) async fn term_stats_sidecar(&self) -> Option<Arc<TermStatsSidecar>> {
+        let reference = self.manifest.term_stats_blob()?.clone();
+        {
+            let cached = self
+                .inner
+                .term_stats_cache
+                .read()
+                .expect("term stats cache lock");
+            if let Some((uri, sidecar)) = cached.as_ref()
+                && *uri == reference.uri
+            {
+                return Some(Arc::clone(sidecar));
+            }
+        }
+        let storage = self.manifest.options.storage.as_ref()?;
+        match term_stats::load(storage.as_ref(), &reference).await {
+            Ok(sidecar) => {
+                let sidecar = Arc::new(sidecar);
+                *self
+                    .inner
+                    .term_stats_cache
+                    .write()
+                    .expect("term stats cache lock") =
+                    Some((reference.uri.clone(), Arc::clone(&sidecar)));
+                Some(sidecar)
+            }
+            Err(e) => {
+                warn!(error = %e, uri = %reference.uri, "term-stats sidecar load failed; falling back to the query-time df gather");
+                None
+            }
+        }
     }
 
     /// The shared `Arc<SupertableInner>` backing this reader. Used to
@@ -4220,14 +4287,7 @@ mod tests {
         // pre-compact warm/cold queries against a disk-cache consumer).
         use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         let hits = consumer
-            .bm25_search(
-                "title",
-                "doc",
-                5,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "doc", 5, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 pre-optimize");
         assert!(!hits.is_empty(), "pre-optimize FTS should return hits");
 
@@ -4236,14 +4296,7 @@ mod tests {
             .expect("sql-shaped optimize after lazy reads");
 
         let hits_after = consumer
-            .bm25_search(
-                "title",
-                "doc",
-                5,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "doc", 5, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 post-optimize");
         assert!(
             !hits_after.is_empty(),
@@ -8094,14 +8147,7 @@ mod tests {
     fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
         use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         table
-            .bm25_search(
-                "title",
-                query,
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", query, 10, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25 search")
             .iter()
             .map(|b| b.num_rows())

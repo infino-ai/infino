@@ -232,7 +232,7 @@ impl Supertable {
     /// Ranked BM25 full-text search over one FTS column.
     ///
     /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and the
-    /// corpus-statistics selector: [`Bm25Stats::PerSuperfile`](crate::Bm25Stats::PerSuperfile)
+    /// corpus-statistics selector: [`Bm25Stats::Global`](crate::Bm25Stats::Global)
     /// (the default, each segment scored against its own local statistics) or
     /// [`Bm25Stats::Global`](crate::Bm25Stats::Global) (one table-wide idf
     /// across all segments, so a fragmented table ranks like a single unified
