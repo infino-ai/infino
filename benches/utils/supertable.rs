@@ -1722,7 +1722,7 @@ pub mod fts {
         // superfile layout is untouched). The read phases then measure
         // the maintained shape a production table sits in. On an engine
         // without the sidecar this is a no-op maintenance pass.
-        if ingest_metrics.is_some() && phases.reads() {
+        if corpus.is_some() && phases.reads() {
             let (cache_dir, admin) = open_consumer(Modality::Fts, &built);
             let stats_only = OptimizeOptions::compact(CompactionSettings {
                 min_fill_percent: 100,
