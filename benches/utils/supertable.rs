@@ -526,7 +526,9 @@ fn listed_objects_under(table: &Supertable, prefix: &str) -> Option<Vec<(String,
 
 /// Cap on printed first-cold-query trace lines; the tail is summarized so a
 /// pre-drain fan (hundreds of GETs) can't flood the log.
-const COLD_TRACE_PRINT_MAX: usize = 12;
+// Raised (from 12) while the trace is forced on: the anomalous post-compact
+// open fans ~25 requests and the whole fan is the evidence.
+const COLD_TRACE_PRINT_MAX: usize = 40;
 /// Opt-in request-level cold trace; normal reports show only aggregate tables.
 const COLD_TRACE_ENV: &str = "INFINO_TRACE_VECTOR_COLD_FAN";
 
@@ -603,8 +605,14 @@ fn log_query_read_trace(prefix: &str, phase: &str, trace: &[storage_meter::Trace
     }
 }
 
+/// Temporarily forced on: the post-compact cold fan reads user data only
+/// on the CI VM, and the per-request trace is the diagnostic that names
+/// the exact objects. Revert to the env opt-in once that run is
+/// understood.
+const FORCE_COLD_TRACE: bool = true;
+
 fn cold_trace_enabled() -> bool {
-    env::var_os(COLD_TRACE_ENV).is_some()
+    FORCE_COLD_TRACE || env::var_os(COLD_TRACE_ENV).is_some()
 }
 
 /// Spread one cold consumer's metered + timed windows into the cost model's
@@ -3549,11 +3557,18 @@ pub mod vector {
         );
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let trace_enabled = cold_trace_enabled();
+        let mut open_trace = None;
         let mut first_query_trace = None;
         let mut steady_trace = None;
         let measured = cold_store::measure_cold_store(
             &meter,
             || {
+                // Arm the trace across the open itself: an open that reads
+                // data-class bytes is exactly the anomaly the per-request
+                // listing needs to name.
+                if trace_enabled {
+                    meter.start_trace();
+                }
                 let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
                     meter.provider(),
                     Some(cache_budget_bytes),
@@ -3570,6 +3585,7 @@ pub mod vector {
             },
             |(consumer, _cache)| {
                 if trace_enabled {
+                    open_trace = Some(meter.take_trace());
                     meter.start_trace();
                 }
                 let _ = consumer
@@ -3626,6 +3642,9 @@ pub mod vector {
             },
         );
         log_cold_split(label, &measured.split);
+        if let Some(trace) = open_trace {
+            log_query_read_trace(label, "cold open", &trace);
+        }
         if let Some(trace) = first_query_trace {
             log_query_read_trace(label, "first cold query", &trace);
         }
