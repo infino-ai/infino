@@ -81,10 +81,7 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap, HashSet},
     slice,
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{self, AtomicU32},
-    },
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
@@ -127,8 +124,8 @@ use crate::{
         fts::{
             bm25,
             reader::{
-                Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf, OR_WINDOW_MIN_TERMS,
-                OrCursorSet, PreparedClauses,
+                Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf, LiveFloor,
+                OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
             },
         },
     },
@@ -326,9 +323,11 @@ struct SharedTopK {
     k: usize,
     /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
     heap: Mutex<BinaryHeap<Reverse<OrdScore>>>,
-    /// f32 bits of the current floor; `NEG_INFINITY` until `k` scores
-    /// have been seen. Monotonically non-decreasing.
-    floor_bits: AtomicU32,
+    /// The current floor — `NEG_INFINITY` until `k` scores have been
+    /// seen, monotone after. Shared with the atom walks as their live
+    /// mid-walk bar (see [`LiveFloor`]), so it rises both from finished
+    /// segments' merges and from running walks' local kth-bests.
+    floor: LiveFloor,
 }
 
 /// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
@@ -352,13 +351,19 @@ impl SharedTopK {
         Arc::new(Self {
             k,
             heap: Mutex::new(BinaryHeap::new()),
-            floor_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            floor: LiveFloor::new(),
         })
     }
 
     /// The current global floor — `NEG_INFINITY` until k scores merged.
     fn floor(&self) -> f32 {
-        f32::from_bits(self.floor_bits.load(atomic::Ordering::Acquire))
+        self.floor.load()
+    }
+
+    /// The floor as the live handle the atom walks read and raise
+    /// mid-walk.
+    fn live_floor(&self) -> &LiveFloor {
+        &self.floor
     }
 
     /// Merge one finished segment's (tombstone-surviving) scores and
@@ -378,10 +383,10 @@ impl SharedTopK {
         if heap.len() == self.k
             && let Some(Reverse(OrdScore(min))) = heap.peek()
         {
-            // The heap min only rises, so a plain store stays monotone
-            // under the lock.
-            self.floor_bits
-                .store(min.to_bits(), atomic::Ordering::Release);
+            // `raise` rather than a plain store: running walks may have
+            // published a higher local kth than this merge's heap min,
+            // and the floor must never move down.
+            self.floor.raise(*min);
         }
     }
 }
@@ -648,6 +653,19 @@ impl SupertableReader {
                 // included — matches an uncoordinated run; only the amount
                 // of skipped work depends on segment completion order.
                 let floor = shared.floor();
+                // The atom walks may also read the floor LIVE mid-walk and
+                // publish their own local kth into it — but a kernel heap
+                // is pre-tombstone-filter, so only a superfile with no
+                // tombstoned rows may participate: its local kth is a
+                // floor the merge (which sees only surviving scores) can
+                // never contradict. The sidecars were warmed by the
+                // dispatcher, so this lookup is an in-memory hit; on a
+                // miss/error the unit just keeps the snapshot floor.
+                let live_floor = match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                    Some(Ok(bitmap)) if !bitmap.is_empty() => None,
+                    Some(Err(_)) => None,
+                    _ => Some(shared.live_floor()),
+                };
                 let hits = match range {
                     // Ranged units exist only for pure multi-should
                     // queries (`fanout_for` never slices when a must
@@ -734,6 +752,7 @@ impl SupertableReader {
                                     negative_phrases: &neg_ph_arc,
                                     global_idf: global_idf.as_deref(),
                                     prefetched: memo.as_deref(),
+                                    live_floor,
                                 },
                                 k,
                                 floor,

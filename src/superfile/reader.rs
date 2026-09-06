@@ -1132,6 +1132,7 @@ impl SuperfileReader {
                 negative_phrases: &negative_phrases,
                 global_idf: None,
                 prefetched: None,
+                live_floor: None,
             },
             k,
             f32::NEG_INFINITY,

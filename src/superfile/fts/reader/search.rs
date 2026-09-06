@@ -18,7 +18,7 @@ use super::{
     filter::{AtomExcludeFilter, ExcludeFilter},
     options::BoolMode,
     phrase::AnyCursor,
-    sink::{TopKEntry, and_heap_push, drain_top_k_desc},
+    sink::{LiveFloor, TopKEntry, and_heap_push, drain_top_k_desc},
     work::{
         MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
     },
@@ -127,6 +127,15 @@ impl FtsReader {
     /// with none, the shoulds' union matches. Docs excluded by
     /// `filter` never reach the heap; docs scoring strictly below
     /// `floor_eff` are dropped at admission.
+    ///
+    /// Phrase verification (the position decode) dominates this walk,
+    /// and its bar-skip is only as good as the bar — so the walk keeps
+    /// the bar live: `live_floor`, when present, is re-read every
+    /// candidate (other segments of the fan-out raise it as their
+    /// heaps fill) and this walk publishes its own kth-best back as it
+    /// improves. A one-shot `floor_eff` snapshot instead left each
+    /// segment verifying against its slowly-filling local heap alone,
+    /// which showed up as phrase shapes degrading to count-like work.
     fn run_atoms_search(
         &self,
         column_id: u32,
@@ -135,10 +144,29 @@ impl FtsReader {
         k: usize,
         mut filter: Option<AtomExcludeFilter>,
         floor_eff: f32,
+        live_floor: Option<&LiveFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        // The strict-below admission cutoff, refreshed from the live
+        // floor: everything published there is a real kth-best, so the
+        // same `next_down` the caller applied to its snapshot keeps
+        // exact ties admissible.
+        let floor_now = || match live_floor {
+            Some(live) => live.load().next_down().max(floor_eff),
+            None => floor_eff,
+        };
+        // Publish this walk's kth-best once its heap is full — the
+        // fan-out's other segments prune against it immediately.
+        let publish = |heap: &BinaryHeap<TopKEntry>| {
+            if let Some(live) = live_floor
+                && heap.len() >= k
+                && let Some(worst) = heap.peek()
+            {
+                live.raise(worst.0);
+            }
+        };
 
         // Per-atom pruning slack: an atom only needs to contribute
         // more than the walk's bar minus what every *other* atom could
@@ -166,6 +194,7 @@ impl FtsReader {
                     Some(f) => f.admits(doc)?,
                     None => true,
                 };
+                let floor_live = floor_now();
                 if admitted {
                     let norm = dl_norm_k1.get(doc);
                     let score: f32 = shoulds
@@ -173,16 +202,17 @@ impl FtsReader {
                         .filter(|a| !a.is_exhausted() && a.current_doc_id() == doc)
                         .map(|a| a.score_current(norm))
                         .sum();
-                    if score > floor_eff {
+                    if score > floor_live {
                         and_heap_push(&mut heap, k, None, score, doc);
+                        publish(&heap);
                     }
                 }
                 let Some(next) = doc.checked_add(1) else {
                     break;
                 };
                 let bar = match heap.len() >= k {
-                    true => heap.peek().expect("heap len == k").0.max(floor_eff),
-                    false => floor_eff,
+                    true => heap.peek().expect("heap len == k").0.max(floor_live),
+                    false => floor_live,
                 };
                 for (a, &others) in shoulds.iter_mut().zip(&others_ub) {
                     if !a.is_exhausted() && a.current_doc_id() == doc {
@@ -207,9 +237,10 @@ impl FtsReader {
         };
         let mut target = 0u32;
         'docs: loop {
+            let floor_live = floor_now();
             let bar = match heap.len() >= k {
-                true => heap.peek().expect("heap len == k").0.max(floor_eff),
-                false => floor_eff,
+                true => heap.peek().expect("heap len == k").0.max(floor_live),
+                false => floor_live,
             };
             // Phase 1 — approximate alignment (phrase = member co-occurrence,
             // no positions).
@@ -268,8 +299,9 @@ impl FtsReader {
                             score += sh.score_current(norm);
                         }
                     }
-                    if score > floor_eff {
+                    if score > floor_live {
                         and_heap_push(&mut heap, k, None, score, aligned);
+                        publish(&heap);
                     }
                 }
             }
@@ -527,8 +559,15 @@ impl FtsReader {
             // its on-CPU time here (sync section, no awaits inside).
             // Gated: an unmetered process must not pay the procfs reads.
             let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-            let result =
-                self.run_atoms_search(column_id, must_atoms, should_atoms, k, filter, floor_eff)?;
+            let result = self.run_atoms_search(
+                column_id,
+                must_atoms,
+                should_atoms,
+                k,
+                filter,
+                floor_eff,
+                lists.live_floor,
+            )?;
             return Ok(PreparedClauses::Done {
                 hits: result,
                 postings_bytes,

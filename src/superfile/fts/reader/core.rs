@@ -30,7 +30,7 @@ use super::{
     metadata::{ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
     search::FetchedTermMemo,
-    sink::{TopKEntry, drain_top_k_desc},
+    sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
 };
 use crate::superfile::{
@@ -85,6 +85,13 @@ pub(crate) struct ClauseLists<'a> {
     /// re-reading the dictionary and postings ranges the df gather
     /// already fetched. `None` on the single-pass path.
     pub prefetched: Option<&'a FetchedTermMemo>,
+    /// The query fan-out's live cross-segment floor (see [`LiveFloor`]):
+    /// the atom walks re-read it per candidate — pruning phrase verify
+    /// work against every segment's published kth-best, not just the
+    /// snapshot taken at segment start — and publish their own local
+    /// kth into it as their heaps fill. `None` on single-superfile
+    /// entry points, where there is no fan-out to share with.
+    pub live_floor: Option<&'a LiveFloor>,
 }
 
 impl ClauseLists<'_> {
