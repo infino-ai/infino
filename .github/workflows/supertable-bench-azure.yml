@@ -201,6 +201,13 @@ jobs:
             superfile)                 args="superfile";         reports="superfile_fts superfile_vector sql" ;;
             supertable|supertable_all) args="supertable";        reports="supertable supertable_fts supertable_vector supertable_sql" ;;
             supertable_fts)            args="supertable fts";    reports="supertable_fts" ;;
+            # The FTS cell split by read phase, so the gate-bearing warm
+            # lane reports fast while the byte-bound cold battery runs on
+            # its own VM. Both keep `build`: the ingest metrics gate the
+            # post-compact lifecycle, and the warm half carries the
+            # quality oracle.
+            supertable_fts_warm)       args="supertable fts build warm quality"; reports="supertable_fts" ;;
+            supertable_fts_cold)       args="supertable fts build cold";         reports="supertable_fts" ;;
             supertable_vector)         args="supertable vector"; reports="supertable_vector" ;;
             supertable_sql)            args="supertable sql";    reports="supertable_sql" ;;
             all)                       args="all";               reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
