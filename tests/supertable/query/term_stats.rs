@@ -10,18 +10,23 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
     CompactionSettings, OptimizeOptions,
     runtime_metrics::op_stats::with_op_stats,
+    storage::StorageProvider,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
     },
-    supertable::{Supertable, SupertableOptions, storage::LocalFsStorageProvider},
+    supertable::{
+        Supertable, SupertableOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
+        storage::LocalFsStorageProvider,
+    },
 };
 use tempfile::TempDir;
 
@@ -55,13 +60,17 @@ fn schema_title() -> Arc<Schema> {
 }
 
 fn options_with_storage(dir: &TempDir) -> SupertableOptions {
+    let storage = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+    options_with_storage_provider(storage)
+}
+
+fn options_with_storage_provider(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
     let writer_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("writer pool"),
     );
-    let storage = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
     SupertableOptions::new(schema_title(), vec![FtsConfig::new("title")], Vec::new())
         .expect("valid options")
         .with_writer_pool(writer_pool)
@@ -273,4 +282,116 @@ fn merging_optimize_republishes_over_new_membership() {
             "post-merge sidecar ranking must equal the control for {query:?}"
         );
     }
+}
+
+// ---- maintenance must not warm the disk cache -----------------------
+//
+// The stats pass reads dictionaries and df headers only. Opening the
+// superfiles with background fills enabled would copy EVERY superfile
+// into the attached disk cache — including compaction's fresh multi-GiB
+// outputs — and on real object storage those fills outlive `optimize`
+// and their reads bleed into whatever is measured next. The gate: after
+// a stats-only optimize on a fill-capable cache, the cache holds only
+// the chunks the dictionary walks actually touched, a small fraction of
+// the table.
+
+/// Bytes under a directory tree.
+fn dir_bytes(root: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Docs per segment in the cache-hygiene fixture — enough bytes per
+/// superfile that a whole-file background fill is unmistakably larger
+/// than the dictionary/header chunks the stats pass legitimately reads.
+const CACHE_FIXTURE_DOCS_PER_SEGMENT: usize = 8_000;
+/// Segments in the cache-hygiene fixture.
+const CACHE_FIXTURE_SEGMENTS: usize = 3;
+/// Settle bound for any background fills the maintenance pass spawned.
+const FILL_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The stats pass may cache the chunks it reads (dictionaries, df
+/// headers); a fill copies whole superfiles. Half the stored bytes
+/// separates the two regimes with wide margin on both sides.
+const CACHE_BYTES_CEILING_FRACTION: f64 = 0.5;
+
+#[test]
+fn stats_only_optimize_does_not_fill_the_disk_cache() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+
+    // Produce a fragmented table without any cache attached.
+    let producer =
+        Supertable::create(options_with_storage_provider(Arc::clone(&storage))).expect("create");
+    for segment in 0..CACHE_FIXTURE_SEGMENTS {
+        let titles: Vec<String> = (0..CACHE_FIXTURE_DOCS_PER_SEGMENT)
+            .map(|i| {
+                format!(
+                    "alpha shared s{segment}d{i:05} \
+                     filler{:04} filler{:04} filler{:04} filler{:04}",
+                    i % 977,
+                    (i * 7) % 977,
+                    (i * 31) % 977,
+                    (i * 131) % 977,
+                )
+            })
+            .collect();
+        let arr: ArrayRef = Arc::new(LargeStringArray::from(
+            titles.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(schema_title(), vec![arr]).expect("batch");
+        let mut w = producer.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(producer);
+    let stored_bytes = dir_bytes(&dir.path().join("data"));
+    assert!(
+        stored_bytes > 0,
+        "fixture must have persisted superfile bytes"
+    );
+
+    // Consumer with a fill-capable disk cache runs the maintenance.
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cfg = DiskCacheConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        disk_budget_bytes: 4 * stored_bytes,
+        cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+        verify_crc_on_open: false,
+        ..Default::default()
+    };
+    let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("disk cache");
+    let consumer = Supertable::open(options_with_storage_provider(storage).with_disk_cache(cache))
+        .expect("open consumer");
+    consumer
+        .optimize(&stats_only_optimize())
+        .expect("stats-only optimize");
+    // Settle anything the pass spawned, so a regression cannot hide
+    // behind a fill that is merely still running when we measure.
+    consumer
+        .wait_until_warm(FILL_SETTLE_TIMEOUT)
+        .expect("fills settle");
+
+    let cache_bytes = dir_bytes(cache_dir.path());
+    let ceiling = (stored_bytes as f64 * CACHE_BYTES_CEILING_FRACTION) as u64;
+    assert!(
+        cache_bytes < ceiling,
+        "stats-only optimize warmed the disk cache like a query would: \
+         {cache_bytes} cached bytes vs {stored_bytes} stored (ceiling {ceiling}) — \
+         the maintenance open must not spawn background fills"
+    );
 }

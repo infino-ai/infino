@@ -8715,12 +8715,19 @@ pub(in crate::supertable) async fn stamp_term_stats(
         let opt_storage = old.options.storage.as_ref().map(Arc::clone);
         let mut readers: Vec<(Uuid, Arc<SuperfileReader>)> = Vec::with_capacity(entries.len());
         for entry in entries {
+            // No background fills: this pass reads dictionaries and df
+            // headers only, and a fill here copies EVERY superfile —
+            // including compaction's fresh multi-GiB outputs — into the
+            // disk cache. On real object storage those fills outlive the
+            // optimize call and their reads bleed into whatever runs
+            // next (they surfaced as phantom user-data GETs in cold
+            // measurements that began while a fill was still draining).
             let reader = open_reader(
                 &store,
                 disk_cache.as_ref(),
                 opt_storage.as_ref(),
                 entry,
-                true,
+                false,
             )
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
