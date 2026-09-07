@@ -43,7 +43,7 @@ use crate::{
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
     supertable::{
-        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri, Supertable,
+        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, Supertable,
         error::CompactionError,
         handle::hidden_vector_index_compaction_settings,
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
@@ -56,7 +56,7 @@ use crate::{
         },
         writer::{
             NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, prepare_superfile, recalibrate_probe_laws,
+            finalize_compaction_commit, prepare_superfile_named, recalibrate_probe_laws,
             refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
         },
     },
@@ -622,7 +622,15 @@ impl Supertable {
             superfile_stats.scalar_stats,
         );
 
-        let prepared_superfile = prepare_superfile(self.inner().as_ref(), shard)?;
+        // A merge keeps a source stem only when every input carries the same
+        // one. Inputs from different sources, or any unnamed input, produce
+        // an unnamed superfile rather than a label that names one source
+        // for rows from several.
+        let stem = superfiles
+            .first()
+            .and_then(|first| first.stem.as_deref())
+            .filter(|stem| superfiles.iter().all(|e| e.stem.as_deref() == Some(*stem)));
+        let prepared_superfile = prepare_superfile_named(self.inner().as_ref(), shard, stem)?;
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
@@ -769,7 +777,7 @@ impl Supertable {
                 Err(_missing) => return Ok(()),
             };
 
-            let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
+            let mut pending_storage_replaces: Vec<(String, Bytes)> = Vec::new();
 
             match try_commit_attempt(
                 storage.clone(),

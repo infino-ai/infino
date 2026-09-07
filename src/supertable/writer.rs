@@ -97,6 +97,7 @@ use super::{
     manifest::{
         CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, ScalarStatsAgg,
         SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
+        superfile_stem,
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -394,6 +395,13 @@ pub struct SupertableWriter {
     /// path stashes on `PendingUpdateEntry`, the commit outputs and
     /// `rows_tombstoned` flush after `Ok`.
     pending_ingest: IngestTally,
+    /// The source label for the batches in `buffer`, set by
+    /// [`Self::append_named`] and cleared by a plain [`Self::append`], so a
+    /// commit that mixes named and unnamed batches is unnamed rather than
+    /// mislabelled. Every commit path takes it: the label belongs to the
+    /// superfiles of the commit that publishes those rows and to nothing
+    /// after.
+    pending_stem: Option<String>,
     /// Pending update entries, in buffer order. Each is
     /// fully-resolved at `update()` call time (predicate
     /// captured, `_id` range minted, IPC sidecar bytes encoded);
@@ -877,6 +885,37 @@ impl Supertable {
         Ok(())
     }
 
+    /// [`Self::append`], naming the source the rows came from.
+    ///
+    /// Every superfile this commit writes is keyed
+    /// `data/<stem>-<uuid>.sf.parquet`, where the stem is `source_name`
+    /// made key-safe (see [`superfile_stem`]): `customers.parquet` yields
+    /// `customers-<uuid>.sf.parquet`. The uuid keeps every key unique; the
+    /// stem is a label on it, so routing, lookup and the caches are exactly
+    /// as for `append`. A name that leaves nothing usable falls back to the
+    /// unnamed shape. A later merge keeps the stem only when every input
+    /// shares it; the update pipeline and the hidden vector index never
+    /// carry one.
+    ///
+    /// A part holding a named superfile is written at
+    /// `FORMAT_VERSION_NAMED`, which a reader from before this method
+    /// refuses rather than mis-derives — so every reader of the table must
+    /// be at least this version before the first `append_named`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
+    )]
+    pub fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
+        w.append_named(batch, source_name)
+            .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
+        w.commit()
+            .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
+        Ok(())
+    }
+
     /// Replace every row matching `predicate` with `new_rows`, then
     /// commit. `new_rows.num_rows()` must equal the match count.
     /// Durable when this returns.
@@ -996,6 +1035,7 @@ impl Supertable {
             Ordering::Relaxed,
         ) {
             Ok(_) => Ok(SupertableWriter {
+                pending_stem: None,
                 inner: Arc::clone(self.inner()),
                 buffer: Vec::new(),
                 buffer_scalar_bytes: 0,
@@ -1087,6 +1127,33 @@ impl SupertableWriter {
         tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len(), role = self.inner.role.as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
+        // An unnamed batch joining the buffer makes the commit's rows come
+        // from more than one place, so the commit is unnamed. Cleared before
+        // the flush below can run, which is what keeps a threshold flush
+        // from labelling a mixed buffer.
+        self.pending_stem = None;
+        self.append_labelled(batch)
+    }
+
+    /// [`Self::append`], labelling the rows with the source they came from:
+    /// the superfiles of the commit that publishes them are keyed
+    /// `data/<stem>-<uuid>.sf.parquet`, with the stem the key-safe form of
+    /// `source_name` (see [`superfile_stem`]). A name that reduces to nothing
+    /// leaves the commit unnamed. The label covers every batch appended
+    /// under it until the next commit; a plain `append` in between clears
+    /// it, since a commit from two sources has no one name.
+    pub fn append_named(
+        &mut self,
+        batch: &RecordBatch,
+        source_name: &str,
+    ) -> Result<(), BuildError> {
+        self.pending_stem = superfile_stem(source_name);
+        self.append_labelled(batch)
+    }
+
+    /// The append body shared by [`Self::append`] and [`Self::append_named`],
+    /// after the label has been set.
+    fn append_labelled(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         let options = &self.inner.options;
 
         // Validate + split. Batch schema is user_schema (no id col).
@@ -1168,7 +1235,10 @@ impl SupertableWriter {
             .saturating_mul(1024)
             .saturating_mul(1024);
         if threshold > 0 && self.buffered_bytes() >= threshold {
-            self.commit_appends_internal()?;
+            // The threshold flush is a commit of the rows buffered so far, so
+            // it takes the label the way `commit` does.
+            let stem = self.pending_stem.take();
+            self.commit_appends_internal(stem.as_deref())?;
         }
 
         Ok(())
@@ -1412,12 +1482,18 @@ impl SupertableWriter {
         ))
     )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
+        // The source label the buffered appends were given, if any. Taken,
+        // not read: it belongs to this commit's superfiles and to no later
+        // batch. Put back on a failed flush, since the buffer is too.
+        let stem = self.pending_stem.take();
         // Step 1: flush appends. A failure here is atomic —
         // the buffer is preserved and no mutation WAL has
         // landed yet.
-        if !self.buffer.is_empty() {
-            self.commit_appends_internal()
-                .map_err(CommitError::AppendFlush)?;
+        if !self.buffer.is_empty()
+            && let Err(flush) = self.commit_appends_internal(stem.as_deref())
+        {
+            self.pending_stem = stem;
+            return Err(CommitError::AppendFlush(flush));
         }
 
         let total_mutations = self.pending_updates.len() + self.pending_deletes.len();
@@ -1782,7 +1858,7 @@ impl SupertableWriter {
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(buffered = self.buffer.len()))
     )]
-    fn commit_appends_internal(&mut self) -> Result<(), BuildError> {
+    fn commit_appends_internal(&mut self, stem: Option<&str>) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok::<(), BuildError>(());
         }
@@ -1809,7 +1885,7 @@ impl SupertableWriter {
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
 
-        match self.commit_appends_with_taken_buffer(&buffer) {
+        match self.commit_appends_with_taken_buffer(&buffer, stem) {
             Ok(()) => {
                 // Durable now, so the ingested work is real work. An
                 // all-empty-batch commit publishes nothing and reports
@@ -1836,8 +1912,14 @@ impl SupertableWriter {
     }
 
     /// Body of [`Self::commit_appends_internal`] after the buffer has been
-    /// taken. On `Err`, the caller restores `buffer` onto the writer.
-    fn commit_appends_with_taken_buffer(&self, buffer: &[BufferedBatch]) -> Result<(), BuildError> {
+    /// taken. On `Err`, the caller restores `buffer` onto the writer. `stem`
+    /// is the source label every superfile this commit produces is keyed
+    /// under, when the caller gave one.
+    fn commit_appends_with_taken_buffer(
+        &self,
+        buffer: &[BufferedBatch],
+        stem: Option<&str>,
+    ) -> Result<(), BuildError> {
         // Phase A — train the global cell grid from the FIRST committed batch
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
@@ -1950,6 +2032,7 @@ impl SupertableWriter {
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
                     Some(&tx),
+                    stem,
                 );
                 // Stamped where the pack ends, not after the join below:
                 // every shard has been handed off by now, so this is the
@@ -2009,10 +2092,12 @@ impl SupertableWriter {
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
                     None,
+                    stem,
                 )?;
                 let build_elapsed = commit_t0.elapsed();
                 let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
-                let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+                let user_batch =
+                    prepare_user_superfile_batch(&self.inner, outputs, cell_hints, stem)?;
                 let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
                 let data_put_bytes: usize = user_batch
                     .pending_storage_writes
@@ -2177,7 +2262,7 @@ impl SupertableWriter {
             )
         })?;
         let superfiles = outputs.len();
-        let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+        let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints, stem)?;
         // Same pre-move / post-Ok discipline as the vector arm above.
         let output_stats = self
             .op_stats
@@ -2734,7 +2819,12 @@ pub(crate) struct PreparedSuperfile {
     /// path; `None` on the cache-attached path (the disk cache
     /// hydrates lazily from storage).
     pub(crate) bytes_for_store: Option<(SuperfileUri, Bytes)>,
-    pub(crate) bytes_for_storage: Option<(SuperfileUri, Bytes)>,
+    /// Bytes destined for object storage, with the key they are PUT at —
+    /// the entry's `storage_path()`, carried rather than re-derived because
+    /// a source-named superfile's key is not a function of its uuid. The two
+    /// cache legs beside it stay keyed by uri: that is how the caches
+    /// address a superfile.
+    pub(crate) bytes_for_storage: Option<(String, Bytes)>,
     pub(crate) bytes_for_cache: Option<(SuperfileUri, Bytes)>,
 }
 
@@ -2746,9 +2836,10 @@ impl PreparedSuperfile {
         let bytes = self
             .bytes_for_store
             .as_ref()
-            .or(self.bytes_for_storage.as_ref())
-            .or(self.bytes_for_cache.as_ref())
-            .map(|(_, b)| b.clone())?;
+            .map(|(_, b)| b)
+            .or(self.bytes_for_storage.as_ref().map(|(_, b)| b))
+            .or(self.bytes_for_cache.as_ref().map(|(_, b)| b))?
+            .clone();
         Some(SuperfileReader::open(bytes))
     }
 }
@@ -2788,24 +2879,30 @@ pub(crate) fn build_column_vector_summary(
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
 /// on the shard bytes, derive FTS + vector summaries, and decide
 /// the bytes-disposition triplet. Pure per-shard work — no shared
-/// mutable state, safe to run in parallel across shards.
+/// mutable state, safe to run in parallel across shards. The superfile
+/// gets the unnamed key shape; a source-named one goes through
+/// [`prepare_superfile_named`].
 pub(super) fn prepare_superfile(
     inner: &SupertableInner,
     shard: ShardOutput,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
-    prepare_superfile_with_uri(inner, shard, None)
+    prepare_superfile_named(inner, shard, None)
 }
 
-pub(super) fn prepare_superfile_with_uri(
+/// [`prepare_superfile`] with the source stem the entry carries: `Some`
+/// puts it in the object key (`data/<stem>-<uuid>.sf.parquet`), `None` is
+/// the unnamed shape. The uri is minted fresh either way — the stem is a
+/// label on the key, never a substitute for the uuid that keeps it unique.
+pub(super) fn prepare_superfile_named(
     inner: &SupertableInner,
     shard: ShardOutput,
-    reuse_uri: Option<SuperfileUri>,
+    stem: Option<&str>,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
     }
 
-    let uri = reuse_uri.unwrap_or_else(SuperfileUri::new_v4);
+    let uri = SuperfileUri::new_v4();
 
     let bytes_for_storage = inner.options.storage.is_some().then(|| shard.bytes.clone());
     let cache_attached = inner.options.disk_cache.is_some() && inner.options.storage.is_some();
@@ -2897,6 +2994,7 @@ pub(super) fn prepare_superfile_with_uri(
         birth_version: 0,
         superfile_id: uuid::Uuid::new_v4(),
         uri,
+        stem: stem.map(str::to_owned),
         n_docs: shard.n_docs,
         id_min: shard.id_min,
         id_max: shard.id_max,
@@ -2912,10 +3010,11 @@ pub(super) fn prepare_superfile_with_uri(
         vector_layout,
     });
 
+    let storage_key = entry.storage_path();
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
-        bytes_for_storage: bytes_for_storage.map(|b| (uri, b)),
+        bytes_for_storage: bytes_for_storage.map(|b| (storage_key, b)),
         bytes_for_cache: bytes_for_cache.map(|b| (uri, b)),
     }))
 }
@@ -2939,6 +3038,7 @@ fn finish_superfile_entry(
         birth_version: old.birth_version,
         superfile_id: old.superfile_id,
         uri: old.uri,
+        stem: old.stem.clone(),
         n_docs: old.n_docs,
         id_min: old.id_min,
         id_max: old.id_max,
@@ -2958,7 +3058,7 @@ fn finish_superfile_entry(
 struct SuperfilePublishBatch {
     new_entries: Vec<Arc<SuperfileEntry>>,
     to_remove: Vec<Arc<SuperfileEntry>>,
-    pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
+    pending_storage_writes: Vec<(String, Bytes)>,
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
     /// In-memory reader-cache inserts deferred until after durable (or
     /// local) membership publish succeeds — inserting earlier leaves
@@ -2971,7 +3071,7 @@ fn collect_prepared_superfiles(
     prepared: Vec<PreparedSuperfile>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
     let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(prepared.len());
-    let mut pending_storage_writes: Vec<(SuperfileUri, Bytes)> = Vec::new();
+    let mut pending_storage_writes: Vec<(String, Bytes)> = Vec::new();
     let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
     let mut pending_store_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
     for p in prepared {
@@ -3133,6 +3233,7 @@ fn prepare_user_superfile_batch_in_scope(
     inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
+    stem: Option<&str>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
     // `zip` silently truncates to the shorter side; a length mismatch here
     // would drop shard outputs or hints and publish an incomplete commit.
@@ -3146,33 +3247,39 @@ fn prepare_user_superfile_batch_in_scope(
     let prepared: Vec<PreparedSuperfile> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
-        .filter_map(|(shard, hint)| match prepare_superfile(inner, shard) {
-            Ok(Some(p)) => {
-                Some(
-                    finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
-                        entry,
-                        bytes_for_store: p.bytes_for_store,
-                        bytes_for_storage: p.bytes_for_storage,
-                        bytes_for_cache: p.bytes_for_cache,
-                    }),
-                )
-            }
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        })
+        .filter_map(
+            |(shard, hint)| match prepare_superfile_named(inner, shard, stem) {
+                Ok(Some(p)) => {
+                    Some(
+                        finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
+                            entry,
+                            bytes_for_store: p.bytes_for_store,
+                            bytes_for_storage: p.bytes_for_storage,
+                            bytes_for_cache: p.bytes_for_cache,
+                        }),
+                    )
+                }
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
     collect_prepared_superfiles(inner, prepared)
 }
 
+/// `stem` is the source name the commit's superfiles are keyed under, when
+/// the caller gave one (`append_named`); every superfile the commit produces
+/// carries it, since they all come from that one source.
 fn prepare_user_superfile_batch(
     inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
+    stem: Option<&str>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
     inner
         .options
         .writer_pool
-        .install(|| prepare_user_superfile_batch_in_scope(inner, outputs, hints))
+        .install(|| prepare_user_superfile_batch_in_scope(inner, outputs, hints, stem))
 }
 
 async fn persist_superfile_publish_batch_async(
@@ -3950,15 +4057,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 remote_shard.shard_id, entry.partition_hint
             )));
         }
-        storage
-            .head(&superfile_storage_path(&entry.uri))
-            .await
-            .map_err(|error| {
-                BuildError::Store(format!(
-                    "drain checkpoint shard {} object is unavailable: {error}",
-                    remote_shard.shard_id
-                ))
-            })?;
+        storage.head(&entry.storage_path()).await.map_err(|error| {
+            BuildError::Store(format!(
+                "drain checkpoint shard {} object is unavailable: {error}",
+                remote_shard.shard_id
+            ))
+        })?;
         for &(cell, count) in &remote_shard.cell_counts {
             match added_per_cell.insert(cell, count) {
                 Some(existing) if existing != count => {
@@ -4093,7 +4197,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 )
                             })?;
                             let (bytes, _) = storage
-                                .get(&entry.uri.storage_path())
+                                .get(&entry.storage_path())
                                 .await
                                 .map_err(|e| BuildError::Store(e.to_string()))?;
                             Arc::new(
@@ -4592,10 +4696,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 "drain prepared removals while publishing new worker shards".into(),
             ));
         }
-        let entry_by_uri: HashMap<SuperfileUri, Arc<SuperfileEntry>> = publish
+        // Uploads are keyed by the object key the bytes were PUT at, which
+        // is also what the entry names, so the completed upload maps back
+        // to its entry without carrying the uri alongside.
+        let entry_by_key: HashMap<String, Arc<SuperfileEntry>> = publish
             .new_entries
             .iter()
-            .map(|entry| (entry.uri, Arc::clone(entry)))
+            .map(|entry| (entry.storage_path(), Arc::clone(entry)))
             .collect();
         let mut pending_cache_inserts = publish.pending_cache_inserts;
         let pending_store_inserts = publish.pending_store_inserts;
@@ -4603,26 +4710,30 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let put_futures = publish
             .pending_storage_writes
             .into_iter()
-            .map(|(uri, bytes)| {
+            .map(|(storage_key, bytes)| {
                 let storage = Arc::clone(&storage);
                 async move {
-                    put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
-                        .await
-                        .map(|()| uri)
-                        .map_err(|error| BuildError::Store(error.to_string()))
+                    put_new_superfile_bytes(
+                        &storage,
+                        multipart_threshold,
+                        storage_key.clone(),
+                        bytes,
+                    )
+                    .await
+                    .map(|()| storage_key)
+                    .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
         let mut uploads =
             stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
         while let Some(uploaded) = uploads.next().await {
-            let uri = uploaded?;
-            let entry = entry_by_uri.get(&uri).cloned().ok_or_else(|| {
-                BuildError::Store(format!("uploaded drain shard {} has no entry", uri.0))
+            let storage_key = uploaded?;
+            let entry = entry_by_key.get(&storage_key).cloned().ok_or_else(|| {
+                BuildError::Store(format!("uploaded drain shard {storage_key} has no entry"))
             })?;
             let shard_id = entry.partition_hint.ok_or_else(|| {
                 BuildError::Store(format!(
-                    "uploaded drain shard {} has no partition hint",
-                    uri.0
+                    "uploaded drain shard {storage_key} has no partition hint"
                 ))
             })?;
             let cell_counts = cell_counts_by_shard
@@ -5866,7 +5977,7 @@ async fn upload_prepared_shards(
                         // bytes nothing will reference.
                         continue;
                     }
-                    let Some((uri, bytes)) = prepared.bytes_for_storage.take() else {
+                    let Some((storage_key, bytes)) = prepared.bytes_for_storage.take() else {
                         // Unreachable as written: `prepare_superfile` fills
                         // `bytes_for_storage` whenever the table has storage,
                         // and this path runs only when it does. Fail closed
@@ -5884,7 +5995,7 @@ async fn upload_prepared_shards(
                     uploaded_bytes += bytes.len() as u64;
                     let storage = Arc::clone(&storage);
                     in_flight.push(async move {
-                        put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                        put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
                             .await
                             .map(|()| (shard_id, prepared))
                             .map_err(|error| BuildError::Store(error.to_string()))
@@ -5907,6 +6018,9 @@ async fn upload_prepared_shards(
     Ok((done.into_iter().map(|(_, p)| p).collect(), uploaded_bytes))
 }
 
+/// `stem` is the source label the commit's superfiles are keyed under, when
+/// the caller gave one; on the pipelined path the shards are prepared and
+/// uploaded from inside this function, so the label has to arrive here.
 fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
@@ -5915,6 +6029,7 @@ fn commit_shards_via_drain(
     n_packed_shards: usize,
     op_stats: &Option<Arc<OpStatsCollector>>,
     pipeline: Option<&PipelinedShardTx>,
+    stem: Option<&str>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -6031,7 +6146,7 @@ fn commit_shards_via_drain(
             let Some(output) = output else {
                 return Ok(None);
             };
-            let Some(prepared) = prepare_superfile(inner, output)? else {
+            let Some(prepared) = prepare_superfile_named(inner, output, stem)? else {
                 return Ok(None);
             };
             let PreparedSuperfile {
@@ -6125,6 +6240,9 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         metric,
         UPDATE_PACKED_SHARDS,
         op_stats,
+        None,
+        // An update's replacement rows come from a caller batch, not a
+        // source file: the superfile is unnamed.
         None,
     )?;
     let output = outputs.pop().ok_or(BuildError::NoDocsToBuild)?;
@@ -7048,14 +7166,16 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
     // (superfile URIs are UUID v4; a re-PUT's `PreconditionFailed` is
     // swallowed as our own prior attempt).
     let multipart_threshold = inner.options.put_multipart_threshold_bytes;
-    let uploads = pending_storage_writes.into_iter().map(|(uri, bytes)| {
-        let storage = Arc::clone(&storage);
-        async move {
-            put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
-                .await
-                .map_err(|error| BuildError::Store(error.to_string()))
-        }
-    });
+    let uploads = pending_storage_writes
+        .into_iter()
+        .map(|(storage_key, bytes)| {
+            let storage = Arc::clone(&storage);
+            async move {
+                put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
+                    .await
+                    .map_err(|error| BuildError::Store(error.to_string()))
+            }
+        });
     let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(upload) = in_flight.next().await {
         if let Err(error) = upload {
@@ -7536,14 +7656,16 @@ pub(in crate::supertable) async fn split_repack_bulk(
     // them (abandon-based recovery).
     pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
     let multipart_threshold = inner.options.put_multipart_threshold_bytes;
-    let uploads = pending_storage_writes.into_iter().map(|(uri, bytes)| {
-        let storage = Arc::clone(&storage);
-        async move {
-            put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
-                .await
-                .map_err(|error| BuildError::Store(error.to_string()))
-        }
-    });
+    let uploads = pending_storage_writes
+        .into_iter()
+        .map(|(storage_key, bytes)| {
+            let storage = Arc::clone(&storage);
+            async move {
+                put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
+                    .await
+                    .map_err(|error| BuildError::Store(error.to_string()))
+            }
+        });
     let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(landed) = in_flight.next().await {
         if let Err(error) = landed {
@@ -8953,8 +9075,8 @@ pub(in crate::supertable) async fn persist_commit_async(
     storage: Arc<dyn StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
     entries_to_remove: &[Arc<SuperfileEntry>],
-    mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
-    mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
+    mut pending_storage_writes: Vec<(String, Bytes)>,
+    mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
@@ -9026,8 +9148,8 @@ pub(in crate::supertable) fn persist_commit(
     storage: Arc<dyn StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
     entries_to_remove: &[Arc<SuperfileEntry>],
-    pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
-    pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
+    pending_storage_writes: Vec<(String, Bytes)>,
+    pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
 ) -> Result<(), SupertableCommitError> {
     let drive = persist_commit_async(
@@ -9127,8 +9249,8 @@ fn drain_read_concurrency() -> usize {
 pub async fn write_superfile_list(
     storage: &Arc<dyn StorageProvider>,
     opts: &Arc<SupertableOptions>,
-    pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
-    pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
+    pending_storage_writes: &mut Vec<(String, Bytes)>,
+    pending_storage_replaces: &mut Vec<(String, Bytes)>,
 ) -> Result<(), SupertableCommitError> {
     write_superfile_list_with_threshold(
         storage,
@@ -9140,13 +9262,18 @@ pub async fn write_superfile_list(
     .await
 }
 
+/// PUT one new superfile's bytes at `storage_key` — the entry's
+/// `storage_path()`, which is where every reader and GC's keep-set will
+/// look for them. Create-only: the key carries a fresh uuid, so an
+/// existing object can only be our own earlier attempt with identical
+/// bytes, and `PreconditionFailed` is success.
 async fn put_new_superfile_bytes(
     storage: &Arc<dyn StorageProvider>,
     multipart_threshold: u64,
-    uri: SuperfileUri,
+    storage_key: String,
     bytes: Bytes,
 ) -> Result<(), SupertableCommitError> {
-    let path = superfile_storage_path(&uri);
+    let path = storage_key;
     let result = if (bytes.len() as u64) >= multipart_threshold {
         put_superfile_multipart(storage.as_ref(), &path, bytes).await
     } else {
@@ -9162,8 +9289,8 @@ async fn write_superfile_list_with_threshold(
     storage: &Arc<dyn StorageProvider>,
     _opts: &Arc<SupertableOptions>,
     put_multipart_threshold_bytes: u64,
-    pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
-    pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
+    pending_storage_writes: &mut Vec<(String, Bytes)>,
+    pending_storage_replaces: &mut Vec<(String, Bytes)>,
 ) -> Result<(), SupertableCommitError> {
     // Bound object-store fanout to half the machine's CPU parallelism. A vector
     // commit can stage one hidden delta per touched cell plus user shards;
@@ -9175,21 +9302,21 @@ async fn write_superfile_list_with_threshold(
     // leaves headroom for a concurrent maintenance pass without saturation.
     let write_concurrency = commit_write_concurrency().get();
 
-    let replace_futs = pending_storage_replaces
-        .iter()
-        .enumerate()
-        .map(|(i, (uri, bytes))| {
-            let storage = Arc::clone(storage);
-            let uri = *uri;
-            let bytes = bytes.clone();
-            async move {
-                let path = superfile_storage_path(&uri);
-                put_superfile_replace(&storage, &path, bytes)
-                    .await
-                    .map(|()| i)
-                    .map_err(SupertableCommitError::from)
-            }
-        });
+    let replace_futs =
+        pending_storage_replaces
+            .iter()
+            .enumerate()
+            .map(|(i, (storage_key, bytes))| {
+                let storage = Arc::clone(storage);
+                let path = storage_key.clone();
+                let bytes = bytes.clone();
+                async move {
+                    put_superfile_replace(&storage, &path, bytes)
+                        .await
+                        .map(|()| i)
+                        .map_err(SupertableCommitError::from)
+                }
+            });
     let mut err = None;
     let mut successful_replace_idx = Vec::with_capacity(pending_storage_replaces.len());
     for r in stream::iter(replace_futs)
@@ -9214,12 +9341,12 @@ async fn write_superfile_list_with_threshold(
     let put_futs = pending_storage_writes
         .iter()
         .enumerate()
-        .map(|(i, (uri, bytes))| {
+        .map(|(i, (storage_key, bytes))| {
             let storage = Arc::clone(storage);
-            let uri = *uri;
+            let storage_key = storage_key.clone();
             let bytes = bytes.clone();
             async move {
-                put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
                     .await
                     .map(|()| i)
             }
@@ -9287,8 +9414,8 @@ pub(crate) async fn try_commit_attempt(
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     birth_versions: NewEntryBirthVersions,
-    pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
-    pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
+    pending_storage_writes: &mut Vec<(String, Bytes)>,
+    pending_storage_replaces: &mut Vec<(String, Bytes)>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -9605,10 +9732,6 @@ fn encode_record_batch_ipc(batch: &RecordBatch) -> Result<Bytes, String> {
         writer.finish().map_err(|e| format!("ipc finish: {e}"))?;
     }
     Ok(Bytes::from(out))
-}
-
-fn superfile_storage_path(uri: &SuperfileUri) -> String {
-    uri.storage_path()
 }
 
 /// Multipart-upload variant of the writer's per-superfile put.
@@ -10033,6 +10156,7 @@ mod tests {
             birth_version: 0,
             superfile_id: uuid,
             uri,
+            stem: None,
             n_docs: 1,
             id_min: 0,
             id_max: 0,
@@ -10050,7 +10174,7 @@ mod tests {
             PreparedSuperfile {
                 entry,
                 bytes_for_store: None,
-                bytes_for_storage: Some((uri, bytes)),
+                bytes_for_storage: Some((uri.storage_path(), bytes)),
                 bytes_for_cache: None,
             },
         )
@@ -10132,7 +10256,7 @@ mod tests {
         // the doomed shard is the only one missing from storage.
         assert!(
             !storage
-                .head(&superfile_storage_path(&doomed_uri))
+                .head(&doomed_uri.storage_path())
                 .await
                 .is_ok_and(|meta| meta.size > 0),
             "the faulted shard must not be durable"

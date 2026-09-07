@@ -37,13 +37,33 @@ use crate::{
     },
 };
 
-/// The format version stamped into every emitted part.
+/// The format version stamped into a part none of whose superfiles carries
+/// a source stem — every part written before stems existed, and every part
+/// since whose entries all have the unnamed key shape.
 ///
 /// Major-version-incompatible readers must reject; minor-
 /// version-newer readers must ignore unknown minor fields
-/// (see [`PartParseError::IncompatibleMajorVersion`]). The
-/// supported range is `>=1.0 <2.0`.
+/// (see [`PartParseError::IncompatibleMajorVersion`]). This reader accepts
+/// the majors in [`SUPPORTED_MAJORS`].
 pub const FORMAT_VERSION: &str = "1.0";
+
+/// The format version stamped into a part in which at least one superfile
+/// carries a source stem, so its object key is `data/<stem>-<uuid>` rather
+/// than `data/seg-<uuid>`.
+///
+/// A MAJOR bump on purpose, though the only wire change is one nullable
+/// field with a default: a reader that predates the field would decode the
+/// part fine, ignore the stem, derive the unnamed key for every entry, and
+/// its GC would then delete the live stem-named objects as orphans. Making
+/// such a reader refuse the part (`IncompatibleMajorVersion`) is the only
+/// thing that turns that data loss into a clean error. Parts without stems
+/// keep [`FORMAT_VERSION`], so a table that never calls `append_named`
+/// stays readable by every older binary.
+pub const FORMAT_VERSION_NAMED: &str = "2.0";
+
+/// The format majors this reader decodes: the unnamed shape and the
+/// source-named one. Anything else is a part from a newer engine.
+const SUPPORTED_MAJORS: [&str; 2] = ["1", "2"];
 
 /// Blake3 digest width in bytes. Blake3 emits a 256-bit (32-byte)
 /// digest; this is the length of a [`ContentHash`]'s payload and the
@@ -245,7 +265,8 @@ fn schema() -> &'static AvroSchema {
                 {"name": "vector_summary", "type": "bytes"},
                 {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null},
                 {"name": "vector_layout", "type": ["null", "string"], "default": null},
-                {"name": "birth_version", "type": "long", "default": 0}
+                {"name": "birth_version", "type": "long", "default": 0},
+                {"name": "stem", "type": ["null", "string"], "default": null}
               ]
             }}}
           ]
@@ -344,14 +365,34 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
                     "birth_version".into(),
                     AvroValue::Long(seg.birth_version as i64),
                 ),
+                (
+                    "stem".into(),
+                    match &seg.stem {
+                        Some(stem) => AvroValue::Union(
+                            AVRO_UNION_VALUE_INDEX,
+                            Box::new(AvroValue::String(stem.clone())),
+                        ),
+                        None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
+                    },
+                ),
             ])
         })
         .collect();
 
+    // A part holding a source-named superfile is a `FORMAT_VERSION_NAMED`
+    // part whatever the caller stamped: a reader from before stems must
+    // refuse it rather than derive the unnamed key for every entry and let
+    // its GC reclaim the live objects. Decided here, at the one wire exit,
+    // so no construction site can forget.
+    let format_version = if part.superfiles.iter().any(|seg| seg.stem.is_some()) {
+        FORMAT_VERSION_NAMED
+    } else {
+        part.format_version.as_str()
+    };
     let record = AvroValue::Record(vec![
         (
             "format_version".into(),
-            AvroValue::String(part.format_version.clone()),
+            AvroValue::String(format_version.to_owned()),
         ),
         (
             "part_id".into(),
@@ -470,10 +511,15 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         Some(AvroValue::Long(n)) => n as u64,
         _ => 0,
     };
+    // Absent on every part written before source-named superfiles existed,
+    // and on every entry without a single source since: `None` is the
+    // unnamed key shape those superfiles actually have.
+    let stem = take_optional_string(&mut map, "stem")?;
 
     Ok(SuperfileEntry {
         superfile_id,
         uri: SuperfileUri(uri),
+        stem,
         n_docs,
         id_min,
         id_max,
@@ -489,15 +535,11 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
 }
 
 fn check_major(fv: &str) -> Result<(), PartParseError> {
-    let supported_major = FORMAT_VERSION
-        .split('.')
-        .next()
-        .expect("constant has a dot");
     let got_major = fv.split('.').next().unwrap_or("");
-    if got_major != supported_major {
+    if !SUPPORTED_MAJORS.contains(&got_major) {
         return Err(PartParseError::IncompatibleMajorVersion {
             got: fv.to_string(),
-            supported: FORMAT_VERSION.to_string(),
+            supported: FORMAT_VERSION_NAMED.to_string(),
         });
     }
     Ok(())
@@ -839,6 +881,7 @@ mod tests {
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -932,6 +975,7 @@ mod tests {
         vec_summary.insert("img".into(), make_vector_summary(16, 1.25));
 
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -1097,6 +1141,7 @@ mod tests {
     fn partition_hint_some_and_none_both_roundtrip() {
         let id = Uuid::new_v4();
         let seg_with = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -1113,6 +1158,7 @@ mod tests {
         });
         let id2 = Uuid::new_v4();
         let seg_without = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id2,
             uri: SuperfileUri(id2),
@@ -1140,9 +1186,11 @@ mod tests {
     #[test]
     fn incompatible_major_version_rejected() {
         let mut part = fresh_part(vec![fresh_superfile(1)]);
-        part.format_version = "2.0".into();
+        // Majors 1 and 2 are both readable (2 only adds the nullable stem);
+        // the first unknown major is 3.
+        part.format_version = "3.0".into();
         let bytes = encode(&part);
-        let err = decode(&bytes).expect_err("major 2 must reject");
+        let err = decode(&bytes).expect_err("major 3 must reject");
         assert!(
             matches!(err, PartParseError::IncompatibleMajorVersion { .. }),
             "expected IncompatibleMajorVersion, got {err:?}"
@@ -1264,6 +1312,7 @@ mod tests {
             open_blob: vec![(50, vec![1, 2, 3, 4]), (9000, vec![9, 9])],
         };
         let seg = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -1294,6 +1343,7 @@ mod tests {
     fn vector_layout_cell_posting_roundtrip_through_part() {
         let id = Uuid::new_v4();
         let seg = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -1330,6 +1380,7 @@ mod tests {
             open_blob: vec![],
         };
         let seg = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -1443,8 +1494,9 @@ mod tests {
     fn check_major_accepts_one_and_rejects_other_majors() {
         assert!(check_major("1.0").is_ok());
         assert!(check_major("1.42").is_ok());
+        assert!(check_major("2.0").is_ok());
         assert!(matches!(
-            check_major("2.0"),
+            check_major("3.0"),
             Err(PartParseError::IncompatibleMajorVersion { .. })
         ));
         assert!(matches!(
@@ -1666,6 +1718,57 @@ mod tests {
         assert!(format!("{lifted}").contains("per-summary decode failed"));
     }
 
+    /// A part holding a source-named superfile round-trips the stem and is
+    /// stamped `FORMAT_VERSION_NAMED` on the wire whatever the caller set,
+    /// so a reader from before stems refuses it instead of mis-deriving the
+    /// key; a part with no stems keeps the version the caller set, so a
+    /// table that never names a source is readable by every older binary.
+    #[test]
+    fn a_source_named_superfile_round_trips_and_stamps_the_named_format_version() {
+        let mut named = (*fresh_superfile(3)).clone();
+        named.stem = Some("customers".into());
+        let named_key = named.storage_path();
+        let part = fresh_part(vec![Arc::new(named), fresh_superfile(2)]);
+        assert_eq!(
+            part.format_version, FORMAT_VERSION,
+            "the caller stamped the unnamed version"
+        );
+
+        let decoded = decode(&encode(&part)).expect("decode");
+        assert_eq!(
+            decoded.format_version, FORMAT_VERSION_NAMED,
+            "one stem anywhere in the part makes it a named-format part"
+        );
+        assert_eq!(decoded.superfiles[0].stem.as_deref(), Some("customers"));
+        assert_eq!(decoded.superfiles[0].storage_path(), named_key);
+        assert_eq!(decoded.superfiles[1].stem, None);
+
+        let unnamed = fresh_part(vec![fresh_superfile(3)]);
+        let decoded = decode(&encode(&unnamed)).expect("decode");
+        assert_eq!(decoded.format_version, FORMAT_VERSION);
+        assert_eq!(decoded.superfiles[0].stem, None);
+    }
+
+    /// Both format majors decode; anything newer is refused as incompatible,
+    /// with the message naming the newest version this reader knows.
+    #[test]
+    fn check_major_accepts_both_supported_majors_and_refuses_a_newer_one() {
+        for ok in ["1.0", "1.7", "2.0", "2.3"] {
+            check_major(ok).unwrap_or_else(|e| panic!("{ok} must be accepted: {e:?}"));
+        }
+        for bad in ["3.0", "0.9", ""] {
+            let err = check_major(bad).expect_err("newer or malformed major is refused");
+            assert!(
+                matches!(
+                    &err,
+                    PartParseError::IncompatibleMajorVersion { got, supported }
+                        if got == bad && supported == FORMAT_VERSION_NAMED
+                ),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn decode_superfile_rejects_malformed_uri_uuid() {
         // A record with a valid superfile_id but a non-UUID `uri`
@@ -1787,6 +1890,7 @@ mod tests {
             },
         );
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),

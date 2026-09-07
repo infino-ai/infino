@@ -269,6 +269,101 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
     assert_eq!(hits.len(), 1, "commit must not break in-memory reads");
 }
 
+/// `append_named` keys the commit's superfile by the source stem while
+/// everything else stays as it is: the object lands as
+/// `data/<stem>-<uuid>.sf.parquet`, a later plain `append` lands unnamed
+/// beside it, a fresh handle reads both back from storage by their keys,
+/// and a zero-gap GC keeps the named object because the keep-set is built
+/// from the same key the writer used.
+#[test]
+fn append_named_keys_the_superfile_by_its_source_stem() {
+    use std::time::Duration;
+
+    use infino::supertable::manifest::SuperfileUri;
+
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    let mut w = st.writer().expect("writer");
+    w.append_named(
+        &build_title_batch(&["nimblefox special token", "ordinary text"]),
+        "Customers 2024.parquet",
+    )
+    .expect("append_named");
+    w.commit().expect("commit");
+    drop(w);
+
+    let data_dir = dir.path().join("data");
+    let names = |label: &str| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&data_dir)
+            .unwrap_or_else(|e| panic!("readdir data ({label}): {e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let after_named = names("after append_named");
+    assert_eq!(
+        after_named.len(),
+        1,
+        "one shard → one object: {after_named:?}"
+    );
+    let named = &after_named[0];
+    assert!(
+        named.starts_with("customers_2024_parquet-") && named.ends_with(".sf.parquet"),
+        "the object key carries the key-safe stem: {named}"
+    );
+    assert!(
+        SuperfileUri::from_storage_path(&format!("data/{named}")).is_some(),
+        "the named key parses back to a uri: {named}"
+    );
+
+    // A plain append afterwards is unnamed, beside it.
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&["another row"]))
+        .expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    let after_plain = names("after plain append");
+    assert_eq!(after_plain.len(), 2, "{after_plain:?}");
+    assert!(
+        after_plain.iter().any(|n| n.starts_with("seg-")),
+        "the plain append is unnamed: {after_plain:?}"
+    );
+
+    // GC's keep-set is built from the same key the writer PUT at: a zero
+    // safety gap reaps superseded manifest history but no live superfile,
+    // named or not.
+    let report = st.gc(Duration::ZERO).expect("gc");
+    assert_eq!(
+        names("after gc"),
+        after_plain,
+        "every live superfile survives gc: {report:?}"
+    );
+
+    // A fresh handle knows nothing of the writer's in-memory bytes: it reads
+    // the named superfile from storage at the key the manifest names.
+    drop(st);
+    let reopened =
+        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("open");
+    let reader = reopened.reader().expect("reader");
+    assert_eq!(reader.n_superfiles(), 2);
+    let hits = reader
+        .bm25_hits(
+            "title",
+            "nimblefox",
+            BM25_TOP_K,
+            infino::supertable::query::fts::BoolMode::Or,
+        )
+        .expect("query through the named key");
+    assert_eq!(hits.len(), 1, "the named superfile's rows are served");
+}
+
 #[test]
 fn manifest_id_increments_only_on_non_empty_commits() {
     // A commit with no buffered batches is a no-op.

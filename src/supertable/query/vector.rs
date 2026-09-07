@@ -7182,6 +7182,7 @@ mod tests {
             .insert(uri, superfile_bytes_with_ids(ids, dim))
             .expect("insert superfile bytes");
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri,
@@ -7204,6 +7205,7 @@ mod tests {
     fn contiguous_entry(id_min: i128, n_docs: u64, seed: u128) -> Arc<SuperfileEntry> {
         let id = Uuid::from_u128(seed);
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -7567,6 +7569,7 @@ mod tests {
 
     fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
         SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id,
             uri: SuperfileUri(superfile_id),

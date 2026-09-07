@@ -101,13 +101,25 @@ use crate::{
 };
 
 /// Object-store / LocalFS directory prefix under which committed superfile
-/// bytes live (`<data>/seg-<id>.sf.parquet`). Shared by [`SuperfileUri::storage_path`]
-/// and the GC live-set sweep so both agree on the superfile namespace.
+/// bytes live (`<data>/seg-<id>.sf.parquet`, or `<data>/<stem>-<id>.sf.parquet`
+/// for a superfile ingested with a source name). Shared by
+/// [`SuperfileUri::storage_path`], [`SuperfileEntry::storage_path`] and the GC
+/// live-set sweep so all three agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
 
 /// Extra extension an in-flight cold-fetch tempfile carries on top of [`SuperfileUri::cache_filename`];
 /// the file is atomically renamed to the bare name once complete.
 pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
+
+/// Characters a hyphenated uuid renders to (`8-4-4-4-12`). The fixed width
+/// is what makes the `<stem>-<uuid>` key grammar unambiguous whatever the
+/// stem contains: the uuid is always the last this many bytes of the body.
+const UUID_TEXT_LEN: usize = 36;
+
+/// Longest stem a source name contributes to an object key. Object stores
+/// allow keys of a kilobyte, so this is not a storage limit; it keeps the key
+/// legible and bounds what a pathological source name can put in it.
+pub const MAX_STEM_CHARS: usize = 64;
 
 /// Legacy storage-subtree prefix for the hidden vector-index sibling
 /// supertable — the commit-time default stamped when a vector table's
@@ -2434,6 +2446,19 @@ pub struct SuperfileEntry {
     /// Opaque key into the `SuperfileReaderCache`. v1 wraps a UUID; the
     /// trait doesn't care about the internal shape.
     pub uri: SuperfileUri,
+    /// Where the rows came from, as a key-safe stem — `foo` for a shard
+    /// ingested from `foo.parquet` — when the writer was told a source
+    /// (`Supertable::append_named`). It puts the origin into the object
+    /// key, `data/<stem>-<uuid>.sf.parquet` (see [`Self::storage_path`]),
+    /// while `uri` stays the 16-byte value every lookup, cache slot and
+    /// tie-break keys on: the stem is a label on the key, never part of
+    /// identity. `None` for a superfile with no single source — the
+    /// update pipeline's replacements, hidden-index cells, a merge whose
+    /// inputs disagree — and for every superfile written before the field
+    /// existed, whose key is the unnamed shape. Never recovered from the
+    /// key: the manifest is the one source of it, which is what keeps the
+    /// writer's PUT key and GC's keep-set the same string.
+    pub stem: Option<String>,
     /// Row count.
     pub n_docs: u64,
     /// id-column min and max (the supertable-injected
@@ -2501,6 +2526,26 @@ pub struct SuperfileEntry {
     /// total order that's safe to watermark on. `0` on entries from before
     /// the field existed (treated as the genesis version).
     pub birth_version: u64,
+}
+
+impl SuperfileEntry {
+    /// Object-store / LocalFS key of this superfile's bytes: the unnamed
+    /// `data/seg-<uuid>.sf.parquet` when it has no stem, else
+    /// `data/<stem>-<uuid>.sf.parquet`. The uuid stays in the key either
+    /// way, so two superfiles can never share one — the property the
+    /// writer's create-only PUT and its retry idempotency rest on.
+    ///
+    /// This is the ONE function that turns an entry into a key. Every
+    /// writer PUT, every reader GET and GC's keep-set go through it (or
+    /// through [`SuperfileUri::storage_path`] for a uri known to have no
+    /// stem), so a key a manifest names and a key GC would keep are the
+    /// same string by construction.
+    pub fn storage_path(&self) -> String {
+        match &self.stem {
+            Some(stem) => format!("{SUPERFILE_DATA_DIR}/{stem}-{}.sf.parquet", self.uri.0),
+            None => self.uri.storage_path(),
+        }
+    }
 }
 
 /// superfile layout offsets cached on the manifest.
@@ -2609,11 +2654,58 @@ impl SuperfileUri {
         Self::from_cache_filename(name.strip_suffix(CACHE_TMP_EXTENSION)?)
     }
 
-    /// Inverse of [`Self::storage_path`]. Fetches the superfile name from the path.
+    /// Inverse of [`Self::storage_path`] and of
+    /// [`SuperfileEntry::storage_path`]: the uri an object key of either
+    /// shape names, `data/seg-<uuid>.sf.parquet` or
+    /// `data/<stem>-<uuid>.sf.parquet`. The stem is skipped, never
+    /// interpreted — the manifest holds it. `None` for any other key,
+    /// including a `.tmp` sibling or a tombstone sidecar.
     pub fn from_storage_path(key: &str) -> Option<Self> {
         let name = key.strip_prefix(SUPERFILE_DATA_DIR)?.strip_prefix('/')?;
-        Self::from_cache_filename(name)
+        let body = name.strip_suffix(".sf.parquet")?;
+        let uuid_text = body.strip_prefix("seg-").or_else(|| uuid_suffix(body))?;
+        Uuid::parse_str(uuid_text).ok().map(SuperfileUri)
     }
+}
+
+/// The uuid text a `<stem>-<uuid>` key body ends in, or `None` when the body
+/// is not shaped that way. The uuid's fixed textual width is what lets a
+/// stem contain anything without making the split ambiguous: the last
+/// [`UUID_TEXT_LEN`] bytes are the uuid, and the byte before them must be
+/// the separator.
+fn uuid_suffix(body: &str) -> Option<&str> {
+    let cut = body.len().checked_sub(UUID_TEXT_LEN)?;
+    let separator = cut.checked_sub(1)?;
+    (body.is_char_boundary(cut) && body.as_bytes()[separator] == b'-').then(|| &body[cut..])
+}
+
+/// The stem a source name contributes to a superfile's object key, or
+/// `None` when nothing usable survives.
+///
+/// Lowercased; every character outside `[a-z0-9]` becomes one `_`, runs
+/// collapse to one, the edges are trimmed, and the result is cut at
+/// [`MAX_STEM_CHARS`]. No `/` survives, so a stem can never nest a key
+/// under `data/`; no `-` survives, so the `-` before the uuid is the only
+/// one the key grammar has to recognise. Pure and deterministic — the same
+/// source name always yields the same stem — which the content-addressed
+/// slow-state blob relies on when it re-encodes entries.
+pub fn superfile_stem(source_name: &str) -> Option<String> {
+    let mut stem = String::with_capacity(source_name.len().min(MAX_STEM_CHARS));
+    let mut in_gap = true;
+    for ch in source_name.chars() {
+        if stem.len() >= MAX_STEM_CHARS {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            stem.push(ch.to_ascii_lowercase());
+            in_gap = false;
+        } else if !in_gap {
+            stem.push('_');
+            in_gap = true;
+        }
+    }
+    let trimmed = stem.trim_matches('_');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// Merge min/max arrays by comparing values and keeping the actual min and max.
@@ -4048,6 +4140,112 @@ mod tests {
         }
     }
 
+    /// A source-named key parses back to its uri by the uuid's fixed width,
+    /// whatever the stem holds — and only when the separator is where the
+    /// grammar puts it. A stem of `seg` is the unnamed shape exactly, and
+    /// parses the same way.
+    #[test]
+    fn from_storage_path_parses_a_source_named_key() {
+        let uri = SuperfileUri::new_v4();
+        for stem in ["customers", "shard_00", "a", "seg", "x_2024_q1_final"] {
+            let key = format!("data/{stem}-{}.sf.parquet", uri.0);
+            assert_eq!(
+                SuperfileUri::from_storage_path(&key),
+                Some(uri),
+                "named key parses: {key}"
+            );
+        }
+        let text = uri.0.to_string();
+        for key in [
+            format!("data/customers{text}.sf.parquet"), // no separator
+            format!("data/customers-{}.sf.parquet", &text[1..]), // uuid one char short
+            format!("data/customers-{text}x.sf.parquet"), // uuid not at the end
+            format!("data/customers-{text}.sf.parquet.tmp"), // in-flight tmp
+        ] {
+            assert_eq!(
+                SuperfileUri::from_storage_path(&key),
+                None,
+                "must not parse: {key}"
+            );
+        }
+    }
+
+    /// The stem is a key-safe label: lowercase `[a-z0-9]` with every other
+    /// run folded to one `_`, trimmed, capped, and `None` when nothing
+    /// survives — so it can never nest a key or carry the separator.
+    #[test]
+    fn superfile_stem_makes_a_key_safe_label() {
+        assert_eq!(superfile_stem("customers"), Some("customers".into()));
+        assert_eq!(
+            superfile_stem("Customers 2024/Q1 (final).parquet"),
+            Some("customers_2024_q1_final_parquet".into())
+        );
+        assert_eq!(superfile_stem("../../evil"), Some("evil".into()));
+        assert_eq!(superfile_stem("Größe"), Some("gr_e".into()));
+        assert_eq!(superfile_stem("shard-00"), Some("shard_00".into()));
+        for empty in ["", "   ", "...", "-_-", "!!!"] {
+            assert_eq!(superfile_stem(empty), None, "nothing survives {empty:?}");
+        }
+        let long = "a".repeat(MAX_STEM_CHARS * 3);
+        let stem = superfile_stem(&long).expect("a long plain name still has a stem");
+        assert_eq!(stem.len(), MAX_STEM_CHARS);
+        // A cut that lands on a gap must not leave the separator dangling.
+        let gappy = format!(
+            "{}!{}",
+            "b".repeat(MAX_STEM_CHARS - 1),
+            "c".repeat(MAX_STEM_CHARS)
+        );
+        let stem = superfile_stem(&gappy).expect("stem");
+        assert!(!stem.ends_with('_'), "trimmed after the cap: {stem}");
+        // Deterministic: the same name always yields the same stem.
+        assert_eq!(superfile_stem("Same Name"), superfile_stem("Same Name"));
+    }
+
+    /// An entry's object key carries its stem; without one it is the uri's
+    /// unnamed key. Both round-trip through `from_storage_path` to the same
+    /// uri, which is what lets GC evict either shape's cache copy.
+    #[test]
+    fn superfile_entry_storage_path_carries_the_stem() {
+        let uri = SuperfileUri::new_v4();
+        let unnamed = SuperfileEntry {
+            stem: None,
+            birth_version: 0,
+            superfile_id: Uuid::new_v4(),
+            uri,
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        };
+        assert_eq!(unnamed.storage_path(), uri.storage_path());
+
+        let named = SuperfileEntry {
+            stem: Some("customers".into()),
+            ..unnamed.clone()
+        };
+        assert_eq!(
+            named.storage_path(),
+            format!("data/customers-{}.sf.parquet", uri.0)
+        );
+        assert_ne!(named.storage_path(), unnamed.storage_path());
+        assert_eq!(
+            SuperfileUri::from_storage_path(&named.storage_path()),
+            Some(uri)
+        );
+        assert_eq!(
+            SuperfileUri::from_storage_path(&unnamed.storage_path()),
+            Some(uri)
+        );
+        // The cache name never learns about the stem.
+        assert_eq!(named.uri.cache_filename(), unnamed.uri.cache_filename());
+    }
+
     /// The 1-bit admit estimate must prefer the instance holding the
     /// query's true nearest centroid on separated fixtures, for every
     /// metric — the property the exact-rescore cell shortlist rides on.
@@ -4234,6 +4432,7 @@ mod tests {
 
     fn seg_entry(uuid: Uuid, n_docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: uuid,
             uri: SuperfileUri(uuid),
@@ -5006,6 +5205,7 @@ mod tests {
     /// destined for `update()`, which derives and stamps the key itself.
     fn make_entry(docs: u64, pk: Vec<u8>, hint: Option<u32>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
@@ -8190,6 +8390,7 @@ mod tests {
     async fn decode_part_off_thread_roundtrips_and_rejects_garbage() {
         let id = Uuid::new_v4();
         let seg = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),

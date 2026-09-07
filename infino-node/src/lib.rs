@@ -723,6 +723,22 @@ impl Table {
             .map_err(map_err)
     }
 
+    /// `append`, naming the source the rows came from: the superfiles this
+    /// commit writes are keyed `data/<stem>-<uuid>.sf.parquet`, with the stem
+    /// the key-safe form of `sourceName` (lowercase `[a-z0-9_]`), so a bucket
+    /// listing shows where each came from. The table behaves exactly as
+    /// after `append`; the name is a label on the object key.
+    #[napi]
+    pub fn append_named(&self, data: Buffer, source_name: String) -> Result<()> {
+        let batches = read_batches_ipc(&data)?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .append_named(&self.align_batches(batches)?, &source_name)
+            .map_err(map_err)
+    }
+
     /// BM25 search over one FTS column. Returns matching rows as an Arrow
     /// IPC `Buffer` (read with `tableFromIPC`). `mode` is `"or"` (default)
     /// or `"and"`. `projection` selects the returned columns — pass

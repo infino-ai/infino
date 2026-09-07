@@ -467,6 +467,30 @@ impl Table {
         }
     }
 
+    /// `append`, naming the source the rows came from: the superfiles this
+    /// commit writes are keyed `data/<stem>-<uuid>.sf.parquet`, with the stem
+    /// the key-safe form of `source_name` (lowercase `[a-z0-9_]`), so a
+    /// bucket listing shows where each came from. The table behaves exactly
+    /// as after `append`; the name is a label on the object key. Not
+    /// available on a hosted table.
+    fn append_named(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        source_name: &str,
+    ) -> PyResult<()> {
+        let declared = self.inner.schema();
+        let py_schema = declared.as_ref().to_pyarrow(py)?;
+        match coerce_to_record_batch(py, data, &py_schema)? {
+            Some(batch) => {
+                let aligned = align_to_schema(declared, batch)?;
+                py.detach(|| self.inner.append_named(&aligned, source_name))
+                    .map_err(py_err)
+            }
+            None => Ok(()),
+        }
+    }
+
     /// BM25 search over one FTS column. Returns a pyarrow `Table`.
     /// `projection` names the output columns (`_id`, any scalar column,
     /// or the trailing `score` — a similarity, higher is better);

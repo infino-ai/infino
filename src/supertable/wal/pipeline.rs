@@ -493,6 +493,7 @@ async fn do_apply(
 
     let uri = SuperfileUri(preallocated_superfile_id);
     let entry = Arc::new(SuperfileEntry {
+        stem: None,
         // Stamped to the winning commit version later, in `ManifestSnapshot::update`.
         birth_version: 0,
         superfile_id: preallocated_superfile_id,
@@ -530,12 +531,15 @@ async fn do_apply(
     // `Writer::commit` path arms it. We swap here so subsequent
     // reads + the idempotency probe on a retry both see the
     // new superfile.
+    // The update pipeline's replacement superfile has no single source, so
+    // its entry carries no stem and this is the unnamed key.
+    let storage_key = entry.storage_path();
     persist_commit(
         inner,
         storage,
         vec![entry],
         &[],
-        vec![(uri, bytes.clone())],
+        vec![(storage_key, bytes.clone())],
         Vec::new(),
         CommitListMetadata::empty(),
     )
@@ -1453,6 +1457,7 @@ fn lookup_ids_in_superfile(
         inner.options.disk_cache.as_ref(),
         inner.options.storage.as_ref(),
         &entry.uri,
+        &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
         true,
     )) {
@@ -1463,16 +1468,15 @@ fn lookup_ids_in_superfile(
                  storage fetch for the id scan",
                 entry.uri.0
             );
-            let bytes =
-                fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
-                    TombstonePhaseError::IdLookupFailed {
-                        targets: scan_label.clone(),
-                        message: format!(
-                            "open superfile {} (storage fallback): {message}",
-                            entry.uri.0
-                        ),
-                    }
-                })?;
+            let bytes = fetch_superfile_bytes_for_id_scan(inner, &entry.storage_path()).map_err(
+                |message| TombstonePhaseError::IdLookupFailed {
+                    targets: scan_label.clone(),
+                    message: format!(
+                        "open superfile {} (storage fallback): {message}",
+                        entry.uri.0
+                    ),
+                },
+            )?;
             Arc::new(SuperfileReader::open(bytes).map_err(|e| {
                 TombstonePhaseError::IdLookupFailed {
                     targets: scan_label.clone(),
@@ -1496,16 +1500,15 @@ fn lookup_ids_in_superfile(
                 entry.uri.0
             );
             // Lazy reader — re-open eagerly from storage.
-            let bytes =
-                fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
-                    TombstonePhaseError::IdLookupFailed {
-                        targets: scan_label.clone(),
-                        message: format!(
-                            "open superfile {} (eager fallback for id_lookup): {message}",
-                            entry.uri.0
-                        ),
-                    }
-                })?;
+            let bytes = fetch_superfile_bytes_for_id_scan(inner, &entry.storage_path()).map_err(
+                |message| TombstonePhaseError::IdLookupFailed {
+                    targets: scan_label.clone(),
+                    message: format!(
+                        "open superfile {} (eager fallback for id_lookup): {message}",
+                        entry.uri.0
+                    ),
+                },
+            )?;
             let eager_reader =
                 SuperfileReader::open(bytes).map_err(|e| TombstonePhaseError::IdLookupFailed {
                     targets: scan_label.clone(),
@@ -1554,9 +1557,11 @@ fn id_window_label(sorted_targets: &[i128]) -> String {
     }
 }
 
-/// Fetch a superfile's full bytes directly from storage.
-/// Storage-fallback path for the recovery sweep when the
-/// in-memory + disk-cache tiers are both cold.
+/// Fetch a superfile's full bytes directly from storage, at the key its
+/// manifest entry names (`SuperfileEntry::storage_path`) — passed in
+/// rather than re-derived, because a source-named superfile's key is not a
+/// function of its uuid. Storage-fallback path for the recovery sweep when
+/// the in-memory + disk-cache tiers are both cold.
 ///
 /// Sync-bridged because the call site
 /// (`lookup_ids_in_superfile`) is sync (called from inside
@@ -1565,7 +1570,7 @@ fn id_window_label(sorted_targets: &[i128]) -> String {
 /// pattern.
 fn fetch_superfile_bytes_for_id_scan(
     inner: &Arc<SupertableInner>,
-    superfile_id: Uuid,
+    storage_key: &str,
 ) -> Result<Bytes, String> {
     let storage = inner
         .options
@@ -1573,7 +1578,7 @@ fn fetch_superfile_bytes_for_id_scan(
         .as_ref()
         .ok_or_else(|| "no storage attached".to_string())?
         .clone();
-    let path = SuperfileUri(superfile_id).storage_path();
+    let path = storage_key.to_owned();
     let (bytes, _) = bridge_sync_to_async(async move { storage.get(&path).await })
         .map_err(|e| format!("storage get: {e}"))?;
     Ok(bytes)
@@ -1700,8 +1705,11 @@ mod tests {
             st.inner().options.storage.is_none(),
             "fixture-free supertable has no storage"
         );
-        let err = fetch_superfile_bytes_for_id_scan(st.inner(), Uuid::from_u128(7))
-            .expect_err("must error without storage");
+        let err = fetch_superfile_bytes_for_id_scan(
+            st.inner(),
+            &SuperfileUri(Uuid::from_u128(7)).storage_path(),
+        )
+        .expect_err("must error without storage");
         assert!(err.contains("no storage"), "got {err}");
     }
 
@@ -1721,7 +1729,8 @@ mod tests {
             .await
             .expect("put superfile");
 
-        let got = fetch_superfile_bytes_for_id_scan(st.inner(), id).expect("fetch bytes");
+        let got = fetch_superfile_bytes_for_id_scan(st.inner(), &SuperfileUri(id).storage_path())
+            .expect("fetch bytes");
         assert_eq!(got, payload, "fetched bytes match what was written");
     }
 

@@ -506,12 +506,13 @@ impl SupertableProvider {
                     disk_cache.as_ref(),
                     storage.as_ref(),
                     &entry.uri,
+                    &entry.storage_path(),
                     entry.subsection_offsets.as_ref(),
                     true,
                 )
                 .await
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-                let path = ObjPath::from(entry.uri.storage_path());
+                let path = ObjPath::from(entry.storage_path());
                 let source = reader.byte_source();
                 let size = source.size();
                 // Index-complete metadata (column + offset page indexes),
@@ -2778,6 +2779,7 @@ mod tests {
         let mut scalar_stats = HashMap::new();
         scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),

@@ -372,6 +372,19 @@ export class Table {
     guard(this.remote, () => this.inner.append(ipc));
   }
 
+  /**
+   * {@link append}, naming the source the rows came from. The superfiles
+   * this commit writes are keyed `data/<stem>-<uuid>.sf.parquet`, with the
+   * stem the key-safe form of `sourceName` (lowercase `[a-z0-9_]`), so a
+   * bucket listing shows where each came from. The table behaves exactly as
+   * after `append`; the name is a label on the object key. Not available on
+   * a hosted table.
+   */
+  appendNamed(data: AppendData, sourceName: string): void {
+    const ipc = dataToIpc(data, () => this.schema());
+    guard(this.remote, () => this.inner.appendNamed(ipc, sourceName));
+  }
+
   /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a
    * similarity (higher is better) — opposite direction from `vectorSearch`'s
    * distance. Fuse with `hybridSearch`. */
