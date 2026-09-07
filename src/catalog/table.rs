@@ -20,8 +20,8 @@ use datafusion::prelude::Expr;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, VectorFilter, superfile::VectorSearchOptions,
-    supertable::Supertable as SupertableHandle,
+    OptimizeOptions, VectorFilter, catalog::ensure_expr_within_connective_cap,
+    superfile::VectorSearchOptions, supertable::Supertable as SupertableHandle,
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -215,11 +215,13 @@ impl Supertable {
         predicate: Expr,
         batch: &RecordBatch,
     ) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
         self.inner.update(predicate, batch)
     }
 
     /// Delete rows matching `predicate`.
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
         self.inner.delete(predicate)
     }
 
