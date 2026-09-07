@@ -60,7 +60,12 @@ jobs:
           # (~0 and hypersensitive to shard df); grading FTS perf and
           # quality there rewards scoring artifacts of that degeneracy
           # instead of behavior on text-shaped term distributions.
-          - { bench: supertable_fts,    docs: "1000000", suffix: st-fts, corpus: realistic }
+          # The realistic corpus is heavier per arm than synthetic — larger
+          # docs make the fresh-cache cold battery ~1.5-2 min per shape —
+          # and the leg times both A/B arms on one VM: one arm alone runs
+          # ~55 min, so the reusable workflow's 60-minute default lands mid
+          # baseline arm. Ceiling sized for two arms plus provision/compile.
+          - { bench: supertable_fts,    docs: "1000000", suffix: st-fts, corpus: realistic, timeout_minutes: "170" }
           - { bench: supertable_vector, docs: "1000000", suffix: st-vec }
           # Non-cosine (L2) leg: exercises the Sq16Adaptive default codec
           # (the cosine leg above stays on the fixed-grid Sq16).
@@ -86,6 +91,8 @@ jobs:
       metric: ${{ matrix.metric }}
       corpus: ${{ matrix.corpus }}
       corpus_dir: ${{ matrix.corpus_dir }}
+      # Per-leg ceiling; legs without one keep the callee's default.
+      timeout_minutes: ${{ matrix.timeout_minutes || '60' }}
       ref: ${{ github.event.pull_request.head.sha }}
       name_suffix: -${{ matrix.suffix }}
       pr_number: ${{ github.event.pull_request.number }}
