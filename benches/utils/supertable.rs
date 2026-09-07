@@ -913,6 +913,16 @@ const WARM_ITERS: usize = 20;
 // and every deterministic cold assertion (GET counts, byte ceilings, cost
 // tables) is per-iteration and unaffected by the count.
 const COLD_ITERS: usize = 3;
+/// FTS-only cold sampling: one fresh-cache pass per shape. The FTS cold
+/// battery is the most byte-bound cell in the suite (realistic text
+/// barely compresses, and every iteration re-pays the whole fan from
+/// the object store) and its latencies are informational — the merge
+/// gate reads warm p90, and the deterministic cold assertions (GET
+/// counts, byte ceilings, cost tables) hold per iteration. One pass
+/// keeps every column populated at a third of the wall time; the
+/// vector and sql cells keep [`COLD_ITERS`] for outlier-discarding
+/// medians.
+const FTS_COLD_ITERS: usize = 1;
 const TOP_K: usize = 10;
 
 /// Selected phases for a per-modality supertable runner.
@@ -2266,7 +2276,7 @@ pub mod fts {
             FTS_BATTERY,
             supertable::TEXT_COLUMN,
             TOP_K,
-            COLD_ITERS,
+            FTS_COLD_ITERS,
             true,
             "supertable_fts",
         )
