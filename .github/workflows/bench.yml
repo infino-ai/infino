@@ -60,7 +60,16 @@ jobs:
           # (~0 and hypersensitive to shard df); grading FTS perf and
           # quality there rewards scoring artifacts of that degeneracy
           # instead of behavior on text-shaped term distributions.
-          - { bench: supertable_fts,    docs: "1000000", suffix: st-fts, corpus: realistic }
+          # The FTS cell runs as two legs split by read phase. The realistic
+          # corpus is ~6x the synthetic bytes at equal docs and cold
+          # measurement pays per byte, so one combined leg overran the
+          # 60-minute default mid baseline arm; splitting lets the
+          # gate-bearing warm leg (build + quality + warm) report in under
+          # an hour while the byte-bound cold battery runs in parallel on
+          # its own VM. Ceilings are sized per leg for two A/B arms plus
+          # VM provision and compile.
+          - { bench: supertable_fts_warm, docs: "1000000", suffix: st-fts-warm, corpus: realistic, timeout_minutes: "75" }
+          - { bench: supertable_fts_cold, docs: "1000000", suffix: st-fts-cold, corpus: realistic, timeout_minutes: "100" }
           - { bench: supertable_vector, docs: "1000000", suffix: st-vec }
           # Non-cosine (L2) leg: exercises the Sq16Adaptive default codec
           # (the cosine leg above stays on the fixed-grid Sq16).
@@ -86,6 +95,8 @@ jobs:
       metric: ${{ matrix.metric }}
       corpus: ${{ matrix.corpus }}
       corpus_dir: ${{ matrix.corpus_dir }}
+      # Per-leg ceiling; legs without one keep the callee's default.
+      timeout_minutes: ${{ matrix.timeout_minutes || '60' }}
       ref: ${{ github.event.pull_request.head.sha }}
       name_suffix: -${{ matrix.suffix }}
       pr_number: ${{ github.event.pull_request.number }}
