@@ -53,7 +53,14 @@ jobs:
         # resources and comment markers unique (all legs share one run_id).
         include:
           - { bench: superfile,         docs: "1000000", suffix: sf }
-          - { bench: supertable_fts,    docs: "1000000", suffix: st-fts }
+          # The FTS leg runs the generated realistic text corpus — the one
+          # the quality oracle is calibrated on. The synthetic corpus draws
+          # every battery token from one Zipf, so its "common-word" phrases
+          # pair near-universal terms whose per-superfile idf is degenerate
+          # (~0 and hypersensitive to shard df); grading FTS perf and
+          # quality there rewards scoring artifacts of that degeneracy
+          # instead of behavior on text-shaped term distributions.
+          - { bench: supertable_fts,    docs: "1000000", suffix: st-fts, corpus: realistic }
           - { bench: supertable_vector, docs: "1000000", suffix: st-vec }
           # Non-cosine (L2) leg: exercises the Sq16Adaptive default codec
           # (the cosine leg above stays on the fixed-grid Sq16).
