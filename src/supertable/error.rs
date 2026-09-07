@@ -541,6 +541,30 @@ pub enum GcError {
     Storage(#[from] crate::storage::StorageError),
 }
 
+/// Errors raised by [`crate::Supertable::format_versions`].
+#[derive(Debug, thiserror::Error)]
+pub enum FormatVersionsError {
+    /// The table is hosted; the report runs where the table's storage is and
+    /// is not available over the hosted transport.
+    #[error("format_versions is not available on a hosted table")]
+    NotLocal,
+
+    /// The manifest could not be refreshed or its superfile list loaded.
+    #[error("manifest error during format_versions: {0}")]
+    Manifest(#[from] ManifestLoadError),
+
+    /// One superfile's footer or section header could not be read or did
+    /// not parse. The report is all-or-nothing: a table with an unreadable
+    /// superfile has no trustworthy version picture.
+    #[error("superfile {superfile_id}: {reason}")]
+    Superfile {
+        /// The superfile whose header failed.
+        superfile_id: String,
+        /// What went wrong, in words.
+        reason: String,
+    },
+}
+
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]
 /// (`query_sql`; future: `bm25_search`, `vector_search`).
 ///

@@ -19,8 +19,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25SearchOptions, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError,
-    OptimizeOptions, VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, BoolMode, ConnectOptions, FormatVersionsError, IndexSpec, InfinoError,
+    OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -494,6 +494,23 @@ async fn optimize_is_client_unsupported_without_a_request() {
 }
 
 #[tokio::test]
+async fn format_versions_is_client_unsupported_without_a_request() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    // The format report reads the table's storage directly; on a hosted
+    // table that is the operator's view, so it short-circuits client-side
+    // and never sends a request.
+    let err = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .format_versions()
+            .expect_err("format_versions is server-side for a hosted table")
+    })
+    .await;
+    assert!(matches!(err, FormatVersionsError::NotLocal), "got {err:?}");
+}
+
+#[tokio::test]
 async fn create_database_posts_name_to_account_scoped_endpoint() {
     let server = MockServer::start().await;
     // The endpoint is account-scoped: no `/mydb` path segment, and the target
@@ -597,7 +614,8 @@ async fn remote_client_matches_the_published_api_spec() {
     // rest go unmatched (404) but their requests are still recorded — we assert
     // on what the client sends, not on the responses. Searches pass a projection
     // so the required field is present (the projection-optionality question is
-    // tracked separately). `optimize`/`gc` short-circuit and send nothing.
+    // tracked separately). `optimize`/`gc`/`format_versions` short-circuit and send
+    // nothing.
     with_connection(server.uri(), |db| {
         let _ = db.create_database();
         let _ = db.create_table("posts", id_schema(), IndexSpec::new());
@@ -616,6 +634,7 @@ async fn remote_client_matches_the_published_api_spec() {
             let _ = table.hybrid_search("id", "x", BoolMode::Or, "id", &[1.0], 1, Some(&["_id"]));
             let _ = table.optimize(&OptimizeOptions::default());
             let _ = table.gc(Duration::from_secs(0));
+            let _ = table.format_versions();
         }
     })
     .await;

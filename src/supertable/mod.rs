@@ -26,6 +26,7 @@
 pub(crate) mod build;
 pub(crate) mod compaction;
 pub mod error;
+pub(crate) mod format_versions;
 pub(crate) mod gc;
 pub mod handle;
 pub(crate) mod hidden_deleted;
@@ -44,7 +45,12 @@ pub mod utils;
 pub mod wal;
 pub mod writer;
 
-pub use error::{BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError};
+pub use error::{
+    BuildError, CommitError, FormatVersionsError, GcError, OpenError, OptimizeError, QueryError,
+};
+pub use format_versions::{
+    FormatVersionsReport, ManifestFormatVersions, OptionsHashRule, SuperfileFormatVersions,
+};
 pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;

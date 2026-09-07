@@ -99,6 +99,48 @@ export interface GcReport {
   deleteErrors: number;
 }
 
+/** Format facts about one superfile, from {@link Table.formatVersions}. */
+export interface SuperfileFormatVersions {
+  /** The superfile's id, as it appears in its storage path. */
+  superfileId: string;
+  /** `true` when the superfile belongs to the table's derived vector index rather than to the user's rows. */
+  vectorIndex: boolean;
+  /** Total size of the superfile in bytes. */
+  sizeBytes: number;
+  /** The container's format version, e.g. `"1.1.0"`. */
+  containerVersion: string;
+  /** Version of the embedded full-text section header, if present. */
+  ftsVersion?: number;
+  /** Version of the embedded vector section header, if present. */
+  vectorVersion?: number;
+  /** `true` when the superfile carries the packed stable-id sidecar. */
+  idSidecar: boolean;
+  /** `true` when every layer is what the running engine writes today. */
+  current: boolean;
+}
+
+/** Format facts about the table's persisted manifest list. */
+export interface ManifestFormatVersions {
+  /** The list's format version as stored, e.g. `"1.0"`. */
+  formatVersion: string;
+  /** Which rule the stored options hash verifies under: `"current"` or `"zero_sentinel"`. */
+  optionsHashRule: string;
+  /** `true` when the list is exactly what the running engine would write. */
+  current: boolean;
+}
+
+/** What {@link Table.formatVersions} returns. */
+export interface FormatVersionsReport {
+  /** The persisted manifest list; absent for an in-process (`memory://`) table. */
+  manifest?: ManifestFormatVersions;
+  /** One row per superfile, in manifest order. */
+  superfiles: SuperfileFormatVersions[];
+  /** `true` when the manifest (if persisted) and every superfile are current. */
+  isCurrent: boolean;
+  /** Superfiles with at least one layer behind the current format. */
+  staleSuperfiles: number;
+}
+
 /** Tuning for `optimize`; all fields optional (omitted ⇒ engine default). */
 export interface OptimizeOptions {
   /** Build-time memory budget, in MB. */
@@ -461,6 +503,18 @@ export class Table {
    */
   gc(graceSecs: number): GcReport {
     return guard(this.remote, () => this.inner.gc(graceSecs));
+  }
+
+  /**
+   * Report the on-disk format versions of the table's manifest and of every
+   * superfile, and whether each is what this engine writes. Read-only; reads
+   * only footers and section headers.
+   *
+   * **Local connections only.** On Infino Cloud the report is the operator's
+   * view, so calling this on a hosted connection throws.
+   */
+  formatVersions(): FormatVersionsReport {
+    return guard(this.remote, () => this.inner.formatVersions());
   }
 }
 

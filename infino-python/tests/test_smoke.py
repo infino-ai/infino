@@ -27,6 +27,9 @@ def test_package_metadata():
         "IndexSpec",
         "MutationStats",
         "GcReport",
+        "FormatVersionsReport",
+        "ManifestFormatVersions",
+        "SuperfileFormatVersions",
         "OptimizeOptions",
     }
 
@@ -433,6 +436,36 @@ def test_gc_rejects_memory():
     t.append([{"title": "alpha"}])
     with pytest.raises(RuntimeError):
         t.gc(0.0)
+
+
+def test_format_versions_reports_durable_table(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}])
+    t.append([{"title": "beta"}])  # two appends -> two superfiles
+
+    report = t.format_versions()
+    assert isinstance(report, infino.FormatVersionsReport)
+    assert report.manifest is not None
+    assert report.manifest.options_hash_rule == "current"
+    assert report.manifest.current is True
+    assert len(report.superfiles) == 2
+    assert all(row.fts_version is not None for row in report.superfiles)
+    assert all(row.vector_version is None for row in report.superfiles)
+    assert all(row.size_bytes > 0 for row in report.superfiles)
+    assert report.is_current is True
+    assert report.stale_superfiles == 0
+    assert "FormatVersionsReport(" in repr(report)
+
+
+def test_format_versions_on_memory_table_has_no_manifest():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}])
+    report = t.format_versions()
+    assert report.manifest is None
+    assert len(report.superfiles) == 1
+    assert report.is_current is True
 
 
 def test_vector_search_end_to_end():

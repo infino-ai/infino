@@ -33,7 +33,8 @@ use pyo3::types::{PyDict, PyList};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
+    FormatVersionsError, GcError, InfinoError as CoreError, Metric, OptimizeError,
+    OptimizeOptions, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -100,6 +101,10 @@ fn optimize_err(e: OptimizeError) -> PyErr {
 }
 
 fn gc_err(e: GcError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
+fn format_versions_err(e: FormatVersionsError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
@@ -408,6 +413,141 @@ impl GcReport {
             self.objects_skipped_live,
             self.objects_skipped_too_new,
             self.delete_errors,
+        )
+    }
+}
+
+/// Format facts about one superfile, from `Table.format_versions`.
+#[pyclass(name = "SuperfileFormatVersions", frozen, skip_from_py_object)]
+#[derive(Clone)]
+struct SuperfileFormatVersions {
+    #[pyo3(get)]
+    superfile_id: String,
+    #[pyo3(get)]
+    vector_index: bool,
+    #[pyo3(get)]
+    size_bytes: u64,
+    #[pyo3(get)]
+    container_version: String,
+    #[pyo3(get)]
+    fts_version: Option<u32>,
+    #[pyo3(get)]
+    vector_version: Option<u32>,
+    #[pyo3(get)]
+    id_sidecar: bool,
+    #[pyo3(get)]
+    current: bool,
+}
+
+impl SuperfileFormatVersions {
+    fn from_core(r: &infino::SuperfileFormatVersions) -> Self {
+        Self {
+            superfile_id: r.superfile_id.clone(),
+            vector_index: r.vector_index,
+            size_bytes: r.size_bytes,
+            container_version: r.container_version.clone(),
+            fts_version: r.fts_version,
+            vector_version: r.vector_version,
+            id_sidecar: r.id_sidecar,
+            current: r.current,
+        }
+    }
+}
+
+#[pymethods]
+impl SuperfileFormatVersions {
+    fn __repr__(&self) -> String {
+        format!(
+            "SuperfileFormatVersions(superfile_id={:?}, vector_index={}, size_bytes={}, \
+             container_version={:?}, fts_version={:?}, vector_version={:?}, id_sidecar={}, \
+             current={})",
+            self.superfile_id,
+            self.vector_index,
+            self.size_bytes,
+            self.container_version,
+            self.fts_version,
+            self.vector_version,
+            self.id_sidecar,
+            self.current,
+        )
+    }
+}
+
+/// Format facts about the table's persisted manifest list.
+#[pyclass(name = "ManifestFormatVersions", frozen, skip_from_py_object)]
+#[derive(Clone)]
+struct ManifestFormatVersions {
+    #[pyo3(get)]
+    format_version: String,
+    /// `"current"` or `"zero_sentinel"`.
+    #[pyo3(get)]
+    options_hash_rule: String,
+    #[pyo3(get)]
+    current: bool,
+}
+
+impl ManifestFormatVersions {
+    fn from_core(r: &infino::ManifestFormatVersions) -> Self {
+        Self {
+            format_version: r.format_version.clone(),
+            options_hash_rule: r.options_hash_rule.as_str().to_string(),
+            current: r.current,
+        }
+    }
+}
+
+#[pymethods]
+impl ManifestFormatVersions {
+    fn __repr__(&self) -> String {
+        format!(
+            "ManifestFormatVersions(format_version={:?}, options_hash_rule={:?}, current={})",
+            self.format_version, self.options_hash_rule, self.current,
+        )
+    }
+}
+
+/// What `Table.format_versions` returns.
+#[pyclass(name = "FormatVersionsReport", frozen)]
+struct FormatVersionsReport {
+    /// `None` for an in-process (`memory://`) table, which has no persisted
+    /// manifest.
+    #[pyo3(get)]
+    manifest: Option<ManifestFormatVersions>,
+    #[pyo3(get)]
+    superfiles: Vec<SuperfileFormatVersions>,
+    #[pyo3(get)]
+    is_current: bool,
+    #[pyo3(get)]
+    stale_superfiles: usize,
+}
+
+impl FormatVersionsReport {
+    fn from_core(r: &infino::FormatVersionsReport) -> Self {
+        Self {
+            manifest: r.manifest.as_ref().map(ManifestFormatVersions::from_core),
+            superfiles: r
+                .superfiles
+                .iter()
+                .map(SuperfileFormatVersions::from_core)
+                .collect(),
+            is_current: r.is_current(),
+            stale_superfiles: r.stale_superfiles(),
+        }
+    }
+}
+
+#[pymethods]
+impl FormatVersionsReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "FormatVersionsReport(manifest={}, superfiles=<{} rows>, is_current={}, \
+             stale_superfiles={})",
+            self.manifest
+                .as_ref()
+                .map_or_else(|| "None".to_string(), ManifestFormatVersions::__repr__),
+            self.superfiles.len(),
+            self.is_current,
+            self.stale_superfiles,
         )
     }
 }
@@ -856,6 +996,18 @@ impl Table {
         Ok(GcReport::from_core(&report))
     }
 
+    /// Report the on-disk format versions of the table's manifest and of
+    /// every superfile, and whether each is what this engine writes.
+    /// Read-only; reads only footers and section headers.
+    ///
+    /// Local connections only — on Infino Cloud this raises `InfinoError`.
+    fn format_versions(&self, py: Python<'_>) -> PyResult<FormatVersionsReport> {
+        let report = py
+            .detach(|| self.inner.format_versions())
+            .map_err(format_versions_err)?;
+        Ok(FormatVersionsReport::from_core(&report))
+    }
+
     /// The user-facing Arrow schema, as a pyarrow `Schema`.
     fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.schema().as_ref().to_pyarrow(py)
@@ -1026,6 +1178,9 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IndexSpec>()?;
     m.add_class::<MutationStats>()?;
     m.add_class::<GcReport>()?;
+    m.add_class::<FormatVersionsReport>()?;
+    m.add_class::<ManifestFormatVersions>()?;
+    m.add_class::<SuperfileFormatVersions>()?;
     m.add_class::<CompactOptions>()?;
     m.add("InfinoError", m.py().get_type::<InfinoError>())?;
     m.add(

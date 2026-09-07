@@ -281,6 +281,14 @@ test("optimize merges superfiles, data intact (localfs)", () => {
   docs.append([{ title: "beta" }]);
   docs.append([{ title: "gamma" }]);
 
+  // the format report sees one current superfile per append
+  const versions = docs.formatVersions();
+  assert.equal(versions.superfiles.length, 3);
+  assert.equal(versions.isCurrent, true);
+  assert.equal(versions.staleSuperfiles, 0);
+  assert.equal(versions.manifest.optionsHashRule, "current");
+  assert.ok(versions.superfiles.every((row) => typeof row.ftsVersion === "number"));
+
   docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50, maxMemoryMb: 512 });
   // data is intact after compaction
   assert.equal(docs.tokenMatch("title", "beta").length, 1);

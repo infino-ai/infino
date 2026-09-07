@@ -12,11 +12,14 @@ from infino._infino import (
     ConflictError,
     Connection,
     ConnectionMemoryBudgetError,
+    FormatVersionsReport,
     GcReport,
     IndexSpec,
     InfinoError,
+    ManifestFormatVersions,
     MutationStats,
     OptimizeOptions,
+    SuperfileFormatVersions,
     Table,
     connect,
 )
@@ -36,5 +39,8 @@ __all__ = [
     "IndexSpec",
     "MutationStats",
     "GcReport",
+    "FormatVersionsReport",
+    "ManifestFormatVersions",
+    "SuperfileFormatVersions",
     "OptimizeOptions",
 ]

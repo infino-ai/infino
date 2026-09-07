@@ -5,8 +5,9 @@
 //!
 //! Implements the internal [`Table`] trait by forwarding each operation over
 //! the wire through its [`RemoteCatalog`]. Every query/mutation is supported;
-//! `optimize` and `gc` are deliberately not — on a hosted table those are the
-//! platform's (server-side) concern, so they report that rather than forwarding.
+//! `optimize`, `gc`, and `format_versions` are deliberately not — on a hosted
+//! table those are the platform's (server-side) concern, so they report that
+//! rather than forwarding.
 
 #[cfg(any(test, feature = "test-helpers"))]
 use std::any::Any;
@@ -19,9 +20,9 @@ use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats,
-    OptimizeError, OptimizeOptions, VectorFilter, catalog::table::Table,
-    superfile::VectorSearchOptions,
+    Bm25SearchOptions, Bm25Stats, BoolMode, FormatVersionsError, FormatVersionsReport, GcError,
+    GcReport, InfinoError, MutationStats, OptimizeError, OptimizeOptions, VectorFilter,
+    catalog::table::Table, superfile::VectorSearchOptions,
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
@@ -284,6 +285,12 @@ impl Table for RemoteTable {
     fn gc(&self, _safety_gap: Duration) -> Result<GcReport, GcError> {
         // Retention/GC on a hosted table is server-side; not a client operation.
         Err(GcError::NoStorage)
+    }
+
+    fn format_versions(&self) -> Result<FormatVersionsReport, FormatVersionsError> {
+        // The report reads the table's storage directly; on a hosted table
+        // that is the operator's view, not a client operation.
+        Err(FormatVersionsError::NotLocal)
     }
 
     #[cfg(any(test, feature = "test-helpers"))]

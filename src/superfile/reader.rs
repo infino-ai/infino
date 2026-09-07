@@ -69,7 +69,7 @@ use crate::{
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
-const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+pub(crate) const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map

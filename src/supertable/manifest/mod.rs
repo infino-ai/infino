@@ -576,6 +576,19 @@ impl ManifestSnapshot {
         self.list.is_none()
     }
 
+    /// The persisted list's format version, stored options hash, and
+    /// partition strategy — what a format report needs to say whether the
+    /// list is current. `None` for an in-process manifest, which has no list.
+    pub(crate) fn list_format_identity(&self) -> Option<(&str, ContentHash, &PartitionStrategy)> {
+        self.list.as_ref().map(|l| {
+            (
+                l.format_version.as_str(),
+                l.options_hash,
+                &l.partition_strategy,
+            )
+        })
+    }
+
     /// Return the resident flat membership only when it is known complete.
     ///
     /// In-process manifests are always flat. Part-backed user manifests are

@@ -179,6 +179,32 @@ fn public_surface_search_maintain_query_and_drop() {
         .sum();
     assert_eq!(n as usize, FIRST_BATCH.len() + SECOND_BATCH.len());
 
+    // The format report through the wrapper: every committed superfile is
+    // current on every layer, the user table's rows carry both index
+    // sections, and any derived vector-index superfile is reported too.
+    let versions = docs.format_versions().expect("format_versions");
+    let manifest = versions
+        .manifest
+        .as_ref()
+        .expect("durable table has a manifest");
+    assert!(manifest.current, "{manifest:?}");
+    let user_rows: Vec<_> = versions
+        .superfiles
+        .iter()
+        .filter(|r| !r.vector_index)
+        .collect();
+    assert!(
+        user_rows.len() >= 2,
+        "at least one superfile per append: {versions:?}"
+    );
+    assert!(
+        user_rows
+            .iter()
+            .all(|r| r.fts_version.is_some() && r.vector_version.is_some()),
+        "{versions:?}"
+    );
+    assert!(versions.is_current(), "{versions:?}");
+
     // Storage accounting sees the committed superfiles.
     let bytes = db.table_storage_bytes("docs").expect("storage bytes");
     assert!(bytes > 0, "committed table must have a nonzero footprint");

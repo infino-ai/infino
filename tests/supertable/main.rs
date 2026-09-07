@@ -33,6 +33,7 @@ mod commit;
 mod compact_gc;
 mod disk_cache;
 mod drain_tombstones;
+mod format_versions;
 mod gc_stale_snapshot;
 mod manifest;
 mod query;

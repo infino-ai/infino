@@ -187,7 +187,9 @@ pub use superfile::{
     vector::distance::Metric,
 };
 pub use supertable::{
-    Consistency, GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
+    Consistency, FormatVersionsError, FormatVersionsReport, GcError, GcReport,
+    ManifestFormatVersions, MutationStats, OptimizeError, OptionsHashRule, SuperfileFormatVersions,
+    query::vector::VectorFilter,
 };
 
 /// Convenience builders for test fixtures. Visible to:

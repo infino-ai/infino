@@ -47,8 +47,9 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings,
+    FormatVersionsError, GcError, InfinoError, Metric, OptimizeError,
+    OptimizeOptions as InfinoOptimizeOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +117,13 @@ fn gc_err(e: GcError) -> Error {
             Status::InvalidArg,
             "gc requires durable storage (not memory://)",
         ),
+        other => Error::new(Status::GenericFailure, other.to_string()),
+    }
+}
+
+fn format_versions_err(e: FormatVersionsError) -> Error {
+    match e {
+        FormatVersionsError::NotLocal => Error::new(Status::InvalidArg, e.to_string()),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -496,6 +504,90 @@ impl From<infino::GcReport> for GcReport {
             objects_skipped_live: r.objects_skipped_live as i64,
             objects_skipped_too_new: r.objects_skipped_too_new as i64,
             delete_errors: r.delete_errors as i64,
+        }
+    }
+}
+
+/// Format facts about one superfile, from `formatVersions`.
+#[napi(object)]
+pub struct SuperfileFormatVersions {
+    /// The superfile's id, as it appears in its storage path.
+    pub superfile_id: String,
+    /// `true` when the superfile belongs to the table's derived vector index
+    /// rather than to the user's rows.
+    pub vector_index: bool,
+    /// Total size of the superfile in bytes.
+    pub size_bytes: i64,
+    /// The container's format version, e.g. `"1.1.0"`.
+    pub container_version: String,
+    /// Version of the embedded full-text section header, if present.
+    pub fts_version: Option<u32>,
+    /// Version of the embedded vector section header, if present.
+    pub vector_version: Option<u32>,
+    /// `true` when the superfile carries the packed stable-id sidecar.
+    pub id_sidecar: bool,
+    /// `true` when every layer is what the running engine writes today.
+    pub current: bool,
+}
+
+impl From<&infino::SuperfileFormatVersions> for SuperfileFormatVersions {
+    fn from(r: &infino::SuperfileFormatVersions) -> Self {
+        Self {
+            superfile_id: r.superfile_id.clone(),
+            vector_index: r.vector_index,
+            size_bytes: r.size_bytes as i64,
+            container_version: r.container_version.clone(),
+            fts_version: r.fts_version,
+            vector_version: r.vector_version,
+            id_sidecar: r.id_sidecar,
+            current: r.current,
+        }
+    }
+}
+
+/// Format facts about the table's persisted manifest list.
+#[napi(object)]
+pub struct ManifestFormatVersions {
+    /// The list's format version as stored, e.g. `"1.0"`.
+    pub format_version: String,
+    /// Which rule the stored options hash verifies under: `"current"` or
+    /// `"zero_sentinel"`.
+    pub options_hash_rule: String,
+    /// `true` when the list is exactly what the running engine would write.
+    pub current: bool,
+}
+
+impl From<&infino::ManifestFormatVersions> for ManifestFormatVersions {
+    fn from(r: &infino::ManifestFormatVersions) -> Self {
+        Self {
+            format_version: r.format_version.clone(),
+            options_hash_rule: r.options_hash_rule.as_str().to_string(),
+            current: r.current,
+        }
+    }
+}
+
+/// What `formatVersions` returns.
+#[napi(object)]
+pub struct FormatVersionsReport {
+    /// The persisted manifest list; absent for an in-process (`memory://`)
+    /// table.
+    pub manifest: Option<ManifestFormatVersions>,
+    /// One row per superfile, in manifest order.
+    pub superfiles: Vec<SuperfileFormatVersions>,
+    /// `true` when the manifest (if persisted) and every superfile are current.
+    pub is_current: bool,
+    /// Superfiles with at least one layer behind the current format.
+    pub stale_superfiles: i64,
+}
+
+impl From<infino::FormatVersionsReport> for FormatVersionsReport {
+    fn from(r: infino::FormatVersionsReport) -> Self {
+        Self {
+            manifest: r.manifest.as_ref().map(ManifestFormatVersions::from),
+            superfiles: r.superfiles.iter().map(SuperfileFormatVersions::from).collect(),
+            is_current: r.is_current(),
+            stale_superfiles: r.stale_superfiles() as i64,
         }
     }
 }
@@ -940,6 +1032,17 @@ impl Table {
     pub fn gc(&self, grace_secs: f64) -> Result<GcReport> {
         let grace = Duration::from_secs_f64(grace_secs.max(0.0));
         self.inner.gc(grace).map(GcReport::from).map_err(gc_err)
+    }
+
+    /// Report the on-disk format versions of the table's manifest and of
+    /// every superfile, and whether each is what this engine writes.
+    /// Read-only; reads only footers and section headers.
+    #[napi]
+    pub fn format_versions(&self) -> Result<FormatVersionsReport> {
+        self.inner
+            .format_versions()
+            .map(FormatVersionsReport::from)
+            .map_err(format_versions_err)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

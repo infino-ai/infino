@@ -91,6 +91,25 @@ impl core::marker::Unpin for infino::Consistency
 impl core::marker::UnsafeUnpin for infino::Consistency
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Consistency
 impl core::panic::unwind_safe::UnwindSafe for infino::Consistency
+pub enum infino::FormatVersionsError
+pub infino::FormatVersionsError::Manifest(infino::supertable::manifest::ManifestLoadError)
+pub infino::FormatVersionsError::NotLocal
+pub infino::FormatVersionsError::Superfile
+pub infino::FormatVersionsError::Superfile::reason: alloc::string::String
+pub infino::FormatVersionsError::Superfile::superfile_id: alloc::string::String
+impl core::error::Error for infino::FormatVersionsError
+pub fn infino::FormatVersionsError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for infino::FormatVersionsError
+pub fn infino::FormatVersionsError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::FormatVersionsError
+pub fn infino::FormatVersionsError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::FormatVersionsError
+impl core::marker::Send for infino::FormatVersionsError
+impl core::marker::Sync for infino::FormatVersionsError
+impl core::marker::Unpin for infino::FormatVersionsError
+impl core::marker::UnsafeUnpin for infino::FormatVersionsError
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::FormatVersionsError
+impl !core::panic::unwind_safe::UnwindSafe for infino::FormatVersionsError
 pub enum infino::GcError
 pub infino::GcError::NoStorage
 pub infino::GcError::Storage(infino::storage::StorageError)
@@ -182,6 +201,27 @@ impl core::marker::Unpin for infino::OptimizeError
 impl core::marker::UnsafeUnpin for infino::OptimizeError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
 impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
+#[non_exhaustive] pub enum infino::OptionsHashRule
+pub infino::OptionsHashRule::Current
+pub infino::OptionsHashRule::ZeroSentinel
+impl infino::OptionsHashRule
+pub fn infino::OptionsHashRule::as_str(self) -> &'static str
+impl core::clone::Clone for infino::OptionsHashRule
+pub fn infino::OptionsHashRule::clone(&self) -> infino::OptionsHashRule
+impl core::cmp::Eq for infino::OptionsHashRule
+impl core::cmp::PartialEq for infino::OptionsHashRule
+pub fn infino::OptionsHashRule::eq(&self, &infino::OptionsHashRule) -> bool
+impl core::fmt::Debug for infino::OptionsHashRule
+pub fn infino::OptionsHashRule::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::OptionsHashRule
+impl core::marker::StructuralPartialEq for infino::OptionsHashRule
+impl core::marker::Freeze for infino::OptionsHashRule
+impl core::marker::Send for infino::OptionsHashRule
+impl core::marker::Sync for infino::OptionsHashRule
+impl core::marker::Unpin for infino::OptionsHashRule
+impl core::marker::UnsafeUnpin for infino::OptionsHashRule
+impl core::panic::unwind_safe::RefUnwindSafe for infino::OptionsHashRule
+impl core::panic::unwind_safe::UnwindSafe for infino::OptionsHashRule
 pub struct infino::Bm25SearchOptions
 pub infino::Bm25SearchOptions::mode: infino::BoolMode
 pub infino::Bm25SearchOptions::stats: infino::Bm25Stats
@@ -276,6 +316,30 @@ impl core::marker::Unpin for infino::Connection
 impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
+#[non_exhaustive] pub struct infino::FormatVersionsReport
+pub infino::FormatVersionsReport::manifest: core::option::Option<infino::ManifestFormatVersions>
+pub infino::FormatVersionsReport::superfiles: alloc::vec::Vec<infino::SuperfileFormatVersions>
+impl infino::FormatVersionsReport
+pub fn infino::FormatVersionsReport::container_versions(&self) -> alloc::collections::btree::map::BTreeMap<alloc::string::String, usize>
+pub fn infino::FormatVersionsReport::fts_versions(&self) -> alloc::collections::btree::map::BTreeMap<u32, usize>
+pub fn infino::FormatVersionsReport::is_current(&self) -> bool
+pub fn infino::FormatVersionsReport::stale_superfiles(&self) -> usize
+pub fn infino::FormatVersionsReport::vector_versions(&self) -> alloc::collections::btree::map::BTreeMap<u32, usize>
+impl core::clone::Clone for infino::FormatVersionsReport
+pub fn infino::FormatVersionsReport::clone(&self) -> infino::FormatVersionsReport
+impl core::cmp::Eq for infino::FormatVersionsReport
+impl core::cmp::PartialEq for infino::FormatVersionsReport
+pub fn infino::FormatVersionsReport::eq(&self, &infino::FormatVersionsReport) -> bool
+impl core::fmt::Debug for infino::FormatVersionsReport
+pub fn infino::FormatVersionsReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::FormatVersionsReport
+impl core::marker::Freeze for infino::FormatVersionsReport
+impl core::marker::Send for infino::FormatVersionsReport
+impl core::marker::Sync for infino::FormatVersionsReport
+impl core::marker::Unpin for infino::FormatVersionsReport
+impl core::marker::UnsafeUnpin for infino::FormatVersionsReport
+impl core::panic::unwind_safe::RefUnwindSafe for infino::FormatVersionsReport
+impl core::panic::unwind_safe::UnwindSafe for infino::FormatVersionsReport
 pub struct infino::FtsField
 impl infino::FtsField
 pub fn infino::FtsField::analyzer(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -354,6 +418,25 @@ impl core::marker::Unpin for infino::IndexSpec
 impl core::marker::UnsafeUnpin for infino::IndexSpec
 impl core::panic::unwind_safe::RefUnwindSafe for infino::IndexSpec
 impl core::panic::unwind_safe::UnwindSafe for infino::IndexSpec
+#[non_exhaustive] pub struct infino::ManifestFormatVersions
+pub infino::ManifestFormatVersions::current: bool
+pub infino::ManifestFormatVersions::format_version: alloc::string::String
+pub infino::ManifestFormatVersions::options_hash_rule: infino::OptionsHashRule
+impl core::clone::Clone for infino::ManifestFormatVersions
+pub fn infino::ManifestFormatVersions::clone(&self) -> infino::ManifestFormatVersions
+impl core::cmp::Eq for infino::ManifestFormatVersions
+impl core::cmp::PartialEq for infino::ManifestFormatVersions
+pub fn infino::ManifestFormatVersions::eq(&self, &infino::ManifestFormatVersions) -> bool
+impl core::fmt::Debug for infino::ManifestFormatVersions
+pub fn infino::ManifestFormatVersions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::ManifestFormatVersions
+impl core::marker::Freeze for infino::ManifestFormatVersions
+impl core::marker::Send for infino::ManifestFormatVersions
+impl core::marker::Sync for infino::ManifestFormatVersions
+impl core::marker::Unpin for infino::ManifestFormatVersions
+impl core::marker::UnsafeUnpin for infino::ManifestFormatVersions
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ManifestFormatVersions
+impl core::panic::unwind_safe::UnwindSafe for infino::ManifestFormatVersions
 #[non_exhaustive] pub struct infino::MutationStats
 impl infino::MutationStats
 pub fn infino::MutationStats::matched(&self) -> usize
@@ -391,6 +474,30 @@ impl core::marker::Unpin for infino::OptimizeOptions
 impl core::marker::UnsafeUnpin for infino::OptimizeOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
+#[non_exhaustive] pub struct infino::SuperfileFormatVersions
+pub infino::SuperfileFormatVersions::container_version: alloc::string::String
+pub infino::SuperfileFormatVersions::current: bool
+pub infino::SuperfileFormatVersions::fts_version: core::option::Option<u32>
+pub infino::SuperfileFormatVersions::id_sidecar: bool
+pub infino::SuperfileFormatVersions::size_bytes: u64
+pub infino::SuperfileFormatVersions::superfile_id: alloc::string::String
+pub infino::SuperfileFormatVersions::vector_index: bool
+pub infino::SuperfileFormatVersions::vector_version: core::option::Option<u32>
+impl core::clone::Clone for infino::SuperfileFormatVersions
+pub fn infino::SuperfileFormatVersions::clone(&self) -> infino::SuperfileFormatVersions
+impl core::cmp::Eq for infino::SuperfileFormatVersions
+impl core::cmp::PartialEq for infino::SuperfileFormatVersions
+pub fn infino::SuperfileFormatVersions::eq(&self, &infino::SuperfileFormatVersions) -> bool
+impl core::fmt::Debug for infino::SuperfileFormatVersions
+pub fn infino::SuperfileFormatVersions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::SuperfileFormatVersions
+impl core::marker::Freeze for infino::SuperfileFormatVersions
+impl core::marker::Send for infino::SuperfileFormatVersions
+impl core::marker::Sync for infino::SuperfileFormatVersions
+impl core::marker::Unpin for infino::SuperfileFormatVersions
+impl core::marker::UnsafeUnpin for infino::SuperfileFormatVersions
+impl core::panic::unwind_safe::RefUnwindSafe for infino::SuperfileFormatVersions
+impl core::panic::unwind_safe::UnwindSafe for infino::SuperfileFormatVersions
 pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
@@ -398,6 +505,7 @@ pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25Sea
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::format_versions(&self) -> core::result::Result<infino::FormatVersionsReport, infino::FormatVersionsError>
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
