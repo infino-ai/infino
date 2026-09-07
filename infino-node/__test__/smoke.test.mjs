@@ -282,7 +282,7 @@ test("optimize merges superfiles, data intact (localfs)", () => {
   docs.append([{ title: "gamma" }]);
 
   // the format report sees one current superfile per append
-  const versions = docs.formatVersions();
+  const versions = docs.inspect();
   assert.equal(versions.superfiles.length, 3);
   assert.equal(versions.isCurrent, true);
   assert.equal(versions.staleSuperfiles, 0);

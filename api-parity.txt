@@ -17,9 +17,9 @@ Supertable::bm25_search	covered	(&self, &str, &str, usize, Bm25SearchOptions, Op
 Supertable::count	covered	(&self, &str, &str, BoolMode) -> Result<u64, InfinoError>
 Supertable::delete	covered	(&self, Expr) -> Result<MutationStats, InfinoError>
 Supertable::exact_match	covered	(&self, &str, &str, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
-Supertable::format_versions	covered	(&self) -> Result<FormatVersionsReport, FormatVersionsError>
 Supertable::gc	covered	(&self, Duration) -> Result<GcReport, GcError>
 Supertable::hybrid_search	covered	(&self, &str, &str, BoolMode, &str, &[f32], usize, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::inspect	covered	(&self) -> Result<Inspection, InspectError>
 Supertable::optimize	covered	(&self, &OptimizeOptions) -> Result<(), OptimizeError>
 Supertable::schema	covered	(&self) -> SchemaRef
 Supertable::token_match	covered	(&self, &str, &str, BoolMode, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>

@@ -541,16 +541,16 @@ pub enum GcError {
     Storage(#[from] crate::storage::StorageError),
 }
 
-/// Errors raised by [`crate::Supertable::format_versions`].
+/// Errors raised by [`crate::Supertable::inspect`].
 #[derive(Debug, thiserror::Error)]
-pub enum FormatVersionsError {
+pub enum InspectError {
     /// The table is hosted; the report runs where the table's storage is and
     /// is not available over the hosted transport.
-    #[error("format_versions is not available on a hosted table")]
+    #[error("inspect is not available on a hosted table")]
     NotLocal,
 
     /// The manifest could not be refreshed or its superfile list loaded.
-    #[error("manifest error during format_versions: {0}")]
+    #[error("manifest error during inspect: {0}")]
     Manifest(#[from] ManifestLoadError),
 
     /// One superfile's footer or section header could not be read or did

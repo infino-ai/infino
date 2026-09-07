@@ -127,14 +127,14 @@ live on the [`Connection`] and [`Supertable`] pages:
   - **Write** — [`append`](Supertable::append),
     [`update`](Supertable::update), [`delete`](Supertable::delete).
   - **Maintain** — [`optimize`](Supertable::optimize),
-    [`gc`](Supertable::gc), [`format_versions`](Supertable::format_versions),
+    [`gc`](Supertable::gc), [`inspect`](Supertable::inspect),
     and [`schema`](Supertable::schema).
 
 Supporting types: [`IndexSpec`], [`Metric`], [`BoolMode`],
 [`VectorFilter`], [`ConnectOptions`], [`MutationStats`],
-[`GcReport`], [`FormatVersionsReport`] (with [`ManifestFormatVersions`],
-[`SuperfileFormatVersions`], and [`OptionsHashRule`]), and the
-[`InfinoError`], [`OptimizeError`], [`GcError`], and [`FormatVersionsError`]
+[`GcReport`], [`Inspection`] (with [`ManifestInspection`],
+[`SuperfileInspection`], and [`OptionsHashRule`]), and the
+[`InfinoError`], [`OptimizeError`], [`GcError`], and [`InspectError`]
 error enums.
 
 ## Cargo features

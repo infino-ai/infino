@@ -26,10 +26,10 @@
 pub(crate) mod build;
 pub(crate) mod compaction;
 pub mod error;
-pub(crate) mod format_versions;
 pub(crate) mod gc;
 pub mod handle;
 pub(crate) mod hidden_deleted;
+pub(crate) mod inspect;
 pub mod lazy_source;
 pub mod manifest;
 pub mod mutations;
@@ -46,13 +46,11 @@ pub mod wal;
 pub mod writer;
 
 pub use error::{
-    BuildError, CommitError, FormatVersionsError, GcError, OpenError, OptimizeError, QueryError,
-};
-pub use format_versions::{
-    FormatVersionsReport, ManifestFormatVersions, OptionsHashRule, SuperfileFormatVersions,
+    BuildError, CommitError, GcError, InspectError, OpenError, OptimizeError, QueryError,
 };
 pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
+pub use inspect::{Inspection, ManifestInspection, OptionsHashRule, SuperfileInspection};
 pub use lazy_source::StorageRangeSource;
 pub use manifest::{
     FtsSummaryAgg, ManifestLoadError, ManifestPartLoader, ManifestSnapshot, ScalarStatsAgg,

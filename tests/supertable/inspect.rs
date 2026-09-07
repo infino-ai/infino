@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `Supertable::format_versions` over durable storage: the manifest facts
+//! `Supertable::inspect` over durable storage: the manifest facts
 //! come from the persisted list, every committed superfile is reported, and
 //! the report costs only footer and header reads — no dictionary, posting
 //! list, or row group is fetched.
@@ -58,7 +58,7 @@ fn durable_table_reports_manifest_and_superfiles_within_a_header_read_budget() {
     }
 
     let before = storage.usage_meter().snapshot();
-    let report = st.format_versions().expect("format_versions");
+    let report = st.inspect().expect("inspect");
     let after = storage.usage_meter().snapshot();
 
     let manifest = report
@@ -87,5 +87,5 @@ fn durable_table_reports_manifest_and_superfiles_within_a_header_read_budget() {
     );
 
     // A second call is the same picture.
-    assert_eq!(st.format_versions().expect("again"), report);
+    assert_eq!(st.inspect().expect("again"), report);
 }

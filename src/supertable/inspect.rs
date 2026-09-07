@@ -8,7 +8,7 @@
 //! and the embedded vector section header — and the manifest list that names
 //! the superfiles has a version and an options hash of its own. The reader
 //! accepts several versions of each layer, so a long-lived table can hold a
-//! mix. [`crate::Supertable::format_versions`] reports that mix, per superfile and
+//! mix. [`crate::Supertable::inspect`] reports that mix, per superfile and
 //! for the manifest, and says which pieces are behind what the running engine
 //! writes today.
 //!
@@ -38,7 +38,7 @@ use crate::{
         reader::{DEFAULT_TAIL_SPECULATIVE_BYTES, vector_layout_from_kv},
         vector::layout::VectorLayout,
     },
-    supertable::error::FormatVersionsError,
+    supertable::error::InspectError,
 };
 
 /// Superfile header reads in flight at once while building the report.
@@ -76,7 +76,7 @@ impl OptionsHashRule {
 /// Format facts about the table's persisted manifest list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ManifestFormatVersions {
+pub struct ManifestInspection {
     /// The list's `format_version` as stored, e.g. `"1.0"`.
     pub format_version: String,
     /// Which rule the stored options hash verifies under.
@@ -89,7 +89,7 @@ pub struct ManifestFormatVersions {
 /// Format facts about one superfile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct SuperfileFormatVersions {
+pub struct SuperfileInspection {
     /// The superfile's id, as it appears in its storage path.
     pub superfile_id: String,
     /// `true` when the superfile belongs to the table's derived vector index
@@ -114,19 +114,19 @@ pub struct SuperfileFormatVersions {
     pub current: bool,
 }
 
-/// What [`crate::Supertable::format_versions`] returns.
+/// What [`crate::Supertable::inspect`] returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct FormatVersionsReport {
+pub struct Inspection {
     /// The persisted manifest list, or `None` for an in-process table that
     /// has no persisted manifest.
-    pub manifest: Option<ManifestFormatVersions>,
+    pub manifest: Option<ManifestInspection>,
     /// One row per superfile, in manifest order: the user table's superfiles
     /// first, then the derived vector index's.
-    pub superfiles: Vec<SuperfileFormatVersions>,
+    pub superfiles: Vec<SuperfileInspection>,
 }
 
-impl FormatVersionsReport {
+impl Inspection {
     /// `true` when the manifest (if persisted) and every superfile are
     /// current.
     pub fn is_current(&self) -> bool {
@@ -176,13 +176,11 @@ impl Supertable {
     /// Read-only: takes no writer or compaction slot and is safe to call at
     /// any time. Per superfile it reads the Parquet footer and the first
     /// bytes of each index section header, nothing more.
-    pub fn format_versions(&self) -> Result<FormatVersionsReport, FormatVersionsError> {
-        bridge_on_runtime(self.format_versions_async(), &self.inner().query_runtime())
+    pub fn inspect(&self) -> Result<Inspection, InspectError> {
+        bridge_on_runtime(self.inspect_async(), &self.inner().query_runtime())
     }
 
-    pub(crate) async fn format_versions_async(
-        &self,
-    ) -> Result<FormatVersionsReport, FormatVersionsError> {
+    pub(crate) async fn inspect_async(&self) -> Result<Inspection, InspectError> {
         let inner = self.inner();
         // Reflect the committed table, not this handle's memory of it. An
         // in-process table has no pointer to refresh against.
@@ -191,7 +189,7 @@ impl Supertable {
         }
 
         let manifest = inner.manifest.load_full();
-        let manifest_report = manifest_format_versions(inner, &manifest)?;
+        let manifest_report = manifest_inspect(inner, &manifest)?;
 
         let mut superfiles = superfile_rows(inner, false).await?;
         if let Some(hidden) = inner.vector_index_table.as_ref() {
@@ -202,17 +200,17 @@ impl Supertable {
             superfiles.extend(superfile_rows(hidden_inner, true).await?);
         }
 
-        Ok(FormatVersionsReport {
+        Ok(Inspection {
             manifest: manifest_report,
             superfiles,
         })
     }
 }
 
-fn manifest_format_versions(
+fn manifest_inspect(
     inner: &SupertableInner,
     manifest: &super::manifest::ManifestSnapshot,
-) -> Result<Option<ManifestFormatVersions>, FormatVersionsError> {
+) -> Result<Option<ManifestInspection>, InspectError> {
     let Some((format_version, stored_hash, strategy)) = manifest.list_format_identity() else {
         return Ok(None);
     };
@@ -226,7 +224,7 @@ fn manifest_format_versions(
             // The table opened, so its hash verified then; options cannot
             // change on an open handle. Reaching here means the manifest
             // moved under rules this engine does not compute.
-            return Err(FormatVersionsError::Manifest(
+            return Err(InspectError::Manifest(
                 ManifestLoadError::ContentHashMismatch {
                     expected: expected.to_hex(),
                     actual: stored_hash.to_hex(),
@@ -236,7 +234,7 @@ fn manifest_format_versions(
     };
     let current = format_version == super::manifest::list::FORMAT_VERSION
         && options_hash_rule == OptionsHashRule::Current;
-    Ok(Some(ManifestFormatVersions {
+    Ok(Some(ManifestInspection {
         format_version: format_version.to_string(),
         options_hash_rule,
         current,
@@ -246,7 +244,7 @@ fn manifest_format_versions(
 async fn superfile_rows(
     inner: &SupertableInner,
     vector_index: bool,
-) -> Result<Vec<SuperfileFormatVersions>, FormatVersionsError> {
+) -> Result<Vec<SuperfileInspection>, InspectError> {
     let manifest = inner.manifest.load_full();
     let entries = manifest.get_all_superfiles_loaded().await?;
     let storage = inner.options.storage.clone();
@@ -275,7 +273,7 @@ fn byte_source_for(
     entry: &SuperfileEntry,
     storage: Option<&Arc<dyn StorageProvider>>,
     store: &dyn super::reader_cache::SuperfileReaderCache,
-) -> Result<Arc<dyn LazyByteSource>, FormatVersionsError> {
+) -> Result<Arc<dyn LazyByteSource>, InspectError> {
     match storage {
         Some(storage) => {
             let path = entry.uri.storage_path();
@@ -309,7 +307,7 @@ async fn superfile_row(
     superfile_id: Uuid,
     source: &dyn LazyByteSource,
     vector_index: bool,
-) -> Result<SuperfileFormatVersions, FormatVersionsError> {
+) -> Result<SuperfileInspection, InspectError> {
     let metadata = footer::read_parquet_metadata_lazy(source, DEFAULT_TAIL_SPECULATIVE_BYTES)
         .await
         .map_err(|e| superfile_error(superfile_id, e.to_string()))?;
@@ -360,7 +358,7 @@ async fn superfile_row(
         (_, Some(v)) => v == format::vec::VERSION,
     };
 
-    Ok(SuperfileFormatVersions {
+    Ok(SuperfileInspection {
         superfile_id: superfile_id.to_string(),
         vector_index,
         size_bytes,
@@ -428,8 +426,8 @@ async fn section_version(
     Ok(u32::from_le_bytes(word))
 }
 
-fn superfile_error(superfile_id: Uuid, reason: String) -> FormatVersionsError {
-    FormatVersionsError::Superfile {
+fn superfile_error(superfile_id: Uuid, reason: String) -> InspectError {
+    InspectError::Superfile {
         superfile_id: superfile_id.to_string(),
         reason,
     }
@@ -478,7 +476,7 @@ mod tests {
         Bytes::from(b.finish().expect("finish builder"))
     }
 
-    fn row_for(bytes: Bytes) -> SuperfileFormatVersions {
+    fn row_for(bytes: Bytes) -> SuperfileInspection {
         let source = BytesLazyByteSource::new(bytes);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -525,7 +523,7 @@ mod tests {
             w.commit().expect("commit");
         }
 
-        let report = st.format_versions().expect("format_versions");
+        let report = st.inspect().expect("inspect");
         assert!(
             report.manifest.is_none(),
             "an in-process table has no persisted manifest list"
@@ -547,7 +545,7 @@ mod tests {
 
     #[test]
     fn report_helpers_summarize_rows() {
-        let row = |fts: Option<u32>, current: bool| SuperfileFormatVersions {
+        let row = |fts: Option<u32>, current: bool| SuperfileInspection {
             superfile_id: Uuid::new_v4().to_string(),
             vector_index: false,
             size_bytes: 1,
@@ -557,8 +555,8 @@ mod tests {
             id_sidecar: true,
             current,
         };
-        let report = FormatVersionsReport {
-            manifest: Some(ManifestFormatVersions {
+        let report = Inspection {
+            manifest: Some(ManifestInspection {
                 format_version: "1.0".into(),
                 options_hash_rule: OptionsHashRule::ZeroSentinel,
                 current: false,

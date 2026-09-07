@@ -48,7 +48,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings,
-    FormatVersionsError, GcError, InfinoError, Metric, OptimizeError,
+    InspectError, GcError, InfinoError, Metric, OptimizeError,
     OptimizeOptions as InfinoOptimizeOptions,
 };
 
@@ -121,9 +121,9 @@ fn gc_err(e: GcError) -> Error {
     }
 }
 
-fn format_versions_err(e: FormatVersionsError) -> Error {
+fn inspect_err(e: InspectError) -> Error {
     match e {
-        FormatVersionsError::NotLocal => Error::new(Status::InvalidArg, e.to_string()),
+        InspectError::NotLocal => Error::new(Status::InvalidArg, e.to_string()),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -508,9 +508,9 @@ impl From<infino::GcReport> for GcReport {
     }
 }
 
-/// Format facts about one superfile, from `formatVersions`.
+/// Format facts about one superfile, from `inspect`.
 #[napi(object)]
-pub struct SuperfileFormatVersions {
+pub struct SuperfileInspection {
     /// The superfile's id, as it appears in its storage path.
     pub superfile_id: String,
     /// `true` when the superfile belongs to the table's derived vector index
@@ -530,8 +530,8 @@ pub struct SuperfileFormatVersions {
     pub current: bool,
 }
 
-impl From<&infino::SuperfileFormatVersions> for SuperfileFormatVersions {
-    fn from(r: &infino::SuperfileFormatVersions) -> Self {
+impl From<&infino::SuperfileInspection> for SuperfileInspection {
+    fn from(r: &infino::SuperfileInspection) -> Self {
         Self {
             superfile_id: r.superfile_id.clone(),
             vector_index: r.vector_index,
@@ -547,7 +547,7 @@ impl From<&infino::SuperfileFormatVersions> for SuperfileFormatVersions {
 
 /// Format facts about the table's persisted manifest list.
 #[napi(object)]
-pub struct ManifestFormatVersions {
+pub struct ManifestInspection {
     /// The list's format version as stored, e.g. `"1.0"`.
     pub format_version: String,
     /// Which rule the stored options hash verifies under: `"current"` or
@@ -557,8 +557,8 @@ pub struct ManifestFormatVersions {
     pub current: bool,
 }
 
-impl From<&infino::ManifestFormatVersions> for ManifestFormatVersions {
-    fn from(r: &infino::ManifestFormatVersions) -> Self {
+impl From<&infino::ManifestInspection> for ManifestInspection {
+    fn from(r: &infino::ManifestInspection) -> Self {
         Self {
             format_version: r.format_version.clone(),
             options_hash_rule: r.options_hash_rule.as_str().to_string(),
@@ -567,25 +567,25 @@ impl From<&infino::ManifestFormatVersions> for ManifestFormatVersions {
     }
 }
 
-/// What `formatVersions` returns.
+/// What `inspect` returns.
 #[napi(object)]
-pub struct FormatVersionsReport {
+pub struct Inspection {
     /// The persisted manifest list; absent for an in-process (`memory://`)
     /// table.
-    pub manifest: Option<ManifestFormatVersions>,
+    pub manifest: Option<ManifestInspection>,
     /// One row per superfile, in manifest order.
-    pub superfiles: Vec<SuperfileFormatVersions>,
+    pub superfiles: Vec<SuperfileInspection>,
     /// `true` when the manifest (if persisted) and every superfile are current.
     pub is_current: bool,
     /// Superfiles with at least one layer behind the current format.
     pub stale_superfiles: i64,
 }
 
-impl From<infino::FormatVersionsReport> for FormatVersionsReport {
-    fn from(r: infino::FormatVersionsReport) -> Self {
+impl From<infino::Inspection> for Inspection {
+    fn from(r: infino::Inspection) -> Self {
         Self {
-            manifest: r.manifest.as_ref().map(ManifestFormatVersions::from),
-            superfiles: r.superfiles.iter().map(SuperfileFormatVersions::from).collect(),
+            manifest: r.manifest.as_ref().map(ManifestInspection::from),
+            superfiles: r.superfiles.iter().map(SuperfileInspection::from).collect(),
             is_current: r.is_current(),
             stale_superfiles: r.stale_superfiles() as i64,
         }
@@ -1038,11 +1038,11 @@ impl Table {
     /// every superfile, and whether each is what this engine writes.
     /// Read-only; reads only footers and section headers.
     #[napi]
-    pub fn format_versions(&self) -> Result<FormatVersionsReport> {
+    pub fn inspect(&self) -> Result<Inspection> {
         self.inner
-            .format_versions()
-            .map(FormatVersionsReport::from)
-            .map_err(format_versions_err)
+            .inspect()
+            .map(Inspection::from)
+            .map_err(inspect_err)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

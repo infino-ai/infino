@@ -19,9 +19,9 @@ use arrow_schema::SchemaRef;
 use datafusion::prelude::Expr;
 
 use crate::{
-    Bm25SearchOptions, BoolMode, FormatVersionsError, FormatVersionsReport, GcError, GcReport,
-    InfinoError, MutationStats, OptimizeError, OptimizeOptions, VectorFilter,
-    superfile::VectorSearchOptions, supertable::Supertable as SupertableHandle,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, InspectError, Inspection,
+    MutationStats, OptimizeError, OptimizeOptions, VectorFilter, superfile::VectorSearchOptions,
+    supertable::Supertable as SupertableHandle,
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -78,7 +78,7 @@ pub(crate) trait Table: Send + Sync {
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
-    fn format_versions(&self) -> Result<FormatVersionsReport, FormatVersionsError>;
+    fn inspect(&self) -> Result<Inspection, InspectError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
     /// can reach engine internals (`options`, `stats`, `reader`, …) through the
@@ -175,8 +175,8 @@ impl Table for SupertableHandle {
         SupertableHandle::gc(self, safety_gap)
     }
 
-    fn format_versions(&self) -> Result<FormatVersionsReport, FormatVersionsError> {
-        SupertableHandle::format_versions(self)
+    fn inspect(&self) -> Result<Inspection, InspectError> {
+        SupertableHandle::inspect(self)
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -390,8 +390,8 @@ impl Supertable {
     /// Report the on-disk format versions of the table's manifest and
     /// superfiles, and whether each is what the running engine writes.
     /// Read-only; reads only footers and section headers. Local tables only.
-    pub fn format_versions(&self) -> Result<FormatVersionsReport, FormatVersionsError> {
-        self.inner.format_versions()
+    pub fn inspect(&self) -> Result<Inspection, InspectError> {
+        self.inner.inspect()
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted

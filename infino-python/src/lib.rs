@@ -33,7 +33,7 @@ use pyo3::types::{PyDict, PyList};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    FormatVersionsError, GcError, InfinoError as CoreError, Metric, OptimizeError,
+    InspectError, GcError, InfinoError as CoreError, Metric, OptimizeError,
     OptimizeOptions, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
@@ -104,7 +104,7 @@ fn gc_err(e: GcError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-fn format_versions_err(e: FormatVersionsError) -> PyErr {
+fn inspect_err(e: InspectError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
@@ -417,10 +417,10 @@ impl GcReport {
     }
 }
 
-/// Format facts about one superfile, from `Table.format_versions`.
-#[pyclass(name = "SuperfileFormatVersions", frozen, skip_from_py_object)]
+/// Format facts about one superfile, from `Table.inspect`.
+#[pyclass(name = "SuperfileInspection", frozen, skip_from_py_object)]
 #[derive(Clone)]
-struct SuperfileFormatVersions {
+struct SuperfileInspection {
     #[pyo3(get)]
     superfile_id: String,
     #[pyo3(get)]
@@ -439,8 +439,8 @@ struct SuperfileFormatVersions {
     current: bool,
 }
 
-impl SuperfileFormatVersions {
-    fn from_core(r: &infino::SuperfileFormatVersions) -> Self {
+impl SuperfileInspection {
+    fn from_core(r: &infino::SuperfileInspection) -> Self {
         Self {
             superfile_id: r.superfile_id.clone(),
             vector_index: r.vector_index,
@@ -455,10 +455,10 @@ impl SuperfileFormatVersions {
 }
 
 #[pymethods]
-impl SuperfileFormatVersions {
+impl SuperfileInspection {
     fn __repr__(&self) -> String {
         format!(
-            "SuperfileFormatVersions(superfile_id={:?}, vector_index={}, size_bytes={}, \
+            "SuperfileInspection(superfile_id={:?}, vector_index={}, size_bytes={}, \
              container_version={:?}, fts_version={:?}, vector_version={:?}, id_sidecar={}, \
              current={})",
             self.superfile_id,
@@ -474,9 +474,9 @@ impl SuperfileFormatVersions {
 }
 
 /// Format facts about the table's persisted manifest list.
-#[pyclass(name = "ManifestFormatVersions", frozen, skip_from_py_object)]
+#[pyclass(name = "ManifestInspection", frozen, skip_from_py_object)]
 #[derive(Clone)]
-struct ManifestFormatVersions {
+struct ManifestInspection {
     #[pyo3(get)]
     format_version: String,
     /// `"current"` or `"zero_sentinel"`.
@@ -486,8 +486,8 @@ struct ManifestFormatVersions {
     current: bool,
 }
 
-impl ManifestFormatVersions {
-    fn from_core(r: &infino::ManifestFormatVersions) -> Self {
+impl ManifestInspection {
+    fn from_core(r: &infino::ManifestInspection) -> Self {
         Self {
             format_version: r.format_version.clone(),
             options_hash_rule: r.options_hash_rule.as_str().to_string(),
@@ -497,38 +497,38 @@ impl ManifestFormatVersions {
 }
 
 #[pymethods]
-impl ManifestFormatVersions {
+impl ManifestInspection {
     fn __repr__(&self) -> String {
         format!(
-            "ManifestFormatVersions(format_version={:?}, options_hash_rule={:?}, current={})",
+            "ManifestInspection(format_version={:?}, options_hash_rule={:?}, current={})",
             self.format_version, self.options_hash_rule, self.current,
         )
     }
 }
 
-/// What `Table.format_versions` returns.
-#[pyclass(name = "FormatVersionsReport", frozen)]
-struct FormatVersionsReport {
+/// What `Table.inspect` returns.
+#[pyclass(name = "Inspection", frozen)]
+struct Inspection {
     /// `None` for an in-process (`memory://`) table, which has no persisted
     /// manifest.
     #[pyo3(get)]
-    manifest: Option<ManifestFormatVersions>,
+    manifest: Option<ManifestInspection>,
     #[pyo3(get)]
-    superfiles: Vec<SuperfileFormatVersions>,
+    superfiles: Vec<SuperfileInspection>,
     #[pyo3(get)]
     is_current: bool,
     #[pyo3(get)]
     stale_superfiles: usize,
 }
 
-impl FormatVersionsReport {
-    fn from_core(r: &infino::FormatVersionsReport) -> Self {
+impl Inspection {
+    fn from_core(r: &infino::Inspection) -> Self {
         Self {
-            manifest: r.manifest.as_ref().map(ManifestFormatVersions::from_core),
+            manifest: r.manifest.as_ref().map(ManifestInspection::from_core),
             superfiles: r
                 .superfiles
                 .iter()
-                .map(SuperfileFormatVersions::from_core)
+                .map(SuperfileInspection::from_core)
                 .collect(),
             is_current: r.is_current(),
             stale_superfiles: r.stale_superfiles(),
@@ -537,14 +537,14 @@ impl FormatVersionsReport {
 }
 
 #[pymethods]
-impl FormatVersionsReport {
+impl Inspection {
     fn __repr__(&self) -> String {
         format!(
-            "FormatVersionsReport(manifest={}, superfiles=<{} rows>, is_current={}, \
+            "Inspection(manifest={}, superfiles=<{} rows>, is_current={}, \
              stale_superfiles={})",
             self.manifest
                 .as_ref()
-                .map_or_else(|| "None".to_string(), ManifestFormatVersions::__repr__),
+                .map_or_else(|| "None".to_string(), ManifestInspection::__repr__),
             self.superfiles.len(),
             self.is_current,
             self.stale_superfiles,
@@ -1001,11 +1001,11 @@ impl Table {
     /// Read-only; reads only footers and section headers.
     ///
     /// Local connections only — on Infino Cloud this raises `InfinoError`.
-    fn format_versions(&self, py: Python<'_>) -> PyResult<FormatVersionsReport> {
+    fn inspect(&self, py: Python<'_>) -> PyResult<Inspection> {
         let report = py
-            .detach(|| self.inner.format_versions())
-            .map_err(format_versions_err)?;
-        Ok(FormatVersionsReport::from_core(&report))
+            .detach(|| self.inner.inspect())
+            .map_err(inspect_err)?;
+        Ok(Inspection::from_core(&report))
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.
@@ -1178,9 +1178,9 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IndexSpec>()?;
     m.add_class::<MutationStats>()?;
     m.add_class::<GcReport>()?;
-    m.add_class::<FormatVersionsReport>()?;
-    m.add_class::<ManifestFormatVersions>()?;
-    m.add_class::<SuperfileFormatVersions>()?;
+    m.add_class::<Inspection>()?;
+    m.add_class::<ManifestInspection>()?;
+    m.add_class::<SuperfileInspection>()?;
     m.add_class::<CompactOptions>()?;
     m.add("InfinoError", m.py().get_type::<InfinoError>())?;
     m.add(

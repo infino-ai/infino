@@ -182,7 +182,7 @@ fn public_surface_search_maintain_query_and_drop() {
     // The format report through the wrapper: every committed superfile is
     // current on every layer, the user table's rows carry both index
     // sections, and any derived vector-index superfile is reported too.
-    let versions = docs.format_versions().expect("format_versions");
+    let versions = docs.inspect().expect("inspect");
     let manifest = versions
         .manifest
         .as_ref()

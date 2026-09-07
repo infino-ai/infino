@@ -99,8 +99,8 @@ export interface GcReport {
   deleteErrors: number;
 }
 
-/** Format facts about one superfile, from {@link Table.formatVersions}. */
-export interface SuperfileFormatVersions {
+/** Format facts about one superfile, from {@link Table.inspect}. */
+export interface SuperfileInspection {
   /** The superfile's id, as it appears in its storage path. */
   superfileId: string;
   /** `true` when the superfile belongs to the table's derived vector index rather than to the user's rows. */
@@ -120,7 +120,7 @@ export interface SuperfileFormatVersions {
 }
 
 /** Format facts about the table's persisted manifest list. */
-export interface ManifestFormatVersions {
+export interface ManifestInspection {
   /** The list's format version as stored, e.g. `"1.0"`. */
   formatVersion: string;
   /** Which rule the stored options hash verifies under: `"current"` or `"zero_sentinel"`. */
@@ -129,12 +129,12 @@ export interface ManifestFormatVersions {
   current: boolean;
 }
 
-/** What {@link Table.formatVersions} returns. */
-export interface FormatVersionsReport {
+/** What {@link Table.inspect} returns. */
+export interface Inspection {
   /** The persisted manifest list; absent for an in-process (`memory://`) table. */
-  manifest?: ManifestFormatVersions;
+  manifest?: ManifestInspection;
   /** One row per superfile, in manifest order. */
-  superfiles: SuperfileFormatVersions[];
+  superfiles: SuperfileInspection[];
   /** `true` when the manifest (if persisted) and every superfile are current. */
   isCurrent: boolean;
   /** Superfiles with at least one layer behind the current format. */
@@ -513,8 +513,8 @@ export class Table {
    * **Local connections only.** On Infino Cloud the report is the operator's
    * view, so calling this on a hosted connection throws.
    */
-  formatVersions(): FormatVersionsReport {
-    return guard(this.remote, () => this.inner.formatVersions());
+  inspect(): Inspection {
+    return guard(this.remote, () => this.inner.inspect());
   }
 }
 
