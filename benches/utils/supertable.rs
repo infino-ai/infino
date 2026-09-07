@@ -905,7 +905,14 @@ pub fn run() {
 // ─── Per-modality query runners ───────────────────────────────────────────
 
 const WARM_ITERS: usize = 20;
-const COLD_ITERS: usize = 5;
+// 3, down from 5: each iteration is a fresh-cache open against the object
+// store, so cold latency scales with stored bytes — on the realistic FTS
+// corpus (~6x the synthetic bytes at equal docs) five iterations put one
+// A/B arm alone near the hour. Three keeps an outlier-discarding median
+// (cold latency is informational — the merge gate reads warm p90 only),
+// and every deterministic cold assertion (GET counts, byte ceilings, cost
+// tables) is per-iteration and unaffected by the count.
+const COLD_ITERS: usize = 3;
 const TOP_K: usize = 10;
 
 /// Selected phases for a per-modality supertable runner.
