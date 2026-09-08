@@ -2662,6 +2662,16 @@ impl SuperfileUri {
     /// including a `.tmp` sibling or a tombstone sidecar.
     pub fn from_storage_path(key: &str) -> Option<Self> {
         let name = key.strip_prefix(SUPERFILE_DATA_DIR)?.strip_prefix('/')?;
+        // Superfile objects sit directly in `data/`, so a key with a further
+        // path segment is something else and must not round-trip. This guard
+        // is load-bearing rather than tidy: reading the uuid off the tail of a
+        // `<stem>-<uuid>` body accepts any stem, and a stem is allowed to
+        // contain anything - so without it `data/whatever/x-<uuid>.sf.parquet`
+        // parses as a live superfile, and gc's keep-set and the cache sweep
+        // both decide what to delete from exactly this function.
+        if name.contains('/') {
+            return None;
+        }
         let body = name.strip_suffix(".sf.parquet")?;
         let uuid_text = body.strip_prefix("seg-").or_else(|| uuid_suffix(body))?;
         Uuid::parse_str(uuid_text).ok().map(SuperfileUri)
@@ -4161,6 +4171,13 @@ mod tests {
             format!("data/customers-{}.sf.parquet", &text[1..]), // uuid one char short
             format!("data/customers-{text}x.sf.parquet"), // uuid not at the end
             format!("data/customers-{text}.sf.parquet.tmp"), // in-flight tmp
+            // A key nested under `data/`. Superfiles sit directly in `data/`,
+            // and reading the uuid off the tail of a `<stem>-<uuid>` body
+            // accepts any stem - so without the segment guard these parse as
+            // live superfiles, and gc's keep-set and the cache sweep both
+            // decide what to delete from this function.
+            format!("data/nested/customers-{text}.sf.parquet"),
+            format!("data/a/b/seg-{text}.sf.parquet"),
         ] {
             assert_eq!(
                 SuperfileUri::from_storage_path(&key),

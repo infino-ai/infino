@@ -436,6 +436,43 @@ fn two_sources_in_one_commit_publish_unnamed() {
     );
 }
 
+/// A row-less batch contributes no rows, so it must contribute no opinion
+/// about the label either. Both arms matter: an empty `append` between two
+/// named appends would otherwise make the commit mixed and publish correctly
+/// sourced rows unnamed, and an empty `append_named` naming a second source
+/// would do the same. A hydrate job hitting an empty shard is exactly the
+/// caller that produces one.
+#[test]
+fn an_empty_batch_leaves_the_source_label_alone() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    let empty = build_title_batch(&[]);
+    let mut w = st.writer().expect("writer");
+    w.append_named(&build_title_batch(&["real row"]), "customers.parquet")
+        .expect("append_named");
+    // Neither of these joins a row, so neither may unname the commit.
+    w.append(&empty).expect("empty append");
+    w.append_named(&empty, "orders.parquet")
+        .expect("empty append_named");
+    w.commit().expect("commit");
+    drop(w);
+
+    let names: Vec<String> = std::fs::read_dir(dir.path().join("data"))
+        .expect("readdir data")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "one commit → one object: {names:?}");
+    assert!(
+        names[0].starts_with("customers_parquet-"),
+        "the label survives row-less batches: {names:?}"
+    );
+}
+
 #[test]
 fn manifest_id_increments_only_on_non_empty_commits() {
     // A commit with no buffered batches is a no-op.

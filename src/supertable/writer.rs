@@ -1131,7 +1131,14 @@ impl SupertableWriter {
         // from more than one place, so the commit is unnamed. Cleared before
         // the flush below can run, which is what keeps a threshold flush
         // from labelling a mixed buffer.
-        self.pending_stem = None;
+        //
+        // A row-less batch joins nothing, so it changes no label. The guard is
+        // on the label alone rather than an early return: the batch still goes
+        // through `append_labelled`, so an empty batch with the wrong schema is
+        // still rejected there instead of silently accepted.
+        if batch.num_rows() > 0 {
+            self.pending_stem = None;
+        }
         self.append_labelled(batch)
     }
 
@@ -1148,19 +1155,25 @@ impl SupertableWriter {
     /// [`Self::append`]. A commit whose rows came from two places has no one
     /// name, and labelling it with either source's would put that source's
     /// name on the other's rows.
+    ///
+    /// A batch with no rows contributes no rows to name, so it leaves the
+    /// label exactly as it was - it neither sets one nor makes the commit
+    /// mixed.
     pub fn append_named(
         &mut self,
         batch: &RecordBatch,
         source_name: &str,
     ) -> Result<(), BuildError> {
-        let next = superfile_stem(source_name);
-        // Cleared before the flush inside `append_labelled` can run, which is
-        // what keeps a threshold flush from labelling a mixed buffer.
-        self.pending_stem = if self.buffer.is_empty() || self.pending_stem == next {
-            next
-        } else {
-            None
-        };
+        if batch.num_rows() > 0 {
+            let next = superfile_stem(source_name);
+            // Cleared before the flush inside `append_labelled` can run, which
+            // is what keeps a threshold flush from labelling a mixed buffer.
+            self.pending_stem = if self.buffer.is_empty() || self.pending_stem == next {
+                next
+            } else {
+                None
+            };
+        }
         self.append_labelled(batch)
     }
 
