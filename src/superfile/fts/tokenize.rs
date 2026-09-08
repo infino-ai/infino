@@ -1014,9 +1014,7 @@ mod tests {
         for len in 1..=3usize {
             let mut counter = vec![0u8; len];
             loop {
-                for i in 0..len {
-                    buf[i] = counter[i];
-                }
+                buf[..len].copy_from_slice(&counter[..len]);
                 let text = std::str::from_utf8(&buf[..len]).expect("ascii is utf8");
                 assert_eq!(
                     ascii_fast_segments(text),
@@ -1054,8 +1052,8 @@ mod tests {
             let mut counter = vec![0usize; len];
             let mut buf = vec![0u8; len];
             loop {
-                for i in 0..len {
-                    buf[i] = alpha[counter[i]];
+                for (slot, &idx) in buf.iter_mut().zip(counter.iter()) {
+                    *slot = alpha[idx];
                 }
                 let text = std::str::from_utf8(&buf).expect("ascii is utf8");
                 assert_eq!(
