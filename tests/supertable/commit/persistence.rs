@@ -416,9 +416,7 @@ fn two_sources_in_one_commit_publish_unnamed() {
     let repeated = names("after the same source twice");
     assert_eq!(repeated.len(), 2, "{repeated:?}");
     assert!(
-        repeated
-            .iter()
-            .any(|n| n.starts_with("customers_parquet-")),
+        repeated.iter().any(|n| n.starts_with("customers_parquet-")),
         "one source named twice keeps its label: {repeated:?}"
     );
 
