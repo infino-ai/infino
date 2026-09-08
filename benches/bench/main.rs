@@ -29,7 +29,9 @@
 //! Token vocabulary:
 //!   tier        : `superfile` | `supertable`        (omitted => both)
 //!   modality    : `fts` | `vector` | `sql`          (omitted => all three)
-//!   phase       : `build` | `warm` | `cold` | `search` (= warm+cold)
+//!   phase       : `build` | `warm` | `cold` | `quality` | `search` (= warm+cold)
+//!                 (`quality` = FTS BM25 top-k parity vs a textbook oracle;
+//!                 supertable fts only, other cells ignore it)
 //!                 (omitted => all three phases)
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
@@ -175,6 +177,17 @@ fn run_cell_in_child(tier: Tier, modality: Modality, phases: Phases, phase_selec
         if phases.cold {
             cmd.arg("cold");
         }
+        if phases.quality {
+            cmd.arg("quality");
+        }
+    }
+    // The corpus selector is process-wide state installed from the
+    // arguments, so a child that did not receive it would silently run
+    // the default corpus under the parent's label.
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with("corpus=") || arg.starts_with("corpus-dir=") {
+            cmd.arg(arg);
+        }
     }
     let status = cmd.status().expect("spawn bench cell child");
     if !status.success() {
@@ -196,7 +209,7 @@ enum DatasetVerb {
 
 fn dataset_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "Usage:\n  cargo bench -- dataset <prepare|bench|run> <prefix> [fts|vector|sql ...] [warm|cold|search]\n\
+        "Usage:\n  cargo bench -- dataset <prepare|bench|run> <prefix> [fts|vector|sql ...] [warm|cold|quality|search]\n\
          \n\
          prepare : ingest the corpus to <prefix> and write the sidecar (fails if already there)\n\
          bench   : open the dataset at <prefix> and run the read phases (fails if absent)\n\
@@ -230,7 +243,7 @@ fn run_dataset_command(tokens: &[String]) {
     };
     let mut prefix: Option<&str> = None;
     let mut modalities: Vec<Modality> = Vec::new();
-    let (mut warm, mut cold) = (false, false);
+    let (mut warm, mut cold, mut quality) = (false, false, false);
     for tok in &tokens[1..] {
         match tok.as_str() {
             "fts" if !modalities.contains(&Modality::Fts) => modalities.push(Modality::Fts),
@@ -241,6 +254,7 @@ fn run_dataset_command(tokens: &[String]) {
             "fts" | "vector" | "sql" => {}
             "warm" => warm = true,
             "cold" => cold = true,
+            "quality" => quality = true,
             "search" => {
                 warm = true;
                 cold = true;
@@ -263,9 +277,10 @@ fn run_dataset_command(tokens: &[String]) {
     if modalities.is_empty() {
         modalities = vec![Modality::Fts, Modality::Vector, Modality::Sql];
     }
-    if !(warm || cold) {
+    if !(warm || cold || quality) {
         warm = true;
         cold = true;
+        quality = true;
     }
 
     for &m in &modalities {
@@ -286,11 +301,13 @@ fn run_dataset_command(tokens: &[String]) {
                 build: true,
                 warm: false,
                 cold: false,
+                quality: false,
             },
             (DatasetVerb::Bench, true) => Phases {
                 build: false,
                 warm,
                 cold,
+                quality,
             },
             (DatasetVerb::Run, exists) => {
                 if exists {
@@ -300,6 +317,7 @@ fn run_dataset_command(tokens: &[String]) {
                     build: !exists,
                     warm,
                     cold,
+                    quality,
                 }
             }
         };
@@ -314,7 +332,8 @@ fn print_usage_and_exit(code: i32) -> ! {
          \n\
          Tier      : superfile | supertable        (omitted => both)\n\
          Modality  : fts | vector | sql            (omitted => all three)\n\
-         Phase     : build | warm | cold | search  (search = warm+cold; omitted => all)\n\
+         Phase     : build | warm | cold | quality | search  (search = warm+cold; omitted => all;\n\
+         \x20           quality = FTS BM25 parity vs a textbook oracle, supertable fts only)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
          Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | disk-warm | recall_while_ingest,\n\
@@ -377,6 +396,7 @@ fn parse_args() -> Selection {
     let mut build = false;
     let mut warm = false;
     let mut cold = false;
+    let mut quality = false;
     let mut want_all = false;
     let mut want_diagnostics = false;
     let mut unknown: Vec<String> = Vec::new();
@@ -415,6 +435,7 @@ fn parse_args() -> Selection {
             "build" => build = true,
             "warm" => warm = true,
             "cold" => cold = true,
+            "quality" => quality = true,
             "search" => {
                 warm = true;
                 cold = true;
@@ -473,9 +494,14 @@ fn parse_args() -> Selection {
         ];
     }
 
-    let phase_selected = build || warm || cold;
+    let phase_selected = build || warm || cold || quality;
     let phases = if phase_selected {
-        Phases { build, warm, cold }
+        Phases {
+            build,
+            warm,
+            cold,
+            quality,
+        }
     } else {
         Phases::ALL
     };

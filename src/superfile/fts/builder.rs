@@ -289,7 +289,7 @@ const ACCUM_POSTING_BYTES: usize = 8;
 /// `sort_unstable_by` instead of the counting/radix variant: under
 /// this count the histogram allocation outweighs the algorithmic
 /// savings.
-const RADIX_SORT_MIN_TRIPLES: usize = 256;
+pub(crate) const RADIX_SORT_MIN_TRIPLES: usize = 256;
 
 /// Upper bound on the initial in-RAM chunk capacity (in triples)
 /// during external merge sort. Caps the up-front `Vec` reservation
@@ -984,27 +984,27 @@ mod finish_debug {
 ///    `0..vocab_size`. The bench Zipfian column has ~10K vocab; even
 ///    a 10M-doc supertable column tops out around a few million —
 ///    the counts table fits comfortably in L2 either way.
-/// 2. The secondary key is *usually free*. Within a partition file,
-///    the triples `add_doc` appends for a fixed `term_id` arrive in
+/// 2. The secondary key is *almost* free. For the tokenizing ingest
+///    feed, all triples for a fixed `term_id` are appended in
 ///    strictly increasing `doc_id` order (`add_doc` is called with
 ///    monotonic `local_doc_id` per `column_id`, and each call emits
 ///    one triple per unique term in iteration order over
 ///    `updated_terms`, with all triples for that doc emitted
-///    contiguously). So a *stable* sort on `lex_rank[term_id]`
-///    leaves the within-rank order as the original `doc_id` order
-///    — exactly the `(lex_rank, doc_id)` order the finish-time
-///    lex-order partition traversal needs. A prebuilt feed does not
-///    promise that: the compaction merge of a cell-packed table
-///    remaps each input's doc ids into cell order, so one term's
-///    postings arrive scattered. After the scatter, one sequential
-///    pass ([`runs_sorted_by_doc`]) checks every within-term run and
-///    only an actual inversion pays the comparison sort — an in-order
-///    build spends the read pass and nothing more.
+///    contiguously), so the *stable* scatter on `lex_rank[term_id]`
+///    already leaves the within-rank order as `doc_id` order. The
+///    compaction carry paths may not arrive ascending — the
+///    multi-cell merge remaps postings through the packed stable-id
+///    row order — so a verification pass (pass 4 below) scans each
+///    rank run and sorts only the runs with an inversion, restoring
+///    the `(lex_rank, doc_id)` order the finish-time lex-order
+///    partition traversal needs.
 /// 3. Counting sort is **one pass to histogram + one pass to
 ///    scatter**. No `O(log n)` compare chain (pdqsort), no 5–8
 ///    LSB-byte passes (radix), no comparator chasing `lex_rank`
-///    twice per call. Two reads of every triple and one write, plus
-///    the sequential order check of point 2.
+///    twice per call. Three reads of every triple and one write
+///    (histogram, scatter, order verification) — the verification
+///    read is sequential and measured within noise on the 1M
+///    superfile build.
 ///
 /// **Memory shape**: `counts: Vec<u32>` of length
 /// `vocab_size + 1` (~40 KiB at 10K vocab), plus the `out: Vec
@@ -1012,12 +1012,16 @@ mod finish_debug {
 /// radix variant's parallel-array workspace, just a single
 /// allocation instead of three.
 ///
-/// Falls back to the comparison sort for tiny inputs where the counts
+/// Falls back to `sort_unstable_by` for tiny inputs where the counts
 /// allocation outweighs the algorithmic savings.
 fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, lex_rank: &[u32]) {
     let n = triples.len();
     if n < RADIX_SORT_MIN_TRIPLES {
-        sort_records_by_rank_then_doc(triples, lex_rank);
+        triples.sort_unstable_by(|a, b| {
+            lex_rank[triple_term_id(a) as usize]
+                .cmp(&lex_rank[triple_term_id(b) as usize])
+                .then(triple_doc_id(a).cmp(&triple_doc_id(b)))
+        });
         return;
     }
 
@@ -1058,10 +1062,11 @@ fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, l
 
     // Pass 3: scatter into `out`. Each triple lands at
     // `offsets[rank]`, then we bump that slot so the next triple
-    // for the same rank lands immediately after. Because we walk
-    // `triples` in arrival order and arrival order is `(doc_id,
-    // term_id_within_doc)`, the within-rank order in `out` is the
-    // partition's `doc_id` order — i.e. `(lex_rank, doc_id)`.
+    // for the same rank lands immediately after. The scatter is
+    // stable, so within a rank `out` holds arrival order — which is
+    // `doc_id` order for the tokenizing ingest feed, but not
+    // necessarily for the compaction carry feeds; pass 4 repairs
+    // any run that needs it.
     let mut out: Vec<[u32; N]> = vec![[0u32; N]; n];
     for t in triples.iter() {
         let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
@@ -1072,39 +1077,36 @@ fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, l
         }
     }
 
-    // The scatter is stable, so a term's run keeps its arrival order.
-    // That is doc order for `add_doc`, but a prebuilt feed remapped out
-    // of order (the multi-cell compaction merge) leaves inversions the
-    // downstream k-way merge and posting encoder both assume away.
-    // Repair them here, where the records are still in RAM.
-    if !runs_sorted_by_doc(&out) {
-        sort_records_by_rank_then_doc(&mut out, lex_rank);
+    // Pass 4: repair within-rank doc order. The counting scatter above is
+    // stable, so within a rank `out` holds arrival order. The tokenizing
+    // ingest path always arrives in ascending doc order, but the
+    // compaction carry paths can feed a term's docs out of order (the
+    // multi-cell merge remaps postings through the packed row order), and
+    // the sorted-chunk contract downstream — the external-merge heap key
+    // and `encode_block`'s strictly-ascending doc ids — is `(lex_rank,
+    // doc_id)`. Scan each rank run and sort only the runs that need it:
+    // linear for the already-sorted ingest shape.
+    let mut run_start = 0usize;
+    let mut run_rank = lex_rank[triple_term_id(&out[0]) as usize];
+    let mut run_sorted = true;
+    for i in 1..=n {
+        let rank_at = |t: &[u32; N]| lex_rank[triple_term_id(t) as usize];
+        let boundary = i == n || rank_at(&out[i]) != run_rank;
+        if boundary {
+            if !run_sorted {
+                out[run_start..i].sort_unstable_by_key(triple_doc_id);
+            }
+            if i < n {
+                run_rank = rank_at(&out[i]);
+            }
+            run_start = i;
+            run_sorted = true;
+        } else if triple_doc_id(&out[i]) < triple_doc_id(&out[i - 1]) {
+            run_sorted = false;
+        }
     }
 
     *triples = out;
-}
-
-/// Whether every run of records sharing a term id is in strictly
-/// ascending doc id order. Records of one term are contiguous after
-/// the counting sort, so adjacent pairs are all that need checking,
-/// and equal term ids mean equal lex ranks (the rank is a bijection
-/// over the dense term ids), so the pass reads the records
-/// sequentially with no `lex_rank` gather.
-fn runs_sorted_by_doc<const N: usize>(records: &[[u32; N]]) -> bool {
-    records.windows(2).all(|w| {
-        triple_term_id(&w[0]) != triple_term_id(&w[1])
-            || triple_doc_id(&w[0]) < triple_doc_id(&w[1])
-    })
-}
-
-/// Comparison sort by `(lex_rank[term_id], doc_id)`: the order every
-/// sorted partition must be in, whatever order its records arrived.
-fn sort_records_by_rank_then_doc<const N: usize>(records: &mut [[u32; N]], lex_rank: &[u32]) {
-    records.sort_unstable_by(|a, b| {
-        lex_rank[triple_term_id(a) as usize]
-            .cmp(&lex_rank[triple_term_id(b) as usize])
-            .then(triple_doc_id(a).cmp(&triple_doc_id(b)))
-    });
 }
 
 /// Open a partition as a sorted-triple iterator. Picks the in-
@@ -1601,12 +1603,17 @@ impl FtsBuilder {
     /// column's accumulator without tokenizing — the FTS-compaction-merge
     /// counterpart of [`add_doc`]. `positions` is empty for a non-positional
     /// column; otherwise it holds the `tf` token offsets for this `(term,
-    /// doc)`. Callers feed postings with each term's docs in ascending doc-id
-    /// order (the merge reads them that way), so a term's posting list stays
-    /// sorted — matching what `add_doc` produces. Mirrors the in-RAM drain in
-    /// [`add_doc_inram`], minus the tokenize + per-doc position-chain walk.
+    /// doc)`. The concatenating merges feed each term's docs in ascending
+    /// doc-id order (sequential inputs, dense remap), matching what
+    /// `add_doc` produces. The multi-cell merge does not — it remaps
+    /// postings through the packed stable-id row order — so it forces the
+    /// column into spill mode first, where the finish restores per-term
+    /// doc order (see `radix_sort_records_by_lex_rank`); the in-RAM
+    /// accumulator preserves insertion order and must only be fed
+    /// ascending. Mirrors the in-RAM drain in [`add_doc_inram`], minus the
+    /// tokenize + per-doc position-chain walk.
     ///
-    /// Doc lengths are fed separately via [`set_prebuilt_doc_lengths`] — the
+    /// Doc lengths are fed separately via [`append_prebuilt_doc_lengths`] — the
     /// merge carries the inputs' stored lengths rather than recomputing them.
     ///
     /// Memory-bounded: while in-RAM, a push that crosses `spill_threshold_bytes`
@@ -4027,6 +4034,38 @@ mod tests {
     use super::*;
     use crate::test_helpers::default_tokenizer as tokenizer;
 
+    /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
+    /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
+    /// order — the compaction carry paths feed postings remapped through
+    /// a packed row order, unlike the always-ascending ingest path. A
+    /// term-only stable scatter once preserved the unsorted arrival
+    /// order, and `encode_block` then indexed a bitset block out of
+    /// bounds on the merged output.
+    #[test]
+    fn radix_sort_orders_docs_within_term_for_unsorted_feeds() {
+        // 4 terms × enough triples to clear the radix threshold, docs
+        // deliberately fed in descending order per term.
+        let n_terms = 4u32;
+        let per_term = RADIX_SORT_MIN_TRIPLES as u32;
+        // Identity lex ranks (term ids already lexicographic).
+        let lex_rank: Vec<u32> = (0..n_terms).collect();
+        let mut triples: Vec<[u32; 3]> = Vec::new();
+        for doc in (0..per_term).rev() {
+            for term in 0..n_terms {
+                triples.push([term, doc, 1]);
+            }
+        }
+        assert!(triples.len() >= RADIX_SORT_MIN_TRIPLES);
+        radix_sort_records_by_lex_rank(&mut triples, &lex_rank);
+        let sorted = triples.windows(2).all(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let ka = (lex_rank[triple_term_id(a) as usize], triple_doc_id(a));
+            let kb = (lex_rank[triple_term_id(b) as usize], triple_doc_id(b));
+            ka < kb
+        });
+        assert!(sorted, "triples must come out in (lex_rank, doc_id) order");
+    }
+
     #[test]
     fn register_column_returns_sequential_ids() {
         let mut b = FtsBuilder::new(tokenizer());
@@ -4545,68 +4584,6 @@ mod tests {
             !chunks.is_empty(),
             "external-merge path must have written at least one sorted-chunk file; \
              observed chunks were empty (test no longer exercises the over-budget branch)"
-        );
-    }
-
-    #[test]
-    fn prebuilt_postings_fed_out_of_doc_order_finish_sorted() {
-        // The compaction merge of a cell-packed table feeds
-        // `add_prebuilt_term_posting` with doc ids in cell order, not
-        // ascending order. The spilled finish's counting sort is stable
-        // and keys on the term's lex rank alone, so left to itself it
-        // would keep that arrival order inside every posting list and
-        // emit lists the reader cannot decode. The finish must restore
-        // doc order whatever order the feed arrived in: the blob must be
-        // byte-identical to the same corpus indexed in order by `add_doc`.
-        //
-        // `common` appears in every doc, so its partition holds well over
-        // `RADIX_SORT_MIN_TRIPLES` records and the counting sort — not the
-        // tiny-input comparison sort — is the path under test.
-        const N_DOCS: u32 = 4 * RADIX_SORT_MIN_TRIPLES as u32;
-        /// Coprime with `N_DOCS`, so the stride walk visits every doc once
-        /// and never in ascending order.
-        const STRIDE: u32 = 7;
-        const TOKENS_PER_DOC: u32 = 3;
-
-        fn terms_of(doc: u32) -> [String; TOKENS_PER_DOC as usize] {
-            [
-                "common".to_string(),
-                format!("term{doc:04}"),
-                format!("payload{doc:04}"),
-            ]
-        }
-
-        let mut baseline = FtsBuilder::new(tokenizer());
-        baseline.set_spill_threshold_bytes(1);
-        baseline
-            .register_column("body".into(), false)
-            .expect("register col");
-        for doc in 0..N_DOCS {
-            baseline
-                .add_doc(0, doc, &terms_of(doc).join(" "))
-                .expect("add doc");
-        }
-        let baseline_blob = baseline.finish().expect("finish baseline");
-
-        let mut shuffled = FtsBuilder::new(tokenizer());
-        shuffled.set_spill_threshold_bytes(1);
-        shuffled
-            .register_column("body".into(), false)
-            .expect("register col");
-        for step in 0..N_DOCS {
-            let doc = (step * STRIDE) % N_DOCS;
-            for term in terms_of(doc) {
-                shuffled
-                    .add_prebuilt_term_posting(0, &term, doc, 1, &[])
-                    .expect("prebuilt push");
-            }
-        }
-        shuffled.append_prebuilt_doc_lengths(0, &vec![TOKENS_PER_DOC; N_DOCS as usize]);
-        let shuffled_blob = shuffled.finish().expect("finish shuffled");
-
-        assert_eq!(
-            shuffled_blob, baseline_blob,
-            "an out-of-order prebuilt feed must finish to the same blob as an in-order build"
         );
     }
 

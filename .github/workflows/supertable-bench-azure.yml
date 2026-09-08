@@ -101,7 +101,9 @@ on:
       # `corpus-dir=` arguments. Empty (the default) selects the synthetic
       # planted-cluster corpus, so every existing leg — and the A/B baseline
       # it is compared against — is byte-identical to before this input
-      # existed. A real-corpus leg sets e.g. corpus: annb:glove-100-angular.
+      # existed. A real-corpus leg sets e.g. corpus: annb:glove-100-angular;
+      # `realistic` selects the generated text corpus the FTS quality phase
+      # is calibrated on (no corpus_dir needed).
       corpus:          { type: string, required: false, default: "" }
       corpus_dir:      { type: string, required: false, default: "" }
       docs:            { type: string, required: false, default: "1000000" }
@@ -199,6 +201,13 @@ jobs:
             superfile)                 args="superfile";         reports="superfile_fts superfile_vector sql" ;;
             supertable|supertable_all) args="supertable";        reports="supertable supertable_fts supertable_vector supertable_sql" ;;
             supertable_fts)            args="supertable fts";    reports="supertable_fts" ;;
+            # The FTS cell split by read phase, so the gate-bearing warm
+            # lane reports fast while the byte-bound cold battery runs on
+            # its own VM. Both keep `build`: the ingest metrics gate the
+            # post-compact lifecycle, and the warm half carries the
+            # quality oracle.
+            supertable_fts_warm)       args="supertable fts build warm quality"; reports="supertable_fts" ;;
+            supertable_fts_cold)       args="supertable fts build cold";         reports="supertable_fts" ;;
             supertable_vector)         args="supertable vector"; reports="supertable_vector" ;;
             supertable_sql)            args="supertable sql";    reports="supertable_sql" ;;
             all)                       args="all";               reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
@@ -212,8 +221,15 @@ jobs:
             if [ -n "${{ inputs.corpus_dir }}" ]; then
               args="$args corpus-dir=${{ inputs.corpus_dir }}"
             else
-              echo "::error::corpus set without corpus_dir; downloadable corpora need a staging dir"
-              exit 1
+              # Generated corpora (`synthetic`, `realistic`) need no staging
+              # dir; every other spec downloads or reads files.
+              case "${{ inputs.corpus }}" in
+                synthetic|realistic) ;;
+                *)
+                  echo "::error::corpus set without corpus_dir; downloadable corpora need a staging dir"
+                  exit 1
+                  ;;
+              esac
             fi
           fi
           echo "args=$args"       >> "$GITHUB_OUTPUT"
@@ -422,12 +438,21 @@ jobs:
 
       # Run the main arm; its metric JSONs stay in place as the PR arm's
       # baseline (Report::load reads them as `prev`).
+      #
+      # A baseline-arm failure is a WARNING, not a step failure: the gate
+      # compares the PR against main, and when main itself cannot complete
+      # the bench (a bug this PR may be fixing), no comparison is possible —
+      # the PR arm still runs and renders "(new)", and the merge gate
+      # already passes with "no gate verdict produced" when baseline
+      # metrics are absent. A red baseline must not block the fixing PR;
+      # a broken PR arm still fails its own (fatal) step below.
       - name: Same-host baseline (A/B main arm)
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          baseline_status=0
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
@@ -438,7 +463,7 @@ jobs:
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
-             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build-main.log
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build-main.log || baseline_status=$?
           set -euo pipefail
           cd "$HOME/infino-src"
           export INFINO_BENCH_STORE=azure
@@ -453,8 +478,13 @@ jobs:
           taskset -c "$CPUSET" "$HOME/bench-main" $BENCH_ARGS 2>&1
           echo "===== BASELINE (main arm) END ====="
           REMOTE
+          if [ "$baseline_status" -ne 0 ]; then
+            echo "::warning::main-arm baseline bench failed (exit ${baseline_status}) — \
+          main is likely broken; the PR arm runs without a comparison and shapes render (new)"
+          fi
           # Stage the main-arm JSONs on the runner too — the AI-summary step
-          # diffs them against the PR arm's metrics (collected later).
+          # diffs them against the PR arm's metrics (collected later). Shapes
+          # that completed before a baseline failure still stage and diff.
           mkdir -p baseline
           for j in $REPORTS; do
             scp $SSH_OPTS \

@@ -50,8 +50,16 @@ jobs:
       # runs the same target; this is the early tripwire, not a second suite.
       - run: make bench-gate
       - run: make ci
+      # libtest's positional filters are plain substring matches ORed
+      # together, not a regex: a single 'a|b' argument matches nothing and
+      # the step passes vacuously with 0 tests run. `cargo test` accepts
+      # only one filter before `--`, so both go after it. Folded scalar:
+      # a plain `run:` value would read the `:: ` before the second
+      # filter as a YAML mapping.
       - name: RustFS storage wire + smoke tests
-        run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1
+        run: >-
+          cargo test --features test-helpers --test supertable --
+          storage::rustfs_s3_wire:: storage::smoke_rustfs:: --test-threads=1
 
   public-api:
     name: Public API surface
