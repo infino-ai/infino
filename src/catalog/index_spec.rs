@@ -127,7 +127,7 @@ impl IndexSpec {
     /// use infino::{FtsField, IndexSpec};
     /// let spec = IndexSpec::new()
     ///     .fts("title")
-    ///     .fts(FtsField::new("body").analyzer("standard").stored(false));
+    ///     .fts(FtsField::new("body").analyzer("ascii_lower").stored(false));
     /// # let _ = spec;
     /// ```
     pub fn fts(mut self, field: impl Into<FtsField>) -> Self {
