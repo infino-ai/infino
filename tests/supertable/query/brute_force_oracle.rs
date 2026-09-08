@@ -29,6 +29,7 @@
 #![deny(clippy::unwrap_used)]
 
 use std::{
+    cmp::Reverse,
     collections::HashSet,
     sync::{Arc, LazyLock},
 };
@@ -819,7 +820,7 @@ fn single_term_global_idf_skip_matches_a_single_superfile() {
     // what makes the equality above unambiguous rather than a tie
     // ordering that happened to agree.
     let mut expected: Vec<(u64, usize)> = SKIP_HOT_DOCS.to_vec();
-    expected.sort_by(|a, b| b.1.cmp(&a.1));
+    expected.sort_by_key(|(_, tf)| Reverse(*tf));
     let expected_ids: Vec<u64> = expected
         .iter()
         .take(SKIP_TOP_K)
