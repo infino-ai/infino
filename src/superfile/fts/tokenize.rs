@@ -959,6 +959,8 @@ impl Tokenizer for StandardTokenizer {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn tokens(text: &str) -> Vec<String> {
@@ -1100,10 +1102,7 @@ mod tests {
         ] {
             let mut fast = Vec::new();
             StandardTokenizer.tokenize_each_inline(text, |t| fast.push(t.to_owned()));
-            let expected: Vec<String> = text
-                .unicode_words()
-                .map(|w| w.to_lowercase())
-                .collect();
+            let expected: Vec<String> = text.unicode_words().map(|w| w.to_lowercase()).collect();
             assert_eq!(fast, expected, "tokens diverged on {text:?}");
         }
     }
@@ -1124,10 +1123,133 @@ mod tests {
             let mut via_each = Vec::new();
             StandardTokenizer.tokenize_each(text, &mut |t| via_each.push(t.to_owned()));
             let mut via_query = Vec::new();
-            StandardTokenizer
-                .tokenize_each_query(text, &mut |t| via_query.push(t.into_owned()));
-            assert_eq!(via_tokenize, via_each, "tokenize vs tokenize_each on {text:?}");
-            assert_eq!(via_tokenize, via_query, "tokenize vs query path on {text:?}");
+            StandardTokenizer.tokenize_each_query(text, &mut |t| via_query.push(t.into_owned()));
+            assert_eq!(
+                via_tokenize, via_each,
+                "tokenize vs tokenize_each on {text:?}"
+            );
+            assert_eq!(
+                via_tokenize, via_query,
+                "tokenize vs query path on {text:?}"
+            );
+        }
+    }
+
+    /// Whether the analyzer picks the ASCII scan is decided for the
+    /// *whole input*, so the same word takes a different code path
+    /// depending on what else the text contains: `"don't"` alone goes
+    /// through the ASCII scan, `"don't café"` through the general
+    /// segmenter. Documents are indexed one way and queries tokenized
+    /// the other, so if the two paths disagreed on a shared word the
+    /// query would silently miss — no error, just lost recall. Pin that
+    /// a word's tokens do not depend on its neighbours' encoding.
+    #[test]
+    fn a_words_tokens_do_not_depend_on_non_ascii_elsewhere_in_the_text() {
+        for ascii_text in [
+            "don't stop",
+            "3.14 and 1,000",
+            "snake_case _leading trailing_",
+            "a.b.c A:B x''y",
+            "plain words here",
+            "MiXeD CaSe WORDS",
+            "hello",
+        ] {
+            // Fast path: the text is entirely ASCII.
+            let fast: Vec<String> = StandardTokenizer.tokenize(ascii_text).collect();
+            assert!(ascii_text.is_ascii(), "fixture must be ASCII");
+
+            // Slow path: the identical text plus one non-ASCII word, so
+            // the whole input falls back to the general segmenter. The
+            // ASCII words' tokens must come out the same.
+            for suffix in [" café", " Straße", " 中文"] {
+                let mixed = format!("{ascii_text}{suffix}");
+                assert!(!mixed.is_ascii(), "fixture must leave the ASCII path");
+                let slow: Vec<String> = StandardTokenizer.tokenize(&mixed).collect();
+                assert_eq!(
+                    slow[..fast.len()],
+                    fast[..],
+                    "{ascii_text:?} tokenized differently once {suffix:?} joined the text"
+                );
+            }
+        }
+    }
+
+    /// The ASCII scan runs 16 bytes at a time with a scalar tail for the
+    /// remainder, so a token's bytes can be split across the vector and
+    /// scalar paths depending only on where it sits in the buffer. Pad
+    /// the front through a full stride so every token visits both, and
+    /// require the tokens to be identical each time.
+    #[test]
+    fn ascii_scan_is_independent_of_alignment_across_the_simd_stride() {
+        const STRIDE: usize = 16;
+        for text in [
+            "don't 3.14 snake_case a.b.c MiXeD",
+            "the quick brown fox jumps over the lazy dog",
+            "a:b 1,000 x_y Z",
+        ] {
+            let baseline: Vec<String> = StandardTokenizer.tokenize(text).collect();
+            let ascii_baseline: Vec<String> = AsciiLowerTokenizer.tokenize(text).collect();
+            // One extra stride so the tail length cycles through every
+            // residue class mod 16.
+            for pad in 1..=STRIDE + 1 {
+                let padded = format!("{}{}", " ".repeat(pad), text);
+                assert_eq!(
+                    StandardTokenizer.tokenize(&padded).collect::<Vec<_>>(),
+                    baseline,
+                    "standard tokens shifted at pad {pad} for {text:?}"
+                );
+                assert_eq!(
+                    AsciiLowerTokenizer.tokenize(&padded).collect::<Vec<_>>(),
+                    ascii_baseline,
+                    "ascii_lower tokens shifted at pad {pad} for {text:?}"
+                );
+            }
+        }
+    }
+
+    /// Characters spanning every ASCII word-break class plus non-ASCII
+    /// letters from three scripts, so a generated string lands on either
+    /// code path and on the boundaries between them.
+    const MIXED_ALPHABET: &[char] = &[
+        'a', 'B', 'z', '1', '9', '_', ':', ',', ';', '.', '\'', ' ', '-', '"', 'é', 'Ä', 'ß', 'Σ',
+        '中', '数',
+    ];
+
+    proptest! {
+        /// Both code paths, against one oracle, for arbitrary mixed
+        /// input: whatever the analyzer emits must equal the general
+        /// UAX #29 segmenter's words, lowercased. Holding for every
+        /// input means the ASCII scan and the fallback also agree with
+        /// each other, which is the property the index and query sides
+        /// depend on.
+        #[test]
+        fn standard_tokens_match_the_general_segmenter_for_any_mixed_input(
+            indices in proptest::collection::vec(0..MIXED_ALPHABET.len(), 0..14)
+        ) {
+            let text: String = indices.iter().map(|&i| MIXED_ALPHABET[i]).collect();
+            let mut got = Vec::new();
+            StandardTokenizer.tokenize_each_inline(&text, |t| got.push(t.to_owned()));
+            let expected: Vec<String> =
+                text.unicode_words().map(|w| w.to_lowercase()).collect();
+            prop_assert_eq!(&got, &expected, "tokens diverged on {:?}", text);
+        }
+
+        /// Every entry point on the analyzer must agree on arbitrary
+        /// mixed input. Documents are indexed through `tokenize_each`
+        /// and queries run through `tokenize` / `tokenize_each_query`,
+        /// so a divergence here is lost recall rather than a failure.
+        #[test]
+        fn standard_entry_points_agree_for_any_mixed_input(
+            indices in proptest::collection::vec(0..MIXED_ALPHABET.len(), 0..14)
+        ) {
+            let text: String = indices.iter().map(|&i| MIXED_ALPHABET[i]).collect();
+            let via_tokenize: Vec<String> = StandardTokenizer.tokenize(&text).collect();
+            let mut via_each = Vec::new();
+            StandardTokenizer.tokenize_each(&text, &mut |t| via_each.push(t.to_owned()));
+            let mut via_query = Vec::new();
+            StandardTokenizer.tokenize_each_query(&text, &mut |t| via_query.push(t.into_owned()));
+            prop_assert_eq!(&via_tokenize, &via_each, "tokenize vs tokenize_each on {:?}", text);
+            prop_assert_eq!(&via_tokenize, &via_query, "tokenize vs query path on {:?}", text);
         }
     }
 
