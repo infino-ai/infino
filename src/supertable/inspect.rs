@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! On-disk format versions of a table's manifest and superfiles.
+//! On-disk format of a table's manifest and superfiles.
 //!
 //! A superfile has three independently versioned layers — the Parquet
 //! container (`inf.format_version`), the embedded full-text section header,
@@ -90,7 +90,11 @@ pub struct ManifestInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SuperfileInspection {
-    /// The superfile's id, as it appears in its storage path.
+    /// The superfile's id, as it appears in its object's storage path.
+    ///
+    /// This is the store routing key, not the entry's separate debugging
+    /// identifier: an operator correlating a stale row with an object in the
+    /// bucket needs the id the object is actually named by.
     pub superfile_id: String,
     /// `true` when the superfile belongs to the table's derived vector index
     /// rather than to the user's rows. Both are part of the table's storage
@@ -170,7 +174,7 @@ impl Inspection {
 }
 
 impl Supertable {
-    /// Report the on-disk format versions of the table's manifest and of
+    /// Report the on-disk format of the table's manifest and of
     /// every superfile, and whether each is what the running engine writes.
     ///
     /// Read-only: takes no writer or compaction slot and is safe to call at
@@ -256,7 +260,7 @@ async fn superfile_rows(
             let store = Arc::clone(&store);
             async move {
                 let source = byte_source_for(&entry, storage.as_ref(), store.as_ref())?;
-                superfile_row(entry.superfile_id, source.as_ref(), vector_index).await
+                superfile_row(entry.uri.0, source.as_ref(), vector_index).await
             }
         })
         .buffered(HEADER_READ_CONCURRENCY)
@@ -297,7 +301,7 @@ fn byte_source_for(
         None => store
             .reader(&entry.uri)
             .map(|reader| reader.byte_source())
-            .map_err(|e| superfile_error(entry.superfile_id, e.to_string())),
+            .map_err(|e| superfile_error(entry.uri.0, e.to_string())),
     }
 }
 

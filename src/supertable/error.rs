@@ -554,8 +554,8 @@ pub enum InspectError {
     Manifest(#[from] ManifestLoadError),
 
     /// One superfile's footer or section header could not be read or did
-    /// not parse. The report is all-or-nothing: a table with an unreadable
-    /// superfile has no trustworthy version picture.
+    /// not parse. The inspection is all-or-nothing: a table with an
+    /// unreadable superfile cannot be judged current or stale.
     #[error("superfile {superfile_id}: {reason}")]
     Superfile {
         /// The superfile whose header failed.

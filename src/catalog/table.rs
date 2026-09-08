@@ -387,7 +387,7 @@ impl Supertable {
         self.inner.gc(safety_gap)
     }
 
-    /// Report the on-disk format versions of the table's manifest and
+    /// Report the on-disk format of the table's manifest and
     /// superfiles, and whether each is what the running engine writes.
     /// Read-only; reads only footers and section headers. Local tables only.
     pub fn inspect(&self) -> Result<Inspection, InspectError> {

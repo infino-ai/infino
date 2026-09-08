@@ -1034,7 +1034,7 @@ impl Table {
         self.inner.gc(grace).map(GcReport::from).map_err(gc_err)
     }
 
-    /// Report the on-disk format versions of the table's manifest and of
+    /// Report the on-disk format of the table's manifest and of
     /// every superfile, and whether each is what this engine writes.
     /// Read-only; reads only footers and section headers.
     #[napi]

@@ -996,7 +996,7 @@ impl Table {
         Ok(GcReport::from_core(&report))
     }
 
-    /// Report the on-disk format versions of the table's manifest and of
+    /// Report the on-disk format of the table's manifest and of
     /// every superfile, and whether each is what this engine writes.
     /// Read-only; reads only footers and section headers.
     ///
