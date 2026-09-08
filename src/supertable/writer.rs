@@ -1139,15 +1139,28 @@ impl SupertableWriter {
     /// the superfiles of the commit that publishes them are keyed
     /// `data/<stem>-<uuid>.sf.parquet`, with the stem the key-safe form of
     /// `source_name` (see [`superfile_stem`]). A name that reduces to nothing
-    /// leaves the commit unnamed. The label covers every batch appended
-    /// under it until the next commit; a plain `append` in between clears
-    /// it, since a commit from two sources has no one name.
+    /// leaves the commit unnamed.
+    ///
+    /// The label describes a whole commit, so it holds only while every
+    /// buffered row shares it: the first batch after a commit sets it, a
+    /// batch naming the same source keeps it, and a batch naming a
+    /// *different* source leaves the commit unnamed — as does a plain
+    /// [`Self::append`]. A commit whose rows came from two places has no one
+    /// name, and labelling it with either source's would put that source's
+    /// name on the other's rows.
     pub fn append_named(
         &mut self,
         batch: &RecordBatch,
         source_name: &str,
     ) -> Result<(), BuildError> {
-        self.pending_stem = superfile_stem(source_name);
+        let next = superfile_stem(source_name);
+        // Cleared before the flush inside `append_labelled` can run, which is
+        // what keeps a threshold flush from labelling a mixed buffer.
+        self.pending_stem = if self.buffer.is_empty() || self.pending_stem == next {
+            next
+        } else {
+            None
+        };
         self.append_labelled(batch)
     }
 
@@ -1236,9 +1249,15 @@ impl SupertableWriter {
             .saturating_mul(1024);
         if threshold > 0 && self.buffered_bytes() >= threshold {
             // The threshold flush is a commit of the rows buffered so far, so
-            // it takes the label the way `commit` does.
+            // it takes the label the way `commit` does — and puts it back on a
+            // failed flush, for the same reason `commit` does: the buffer is
+            // kept, so dropping the label would publish those same rows
+            // unnamed on the retry.
             let stem = self.pending_stem.take();
-            self.commit_appends_internal(stem.as_deref())?;
+            if let Err(flush) = self.commit_appends_internal(stem.as_deref()) {
+                self.pending_stem = stem;
+                return Err(flush);
+            }
         }
 
         Ok(())

@@ -364,6 +364,80 @@ fn append_named_keys_the_superfile_by_its_source_stem() {
     assert_eq!(hits.len(), 1, "the named superfile's rows are served");
 }
 
+/// A label describes a whole commit, so two sources buffered into one commit
+/// must publish it unnamed rather than under whichever source was named last
+/// — labelling it `orders` would put that name on the `customers` rows. The
+/// same source named twice keeps its label, so the guard costs the ordinary
+/// case nothing.
+#[test]
+fn two_sources_in_one_commit_publish_unnamed() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    let data_dir = dir.path().join("data");
+    let names = |label: &str| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&data_dir)
+            .unwrap_or_else(|e| panic!("readdir data ({label}): {e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // Two different sources, one commit: no single name describes it.
+    let mut w = st.writer().expect("writer");
+    w.append_named(&build_title_batch(&["from customers"]), "customers.parquet")
+        .expect("append_named customers");
+    w.append_named(&build_title_batch(&["from orders"]), "orders.parquet")
+        .expect("append_named orders");
+    w.commit().expect("commit");
+    drop(w);
+
+    let mixed = names("after two sources");
+    assert_eq!(mixed.len(), 1, "one commit → one object: {mixed:?}");
+    assert!(
+        mixed[0].starts_with("seg-"),
+        "a two-source commit is unnamed, not keyed by the last source: {mixed:?}"
+    );
+
+    // The same source named twice is still one source: the label holds.
+    let mut w = st.writer().expect("writer");
+    w.append_named(&build_title_batch(&["first"]), "customers.parquet")
+        .expect("append_named 1");
+    w.append_named(&build_title_batch(&["second"]), "customers.parquet")
+        .expect("append_named 2");
+    w.commit().expect("commit");
+    drop(w);
+
+    let repeated = names("after the same source twice");
+    assert_eq!(repeated.len(), 2, "{repeated:?}");
+    assert!(
+        repeated
+            .iter()
+            .any(|n| n.starts_with("customers_parquet-")),
+        "one source named twice keeps its label: {repeated:?}"
+    );
+
+    // A commit after the mixed one starts clean: the dropped label does not
+    // leak into the next commit, and a fresh name applies.
+    let mut w = st.writer().expect("writer");
+    w.append_named(&build_title_batch(&["third"]), "invoices.parquet")
+        .expect("append_named invoices");
+    w.commit().expect("commit");
+    drop(w);
+
+    let after = names("after a fresh source");
+    assert_eq!(after.len(), 3, "{after:?}");
+    assert!(
+        after.iter().any(|n| n.starts_with("invoices_parquet-")),
+        "a commit after a mixed one takes its own label: {after:?}"
+    );
+}
+
 #[test]
 fn manifest_id_increments_only_on_non_empty_commits() {
     // A commit with no buffered batches is a no-op.
