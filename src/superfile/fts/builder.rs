@@ -102,7 +102,7 @@ use crate::superfile::{
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
-        tokenize::{AsciiLowerTokenizer, Tokenizer},
+        tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
 };
 
@@ -1869,6 +1869,14 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<AsciiLowerTokenizer>();
+        // `standard` is the default analyzer, so it needs the same
+        // monomorphized scan the ASCII tokenizer gets — through the
+        // trait object every token costs an indirect call and the
+        // interning closure cannot inline into the scan loop.
+        let standard_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StandardTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
         let positional = self.columns[col_idx].positions;
@@ -1935,6 +1943,8 @@ impl FtsBuilder {
             };
             if let Some(ascii) = ascii_tok {
                 ascii.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(standard) = standard_tok {
+                standard.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -1986,6 +1996,15 @@ impl FtsBuilder {
                 // position ordinal but emits no token.
                 ascii.tokenize_each_inline_positioned(text, |tok, position| {
                     record(tok, position);
+                    tokens_in_doc += 1;
+                });
+            } else if let Some(standard) = standard_tok {
+                // `standard` drops nothing — every segment carrying an
+                // alphanumeric is emitted — so an emission ordinal *is*
+                // the gap-inclusive position and no gap bookkeeping is
+                // needed. Monomorphized for the same reason as above.
+                standard.tokenize_each_inline(text, |tok| {
+                    record(tok, tokens_in_doc);
                     tokens_in_doc += 1;
                 });
             } else {
@@ -2103,6 +2122,14 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<AsciiLowerTokenizer>();
+        // `standard` is the default analyzer, so it needs the same
+        // monomorphized scan the ASCII tokenizer gets — through the
+        // trait object every token costs an indirect call and the
+        // interning closure cannot inline into the scan loop.
+        let standard_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StandardTokenizer>();
         let mut tokens_in_doc: u64 = 0;
         let positional = self.columns[col_idx].positions;
 
@@ -2147,6 +2174,8 @@ impl FtsBuilder {
             };
             if let Some(ascii) = ascii_tok {
                 ascii.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(standard) = standard_tok {
+                standard.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -2205,6 +2234,15 @@ impl FtsBuilder {
                 // position ordinal but emits no token.
                 ascii.tokenize_each_inline_positioned(text, |tok, position| {
                     record(tok, position);
+                    tokens_in_doc += 1;
+                });
+            } else if let Some(standard) = standard_tok {
+                // `standard` drops nothing — every segment carrying an
+                // alphanumeric is emitted — so an emission ordinal *is*
+                // the gap-inclusive position and no gap bookkeeping is
+                // needed. Monomorphized for the same reason as above.
+                standard.tokenize_each_inline(text, |tok| {
+                    record(tok, tokens_in_doc);
                     tokens_in_doc += 1;
                 });
             } else {

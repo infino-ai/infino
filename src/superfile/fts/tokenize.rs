@@ -702,6 +702,149 @@ pub fn tokenizer_for_name(name: &str) -> Option<Arc<dyn Tokenizer>> {
     }
 }
 
+// ── UAX #29 word breaks, restricted to ASCII ─────────────────────────
+//
+// Over ASCII the word-break property takes only seven values, so the
+// general segmenter's per-character property lookups collapse into one
+// 256-entry table and a handful of bit tests. `standard` is the default
+// analyzer and most corpora are predominantly ASCII, so this is the path
+// that decides ingest throughput. `ascii_word_segments` is verified
+// against `unicode_words` exhaustively in the tests below — the two must
+// agree exactly, or text would be indexed under one tokenization and
+// queried under another.
+
+/// Word_Break classes reachable from an ASCII byte, as disjoint bits so
+/// a rule can test a set membership with one `&`.
+const WB_OTHER: u8 = 0;
+/// `[A-Za-z]`.
+const WB_ALETTER: u8 = 1 << 0;
+/// `[0-9]`.
+const WB_NUMERIC: u8 = 1 << 1;
+/// `_` — joins to alphanumerics on either side and is kept *inside* the
+/// token (`_id` and `a_b` are each one word), unlike every other joiner.
+const WB_EXTEND_NUM_LET: u8 = 1 << 2;
+/// `:` — joins letters only.
+const WB_MID_LETTER: u8 = 1 << 3;
+/// `,` `;` — join digits only.
+const WB_MID_NUM: u8 = 1 << 4;
+/// `.` `'` — join letters *or* digits (MidNumLet plus Single_Quote,
+/// which are indistinguishable within ASCII).
+const WB_MID_NUM_LET: u8 = 1 << 5;
+
+/// `WB_ALETTER | WB_NUMERIC` — the classes that alone can carry a token.
+const WB_ALNUM: u8 = WB_ALETTER | WB_NUMERIC;
+
+/// Word_Break class per byte value. Non-ASCII bytes map to
+/// [`WB_OTHER`]; the ASCII scan is only entered for all-ASCII input, so
+/// those entries are never consulted.
+static ASCII_WORD_BREAK_CLASS: [u8; 256] = {
+    let mut table = [WB_OTHER; 256];
+    let mut b = 0usize;
+    while b < 128 {
+        table[b] = match b as u8 {
+            b'A'..=b'Z' | b'a'..=b'z' => WB_ALETTER,
+            b'0'..=b'9' => WB_NUMERIC,
+            b'_' => WB_EXTEND_NUM_LET,
+            b':' => WB_MID_LETTER,
+            b',' | b';' => WB_MID_NUM,
+            b'.' | b'\'' => WB_MID_NUM_LET,
+            _ => WB_OTHER,
+        };
+        b += 1;
+    }
+    table
+};
+
+#[inline(always)]
+fn wb_class(b: u8) -> u8 {
+    ASCII_WORD_BREAK_CLASS[b as usize]
+}
+
+/// Whether UAX #29 joins the bytes classed `a` and `b` (adjacent, `a`
+/// first) into one word. `prev` is the class before `a` and `next` the
+/// class after `b`, both [`WB_OTHER`] past the ends of the input — the
+/// mid-joiner rules are the only context-sensitive ones and need
+/// exactly one byte of lookaround on each side.
+#[inline(always)]
+fn wb_joined(prev: u8, a: u8, b: u8, next: u8) -> bool {
+    // WB5 / WB8 / WB9 / WB10 — letters and digits run together.
+    if a & WB_ALNUM != 0 && b & WB_ALNUM != 0 {
+        return true;
+    }
+    // WB13a / WB13b — `_` binds to alphanumerics and to itself.
+    if a & (WB_ALNUM | WB_EXTEND_NUM_LET) != 0 && b & WB_EXTEND_NUM_LET != 0 {
+        return true;
+    }
+    if a & WB_EXTEND_NUM_LET != 0 && b & WB_ALNUM != 0 {
+        return true;
+    }
+    // WB6 / WB7 — a single `:`/`.`/`'` between two letters (`don't`,
+    // `a.b`). Doubling it breaks, because the lookaround then sees the
+    // joiner rather than a letter.
+    if a & WB_ALETTER != 0 && b & (WB_MID_LETTER | WB_MID_NUM_LET) != 0 && next & WB_ALETTER != 0 {
+        return true;
+    }
+    if a & (WB_MID_LETTER | WB_MID_NUM_LET) != 0 && b & WB_ALETTER != 0 && prev & WB_ALETTER != 0 {
+        return true;
+    }
+    // WB11 / WB12 — the digit twin (`3.14`, `1,000`).
+    if a & WB_NUMERIC != 0 && b & (WB_MID_NUM | WB_MID_NUM_LET) != 0 && next & WB_NUMERIC != 0 {
+        return true;
+    }
+    if a & (WB_MID_NUM | WB_MID_NUM_LET) != 0 && b & WB_NUMERIC != 0 && prev & WB_NUMERIC != 0 {
+        return true;
+    }
+    // WB999 — break everywhere else.
+    false
+}
+
+/// Segment all-ASCII `bytes` on UAX #29 word boundaries, calling
+/// `f(start, end, has_upper)` for each segment that carries at least one
+/// alphanumeric. Segments of pure punctuation are dropped, matching
+/// `unicode_words`. `has_upper` reports whether the segment holds an
+/// upper-case byte, so a caller can borrow instead of case-folding.
+///
+/// Byte ranges rather than `&str` slices: the caller owns the input and
+/// can reslice it at whatever lifetime it needs, which keeps the
+/// zero-copy query path free of any lifetime juggling.
+///
+/// Callers must have established that the input is ASCII, so every index
+/// is a codepoint boundary.
+#[inline]
+fn ascii_word_segments<F: FnMut(usize, usize, bool)>(bytes: &[u8], mut f: F) {
+    let n = bytes.len();
+    let mut seg_start = 0usize;
+    let mut has_alnum = false;
+    let mut has_upper = false;
+    let mut prev = WB_OTHER;
+    let mut a = WB_OTHER;
+    for i in 0..n {
+        let cur = wb_class(bytes[i]);
+        if i > seg_start {
+            let next = if i + 1 < n {
+                wb_class(bytes[i + 1])
+            } else {
+                WB_OTHER
+            };
+            if !wb_joined(prev, a, cur, next) {
+                if has_alnum {
+                    f(seg_start, i, has_upper);
+                }
+                seg_start = i;
+                has_alnum = false;
+                has_upper = false;
+            }
+        }
+        has_alnum |= cur & WB_ALNUM != 0;
+        has_upper |= bytes[i].is_ascii_uppercase();
+        prev = a;
+        a = cur;
+    }
+    if has_alnum && seg_start < n {
+        f(seg_start, n, has_upper);
+    }
+}
+
 /// Unicode-aware tokenizer: UAX #29 word segmentation followed by full
 /// Unicode lowercasing, preserving non-ASCII text. See the module-level
 /// docs for the exact semantics and how it differs from
@@ -713,22 +856,34 @@ impl StandardTokenizer {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl Tokenizer for StandardTokenizer {
-    fn name(&self) -> &'static str {
-        STANDARD_TOKENIZER
-    }
-
-    fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
-        // `unicode_words` yields the UAX #29 word segments that contain
-        // alphanumerics — whitespace/punctuation-only segments are
-        // dropped. Lowercasing is full Unicode case folding, correct for
-        // non-ASCII letters, which are kept rather than dropped.
-        Box::new(text.unicode_words().map(str::to_lowercase))
-    }
-
-    fn tokenize_each(&self, text: &str, f: &mut dyn FnMut(&str)) {
+    /// Monomorphized token scan — the same tokens
+    /// [`Tokenizer::tokenize_each`] emits, but with a concrete `F` so
+    /// LLVM can inline the callback into the scan loop instead of
+    /// paying an indirect call per token. Every other entry point on
+    /// this tokenizer routes through here, so no two of them can
+    /// disagree about which tokens exist.
+    ///
+    /// All-ASCII input takes the table-driven ASCII word-break scan;
+    /// anything else falls back to the general UAX #29 segmenter. The
+    /// check is whole-input rather than per-chunk because a non-ASCII
+    /// character changes how its ASCII neighbours segment (`aéb` is one
+    /// word), so a chunk boundary could not be placed soundly.
+    #[inline]
+    pub fn tokenize_each_inline<F: FnMut(&str)>(&self, text: &str, mut f: F) {
+        if text.is_ascii() {
+            ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
+                let seg = &text[start..end];
+                if has_upper {
+                    // Cased ASCII only, so `to_ascii_lowercase` agrees
+                    // with the Unicode fold the non-ASCII path applies.
+                    f(&seg.to_ascii_lowercase());
+                } else {
+                    f(seg);
+                }
+            });
+            return;
+        }
         let mut buf = String::new();
         for word in text.unicode_words() {
             // Borrow directly when every cased character is already
@@ -740,23 +895,65 @@ impl Tokenizer for StandardTokenizer {
                 f(word);
             } else {
                 buf.clear();
-                // Context-aware full-string lowercasing, matching
-                // `tokenize`. `str::to_lowercase` applies Unicode
-                // special-casing such as Final_Sigma (a word-final `Σ`
-                // lowercases to `ς`, but to `σ` elsewhere); a char-by-char
-                // fold has no word context and would emit `σ` in both
-                // spots. The two paths must agree — text is indexed
-                // through `tokenize_each` and queried through `tokenize`,
-                // so any divergence indexes a term under one form and
-                // searches it under another.
+                // Context-aware full-string lowercasing. `str::to_lowercase`
+                // applies Unicode special-casing such as Final_Sigma (a
+                // word-final `Σ` lowercases to `ς`, but to `σ` elsewhere);
+                // a char-by-char fold has no word context and would emit
+                // `σ` in both spots.
                 buf.push_str(&word.to_lowercase());
                 f(&buf);
             }
         }
     }
+}
+
+impl Tokenizer for StandardTokenizer {
+    fn name(&self) -> &'static str {
+        STANDARD_TOKENIZER
+    }
+
+    /// Collected rather than lazy: sharing one scan with the ingest
+    /// path is what guarantees a term is indexed and queried under the
+    /// same form, and the query strings this runs on are short.
+    fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
+        let mut out = Vec::new();
+        self.tokenize_each_inline(text, |t| out.push(t.to_owned()));
+        Box::new(out.into_iter())
+    }
+
+    /// Trait-object dispatch path: delegates to the inherent
+    /// [`tokenize_each_inline`](Self::tokenize_each_inline) so the body
+    /// lives in one place. Callers holding a concrete
+    /// [`StandardTokenizer`] (or downcasting a `&dyn Tokenizer` via
+    /// [`Tokenizer::as_any`]) should call the inherent method directly
+    /// to skip the per-token `&mut dyn FnMut(&str)` indirection.
+    fn tokenize_each(&self, text: &str, f: &mut dyn FnMut(&str)) {
+        self.tokenize_each_inline(text, |s| f(s));
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Zero-copy override for the query side: an already-lowercase
+    /// all-ASCII token borrows from `text`; only a token needing a case
+    /// fold is copied. Non-ASCII input keeps the general segmenter and
+    /// its owned folds.
+    fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
+        if text.is_ascii() {
+            ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
+                // `text` outlives the callback, so the reslice carries
+                // the caller's `'q` with no lifetime gymnastics.
+                let seg: &'q str = &text[start..end];
+                if has_upper {
+                    f(Cow::Owned(seg.to_ascii_lowercase()));
+                } else {
+                    f(Cow::Borrowed(seg));
+                }
+            });
+            return;
+        }
+        self.tokenize_each_inline(text, |t| f(Cow::Owned(t.to_owned())));
     }
 }
 
@@ -774,6 +971,164 @@ mod tests {
         AsciiLowerTokenizer
             .tokenize_each_inline_positioned(text, |tok, pos| out.push((tok.to_owned(), pos)));
         out
+    }
+
+    // ---- ASCII word-break fast path vs the general segmenter ----
+    //
+    // `standard` indexes through the ASCII scan and may be queried
+    // through it too, so a single disagreement with `unicode_words`
+    // would index a term under one tokenization and search it under
+    // another. These verify the two exhaustively rather than by
+    // sampling: the class table is small enough that full coverage of
+    // short inputs is cheap, and every joiner rule is context-sensitive
+    // over at most one byte on each side, so short inputs are where any
+    // divergence has to show up.
+
+    /// Segments the fast path yields, as owned strings.
+    fn ascii_fast_segments(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        ascii_word_segments(text.as_bytes(), |start, end, _| {
+            out.push(text[start..end].to_owned());
+        });
+        out
+    }
+
+    /// What the general UAX #29 segmenter yields for the same input.
+    fn unicode_segments(text: &str) -> Vec<String> {
+        text.unicode_words().map(str::to_owned).collect()
+    }
+
+    /// One byte per Word_Break class the ASCII table can produce, plus
+    /// the shapes that stress the lookaround: letters, a digit, `_`,
+    /// `:`, `,`, `.`, `'`, a plain separator, and a space.
+    const WB_ALPHABET: &[u8] = b"aB1_:,.' ";
+
+    #[test]
+    fn ascii_fast_path_matches_unicode_words_for_every_short_input() {
+        // All 128 ASCII bytes at lengths 1..=3. The mid-joiner rules
+        // look at one byte either side of a boundary, so a three-byte
+        // window covers every rule's full context.
+        let mut buf = [0u8; 3];
+        for len in 1..=3usize {
+            let mut counter = vec![0u8; len];
+            loop {
+                for i in 0..len {
+                    buf[i] = counter[i];
+                }
+                let text = std::str::from_utf8(&buf[..len]).expect("ascii is utf8");
+                assert_eq!(
+                    ascii_fast_segments(text),
+                    unicode_segments(text),
+                    "segmentation diverged on {text:?} (bytes {:?})",
+                    &buf[..len]
+                );
+                // Odometer over 0..128 in each position.
+                let mut i = 0;
+                loop {
+                    if i == len {
+                        break;
+                    }
+                    counter[i] += 1;
+                    if counter[i] < 128 {
+                        break;
+                    }
+                    counter[i] = 0;
+                    i += 1;
+                }
+                if i == len {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_fast_path_matches_unicode_words_for_longer_class_words() {
+        // Longer inputs over one representative byte per class, up to
+        // length 6 — chained joiners (`a.b.c`, `1,000,000`, `a__b`) and
+        // the doubling that must break.
+        let alpha = WB_ALPHABET;
+        for len in 4..=6usize {
+            let mut counter = vec![0usize; len];
+            let mut buf = vec![0u8; len];
+            loop {
+                for i in 0..len {
+                    buf[i] = alpha[counter[i]];
+                }
+                let text = std::str::from_utf8(&buf).expect("ascii is utf8");
+                assert_eq!(
+                    ascii_fast_segments(text),
+                    unicode_segments(text),
+                    "segmentation diverged on {text:?}"
+                );
+                let mut i = 0;
+                loop {
+                    if i == len {
+                        break;
+                    }
+                    counter[i] += 1;
+                    if counter[i] < alpha.len() {
+                        break;
+                    }
+                    counter[i] = 0;
+                    i += 1;
+                }
+                if i == len {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn standard_tokens_match_the_general_segmenter_on_mixed_text() {
+        // The whole-input ASCII check must not change what `standard`
+        // emits: an input with any non-ASCII byte takes the general
+        // segmenter, and an all-ASCII one must agree with it.
+        for text in [
+            "the quick brown fox",
+            "Don't stop 3.14 or 1,000,000 things",
+            "snake_case and _leading and trailing_",
+            "a.b.c A:B 1;2 x''y z--w",
+            "café résumé naïve Straße",
+            "mixed café and plain ascii 42",
+            "中文 text with ascii",
+            "",
+            "   ",
+            "___",
+            "!!!",
+        ] {
+            let mut fast = Vec::new();
+            StandardTokenizer.tokenize_each_inline(text, |t| fast.push(t.to_owned()));
+            let expected: Vec<String> = text
+                .unicode_words()
+                .map(|w| w.to_lowercase())
+                .collect();
+            assert_eq!(fast, expected, "tokens diverged on {text:?}");
+        }
+    }
+
+    #[test]
+    fn standard_entry_points_agree_with_each_other() {
+        // `tokenize`, `tokenize_each` and `tokenize_each_query` all
+        // route through one scan; this pins that they stay in lockstep,
+        // since a divergence between the index and query paths is
+        // silent recall loss rather than a visible failure.
+        for text in [
+            "Don't PANIC 3.14",
+            "snake_case Mixed CASE",
+            "café AU lait",
+            "a.b,c 1.2,3",
+        ] {
+            let via_tokenize: Vec<String> = StandardTokenizer.tokenize(text).collect();
+            let mut via_each = Vec::new();
+            StandardTokenizer.tokenize_each(text, &mut |t| via_each.push(t.to_owned()));
+            let mut via_query = Vec::new();
+            StandardTokenizer
+                .tokenize_each_query(text, &mut |t| via_query.push(t.into_owned()));
+            assert_eq!(via_tokenize, via_each, "tokenize vs tokenize_each on {text:?}");
+            assert_eq!(via_tokenize, via_query, "tokenize vs query path on {text:?}");
+        }
     }
 
     // ---- StandardTokenizer (Unicode-aware) ----
