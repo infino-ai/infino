@@ -14,6 +14,7 @@ use std::{sync::Arc, time::Duration};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{Expr, col, lit};
 use infino::{
     CompactionSettings, OptimizeOptions,
     runtime_metrics::op_stats::with_op_stats,
@@ -393,5 +394,229 @@ fn stats_only_optimize_does_not_fill_the_disk_cache() {
         "stats-only optimize warmed the disk cache like a query would: \
          {cache_bytes} cached bytes vs {stored_bytes} stored (ceiling {ceiling}) — \
          the maintenance open must not spawn background fills"
+    );
+}
+
+// ---- mutations on a covered table ----------------------------------
+//
+// Deletes and updates never rewrite a superfile's dictionary, so the df
+// a covered superfile contributed to the sidecar stays exactly what it
+// was — "gross" df, unchanged until a compaction rebuilds that
+// dictionary. Both tests below assert the same invariant the append
+// tests do (sidecar-served ranking equals a never-optimized control,
+// which derives df from the query-time gather), because that is what
+// makes the sidecar faithful rather than merely fast. Each then pins
+// the gross semantics themselves, so a future change that quietly made
+// mutations net-of-tombstones would fail here rather than surface as a
+// scoring drift.
+
+/// Titles in `segment` whose topic token is `alpha` — the rows the
+/// mutation tests target, chosen because `alpha` df varies per segment
+/// (see [`segment_titles`]) so its idf genuinely depends on the sums.
+fn alpha_titles(segment: usize) -> Vec<String> {
+    segment_titles(segment)
+        .into_iter()
+        .filter(|t| t.starts_with("alpha "))
+        .collect()
+}
+
+/// The same titles with the topic token rewritten to `gamma`, keeping
+/// the 4-token shape so per-superfile `avgdl` is unchanged and idf stays
+/// the only ranking variable.
+fn gamma_rewrites(titles: &[String]) -> Vec<String> {
+    titles
+        .iter()
+        .map(|t| t.replacen("alpha ", "gamma ", 1))
+        .collect()
+}
+
+fn title_batch(titles: &[String]) -> RecordBatch {
+    let arr: ArrayRef = Arc::new(LargeStringArray::from(
+        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    RecordBatch::try_new(schema_title(), vec![arr]).expect("batch")
+}
+
+fn in_list_predicate(titles: &[String]) -> Expr {
+    col("title").in_list(titles.iter().map(|t| lit(t.as_str())).collect(), false)
+}
+
+/// Segments in the mutation fixtures: enough that the mutated segment is
+/// a minority of the corpus, so a df that wrongly went net would move
+/// scores measurably instead of marginally.
+const MUTATION_SEGMENTS: usize = 3;
+
+/// A delete on a covered table hides its rows but leaves every surviving
+/// document's score untouched: the tombstone removes the row from result
+/// sets while its contribution stays in both the sidecar's df sums and
+/// the table's document count.
+#[test]
+fn delete_on_a_covered_table_leaves_surviving_scores_unchanged() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = Supertable::create(options_with_storage(&dir)).expect("create");
+    let ctrl_dir = TempDir::new().expect("tempdir");
+    let control = Supertable::create(options_with_storage(&ctrl_dir)).expect("create control");
+    for segment in 0..MUTATION_SEGMENTS {
+        commit_segment(&st, segment);
+        commit_segment(&control, segment);
+    }
+    st.optimize(&stats_only_optimize()).expect("optimize");
+
+    // Ranking before the delete, over a shape whose idf depends on
+    // `alpha`'s corpus-wide df.
+    let before = global_hits(&st, "alpha shared", BoolMode::Or);
+    assert!(!before.is_empty(), "fixture query must match");
+
+    // Delete the same rows from both tables.
+    let targets = alpha_titles(0);
+    assert!(
+        !targets.is_empty(),
+        "fixture must have alpha rows to delete"
+    );
+    let deleted = st
+        .delete(in_list_predicate(&targets))
+        .expect("delete on covered table");
+    assert_eq!(deleted.matched(), targets.len());
+    control
+        .delete(in_list_predicate(&targets))
+        .expect("delete on control");
+
+    let after = global_hits(&st, "alpha shared", BoolMode::Or);
+    assert_eq!(
+        after,
+        global_hits(&control, "alpha shared", BoolMode::Or),
+        "sidecar-served ranking must equal the gather-served control after a delete"
+    );
+
+    // The deleted rows are gone from the result set...
+    let target_set: std::collections::HashSet<&String> = targets.iter().collect();
+    for (title, _) in &after {
+        assert!(
+            !target_set.contains(title),
+            "deleted row {title:?} resurfaced"
+        );
+    }
+    // ...and every survivor keeps the exact score it had before, which is
+    // only true while df and the document count both stay gross. A df
+    // that dropped with the tombstones would raise idf and move all of
+    // these.
+    assert!(
+        !after.is_empty() && after.len() < before.len(),
+        "delete must have removed some rows and left others to compare ({} then {})",
+        before.len(),
+        after.len()
+    );
+    for row in &after {
+        assert!(
+            before.contains(row),
+            "surviving row {:?} changed score after the delete ({:?} not in the pre-delete \
+             ranking) — df or the document count went net-of-tombstones",
+            row.0,
+            row
+        );
+    }
+}
+
+/// An update is a delete plus an insert, so on a covered table the
+/// superseded row's df stays in the sidecar's sums (its dictionary is
+/// untouched) while the replacement row's df arrives through the
+/// uncovered tail — the term is counted in both, and the gather-served
+/// control agrees exactly. A merging optimize is what finally rewrites
+/// those dictionaries and converges the table onto net statistics.
+#[test]
+fn update_on_a_covered_table_counts_superseded_and_replacement_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = Supertable::create(options_with_storage(&dir)).expect("create");
+    let ctrl_dir = TempDir::new().expect("tempdir");
+    let control = Supertable::create(options_with_storage(&ctrl_dir)).expect("create control");
+    for segment in 0..MUTATION_SEGMENTS {
+        commit_segment(&st, segment);
+        commit_segment(&control, segment);
+    }
+    st.optimize(&stats_only_optimize()).expect("optimize");
+
+    // Rewrite segment 0's `alpha` rows to `gamma`: afterwards `alpha`
+    // survives only in the later segments and `gamma` exists only in the
+    // tail, so both directions of the sum are exercised.
+    let targets = alpha_titles(0);
+    let replacements = gamma_rewrites(&targets);
+    let new_rows = title_batch(&replacements);
+    let updated = st
+        .update(in_list_predicate(&targets), &new_rows)
+        .expect("update on covered table");
+    assert_eq!(updated.matched(), targets.len());
+    control
+        .update(in_list_predicate(&targets), &new_rows)
+        .expect("update on control");
+
+    // Sidecar (covered segments) + tail (the replacement rows) must sum
+    // to exactly what the control's gather computes, for a term left
+    // only in the covered part, a term living only in the tail, and a
+    // term spanning both.
+    for (query, mode) in [
+        ("alpha", BoolMode::Or),
+        ("gamma", BoolMode::Or),
+        ("shared", BoolMode::Or),
+        ("gamma shared", BoolMode::And),
+    ] {
+        assert_eq!(
+            global_hits(&st, query, mode),
+            global_hits(&control, query, mode),
+            "sidecar + tail must equal the gather-served control for {query:?} after an update"
+        );
+    }
+
+    // The superseded rows are invisible to results even though their
+    // statistics remain.
+    let target_set: std::collections::HashSet<&String> = targets.iter().collect();
+    for (title, _) in global_hits(&st, "alpha shared", BoolMode::Or) {
+        assert!(
+            !target_set.contains(&title),
+            "superseded row {title:?} resurfaced after the update"
+        );
+    }
+
+    // Gross, not net: a table built from scratch with the post-update
+    // content holds neither the superseded rows' df nor their document
+    // count, so its idf — and therefore its scores — differ. This is the
+    // intended semantics (matching the query-time gather, and matching
+    // how deletes behave until compaction), so it is pinned rather than
+    // left to drift.
+    let fresh_dir = TempDir::new().expect("tempdir");
+    let fresh = Supertable::create(options_with_storage(&fresh_dir)).expect("create fresh");
+    for segment in 0..MUTATION_SEGMENTS {
+        let titles: Vec<String> = match segment {
+            0 => segment_titles(0)
+                .into_iter()
+                .map(|t| t.replacen("alpha ", "gamma ", 1))
+                .collect(),
+            other => segment_titles(other),
+        };
+        let mut w = fresh.writer().expect("writer");
+        w.append(&title_batch(&titles)).expect("append");
+        w.commit().expect("commit");
+    }
+    let mutated_scores: Vec<f32> = global_hits(&st, "gamma", BoolMode::Or)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    let fresh_scores: Vec<f32> = global_hits(&fresh, "gamma", BoolMode::Or)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(
+        mutated_scores.len(),
+        fresh_scores.len(),
+        "both tables must return the same `gamma` rows, so the comparison below is about \
+         scores rather than result-set size"
+    );
+    assert!(
+        !mutated_scores.is_empty(),
+        "fixture must return replacement rows to compare"
+    );
+    assert_ne!(
+        mutated_scores, fresh_scores,
+        "an updated table scored identically to a from-scratch rebuild — the superseded \
+         rows' statistics were dropped before compaction rewrote their dictionaries"
     );
 }
