@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Int32Array, RecordBatch};
 use infino::supertable::{Supertable, manifest::commit::read_pointer};
 
 /// 1-byte multipart threshold forcing every upload through the
@@ -470,6 +471,46 @@ fn an_empty_batch_leaves_the_source_label_alone() {
     assert!(
         names[0].starts_with("customers_parquet-"),
         "the label survives row-less batches: {names:?}"
+    );
+}
+
+/// A rejected append leaves the buffered commit alone - its rows AND its
+/// label. The buffer is what a failed append preserves, so preserving the rows
+/// while relabelling them would publish one source's rows under another's
+/// name, or unnamed, on a call that returned an error.
+#[test]
+fn a_rejected_append_does_not_relabel_the_buffered_commit() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    let mut w = st.writer().expect("writer");
+    w.append_named(&build_title_batch(&["from customers"]), "customers.parquet")
+        .expect("append_named");
+
+    // A batch the writer must refuse: a schema that is not the table's.
+    let wrong = RecordBatch::try_from_iter([(
+        "not_the_title_column",
+        Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+    )])
+    .expect("build a mismatched batch");
+    w.append_named(&wrong, "orders.parquet")
+        .expect_err("a mismatched schema must be refused");
+
+    w.commit().expect("commit");
+    drop(w);
+
+    let names: Vec<String> = std::fs::read_dir(dir.path().join("data"))
+        .expect("readdir data")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "one commit → one object: {names:?}");
+    assert!(
+        names[0].starts_with("customers_parquet-"),
+        "the refused append must not have taken the label with it: {names:?}"
     );
 }
 

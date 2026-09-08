@@ -34,6 +34,7 @@ use crate::{
             decode_vector_summary_map, encode_fts_summary_map, encode_scalar_stats,
             encode_vector_summary_map,
         },
+        superfile_stem,
     },
 };
 
@@ -232,6 +233,8 @@ pub enum PartParseError {
     MissingField(&'static str),
     #[error("wrong avro field type for {0}")]
     WrongFieldType(&'static str),
+    #[error("stem is not a normalized storage-safe label: {0:?}")]
+    UnnormalizedStem(String),
 }
 
 /// The Avro schema for a `ManifestPart`.
@@ -514,7 +517,22 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     // Absent on every part written before source-named superfiles existed,
     // and on every entry without a single source since: `None` is the
     // unnamed key shape those superfiles actually have.
+    //
+    // Validated rather than trusted, because this string is concatenated into
+    // an object key by `SuperfileEntry::storage_path()` and that key is what
+    // every read, every write and gc's keep-set use. A part is written by our
+    // own writer, but it is written into a bucket the customer owns under BYOB
+    // and can be edited there - so a stem carrying a `/` or a `..` would let a
+    // manifest point the engine at a different key namespace, or at somebody
+    // else's prefix. `superfile_stem` is idempotent on its own output, so
+    // "normalizes to itself" is exactly the check for "this came out of the
+    // writer".
     let stem = take_optional_string(&mut map, "stem")?;
+    if let Some(value) = stem.as_deref()
+        && superfile_stem(value).as_deref() != Some(value)
+    {
+        return Err(PartParseError::UnnormalizedStem(value.to_string()));
+    }
 
     Ok(SuperfileEntry {
         superfile_id,
@@ -1747,6 +1765,43 @@ mod tests {
         let decoded = decode(&encode(&unnamed)).expect("decode");
         assert_eq!(decoded.format_version, FORMAT_VERSION);
         assert_eq!(decoded.superfiles[0].stem, None);
+    }
+
+    /// A stem is concatenated into an object key by `storage_path()`, and that
+    /// key is what every read, every write and gc's keep-set use - so a decode
+    /// must not accept one the writer could not have produced. Under BYOB the
+    /// part sits in a bucket the customer owns and can edit, which is what
+    /// makes this a boundary rather than an internal invariant.
+    #[test]
+    fn decode_refuses_a_stem_the_writer_could_not_have_written() {
+        for hostile in [
+            "../../etc",         // climbs out of the data prefix
+            "other/tenant",      // a different key namespace
+            "Customers",         // not lowercased
+            "customers.parquet", // separators not folded
+            "customers-",        // trailing separator
+            " customers",        // untrimmed
+        ] {
+            let mut named = (*fresh_superfile(3)).clone();
+            named.stem = Some(hostile.into());
+            let part = fresh_part(vec![Arc::new(named)]);
+            let err = decode(&encode(&part)).expect_err("must refuse: {hostile}");
+            assert!(
+                matches!(err, PartParseError::UnnormalizedStem(ref s) if s == hostile),
+                "wrong error for {hostile}: {err:?}"
+            );
+        }
+
+        // And the writer's own output still decodes: `superfile_stem` is
+        // idempotent, so "normalizes to itself" admits exactly what it wrote.
+        for ok in ["customers", "shard_00", "x_2024_q1_final", "seg", "a"] {
+            let mut named = (*fresh_superfile(3)).clone();
+            named.stem = Some(ok.into());
+            let part = fresh_part(vec![Arc::new(named)]);
+            let decoded =
+                decode(&encode(&part)).unwrap_or_else(|e| panic!("{ok} must decode: {e:?}"));
+            assert_eq!(decoded.superfiles[0].stem.as_deref(), Some(ok));
+        }
     }
 
     /// Both format majors decode; anything newer is refused as incompatible,

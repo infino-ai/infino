@@ -460,6 +460,20 @@ impl fmt::Debug for SupertableWriter {
     }
 }
 
+/// What one append says about the source label of the commit it joins. An
+/// enum rather than an `Option<&str>` because the two cases are not "a name or
+/// no name": a plain `append` is a positive statement that these rows came
+/// from no named source, which CLEARS the label, while a `Named` append may
+/// set, keep or clear it depending on what is already buffered.
+#[derive(Clone, Copy)]
+enum SourceLabel<'a> {
+    /// A plain [`SupertableWriter::append`].
+    Unnamed,
+    /// An [`SupertableWriter::append_named`], carrying the caller's raw source
+    /// name - normalized by [`superfile_stem`] at the transition, not here.
+    Named(&'a str),
+}
+
 /// One buffered append-call payload. Vectors stored as
 /// `Arc<Float32Array>` so the buffer owns its data outright;
 /// per-shard builders re-derive `&[f32]` slices via
@@ -1127,19 +1141,7 @@ impl SupertableWriter {
         tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len(), role = self.inner.role.as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
-        // An unnamed batch joining the buffer makes the commit's rows come
-        // from more than one place, so the commit is unnamed. Cleared before
-        // the flush below can run, which is what keeps a threshold flush
-        // from labelling a mixed buffer.
-        //
-        // A row-less batch joins nothing, so it changes no label. The guard is
-        // on the label alone rather than an early return: the batch still goes
-        // through `append_labelled`, so an empty batch with the wrong schema is
-        // still rejected there instead of silently accepted.
-        if batch.num_rows() > 0 {
-            self.pending_stem = None;
-        }
-        self.append_labelled(batch)
+        self.append_labelled(batch, SourceLabel::Unnamed)
     }
 
     /// [`Self::append`], labelling the rows with the source they came from:
@@ -1164,22 +1166,17 @@ impl SupertableWriter {
         batch: &RecordBatch,
         source_name: &str,
     ) -> Result<(), BuildError> {
-        if batch.num_rows() > 0 {
-            let next = superfile_stem(source_name);
-            // Cleared before the flush inside `append_labelled` can run, which
-            // is what keeps a threshold flush from labelling a mixed buffer.
-            self.pending_stem = if self.buffer.is_empty() || self.pending_stem == next {
-                next
-            } else {
-                None
-            };
-        }
-        self.append_labelled(batch)
+        self.append_labelled(batch, SourceLabel::Named(source_name))
     }
 
-    /// The append body shared by [`Self::append`] and [`Self::append_named`],
-    /// after the label has been set.
-    fn append_labelled(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
+    /// The append body shared by [`Self::append`] and [`Self::append_named`].
+    /// It owns the label transition as well as the buffering, because the two
+    /// have to happen together: see the comment at the transition itself.
+    fn append_labelled(
+        &mut self,
+        batch: &RecordBatch,
+        label: SourceLabel<'_>,
+    ) -> Result<(), BuildError> {
         let options = &self.inner.options;
 
         // Validate + split. Batch schema is user_schema (no id col).
@@ -1237,6 +1234,40 @@ impl SupertableWriter {
         let scalar_bytes = scalar.get_array_memory_size();
         let vector_bytes = vector_bytes_u64 as usize;
         let fts_bytes = fts_bytes_u64 as usize;
+
+        // The commit's source label. Two placements matter and both are
+        // load-bearing.
+        //
+        // AFTER validation: everything above this line can fail, and a failed
+        // append preserves the buffer, so it has to preserve the buffer's
+        // label too. Setting it earlier meant a batch rejected for a bad
+        // schema could still relabel rows that were already buffered - an
+        // `append_named(bad_batch, "orders")` onto a buffer of `customers`
+        // rows would make the commit mixed and publish those rows unnamed.
+        //
+        // BEFORE the push below: `buffer.is_empty()` has to mean "nothing was
+        // buffered before this batch", which is what distinguishes the first
+        // batch of a commit (it sets the label) from a later one (it can only
+        // keep or clear it).
+        //
+        // A row-less batch joins nothing, so it says nothing about the label -
+        // but it is still validated above rather than returned early, so an
+        // empty batch with the wrong schema is rejected rather than accepted.
+        if n_rows > 0 {
+            self.pending_stem = match label {
+                // Rows from no named source: the commit's rows now come from
+                // more than one place, so it has no one name.
+                SourceLabel::Unnamed => None,
+                SourceLabel::Named(source_name) => {
+                    let next = superfile_stem(source_name);
+                    if self.buffer.is_empty() || self.pending_stem == next {
+                        next
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
 
         self.buffer.push(BufferedBatch { scalar, vectors });
         self.buffer_scalar_bytes += scalar_bytes;
