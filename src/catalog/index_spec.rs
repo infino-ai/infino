@@ -8,7 +8,7 @@
 
 use crate::superfile::{
     builder::FtsConfig,
-    fts::tokenize::ASCII_LOWER_TOKENIZER,
+    fts::tokenize::STANDARD_TOKENIZER,
     vector::{builder::VectorConfig, distance::Metric},
 };
 
@@ -46,22 +46,23 @@ pub struct FtsField {
 
 impl FtsField {
     /// Declare `column` as full-text indexed with the defaults: the
-    /// `ascii_lower` analyzer (ASCII split + lowercase, non-ASCII
-    /// dropped) and the raw text stored. The column must be a UTF-8
-    /// string column in the table schema.
+    /// `standard` analyzer (Unicode UAX #29 word segmentation, full
+    /// Unicode lowercasing) and the raw text stored. The column must be
+    /// a UTF-8 string column in the table schema.
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
-            analyzer: ASCII_LOWER_TOKENIZER.to_string(),
+            analyzer: STANDARD_TOKENIZER.to_string(),
             stored: true,
         }
     }
 
-    /// Pick the column's analyzer by name (`"ascii_lower"` or
-    /// `"standard"` — the Unicode-aware UAX #29 tokenizer that keeps
-    /// non-ASCII text). The analyzer is per column: each FTS column is
-    /// tokenized with its own, so columns in one table may use
-    /// different analyzers.
+    /// Pick the column's analyzer by name — `"standard"` (the default)
+    /// or `"ascii_lower"`, which splits on ASCII alphanumerics and
+    /// drops every non-ASCII token. The analyzer is per column: each
+    /// FTS column is tokenized with its own, so columns in one table
+    /// may use different analyzers. It is recorded with the table and
+    /// cannot be changed afterwards.
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         self.analyzer = name.into();
         self

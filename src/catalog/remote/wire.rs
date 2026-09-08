@@ -22,7 +22,7 @@ use arrow_schema::Schema;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
-use crate::{IndexSpec, InfinoError, Metric, superfile::fts::tokenize::ASCII_LOWER_TOKENIZER};
+use crate::{IndexSpec, InfinoError, Metric};
 
 /// Content type for an Arrow IPC streaming body — the encoding for `append`
 /// bodies and read responses.
@@ -46,11 +46,10 @@ pub(crate) fn metric_str(metric: Metric) -> &'static str {
 /// `{fts: [entry, …], vector: [{column, dim, metric}, …]}`. Absent index kinds
 /// are omitted (the server treats a missing key as "none").
 ///
-/// Each FTS entry is a bare column name when every option is at its default
-/// (`ascii_lower` analyzer, stored text), or a `{column, …}` object carrying
-/// only the non-default options (`analyzer`, `stored: false`), so the chosen
-/// options reach the server rather than being dropped. The bare form for the
-/// defaults keeps the request identical to what older servers expect.
+/// Each FTS entry is a `{column, analyzer}` object — plus `stored: false`
+/// for an index-only column. The analyzer is always named rather than left
+/// to the server's own idea of a default, so a table is created with the
+/// analyzer this client resolved and the two can never drift apart.
 pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
     let mut indexes = serde_json::Map::new();
     let columns = spec.fts_columns();
@@ -60,14 +59,9 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
             .zip(spec.fts_analyzers())
             .zip(spec.fts_stored())
             .map(|((column, analyzer), stored)| {
-                if analyzer == ASCII_LOWER_TOKENIZER && stored {
-                    return json!(column);
-                }
                 let mut entry = serde_json::Map::new();
                 entry.insert("column".to_string(), json!(column));
-                if analyzer != ASCII_LOWER_TOKENIZER {
-                    entry.insert("analyzer".to_string(), json!(analyzer));
-                }
+                entry.insert("analyzer".to_string(), json!(analyzer));
                 if !stored {
                     entry.insert("stored".to_string(), json!(false));
                 }
@@ -182,7 +176,10 @@ mod tests {
             .fts("body")
             .vector("embedding", 384, Metric::Cosine);
         let json = index_spec_to_json(&spec);
-        assert_eq!(json["fts"], json!(["body"]));
+        assert_eq!(
+            json["fts"],
+            json!([{"column": "body", "analyzer": "ascii_lower"}])
+        );
         assert_eq!(
             json["vector"][0],
             json!({"column": "embedding", "dim": 384, "metric": "cosine"})
@@ -190,28 +187,32 @@ mod tests {
     }
 
     #[test]
-    fn index_spec_json_carries_a_non_default_analyzer() {
-        // A named analyzer must cross the wire as a {column, analyzer} object,
-        // so the server builds the index with it rather than the default. A
-        // default-analyzer column alongside it stays a bare string, so only the
-        // columns that need the object form pay for it.
+    fn index_spec_json_names_every_columns_analyzer() {
+        // Each column crosses as a {column, analyzer} object, whichever
+        // analyzer it resolved to, so the server builds the index with the
+        // analyzer this client chose and never with one of its own.
         let spec = IndexSpec::new()
             .fts("title")
             .fts(FtsField::new("body").analyzer("standard"));
         let json = index_spec_to_json(&spec);
         assert_eq!(
             json["fts"],
-            json!(["title", {"column": "body", "analyzer": "standard"}])
+            json!([
+                {"column": "title", "analyzer": "ascii_lower"},
+                {"column": "body", "analyzer": "standard"}
+            ])
         );
     }
 
     #[test]
-    fn index_spec_json_bare_form_for_the_default_analyzer() {
-        // An explicit ascii_lower is the default, so it serializes identically to
-        // a bare column name — no needless object form, and byte-identical to
-        // what an older server expects.
-        let spec = IndexSpec::new().fts(FtsField::new("body").analyzer("ascii_lower"));
-        assert_eq!(index_spec_to_json(&spec)["fts"], json!(["body"]));
+    fn index_spec_json_carries_an_index_only_column() {
+        // `stored: false` rides alongside the analyzer; it is the one key
+        // that appears only when it is not the default.
+        let spec = IndexSpec::new().fts(FtsField::new("body").stored(false));
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{"column": "body", "analyzer": "ascii_lower", "stored": false}])
+        );
     }
 
     #[test]

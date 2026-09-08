@@ -175,7 +175,7 @@ use crate::{
                 WIDTH_LAW_KS,
             },
             options_hash,
-            part::{self as part_mod, PartId},
+            part::{self as part_mod, ContentHash, PartId},
             term_stats,
         },
         query::{
@@ -3765,7 +3765,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 remote_state.checkpoint.shard_count
             )));
         }
-        if remote_state.checkpoint.options_hash != current_options_hash {
+        // Same acceptance rule as reopening the table: a checkpoint
+        // written before the engine's current options encoding still
+        // identifies this table, so a drain that spans an upgrade
+        // resumes instead of wedging on a re-encoded digest.
+        let checkpoint_hash = ContentHash::from_hex(&remote_state.checkpoint.options_hash);
+        let recognized = checkpoint_hash.is_some_and(|stored| {
+            options_hash::verify_options_hash(user_inner.options.as_ref(), &user_strategy, stored)
+                .is_ok()
+        });
+        if !recognized {
             return Err(BuildError::Store(format!(
                 "drain checkpoint options hash {} != current {}",
                 remote_state.checkpoint.options_hash, current_options_hash

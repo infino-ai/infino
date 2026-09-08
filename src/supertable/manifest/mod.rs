@@ -714,8 +714,9 @@ impl ManifestSnapshot {
         // manifest's stamped digest. The all-zero stored
         // hash bypasses validation (legacy + synthetic
         // fixtures).
-        let expected_hash = options_hash::compute_options_hash(&options, &list.partition_strategy);
-        if let Err(mismatch) = options_hash::verify_options_hash(expected_hash, list.options_hash) {
+        if let Err(mismatch) =
+            options_hash::verify_options_hash(&options, &list.partition_strategy, list.options_hash)
+        {
             return Err(ManifestLoadError::ContentHashMismatch {
                 expected: mismatch.expected,
                 actual: mismatch.actual,

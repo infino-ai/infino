@@ -190,12 +190,14 @@ impl CandidatePlan {
     /// provider's filters together) into one plan. `fts_cols` is the set
     /// of FTS-indexed column names; `resolve` maps an FTS column to the
     /// tokenizer it was indexed with, so per-column analyzers lower query
-    /// text the same way the column was tokenized at ingest. Empty
-    /// `fts_cols` ⇒ no FTS columns ⇒ always [`Unbounded`].
+    /// text the same way the column was tokenized at ingest. A column
+    /// `resolve` cannot answer for has no index to bound against, so its
+    /// predicate lowers to [`Unbounded`] — no analyzer is assumed on its
+    /// behalf. Empty `fts_cols` ⇒ no FTS columns ⇒ always [`Unbounded`].
     pub(crate) fn from_filters(
         filters: &[Expr],
         fts_cols: &HashSet<&str>,
-        resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+        resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     ) -> CandidatePlan {
         if fts_cols.is_empty() {
             return CandidatePlan::Unbounded;
@@ -617,7 +619,7 @@ async fn expand_like(
 fn lower(
     expr: &Expr,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     match expr {
         Expr::BinaryExpr(be) => match be.op {
@@ -647,7 +649,7 @@ fn eq_leaf(
     left: &Expr,
     right: &Expr,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     let (column, value) = match (left, right) {
         (Expr::Column(c), Expr::Literal(v, _)) => (&c.name, v),
@@ -661,7 +663,7 @@ fn eq_leaf(
 fn in_list_leaf(
     il: &InList,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     let Expr::Column(c) = il.expr.as_ref() else {
         return CandidatePlan::Unbounded;
@@ -688,7 +690,7 @@ fn in_list_leaf(
 fn like_leaf(
     like: &Like,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     // `NOT LIKE` excludes rows — no term set bounds an exclusion.
     if like.negated {
@@ -712,7 +714,9 @@ fn like_leaf(
     let Some(pattern) = scalar_str(v) else {
         return CandidatePlan::Unbounded;
     };
-    let tok = resolve(&c.name);
+    let Some(tok) = resolve(&c.name) else {
+        return CandidatePlan::Unbounded;
+    };
     let Some(analyzer) = Analyzer::of(tok.as_ref()) else {
         return CandidatePlan::Unbounded;
     };
@@ -903,7 +907,7 @@ fn terms_all(
     column: &str,
     value: &ScalarValue,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     if !fts_cols.contains(column) {
         return CandidatePlan::Unbounded;
@@ -911,7 +915,9 @@ fn terms_all(
     let Some(s) = scalar_str(value) else {
         return CandidatePlan::Unbounded;
     };
-    let tok = resolve(column);
+    let Some(tok) = resolve(column) else {
+        return CandidatePlan::Unbounded;
+    };
     let tokens: Vec<String> = tok.tokenize(s).collect();
     if tokens.is_empty() {
         return CandidatePlan::Unbounded;
@@ -979,7 +985,7 @@ fn collapse(mut flat: Vec<CandidatePlan>, is_and: bool) -> CandidatePlan {
 pub(crate) fn like_prune_leaves(
     filters: &[Expr],
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> Vec<PruneLeaf> {
     let mut out = Vec::new();
     for filter in filters {
@@ -993,7 +999,7 @@ pub(crate) fn like_prune_leaves(
 fn collect_like_leaves(
     expr: &Expr,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     out: &mut Vec<PruneLeaf>,
 ) {
     match expr {
@@ -1028,8 +1034,8 @@ mod tests {
 
     /// Resolver for the lowering tests: every column tokenizes with the
     /// ASCII-lower analyzer.
-    fn ascii_resolver(_col: &str) -> Arc<dyn Tokenizer> {
-        Arc::new(AsciiLowerTokenizer)
+    fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(Arc::new(AsciiLowerTokenizer))
     }
 
     fn plan(expr: Expr) -> CandidatePlan {
@@ -1207,8 +1213,8 @@ mod tests {
     }
 
     /// Resolver for the Unicode-aware analyzer.
-    fn standard_resolver(_col: &str) -> Arc<dyn Tokenizer> {
-        Arc::new(StandardTokenizer)
+    fn standard_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(Arc::new(StandardTokenizer))
     }
 
     fn standard_plan(expr: Expr) -> CandidatePlan {
@@ -1617,11 +1623,11 @@ mod tests {
         // `title` is analyzed with the Unicode-aware standard tokenizer,
         // which keeps non-ASCII letters; ascii_lower drops the whole
         // token. The lowering must pick the column's own analyzer.
-        let resolve = |col: &str| -> Arc<dyn Tokenizer> {
+        let resolve = |col: &str| -> Option<Arc<dyn Tokenizer>> {
             if col == "title" {
-                Arc::new(StandardTokenizer)
+                Some(Arc::new(StandardTokenizer))
             } else {
-                Arc::new(AsciiLowerTokenizer)
+                Some(Arc::new(AsciiLowerTokenizer))
             }
         };
         let bounded =

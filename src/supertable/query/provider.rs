@@ -410,7 +410,10 @@ impl SupertableProvider {
             {
                 // Per-column analyzer: prune with the tokenizer this column
                 // was indexed with, not a single table-wide default.
-                let tok = opts.fts_tokenizer_for(&pred.column);
+                let Some(tok) = opts.try_fts_tokenizer_for(&pred.column) else {
+                    leaves.push(PruneLeaf::Scalar(pred));
+                    continue;
+                };
                 let terms: Vec<String> = tok.tokenize(literal).collect();
                 if !terms.is_empty() {
                     leaves.push(PruneLeaf::TermPresence {
@@ -440,13 +443,13 @@ impl SupertableProvider {
             filters,
             &self.schema,
             &self.fts_cols_set(),
-            &|col| opts.fts_tokenizer_for(col),
+            &|col| opts.try_fts_tokenizer_for(col),
         ));
 
         // `LIKE` on an FTS column: a term bloom for the pattern's complete
         // tokens and a lex-range check for a prefix token.
         leaves.extend(like_prune_leaves(filters, &self.fts_cols_set(), &|col| {
-            opts.fts_tokenizer_for(col)
+            opts.try_fts_tokenizer_for(col)
         }));
 
         leaves.extend(exprs_to_null_leaves(filters, &self.schema));
@@ -894,7 +897,7 @@ impl TableProvider for SupertableProvider {
         // the superfile). See `crate::supertable::query::candidate`.
         let opts = &self.manifest.options;
         let candidate_plan = CandidatePlan::from_filters(filters, &self.fts_cols_set(), &|col| {
-            opts.fts_tokenizer_for(col)
+            opts.try_fts_tokenizer_for(col)
         });
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
@@ -1497,7 +1500,7 @@ pub(crate) fn exprs_to_value_set_leaves(
     filters: &[Expr],
     schema: &SchemaRef,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> Vec<PruneLeaf> {
     let mut out = Vec::new();
 
@@ -1515,7 +1518,7 @@ fn collect_value_set_leaves(
     expr: &Expr,
     schema: &SchemaRef,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     out: &mut Vec<PruneLeaf>,
 ) {
     match expr {
@@ -1571,13 +1574,14 @@ fn emit_value_set_leaves(
     column: String,
     values: Vec<ScalarValue>,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     out: &mut Vec<PruneLeaf>,
 ) {
-    if fts_cols.contains(column.as_str()) {
-        // Per-column analyzer: tokenize the value set with this column's
-        // own tokenizer so the bloom probe matches how it was indexed.
-        let tok = resolve(&column);
+    // Per-column analyzer: tokenize the value set with this column's own
+    // tokenizer so the bloom probe matches how it was indexed. A column
+    // `resolve` cannot answer for gets no bloom leaf — probing it with
+    // some other analyzer's tokens could drop a matching superfile.
+    if let Some(tok) = resolve(&column).filter(|_| fts_cols.contains(column.as_str())) {
         let terms = unique_tokens(tok.as_ref(), values.iter().filter_map(scalar_as_str));
         if !terms.is_empty() {
             out.push(PruneLeaf::TermPresence {
@@ -1771,8 +1775,8 @@ mod tests {
 
     /// Per-column tokenizer resolver for the pruning-walker tests: every
     /// column resolves to the default ASCII-lower analyzer.
-    fn ascii_resolver(_col: &str) -> Arc<dyn Tokenizer> {
-        default_tokenizer()
+    fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(default_tokenizer())
     }
 
     /// `view_string_schema` views scalar `Utf8`/`LargeUtf8` columns as
@@ -2291,11 +2295,11 @@ mod tests {
             Field::new("body", DataType::Utf8, true),
         ]));
         let fts = HashSet::from(["title", "body"]);
-        let resolve = |c: &str| -> Arc<dyn Tokenizer> {
+        let resolve = |c: &str| -> Option<Arc<dyn Tokenizer>> {
             if c == "title" {
-                Arc::new(StandardTokenizer)
+                Some(Arc::new(StandardTokenizer))
             } else {
-                Arc::new(AsciiLowerTokenizer)
+                Some(Arc::new(AsciiLowerTokenizer))
             }
         };
 

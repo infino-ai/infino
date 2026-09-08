@@ -680,10 +680,11 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
 }
 
-/// Name of the default ASCII tokenizer in a column's FTS config.
+/// Name of the ASCII-only tokenizer in a column's FTS config.
 pub const ASCII_LOWER_TOKENIZER: &str = "ascii_lower";
 
-/// Name of the Unicode-aware standard tokenizer in a column's FTS config.
+/// Name of the Unicode-aware standard tokenizer in a column's FTS
+/// config, and the analyzer a column gets when none is named.
 pub const STANDARD_TOKENIZER: &str = "standard";
 
 /// Resolve a tokenizer name to an instance, or `None` for an

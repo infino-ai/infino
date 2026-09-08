@@ -98,7 +98,7 @@ use crate::{
     storage::StorageProvider,
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        fts::tokenize::{StandardTokenizer, Tokenizer},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -190,8 +190,10 @@ pub fn decimal128_id_field(name: &str) -> Field {
     Field::new(name, DataType::Decimal128(38, 0), false)
 }
 
-/// The default tokenizer used in tests + benches:
-/// `AsciiLowerTokenizer` wrapped in `Arc<dyn Tokenizer>`.
+/// The engine's default tokenizer, for tests + benches:
+/// `StandardTokenizer` wrapped in `Arc<dyn Tokenizer>`. A fixture that
+/// exercises ASCII-only tokenization names `AsciiLowerTokenizer`
+/// itself rather than relying on this.
 ///
 /// Callers passing this into `BuilderOptions::new` wrap in
 /// `Some(...)` at the call site:
@@ -201,7 +203,7 @@ pub fn decimal128_id_field(name: &str) -> Field {
 ///                     Some(default_tokenizer()));
 /// ```
 pub fn default_tokenizer() -> Arc<dyn Tokenizer> {
-    Arc::new(AsciiLowerTokenizer)
+    Arc::new(StandardTokenizer)
 }
 
 /// Default `VectorConfig` for test fixtures: `dim=16`,

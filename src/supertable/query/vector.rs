@@ -10175,7 +10175,7 @@ mod tests {
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
         let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
-            manifest.options.fts_tokenizer_for(col)
+            manifest.options.try_fts_tokenizer_for(col)
         });
 
         let mut q = vec![0.0f32; dim];

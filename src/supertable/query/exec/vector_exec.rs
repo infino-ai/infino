@@ -405,7 +405,7 @@ impl ExecutionPlan for VectorSearchExec {
                 .map(|c| c.column.as_str())
                 .collect();
             let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
-                manifest.options.fts_tokenizer_for(col)
+                manifest.options.try_fts_tokenizer_for(col)
             });
             let hits = match plan {
                 CandidatePlan::Unbounded => {
