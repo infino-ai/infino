@@ -86,9 +86,12 @@ async fn create_table_posts_expected_shape() {
     Mock::given(method("POST"))
         .and(path("/v1/create_table/mydb"))
         .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        // The client names every column's analyzer rather than sending a
+        // bare column name, so the server builds the index with the
+        // analyzer the client resolved and never with a default of its own.
         .and(body_partial_json(json!({
             "table_name": "posts",
-            "indexes": {"fts": ["id"]},
+            "indexes": {"fts": [{"column": "id", "analyzer": "standard"}]},
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
