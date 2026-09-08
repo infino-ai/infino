@@ -971,10 +971,11 @@ impl SuperfileBuilder {
     /// non-monotonic remap (the multi-cell merge's stable-id reorder)
     /// must scatter them into output order itself, and must also force
     /// the spilled accumulator first
-    /// ([`Self::set_fts_spill_threshold_bytes`] to 0): the spilled
-    /// finish sorts triples by `(term, doc)`, so feed order doesn't
-    /// matter there, while the in-RAM accumulator preserves insertion
-    /// order and requires per-term ascending doc ids.
+    /// ([`Self::set_fts_spill_threshold_bytes`] to 1, the minimum): the
+    /// spilled finish sorts every partition by `(term, doc)` whatever
+    /// order the postings arrived in, while the in-RAM accumulator
+    /// preserves insertion order and requires per-term ascending doc
+    /// ids.
     fn carry_fts_postings_with_remap(
         &mut self,
         reader: &SuperfileReader,
