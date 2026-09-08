@@ -2481,13 +2481,15 @@ mod tests {
             1,
             "a wildcard-free LIKE prunes like the equality"
         );
-        // Under the default `ascii_lower` analyzer an open-edged token
-        // cannot be required (a run holding a non-ASCII byte is dropped
-        // whole), so a substring pattern keeps every superfile.
+        // An open-edged token is not required as a term here: this
+        // fixture's stored text is tiny against its vocabulary, so the
+        // dictionary walk that would widen the token to the terms it
+        // sits inside is not worth taking and the token is left to the
+        // scan. Every superfile therefore survives.
         assert_eq!(
             rt.block_on(provider.surviving_superfile_count(&[col("title").like(lit("%mango%"))])),
             3,
-            "an open-edged LIKE token under ascii_lower prunes nothing"
+            "an open-edged LIKE token left to the scan prunes nothing"
         );
     }
 

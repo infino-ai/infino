@@ -5,8 +5,8 @@
 //! The parser lives here because the `+` / `-` clause sigils must be
 //! handled before tokenizing — the tokenizer splits on both.
 //!
-//! Ships two tokenizers: [`AsciiLowerTokenizer`] (the default) and
-//! [`StandardTokenizer`]. The [`Tokenizer`] trait is the extension
+//! Ships two tokenizers: [`StandardTokenizer`] (the default) and
+//! [`AsciiLowerTokenizer`]. The [`Tokenizer`] trait is the extension
 //! point for ICU / language-aware stemmers / custom char filters
 //! under the same trait without touching FTS code.
 //!
@@ -78,12 +78,13 @@ const TOKEN_SCRATCH_INITIAL_CAP: usize = 32;
 ///     callback body into the tokenizer scan loop.
 ///
 ///   - [`Tokenizer::as_any`] — downcast hatch so the FTS build path
-///     can take a monomorphic fast path when the tokenizer is the
-///     default [`AsciiLowerTokenizer`]. The fast path bypasses the
-///     `&mut dyn FnMut(&str)` indirection by calling the inherent
-///     [`AsciiLowerTokenizer::tokenize_each_inline`] method, whose
+///     can take a monomorphic fast path for either shipped tokenizer.
+///     It bypasses the `&mut dyn FnMut(&str)` indirection by calling
+///     the inherent `tokenize_each_inline` method
+///     ([`AsciiLowerTokenizer::tokenize_each_inline`],
+///     [`StandardTokenizer::tokenize_each_inline`]), whose
 ///     `F: FnMut(&str)` parameter lets LLVM inline the callback
-///     body straight into the tokenizer's per-byte scan. Custom
+///     body straight into the tokenizer's scan. Custom
 ///     tokenizers don't need to opt in — they just return `self`
 ///     and never get downcast.
 pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {

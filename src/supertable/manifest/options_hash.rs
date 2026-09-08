@@ -594,9 +594,9 @@ mod tests {
         let standard = compute_options_hash(&fts_opts_analyzer("standard"), &strat);
         assert_ne!(ascii.0, standard.0, "analyzer choice must change the hash");
 
-        // Explicit `ascii_lower` is the same declaration the default
-        // produces, so it hashes identically — the analyzer is in the
-        // identity by name, never by "is it the default".
+        // Two declarations naming the same analyzer hash identically —
+        // the analyzer enters the identity by name, never by whether it
+        // happens to be the engine default.
         let ascii_explicit = compute_options_hash(&fts_opts_analyzer("ascii_lower"), &strat);
         assert_eq!(
             ascii.0, ascii_explicit.0,

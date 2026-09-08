@@ -27,14 +27,14 @@ struct VectorIndex {
 /// One full-text (BM25) indexed column, with its per-column options.
 ///
 /// Passed to [`IndexSpec::fts`]. A plain column name converts with all
-/// defaults (`ascii_lower` analyzer, stored text), so the common case
+/// defaults (`standard` analyzer, stored text), so the common case
 /// stays `.fts("body")`; build a `FtsField` to change an option:
 ///
 /// ```
 /// use infino::{FtsField, IndexSpec};
 /// let spec = IndexSpec::new()
 ///     .fts("title")
-///     .fts(FtsField::new("body").analyzer("standard").stored(false));
+///     .fts(FtsField::new("body").analyzer("ascii_lower").stored(false));
 /// # let _ = spec;
 /// ```
 #[derive(Debug, Clone)]

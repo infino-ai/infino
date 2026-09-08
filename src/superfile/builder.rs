@@ -63,8 +63,8 @@
 //! `register_column_with_tokenizer` sets a per-column analyzer — and
 //! dispatches per (column, doc) at `add_doc` time.
 //!
-//! Two tokenizers ship: `AsciiLowerTokenizer` (the default) and the
-//! Unicode-aware `StandardTokenizer`, selectable per column. The
+//! Two tokenizers ship: the Unicode-aware `StandardTokenizer` (the
+//! default) and `AsciiLowerTokenizer`, selectable per column. The
 //! `inf.fts.columns` JSON persists each column's tokenizer name, so a
 //! column is re-tokenized at rebuild / compaction with the analyzer it
 //! was indexed with. Further analyzers (language-specific stemmers, …)
@@ -130,7 +130,7 @@ use crate::superfile::{
 pub struct FtsConfig {
     pub column: String,
     /// Analyzer (tokenizer) name applied to this column —
-    /// `"ascii_lower"` (the default) or `"standard"`. Resolved to a
+    /// `"standard"` (the default) or `"ascii_lower"`. Resolved to a
     /// tokenizer instance once, at builder construction; an unknown
     /// name is a build error. Per column: each FTS column is tokenized
     /// with its own analyzer, so columns in one table may differ.
