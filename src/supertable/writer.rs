@@ -1250,24 +1250,34 @@ impl SupertableWriter {
         // batch of a commit (it sets the label) from a later one (it can only
         // keep or clear it).
         //
-        // A row-less batch joins nothing, so it says nothing about the label -
-        // but it is still validated above rather than returned early, so an
-        // empty batch with the wrong schema is rejected rather than accepted.
-        if n_rows > 0 {
-            self.pending_stem = match label {
-                // Rows from no named source: the commit's rows now come from
-                // more than one place, so it has no one name.
-                SourceLabel::Unnamed => None,
-                SourceLabel::Named(source_name) => {
-                    let next = superfile_stem(source_name);
-                    if self.buffer.is_empty() || self.pending_stem == next {
-                        next
-                    } else {
-                        None
-                    }
-                }
-            };
+        // A row-less batch is validated above and then contributes nothing: no
+        // rows, no bytes, no opinion about the label. Returning here rather
+        // than at the top of `append`/`append_named` is what keeps the
+        // validation - an empty batch with the wrong schema is still rejected
+        // - while keeping `self.buffer` a buffer of ROWS.
+        //
+        // That last part is the bug this shape avoids: an empty batch pushed
+        // into the buffer made `buffer.is_empty()` false while nothing had
+        // been buffered, so a plain `append` of an empty batch followed by
+        // `append_named(rows, "customers")` read as a mixed commit and
+        // published those rows unnamed.
+        if n_rows == 0 {
+            return Ok(());
         }
+
+        self.pending_stem = match label {
+            // Rows from no named source: the commit's rows now come from more
+            // than one place, so it has no one name.
+            SourceLabel::Unnamed => None,
+            SourceLabel::Named(source_name) => {
+                let next = superfile_stem(source_name);
+                if self.buffer.is_empty() || self.pending_stem == next {
+                    next
+                } else {
+                    None
+                }
+            }
+        };
 
         self.buffer.push(BufferedBatch { scalar, vectors });
         self.buffer_scalar_bytes += scalar_bytes;

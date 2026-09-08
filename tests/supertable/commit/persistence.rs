@@ -474,6 +474,41 @@ fn an_empty_batch_leaves_the_source_label_alone() {
     );
 }
 
+/// A row-less batch BEFORE the first named one, which is the harder half: an
+/// empty batch that reached the buffer would make it non-empty while nothing
+/// had been buffered, so the first real named append would read as joining a
+/// mixed commit and lose its label. `buffer` has to hold rows or nothing.
+#[test]
+fn an_empty_batch_before_the_first_named_one_does_not_cost_it_its_label() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    let empty = build_title_batch(&[]);
+    let mut w = st.writer().expect("writer");
+    // Both orders, because both put a row-less batch through the buffer path.
+    w.append(&empty).expect("empty append first");
+    w.append_named(&empty, "ignored.parquet")
+        .expect("empty append_named");
+    w.append_named(&build_title_batch(&["real row"]), "customers.parquet")
+        .expect("append_named");
+    w.commit().expect("commit");
+    drop(w);
+
+    let names: Vec<String> = std::fs::read_dir(dir.path().join("data"))
+        .expect("readdir data")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "one commit → one object: {names:?}");
+    assert!(
+        names[0].starts_with("customers_parquet-"),
+        "an empty batch before the named one must not make the commit look mixed: {names:?}"
+    );
+}
+
 /// A rejected append leaves the buffered commit alone - its rows AND its
 /// label. The buffer is what a failed append preserves, so preserving the rows
 /// while relabelling them would publish one source's rows under another's
