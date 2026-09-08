@@ -178,7 +178,7 @@ mod tests {
         let json = index_spec_to_json(&spec);
         assert_eq!(
             json["fts"],
-            json!([{"column": "body", "analyzer": "ascii_lower"}])
+            json!([{"column": "body", "analyzer": "standard"}])
         );
         assert_eq!(
             json["vector"][0],
@@ -191,8 +191,10 @@ mod tests {
         // Each column crosses as a {column, analyzer} object, whichever
         // analyzer it resolved to, so the server builds the index with the
         // analyzer this client chose and never with one of its own.
+        // Both analyzers named explicitly, so this stays a per-column test
+        // whichever one the engine defaults to.
         let spec = IndexSpec::new()
-            .fts("title")
+            .fts(FtsField::new("title").analyzer("ascii_lower"))
             .fts(FtsField::new("body").analyzer("standard"));
         let json = index_spec_to_json(&spec);
         assert_eq!(
@@ -201,6 +203,15 @@ mod tests {
                 {"column": "title", "analyzer": "ascii_lower"},
                 {"column": "body", "analyzer": "standard"}
             ])
+        );
+
+        // A column declared without an analyzer crosses with the engine
+        // default named explicitly, never as a bare string the server
+        // would have to resolve itself.
+        let defaulted = index_spec_to_json(&IndexSpec::new().fts("title"));
+        assert_eq!(
+            defaulted["fts"],
+            json!([{"column": "title", "analyzer": "standard"}])
         );
     }
 
@@ -211,7 +222,7 @@ mod tests {
         let spec = IndexSpec::new().fts(FtsField::new("body").stored(false));
         assert_eq!(
             index_spec_to_json(&spec)["fts"],
-            json!([{"column": "body", "analyzer": "ascii_lower", "stored": false}])
+            json!([{"column": "body", "analyzer": "standard", "stored": false}])
         );
     }
 
