@@ -28,6 +28,7 @@ use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use tokio::runtime::Runtime;
 use tracing::{Instrument, debug, warn};
+use uuid::Uuid;
 
 use super::{
     error::{BuildError, CommitError, OpenError},
@@ -78,6 +79,30 @@ use crate::{
 #[derive(Clone)]
 pub struct Supertable {
     inner: Arc<SupertableInner>,
+}
+
+/// The parsed global term-stats artifact plus the verdict of checking
+/// its coverage, so neither cost is repaid per query.
+///
+/// Two things are memoized here because each is invariant over a
+/// different key. The parsed FST is keyed by the artifact's
+/// content-addressed `uri`: an append carries the same reference
+/// forward, so successive generations reuse it and only a maintenance
+/// republish refetches. The coverage verdict is keyed by manifest
+/// generation, because a manifest pins both its superfile list and its
+/// artifact reference — so `usable` is a pure function of
+/// `checked_generation`, and one check per generation serves every
+/// query on that snapshot.
+pub(super) struct CachedTermStats {
+    /// The artifact's content-addressed storage uri.
+    pub(super) uri: String,
+    /// Manifest generation `usable` was evaluated against.
+    pub(super) checked_generation: u64,
+    /// Whether every superfile the artifact covers was still listed by
+    /// that generation's manifest. `false` means callers must read df
+    /// from the superfile dictionaries instead.
+    pub(super) usable: bool,
+    pub(super) sidecar: Arc<TermStatsSidecar>,
 }
 
 /// Internal shared state. Every `Supertable` clone holds one Arc
@@ -154,11 +179,10 @@ pub(super) struct SupertableInner {
     /// queries under `Bm25Stats::Global` skip the dictionary gather
     /// fan — see [`GlobalIdfCache`].
     pub(super) global_idf_cache: GlobalIdfCache,
-    /// Lazily loaded + verified global term-stats sidecar, keyed by its
-    /// content-addressed URI so appends (which carry the same ref) reuse
-    /// the parsed artifact and a maintenance republish swaps it. `None`
-    /// until first use or when the manifest carries no ref.
-    pub(super) term_stats_cache: StdRwLock<Option<(String, Arc<TermStatsSidecar>)>>,
+    /// Lazily loaded + verified global term-stats sidecar. `None` until
+    /// first use or when the manifest carries no ref — see
+    /// [`CachedTermStats`] for what the entry holds and why.
+    pub(super) term_stats_cache: StdRwLock<Option<CachedTermStats>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -1555,7 +1579,7 @@ pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
 }
 
 fn generate_vector_index_storage_prefix() -> String {
-    format!("_infino_{}_vector_index", uuid::Uuid::new_v4())
+    format!("_infino_{}_vector_index", Uuid::new_v4())
 }
 
 fn resolve_vector_index_storage_prefix(
@@ -2039,35 +2063,88 @@ impl SupertableReader {
     /// gather wave, trading latency for availability.
     pub(crate) async fn term_stats_sidecar(&self) -> Option<Arc<TermStatsSidecar>> {
         let reference = self.manifest.term_stats_blob()?.clone();
+        let generation = self.manifest.get_manifest_id();
+        // Already parsed AND already checked against this generation's
+        // superfiles: the whole call is one cache read.
         {
             let cached = self
                 .inner
                 .term_stats_cache
                 .read()
                 .expect("term stats cache lock");
-            if let Some((uri, sidecar)) = cached.as_ref()
-                && *uri == reference.uri
+            if let Some(entry) = cached.as_ref()
+                && entry.uri == reference.uri
+                && entry.checked_generation == generation
             {
-                return Some(Arc::clone(sidecar));
+                return entry.usable.then(|| Arc::clone(&entry.sidecar));
             }
         }
-        let storage = self.manifest.options.storage.as_ref()?;
-        match term_stats::load(storage.as_ref(), &reference).await {
-            Ok(sidecar) => {
-                let sidecar = Arc::new(sidecar);
-                *self
-                    .inner
-                    .term_stats_cache
-                    .write()
-                    .expect("term stats cache lock") =
-                    Some((reference.uri.clone(), Arc::clone(&sidecar)));
-                Some(sidecar)
+        // Same artifact, new generation (an append carries the
+        // reference forward): keep the parsed FST and re-check its
+        // coverage rather than refetching.
+        let parsed = {
+            let cached = self
+                .inner
+                .term_stats_cache
+                .read()
+                .expect("term stats cache lock");
+            cached
+                .as_ref()
+                .filter(|entry| entry.uri == reference.uri)
+                .map(|entry| Arc::clone(&entry.sidecar))
+        };
+        let sidecar = match parsed {
+            Some(sidecar) => sidecar,
+            None => {
+                let storage = self.manifest.options.storage.as_ref()?;
+                match term_stats::load(storage.as_ref(), &reference).await {
+                    Ok(sidecar) => Arc::new(sidecar),
+                    Err(e) => {
+                        warn!(error = %e, uri = %reference.uri, "term-stats sidecar load failed; falling back to the query-time df gather");
+                        return None;
+                    }
+                }
             }
-            Err(e) => {
-                warn!(error = %e, uri = %reference.uri, "term-stats sidecar load failed; falling back to the query-time df gather");
-                None
-            }
+        };
+        // Coverage check, once per (artifact, generation). The artifact's
+        // sums are aggregates over the superfiles it names, so a
+        // superfile that has since left the manifest cannot be
+        // subtracted back out — serving df from it would over-count and
+        // depress idf for the affected terms. The manifest carry rule
+        // drops the reference on any commit that removes superfiles,
+        // which is what makes a stale artifact unreachable; this is the
+        // belt to those braces, and it runs in every build because the
+        // failure mode is silently wrong ranking rather than an error.
+        // Rejecting an artifact costs latency, never correctness: with
+        // no artifact, callers read df from every superfile's own
+        // dictionary.
+        let current: HashSet<Uuid> = self
+            .manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.superfile_id)
+            .collect();
+        let usable = sidecar.covered().iter().all(|id| current.contains(id));
+        if !usable {
+            warn!(
+                uri = %reference.uri,
+                generation,
+                "term-stats sidecar covers a superfile this manifest no longer lists; \
+                 ignoring it and reading document frequency from the superfile \
+                 dictionaries instead"
+            );
         }
+        *self
+            .inner
+            .term_stats_cache
+            .write()
+            .expect("term stats cache lock") = Some(CachedTermStats {
+            uri: reference.uri.clone(),
+            checked_generation: generation,
+            usable,
+            sidecar: Arc::clone(&sidecar),
+        });
+        usable.then_some(sidecar)
     }
 
     /// The shared `Arc<SupertableInner>` backing this reader. Used to

@@ -89,7 +89,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 /// Fewest should-terms for which a ranged kernel is shipped to the
@@ -874,33 +874,12 @@ impl SupertableReader {
         // table whose maintenance is current, restoring the single fully
         // overlapped dispatch of the per-superfile plan. A load failure
         // degrades to the full query-time wave.
-        // An artifact is only usable while every superfile it covers is
-        // still in this manifest. Its sums are aggregates, so a departed
-        // superfile's contribution cannot be subtracted back out — using
-        // it anyway would over-count df and depress idf for the affected
-        // terms. The manifest carry rule drops the reference on any
-        // commit that removes superfiles, which is what makes a stale
-        // artifact unreachable; this check is the belt to that braces,
-        // and it runs in every build because the failure mode is
-        // silently wrong ranking rather than an error. Rejecting the
-        // artifact costs latency, never correctness: `covered` stays
-        // empty, so the wave below reads df from every superfile's own
-        // dictionary. The set build is O(superfiles), the same order as
-        // the presence prune that follows it.
-        let sidecar = self.term_stats_sidecar().await.filter(|s| {
-            let current: HashSet<Uuid> =
-                manifest.superfiles.iter().map(|e| e.superfile_id).collect();
-            let usable = s.covered().iter().all(|id| current.contains(id));
-            if !usable {
-                warn!(
-                    column,
-                    "term-stats artifact covers a superfile this manifest no longer lists; \
-                     ignoring it and reading document frequency from the superfile \
-                     dictionaries instead"
-                );
-            }
-            usable
-        });
+        // `term_stats_sidecar` hands back an artifact only when its
+        // covered set is still entirely listed by this manifest — it
+        // verifies that once per generation and caches the verdict, so
+        // a stale artifact reads as absent here and this wave falls
+        // back to every superfile's own dictionary.
+        let sidecar = self.term_stats_sidecar().await;
         let covered: HashSet<Uuid> = sidecar
             .as_ref()
             .map(|s| s.covered().iter().copied().collect())
