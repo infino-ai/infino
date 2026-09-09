@@ -2097,7 +2097,7 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.4,"b":0.6}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(r.columns[0].params, bm25::Bm25Params::new(1.4, 0.6));
-        assert!(!r.columns[0].params.is_standard());
+        assert_ne!(r.columns[0].params, bm25::Bm25Params::STANDARD);
     }
 
     #[test]

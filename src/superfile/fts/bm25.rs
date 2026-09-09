@@ -68,14 +68,6 @@ impl Bm25Params {
         Self { k1, b }
     }
 
-    /// Whether this is the standard pair, bit-for-bit. Drives the
-    /// "only when non-default" decisions — chiefly whether a query
-    /// needs a bound-correction factor at all.
-    #[inline]
-    pub(crate) fn is_standard(&self) -> bool {
-        self.k1 == K1 && self.b == B
-    }
-
     /// `k1 · (1 − b + b·dl/avgdl)` — the per-doc length normalizer the
     /// scorer divides by, precomputed per length bucket in the reader's
     /// norm table. `avgdl <= 0` (an empty column) yields `k1`, the
