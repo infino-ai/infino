@@ -461,6 +461,7 @@ impl ManifestSnapshot {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts,
             tombstone_seqs,
@@ -1270,6 +1271,17 @@ impl ManifestSnapshot {
         self.list.as_ref()?.slow_vector_state_graphs.as_ref()
     }
 
+    /// The centroid-router-graph sibling ref (persisted HNSW over the fp32
+    /// fine centroids), or `None` on manifests written before it existed, when
+    /// the router was off at drain, or on a build failure. Consumers
+    /// reconstruct the router in memory when absent.
+    pub(crate) fn slow_vector_state_centroid_graph_blob(&self) -> Option<&RoutingRef> {
+        self.list
+            .as_ref()?
+            .slow_vector_state_centroid_graph
+            .as_ref()
+    }
+
     test_visible! {
         /// Bench/test introspection for the published resident vector-index
         /// blob (the flat plane or graph bundle the drain persisted): its
@@ -1318,6 +1330,7 @@ impl ManifestSnapshot {
         hash: part::ContentHash,
         centroids: RoutingRef,
         graphs: Option<RoutingRef>,
+        centroid_graph: Option<RoutingRef>,
     ) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
@@ -1327,6 +1340,7 @@ impl ManifestSnapshot {
             list.slow_vector_state_content_hash = Some(hash);
             list.slow_vector_state_centroids = Some(centroids);
             list.slow_vector_state_graphs = graphs;
+            list.slow_vector_state_centroid_graph = centroid_graph;
             list
         });
         let mut superfile_list = self.superfile_list.clone();
@@ -2020,6 +2034,10 @@ impl ManifestSnapshot {
                 .list
                 .as_ref()
                 .and_then(|l| l.slow_vector_state_graphs.clone()),
+            // Membership-dependent (its node map indexes the visible superfile
+            // set), so it is cleared here like the centroid section and the
+            // settle restamps it for the new generation — never carried forward.
+            slow_vector_state_centroid_graph: None,
             parts: out_list_entries_after_removal,
         };
         let mut new_superfile_list = self
@@ -4641,6 +4659,7 @@ mod tests {
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
+                slow_vector_state_centroid_graph: None,
                 term_stats: None,
                 parts: entries,
             }
@@ -4948,6 +4967,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
@@ -5127,6 +5147,7 @@ mod tests {
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
+                slow_vector_state_centroid_graph: None,
                 term_stats: None,
                 parts: vec![],
             }),
@@ -5157,6 +5178,7 @@ mod tests {
             "slow-vector-state/state-x.bin".into(),
             hash,
             centroids.clone(),
+            None,
             None,
         );
         let (uri, got_hash) = stamped.slow_vector_state_blob().expect("ref stamped");
@@ -5264,6 +5286,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![part_entry(pa_id), part_entry(pb_id)],
         };
@@ -5340,6 +5363,7 @@ mod tests {
             slow_vector_state_content_hash: Some(ContentHash([7u8; 32])),
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: Vec::new(),
         };
@@ -5467,6 +5491,7 @@ mod tests {
             slow_vector_state_content_hash: slow_hash,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -5678,6 +5703,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: part.part_id,
@@ -5939,6 +5965,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -6093,6 +6120,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 entry_for(&pw_a_old),
@@ -6305,6 +6333,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -6409,6 +6438,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -6540,6 +6570,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -6661,6 +6692,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 ManifestPartEntry {
@@ -6798,6 +6830,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 ManifestPartEntry {
@@ -6945,6 +6978,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 ManifestPartEntry {
@@ -7106,6 +7140,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 ManifestPartEntry {
@@ -7329,6 +7364,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -7430,6 +7466,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -7547,6 +7584,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 ManifestPartEntry {
@@ -7687,6 +7725,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 ManifestPartEntry {
@@ -7824,6 +7863,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -7915,6 +7955,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
@@ -8025,6 +8066,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts: vec![
                 ManifestPartEntry {
@@ -8158,6 +8200,7 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
             term_stats: None,
             parts,
         }
