@@ -5015,52 +5015,71 @@ async fn group_multicell_rows(
     Ok(out)
 }
 
-/// Per-cell doc counts from a packed (or legacy) entry. Legacy returns one
-/// `(partition_hint_or_0, n_docs)` pair.
-async fn cell_doc_counts_for_entry(
+/// Per-cell physical doc counts held by `entry`, as `(cell, n_docs)` pairs,
+/// with superseded cells excluded. Read straight off the manifest's
+/// per-entry [`VectorSummary`] — no superfile open. Every entry this engine
+/// writes carries one (built from the just-written bytes at commit time), so
+/// a missing or empty summary is treated as a genuine error rather than a
+/// silent degrade.
+fn cell_doc_counts_for_entry(
     inner: &SupertableInner,
     entry: &Arc<SuperfileEntry>,
     superseded: Option<&BTreeSet<u32>>,
 ) -> Result<Vec<(u32, u32)>, BuildError> {
-    let storage = inner
-        .options
-        .storage
-        .as_ref()
-        .ok_or_else(|| BuildError::Store("cell maintenance requires storage".into()))?;
-    let reader = open_reader(
-        &inner.options.store,
-        inner.options.disk_cache.as_ref(),
-        Some(storage),
-        entry,
-        true,
-    )
-    .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
-    let v = reader
-        .vec()
-        .ok_or_else(|| BuildError::Store("IVF entry missing vector index".into()))?;
-    // A superseded cell's on-disk blocks are dead (replaced by a split's
-    // children elsewhere), so it contributes no live docs — excluding it here
-    // keeps split-selection and parent-discovery from re-counting the same
-    // rows that already live in the child cells.
-    let is_superseded = |cell: u32| superseded.is_some_and(|s| s.contains(&cell));
-    if v.is_multi_cell() {
-        Ok(v.packed_cell_ids()
-            .iter()
-            .filter(|&&cell| !is_superseded(cell))
-            .filter_map(|&cell| {
-                let n = v.packed_cell_n_docs(cell)?;
-                Some((cell, n))
-            })
-            .collect())
-    } else {
-        let cell = entry.partition_hint.unwrap_or(0);
-        if is_superseded(cell) {
-            Ok(vec![])
-        } else {
-            Ok(vec![(cell, entry.n_docs as u32)])
-        }
+    let column = vector_index_column(inner)
+        .ok_or_else(|| BuildError::Store("no vector index column configured".into()))?;
+    let summary = entry.vector_summary.get(&column).ok_or_else(|| {
+        BuildError::Store(format!(
+            "superfile {} missing vector summary for {column:?}",
+            entry.superfile_id
+        ))
+    })?;
+    if summary.cells.is_empty() {
+        return Err(BuildError::Store(format!(
+            "superfile {} vector summary carries no cells",
+            entry.superfile_id
+        )));
     }
+    let is_superseded = |cell: u32| superseded.is_some_and(|s| s.contains(&cell));
+    if summary.cells.iter().any(|c| c.cell_id.is_none()) {
+        let cell = entry.partition_hint.unwrap_or(0);
+        return Ok(if is_superseded(cell) {
+            vec![]
+        } else {
+            vec![(cell, entry.n_docs as u32)]
+        });
+    }
+    let mut out = Vec::with_capacity(summary.cells.len());
+    for cell in &summary.cells {
+        // Every cell here has `cell_id: Some(_)` — the mixed-shape branch
+        // above already returned on the first `None`.
+        let id = cell
+            .cell_id
+            .expect("checked above: no unscoped cell in this summary");
+        if is_superseded(id) {
+            continue;
+        }
+        let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+        let n = u32::try_from(n)
+            .map_err(|_| BuildError::Store(format!("cell {id} doc count overflows u32: {n}")))?;
+        out.push((id, n));
+    }
+    Ok(out)
+}
+
+/// The vector column the hidden index is keyed on, or `None` if the table
+/// has none configured.
+fn vector_index_column(inner: &SupertableInner) -> Option<String> {
+    if let PartitionStrategy::VectorCell { column, .. } =
+        inner.manifest.load().get_partition_strategy()
+    {
+        return Some(column);
+    }
+    inner
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())
 }
 
 /// Coarse current RSS in MiB from `/proc/self/status` (Linux); `None` elsewhere
@@ -6405,7 +6424,7 @@ pub(in crate::supertable) async fn scan_cell_parents(
     let mut parents_by_cell: HashMap<u32, Vec<Arc<SuperfileEntry>>> = HashMap::new();
     for entry in manifest.superfiles.iter() {
         let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
-        for (cell, n) in cell_doc_counts_for_entry(inner, entry, superseded).await? {
+        for (cell, n) in cell_doc_counts_for_entry(inner, entry, superseded)? {
             if only_cells.is_some_and(|want| !want.contains(&cell)) {
                 continue;
             }
@@ -7949,8 +7968,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     let mut total_docs = 0u64;
     for entry in manifest.superfiles.iter() {
         let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
-        let cells: Vec<(u32, u32)> = cell_doc_counts_for_entry(inner, entry, superseded)
-            .await?
+        let cells: Vec<(u32, u32)> = cell_doc_counts_for_entry(inner, entry, superseded)?
             .into_iter()
             .filter(|&(_, n)| n > 0)
             .collect();
@@ -9899,6 +9917,7 @@ mod tests {
         supertable::{
             SupertableOptions,
             handle::Supertable,
+            manifest::{CellVectorSummary, ClusterCentroids, VectorSummary},
             storage::LocalFsStorageProvider,
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
         },
@@ -11533,6 +11552,175 @@ mod tests {
         )
         .expect("valid options")
         .with_writer_pool(pool)
+    }
+
+    /// Storage-attached table with a drained hidden index across two cells.
+    fn drained_hidden_two_cells() -> (TempDir, Supertable, Arc<Supertable>) {
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(titles) as Arc<dyn Array>, Arc::new(fsl)],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        (dir, st, hidden)
+    }
+
+    #[test]
+    fn cell_doc_counts_for_entry_matches_the_drained_cells() {
+        let (_dir, _st, hidden) = drained_hidden_two_cells();
+        let inner = Arc::clone(hidden.inner());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        assert!(
+            !manifest.superfiles.is_empty(),
+            "the drain must have packed at least one superfile"
+        );
+
+        let mut populated: Vec<u32> = Vec::new();
+        for entry in manifest.superfiles.iter() {
+            let counts = cell_doc_counts_for_entry(&inner, entry, None)
+                .expect("a drained superfile carries a per-cell summary");
+            populated.extend(
+                counts
+                    .iter()
+                    .filter(|&&(_, n)| n > 0)
+                    .map(|&(cell, _)| cell),
+            );
+        }
+        populated.sort_unstable();
+        populated.dedup();
+        assert!(
+            populated.len() >= 2,
+            "two distinct populated cells expected, got {populated:?}"
+        );
+
+        let dropped: BTreeSet<u32> = [populated[0]].into_iter().collect();
+        for entry in manifest.superfiles.iter() {
+            let counts = cell_doc_counts_for_entry(&inner, entry, Some(&dropped))
+                .expect("summary still present");
+            assert!(counts.iter().all(|&(cell, _)| cell != populated[0]));
+        }
+    }
+
+    #[test]
+    fn cell_doc_counts_for_entry_errors_without_a_summary() {
+        let (_dir, _st, hidden) = drained_hidden_two_cells();
+        let inner = Arc::clone(hidden.inner());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        let entry = manifest.superfiles.first().expect("a packed superfile");
+
+        let mut stripped = (**entry).clone();
+        stripped.vector_summary.clear();
+        assert!(cell_doc_counts_for_entry(&inner, &Arc::new(stripped), None).is_err());
+
+        let mut empty_cells = (**entry).clone();
+        for summary in empty_cells.vector_summary.values_mut() {
+            summary.cells.clear();
+        }
+        assert!(cell_doc_counts_for_entry(&inner, &Arc::new(empty_cells), None).is_err());
+    }
+
+    #[test]
+    fn cell_doc_counts_for_entry_resolves_the_legacy_single_cell_shape() {
+        let (_dir, _st, hidden) = drained_hidden_two_cells();
+        let inner = Arc::clone(hidden.inner());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        let entry = manifest.superfiles.first().expect("a packed superfile");
+        let column = vector_index_column(&inner).expect("hidden index column");
+
+        let mut legacy = (**entry).clone();
+        legacy.partition_hint = Some(3);
+        legacy.n_docs = 5;
+        legacy.vector_summary.clear();
+        legacy.vector_summary.insert(
+            column,
+            VectorSummary {
+                centroid: vec![0.0; 16],
+                cells: vec![CellVectorSummary {
+                    cell_id: None,
+                    clusters: ClusterCentroids::from_fp32(1, 16, &[0.0; 16], vec![5]),
+                }],
+            },
+        );
+        let legacy = Arc::new(legacy);
+        assert_eq!(
+            cell_doc_counts_for_entry(&inner, &legacy, None).expect("legacy shape resolves"),
+            vec![(3, 5)]
+        );
+        let superseded: BTreeSet<u32> = [3].into_iter().collect();
+        assert_eq!(
+            cell_doc_counts_for_entry(&inner, &legacy, Some(&superseded))
+                .expect("legacy shape resolves"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn vector_index_column_falls_back_to_the_configured_column() {
+        let with_vector = Supertable::create(options_with_vector(16)).expect("create");
+        assert_eq!(
+            vector_index_column(with_vector.inner()),
+            Some("emb".to_string())
+        );
+        let plain = Supertable::create(options_id_title_serial()).expect("create");
+        assert_eq!(vector_index_column(plain.inner()), None);
     }
 
     #[test]
