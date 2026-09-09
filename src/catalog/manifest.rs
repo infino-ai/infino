@@ -54,9 +54,12 @@ pub(crate) struct TableEntry {
     /// FTS-indexed column names.
     pub(crate) fts: Vec<String>,
     /// FTS analyzer names, parallel to `fts` (`"ascii_lower"` /
-    /// `"standard"`). Absent in catalogs written before per-column
-    /// analyzers existed; a missing or short entry defaults to
-    /// `ascii_lower` on reopen.
+    /// `"standard"`). Every entry `create_table` writes carries one name
+    /// per FTS column; `open_table` requires the two lists to be the
+    /// same length rather than inferring an analyzer for a column that
+    /// lacks one. `serde(default)` only keeps the *rest* of the catalog
+    /// decodable — an entry that decodes to a short list is rejected per
+    /// table, not silently patched.
     #[serde(default)]
     pub(crate) fts_analyzers: Vec<String>,
     /// FTS stored flags, parallel to `fts` (`false` = index-only, the

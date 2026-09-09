@@ -69,9 +69,9 @@ def test_memory_roundtrip():
 
 
 def test_fts_standard_analyzer_keeps_non_ascii():
-    # The `analyzer` kwarg selects the tokenizer. The default ascii_lower
-    # drops non-ASCII (so "café" is unsearchable); the standard analyzer
-    # (UAX #29 + lowercase) keeps it.
+    # The `analyzer` kwarg selects the tokenizer. The default, standard
+    # (UAX #29 + lowercase), keeps non-ASCII; ascii_lower drops it, so
+    # "café" is unsearchable under it.
     db = infino.connect("memory://")
 
     std_tbl = db.create_table(
@@ -80,7 +80,9 @@ def test_fts_standard_analyzer_keeps_non_ascii():
     std_tbl.append(_title_batch(["café latte"]))
     assert std_tbl.bm25_search("title", "café", 10).num_rows == 1
 
-    ascii_tbl = db.create_table("ascii", _title_schema(), infino.IndexSpec().fts("title"))
+    ascii_tbl = db.create_table(
+        "ascii", _title_schema(), infino.IndexSpec().fts("title", analyzer="ascii_lower")
+    )
     ascii_tbl.append(_title_batch(["café latte"]))
     try:
         ascii_hits = ascii_tbl.bm25_search("title", "café", 10).num_rows

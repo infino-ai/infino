@@ -56,7 +56,7 @@ use crate::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
                 PreparedClauses, TermPattern,
             },
-            tokenize::{AsciiLowerTokenizer, Tokenizer},
+            tokenize::Tokenizer,
         },
         vector::{
             layout::VectorLayout,
@@ -1095,15 +1095,15 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        // Tokenize with the target column's configured tokenizer so
-        // query terms match how the column was indexed (ascii_lower /
-        // standard). Falls back to ascii_lower when there is no FTS
-        // index or column; the search then fails downstream as before.
-        let tok: Arc<dyn Tokenizer> = self
-            .fts
-            .as_ref()
-            .and_then(|f| f.column_tokenizer(column).ok())
-            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        // Tokenize with the target column's configured tokenizer so query
+        // terms match how the column was indexed (ascii_lower / standard).
+        // A column this superfile has no full-text index for fails here,
+        // where the reason is still nameable, rather than after a pass with
+        // some other column's analyzer.
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let tok: Arc<dyn Tokenizer> = fts.column_tokenizer(column)?;
 
         // Split the query into clause lists and resolve the bare
         // tokens' polarity from the default operator. The parsed
@@ -1343,12 +1343,13 @@ impl SuperfileReader {
     ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
         // string's tokens (a superset of the exact matches). Tokenize
-        // with the column's configured tokenizer to match the index.
-        let tok: Arc<dyn Tokenizer> = self
-            .fts
-            .as_ref()
-            .and_then(|f| f.column_tokenizer(column).ok())
-            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        // with the column's configured tokenizer to match the index; a
+        // column with no full-text index here has no dictionary to prune
+        // through, so it fails rather than pruning with a foreign analyzer.
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let tok: Arc<dyn Tokenizer> = fts.column_tokenizer(column)?;
         let tokens: Vec<String> = tok.tokenize(value).collect();
         let (candidates, work): (Vec<u32>, MatchWork) = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
@@ -3168,12 +3169,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_match_on_non_text_column_errors() {
-        // `exact_match` only supports LargeUtf8 columns. Querying the
-        // Decimal128 `doc_id` column drives the non-LargeUtf8 downcast
-        // failure. The value tokenizes to nothing (punctuation only),
-        // so every row becomes a candidate and the verify pass reaches
-        // the downcast on the decimal column.
+    async fn exact_match_on_a_column_without_a_full_text_index_errors() {
+        // `exact_match` prunes through the column's own term dictionary,
+        // so a column with no full-text index — here the Decimal128
+        // `doc_id` — is rejected by name. It used to tokenize the value
+        // with a fallback analyzer and fail later on the text downcast,
+        // which said nothing about the real problem.
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         let err = r
@@ -3181,10 +3182,37 @@ mod tests {
             .await
             .expect_err("expected error");
         match err {
-            ReadError::Io(e) => {
-                assert!(e.to_string().contains("not LargeUtf8"));
+            ReadError::Fts(inner) => {
+                let rendered = inner.to_string();
+                assert!(
+                    rendered.contains("doc_id"),
+                    "error must name the column: {rendered}"
+                );
             }
-            other => panic!("expected ReadError::Io, got {:?}", other),
+            other => panic!("expected ReadError::Fts, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bm25_hits_on_a_column_without_a_full_text_index_errors() {
+        // Same rule for the scored path: without an index there is no
+        // analyzer to tokenize the query with, so it fails up front
+        // rather than after a pass with some other column's analyzer.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let err = r
+            .bm25_hits_async("doc_id", "anything", 10, BoolMode::Or)
+            .await
+            .expect_err("expected error");
+        match err {
+            ReadError::Fts(inner) => {
+                let rendered = inner.to_string();
+                assert!(
+                    rendered.contains("doc_id"),
+                    "error must name the column: {rendered}"
+                );
+            }
+            other => panic!("expected ReadError::Fts, got {other:?}"),
         }
     }
 }

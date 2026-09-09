@@ -1195,12 +1195,17 @@ impl SupertableReader {
         ),
         QueryError,
     > {
-        let clauses = self
-            .manifest()
-            .options
-            .fts_tokenizer_for(column)
-            .parse(query)
-            .into_clauses(mode);
+        let manifest = self.manifest();
+        // Same up-front check as the scored path: without a full-text index
+        // on `column` there is no analyzer to parse the query with, and no
+        // postings to match it against.
+        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(column) else {
+            return Err(QueryError::InvalidQuery(no_fts_index_message(
+                column,
+                &manifest.options.fts_columns,
+            )));
+        };
+        let clauses = tokenizer.parse(query).into_clauses(mode);
         // Drop repeated tokens within each clause role. Unranked
         // matching is set-valued — an AND/OR/exclude over a term repeated
         // in the query (e.g. `+to +be +or +not +to +be`) is idempotent —
@@ -1567,11 +1572,15 @@ impl SupertableReader {
         value: &str,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
-        let term_strings: Vec<String> = manifest
-            .options
-            .fts_tokenizer_for(column)
-            .tokenize(value)
-            .collect();
+        // `exact_match` prunes through the column's own term dictionary, so
+        // a column with no full-text index has nothing to prune with.
+        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(column) else {
+            return Err(QueryError::InvalidQuery(no_fts_index_message(
+                column,
+                &manifest.options.fts_columns,
+            )));
+        };
+        let term_strings: Vec<String> = tokenizer.tokenize(value).collect();
         // Tokens prune superfiles via the term bloom (AND); a token-less
         // value (e.g. punctuation only) can't prune, so keep all.
         let leaves = if term_strings.is_empty() {

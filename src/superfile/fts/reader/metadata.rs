@@ -121,11 +121,10 @@ pub struct ColumnMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FtsColumnConfig {
     pub name: String,
-    /// The column's analyzer name: `"ascii_lower"` (the default) or
-    /// `"standard"`. A missing field deserializes to `"ascii_lower"`
-    /// for backward compatibility with files written before the
-    /// analyzer name was recorded.
-    #[serde(default = "default_tokenizer")]
+    /// The column's analyzer name: `"ascii_lower"` or `"standard"`.
+    /// Required — the builder has always emitted it, so a column entry
+    /// without it is a malformed footer and open fails rather than
+    /// guessing which analyzer produced the postings.
     pub tokenizer: String,
     /// Whether this column's index records token positions (phrase
     /// support). Files written before positions existed lack the
@@ -139,10 +138,6 @@ pub struct FtsColumnConfig {
     /// `true` (the writer emits it only when `false`).
     #[serde(default = "default_stored")]
     pub stored: bool,
-}
-
-pub(super) fn default_tokenizer() -> String {
-    "ascii_lower".to_string()
 }
 
 pub(super) fn default_stored() -> bool {
@@ -214,20 +209,18 @@ mod tests {
     }
 
     #[test]
-    fn default_tokenizer_helper_is_ascii_lower() {
-        assert_eq!(default_tokenizer(), "ascii_lower");
-    }
-
-    #[test]
-    fn fts_column_config_missing_tokenizer_defaults() {
-        // A column JSON without the optional `tokenizer` field decodes to
-        // the ascii_lower default (round-trips an old file written before
-        // the field existed).
+    fn fts_column_config_without_tokenizer_is_rejected() {
+        // The analyzer name is load-bearing: query terms must be
+        // tokenized the way the postings were. A column entry missing it
+        // is a malformed footer, so open fails instead of picking an
+        // analyzer for the caller.
         let (blob, _) = build_blob();
         let json = r#"[{"name":"body"}]"#;
-        let r = FtsReader::open(blob, json).expect("open with terse json");
-        let cfg = r.fts_columns_config().next().expect("one column");
-        assert_eq!(cfg.name, "body");
+        let err = FtsReader::open(blob, json).expect_err("missing tokenizer must fail open");
+        assert!(
+            err.to_string().contains("tokenizer"),
+            "error should name the missing field: {err}"
+        );
     }
 
     #[test]

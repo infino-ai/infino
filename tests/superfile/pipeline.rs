@@ -589,7 +589,7 @@ fn add_batch_from_reader_mergeability_fts_analyzer_mismatch() {
     let opts = BuilderOptions::new(
         pipeline_schema(),
         "doc_id",
-        vec![FtsConfig::new("body")], // ascii_lower default
+        vec![FtsConfig::new("body").analyzer("ascii_lower")],
         vec![],
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -670,7 +670,9 @@ fn add_batch_from_reader_mergeability_fts_presence_mismatch() {
 /// postings.
 #[test]
 fn fts_merge_rejects_mixed_analyzers() {
-    let a = Arc::new(one_row_superfile_with(FtsConfig::new("body")));
+    let a = Arc::new(one_row_superfile_with(
+        FtsConfig::new("body").analyzer("ascii_lower"),
+    ));
     let b = Arc::new(one_row_superfile_with(
         FtsConfig::new("body").analyzer("standard"),
     ));

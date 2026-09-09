@@ -63,8 +63,8 @@
 //! `register_column_with_tokenizer` sets a per-column analyzer — and
 //! dispatches per (column, doc) at `add_doc` time.
 //!
-//! Two tokenizers ship: `AsciiLowerTokenizer` (the default) and the
-//! Unicode-aware `StandardTokenizer`, selectable per column. The
+//! Two tokenizers ship: the Unicode-aware `StandardTokenizer` (the
+//! default) and `AsciiLowerTokenizer`, selectable per column. The
 //! `inf.fts.columns` JSON persists each column's tokenizer name, so a
 //! column is re-tokenized at rebuild / compaction with the analyzer it
 //! was indexed with. Further analyzers (language-specific stemmers, …)
@@ -98,7 +98,7 @@ use crate::superfile::{
     fts::{
         builder::FtsBuilder,
         reader::ColumnMeta,
-        tokenize::{ASCII_LOWER_TOKENIZER, AsciiLowerTokenizer, tokenizer_for_name},
+        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, tokenizer_for_name},
     },
     stats::SuperfileStats,
     vector::{
@@ -130,7 +130,7 @@ use crate::superfile::{
 pub struct FtsConfig {
     pub column: String,
     /// Analyzer (tokenizer) name applied to this column —
-    /// `"ascii_lower"` (the default) or `"standard"`. Resolved to a
+    /// `"standard"` (the default) or `"ascii_lower"`. Resolved to a
     /// tokenizer instance once, at builder construction; an unknown
     /// name is a build error. Per column: each FTS column is tokenized
     /// with its own analyzer, so columns in one table may differ.
@@ -157,12 +157,12 @@ pub struct FtsConfig {
 }
 
 impl FtsConfig {
-    /// Configuration with the defaults: `ascii_lower` analyzer, no
+    /// Configuration with the defaults: `standard` analyzer, no
     /// positions, text stored.
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
-            analyzer: ASCII_LOWER_TOKENIZER.to_string(),
+            analyzer: STANDARD_TOKENIZER.to_string(),
             positions: false,
             stored: true,
         }
@@ -379,8 +379,9 @@ impl BuilderOptions {
 
     pub fn new_from_reader(reader: &SuperfileReader) -> Self {
         // Recover each FTS column's analyzer from the source reader so a
-        // rebuild carries the analyzer it was built with, instead of
-        // defaulting to ASCII.
+        // rebuild carries the analyzer the postings were built with. This
+        // is why an existing table keeps its recorded analyzer through
+        // compaction and optimize no matter what the engine's default is.
         let fts_columns: Vec<FtsConfig> = if let Some(fts) = &reader.fts() {
             fts.fts_columns_config()
                 .map(|c| {
@@ -2697,7 +2698,7 @@ mod tests {
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
-        assert!(s.contains(r#""tokenizer":"ascii_lower""#));
+        assert!(s.contains(r#""tokenizer":"standard""#));
         // Positionless columns emit no positions field at all — the
         // JSON stays byte-identical to files written before the flag
         // existed.
@@ -2715,21 +2716,23 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"ascii_lower","positions":true}"#),
+            s.contains(r#"{"name":"title","tokenizer":"standard","positions":true}"#),
             "positional column carries the flag: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"ascii_lower"}"#),
-            "positionless column stays in the legacy shape: {s}"
+            s.contains(r#"{"name":"body","tokenizer":"standard"}"#),
+            "positionless column carries no positions key at all: {s}"
         );
     }
 
     /// Per-column analyzers: each column records its own tokenizer name.
     #[test]
     fn fts_columns_json_per_column_analyzers() {
+        // Both analyzers named explicitly: the recorded name must be the
+        // column's own, independent of which one the engine defaults to.
         let cols = vec![
             FtsConfig::new("title").analyzer("standard"),
-            FtsConfig::new("body"),
+            FtsConfig::new("body").analyzer("ascii_lower"),
         ];
         let s = fts_columns_json(&cols);
         assert!(
@@ -2752,11 +2755,11 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"ascii_lower"}"#),
-            "stored column stays in the legacy shape: {s}"
+            s.contains(r#"{"name":"title","tokenizer":"standard"}"#),
+            "stored column carries no stored key at all: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"ascii_lower","stored":false}"#),
+            s.contains(r#"{"name":"body","tokenizer":"standard","stored":false}"#),
             "index-only column carries the flag: {s}"
         );
     }

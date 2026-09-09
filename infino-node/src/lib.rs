@@ -529,9 +529,10 @@ pub struct IndexSpec {
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FtsOptions {
-    /// Tokenizer: `"ascii_lower"` (default — ASCII split + lowercase,
-    /// non-ASCII dropped) or `"standard"` (the Unicode-aware UAX #29
-    /// tokenizer that keeps non-ASCII text).
+    /// Tokenizer: `"standard"` (the default — the Unicode-aware UAX #29
+    /// tokenizer that keeps non-ASCII text) or `"ascii_lower"` (ASCII
+    /// split + lowercase, non-ASCII dropped). It is recorded with the
+    /// table and cannot be changed afterwards.
     pub analyzer: Option<String>,
     /// Keep the raw text in the table (default true). `false` makes the
     /// column index-only: searchable, but the text is never stored, so

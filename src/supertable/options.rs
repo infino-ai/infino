@@ -66,7 +66,7 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer, tokenizer_for_name},
+        fts::tokenize::{Tokenizer, tokenizer_for_name},
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -892,15 +892,6 @@ impl SupertableOptions {
             .iter()
             .find(|c| c.column == column)
             .and_then(|c| tokenizer_for_name(&c.analyzer))
-    }
-
-    /// Tokenizer configured for `column`, for tokenizing query text so
-    /// it matches how the column was indexed. Falls back to the ASCII
-    /// default when `column` is not a registered FTS column; a caller that
-    /// must distinguish that case uses [`Self::try_fts_tokenizer_for`].
-    pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
-        self.try_fts_tokenizer_for(column)
-            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer))
     }
 
     /// Attach a disk cache for storage-backed reads.

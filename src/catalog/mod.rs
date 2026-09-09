@@ -85,7 +85,6 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
-        fts::tokenize::ASCII_LOWER_TOKENIZER,
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
@@ -562,15 +561,22 @@ impl Connection {
                 // the defaults it applies (rotation seed, rerank codec) are
                 // identical and the table's options-hash check passes.
                 let mut spec = IndexSpec::new();
+                // The analyzer decides how query text is tokenized, so it
+                // cannot be inferred: a record that does not name one per
+                // full-text column is unusable, and guessing would return
+                // wrong results rather than an error.
+                if entry.fts_analyzers.len() != entry.fts.len() {
+                    return Err(InfinoError::Backend(format!(
+                        "table '{name}' has {} full-text columns but {} analyzer names recorded; \
+                         the table record is incomplete",
+                        entry.fts.len(),
+                        entry.fts_analyzers.len()
+                    ))
+                    .with_context("open_table", Some(name)));
+                }
                 for (i, column) in entry.fts.iter().enumerate() {
-                    // Catalogs written before per-column analyzers omit
-                    // `fts_analyzers`; those columns default to ascii_lower.
-                    let analyzer = entry
-                        .fts_analyzers
-                        .get(i)
-                        .map(String::as_str)
-                        .unwrap_or(ASCII_LOWER_TOKENIZER);
-                    // Same back-compat rule for `fts_stored`: a catalog
+                    let analyzer = entry.fts_analyzers[i].as_str();
+                    // `fts_stored` keeps its back-compat rule: a catalog
                     // written before index-only columns existed can only
                     // mean the text is stored.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
@@ -1375,6 +1381,7 @@ mod tests {
     use super::*;
     use crate::{
         Bm25SearchOptions, BoolMode, Consistency,
+        catalog::manifest::CATALOG_PATH,
         supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
     };
@@ -1573,9 +1580,13 @@ mod tests {
     fn standard_analyzer_keeps_non_ascii_end_to_end() {
         let conn = connect("memory://").expect("connect");
 
-        // Default (ascii_lower) drops non-ASCII, so "café" is unsearchable.
+        // Explicit ascii_lower drops non-ASCII, so "café" is unsearchable.
         let ascii = conn
-            .create_table("ascii", schema_id_title(), IndexSpec::new().fts("title"))
+            .create_table(
+                "ascii",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("ascii_lower")),
+            )
             .expect("create ascii table");
         ascii
             .append(&build_title_batch(&["café latte"]))
@@ -1606,6 +1617,23 @@ mod tests {
             n_rows(&hits),
             1,
             "standard analyzer matches the non-ASCII term"
+        );
+
+        // A column declared without an analyzer gets `standard`, so it
+        // behaves like the explicit table above rather than the ascii one.
+        let default_tbl = conn
+            .create_table("dflt", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create default table");
+        default_tbl
+            .append(&build_title_batch(&["café latte"]))
+            .expect("append");
+        let default_hits = default_tbl
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&default_hits),
+            1,
+            "a bare declaration keeps the non-ASCII term"
         );
 
         // An unknown analyzer is a configuration error at create time.
@@ -1729,6 +1757,53 @@ mod tests {
         assert_eq!(
             body_cafe, 0,
             "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_table_rejects_a_record_missing_its_analyzer_names() {
+        // The analyzer names are what let a reopened table tokenize query
+        // text the way its postings were built. A record that has full-text
+        // columns but no name for one of them cannot be reopened
+        // correctly, so `open_table` says so and names the table instead
+        // of picking an analyzer and returning wrong results.
+        let dir = std::env::temp_dir().join(format!("infino-noanalyzer-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+        let schema = schema_title_body();
+        {
+            let conn = connect(&uri).expect("connect");
+            conn.create_table(
+                "docs",
+                schema.clone(),
+                IndexSpec::new().fts("title").fts("body"),
+            )
+            .expect("create_table");
+        }
+        // Strip the analyzer list from the stored record, the shape a
+        // record written before analyzers were recorded per column has.
+        let catalog_file = dir.join(CATALOG_PATH);
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_file).expect("read catalog"))
+                .expect("catalog json");
+        body["tables"]["docs"]
+            .as_object_mut()
+            .expect("table entry")
+            .remove("fts_analyzers");
+        fs::write(
+            &catalog_file,
+            serde_json::to_vec(&body).expect("encode catalog"),
+        )
+        .expect("write catalog");
+
+        let conn = connect(&uri).expect("reconnect");
+        let err = conn.open_table("docs").expect_err("incomplete record");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docs"), "must name the table: {rendered}");
+        assert!(
+            rendered.contains("analyzer"),
+            "must say what is missing: {rendered}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
