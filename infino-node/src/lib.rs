@@ -520,7 +520,7 @@ pub struct VectorFilter {
 #[derive(Clone, Default)]
 pub struct IndexSpec {
     /// `(column, analyzer, stored)`; `analyzer` `None` means the default.
-    fts: Vec<(String, Option<String>, bool)>,
+    fts: Vec<(String, Option<String>, bool, Option<f64>, Option<f64>)>,
     /// `(column, dim, metric)`.
     vectors: Vec<(String, u32, String)>,
 }
@@ -539,6 +539,14 @@ pub struct FtsOptions {
     /// it cannot be selected, projected, or filtered on (append/update
     /// batches still carry it).
     pub stored: Option<bool>,
+    /// BM25 term-frequency saturation, `> 0`; defaults to 1.2. Recorded
+    /// with the table, and the stored score bounds are built with it,
+    /// so a search that does not override it pays nothing. Pass with
+    /// `b` or not at all.
+    pub k1: Option<f64>,
+    /// BM25 length normalization, in `[0, 1]`; defaults to 0.75. Pass
+    /// with `k1` or not at all.
+    pub b: Option<f64>,
 }
 
 #[napi]
@@ -549,13 +557,18 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed,
-    /// with optional per-column `options` (analyzer, stored).
+    /// with optional per-column `options` (analyzer, stored, k1/b).
     #[napi]
     pub fn fts(&self, column: String, options: Option<FtsOptions>) -> Self {
         let mut next = self.clone();
         let opts = options.unwrap_or_default();
-        next.fts
-            .push((column, opts.analyzer, opts.stored.unwrap_or(true)));
+        next.fts.push((
+            column,
+            opts.analyzer,
+            opts.stored.unwrap_or(true),
+            opts.k1,
+            opts.b,
+        ));
         next
     }
 
@@ -574,10 +587,21 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> Result<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for (column, analyzer, stored) in &self.fts {
+        for (column, analyzer, stored, k1, b) in &self.fts {
             let mut field = infino::FtsField::new(column.clone()).stored(*stored);
             if let Some(a) = analyzer {
                 field = field.analyzer(a.clone());
+            }
+            // Both or neither: the two parameters interact through the
+            // length norm, so half-overriding is a footgun.
+            match (k1, b) {
+                (Some(k1), Some(b)) => field = field.bm25(*k1 as f32, *b as f32),
+                (None, None) => {}
+                _ => {
+                    return Err(napi::Error::from_reason(
+                        "IndexSpec.fts: pass k1 and b together, or neither",
+                    ));
+                }
             }
             spec = spec.fts(field);
         }
@@ -730,7 +754,16 @@ impl Table {
     /// `["_id", "score"]` for just id + score, or omit for full rows.
     /// `score` is a similarity (higher is better) — opposite direction
     /// from `vectorSearch`'s distance. Fuse with `hybridSearch`.
+    ///
+    /// `k1` / `b` override the columns' declared BM25 similarity
+    /// parameters for this search only — pass both or neither. The
+    /// stored score bounds belong to the declared pair, so the reader
+    /// corrects them for the difference: results stay exact and only
+    /// pruning power is traded, and nothing is rebuilt. A pair you mean
+    /// to keep belongs on the column (`IndexSpec.fts`), where the
+    /// bounds are built with it and the correction disappears.
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn bm25_search(
         &self,
         column: String,
@@ -739,10 +772,21 @@ impl Table {
         mode: Option<String>,
         stats: Option<String>,
         projection: Option<Vec<String>>,
+        k1: Option<f64>,
+        b: Option<f64>,
     ) -> Result<Buffer> {
-        let opts = Bm25SearchOptions::new()
+        let mut opts = Bm25SearchOptions::new()
             .with_mode(parse_mode(mode.as_deref())?)
             .with_stats(parse_stats(stats.as_deref())?);
+        opts = match (k1, b) {
+            (Some(k1), Some(b)) => opts.with_bm25(k1 as f32, b as f32),
+            (None, None) => opts,
+            _ => {
+                return Err(napi::Error::from_reason(
+                    "bm25Search: pass k1 and b together, or neither",
+                ));
+            }
+        };
         let proj: Option<Vec<&str>> = projection
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());

@@ -44,7 +44,10 @@ use infino::{
         },
     },
     supertable::{Supertable, SupertableOptions, query::SuperfileHit},
-    test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer, schema_id_title},
+    test_helpers::{
+        brute_force_bm25::{BruteForceBm25, OracleBm25Params},
+        default_tokenizer, schema_id_title,
+    },
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -171,6 +174,42 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
     st
 }
 
+/// Same fixture, but every FTS column declares `params` — so the build
+/// bakes its block-max bounds at that pair and the reader scores with
+/// it.
+fn build_supertable_with_params(
+    corpus: &[(u64, String)],
+    n_superfiles: usize,
+    params: OracleBm25Params,
+) -> Supertable {
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("pool"),
+    );
+    let opts = SupertableOptions::new(
+        schema_id_title(),
+        vec![FtsConfig::new("title").bm25(params.k1, params.b)],
+        vec![],
+    )
+    .expect("opts")
+    .with_writer_pool(pool);
+
+    let st = Supertable::create(opts).expect("create");
+    let mut w = st.writer().expect("writer");
+    let chunk_size = corpus.len().div_ceil(n_superfiles);
+    for chunk in corpus.chunks(chunk_size) {
+        let titles =
+            LargeStringArray::from(chunk.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+    st
+}
+
 /// Convert supertable hits to global doc_ids using the superfile-
 /// append order (superfile_index * chunk_size + local_doc_id).
 fn supertable_to_global_ids(
@@ -260,6 +299,19 @@ fn supertable_prefix_global(
 /// Build a per-superfile BruteForceBm25 oracle list. Index i scores
 /// superfile i with that superfile's own IDF/avgdl, mirroring the
 /// supertable's per-superfile scoring shape.
+/// Per-superfile oracles that score with `params` rather than the
+/// standard pair — the reference side of a declared-parameter fixture.
+fn build_oracles_with_params(
+    corpus: &[(u64, String)],
+    n_superfiles: usize,
+    params: OracleBm25Params,
+) -> Vec<BruteForceBm25> {
+    build_oracles(corpus, n_superfiles)
+        .into_iter()
+        .map(|o| o.with_params(params))
+        .collect()
+}
+
 fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForceBm25> {
     let tok = default_tokenizer();
     let chunk_size = corpus.len().div_ceil(n_superfiles);
@@ -350,6 +402,90 @@ static STANDARD_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
     let oracles = build_oracles(&corp, SUPERFILES);
     StandardFixture { infino, oracles }
 });
+
+/// The same corpus with a declared, non-standard BM25 pair on both
+/// sides. The engine bakes its block-max bounds at this pair and scores
+/// with it; the oracle uses the identical formula, so a divergence is a
+/// real disagreement rather than two different similarity functions.
+const DECLARED_PARAMS: OracleBm25Params = OracleBm25Params { k1: 1.6, b: 0.4 };
+
+static DECLARED_PARAM_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
+    let corp = corpus_with_prefix_terms();
+    let infino = build_supertable_with_params(&corp, SUPERFILES, DECLARED_PARAMS);
+    let oracles = build_oracles_with_params(&corp, SUPERFILES, DECLARED_PARAMS);
+    StandardFixture { infino, oracles }
+});
+
+// ---- Tests: declared BM25 parameters ---------------------------------
+
+/// A column that declares a non-standard pair must rank exactly as the
+/// reference implementation does at the same pair — across the query
+/// shapes that exercise different kernels (single rare, single common,
+/// multi-term union).
+#[test]
+fn oracle_declared_bm25_params_match_across_query_shapes() {
+    let f = &*DECLARED_PARAM_FIXTURE;
+    for (label, query, k, head) in [
+        (
+            "declared_single_rare",
+            "rare-token-zzz",
+            ORACLE_TOP_K_SMALL,
+            1,
+        ),
+        ("declared_single_common", "rust", ORACLE_TOP_K, 3),
+        ("declared_two_term_or", "rust async", ORACLE_TOP_K, 2),
+    ] {
+        let inf_hits = supertable_search_global(&f.infino, query, k, CHUNK_SIZE);
+        let ora_hits = brute_force_top_k(&f.oracles, query, k);
+        assert_top_k_sets_match(label, inf_hits, ora_hits, head);
+    }
+}
+
+/// A query-time override on a *standard* table must rank as the
+/// reference does at the override's pair. This is the pruning-correction
+/// path: the stored bounds belong to 1.2 / 0.75, so every bound is
+/// inflated by the correction factor, and a factor that came out too
+/// small would drop a qualifying doc and show up here as a set
+/// mismatch.
+#[test]
+fn oracle_query_time_override_matches_the_reference_at_that_pair() {
+    let f = &*STANDARD_FIXTURE;
+    let corp = corpus_with_prefix_terms();
+    for params in [
+        OracleBm25Params { k1: 1.6, b: 0.4 },
+        OracleBm25Params { k1: 0.6, b: 0.9 },
+        OracleBm25Params { k1: 1.2, b: 0.0 },
+    ] {
+        let oracles = build_oracles_with_params(&corp, SUPERFILES, params);
+        for (query, k, head) in [
+            ("rare-token-zzz", ORACLE_TOP_K_SMALL, 1),
+            ("rust", ORACLE_TOP_K, 3),
+            ("rust async", ORACLE_TOP_K, 2),
+        ] {
+            let hits = f
+                .infino
+                .reader()
+                .expect("reader")
+                .bm25_hits(
+                    "title",
+                    query,
+                    k,
+                    infino::Bm25SearchOptions::new()
+                        .with_stats(Bm25Stats::PerSuperfile)
+                        .with_bm25(params.k1, params.b),
+                )
+                .expect("bm25 with override");
+            let inf_hits = supertable_to_global_ids(&f.infino, hits, CHUNK_SIZE);
+            let ora_hits = brute_force_top_k(&oracles, query, k);
+            assert_top_k_sets_match(
+                &format!("override_k1={}_b={}_{query}", params.k1, params.b),
+                inf_hits,
+                ora_hits,
+                head,
+            );
+        }
+    }
+}
 
 // ---- Tests: query-shape coverage -------------------------------------
 

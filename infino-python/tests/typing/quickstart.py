@@ -35,6 +35,15 @@ def quickstart() -> None:
     hits = docs.bm25_search("title", "fox", k=10, mode="and")
     names: list[str] = hits.column_names
 
+    # The BM25 pair: declared per column, and overridable per search.
+    tuned = db.create_table(
+        "tuned",
+        schema,
+        infino.IndexSpec().fts("title", k1=1.4, b=0.6),
+    )
+    retuned = tuned.bm25_search("title", "fox", k=10, k1=1.2, b=0.75)
+    _ = retuned.column_names
+
     counts = db.query_sql("SELECT COUNT(*) AS n FROM docs")
     tables: list[str] = db.list_tables()
     _ = (names, counts, tables)
