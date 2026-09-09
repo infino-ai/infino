@@ -3502,6 +3502,196 @@ mod tests {
         st
     }
 
+    /// Phrase and must-clause queries route through kernels the
+    /// single-term and union tests never touch — the phrase cursor
+    /// composes its members' idfs and its own term-level bound, and a
+    /// `+must` clause runs the ranked-AND membership walk. Both read
+    /// stored bounds, so both have to see the correction; the check is
+    /// that a declared pair and the same pair reached by override agree
+    /// document-for-document and score-for-score.
+    #[test]
+    fn declared_and_overridden_pairs_agree_on_phrase_and_must_kernels() {
+        const K1: f32 = 1.6;
+        const B: f32 = 0.4;
+
+        // One table baked at the pair, one baked at the defaults and
+        // queried with the pair as an override.
+        let baked = {
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            );
+            let opts = SupertableOptions::new(
+                schema_id_title(),
+                vec![FtsConfig::new("title").positions(true).bm25(K1, B)],
+                vec![],
+            )
+            .expect("valid options")
+            .with_writer_pool(pool);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(0, &["new york city", "the new york times"]))
+                .expect("append");
+            w.commit().expect("commit");
+            w.append(&build_batch(10, &["york loves new haven", "big new york"]))
+                .expect("append");
+            w.commit().expect("commit");
+            st
+        };
+        let standard = seeded_phrase_supertable();
+
+        let hits = |st: &Supertable, query: &str, opts: Bm25SearchOptions| {
+            st.reader()
+                .expect("reader")
+                .bm25_hits("title", query, 10, opts)
+                .expect("bm25 hits")
+        };
+
+        for query in [r#""new york""#, "+new +york", r#""new york" city"#] {
+            let from_declared = hits(
+                &baked,
+                query,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            );
+            let from_override = hits(
+                &standard,
+                query,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_bm25(K1, B),
+            );
+            assert!(
+                !from_declared.is_empty(),
+                "{query} must match something for the comparison to mean anything"
+            );
+            assert_eq!(
+                from_declared.len(),
+                from_override.len(),
+                "hit count diverged for {query}"
+            );
+            for (a, b) in from_declared.iter().zip(from_override.iter()) {
+                assert_eq!(
+                    a.local_doc_id, b.local_doc_id,
+                    "doc order diverged for {query}"
+                );
+                assert!(
+                    (a.score - b.score).abs() < 1e-4,
+                    "score diverged for {query}: {} vs {}",
+                    a.score,
+                    b.score
+                );
+            }
+        }
+    }
+
+    /// The correction factor composes with the idf rescale — the shipped
+    /// factor is `(idf / local_idf) · R`, and global statistics are the
+    /// default, so the composed form is the common path rather than an
+    /// edge case. Under either statistics scope, an override must agree
+    /// with a table baked at that pair.
+    #[test]
+    fn the_override_composes_with_either_statistics_scope() {
+        const K1: f32 = 0.7;
+        const B: f32 = 0.9;
+
+        let baked = {
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            );
+            let opts = SupertableOptions::new(
+                schema_id_title(),
+                vec![FtsConfig::new("title").bm25(K1, B)],
+                vec![],
+            )
+            .expect("valid options")
+            .with_writer_pool(pool);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(
+                0,
+                &["the quick brown fox", "a lazy dog", "quick thinking"],
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+            st
+        };
+        let standard = seeded_three_doc_supertable();
+
+        for stats in [Bm25Stats::Global, Bm25Stats::PerSuperfile] {
+            let declared = baked
+                .reader()
+                .expect("reader")
+                .bm25_hits(
+                    "title",
+                    "quick",
+                    10,
+                    Bm25SearchOptions::new().with_stats(stats),
+                )
+                .expect("declared");
+            let overridden = standard
+                .reader()
+                .expect("reader")
+                .bm25_hits(
+                    "title",
+                    "quick",
+                    10,
+                    Bm25SearchOptions::new().with_stats(stats).with_bm25(K1, B),
+                )
+                .expect("overridden");
+            assert_eq!(declared.len(), overridden.len(), "{stats:?}: hit count");
+            for (a, b) in declared.iter().zip(overridden.iter()) {
+                assert!(
+                    (a.score - b.score).abs() < 1e-4,
+                    "{stats:?}: score diverged {} vs {}",
+                    a.score,
+                    b.score
+                );
+            }
+        }
+    }
+
+    /// A small `k` fills the top-k heap and engages the block-max skips;
+    /// a `k` covering the whole match set does not. Under an override
+    /// every stored bound is inflated by the correction factor, so a
+    /// factor that came out too small would skip a block holding a
+    /// qualifying document — visible only as the small-`k` result
+    /// disagreeing with the head of the unpruned one.
+    #[test]
+    fn an_override_prunes_without_dropping_hits() {
+        let st = seeded_three_doc_supertable();
+        let r = st.reader().expect("reader");
+        const K_ALL: usize = 1000;
+
+        for (k1, b) in [(1.6_f32, 0.4_f32), (0.5, 0.9), (1.2, 0.0), (2.0, 1.0)] {
+            let opts = || {
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_bm25(k1, b)
+            };
+            let unpruned = r
+                .bm25_hits("title", "quick brown", K_ALL, opts())
+                .expect("unpruned");
+            for k in [1usize, 2] {
+                let pruned = r
+                    .bm25_hits("title", "quick brown", k, opts())
+                    .expect("pruned");
+                let want = k.min(unpruned.len());
+                assert_eq!(pruned.len(), want, "k={k} at k1={k1} b={b}");
+                for (i, hit) in pruned.iter().enumerate() {
+                    assert_eq!(
+                        hit.local_doc_id, unpruned[i].local_doc_id,
+                        "k={k} at k1={k1} b={b}: pruning changed the top-{k} head"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn phrase_query_end_to_end() {
         let st = seeded_phrase_supertable();
