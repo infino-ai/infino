@@ -174,7 +174,7 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 
 ![Vector search p99 vs vector databases, VectorDBBench Cohere 1M](docs/assets/readme/compare-vdb.svg)
 
-[VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
+[VectorDBBench](https://vdbbench-viewer-q6unoyyhua-uc.a.run.app/results)
 ([Repro](https://github.com/infino-ai/retrievalbench))
 
 ![Quantized vector indexes vs embedded libraries, dbpedia-1536 100K, same queries and ground truth](docs/assets/readme/compare-embedded.svg)
