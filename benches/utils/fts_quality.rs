@@ -33,7 +33,7 @@
 //! | column | definition |
 //! |---|---|
 //! | recall vs BM25 | engine top-k under `Global` graded against T — the user-facing quality, including the quantization and avgdl costs |
-//! | recall (default stats) | the same under `PerSuperfile` — the default mode's sharded-idf drift |
+//! | recall (per-superfile stats) | the same under `PerSuperfile` — the opt-in mode's sharded-idf drift |
 //! | recall vs engine BM25 | engine top-k under `Global` graded against Q, a hit allowed to fall short of the k-th score by the avgdl residual — must be ≈ 1.0; a drop is a kernel or pruning bug. **Gated.** |
 //! | max score Δ | largest relative gap between an engine score and Q for the same document (`Global`). **Gated** at the avgdl residual. |
 //!

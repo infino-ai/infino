@@ -77,8 +77,8 @@ pub(crate) struct ClauseLists<'a> {
     pub must_phrases: &'a [Vec<String>],
     pub should_phrases: &'a [Vec<String>],
     pub negative_phrases: &'a [Vec<String>],
-    /// Per-term global idf for [`Bm25Stats::Global`]; `None` scores
-    /// with per-superfile local idf (the default).
+    /// Per-term global idf for [`Bm25Stats::Global`], the default;
+    /// `None` scores with [`Bm25Stats::PerSuperfile`] local idf.
     pub global_idf: Option<&'a GlobalTermIdf>,
     /// Open-wave fetches for the scored terms (global stats): the
     /// cursor builds serve these terms from the memo instead of

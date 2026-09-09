@@ -10673,7 +10673,7 @@ mod tests {
     /// corpus-wide document count and per-term document frequencies are
     /// gathered across every superfile before scoring, so a term's idf —
     /// and a doc's score — does not depend on which superfile the doc
-    /// landed in. The default per-superfile mode never runs that gather;
+    /// landed in. The opt-in per-superfile mode never runs that gather;
     /// this is the global mode's only end-to-end exercise.
     #[test]
     fn bm25_global_stats_scores_across_superfiles() {
