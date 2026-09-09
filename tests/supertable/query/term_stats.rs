@@ -116,8 +116,9 @@ fn global_hits(st: &Supertable, query: &str, mode: BoolMode) -> Vec<(String, f32
             "title",
             query,
             TOP_K,
-            mode,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(mode)
+                .with_stats(Bm25Stats::Global),
             Some(&["title", "score"]),
         )
         .expect("bm25_search");
@@ -145,7 +146,14 @@ fn planned_ranges(st: &Supertable, query: &str, mode: BoolMode, stats: Bm25Stats
     let (hits, op) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats("title", query, TOP_K, mode, stats)
+            .bm25_hits(
+                "title",
+                query,
+                TOP_K,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(mode)
+                    .with_stats(stats),
+            )
             .expect("bm25")
     });
     assert!(!hits.is_empty(), "fixture query {query:?} must match");

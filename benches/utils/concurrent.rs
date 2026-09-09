@@ -47,7 +47,6 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::{Bm25Stats, BoolMode},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{Supertable, SupertableOptions},
@@ -327,8 +326,7 @@ async fn reader_loop(
                     QUERY_FIELD,
                     QUERY_TERM,
                     TOP_K,
-                    BoolMode::Or,
-                    Bm25Stats::default(),
+                    infino::Bm25SearchOptions::new(),
                     None,
                 )
                 .expect("bm25_search"),

@@ -210,7 +210,12 @@ fn supertable_search_stats(
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits_stats("title", query, k, BoolMode::Or, stats)
+        .bm25_hits(
+            "title",
+            query,
+            k,
+            infino::Bm25SearchOptions::new().with_stats(stats),
+        )
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -224,7 +229,14 @@ fn supertable_search_and_global(
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits_stats("title", query, k, BoolMode::And, Bm25Stats::PerSuperfile)
+        .bm25_hits(
+            "title",
+            query,
+            k,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::And)
+                .with_stats(Bm25Stats::PerSuperfile),
+        )
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -774,7 +786,14 @@ fn skip_path_hits(st: &Supertable, k: usize, chunk_size: usize) -> Vec<(u64, f32
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits_stats("title", "common", k, BoolMode::Or, Bm25Stats::Global)
+        .bm25_hits(
+            "title",
+            "common",
+            k,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
+        )
         .expect("single-term global search");
     let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
     supertable_to_global_ids(st, hits, chunk_size)

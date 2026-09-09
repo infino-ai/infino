@@ -47,7 +47,6 @@ use arrow_array::RecordBatch;
 use chrono::Utc;
 use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::fts::reader::{Bm25Stats, BoolMode},
     supertable::{
         Supertable,
         wal::{
@@ -249,8 +248,7 @@ fn measure_fts(st: &Supertable) -> Duration {
             "title",
             QUERY_TERM,
             TOP_K,
-            BoolMode::Or,
-            Bm25Stats::default(),
+            infino::Bm25SearchOptions::new(),
             None,
         )
         .expect("fts");
@@ -265,8 +263,7 @@ fn measure_fts(st: &Supertable) -> Duration {
                 black_box("title"),
                 black_box(QUERY_TERM),
                 black_box(TOP_K),
-                BoolMode::Or,
-                Bm25Stats::default(),
+                infino::Bm25SearchOptions::new(),
                 None,
             )
             .expect("fts");

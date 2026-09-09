@@ -130,7 +130,12 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", "alpha", 10, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "alpha",
+            10,
+            crate::superfile::fts::reader::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("fts");
     // The "alpha" row is local doc_id 0 — verify it's filtered.
     for hit in &hits {
@@ -274,7 +279,12 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", "foo", 10, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "foo",
+            10,
+            crate::superfile::fts::reader::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("fts");
     for hit in &hits {
         assert_ne!(hit.local_doc_id, 0);

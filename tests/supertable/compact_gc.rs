@@ -132,15 +132,25 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
 
     // Spot-check three markers are queryable.
     assert_eq!(
-        r.bm25_hits("title", "alphatoken", TOP_K, BoolMode::Or)
-            .expect("query alpha")
-            .len(),
+        r.bm25_hits(
+            "title",
+            "alphatoken",
+            TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+        )
+        .expect("query alpha")
+        .len(),
         1
     );
     assert_eq!(
-        r.bm25_hits("title", "kappatoken", TOP_K, BoolMode::Or)
-            .expect("query kappa")
-            .len(),
+        r.bm25_hits(
+            "title",
+            "kappatoken",
+            TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+        )
+        .expect("query kappa")
+        .len(),
         1
     );
 
@@ -187,9 +197,14 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
     let r = st.reader().expect("reader");
     for m in &markers {
         assert_eq!(
-            r.bm25_hits("title", m, TOP_K, BoolMode::Or)
-                .expect("query after gc")
-                .len(),
+            r.bm25_hits(
+                "title",
+                m,
+                TOP_K,
+                infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+            )
+            .expect("query after gc")
+            .len(),
             1,
             "marker {m} not found after GC"
         );
@@ -261,17 +276,27 @@ fn gc_reaps_tombstone_sidecar_for_merged_away_superfile() {
 
     let r = st.reader().expect("reader");
     assert_eq!(
-        r.bm25_hits("title", "alphatoken", TOP_K, BoolMode::Or)
-            .expect("query alpha after gc")
-            .len(),
+        r.bm25_hits(
+            "title",
+            "alphatoken",
+            TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+        )
+        .expect("query alpha after gc")
+        .len(),
         0,
         "deleted row stays gone"
     );
     for m in &markers[1..] {
         assert_eq!(
-            r.bm25_hits("title", m, TOP_K, BoolMode::Or)
-                .expect("query after gc")
-                .len(),
+            r.bm25_hits(
+                "title",
+                m,
+                TOP_K,
+                infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+            )
+            .expect("query after gc")
+            .len(),
             1,
             "marker {m} not found after GC"
         );
@@ -474,8 +499,7 @@ fn gc_drops_disk_cache_copies_of_deleted_superfiles() {
             "title",
             "alpha",
             TOP_K,
-            BoolMode::Or,
-            Default::default(),
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
             None,
         )
         .expect("bm25 after gc");

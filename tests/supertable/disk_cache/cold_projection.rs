@@ -180,8 +180,9 @@ async fn cold_bm25_projection_pairs_each_hit_with_its_own_row() {
             "title",
             "fox",
             TOP_K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("cold bm25");
@@ -205,8 +206,9 @@ async fn cold_bm25_projection_pairs_each_hit_with_its_own_row() {
             "title",
             "async wolf",
             TOP_K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("cold bm25 or");

@@ -127,7 +127,14 @@ fn scoped_fts_stats(st: &Supertable, query: &str) -> OpStats {
     let (hits, stats) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats("title", query, TOP_K, BoolMode::Or, Bm25Stats::PerSuperfile)
+            .bm25_hits(
+                "title",
+                query,
+                TOP_K,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
+            )
             .expect("bm25")
     });
     assert!(!hits.is_empty(), "fixture query {query:?} must match");
@@ -155,24 +162,26 @@ fn a_scoped_bm25_query_reports_its_planned_ranges() {
     let (_, one_term) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats(
+            .bm25_hits(
                 "title",
                 "rust",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
             )
             .expect("bm25")
     });
     let (_, three_terms) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats(
+            .bm25_hits(
                 "title",
                 "rust async web",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
             )
             .expect("bm25")
     });
@@ -203,12 +212,13 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
     let (_, one_term) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats(
+            .bm25_hits(
                 "title",
                 "rust",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
             )
             .expect("bm25")
     });
@@ -221,12 +231,13 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
     let (_, three_terms) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats(
+            .bm25_hits(
                 "title",
                 "rust async web",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
             )
             .expect("bm25")
     });
@@ -261,7 +272,14 @@ fn global_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
     let (hits, stats) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats("title", q, TOP_K, mode, Bm25Stats::Global)
+            .bm25_hits(
+                "title",
+                q,
+                TOP_K,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(mode)
+                    .with_stats(Bm25Stats::Global),
+            )
             .expect("bm25")
     });
     assert!(!hits.is_empty(), "fixture query {q:?} must match");
@@ -273,7 +291,14 @@ fn per_superfile_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
     let (hits, stats) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats("title", q, TOP_K, mode, Bm25Stats::PerSuperfile)
+            .bm25_hits(
+                "title",
+                q,
+                TOP_K,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(mode)
+                    .with_stats(Bm25Stats::PerSuperfile),
+            )
             .expect("bm25")
     });
     assert!(!hits.is_empty(), "fixture query {q:?} must match");
@@ -383,7 +408,14 @@ fn a_scoped_bm25_query_reports_kernel_cpu() {
             let query = if i % 2 == 0 { "rust" } else { "rust async web" };
             st.reader()
                 .expect("reader")
-                .bm25_hits_stats("title", query, TOP_K, BoolMode::Or, Bm25Stats::PerSuperfile)
+                .bm25_hits(
+                    "title",
+                    query,
+                    TOP_K,
+                    infino::Bm25SearchOptions::new()
+                        .with_mode(BoolMode::Or)
+                        .with_stats(Bm25Stats::PerSuperfile),
+                )
                 .expect("bm25");
         }
     });
@@ -413,12 +445,13 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
     let reader = st.reader().expect("reader");
     let (hits, stats) = with_op_stats(|| {
         reader
-            .bm25_hits_stats(
+            .bm25_hits(
                 "title",
                 "rust",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
             )
             .expect("bm25")
     });
@@ -439,24 +472,26 @@ fn an_inline_df1_term_plans_no_posting_range() {
     let (_, base) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats(
+            .bm25_hits(
                 "title",
                 "rust",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
             )
             .expect("bm25")
     });
     let (_, with_inline) = with_op_stats(|| {
         st.reader()
             .expect("reader")
-            .bm25_hits_stats(
+            .bm25_hits(
                 "title",
                 "rust filler0x0",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::PerSuperfile),
             )
             .expect("bm25")
     });
@@ -572,8 +607,9 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "title",
                 "rust",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::Global,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["title"]),
             )
             .expect("projected search")
@@ -591,8 +627,9 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "title",
                 "rust",
                 TOP_K,
-                BoolMode::Or,
-                Bm25Stats::Global,
+                infino::Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 None,
             )
             .expect("bare search")

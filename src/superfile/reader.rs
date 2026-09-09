@@ -52,6 +52,7 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
+            bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
                 PreparedClauses, TermPattern,
@@ -1414,20 +1415,46 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
+        bm25: Option<Bm25Params>,
     ) -> Result<PreparedClauses, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.prepare_clauses(column, lists, k, floor).await?)
     }
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched.
-    pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, ReadError> {
+    ///
+    /// `bm25` must be the same override the paired `prepare_clauses`
+    /// was given: the cursors carry `idf · (k1 + 1)` from the pair they
+    /// were built with, and scoring divides by a norm table derived
+    /// from the same pair. `with_bm25_override` is deterministic, so
+    /// two separately-derived views of one pair agree bit for bit.
+    pub(crate) fn run_prepared(
+        &self,
+        prep: PreparedClauses,
+        bm25: Option<Bm25Params>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self.fts_scored(bm25)?;
+        Ok(fts.run_prepared(prep)?)
+    }
+
+    /// The FTS reader a scored query should read through: this
+    /// superfile's own, or a view of it that scores with `bm25`
+    /// instead of what each column declared.
+    ///
+    /// Borrowed when there is no override, which is the default path
+    /// and costs nothing. An override clones the reader — an `Arc` bump
+    /// for the blob plus one 1 KiB decode table per column whose pair
+    /// actually differs — and records the factor that keeps each
+    /// column's stored bounds upper bounds under the new pair.
+    fn fts_scored(&self, bm25: Option<Bm25Params>) -> Result<Cow<'_, FtsReader>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.run_prepared(prep)?)
+        Ok(match bm25 {
+            Some(params) => Cow::Owned(fts.with_bm25_override(params)),
+            None => Cow::Borrowed(fts),
+        })
     }
 
     /// Prefix-expanded BM25 search.
@@ -1598,10 +1625,9 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        bm25: Option<Bm25Params>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
     }
 
@@ -1626,7 +1652,16 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let set = self.bm25_prefix_cursor_set(column, prefix, pool).await?;
-        self.bm25_search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, f32::NEG_INFINITY)
+        // Prefix search has no search-options surface, so columns score
+        // with the pair they declared.
+        self.bm25_search_or_range_prebuilt(
+            &set,
+            k,
+            doc_id_start,
+            doc_id_end,
+            f32::NEG_INFINITY,
+            None,
+        )
     }
 
     /// Multi-column BM25 search with per-column weights ("most

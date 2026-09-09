@@ -199,7 +199,12 @@ fn run_bm25(st: &Supertable) -> Vec<(String, u32)> {
     hit_key(
         &st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust", K, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "rust",
+                K,
+                infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("bm25"),
     )
 }

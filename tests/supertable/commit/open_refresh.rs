@@ -142,7 +142,12 @@ fn strong_consistency_query_sees_another_writers_new_commit() {
     let hits = consumer
         .reader()
         .expect("reader")
-        .bm25_hits("title", "added", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "added",
+            BM25_TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("query under strong consistency");
     assert!(!hits.is_empty(), "strong query must see the v2 row");
     assert_eq!(consumer.manifest_id(), 2);
@@ -187,7 +192,12 @@ fn strong_consistency_query_is_stable_when_pointer_unchanged() {
     let _ = consumer
         .reader()
         .expect("reader")
-        .bm25_hits("title", "only", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "only",
+            BM25_TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("query");
     assert_eq!(consumer.manifest_id(), 1);
 }
@@ -210,7 +220,12 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", "anything", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "anything",
+            BM25_TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("query on uncommitted table");
     assert!(hits.is_empty());
     assert_eq!(st.manifest_id(), 0);

@@ -186,7 +186,12 @@ async fn fts_query_excludes_tombstoned_row() {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "alpha",
+            BM25_TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("fts");
     assert_eq!(hits.len(), 2, "tombstoned row must be excluded");
     for hit in &hits {
@@ -808,8 +813,9 @@ fn tombstoned_superfile_does_not_raise_the_shared_phrase_floor() {
                     "title",
                     "\"alpha beta\"",
                     FLOOR_TOP_K,
-                    BoolMode::Or,
-                    stats,
+                    infino::Bm25SearchOptions::new()
+                        .with_mode(BoolMode::Or)
+                        .with_stats(stats),
                     Some(&["title"]),
                 )
                 .expect("phrase search");

@@ -134,8 +134,9 @@ fn bm25_exact_term_loads_only_the_matching_part() {
             "title",
             "echo",
             BM25_TOP_K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("bm25");
@@ -186,8 +187,9 @@ fn bm25_term_in_no_part_loads_nothing() {
             "title",
             "zoo",
             BM25_TOP_K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("bm25");
@@ -871,8 +873,9 @@ fn eager_mode_query_paths_observationally_unchanged() {
             "title",
             "alpha",
             BM25_TOP_K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("bm25");

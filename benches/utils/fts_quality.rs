@@ -647,7 +647,15 @@ fn engine_hits(
     stats: Bm25Stats,
 ) -> Vec<EngineHit> {
     let batches = reader
-        .bm25_search(column, q.query, k, q.mode, stats, Some(&[column, "score"]))
+        .bm25_search(
+            column,
+            q.query,
+            k,
+            infino::Bm25SearchOptions::new()
+                .with_mode(q.mode)
+                .with_stats(stats),
+            Some(&[column, "score"]),
+        )
         .expect("quality bm25_search");
     let mut hits = Vec::with_capacity(k);
     for batch in &batches {

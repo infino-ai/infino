@@ -123,9 +123,10 @@ use crate::{
         error::{FtsError, ReadError},
         fts::{
             bm25,
+            bm25::Bm25Params,
             reader::{
-                Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf, LiveFloor,
-                OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
+                Bm25SearchOptions, Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf,
+                LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
             },
         },
     },
@@ -414,16 +415,44 @@ impl SupertableReader {
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
+    /// Reject an out-of-range query-time override before the fan-out
+    /// starts. A declared pair is validated at `create_table`; this is
+    /// the same check for the per-search form, so a caller sees the
+    /// bounds rather than a silently strange ranking.
+    fn validate_bm25_override(p: Bm25Params) -> Result<(), QueryError> {
+        let (k1, b) = (p.k1, p.b);
+        match k1.is_finite() && k1 > 0.0 && b.is_finite() && (0.0..=1.0).contains(&b) {
+            true => Ok(()),
+            false => Err(QueryError::InvalidQuery(format!(
+                "bm25 k1 must be finite and > 0, b must be finite and in [0, 1]; \
+                 got k1={k1}, b={b}"
+            ))),
+        }
+    }
+
     pub(crate) async fn bm25_search_async(
         &self,
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: Bm25SearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 {
             return Ok(Vec::new());
+        }
+        // Destructured once here rather than threaded as three
+        // positionals: `mode` shapes the clause split, `stats` selects
+        // the idf source, and `bm25` — when set — overrides what each
+        // column declared, which every per-superfile reader below has
+        // to apply identically or two superfiles would score one query
+        // two ways.
+        let Bm25SearchOptions {
+            mode,
+            stats,
+            bm25: bm25_override,
+        } = opts;
+        if let Some(p) = bm25_override {
+            Self::validate_bm25_override(p)?;
         }
         let manifest = self.manifest();
         let pool_threads = manifest.options.reader_pool.current_num_threads();
@@ -721,6 +750,7 @@ impl SupertableReader {
                                             start,
                                             end,
                                             floor,
+                                            bm25_override,
                                         )
                                     })
                                 },
@@ -730,7 +760,14 @@ impl SupertableReader {
                             .map_err(fts_read_error)?
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
-                                r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
+                                r.bm25_search_or_range_prebuilt(
+                                    set,
+                                    k,
+                                    start,
+                                    end,
+                                    floor,
+                                    bm25_override,
+                                )
                             })
                             .map_err(fts_read_error)?
                         }
@@ -756,6 +793,7 @@ impl SupertableReader {
                                 },
                                 k,
                                 floor,
+                                bm25_override,
                             )
                             .await
                             .map_err(fts_read_error)?;
@@ -787,7 +825,7 @@ impl SupertableReader {
                                     "un-ranged fts kernel: reader pool dropped result",
                                     move || {
                                         op_stats::timed_kernel(&kernel_stats, || {
-                                            kernel_reader.run_prepared(prep)
+                                            kernel_reader.run_prepared(prep, bm25_override)
                                         })
                                     },
                                 )
@@ -795,8 +833,10 @@ impl SupertableReader {
                                 .map_err(|e| QueryError::Execute(e.to_string()))?
                                 .map_err(fts_read_error)?
                             }
-                            prep => op_stats::timed_kernel(&op_stats, || r.run_prepared(prep))
-                                .map_err(fts_read_error)?,
+                            prep => op_stats::timed_kernel(&op_stats, || {
+                                r.run_prepared(prep, bm25_override)
+                            })
+                            .map_err(fts_read_error)?,
                         }
                     }
                 };
@@ -1116,6 +1156,13 @@ impl SupertableReader {
                                             start,
                                             end,
                                             f32::NEG_INFINITY,
+                                            // Prefix search takes no
+                                            // search options yet, so
+                                            // there is no pair to
+                                            // override with; columns
+                                            // score with what they
+                                            // declared.
+                                            None,
                                         )
                                     })
                                 },
@@ -1131,6 +1178,7 @@ impl SupertableReader {
                                     start,
                                     end,
                                     f32::NEG_INFINITY,
+                                    None,
                                 )
                             })
                             .map_err(fts_read_error)
@@ -1721,15 +1769,12 @@ impl SupertableReader {
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
-            let hits = self
-                .bm25_search_async(column, query, k, mode, stats)
-                .await?;
+            let hits = self.bm25_search_async(column, query, k, opts).await?;
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
@@ -1756,30 +1801,20 @@ impl SupertableReader {
     /// `climate`, ranking those that also mention `policy` higher)
     /// and a plain union when none does. A query with only negated
     /// terms is an error.
+    ///
+    /// Takes the same [`Bm25SearchOptions`] as
+    /// [`bm25_search`](Self::bm25_search) — the statistics scope a
+    /// separate `bm25_hits_stats` used to exist for is one of its
+    /// fields, so the two collapsed into this.
     pub fn bm25_hits(
         &self,
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-    ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.bm25_hits_stats(column, query, k, mode, Bm25Stats::default())
-    }
-
-    /// [`bm25_hits`](Self::bm25_hits) with an explicit statistics
-    /// scope. Callers that pin mode-specific behavior (the
-    /// per-superfile fan shape, or local-idf scoring parity) select it
-    /// here instead of relying on the crate default.
-    pub fn bm25_hits_stats(
-        &self,
-        column: &str,
-        query: &str,
-        k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: Bm25SearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.bm25_search_async(column, query, k, mode, stats))
+        self.block_on(self.bm25_search_async(column, query, k, opts))
     }
 
     /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
@@ -2081,13 +2116,12 @@ impl Supertable {
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        debug!(column, k, mode = ?mode, "bm25_search");
+        debug!(column, k, mode = ?opts.mode, "bm25_search");
         self.reader()?
-            .bm25_search(column, query, k, mode, stats, projection)
+            .bm25_search(column, query, k, opts, projection)
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("bm25_search", None))
     }
@@ -2216,7 +2250,7 @@ mod tests {
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-            fts::reader::top_k_initial_capacity,
+            fts::reader::{Bm25SearchOptions, top_k_initial_capacity},
             vector::layout::VectorLayout,
         },
         supertable::{
@@ -2317,8 +2351,9 @@ mod tests {
                 "title",
                 query,
                 k,
-                BoolMode::Or,
-                stats,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(stats),
                 Some(&["title", "score"]),
             )
             .expect("bm25_search");
@@ -2781,13 +2816,23 @@ mod tests {
 
         let r = st.reader().expect("reader");
         let hits = r
-            .bm25_hits("title", "alpha -beta", 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "alpha -beta",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("negation search");
         assert_eq!(hits.len(), 2, "alpha minus beta: {hits:?}");
 
         // Positive-only stays untouched: all three alpha docs.
         let hits = r
-            .bm25_hits("title", "alpha", 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "alpha",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("positive search");
         assert_eq!(hits.len(), 3);
     }
@@ -2810,7 +2855,12 @@ mod tests {
 
         let r = st.reader().expect("reader");
         let hits = r
-            .bm25_hits("title", "alpha -delta", 10, BoolMode::And)
+            .bm25_hits(
+                "title",
+                "alpha -delta",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::And),
+            )
             .expect("negation search");
         assert_eq!(hits.len(), 2, "alpha minus delta: {hits:?}");
     }
@@ -2823,7 +2873,12 @@ mod tests {
         w.commit().expect("commit");
 
         let r = st.reader().expect("reader");
-        let res = r.bm25_hits("title", "-alpha", 10, BoolMode::Or);
+        let res = r.bm25_hits(
+            "title",
+            "-alpha",
+            10,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        );
         assert!(res.is_err(), "negation-only must error; got {res:?}");
     }
 
@@ -2865,7 +2920,12 @@ mod tests {
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         let r = st.reader().expect("reader");
         let hits = r
-            .bm25_hits("title", "rust", 5, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "rust",
+                5,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -2883,8 +2943,9 @@ mod tests {
                 "title",
                 "rust",
                 5,
-                BoolMode::Or,
-                Bm25Stats::Global,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["title", "does_not_exist"]),
             )
             .expect_err("unknown projection column must error");
@@ -2922,7 +2983,12 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader().expect("reader");
         let hits = r
-            .bm25_hits("title", "rust", 0, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "rust",
+                0,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("query");
         assert!(hits.is_empty());
     }
@@ -2944,7 +3010,12 @@ mod tests {
         w.commit().expect("commit");
         let r = st.reader().expect("reader");
         let hits = r
-            .bm25_hits("title", "rust", 4, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "rust",
+                4,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("query");
         // Should return 3 hits (the python doc has no `rust`).
         assert_eq!(hits.len(), 3);
@@ -2966,7 +3037,12 @@ mod tests {
         let r = st.reader().expect("reader");
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
-            .bm25_hits("title", "rust", 5, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "rust",
+                5,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("query");
         assert_eq!(hits.len(), 2);
         // Both superfile URIs should appear.
@@ -3029,7 +3105,12 @@ mod tests {
 
         let st_reader = st.reader().expect("reader");
         let st_hits = st_reader
-            .bm25_hits("title", "nimblefox", 5, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "nimblefox",
+                5,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
         // Resolve supertable hits to global doc-ids via superfile
@@ -3141,7 +3222,12 @@ mod tests {
 
         let r = st.reader().expect("reader");
         let err = r
-            .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
+            .bm25_hits(
+                "missing_column",
+                "rust",
+                5,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect_err("expected error");
         assert!(matches!(err, QueryError::InvalidQuery(_)), "got {err:?}");
         let msg = err.to_string();
@@ -3168,7 +3254,12 @@ mod tests {
         }
         let r = st.reader().expect("reader");
         let hits = r
-            .bm25_hits("title", "rust", 2, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "rust",
+                2,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("query");
         assert_eq!(hits.len(), 2);
     }
@@ -3185,13 +3276,111 @@ mod tests {
         st
     }
 
+    /// The override has to survive the whole path — public options,
+    /// `bm25_search_async`, the per-superfile fan-out, both the prepare
+    /// and the score halves — and it is only observable through scores,
+    /// so this asserts on the numbers rather than on plumbing.
+    #[test]
+    fn supertable_bm25_search_honors_a_query_time_bm25_override() {
+        let st = seeded_three_doc_supertable();
+        let scores = |opts: Bm25SearchOptions| -> Vec<(String, f32)> {
+            use arrow_array::{Float32Array, LargeStringArray};
+            let batches = st
+                .reader()
+                .expect("reader")
+                .bm25_search("title", "quick", 10, opts, Some(&["title", "score"]))
+                .expect("bm25_search");
+            let mut out = Vec::new();
+            for b in &batches {
+                let titles = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title utf8");
+                let sc = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("score f32");
+                for i in 0..b.num_rows() {
+                    out.push((titles.value(i).to_string(), sc.value(i)));
+                }
+            }
+            out
+        };
+
+        let base = scores(Bm25SearchOptions::new());
+        assert_eq!(base.len(), 2, "two docs contain `quick`");
+
+        // b = 0 disables length normalization entirely, so the two docs'
+        // scores must converge: they differ under the default only
+        // because one is longer.
+        let no_len_norm = scores(Bm25SearchOptions::new().with_bm25(1.2, 0.0));
+        assert_eq!(no_len_norm.len(), base.len(), "same match set");
+        let spread = |v: &[(String, f32)]| {
+            let mut s: Vec<f32> = v.iter().map(|(_, x)| *x).collect();
+            s.sort_by(|a, b| b.total_cmp(a));
+            s[0] - s[s.len() - 1]
+        };
+        assert!(
+            spread(&no_len_norm) < spread(&base),
+            "b=0 must compress the score spread: base {:?} vs override {:?}",
+            base,
+            no_len_norm
+        );
+        assert!(
+            spread(&no_len_norm) < 1e-6,
+            "with b=0 both docs share a length norm, so scores tie: {no_len_norm:?}"
+        );
+
+        // An override equal to what the columns declare changes nothing.
+        let same = scores(Bm25SearchOptions::new().with_bm25(1.2, 0.75));
+        for ((t1, s1), (t2, s2)) in base.iter().zip(same.iter()) {
+            assert_eq!(t1, t2);
+            assert!((s1 - s2).abs() < 1e-6, "{s1} vs {s2}");
+        }
+    }
+
+    /// An out-of-range override is rejected before the fan-out, naming
+    /// the bounds rather than ranking oddly.
+    #[test]
+    fn supertable_bm25_search_rejects_an_invalid_override() {
+        let st = seeded_three_doc_supertable();
+        for (k1, b) in [(0.0_f32, 0.5_f32), (-1.0, 0.5), (1.2, 1.5), (1.2, -0.1)] {
+            let err = st
+                .reader()
+                .expect("reader")
+                .bm25_search(
+                    "title",
+                    "quick",
+                    10,
+                    Bm25SearchOptions::new().with_bm25(k1, b),
+                    None,
+                )
+                .expect_err("out-of-range override must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("k1") && msg.contains("b"),
+                "the error should name both bounds: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn supertable_bm25_search_rows_default_and_projected() {
         let st = seeded_three_doc_supertable();
 
         // Bare call → `_id` + `score` only (no scalar decode).
         let bare = st
-            .bm25_search("title", "fox", 10, BoolMode::Or, Bm25Stats::Global, None)
+            .bm25_search(
+                "title",
+                "fox",
+                10,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
+                None,
+            )
             .expect("bm25 rows");
         assert_eq!(bare.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(bare[0].num_columns(), 2, "_id + score");
@@ -3202,8 +3391,9 @@ mod tests {
                 "title",
                 "fox",
                 10,
-                BoolMode::Or,
-                Bm25Stats::Global,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["_id", "title", "score"]),
             )
             .expect("bm25 projected rows");
@@ -3320,7 +3510,12 @@ mod tests {
         // Ranked: exactly the adjacent-in-order docs across both
         // superfiles.
         let hits = r
-            .bm25_hits("title", r#""new york""#, 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                r#""new york""#,
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("phrase hits");
         assert_eq!(hits.len(), 3, "three docs contain the phrase");
 
@@ -3337,7 +3532,12 @@ mod tests {
 
         // Phrase composed with clauses: must-phrase + must-term.
         let hits = r
-            .bm25_hits("title", r#"+"new york" +the"#, 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                r#"+"new york" +the"#,
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("phrase + term");
         assert_eq!(hits.len(), 1);
 
@@ -3353,7 +3553,12 @@ mod tests {
         let st = seeded_clause_supertable();
         let r = st.reader().expect("reader");
         let err = r
-            .bm25_hits("title", r#""climate change""#, 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                r#""climate change""#,
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect_err("typed error expected");
         // A phrase on a positionless column is a bad *request*, not a
         // read failure — it surfaces as InvalidQuery, and the message
@@ -3384,7 +3589,12 @@ mod tests {
         // 3 docs contain `climate`; `policy` is scoring-only and must
         // not pull in "policy analysis quarterly".
         let hits = r
-            .bm25_hits("title", "+climate policy", 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "+climate policy",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("bm25 +climate policy");
         assert_eq!(hits.len(), 3, "match set is the must set");
 
@@ -3428,7 +3638,12 @@ mod tests {
         // Negation still excludes: drop the summit doc from the
         // climate must set.
         let hits = r
-            .bm25_hits("title", "+climate policy -summit", 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "+climate policy -summit",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("bm25 with negation");
         assert_eq!(hits.len(), 2);
         let n = r
@@ -3444,7 +3659,12 @@ mod tests {
         // The must term exists nowhere: bloom-prune (or the empty
         // intersection) yields no hits despite the common should.
         let hits = r
-            .bm25_hits("title", "+zzzabsent policy", 10, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "+zzzabsent policy",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("bm25 absent must");
         assert!(hits.is_empty());
         let n = r

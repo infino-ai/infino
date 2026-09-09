@@ -263,7 +263,8 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
             "title",
             "nimblefox",
             BM25_TOP_K,
-            infino::supertable::query::fts::BoolMode::Or,
+            infino::Bm25SearchOptions::new()
+                .with_mode(infino::supertable::query::fts::BoolMode::Or),
         )
         .expect("query");
     assert_eq!(hits.len(), 1, "commit must not break in-memory reads");

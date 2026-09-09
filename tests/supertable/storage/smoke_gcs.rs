@@ -191,7 +191,15 @@ async fn supertable_real_gcs_round_trip() {
     let bm25 = consumer
         .reader()
         .expect("reader")
-        .bm25_search("title", "alpha", 10, BoolMode::Or, Bm25Stats::Global, None)
+        .bm25_search(
+            "title",
+            "alpha",
+            10,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
+            None,
+        )
         .expect("bm25 over real gcs");
     assert!(!bm25.is_empty(), "cold BM25 must find the alpha docs");
 

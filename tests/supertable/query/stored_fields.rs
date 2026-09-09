@@ -104,7 +104,15 @@ fn index_only_column_searches_but_rejects_projection() {
 
     // Ranked search over the index-only column spans both segments.
     let batches = reader
-        .bm25_search("body", "signal", K, BoolMode::Or, Bm25Stats::Global, None)
+        .bm25_search(
+            "body",
+            "signal",
+            K,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
+            None,
+        )
         .expect("bm25 over index-only column");
     let n: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(n, 2, "one signal doc per segment");
@@ -115,8 +123,9 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("stored projection");
@@ -130,8 +139,9 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            infino::Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "body", "score"]),
         )
         .expect_err("index-only column must not be projectable");
