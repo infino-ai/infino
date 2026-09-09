@@ -32,7 +32,7 @@ pub const B: f32 = 0.75;
 
 /// A column's BM25 similarity parameters.
 ///
-/// [`Default`] is the standard pair ([`K1`], [`B`]) — the values every
+/// [`Default`] is the standard pair (`k1 = 1.2`, `b = 0.75`) — the values every
 /// superfile written before the parameters were recordable was built
 /// with, and the values a column that declares nothing still uses. That
 /// meaning is frozen: a file whose column entry carries no parameters
@@ -68,12 +68,11 @@ impl Bm25Params {
         Self { k1, b }
     }
 
-    /// Whether this is the standard pair, bit-for-bit. Drives every
-    /// "only when non-default" decision: whether a file's FTS section
-    /// takes the parameter-carrying version, and whether a query needs
-    /// a bound-correction factor at all.
+    /// Whether this is the standard pair, bit-for-bit. Drives the
+    /// "only when non-default" decisions — chiefly whether a query
+    /// needs a bound-correction factor at all.
     #[inline]
-    pub fn is_standard(&self) -> bool {
+    pub(crate) fn is_standard(&self) -> bool {
         self.k1 == K1 && self.b == B
     }
 
@@ -82,7 +81,7 @@ impl Bm25Params {
     /// norm table. `avgdl <= 0` (an empty column) yields `k1`, the
     /// unit-norm value; such a column is never scored.
     #[inline]
-    pub fn dl_norm_k1(&self, dl: u32, avgdl: f32) -> f32 {
+    pub(crate) fn dl_norm_k1(&self, dl: u32, avgdl: f32) -> f32 {
         let norm = if avgdl > 0.0 {
             1.0 - self.b + self.b * (dl as f32) / avgdl
         } else {
@@ -93,7 +92,7 @@ impl Bm25Params {
 
     /// `idf · (k1 + 1)` — the per-term factor the scorer multiplies by.
     #[inline]
-    pub fn idf_x_k1p1(&self, idf: f32) -> f32 {
+    pub(crate) fn idf_x_k1p1(&self, idf: f32) -> f32 {
         idf * (self.k1 + 1.0)
     }
 }

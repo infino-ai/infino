@@ -502,7 +502,7 @@ impl FtsReader {
     /// Cheap enough to do per query: the clone is a `Bytes`/`Arc` bump
     /// for the blob, one `String` and one 1 KiB table per re-derived
     /// column, and no pass over any per-doc array.
-    pub fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
+    pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
         let mut view = self.clone();
         for col in &mut view.columns {
             if col.params == params {

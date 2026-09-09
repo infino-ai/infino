@@ -182,16 +182,40 @@ impl core::marker::Unpin for infino::OptimizeError
 impl core::marker::UnsafeUnpin for infino::OptimizeError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
 impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
-pub struct infino::Bm25SearchOptions
+#[non_exhaustive] pub struct infino::Bm25Params
+pub infino::Bm25Params::b: f32
+pub infino::Bm25Params::k1: f32
+impl infino::Bm25Params
+pub const infino::Bm25Params::STANDARD: Self
+pub const fn infino::Bm25Params::new(f32, f32) -> Self
+impl core::clone::Clone for infino::Bm25Params
+pub fn infino::Bm25Params::clone(&self) -> infino::Bm25Params
+impl core::cmp::PartialEq for infino::Bm25Params
+pub fn infino::Bm25Params::eq(&self, &infino::Bm25Params) -> bool
+impl core::default::Default for infino::Bm25Params
+pub fn infino::Bm25Params::default() -> Self
+impl core::fmt::Debug for infino::Bm25Params
+pub fn infino::Bm25Params::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Bm25Params
+impl core::marker::StructuralPartialEq for infino::Bm25Params
+impl core::marker::Freeze for infino::Bm25Params
+impl core::marker::Send for infino::Bm25Params
+impl core::marker::Sync for infino::Bm25Params
+impl core::marker::Unpin for infino::Bm25Params
+impl core::marker::UnsafeUnpin for infino::Bm25Params
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Bm25Params
+impl core::panic::unwind_safe::UnwindSafe for infino::Bm25Params
+#[non_exhaustive] pub struct infino::Bm25SearchOptions
+pub infino::Bm25SearchOptions::bm25: core::option::Option<infino::Bm25Params>
 pub infino::Bm25SearchOptions::mode: infino::BoolMode
 pub infino::Bm25SearchOptions::stats: infino::Bm25Stats
 impl infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::new() -> Self
+pub fn infino::Bm25SearchOptions::with_bm25(self, f32, f32) -> Self
 pub fn infino::Bm25SearchOptions::with_mode(self, infino::BoolMode) -> Self
 pub fn infino::Bm25SearchOptions::with_stats(self, infino::Bm25Stats) -> Self
 impl core::clone::Clone for infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::clone(&self) -> infino::Bm25SearchOptions
-impl core::cmp::Eq for infino::Bm25SearchOptions
 impl core::cmp::PartialEq for infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::eq(&self, &infino::Bm25SearchOptions) -> bool
 impl core::default::Default for infino::Bm25SearchOptions
@@ -279,6 +303,7 @@ impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
 pub struct infino::FtsField
 impl infino::FtsField
 pub fn infino::FtsField::analyzer(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::FtsField::bm25(self, f32, f32) -> Self
 pub fn infino::FtsField::new(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::FtsField::stored(self, bool) -> Self
 impl core::clone::Clone for infino::FtsField
