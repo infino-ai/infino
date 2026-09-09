@@ -93,7 +93,7 @@ def test_fts_standard_analyzer_keeps_non_ascii():
 
 def test_bm25_stats_kwarg():
     # `stats` selects the BM25 corpus statistics. Both modes return the
-    # matching docs; the default is per-superfile. Correctness of the
+    # matching docs; the default is global. Correctness of the
     # global ranking is covered by the Rust oracle; here we just exercise
     # the binding and the string parsing.
     db = infino.connect("memory://")

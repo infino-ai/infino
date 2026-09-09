@@ -229,11 +229,11 @@ JSON metrics land in `target/infino-bench/<bench>.json` (local only).
 
 _Host: unknown CPU · 16C/16T · macos/aarch64_
 
-Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). `recall vs BM25` = `Bm25Stats::Global` against textbook BM25 with exact doc lengths — the user-facing quality, which pays for the one-byte length quantization and per-superfile avgdl. `recall (default stats)` = the same under the default `PerSuperfile` idf. `recall vs engine BM25` = `Global` against BM25 with the engine's stored (quantized) lengths, a hit allowed to fall short of the k-th score by the avgdl residual (5.0% at this scale: the oracle normalizes with the corpus-wide average length, the engine with each superfile's own) — gated at 0.99: below it the kernels disagree with their own formula. `max score Δ` = largest relative gap between an engine score and that reference for the same doc — gated at the same 5.0%.
+Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). `recall vs BM25` = `Bm25Stats::Global` against textbook BM25 with exact doc lengths — the user-facing quality, which pays for the one-byte length quantization and per-superfile avgdl. `recall (per-superfile stats)` = the same under segment-local `PerSuperfile` idf (the pre-0.7 default). `recall vs engine BM25` = `Global` against BM25 with the engine's stored (quantized) lengths, a hit allowed to fall short of the k-th score by the avgdl residual (5.0% at this scale: the oracle normalizes with the corpus-wide average length, the engine with each superfile's own) — gated at 0.99: below it the kernels disagree with their own formula. `max score Δ` = largest relative gap between an engine score and that reference for the same doc — gated at the same 5.0%.
 
 **k = 10**
 
-| Query | matches | recall vs BM25 | recall (default stats) | recall vs engine BM25 | max score Δ |
+| Query | matches | recall vs BM25 | recall (per-superfile stats) | recall vs engine BM25 | max score Δ |
 | --- | --- | --- | --- | --- | --- |
 | stopword | 8.4M | 0.9000 | 0.0000 | 1.0000 | 0.02% |
 | common | 2.1M | 1.0000 | 0.1000 | 1.0000 | 0.04% |
@@ -256,7 +256,7 @@ Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-a
 
 **k = 100**
 
-| Query | matches | recall vs BM25 | recall (default stats) | recall vs engine BM25 | max score Δ |
+| Query | matches | recall vs BM25 | recall (per-superfile stats) | recall vs engine BM25 | max score Δ |
 | --- | --- | --- | --- | --- | --- |
 | stopword | 8.4M | 0.8800 | 0.0300 | 1.0000 | 0.03% |
 | common | 2.1M | 0.9500 | 0.4000 | 1.0000 | 0.05% |
@@ -279,7 +279,7 @@ Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-a
 
 **k = 1000**
 
-| Query | matches | recall vs BM25 | recall (default stats) | recall vs engine BM25 | max score Δ |
+| Query | matches | recall vs BM25 | recall (per-superfile stats) | recall vs engine BM25 | max score Δ |
 | --- | --- | --- | --- | --- | --- |
 | stopword | 8.4M | 0.9160 | 0.0620 | 1.0000 | 0.05% |
 | common | 2.1M | 0.9750 | 0.6860 | 1.0000 | 0.10% |

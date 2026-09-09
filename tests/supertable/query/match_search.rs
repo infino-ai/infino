@@ -262,14 +262,23 @@ fn count_dedups_repeated_negatives_and_required_excluded() {
 /// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
 /// across every superfile before scoring. Statistics change SCORES,
 /// never MEMBERSHIP: with `k` covering every match, the global-stats
-/// result holds the same number of rows as the default per-superfile
-/// mode's hit set.
+/// result holds the same number of rows as the per-superfile mode's hit
+/// set. The per-superfile arm is requested explicitly — `bm25_hits`
+/// scores with the crate default, which is `Global`, so relying on it
+/// here would compare global statistics against themselves and assert
+/// nothing.
 #[test]
-fn bm25_global_stats_keeps_the_default_modes_membership() {
+fn bm25_global_stats_keeps_the_per_superfile_membership() {
     let st = demo_two_superfiles();
     let reader = st.reader().expect("reader");
-    let default_hits = reader
-        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+    let per_superfile_hits = reader
+        .bm25_hits_stats(
+            "title",
+            "rust",
+            TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+        )
         .expect("per-superfile bm25");
     let global = reader
         .bm25_search(
@@ -282,10 +291,10 @@ fn bm25_global_stats_keeps_the_default_modes_membership() {
         )
         .expect("global-stats bm25");
     let global_rows: usize = global.iter().map(|b| b.num_rows()).sum();
-    assert!(!default_hits.is_empty(), "the corpus has rust docs");
+    assert!(!per_superfile_hits.is_empty(), "the corpus has rust docs");
     assert_eq!(
         global_rows,
-        default_hits.len(),
+        per_superfile_hits.len(),
         "global statistics rescore the same match set"
     );
 }
