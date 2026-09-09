@@ -7532,6 +7532,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::IndexOutcome;
+    use crate::superfile::fts::reader::Bm25SearchOptions;
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
@@ -10684,7 +10685,7 @@ mod tests {
                 "title",
                 "5",
                 8,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::And)
                     .with_stats(Bm25Stats::Global),
                 None,

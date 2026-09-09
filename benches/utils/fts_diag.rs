@@ -28,7 +28,7 @@
 
 use std::time::Instant;
 
-use infino::superfile::fts::reader::BoolMode;
+use infino::{Bm25SearchOptions, superfile::fts::reader::BoolMode};
 
 use crate::{diag_common, markdown::fmt_count};
 
@@ -98,7 +98,7 @@ pub fn run() {
                 COLUMN,
                 s.query,
                 K,
-                infino::Bm25SearchOptions::new().with_mode(s.mode),
+                Bm25SearchOptions::new().with_mode(s.mode),
                 None,
             )
             .expect("warm-up bm25_search");
@@ -129,7 +129,7 @@ pub fn run() {
                 COLUMN,
                 s.query,
                 K,
-                infino::Bm25SearchOptions::new().with_mode(s.mode),
+                Bm25SearchOptions::new().with_mode(s.mode),
             )
             .expect("bm25_hits")
             .len();
@@ -150,7 +150,7 @@ pub fn run() {
                     COLUMN,
                     s.query,
                     K,
-                    infino::Bm25SearchOptions::new().with_mode(s.mode),
+                    Bm25SearchOptions::new().with_mode(s.mode),
                 )
                 .expect("kernel bm25_hits");
             kernel.push(t.elapsed());
@@ -165,7 +165,7 @@ pub fn run() {
                     COLUMN,
                     s.query,
                     K,
-                    infino::Bm25SearchOptions::new().with_mode(s.mode),
+                    Bm25SearchOptions::new().with_mode(s.mode),
                     None,
                 )
                 .expect("full bm25_search");

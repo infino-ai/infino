@@ -19,6 +19,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -108,7 +109,7 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             None,
@@ -123,7 +124,7 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             Some(&["_id", "title", "rating", "score"]),
@@ -139,7 +140,7 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             Some(&["_id", "body", "score"]),

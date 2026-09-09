@@ -65,6 +65,7 @@ use std::{borrow::Cow, cmp::Ordering, collections::HashMap, time::Instant};
 
 use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch, StringArray};
 use infino::{
+    Bm25SearchOptions,
     superfile::fts::{
         bm25::stored_len,
         reader::{Bm25Stats, BoolMode},
@@ -651,9 +652,7 @@ fn engine_hits(
             column,
             q.query,
             k,
-            infino::Bm25SearchOptions::new()
-                .with_mode(q.mode)
-                .with_stats(stats),
+            Bm25SearchOptions::new().with_mode(q.mode).with_stats(stats),
             Some(&[column, "score"]),
         )
         .expect("quality bm25_search");

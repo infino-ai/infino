@@ -31,6 +31,7 @@ use arrow_schema::{DataType, Field, Schema};
 use chrono::Utc;
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
+    Bm25SearchOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::FtsConfig,
@@ -190,7 +191,7 @@ async fn fts_query_excludes_tombstoned_row() {
             "title",
             "alpha",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("fts");
     assert_eq!(hits.len(), 2, "tombstoned row must be excluded");
@@ -813,7 +814,7 @@ fn tombstoned_superfile_does_not_raise_the_shared_phrase_floor() {
                     "title",
                     "\"alpha beta\"",
                     FLOOR_TOP_K,
-                    infino::Bm25SearchOptions::new()
+                    Bm25SearchOptions::new()
                         .with_mode(BoolMode::Or)
                         .with_stats(stats),
                     Some(&["title"]),

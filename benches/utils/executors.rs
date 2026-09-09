@@ -18,6 +18,7 @@ use std::{
 };
 
 use arrow_array::{Array, RecordBatch};
+use infino::Bm25SearchOptions;
 
 use crate::{
     cpu,
@@ -786,7 +787,7 @@ pub mod fts {
                 column,
                 query,
                 k,
-                infino::Bm25SearchOptions::new().with_mode(mode),
+                Bm25SearchOptions::new().with_mode(mode),
                 None,
             )
             .expect("supertable bm25_search")
@@ -806,7 +807,7 @@ pub mod fts {
                 column,
                 query,
                 k,
-                infino::Bm25SearchOptions::new().with_mode(mode),
+                Bm25SearchOptions::new().with_mode(mode),
                 Some(&["_id", column, "score"]),
             )
             .expect("supertable bm25_search fetched")
@@ -827,7 +828,7 @@ pub mod fts {
                     column,
                     query,
                     k,
-                    infino::Bm25SearchOptions::new().with_mode(mode),
+                    Bm25SearchOptions::new().with_mode(mode),
                     None,
                 )
                 .expect("supertable bm25_search payload");
@@ -836,7 +837,7 @@ pub mod fts {
                     column,
                     query,
                     k,
-                    infino::Bm25SearchOptions::new().with_mode(mode),
+                    Bm25SearchOptions::new().with_mode(mode),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("supertable bm25_search fetched payload");

@@ -16,7 +16,7 @@ use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    CompactionSettings, OptimizeOptions,
+    Bm25SearchOptions, CompactionSettings, OptimizeOptions,
     runtime_metrics::op_stats::with_op_stats,
     storage::StorageProvider,
     superfile::{
@@ -116,7 +116,7 @@ fn global_hits(st: &Supertable, query: &str, mode: BoolMode) -> Vec<(String, f32
             "title",
             query,
             TOP_K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(mode)
                 .with_stats(Bm25Stats::Global),
             Some(&["title", "score"]),
@@ -150,9 +150,7 @@ fn planned_ranges(st: &Supertable, query: &str, mode: BoolMode, stats: Bm25Stats
                 "title",
                 query,
                 TOP_K,
-                infino::Bm25SearchOptions::new()
-                    .with_mode(mode)
-                    .with_stats(stats),
+                Bm25SearchOptions::new().with_mode(mode).with_stats(stats),
             )
             .expect("bm25")
     });

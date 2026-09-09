@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::{reader::BoolMode, tokenize::Tokenizer},
@@ -146,7 +147,7 @@ fn strong_consistency_query_sees_another_writers_new_commit() {
             "title",
             "added",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("query under strong consistency");
     assert!(!hits.is_empty(), "strong query must see the v2 row");
@@ -196,7 +197,7 @@ fn strong_consistency_query_is_stable_when_pointer_unchanged() {
             "title",
             "only",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("query");
     assert_eq!(consumer.manifest_id(), 1);
@@ -224,7 +225,7 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
             "title",
             "anything",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("query on uncommitted table");
     assert!(hits.is_empty());

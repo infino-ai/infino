@@ -969,7 +969,7 @@ mod tests {
         Bm25Stats, BoolMode, VectorSearchOptions,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         memory::ConnectionMemoryBudget,
-        superfile::builder::FtsConfig,
+        superfile::{builder::FtsConfig, fts::reader::Bm25SearchOptions},
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
@@ -2905,7 +2905,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 None,
@@ -2919,7 +2919,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 None,

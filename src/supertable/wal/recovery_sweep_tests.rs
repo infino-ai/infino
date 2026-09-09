@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 use crate::{
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::fts::reader::BoolMode,
+    superfile::fts::reader::{Bm25SearchOptions, BoolMode},
     supertable::{
         Supertable,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
@@ -134,7 +134,7 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
             "title",
             "alpha",
             10,
-            crate::superfile::fts::reader::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("fts");
     // The "alpha" row is local doc_id 0 — verify it's filtered.
@@ -283,7 +283,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
             "title",
             "foo",
             10,
-            crate::superfile::fts::reader::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("fts");
     for hit in &hits {

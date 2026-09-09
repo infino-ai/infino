@@ -36,6 +36,7 @@ use std::{
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::{
@@ -253,7 +254,7 @@ fn supertable_search_stats(
             "title",
             query,
             k,
-            infino::Bm25SearchOptions::new().with_stats(stats),
+            Bm25SearchOptions::new().with_stats(stats),
         )
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -272,7 +273,7 @@ fn supertable_search_and_global(
             "title",
             query,
             k,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::And)
                 .with_stats(Bm25Stats::PerSuperfile),
         )
@@ -470,7 +471,7 @@ fn oracle_query_time_override_matches_the_reference_at_that_pair() {
                     "title",
                     query,
                     k,
-                    infino::Bm25SearchOptions::new()
+                    Bm25SearchOptions::new()
                         .with_stats(Bm25Stats::PerSuperfile)
                         .with_bm25(params.k1, params.b),
                 )
@@ -926,7 +927,7 @@ fn skip_path_hits(st: &Supertable, k: usize, chunk_size: usize) -> Vec<(u64, f32
             "title",
             "common",
             k,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
         )

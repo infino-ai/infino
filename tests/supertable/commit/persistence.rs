@@ -33,6 +33,7 @@ const PUT_MULTIPART_THRESHOLD_BYTES: u64 = 1;
 /// BM25 top-k for the post-commit query.
 const BM25_TOP_K: usize = 5;
 use infino::{
+    Bm25SearchOptions,
     supertable::storage::{LocalFsStorageProvider, StorageProvider},
     test_helpers::{build_title_batch, default_supertable_options},
 };
@@ -263,8 +264,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
             "title",
             "nimblefox",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new()
-                .with_mode(infino::supertable::query::fts::BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(infino::supertable::query::fts::BoolMode::Or),
         )
         .expect("query");
     assert_eq!(hits.len(), 1, "commit must not break in-memory reads");

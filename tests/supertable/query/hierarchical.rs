@@ -36,6 +36,7 @@ use std::sync::Arc;
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -134,7 +135,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
             "title",
             "echo",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             None,
@@ -187,7 +188,7 @@ fn bm25_term_in_no_part_loads_nothing() {
             "title",
             "zoo",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             None,
@@ -873,7 +874,7 @@ fn eager_mode_query_paths_observationally_unchanged() {
             "title",
             "alpha",
             BM25_TOP_K,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             None,

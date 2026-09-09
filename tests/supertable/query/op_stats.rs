@@ -18,7 +18,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    ConnectOptions, Connection, FtsField, IndexSpec, Metric, connect, connect_with,
+    Bm25SearchOptions, ConnectOptions, Connection, FtsField, IndexSpec, Metric, connect,
+    connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
@@ -131,7 +132,7 @@ fn scoped_fts_stats(st: &Supertable, query: &str) -> OpStats {
                 "title",
                 query,
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -166,7 +167,7 @@ fn a_scoped_bm25_query_reports_its_planned_ranges() {
                 "title",
                 "rust",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -179,7 +180,7 @@ fn a_scoped_bm25_query_reports_its_planned_ranges() {
                 "title",
                 "rust async web",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -216,7 +217,7 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
                 "title",
                 "rust",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -235,7 +236,7 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
                 "title",
                 "rust async web",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -276,7 +277,7 @@ fn global_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
                 "title",
                 q,
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(mode)
                     .with_stats(Bm25Stats::Global),
             )
@@ -295,7 +296,7 @@ fn per_superfile_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
                 "title",
                 q,
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(mode)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -412,7 +413,7 @@ fn a_scoped_bm25_query_reports_kernel_cpu() {
                     "title",
                     query,
                     TOP_K,
-                    infino::Bm25SearchOptions::new()
+                    Bm25SearchOptions::new()
                         .with_mode(BoolMode::Or)
                         .with_stats(Bm25Stats::PerSuperfile),
                 )
@@ -449,7 +450,7 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
                 "title",
                 "rust",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -476,7 +477,7 @@ fn an_inline_df1_term_plans_no_posting_range() {
                 "title",
                 "rust",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -489,7 +490,7 @@ fn an_inline_df1_term_plans_no_posting_range() {
                 "title",
                 "rust filler0x0",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::PerSuperfile),
             )
@@ -607,7 +608,7 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "title",
                 "rust",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 Some(&["title"]),
@@ -627,7 +628,7 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "title",
                 "rust",
                 TOP_K,
-                infino::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 None,

@@ -28,6 +28,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::{FtsConfig, VectorConfig},
         fts::reader::{Bm25Stats, BoolMode},
@@ -195,7 +196,7 @@ async fn supertable_real_gcs_round_trip() {
             "title",
             "alpha",
             10,
-            infino::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             None,

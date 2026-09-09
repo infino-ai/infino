@@ -43,7 +43,7 @@ use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatc
 use arrow_schema::{DataType, Field, Schema};
 use futures::future::join_all;
 use infino::{
-    VectorSearchOptions,
+    Bm25SearchOptions, VectorSearchOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
@@ -326,7 +326,7 @@ async fn reader_loop(
                     QUERY_FIELD,
                     QUERY_TERM,
                     TOP_K,
-                    infino::Bm25SearchOptions::new(),
+                    Bm25SearchOptions::new(),
                     None,
                 )
                 .expect("bm25_search"),

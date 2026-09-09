@@ -46,6 +46,7 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
@@ -203,7 +204,7 @@ fn build_supertable() -> (Supertable, Vec<TempDir>) {
             "title",
             "common",
             K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("prewarm");
     consumer
@@ -358,7 +359,7 @@ fn fanout_floor_decomposition() {
                 "title",
                 term,
                 K,
-                infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25_hits");
         assert_eq!(
@@ -379,7 +380,7 @@ fn fanout_floor_decomposition() {
                     "title",
                     term,
                     K,
-                    infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 )
                 .expect("bm25_hits");
             std::hint::black_box(h);
@@ -392,7 +393,7 @@ fn fanout_floor_decomposition() {
                     "title",
                     term,
                     K,
-                    infino::Bm25SearchOptions::new()
+                    Bm25SearchOptions::new()
                         .with_mode(BoolMode::Or)
                         .with_stats(Bm25Stats::Global),
                     None,
@@ -409,7 +410,7 @@ fn fanout_floor_decomposition() {
                     "title",
                     term,
                     K,
-                    infino::Bm25SearchOptions::new()
+                    Bm25SearchOptions::new()
                         .with_mode(BoolMode::Or)
                         .with_stats(Bm25Stats::Global),
                     Some(&["_id", "title", "score"]),

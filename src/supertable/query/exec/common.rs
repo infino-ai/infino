@@ -916,7 +916,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
-            fts::reader::{Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -1072,7 +1072,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 Some(&["_id"]),
@@ -1095,7 +1095,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 None,
@@ -1119,7 +1119,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 Some(&["_id", "title", "score"]),
@@ -1144,7 +1144,7 @@ mod tests {
             "title",
             "rust",
             10,
-            crate::superfile::fts::reader::Bm25SearchOptions::new()
+            Bm25SearchOptions::new()
                 .with_mode(BoolMode::Or)
                 .with_stats(Bm25Stats::Global),
             Some(&["nope"]),
@@ -1162,7 +1162,7 @@ mod tests {
                 "title",
                 "nonexistentterm",
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 Some(&["_id"]),
@@ -1681,7 +1681,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 Some(&["title", "score"]),
@@ -1722,7 +1722,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 Some(&["_id", "title", "score"]),
@@ -1750,7 +1750,7 @@ mod tests {
                 "title",
                 "nonexistentterm",
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 Some(&["title", "score"]),

@@ -2343,6 +2343,7 @@ mod tests {
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::reader::Bm25SearchOptions,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -4430,7 +4431,7 @@ mod tests {
                 "title",
                 "doc",
                 5,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 None,
@@ -4447,7 +4448,7 @@ mod tests {
                 "title",
                 "doc",
                 5,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 None,
@@ -8450,7 +8451,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(BoolMode::Or)
                     .with_stats(Bm25Stats::Global),
                 None,

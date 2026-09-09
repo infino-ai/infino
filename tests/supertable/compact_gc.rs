@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Schema};
 use chrono::{Duration as ChronoDuration, Utc};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    CompactionSettings, GcSettings, OptimizeOptions,
+    Bm25SearchOptions, CompactionSettings, GcSettings, OptimizeOptions,
     superfile::{builder::FtsConfig, fts::reader::BoolMode, vector::rerank_codec::RerankCodec},
     supertable::{
         Supertable, SupertableOptions,
@@ -136,7 +136,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
             "title",
             "alphatoken",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+            Bm25SearchOptions::new().with_mode(BoolMode::Or)
         )
         .expect("query alpha")
         .len(),
@@ -147,7 +147,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
             "title",
             "kappatoken",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+            Bm25SearchOptions::new().with_mode(BoolMode::Or)
         )
         .expect("query kappa")
         .len(),
@@ -201,7 +201,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
                 "title",
                 m,
                 TOP_K,
-                infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+                Bm25SearchOptions::new().with_mode(BoolMode::Or)
             )
             .expect("query after gc")
             .len(),
@@ -280,7 +280,7 @@ fn gc_reaps_tombstone_sidecar_for_merged_away_superfile() {
             "title",
             "alphatoken",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+            Bm25SearchOptions::new().with_mode(BoolMode::Or)
         )
         .expect("query alpha after gc")
         .len(),
@@ -293,7 +293,7 @@ fn gc_reaps_tombstone_sidecar_for_merged_away_superfile() {
                 "title",
                 m,
                 TOP_K,
-                infino::Bm25SearchOptions::new().with_mode(BoolMode::Or)
+                Bm25SearchOptions::new().with_mode(BoolMode::Or)
             )
             .expect("query after gc")
             .len(),
@@ -499,7 +499,7 @@ fn gc_drops_disk_cache_copies_of_deleted_superfiles() {
             "title",
             "alpha",
             TOP_K,
-            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
             None,
         )
         .expect("bm25 after gc");
