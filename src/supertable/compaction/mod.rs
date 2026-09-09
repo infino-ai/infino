@@ -2901,28 +2901,14 @@ mod tests {
         measured_iters: usize,
     ) -> u128 {
         for _ in 0..warmup_iters {
-            st.bm25_search(
-                "title",
-                query,
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
-            .expect("bm25_search warmup");
+            st.bm25_search("title", query, 10, BoolMode::Or, Bm25Stats::Global, None)
+                .expect("bm25_search warmup");
         }
         let mut samples = Vec::with_capacity(measured_iters);
         for _ in 0..measured_iters {
             let start = Instant::now();
-            st.bm25_search(
-                "title",
-                query,
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
-            .expect("bm25_search measured");
+            st.bm25_search("title", query, 10, BoolMode::Or, Bm25Stats::Global, None)
+                .expect("bm25_search measured");
             samples.push(start.elapsed().as_micros());
         }
         samples.sort_unstable();

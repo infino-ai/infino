@@ -180,6 +180,18 @@ pub struct Manifest {
     /// manifests, when the router is off at drain, or on a build failure
     /// (consumers reconstruct it in memory).
     pub slow_vector_state_centroid_graph: Option<RoutingRef>,
+    /// Global term-statistics sidecar: a content-addressed artifact
+    /// holding gross `df` per (column, term) summed over a recorded set
+    /// of this table's superfiles, so a global-stats BM25 query reads
+    /// corpus-wide df in one lookup instead of fanning over every
+    /// superfile's dictionary. Written by maintenance (optimize);
+    /// **carried through appends** (new superfiles are simply uncovered
+    /// tail the query tops up from their own dictionaries) and
+    /// **dropped by any commit that removes superfiles** (a removed
+    /// superfile's contribution is baked into the sum and cannot be
+    /// attributed, so only a fresh maintenance pass may republish).
+    /// Absent on older manifests and until the first maintenance pass.
+    pub term_stats: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1306,6 +1318,10 @@ struct ManifestDto {
     slow_vector_state_centroid_graph_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroid_graph_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    term_stats_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    term_stats_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1890,6 +1906,8 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_centroid_graph
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
+        term_stats_uri: l.term_stats.as_ref().map(|r| r.uri.clone()),
+        term_stats_content_hash: l.term_stats.as_ref().map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -2010,6 +2028,13 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             d.slow_vector_state_centroid_graph_uri,
             d.slow_vector_state_centroid_graph_content_hash.as_deref(),
         ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        term_stats: match (d.term_stats_uri, d.term_stats_content_hash.as_deref()) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
                 content_hash: decode_hash(hash)?,
@@ -2625,6 +2650,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            term_stats: None,
             parts: vec![],
         }
     }
@@ -3285,6 +3311,41 @@ mod tests {
         assert!(
             matches!(err, ListParseError::BadContentHash(_)),
             "expected BadContentHash, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn term_stats_ref_round_trips_and_requires_both_halves() {
+        let mut list = empty_list();
+        list.term_stats = Some(RoutingRef {
+            uri: "term-stats/stats-abc.bin".into(),
+            content_hash: ContentHash([7u8; 32]),
+        });
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.term_stats, list.term_stats);
+        // A manifest without the field decodes to None (older writers).
+        let empty_bytes = encode(&empty_list()).expect("encode empty");
+        let s = from_utf8(&empty_bytes).expect("utf8");
+        assert!(
+            !s.contains("term_stats"),
+            "absent ref must not appear on the wire (older manifests stay byte-identical)"
+        );
+        assert!(
+            decode(&empty_bytes)
+                .expect("decode empty")
+                .term_stats
+                .is_none()
+        );
+        // One half without the other is treated as no ref, like the
+        // centroid/graph refs.
+        let with_ref = from_utf8(&bytes).expect("utf8");
+        let uri_only = with_ref.replacen("term_stats_content_hash", "term_stats_ignored", 1);
+        assert!(
+            decode(uri_only.as_bytes())
+                .expect("decode uri-only")
+                .term_stats
+                .is_none()
         );
     }
 

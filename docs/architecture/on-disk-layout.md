@@ -38,6 +38,14 @@ mydb/                                     database root (the connect() path)
 │   │       │          bloom + min/max summaries
 │   │       └ used   : skip-pruning; reject superfiles before reading their bytes
 │   │
+│   ├── term-stats/                       present only after a maintenance pass
+│   │   └── stats-<blake3>.bin            binary · magic "INFTSTA1", immutable,
+│   │                                     content-addressed
+│   │       ├ stores : document frequency per (column, term), summed over the
+│   │       │          superfile ids the file records as covered
+│   │       └ used   : corpus-wide BM25 statistics; one lookup replaces probing
+│   │                  every superfile's own term dictionary
+│   │
 │   ├── data/
 │   │   └── <superfile>.sf.parquet        the superfiles (files prefixed seg-)
 │   │       ├ stores : valid Parquet columns + embedded BM25 + vector index,
@@ -92,14 +100,20 @@ Who points to whom, and how many. The catalog lists many tables; each table pins
                │    │  (avro.zst)      │─ entry ━━━━━▶ seg-B.sf.parquet ╌╌╌╌╌▶ B.tombstones
                │    └──────────────────┘
                │
-               └──▶ ┌──────────────────┐
-                    │ manifest part 2  │─ entry ━━━━━▶ seg-C.sf.parquet ╌╌╌╌╌▶ C.tombstones
-                    │  (avro.zst)      │─ entry ━━━━━▶ seg-D.sf.parquet ╌╌╌╌╌▶ (none yet, as nothing deleted/updated)
-                    └──────────────────┘
+               ├──▶ ┌──────────────────┐
+               │    │ manifest part 2  │─ entry ━━━━━▶ seg-C.sf.parquet ╌╌╌╌╌▶ C.tombstones
+               │    │  (avro.zst)      │─ entry ━━━━━▶ seg-D.sf.parquet ╌╌╌╌╌▶ (none yet, as nothing deleted/updated)
+               │    └──────────────────┘
+               │
+               │    term_stats.uri
+               └──▶ ┌──────────────────────┐
+                    │ stats-<blake3>.bin   │  absent on a table no maintenance
+                    └──────────────────────┘  pass has run yet
 
    Legend
      seg-X            = data/seg-<id>.sf.parquet   (the superfile: Parquet + BM25 + vector)
      X.tombstones     = superfiles/<id>.tombstones (shares the superfile's id)
+     stats-<blake3>   = term-stats/stats-<blake3>.bin
 
      ━━━━━▶   stored pointer: the labelled field names the next file
      ╌╌╌╌╌▶   NOT a stored pointer: derived from the superfile id; the
@@ -113,6 +127,7 @@ Every hop below the two pointer files is content-addressed with a blake3 hash, s
 - `data/` holds the superfiles; `superfiles/` holds only their tombstones. The directory name is misleading.
 - The live set is whatever the current manifest names. An update writes a new superfile and tombstones the old one, so `data/` accumulates more `.sf.parquet` files than the table's live row count until GC removes the dead ones.
 - `wal/mutations/` is normally empty. A `<walid>.json` (and, for UPDATE, its `.arrow` sidecar) exists only while a mutation is in flight or was interrupted; the next recovery sweep drains it.
+- `term-stats/` is derived, not source data: every figure in it can be recomputed by reading the covered superfiles' own dictionaries, and a reader that cannot load the file falls back to doing exactly that. A maintenance pass (`optimize`) writes it; a commit that only appends keeps the reference, since the new superfiles are simply uncovered and a query tops their df up from their own dictionaries; a commit that removes superfiles drops the reference, because a departed superfile's contribution is baked into sums that cannot be attributed back out. So a table can legitimately have no `term-stats/` file, one file, or one live file alongside superseded ones GC has not yet swept.
 
 ## Source references
 
@@ -128,3 +143,4 @@ Anchored by symbol so they survive line moves:
 | `wal/mutations/` state-doc + `.arrow` sidecar | `WAL_DIR`, `WalStore` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | `superfiles/<id>.tombstones` sidecar paths | `SUPERFILES_DIR`, `tombstones_path` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | tombstone binary format (`INFTOMB\0` + RoaringBitmap) | `MAGIC`, layout doc | [src/supertable/wal/tombstones_codec.rs](../../src/supertable/wal/tombstones_codec.rs) |
+| `term-stats/stats-<hash>.bin` name, binary layout (`INFTSTA1` + covered ids + FST), and the carry/drop rule | `STORAGE_PREFIX`, `MAGIC`, `TermStatsSidecar` | [src/supertable/manifest/term_stats.rs](../../src/supertable/manifest/term_stats.rs) |

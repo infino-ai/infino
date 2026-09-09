@@ -19,6 +19,7 @@ use crate::{
         manifest::{
             SUPERFILE_DATA_DIR, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
+            term_stats::STORAGE_PREFIX as TERM_STATS_STORAGE_PREFIX,
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
         wal::persistence::{SUPERFILES_DIR, WalStore},
@@ -91,6 +92,11 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     }
     if let Some(centroid_graph) = manifest.slow_vector_state_centroid_graph_blob() {
         live.insert(centroid_graph.uri.clone());
+    }
+    // The global term-stats sidecar, same list-ref discipline: the current
+    // artifact is live; superseded generations age out past the safety gap.
+    if let Some(stats) = manifest.term_stats_blob() {
+        live.insert(stats.uri.clone());
     }
 
     // Each resident superfile's tombstone sidecar. `superfiles/` is swept whatever the flag says,
@@ -220,6 +226,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
+        TERM_STATS_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
         SUPERFILES_DIR,
@@ -443,6 +450,7 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
+                term_stats: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -518,6 +526,7 @@ mod tests {
                 }),
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
+                term_stats: None,
                 parts: Vec::new(),
             }),
         );
@@ -585,6 +594,7 @@ mod tests {
                     uri: centroid_graph_uri.clone(),
                     content_hash: centroid_graph_hash,
                 }),
+                term_stats: None,
                 parts: Vec::new(),
             }),
         );

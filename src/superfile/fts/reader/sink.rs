@@ -6,10 +6,59 @@
 //! AND flat-merge over score-into-heap vs collect/count, and the shared
 //! `and_heap_push`. `pub(super)` within `reader/`.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+    sync::atomic::{AtomicU32, Ordering as AtomicOrdering},
+};
 
 use super::{cursor::TermCursor, filter::ExcludeFilter, metadata::NormTable};
 use crate::superfile::fts::bm25;
+
+/// A monotonically rising score floor shared by every segment of one
+/// query's fan-out, readable and raisable lock-free mid-walk.
+///
+/// The kth-best score of any one segment is a lower bound on the
+/// kth-best of the whole query (the merged candidate set is a
+/// superset), so each walk may publish its local kth as it improves
+/// and every other walk may prune against the highest published value
+/// — the same cross-segment floor the fan-out already applies at
+/// segment start, made live. Pruning stays exact: walks skip only
+/// work strictly below the floor, so score ties still surface and the
+/// merged top-k is unchanged; only the amount of skipped work depends
+/// on timing.
+pub(crate) struct LiveFloor(AtomicU32);
+
+impl LiveFloor {
+    pub(crate) fn new() -> Self {
+        Self(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+    }
+
+    /// The highest floor published so far (`NEG_INFINITY` until some
+    /// segment has k scores).
+    #[inline]
+    pub(crate) fn load(&self) -> f32 {
+        f32::from_bits(self.0.load(AtomicOrdering::Acquire))
+    }
+
+    /// Raise the floor to `candidate` if it exceeds the current value;
+    /// lower values are ignored, so the floor is monotone under any
+    /// interleaving of publishers.
+    pub(crate) fn raise(&self, candidate: f32) {
+        let mut current = self.0.load(AtomicOrdering::Relaxed);
+        while candidate.total_cmp(&f32::from_bits(current)) == Ordering::Greater {
+            match self.0.compare_exchange_weak(
+                current,
+                candidate.to_bits(),
+                AtomicOrdering::Release,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+}
 
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
 /// path (single-term BMW, WAND+BMW, MaxScore+BMM, exhaustive union,

@@ -373,14 +373,7 @@ fn fanout_floor_decomposition() {
         // arithmetic `_id` resolve, no Parquet involvement.
         let (ids_p50, ids_flt) = time_p50(|| {
             let b = reader
-                .bm25_search(
-                    "title",
-                    term,
-                    K,
-                    BoolMode::Or,
-                    Bm25Stats::PerSuperfile,
-                    None,
-                )
+                .bm25_search("title", term, K, BoolMode::Or, Bm25Stats::Global, None)
                 .expect("bm25_search");
             std::hint::black_box(b);
         });
@@ -394,7 +387,7 @@ fn fanout_floor_decomposition() {
                     term,
                     K,
                     BoolMode::Or,
-                    Bm25Stats::PerSuperfile,
+                    Bm25Stats::Global,
                     Some(&["_id", "title", "score"]),
                 )
                 .expect("bm25_search");

@@ -1073,7 +1073,7 @@ mod tests {
                 "rust",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["_id"]),
             )
             .expect("bm25_search _id");
@@ -1090,14 +1090,7 @@ mod tests {
         let batches = st
             .reader()
             .expect("reader")
-            .bm25_search(
-                "title",
-                "rust",
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "rust", 10, BoolMode::Or, Bm25Stats::Global, None)
             .expect("bm25_search default");
         let b = &batches[0];
         assert_eq!(b.num_columns(), 2);
@@ -1118,7 +1111,7 @@ mod tests {
                 "rust",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["_id", "title", "score"]),
             )
             .expect("bm25_search title");
@@ -1142,7 +1135,7 @@ mod tests {
             "rust",
             10,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             Some(&["nope"]),
         );
         assert!(res.is_err(), "unknown projected column must error");
@@ -1159,7 +1152,7 @@ mod tests {
                 "nonexistentterm",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["_id"]),
             )
             .expect("bm25_search empty");
@@ -1677,7 +1670,7 @@ mod tests {
                 "rust",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["title", "score"]),
             )
             .expect("cold bm25 with scalar projection");
@@ -1717,7 +1710,7 @@ mod tests {
                 "rust",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["_id", "title", "score"]),
             )
             .expect("cold bm25 with id and scalar projection");
@@ -1744,7 +1737,7 @@ mod tests {
                 "nonexistentterm",
                 10,
                 BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25Stats::Global,
                 Some(&["title", "score"]),
             )
             .expect("cold bm25 with no matches");

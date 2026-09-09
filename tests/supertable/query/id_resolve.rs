@@ -104,14 +104,7 @@ fn bare_projection_ids_match_id_page_read_path() {
     // `common` is in every doc → hits span segments; per-doc unique
     // tokens keep scores distinct so rank order is meaningful.
     let bare = reader
-        .bm25_search(
-            "title",
-            "common",
-            K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
-            None,
-        )
+        .bm25_search("title", "common", K, BoolMode::Or, Bm25Stats::Global, None)
         .expect("bare search");
     assert_eq!(bare.len(), 1, "single merged batch");
     let bare = &bare[0];
@@ -127,7 +120,7 @@ fn bare_projection_ids_match_id_page_read_path() {
             "common",
             K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             Some(&["_id", "title", "score"]),
         )
         .expect("projected search");
@@ -155,7 +148,7 @@ fn bare_projection_ids_match_id_page_read_path() {
             &probe_token,
             PROBE_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             None,
         )
         .expect("bare unique");
@@ -165,7 +158,7 @@ fn bare_projection_ids_match_id_page_read_path() {
             &probe_token,
             PROBE_K,
             BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25Stats::Global,
             Some(&["_id", "title", "score"]),
         )
         .expect("projected unique");

@@ -1131,6 +1131,8 @@ impl SuperfileReader {
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
                 global_idf: None,
+                prefetched: None,
+                live_floor: None,
             },
             k,
             f32::NEG_INFINITY,
@@ -1302,6 +1304,20 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.term_dfs(column, tokens).await?)
+    }
+
+    /// Open-wave fetch of `terms`' dictionary slots + postings ranges
+    /// with per-term df, for the fused global-stats gather. Delegates to
+    /// [`FtsReader::fetch_scored_terms`].
+    pub(crate) async fn fetch_scored_terms(
+        &self,
+        column: &str,
+        terms: &[&str],
+    ) -> Result<fts_reader::FetchedTermMemo, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.fetch_scored_terms(column, terms).await?)
     }
 
     /// Two-pass exact match of a **raw string** `value` against
@@ -1533,11 +1549,14 @@ impl SuperfileReader {
         column: &str,
         terms: &[&str],
         global_idf: Option<&fts_reader::GlobalTermIdf>,
+        prefetched: Option<&fts_reader::FetchedTermMemo>,
     ) -> Result<OrCursorSet, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.build_or_cursor_set(column, terms, global_idf).await?)
+        Ok(fts
+            .build_or_cursor_set(column, terms, global_idf, prefetched)
+            .await?)
     }
 
     /// Expand `prefix` via the FST and build its OR cursor set, for
@@ -1563,7 +1582,9 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
             .collect();
-        Ok(fts.build_or_cursor_set(column, &term_strings, None).await?)
+        Ok(fts
+            .build_or_cursor_set(column, &term_strings, None, None)
+            .await?)
     }
 
     /// Ranged multi-term OR against prebuilt cursors — see

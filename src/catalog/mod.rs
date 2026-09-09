@@ -34,7 +34,19 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use dashmap::DashMap;
-use datafusion::{config::Dialect, error::DataFusionError, execution::context::SQLOptions};
+use datafusion::{
+    common::tree_node::{TreeNode, TreeNodeRecursion},
+    config::Dialect,
+    error::DataFusionError,
+    execution::context::SQLOptions,
+    logical_expr::{BinaryExpr, Operator},
+    prelude::Expr,
+    sql::sqlparser::{
+        dialect::GenericDialect,
+        keywords::Keyword,
+        tokenizer::{Token, Tokenizer as SqlTokenizer},
+    },
+};
 use futures::future::try_join_all;
 pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
@@ -42,9 +54,18 @@ use manifest::{
 };
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tracing::{debug, info};
 use uri::{Backend, parse_uri};
+
+/// Most `AND` / `OR` connectives allowed in one SQL statement or mutation predicate: past a few
+/// thousand, DataFusion's planner recursion overflows the stack and aborts. `IN (...)` is one
+/// node, never counted.
+pub(crate) const MAX_PREDICATE_CONNECTIVES: usize = 1024;
+
+/// Fewest bytes one connective can occupy in SQL text; text shorter than
+/// `MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES` cannot reach the cap and skips the scan.
+const MIN_BYTES_PER_CONNECTIVE: usize = 3;
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
@@ -840,6 +861,9 @@ impl Connection {
             return c.query_sql(sql);
         }
 
+        // Past the cap the planner aborts instead of erroring; refuse before any planning work.
+        ensure_sql_within_connective_cap(sql)?;
+
         // Gate SQL heap on the connection budget: DataFusion allocates the
         // working set (sort / aggregate / join), so its pool is the gate.
         let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
@@ -886,37 +910,53 @@ impl Connection {
         // poll on runtime threads where the scope's slot is invisible.
         let op_stats = op_stats::current();
         let drive = async move {
-            // Plan, check, execute. `SessionContext::sql` would run a DDL or session statement while
-            // producing the DataFrame, so the read-only check sits between planning and execution.
-            // It runs on the planned tree, so spelling is irrelevant: `SELECT ... INTO` is a CREATE
-            // TABLE, and an INSERT behind a comment or an EXPLAIN is the same DML node. Planning has
-            // no side effects; a refused statement has touched nothing.
-            let plan =
-                ctx.state().create_logical_plan(&sql).await.map_err(|e| {
-                    InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                })?;
+            // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
+            // planner recursion depth must not hang on a stack the engine does not own. A panic
+            // surfaces through the join as a query error.
+            let planner_ctx = ctx.clone();
+            let (task_ctx, plan) = Handle::current()
+                .spawn(async move {
+                    // Plan, check, execute. `SessionContext::sql` would run a DDL or session
+                    // statement while producing the DataFrame, so the read-only check sits between
+                    // planning and execution. It runs on the planned tree, so spelling is
+                    // irrelevant: `SELECT ... INTO` is a CREATE TABLE, and an INSERT behind a
+                    // comment or an EXPLAIN is the same DML node. Planning has no side effects; a
+                    // refused statement has touched nothing.
+                    let plan = planner_ctx
+                        .state()
+                        .create_logical_plan(&sql)
+                        .await
+                        .map_err(|e| {
+                            InfinoError::Query(e.to_string()).with_context("query_sql", None)
+                        })?;
 
-            read_only_sql_options().verify_plan(&plan).map_err(|e| {
-                InfinoError::Query(format!(
-                    "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
-                ))
-                .with_context("query_sql", None)
-            })?;
+                    read_only_sql_options().verify_plan(&plan).map_err(|e| {
+                        InfinoError::Query(format!(
+                            "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
+                        ))
+                        .with_context("query_sql", None)
+                    })?;
 
-            let df = ctx
-                .execute_logical_plan(plan)
+                    let df = planner_ctx.execute_logical_plan(plan).await.map_err(|e| {
+                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
+                    })?;
+
+                    // Execute through the physical plan (what `DataFrame::collect`
+                    // does internally) so the plan handle survives execution and
+                    // DataFusion's own operator metrics — elapsed compute, scan
+                    // output rows — can be folded into the per-query stats.
+                    let task_ctx = planner_ctx.task_ctx();
+                    let plan = df
+                        .create_physical_plan()
+                        .await
+                        .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+                    Ok::<_, InfinoError>((task_ctx, plan))
+                })
                 .await
-                .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
-
-            // Execute through the physical plan (what `DataFrame::collect`
-            // does internally) so the plan handle survives execution and
-            // DataFusion's own operator metrics — elapsed compute, scan
-            // output rows — can be folded into the per-query stats.
-            let task_ctx = ctx.task_ctx();
-            let plan = df
-                .create_physical_plan()
-                .await
-                .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+                .map_err(|join| {
+                    InfinoError::Query(format!("planning task failed: {join}"))
+                        .with_context("query_sql", None)
+                })??;
             // The shared meter-collect-harvest step: the root wrapper
             // meters the whole plan (aggregation, sort and join work sits
             // above the scan and is this query's CPU too), the scan
@@ -965,6 +1005,104 @@ fn read_only_sql_options() -> SQLOptions {
         .with_allow_ddl(false)
         .with_allow_dml(false)
         .with_allow_statements(false)
+}
+
+/// Occurrences of `or` / `and` as case-insensitive substrings: an upper bound on the true
+/// connective count (`ORDER` or a literal only overcount), provable in one byte pass.
+fn connective_upper_bound(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i].eq_ignore_ascii_case(&b'o') && bytes[i + 1].eq_ignore_ascii_case(&b'r') {
+            count += 1;
+            i += 2;
+        } else if i + 2 < bytes.len()
+            && bytes[i].eq_ignore_ascii_case(&b'a')
+            && bytes[i + 1].eq_ignore_ascii_case(&b'n')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'd')
+        {
+            count += 1;
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn connective_cap_error(surface: &str) -> InfinoError {
+    InfinoError::Query(format!(
+        "{surface} has more than {MAX_PREDICATE_CONNECTIVES} AND/OR connectives; rewrite long value lists as IN (...)"
+    ))
+}
+
+/// Refuse SQL with more than [`MAX_PREDICATE_CONNECTIVES`] `AND` / `OR` tokens, before planning.
+/// Cheapest stage that can decide wins:
+///
+/// - shorter than the cap could occupy: pass, no scan,
+/// - substring bound under the cap: pass, one byte scan, no lexing,
+/// - exact token count decides: a keyword inside a string literal does not count, `BETWEEN`'s
+///   `AND` does (refuses sooner, never admits more).
+///
+/// Text that fails to tokenize passes; the parser reports it right after.
+fn ensure_sql_within_connective_cap(sql: &str) -> Result<(), InfinoError> {
+    if sql.len() < MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES {
+        return Ok(());
+    }
+
+    if connective_upper_bound(sql) <= MAX_PREDICATE_CONNECTIVES {
+        return Ok(());
+    }
+
+    if connective_count(sql).is_some_and(|count| count > MAX_PREDICATE_CONNECTIVES) {
+        return Err(connective_cap_error("query").with_context("query_sql", None));
+    }
+
+    Ok(())
+}
+
+/// Exact `AND` / `OR` keyword count over the token stream; `None` when the text does not tokenize.
+fn connective_count(sql: &str) -> Option<usize> {
+    let tokens = SqlTokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
+    Some(
+        tokens
+            .iter()
+            .filter(|token| {
+                matches!(token, Token::Word(word) if matches!(word.keyword, Keyword::AND | Keyword::OR))
+            })
+            .count(),
+    )
+}
+
+/// Mutation-predicate side of [`ensure_sql_within_connective_cap`]: count `AND` / `OR` nodes in
+/// a built `Expr`. The stack-protected `TreeNode` walk is safe on the input it refuses; stops at
+/// the first node past the cap.
+pub(crate) fn ensure_expr_within_connective_cap(predicate: &Expr) -> Result<(), InfinoError> {
+    let mut connectives = 0usize;
+    predicate
+        .apply(|expr| {
+            if let Expr::BinaryExpr(BinaryExpr {
+                op: Operator::And | Operator::Or,
+                ..
+            }) = expr
+            {
+                connectives += 1;
+            }
+
+            Ok(if connectives > MAX_PREDICATE_CONNECTIVES {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        })
+        .expect("invariant: the counting visitor never errors");
+
+    if connectives > MAX_PREDICATE_CONNECTIVES {
+        return Err(connective_cap_error("predicate"));
+    }
+
+    Ok(())
 }
 
 /// Build `SupertableOptions` from a schema + lowered configs, attaching
@@ -1232,6 +1370,7 @@ mod tests {
         logical_expr::LogicalPlan,
         prelude::{SessionContext, col, lit},
     };
+    use proptest::prelude::*;
 
     use super::*;
     use crate::{
@@ -3698,6 +3837,8 @@ mod tests {
             "SELECT (SELECT COUNT(*) FROM docs) AS scalar",
             "SELECT * FROM (SELECT title FROM docs) AS sub",
             "EXPLAIN SELECT title FROM docs",
+            "WITH ranked AS (SELECT title, ROW_NUMBER() OVER (ORDER BY title) AS rn, COUNT(*) OVER () AS total FROM docs), top AS (SELECT title, rn FROM ranked WHERE rn <= 10 OR total < 100) SELECT title FROM top WHERE rn > 0 AND title <> '' ORDER BY rn",
+            "SELECT title, SUM(CHAR_LENGTH(title)) OVER (ORDER BY title ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM docs ORDER BY title LIMIT 5",
         ] {
             conn.query_sql(sql)
                 .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
@@ -3762,6 +3903,135 @@ mod tests {
             assert_eq!(plan_has_side_effect(&plan), side_effect, "{sql}");
             assert_eq!(options.verify_plan(&plan).is_err(), side_effect, "{sql}");
         }
+    }
+
+    /// `SELECT ... WHERE _id=0 OR _id=1 OR ...`: `terms` equality terms, `terms - 1` connectives.
+    fn or_chain(terms: usize) -> String {
+        let clause: Vec<String> = (0..terms).map(|i| format!("_id={i}")).collect();
+        format!("SELECT title FROM docs WHERE {}", clause.join(" OR "))
+    }
+
+    #[test]
+    fn query_sql_refuses_a_boolean_chain_over_the_connective_cap() {
+        // Twice the cap; without the cap this aborts the test binary, not the assertion.
+        let conn = conn_with_docs();
+        let err = conn.query_sql(&or_chain(2 * MAX_PREDICATE_CONNECTIVES));
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("connectives")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_sql_allows_a_boolean_chain_at_the_connective_cap() {
+        // Exactly the cap plans and runs.
+        let conn = conn_with_docs();
+        conn.query_sql(&or_chain(MAX_PREDICATE_CONNECTIVES + 1))
+            .expect("at-cap chain plans");
+    }
+
+    #[test]
+    fn query_sql_in_list_is_not_capped() {
+        // IN is one node however long; ten times the cap plans fine.
+        let conn = conn_with_docs();
+        let values: Vec<String> = (0..10 * MAX_PREDICATE_CONNECTIVES)
+            .map(|i| i.to_string())
+            .collect();
+        let sql = format!(
+            "SELECT title FROM docs WHERE _id IN ({})",
+            values.join(", ")
+        );
+        conn.query_sql(&sql).expect("long IN list plans");
+    }
+
+    #[test]
+    fn query_sql_connectives_inside_a_string_literal_do_not_count() {
+        // Past the length pre-filter, but every OR is inside one literal: none count.
+        let conn = conn_with_docs();
+        let literal = "x OR ".repeat(MAX_PREDICATE_CONNECTIVES);
+        let sql = format!("SELECT title FROM docs WHERE title = '{literal}'");
+        conn.query_sql(&sql)
+            .expect("literal ORs are not connectives");
+    }
+
+    #[test]
+    fn delete_allows_a_predicate_at_the_connective_cap() {
+        // Exactly the cap resolves (zero rows match). Storage-backed table: mutations refuse
+        // memory:// before the predicate matters.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new())
+            .expect("create docs");
+        docs.append(&build_title_batch(&["one row"]))
+            .expect("append docs");
+        let predicate = (0..MAX_PREDICATE_CONNECTIVES + 1)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        docs.delete(predicate).expect("at-cap predicate resolves");
+    }
+
+    proptest! {
+        // Stage two skips the lexer on this inequality: the byte-scan bound never undercounts
+        // the true keyword count, on any input.
+        #[test]
+        fn connective_upper_bound_never_undercounts(sql in ".{0,4096}") {
+            if let Some(exact) = connective_count(&sql) {
+                prop_assert!(connective_upper_bound(&sql) >= exact);
+            }
+        }
+    }
+
+    #[test]
+    fn prefilter_floor_holds_for_the_densest_chain() {
+        // Densest lexable chain, `(1)OR(1)...`, spends 5 bytes per connective, so text under the
+        // pre-filter length tops out near 614 connectives: under the cap, stage one is sound.
+        let limit = MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES;
+        let mut sql = String::from("(1");
+        while sql.len() + 6 < limit {
+            sql.push_str(")OR(1");
+        }
+        sql.push(')');
+        assert!(sql.len() < limit);
+        let count = connective_count(&sql).expect("chain tokenizes");
+        assert!(
+            count <= MAX_PREDICATE_CONNECTIVES,
+            "{count} connectives fit under the pre-filter length"
+        );
+    }
+
+    #[test]
+    fn update_refuses_a_predicate_over_the_connective_cap() {
+        // Same gate as delete; refusal comes before storage or batch shape is looked at.
+        let conn = conn_with_docs();
+        let docs = conn.open_table("docs").expect("open docs");
+        let predicate = (0..MAX_PREDICATE_CONNECTIVES + 2)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        let err = docs.update(predicate, &build_title_batch(&["replacement"]));
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("connectives")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn delete_refuses_a_predicate_over_the_connective_cap() {
+        // One connective past the cap, refused before any id capture.
+        let conn = conn_with_docs();
+        let docs = conn.open_table("docs").expect("open docs");
+        let predicate = (0..MAX_PREDICATE_CONNECTIVES + 2)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        let err = docs.delete(predicate);
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("connectives")),
+            "got {err:?}"
+        );
     }
 
     #[test]

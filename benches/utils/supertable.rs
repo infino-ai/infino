@@ -50,14 +50,13 @@ use std::{
 };
 
 use infino::{
-    OptimizeOptions,
+    CompactionSettings, OptimizeOptions,
     supertable::{
         Supertable,
         manifest::{ClusterCentroids, SuperfileEntry},
         writer::maintenance_pool_width,
     },
 };
-use tempfile::TempDir;
 
 use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
@@ -906,7 +905,24 @@ pub fn run() {
 // ─── Per-modality query runners ───────────────────────────────────────────
 
 const WARM_ITERS: usize = 20;
-const COLD_ITERS: usize = 5;
+// 3, down from 5: each iteration is a fresh-cache open against the object
+// store, so cold latency scales with stored bytes — on the realistic FTS
+// corpus (~6x the synthetic bytes at equal docs) five iterations put one
+// A/B arm alone near the hour. Three keeps an outlier-discarding median
+// (cold latency is informational — the merge gate reads warm p90 only),
+// and every deterministic cold assertion (GET counts, byte ceilings, cost
+// tables) is per-iteration and unaffected by the count.
+const COLD_ITERS: usize = 3;
+/// FTS-only cold sampling: one fresh-cache pass per shape. The FTS cold
+/// battery is the most byte-bound cell in the suite (realistic text
+/// barely compresses, and every iteration re-pays the whole fan from
+/// the object store) and its latencies are informational — the merge
+/// gate reads warm p90, and the deterministic cold assertions (GET
+/// counts, byte ceilings, cost tables) hold per iteration. One pass
+/// keeps every column populated at a third of the wall time; the
+/// vector and sql cells keep [`COLD_ITERS`] for outlier-discarding
+/// medians.
+const FTS_COLD_ITERS: usize = 1;
 const TOP_K: usize = 10;
 
 /// Selected phases for a per-modality supertable runner.
@@ -962,7 +978,10 @@ fn build_measured(
     (built, metrics)
 }
 
-fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempDir, Supertable) {
+fn open_consumer(
+    modality: Modality,
+    built: &supertable::IngestResult,
+) -> (tiers::RetryingTempDir, Supertable) {
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         Arc::clone(&built.storage),
         Some(built.total_index_bytes),
@@ -972,7 +991,9 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
         Arc::clone(&built.storage),
         cache,
     );
-    (cache_dir, tiers::open_consumer(opts))
+    // Consumers keep background fills going; every caller's cache dir gets
+    // the removal that retries until the tree is actually gone.
+    (cache_dir.into(), tiers::open_consumer(opts))
 }
 
 // ==== shared routing-state observability framework ====
@@ -1712,6 +1733,30 @@ pub mod fts {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
+        // Maintenance parity for the global-stats default: publish the
+        // term-stats sidecar over the fresh fragmented layout via a
+        // stats-only optimize (both merge triggers disabled, so the
+        // superfile layout is untouched). The read phases then measure
+        // the maintained shape a production table sits in. On an engine
+        // without the sidecar this is a no-op maintenance pass.
+        if corpus.is_some() && phases.reads() {
+            let (cache_dir, admin) = open_consumer(Modality::Fts, &built);
+            let stats_only = OptimizeOptions::compact(CompactionSettings {
+                min_fill_percent: 100,
+                min_superfiles_for_merge: u64::MAX,
+                ..CompactionSettings::default()
+            });
+            let (result, wall, _cpu) = cpu::timed(|| admin.optimize(&stats_only));
+            result.expect("stats-only optimize");
+            eprintln!(
+                "[supertable_fts] term-stats maintenance (stats-only optimize): {:.1}s, {} superfiles",
+                wall.as_secs_f64(),
+                admin.reader().expect("reader").n_superfiles()
+            );
+            drop(admin);
+            drop(cache_dir);
+        }
+
         // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
         // → compact → post-compact) on a fresh ingest in this process —
         // same gate as the vector cell. Drain is a no-op without a hidden
@@ -1896,7 +1941,7 @@ pub mod fts {
                                 &query,
                                 TOP_K,
                                 exec_fts::to_infino_mode(q.mode),
-                                infino::Bm25Stats::PerSuperfile,
+                                infino::Bm25Stats::default(),
                                 None,
                             )
                             .expect("serving working-set bm25_search");
@@ -2109,7 +2154,7 @@ pub mod fts {
                             &query,
                             TOP_K,
                             mode,
-                            infino::Bm25Stats::PerSuperfile,
+                            infino::Bm25Stats::default(),
                             None,
                         )
                         .expect("routing-state warm bm25 search"),
@@ -2161,7 +2206,7 @@ pub mod fts {
                     &query,
                     TOP_K,
                     exec_fts::to_infino_mode(q.mode),
-                    infino::Bm25Stats::PerSuperfile,
+                    infino::Bm25Stats::default(),
                     None,
                 )
                 .expect("warm prewarm bm25_search");
@@ -2231,7 +2276,7 @@ pub mod fts {
             FTS_BATTERY,
             supertable::TEXT_COLUMN,
             TOP_K,
-            COLD_ITERS,
+            FTS_COLD_ITERS,
             true,
             "supertable_fts",
         )
@@ -2266,9 +2311,11 @@ pub mod fts {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
-                (cache_dir, consumer)
+                // Consumer first: it must shut down before the cache dir's
+                // removal starts — see `RetryingTempDir`.
+                (consumer, tiers::RetryingTempDir::from(cache_dir))
             },
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2279,12 +2326,12 @@ pub mod fts {
                         &terms,
                         TOP_K,
                         mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        infino::Bm25Stats::default(),
                         None,
                     )
                     .expect("metered cold bm25_search");
             },
-            |(_cache, consumer), i| {
+            |(consumer, _cache), i| {
                 let q = steady[i % steady.len()];
                 let terms = q.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(q.mode);
@@ -2296,13 +2343,13 @@ pub mod fts {
                         &terms,
                         TOP_K,
                         mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        infino::Bm25Stats::default(),
                         None,
                     )
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2313,7 +2360,7 @@ pub mod fts {
                         &terms,
                         TOP_K,
                         mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        infino::Bm25Stats::default(),
                         None,
                     )
                     .expect("metered repeat cold bm25_search");
@@ -2328,16 +2375,18 @@ pub mod fts {
     /// no `open_all_superfiles`. Timed search is the first
     /// `bm25_search`, which opens prune survivors itself.
     struct SupertableColdGuard {
-        _cache_dir: TempDir,
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
         consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
     }
 
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
             Self {
-                _cache_dir: cache_dir,
                 consumer,
+                _cache_dir: cache_dir,
             }
         }
     }
@@ -2353,14 +2402,7 @@ pub mod fts {
             self.consumer
                 .reader()
                 .expect("reader")
-                .bm25_search(
-                    column,
-                    query,
-                    k,
-                    mode,
-                    infino::Bm25Stats::PerSuperfile,
-                    None,
-                )
+                .bm25_search(column, query, k, mode, infino::Bm25Stats::default(), None)
                 .expect("cold bm25_search")
                 .iter()
                 .map(|b| b.num_rows())
@@ -2382,7 +2424,7 @@ pub mod fts {
                     query,
                     k,
                     mode,
-                    infino::Bm25Stats::PerSuperfile,
+                    infino::Bm25Stats::default(),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("cold bm25_search fetched")
@@ -2639,8 +2681,10 @@ pub mod vector {
     }
 
     struct SupertableVecColdGuard {
-        _cache_dir: TempDir,
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
         consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
         id_to_dense: Arc<std::collections::HashMap<i128, u32>>,
     }
 
@@ -2651,8 +2695,8 @@ pub mod vector {
         ) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
             Self {
-                _cache_dir: cache_dir,
                 consumer,
+                _cache_dir: cache_dir,
                 id_to_dense,
             }
         }
@@ -3537,9 +3581,11 @@ pub mod vector {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
-                (cache_dir, consumer)
+                // Consumer first: it must shut down before the cache dir's
+                // removal starts — see `RetryingTempDir`.
+                (consumer, tiers::RetryingTempDir::from(cache_dir))
             },
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 if trace_enabled {
                     meter.start_trace();
                 }
@@ -3559,7 +3605,7 @@ pub mod vector {
                     first_query_trace = Some(meter.take_trace());
                 }
             },
-            |(_cache, consumer), i| {
+            |(consumer, _cache), i| {
                 let q = &steady_queries[i % steady_queries.len()];
                 if trace_enabled && i == 0 {
                     meter.start_trace();
@@ -3581,7 +3627,7 @@ pub mod vector {
                 }
             },
             steady_queries.len().min(STEADY_COLD_SAMPLES),
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 let _ = consumer
                     .reader()
                     .expect("reader")
@@ -5499,12 +5545,14 @@ pub mod sql {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
-                (cache_dir, consumer)
+                // Consumer first: it must shut down before the cache dir's
+                // removal starts — see `RetryingTempDir`.
+                (consumer, tiers::RetryingTempDir::from(cache_dir))
             },
             // First/repeat probe the by-key point lookup, which returns the
             // sample row — require a hit so a wrong predicate can't look like
             // success (`query_rows` already `.expect`s on plan/exec failure).
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 assert!(
                     consumer.query_rows(first) > 0,
                     "metered first cold SQL returned no rows: {first}"
@@ -5516,11 +5564,11 @@ pub mod sql {
             // the wall-median (and its GET count) down. The range predicate
             // may legitimately match zero rows yet still scans row groups
             // (real GETs), so it carries no non-empty assertion.
-            |(_cache, consumer), i| {
+            |(consumer, _cache), i| {
                 let _ = consumer.query_rows(&scan[1 + (i % (scan.len() - 1))].1);
             },
             (scan.len() - 1).min(STEADY_COLD_SAMPLES),
-            |(_cache, consumer)| {
+            |(consumer, _cache)| {
                 assert!(
                     consumer.query_rows(first) > 0,
                     "metered repeat cold SQL returned no rows: {first}"
@@ -5538,15 +5586,17 @@ pub mod sql {
     /// postings; SQL covered aggregates do not, and pre-open made "cold
     /// open" look like a full table fetch.)
     struct SupertableSqlColdGuard {
-        _cache_dir: TempDir,
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
         consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
     }
     impl SupertableSqlColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
             Self {
-                _cache_dir: cache_dir,
                 consumer,
+                _cache_dir: cache_dir,
             }
         }
     }

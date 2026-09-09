@@ -37,6 +37,12 @@ impl Supertable {
         // pre-build the centroid-router graph so the next centroid-graph query
         // loads it instead of building on the hot path. Best-effort.
         self.refresh_centroid_router_cache();
+        // Refresh the global term-stats sidecar over the post-merge
+        // membership (compaction's removals dropped any prior reference —
+        // see the manifest carry rule). Runs before gc so the sweep's live
+        // set names the fresh artifact.
+        self.refresh_term_stats_sync()
+            .map_err(|e| OptimizeError::Build(e.to_string()))?;
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}
             Err(e) => return Err(OptimizeError::Gc(e)),

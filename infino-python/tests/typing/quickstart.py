@@ -15,11 +15,22 @@ import infino
 def quickstart() -> None:
     db: infino.Connection = infino.connect("memory://")
 
-    schema = pa.schema([pa.field("title", pa.large_utf8(), nullable=False)])
-    spec = infino.IndexSpec().fts("title")
+    schema = pa.schema(
+        [
+            pa.field("title", pa.large_utf8(), nullable=False),
+            pa.field("body", pa.large_utf8(), nullable=False),
+        ]
+    )
+    # Every per-column FTS option the runtime accepts must type-check.
+    spec = infino.IndexSpec().fts("title").fts("body", analyzer="standard", stored=False)
     docs: infino.Table = db.create_table("docs", schema, spec)
 
-    docs.append([{"title": "the quick brown fox"}, {"title": "a lazy dog"}])
+    docs.append(
+        [
+            {"title": "the quick brown fox", "body": "jumps over the fence"},
+            {"title": "a lazy dog", "body": "sleeps in the sun"},
+        ]
+    )
 
     hits = docs.bm25_search("title", "fox", k=10, mode="and")
     names: list[str] = hits.column_names

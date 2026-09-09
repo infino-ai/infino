@@ -377,7 +377,7 @@ impl ExecutionPlan for Bm25Exec {
             let hits = match &query {
                 Bm25Query::Terms { query, mode } => {
                     reader
-                        .bm25_search_async(&column, query, k, *mode, Bm25Stats::PerSuperfile)
+                        .bm25_search_async(&column, query, k, *mode, Bm25Stats::default())
                         .await
                 }
                 Bm25Query::Prefix { prefix } => {

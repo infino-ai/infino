@@ -173,7 +173,11 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
             "query": "hello",
             "k": 10,
             "mode": "or",
-            "stats": "per_superfile",
+            // A defaulted request sends the CURRENT default explicitly —
+            // "global" since the stats default flipped — rather than
+            // relying on the server's own default (which stays frozen at
+            // its historical meaning for bare/omitted).
+            "stats": "global",
         })))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![1, 2, 3])), ARROW_CT),

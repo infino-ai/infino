@@ -50,8 +50,16 @@ jobs:
       # runs the same target; this is the early tripwire, not a second suite.
       - run: make bench-gate
       - run: make ci
+      # libtest's positional filters are plain substring matches ORed
+      # together, not a regex: a single 'a|b' argument matches nothing and
+      # the step passes vacuously with 0 tests run. `cargo test` accepts
+      # only one filter before `--`, so both go after it. Folded scalar:
+      # a plain `run:` value would read the `:: ` before the second
+      # filter as a YAML mapping.
       - name: RustFS storage wire + smoke tests
-        run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1
+        run: >-
+          cargo test --features test-helpers --test supertable --
+          storage::rustfs_s3_wire:: storage::smoke_rustfs:: --test-threads=1
 
   public-api:
     name: Public API surface
@@ -234,6 +242,22 @@ jobs:
           workspaces: infino-node
       # Build the addon (debug); the examples' `file:../..` dependency links it.
       - run: cd infino-node && npm install && npm run build:debug
+      # Install the examples' deps *before* restoring the model cache: transformers.js
+      # keeps downloaded models under node_modules/@huggingface/transformers/.cache,
+      # and npm would discard a restored cache that sits in an otherwise-empty
+      # node_modules. The `npm install` inside `make node-example` is then a no-op.
+      - run: |
+          for d in infino-node/examples/agent-memory infino-node/examples/hybrid-search-api; do
+            (cd "$d" && npm install)
+          done
+      # Cache the embedding model both examples pull from the Hugging Face Hub, so a
+      # Hub outage (503 on model.onnx) doesn't fail the job on every run.
+      - name: Cache transformers.js models
+        uses: actions/cache@v4
+        with:
+          path: infino-node/examples/*/node_modules/@huggingface/transformers/.cache
+          key: transformers-${{ runner.os }}-${{ hashFiles('infino-node/examples/*/index.mjs') }}
+          restore-keys: transformers-${{ runner.os }}-
       # Run each example end to end (self-asserting; non-zero exit fails the job).
       - run: make node-example
 

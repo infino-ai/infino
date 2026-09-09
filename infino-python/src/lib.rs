@@ -932,11 +932,11 @@ fn parse_filter<'a>(
 }
 
 fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
-    match stats
-        .unwrap_or("per_superfile")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let Some(stats) = stats else {
+        // Omitted means the engine default.
+        return Ok(Bm25Stats::default());
+    };
+    match stats.to_ascii_lowercase().as_str() {
         "per_superfile" => Ok(Bm25Stats::PerSuperfile),
         "global" => Ok(Bm25Stats::Global),
         other => Err(PyValueError::new_err(format!(
