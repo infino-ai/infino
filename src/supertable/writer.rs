@@ -376,6 +376,12 @@ pub struct SupertableWriter {
     buffer_scalar_bytes: usize,
     /// Held f32 vector payload bytes across `buffer`.
     buffer_vector_bytes: usize,
+    /// scratch memory increases with the rows read, not with the parent
+    /// allocation. this field tracks bytes a builder will actually read.
+    /// Its possible for multiple columns, and their nested arrays, to share the allocation, causing
+    /// the get_array_memory_size() to report a much larger size than actually
+    /// needed.
+    buffer_visible_scalar_bytes: usize,
     /// Byte size of the FTS-indexed text columns within `buffer`. A
     /// subset of `buffer_scalar_bytes`, not extra held memory; tracked
     /// only to weight the build-scratch reserve, since the FTS index
@@ -1000,6 +1006,7 @@ impl Supertable {
                 inner: Arc::clone(self.inner()),
                 buffer: Vec::new(),
                 buffer_scalar_bytes: 0,
+                buffer_visible_scalar_bytes: 0,
                 buffer_vector_bytes: 0,
                 buffer_fts_bytes: 0,
                 pending_ingest: IngestTally::default(),
@@ -1148,6 +1155,7 @@ impl SupertableWriter {
 
         self.buffer.push(BufferedBatch { scalar, vectors });
         self.buffer_scalar_bytes += scalar_bytes;
+        self.buffer_visible_scalar_bytes += scalar_bytes_u64 as usize;
         self.buffer_vector_bytes += vector_bytes;
         self.buffer_fts_bytes += fts_bytes;
 
@@ -1794,7 +1802,7 @@ impl SupertableWriter {
         // Held until this function returns, i.e. past `publish_superfiles` below.
         let _build_guard = reserve_build_scratch(
             &self.inner.options.connection_memory_budget,
-            self.buffer_scalar_bytes,
+            self.buffer_visible_scalar_bytes,
             self.buffer_vector_bytes,
             self.buffer_fts_bytes,
         )?;
@@ -1802,11 +1810,13 @@ impl SupertableWriter {
         // Take the buffer so a concurrent append can't observe a half-drained
         // state, but keep the batches for restore on any later failure (S9).
         let saved_scalar = self.buffer_scalar_bytes;
+        let saved_visible_scalar = self.buffer_visible_scalar_bytes;
         let saved_vector = self.buffer_vector_bytes;
         let saved_fts = self.buffer_fts_bytes;
         let saved_ingest = mem::take(&mut self.pending_ingest);
         let buffer = mem::take(&mut self.buffer);
         self.buffer_scalar_bytes = 0;
+        self.buffer_visible_scalar_bytes = 0;
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
 
@@ -1828,6 +1838,7 @@ impl SupertableWriter {
             Err(e) => {
                 self.buffer = buffer;
                 self.buffer_scalar_bytes = saved_scalar;
+                self.buffer_visible_scalar_bytes = saved_visible_scalar;
                 self.buffer_vector_bytes = saved_vector;
                 self.buffer_fts_bytes = saved_fts;
                 self.pending_ingest = saved_ingest;
@@ -10067,10 +10078,12 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use arrow::ipc::reader::StreamReader;
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+        StringArray, StructArray,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::prelude::{col, lit};
     use figment::{
         Figment,
@@ -11443,6 +11456,150 @@ mod tests {
         let budget = &st.options().connection_memory_budget;
         assert_eq!(budget.denials(), 0);
         assert!(budget.limit().is_some(), "bounded, not measured");
+    }
+
+    /// Child arrays in the fixture's nested column. An Arrow IPC decode
+    /// points every child at the one shared message buffer, and
+    /// `get_array_memory_size` sums `Buffer::capacity()`, so every child is
+    /// billed for the whole message: the capacity measure inflates by roughly
+    /// this factor across the round trip while the visible measure does not
+    /// move.
+    const NESTED_IPC_CHILDREN: usize = 16;
+
+    /// Rows in the nested fixture batch. Small on purpose — the inflation is
+    /// a function of the child count, not the row count.
+    const NESTED_IPC_ROWS: usize = 64;
+
+    /// The least inflation the nested fixture must exhibit for the budget
+    /// below to separate the two measures. The reserve is 2.5x and the
+    /// enforced ceiling is 0.9 of the configured budget, so capacity must
+    /// exceed visible by more than 2.5 / 0.9 before "2.5x visible fits, 2.5x
+    /// capacity does not" is a real distinction.
+    const MIN_NESTED_IPC_INFLATION: usize = 4;
+
+    /// A single nested (struct-of-strings) user column.
+    fn schema_nested() -> Arc<Schema> {
+        let children: Fields = (0..NESTED_IPC_CHILDREN)
+            .map(|i| Arc::new(Field::new(format!("f{i}"), DataType::Utf8, false)))
+            .collect();
+        Arc::new(Schema::new(vec![Field::new(
+            "attrs",
+            DataType::Struct(children),
+            false,
+        )]))
+    }
+
+    fn options_nested_serial() -> SupertableOptions {
+        SupertableOptions::new(schema_nested(), vec![], vec![])
+            .expect("valid nested options")
+            .with_writer_pool(writer_pool_with(1))
+    }
+
+    fn build_nested_batch() -> RecordBatch {
+        let schema = schema_nested();
+        let DataType::Struct(children) = schema.field(0).data_type().clone() else {
+            panic!("fixture column is a struct");
+        };
+        let arrays: Vec<ArrayRef> = (0..NESTED_IPC_CHILDREN)
+            .map(|c| {
+                Arc::new(StringArray::from(
+                    (0..NESTED_IPC_ROWS)
+                        .map(|r| format!("child {c} row {r} payload"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StructArray::new(children, arrays, None))],
+        )
+        .expect("nested batch")
+    }
+
+    /// Round-trip a batch through an Arrow IPC stream, as a caller feeding
+    /// the engine from a wire format does.
+    fn ipc_round_trip(batch: &RecordBatch) -> RecordBatch {
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut bytes, batch.schema_ref()).expect("ipc writer");
+            writer.write(batch).expect("ipc write");
+            writer.finish().expect("ipc finish");
+        }
+        StreamReader::try_new(io::Cursor::new(bytes), None)
+            .expect("ipc reader")
+            .next()
+            .expect("one batch on the stream")
+            .expect("ipc decode")
+    }
+
+    #[test]
+    fn append_admits_an_ipc_decoded_nested_batch_within_budget() {
+        // The build-scratch reserve must be weighted by the bytes the build
+        // will actually read — the batch's visible size — not by the parent
+        // allocation its arrays share. Over IPC the two diverge by the number
+        // of child arrays, so a nested batch that comfortably fits is refused
+        // when the reserve reads the held-memory (capacity) figure.
+        let batch = ipc_round_trip(&build_nested_batch());
+
+        // The fixture only means anything if it exhibits the inflation.
+        let capacity = batch.get_array_memory_size();
+        let visible: usize = batch
+            .columns()
+            .iter()
+            .map(|c| visible_array_bytes(c.as_ref()) as usize)
+            .sum();
+        assert!(
+            capacity >= visible.saturating_mul(MIN_NESTED_IPC_INFLATION),
+            "fixture must inflate the capacity measure: {capacity} B capacity \
+             vs {visible} B visible"
+        );
+
+        // One capacity-measure of budget: 2.5x the visible size fits inside
+        // it, 2.5x the capacity measure cannot.
+        let mut opts = options_nested_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(capacity as u64);
+        let st = Supertable::create(opts).expect("create");
+
+        st.append(&batch)
+            .expect("a batch whose visible size fits the budget must be admitted");
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            NESTED_IPC_ROWS as u64
+        );
+    }
+
+    #[test]
+    fn a_failed_commit_restores_the_visible_scalar_counter() {
+        // The reserve counter has to be restored alongside the buffer it
+        // describes: a commit that fails *after* reserving zeroes the buffer
+        // counters before the build, and a retry that reserved 0 bytes for
+        // rows still sitting in the buffer would under-reserve. Distinct from
+        // `over_budget_commit_preserves_the_buffer`, which is refused at the
+        // reserve itself and so never reaches the save/clear/restore step.
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(options_id_title_serial().with_storage(Arc::clone(&storage)))
+            .expect("create");
+
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 8)).expect("append buffers");
+        let reserved = w.buffer_visible_scalar_bytes;
+        assert!(reserved > 0, "the append recorded visible scalar bytes");
+
+        // Fail every superfile upload (empty fragment matches every uri), so
+        // the commit gets past the reserve and then fails.
+        faults.fail_with(FaultKind::Transient, FaultOp::PutAtomic, "", usize::MAX);
+        w.commit().expect_err("the upload fault fails the commit");
+
+        assert_eq!(w.buffered_batches(), 1, "the buffer was restored");
+        assert_eq!(
+            w.buffer_visible_scalar_bytes, reserved,
+            "the reserve counter was restored with the buffer it describes"
+        );
     }
 
     #[test]
