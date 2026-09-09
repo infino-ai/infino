@@ -487,6 +487,7 @@ impl Table {
     /// gather, but a term's idf depends on which segment a document
     /// landed in, so ranking drifts as the table fragments.
     #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None))]
+    #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
         &self,
         py: Python<'py>,
@@ -1023,6 +1024,7 @@ fn coerce_to_record_batch(
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(bench_serve::bench_serve_tcp, m)?)?;
+    m.add_function(wrap_pyfunction!(bench_serve::bench_serve_build_tcp, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<Table>()?;
     m.add_class::<IndexSpec>()?;

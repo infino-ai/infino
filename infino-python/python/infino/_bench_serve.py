@@ -36,11 +36,27 @@ def main() -> None:
             "(dataset id, 8-byte LE); empty returns the engine _id (16-byte)"
         ),
     )
+    p.add_argument(
+        "--build",
+        action="store_true",
+        help=(
+            "build+serve mode: an opcode-tagged wire (create/append/optimize/"
+            "search) so a client on a separate machine drives the whole build "
+            "over TCP. Search returns the dataset id (8-byte LE), mapped from the "
+            "engine _id by an in-memory table built at optimize. In this mode "
+            "--id-col names the dataset id column to store (default 'id')."
+        ),
+    )
     a = p.parse_args()
 
-    from infino._infino import bench_serve_tcp
+    from infino._infino import bench_serve_build_tcp, bench_serve_tcp
 
-    bench_serve_tcp(a.data, a.table, a.col, a.addr, a.cache_bytes, a.id_col)
+    if a.build:
+        bench_serve_build_tcp(
+            a.data, a.table, a.col, a.id_col or "id", a.addr, a.cache_bytes
+        )
+    else:
+        bench_serve_tcp(a.data, a.table, a.col, a.addr, a.cache_bytes, a.id_col)
 
 
 if __name__ == "__main__":
