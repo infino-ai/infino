@@ -48,6 +48,17 @@ pub enum BuildError {
     #[error("FTS column {column:?} must be LargeUtf8; found {actual}")]
     FtsColumnMustBeLargeUtf8 { column: String, actual: String },
 
+    /// A column declared BM25 parameters outside their valid ranges.
+    /// Caught before anything is written: the build bakes the
+    /// block-max bounds with these, so a nonsense pair would otherwise
+    /// surface much later as strange scores rather than as a rejected
+    /// table.
+    #[error(
+        "FTS column {column:?}: BM25 k1 must be finite and > 0, b must be finite and in [0, 1]; \
+         got k1={k1}, b={b}"
+    )]
+    FtsBm25ParamsOutOfRange { column: String, k1: f32, b: f32 },
+
     #[error("vector column {column:?} not found in schema")]
     VectorColumnMissing { column: String },
 

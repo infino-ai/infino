@@ -315,6 +315,11 @@ struct ColumnState {
     /// positional capture path in `add_doc` and the extended
     /// per-term layout at emit.
     positions: bool,
+    /// BM25 parameters for this column, from `FtsConfig::bm25`. The
+    /// per-block score bounds in the skip table are the block's true
+    /// max under this pair, and the pair itself is recorded in the
+    /// column's KV entry so the reader knows what the bounds mean.
+    params: bm25::Bm25Params,
 }
 
 /// Per-column posting accumulator. Starts in `InRam` mode; transitions
@@ -1386,9 +1391,12 @@ impl FtsBuilder {
     /// Register an FTS column up-front, tokenized with the builder's
     /// default tokenizer. Returns its `column_id` (its index in
     /// declaration order).
+    /// Scores with the standard BM25 pair; use
+    /// [`FtsBuilder::register_column_with_tokenizer`] to declare
+    /// another.
     pub fn register_column(&mut self, name: String, positions: bool) -> Result<u32, BuildError> {
         let tokenizer = Arc::clone(&self.default_tokenizer);
-        self.register_column_with_tokenizer(name, positions, tokenizer)
+        self.register_column_with_tokenizer(name, positions, tokenizer, bm25::Bm25Params::STANDARD)
     }
 
     /// Register an FTS column tokenized with an explicit `tokenizer`,
@@ -1399,6 +1407,7 @@ impl FtsBuilder {
         name: String,
         positions: bool,
         tokenizer: Arc<dyn Tokenizer>,
+        params: bm25::Bm25Params,
     ) -> Result<u32, BuildError> {
         if name.as_bytes().contains(&FST_SEPARATOR) {
             return Err(BuildError::ReservedSeparatorInColumnName(name));
@@ -1415,6 +1424,7 @@ impl FtsBuilder {
             doc_lengths: Vec::new(),
             total_tokens: 0,
             positions,
+            params,
         });
         self.postings.push(ColumnPostings::new());
         self.column_tokenizers.push(tokenizer);
@@ -2549,6 +2559,7 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -2597,6 +2608,7 @@ impl FtsBuilder {
                     col_name_bytes,
                     col_doc_lengths,
                     avgdl,
+                    params,
                     n_docs,
                     &mut key_buf,
                     &mut postings_writer,
@@ -2759,6 +2771,7 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -2802,6 +2815,7 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
+                            params,
                             n_docs,
                             &mut key_buf,
                             &mut postings_writer,
@@ -2949,6 +2963,7 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
+                            params,
                             n_docs,
                             &mut key_buf,
                             &mut postings_writer,
@@ -2986,6 +3001,7 @@ impl FtsBuilder {
                                 col_name_bytes,
                                 col_doc_lengths,
                                 avgdl,
+                                params,
                                 n_docs,
                                 &mut key_buf,
                                 &mut postings_writer,
@@ -3378,6 +3394,10 @@ fn assemble_and_write_blob<W: Write>(
     // The legacy ladder (V2/V3/V4) is written only when the coarse table is
     // suppressed (test-only), so the backwards-compat tests can produce a
     // genuine pre-086 blob.
+    // A column's BM25 parameters do not move the version: they are
+    // recorded in its `inf.fts.columns` entry and read back from there,
+    // so the stored per-block bound is interpreted against the pair that
+    // entry names. Nothing about the layout differs either way.
     let fts_version = if write_coarse {
         format::fts::VERSION_V5
     } else if finish_profile.saw_bitset_block {
@@ -3515,6 +3535,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
+    params: bm25::Bm25Params,
     n_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
@@ -3626,6 +3647,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             col_name_bytes,
             col_doc_lengths,
             avgdl,
+            params,
             n_docs,
             key_buf,
             postings_writer,
@@ -3667,6 +3689,7 @@ fn encode_and_emit_term<W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
+    params: bm25::Bm25Params,
     n_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
@@ -3773,7 +3796,7 @@ fn encode_and_emit_term<W: Write>(
                 .map(|(&d, &t)| {
                     let reader_dl =
                         bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
-                    bm25::score(idf_t, t, reader_dl, avgdl)
+                    bm25::score(idf_t, t, reader_dl, avgdl, params)
                 })
                 .fold(0.0f32, f32::max);
             block_ub_per_block.push(block_ub);

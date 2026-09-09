@@ -184,8 +184,13 @@ pub(super) struct PhraseCursor {
     /// Positional verification still runs in query order (`members`
     /// order), which the phrase adjacency check requires.
     pub(super) align_order: Vec<usize>,
-    /// Σ member idf × (K1 + 1) — the phrase's scoring constant.
+    /// Σ member idf × (k1 + 1) — the phrase's scoring constant, built
+    /// with the parameters this query scores with.
     pub(super) idf_x_k1p1: f32,
+    /// Σ member idf, kept so a bound in the "scaled" form can be
+    /// recovered without dividing `idf_x_k1p1` by a `(k1 + 1)` the
+    /// cursor would have to guess.
+    pub(super) idf_sum: f32,
     /// Phrase-scaled term-level upper bound (see type docs).
     pub(super) term_max_bm25: f32,
     /// Aligned-and-verified doc, or `u32::MAX` when exhausted.
@@ -207,6 +212,7 @@ impl PhraseCursor {
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
+        params: bm25::Bm25Params,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
@@ -218,7 +224,11 @@ impl PhraseCursor {
             .zip(positions)
             .zip(positional)
             .map(|((cursor, positions), (term_meta, inline_position))| {
-                let idf = cursor.idf_x_k1p1 / (bm25::K1 + 1.0);
+                // The member's own idf, not `idf_x_k1p1 / (K1 + 1)`:
+                // dividing by the crate constant would recover the wrong
+                // value for a column scoring at a declared or overridden
+                // pair.
+                let idf = cursor.idf;
                 min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
                 idf_sum += idf;
                 PhraseMember {
@@ -240,7 +250,8 @@ impl PhraseCursor {
         let mut align_order: Vec<usize> = (0..members.len()).collect();
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
-            idf_x_k1p1: idf_sum * (bm25::K1 + 1.0),
+            idf_x_k1p1: params.idf_x_k1p1(idf_sum),
+            idf_sum,
             term_max_bm25: idf_sum * min_scaled_bound,
             members,
             align_order,
@@ -532,7 +543,7 @@ impl PhraseCursor {
             let b = m.cursor.block_max_in_range(range_start, range_end);
             min_scaled = min_scaled.min(b / m.idf);
         }
-        let idf_sum = self.idf_x_k1p1 / (bm25::K1 + 1.0);
+        let idf_sum = self.idf_sum;
         idf_sum * min_scaled
     }
 }

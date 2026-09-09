@@ -96,6 +96,7 @@ use crate::superfile::{
         kv,
     },
     fts::{
+        bm25,
         builder::FtsBuilder,
         reader::ColumnMeta,
         tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, tokenizer_for_name},
@@ -154,6 +155,16 @@ pub struct FtsConfig {
     /// existing superfile the column is legitimately absent from the
     /// stored schema and its postings are carried across instead.
     pub stored: bool,
+    /// BM25 similarity parameters for this column. The build bakes the
+    /// stored per-block score bounds at this pair and records it in the
+    /// column's `inf.fts.columns` entry, so a reader never infers which
+    /// parameters a bound belongs to. A query may score at a different
+    /// pair; the reader corrects the bounds for the difference.
+    ///
+    /// Defaults to the standard pair (`k1 = 1.2`, `b = 0.75`), which
+    /// keeps the built bytes identical to a file written before the
+    /// parameters were declarable.
+    pub bm25: bm25::Bm25Params,
 }
 
 impl FtsConfig {
@@ -165,6 +176,7 @@ impl FtsConfig {
             analyzer: STANDARD_TOKENIZER.to_string(),
             positions: false,
             stored: true,
+            bm25: bm25::Bm25Params::STANDARD,
         }
     }
 
@@ -183,6 +195,14 @@ impl FtsConfig {
     /// Keep the raw text in the Parquet body (see the field docs).
     pub fn stored(mut self, stored: bool) -> Self {
         self.stored = stored;
+        self
+    }
+
+    /// Set the BM25 similarity parameters (see the field docs).
+    /// Validated at `SupertableOptions::new`, which names the column
+    /// in the error.
+    pub fn bm25(mut self, k1: f32, b: f32) -> Self {
+        self.bm25 = bm25::Bm25Params::new(k1, b);
         self
     }
 }
@@ -382,6 +402,13 @@ impl BuilderOptions {
         // rebuild carries the analyzer the postings were built with. This
         // is why an existing table keeps its recorded analyzer through
         // compaction and optimize no matter what the engine's default is.
+        //
+        // The BM25 pair rides along for the same reason and with a sharper
+        // consequence: dropping it here would rebake the merged file's
+        // block-max bounds at the standard pair while the source files
+        // kept theirs, so one column would score two ways depending on
+        // which superfile a document landed in — and a compaction, not
+        // any user action, would be what changed the ranking.
         let fts_columns: Vec<FtsConfig> = if let Some(fts) = &reader.fts() {
             fts.fts_columns_config()
                 .map(|c| {
@@ -389,6 +416,7 @@ impl BuilderOptions {
                         .analyzer(c.tokenizer.name())
                         .positions(c.positions)
                         .stored(c.stored)
+                        .bm25(c.params.k1, c.params.b)
                 })
                 .collect()
         } else {
@@ -706,7 +734,7 @@ impl SuperfileBuilder {
                         analyzer: fc.analyzer.clone(),
                     }
                 })?;
-                fb.register_column_with_tokenizer(fc.column.clone(), fc.positions, tok)?;
+                fb.register_column_with_tokenizer(fc.column.clone(), fc.positions, tok, fc.bm25)?;
             }
             Some(fb)
         };
@@ -2286,11 +2314,32 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 /// JSON per column.
 ///
 /// Output shape per column:
-/// `{"name":"<escaped>","tokenizer":"<name>"}`.
+/// `{"name":"<escaped>","tokenizer":"<name>","k1":<f>,"b":<f>}`.
 /// `tokenizer` is that column's analyzer name (`"ascii_lower"` or
 /// `"standard"`), straight from `FtsConfig.analyzer` — the reader
 /// reconstructs the matching tokenizer from it for query-time
 /// tokenization.
+///
+/// `k1` / `b` are written **unconditionally, defaults included**,
+/// unlike `positions` and `stored`. Those two are booleans whose
+/// absence has exactly one possible meaning, so omitting them keeps a
+/// default column's JSON byte-identical to older files. A scoring
+/// parameter is different: it is the provenance of the stored
+/// block-max bounds, and a reader that has to infer it is a reader
+/// that will infer wrong the day the recommended default moves. The
+/// same lesson is recorded on `rerank_codec` in
+/// `supertable::manifest::options_hash` — a data-determined value
+/// belongs on disk, read back rather than re-derived.
+/// One BM25 parameter as JSON. `{:?}` on an `f32` is the shortest
+/// decimal that round-trips back to the same bits, and always carries a
+/// `.`, so the value the reader deserializes is bit-for-bit the value
+/// the bounds were baked with — which is what makes the
+/// `params == query` comparison in the reader exact rather than
+/// approximate.
+fn fts_param_json(v: f32) -> String {
+    format!("{v:?}")
+}
+
 fn fts_columns_json(cols: &[FtsConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
@@ -2302,6 +2351,11 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         s.push_str(r#"","tokenizer":""#);
         s.push_str(&escape_json(&c.analyzer));
         s.push('"');
+        // Always emitted — see the function docs.
+        s.push_str(r#","k1":"#);
+        s.push_str(&fts_param_json(c.bm25.k1));
+        s.push_str(r#","b":"#);
+        s.push_str(&fts_param_json(c.bm25.b));
         // Emitted only when set: a positionless column's JSON stays
         // byte-identical to files written before positions existed
         // (the reader defaults a missing field to false).
@@ -2716,11 +2770,13 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard","positions":true}"#),
+            s.contains(
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}"#
+            ),
             "positional column carries the flag: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"standard"}"#),
+            s.contains(r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}"#),
             "positionless column carries no positions key at all: {s}"
         );
     }
@@ -2736,11 +2792,11 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard"}"#),
+            s.contains(r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}"#),
             "title uses the standard analyzer: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"ascii_lower"}"#),
+            s.contains(r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75}"#),
             "body uses ascii_lower: {s}"
         );
     }
@@ -2755,11 +2811,13 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard"}"#),
+            s.contains(r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}"#),
             "stored column carries no stored key at all: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"standard","stored":false}"#),
+            s.contains(
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false}"#
+            ),
             "index-only column carries the flag: {s}"
         );
     }
@@ -4838,6 +4896,53 @@ mod tests {
             .await
             .expect("bm25 on carried stored column");
         assert_eq!(hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn build_from_readers_bm25_params_preserved_by_new_from_reader() {
+        // Same failure shape as the codec case below: dropping the pair in
+        // `new_from_reader` would rebake the merged file's block-max bounds
+        // at the standard values while the source kept its own, so one
+        // column would score two ways depending on which superfile a
+        // document landed in — and a compaction, not any user action,
+        // would be what changed the ranking.
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").bm25(1.4, 0.6)],
+            vec![],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let source_bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(source_bytes)).expect("open reader");
+        let source_pair = reader
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column")
+            .params;
+        assert_eq!(source_pair, bm25::Bm25Params::new(1.4, 0.6));
+
+        let (merged_bytes, _stats) =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let merged_pair = merged
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column")
+            .params;
+        assert_eq!(
+            merged_pair, source_pair,
+            "the declared pair must survive a rebuild, or compaction silently rescores the column"
+        );
     }
 
     #[tokio::test]

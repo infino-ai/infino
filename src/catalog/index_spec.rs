@@ -8,7 +8,7 @@
 
 use crate::superfile::{
     builder::FtsConfig,
-    fts::tokenize::STANDARD_TOKENIZER,
+    fts::{bm25::Bm25Params, tokenize::STANDARD_TOKENIZER},
     vector::{builder::VectorConfig, distance::Metric},
 };
 
@@ -42,6 +42,7 @@ pub struct FtsField {
     column: String,
     analyzer: String,
     stored: bool,
+    bm25: Bm25Params,
 }
 
 impl FtsField {
@@ -54,6 +55,7 @@ impl FtsField {
             column: column.into(),
             analyzer: STANDARD_TOKENIZER.to_string(),
             stored: true,
+            bm25: Bm25Params::STANDARD,
         }
     }
 
@@ -78,6 +80,23 @@ impl FtsField {
     /// searched skips the stored copy entirely.
     pub fn stored(mut self, stored: bool) -> Self {
         self.stored = stored;
+        self
+    }
+
+    /// Set this column's BM25 similarity parameters — `k1` (term
+    /// frequency saturation, `> 0`) and `b` (length normalization, in
+    /// `[0, 1]`). Defaults to `1.2` / `0.75`, the standard pair.
+    ///
+    /// Per column, and recorded in the index: the stored block-max
+    /// bounds are built with the pair declared here, and the pair
+    /// itself is written alongside them, so a reader always scores with
+    /// the parameters its bounds belong to. A search may score with a
+    /// different pair — the bounds are corrected for the difference —
+    /// so this is the column's default rather than a commitment.
+    ///
+    /// Validated at `create_table`, with the column named in the error.
+    pub fn bm25(mut self, k1: f32, b: f32) -> Self {
+        self.bm25 = Bm25Params::new(k1, b);
         self
     }
 }
@@ -165,6 +184,12 @@ impl IndexSpec {
         self.fts.iter().map(|f| f.stored).collect()
     }
 
+    /// FTS BM25 parameters, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_bm25(&self) -> Vec<Bm25Params> {
+        self.fts.iter().map(|f| f.bm25).collect()
+    }
+
     /// Vector index declarations as `(column, dim, metric)`, in declaration
     /// order. Used by the remote transport to serialize the spec.
     #[cfg(feature = "remote")]
@@ -185,6 +210,7 @@ impl IndexSpec {
                 FtsConfig::new(f.column.clone())
                     .analyzer(f.analyzer.clone())
                     .stored(f.stored)
+                    .bm25(f.bm25.k1, f.bm25.b)
             })
             .collect();
         let vectors = self

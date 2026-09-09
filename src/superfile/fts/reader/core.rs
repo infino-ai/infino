@@ -45,6 +45,7 @@ use crate::superfile::{
         },
     },
     fts::{
+        bm25,
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,
@@ -453,7 +454,7 @@ pub(super) fn two_term_has_rare_anchor(cursors: &[TermCursor]) -> bool {
 
 /// FTS blob reader. Self-contained — owns its `Bytes` (which the storage
 /// layer assembled from mmap / range-fetch / full-read).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FtsReader {
     pub(super) source: Source,
     pub(super) n_docs: u32,
@@ -483,6 +484,38 @@ pub struct FtsReader {
 }
 
 impl FtsReader {
+    /// A view of this reader that scores every column with `params`
+    /// instead of the pair that column declared.
+    ///
+    /// Two things change per column, and nothing else: the norm decode
+    /// table is re-derived at `params` (the per-doc length buckets are
+    /// shared, not copied — they carry no parameters), and
+    /// [`ColumnMeta::bound_scale`] picks up the factor that keeps the
+    /// *stored* bounds — which belong to the declared pair — upper
+    /// bounds under the new one. Results stay exact; only pruning power
+    /// is traded.
+    ///
+    /// A column whose declared pair already equals `params` is left
+    /// untouched, so a query that "overrides" with what the column
+    /// already uses costs nothing.
+    ///
+    /// Cheap enough to do per query: the clone is a `Bytes`/`Arc` bump
+    /// for the blob, one `String` and one 1 KiB table per re-derived
+    /// column, and no pass over any per-doc array.
+    pub fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
+        let mut view = self.clone();
+        for col in &mut view.columns {
+            if col.params == params {
+                continue;
+            }
+            let rescored = col.dl_norm_k1.rescored(col.avgdl, params);
+            col.bound_scale = col.dl_norm_k1.bound_scale(&rescored, col.params, params);
+            col.dl_norm_k1 = rescored;
+            col.params = params;
+        }
+        view
+    }
+
     /// Open with default options (CRC verification on).
     pub fn open(blob: Bytes, columns_json: &str) -> Result<Self, FtsError> {
         Self::open_with(blob, columns_json, OpenOptions::default())
@@ -882,10 +915,15 @@ impl FtsReader {
             // For avgdl == 0 (empty column) this is an empty table; it'll
             // never be indexed since `search` short-circuits.
             let n = n_docs as usize;
+            // The column's declared parameters — recorded in the KV
+            // entry by every writer since they became recordable, and
+            // the standard pair for any file older than that.
+            let params = col_cfg.params();
             let dl_norm_k1 = NormTable::new(
                 (0..n).map(|d| read_u32_le(&array_region[d * 4..d * 4 + 4])),
                 n,
                 avgdl,
+                params,
             );
             let tokenizer = tokenizer_for_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
@@ -898,6 +936,10 @@ impl FtsReader {
                 doc_lengths_range: doc_lengths_offset..array_end,
                 avgdl,
                 dl_norm_k1,
+                params,
+                // Scoring with the pair the bounds were baked at, so no
+                // correction. `with_bm25_override` is what changes this.
+                bound_scale: 1.0,
                 positions: col_cfg.positions,
                 tokenizer,
                 stored: col_cfg.stored,
@@ -1219,7 +1261,10 @@ impl FtsReader {
                 .collect();
             let positions = self.fetch_term_positions(&pos_ranges).await?;
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
-                cursors, positions, positional,
+                cursors,
+                positions,
+                positional,
+                col_meta.params,
             )?)));
         }
         Ok((out, dict_ranges))
@@ -1350,6 +1395,12 @@ impl FtsReader {
                         false,
                         false,
                         self.has_coarse_block_max,
+                        // Carry-only: no scores, so the pair is irrelevant.
+                        bm25::Bm25Params::STANDARD,
+                        // This walk carries postings across into a merge; it
+                        // reads doc ids, tfs and positions and never consults
+                        // a score bound, so no correction applies.
+                        1.0,
                     )?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
@@ -1813,7 +1864,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::{
         BytesLazyByteSource,
-        fts::{builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer},
+        fts::{bm25, builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer},
     };
 
     #[test]
@@ -2025,6 +2076,270 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(r.read_doc_lengths(0).expect("doc lengths"), vec![3, 4]);
+    }
+
+    #[test]
+    fn declared_bm25_params_round_trip_through_the_column_entry() {
+        // A column whose entry records a non-standard pair: the reader
+        // must score with what the file says, never with the crate
+        // default, because the stored bounds were baked at that pair.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column_with_tokenizer(
+            "body".into(),
+            false,
+            Arc::new(AsciiLowerTokenizer),
+            bm25::Bm25Params::new(1.4, 0.6),
+        )
+        .expect("register");
+        b.add_doc(0, 0, "a b a").expect("doc 0");
+        b.add_doc(0, 1, "b a c d").expect("doc 1");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.4,"b":0.6}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(r.columns[0].params, bm25::Bm25Params::new(1.4, 0.6));
+        assert!(!r.columns[0].params.is_standard());
+    }
+
+    #[test]
+    fn a_column_entry_without_params_reads_as_the_standard_pair() {
+        // The frozen legacy default: a file written before the pair was
+        // recordable can only have been built with the standard values,
+        // so absence has exactly one meaning and must not track a later
+        // change to what the API recommends.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "a b a").expect("doc 0");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(r.columns[0].params, bm25::Bm25Params::STANDARD);
+        assert_eq!(r.columns[0].params.k1, bm25::K1);
+        assert_eq!(r.columns[0].params.b, bm25::B);
+    }
+
+    #[test]
+    fn norm_table_is_built_from_the_declared_pair() {
+        // The per-doc buckets are lengths (parameter-free); the 256-entry
+        // decode table is where the parameters live. Two readers over the
+        // same corpus at different pairs must therefore disagree on the
+        // norm and agree on nothing else being different.
+        let build = |params: bm25::Bm25Params| {
+            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            b.register_column_with_tokenizer(
+                "body".into(),
+                false,
+                Arc::new(AsciiLowerTokenizer),
+                params,
+            )
+            .expect("register");
+            b.add_doc(0, 0, "a b a").expect("doc 0");
+            b.add_doc(0, 1, "b a c d e f g h").expect("doc 1");
+            b.finish().expect("finish")
+        };
+
+        let std_json = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75}]"#;
+        let alt_json = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.4,"b":0.6}]"#;
+        let std_reader = FtsReader::open(Bytes::from(build(bm25::Bm25Params::STANDARD)), std_json)
+            .expect("open standard");
+        let alt_reader = FtsReader::open(
+            Bytes::from(build(bm25::Bm25Params::new(1.4, 0.6))),
+            alt_json,
+        )
+        .expect("open alt");
+
+        let std_norm = std_reader.columns[0].dl_norm_k1.get(1);
+        let alt_norm = alt_reader.columns[0].dl_norm_k1.get(1);
+        assert_ne!(
+            std_norm, alt_norm,
+            "the decode table must reflect the declared pair"
+        );
+        // And each matches the closed form for its own pair, against the
+        // quantized length the scorer actually sees.
+        let dl = bm25::stored_len(8);
+        let avgdl = std_reader.columns[0].avgdl;
+        assert!((std_norm - bm25::Bm25Params::STANDARD.dl_norm_k1(dl, avgdl)).abs() < 1e-6);
+        assert!((alt_norm - bm25::Bm25Params::new(1.4, 0.6).dl_norm_k1(dl, avgdl)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bound_scale_is_one_for_the_same_pair_and_above_one_otherwise() {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..64u32 {
+            let words = (d % 30) + 1;
+            let text: String = (0..words).map(|w| format!("t{w} ")).collect();
+            b.add_doc(0, d, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let col = &r.columns[0];
+        let baked = col.params;
+
+        assert_eq!(
+            col.dl_norm_k1.bound_scale(&col.dl_norm_k1, baked, baked),
+            1.0,
+            "no correction when the query scores at the baked pair"
+        );
+
+        for (k1, b_param) in [(1.4_f32, 0.75_f32), (0.9, 0.75), (1.2, 0.4), (1.2, 0.0)] {
+            let query = bm25::Bm25Params::new(k1, b_param);
+            let other = col.dl_norm_k1.rescored(col.avgdl, query);
+            let r_factor = col.dl_norm_k1.bound_scale(&other, baked, query);
+            assert!(
+                r_factor >= 1.0,
+                "the factor must never shrink a bound: {k1}/{b_param} gave {r_factor}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_scale_keeps_the_bound_above_every_rescored_score() {
+        // The property the whole correction rests on: for any (tf, dl) in
+        // the column, R * score_at(baked) >= score_at(query). Checked
+        // against the closed form over the corpus's own length range
+        // rather than a hand-picked case.
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..128u32 {
+            let words = (d % 50) + 1;
+            let text: String = (0..words).map(|w| format!("t{w} ")).collect();
+            b.add_doc(0, d, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let col = &r.columns[0];
+        let baked = col.params;
+        let avgdl = col.avgdl;
+
+        for (k1, b_param) in [
+            (1.4_f32, 0.75_f32),
+            (0.5, 0.75),
+            (2.0, 0.75),
+            (1.2, 0.0),
+            (1.2, 1.0),
+            (0.5, 0.2),
+            (2.0, 1.0),
+        ] {
+            let query = bm25::Bm25Params::new(k1, b_param);
+            let other = col.dl_norm_k1.rescored(avgdl, query);
+            let r_factor = col.dl_norm_k1.bound_scale(&other, baked, query);
+            for dl in 1..=50u32 {
+                for tf in [1u32, 2, 3, 7, 20, 100] {
+                    let idf = 1.0_f32;
+                    let at_baked = bm25::score(idf, tf, bm25::stored_len(dl), avgdl, baked);
+                    let at_query = bm25::score(idf, tf, bm25::stored_len(dl), avgdl, query);
+                    assert!(
+                        r_factor * at_baked >= at_query - 1e-6,
+                        "R={r_factor} too small for k1={k1} b={b_param} tf={tf} dl={dl}: \
+                         {} vs {}",
+                        r_factor * at_baked,
+                        at_query
+                    );
+                }
+            }
+        }
+    }
+
+    /// The end-to-end guarantee behind the correction factor: scoring
+    /// with an override must produce exactly what a file *built* at
+    /// those parameters produces. Scores never depend on which pair the
+    /// bounds were baked at — only pruning does — so any divergence
+    /// means a bound was left too small and a qualifying document was
+    /// skipped.
+    #[tokio::test]
+    async fn an_override_scores_identically_to_a_file_baked_at_that_pair() {
+        let corpus: Vec<String> = (0..400u32)
+            .map(|d| {
+                let words = (d % 37) + 1;
+                let mut text: String = (0..words).map(|w| format!("t{} ", w % 11)).collect();
+                if d % 3 == 0 {
+                    text.push_str("common ");
+                }
+                if d % 29 == 0 {
+                    text.push_str("rare ");
+                }
+                text.trim().to_string()
+            })
+            .collect();
+
+        let build = |params: bm25::Bm25Params| {
+            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            b.register_column_with_tokenizer(
+                "body".into(),
+                false,
+                Arc::new(AsciiLowerTokenizer),
+                params,
+            )
+            .expect("register");
+            for (i, t) in corpus.iter().enumerate() {
+                b.add_doc(0, i as u32, t).expect("add doc");
+            }
+            Bytes::from(b.finish().expect("finish"))
+        };
+
+        for (k1, b_param) in [(1.4_f32, 0.6_f32), (0.5, 0.9), (2.0, 0.2), (1.2, 0.0)] {
+            let params = bm25::Bm25Params::new(k1, b_param);
+            let json_std = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75}]"#;
+            let json_alt = format!(
+                r#"[{{"name":"body","tokenizer":"ascii_lower","k1":{k1:?},"b":{b_param:?}}}]"#
+            );
+
+            let baked_standard =
+                FtsReader::open(build(bm25::Bm25Params::STANDARD), json_std).expect("open std");
+            let baked_at_params = FtsReader::open(build(params), &json_alt).expect("open alt");
+            // Same query parameters, reached two ways: an override on a
+            // file baked at the standard pair, and a file baked at the
+            // pair itself.
+            let overridden = baked_standard.with_bm25_override(params);
+
+            for terms in [
+                &["common"][..],
+                &["rare"][..],
+                &["common", "rare"][..],
+                &["t0", "t1", "common"][..],
+            ] {
+                for k in [1usize, 10, 100] {
+                    let a = overridden
+                        .search("body", terms, k, BoolMode::Or)
+                        .await
+                        .expect("override search");
+                    let b = baked_at_params
+                        .search("body", terms, k, BoolMode::Or)
+                        .await
+                        .expect("baked search");
+                    assert_eq!(
+                        a.len(),
+                        b.len(),
+                        "hit count diverged for {terms:?} k={k} at k1={k1} b={b_param}"
+                    );
+                    for ((da, sa), (db, sb)) in a.iter().zip(b.iter()) {
+                        assert_eq!(
+                            da, db,
+                            "doc order diverged for {terms:?} k={k} at k1={k1} b={b_param}"
+                        );
+                        assert!(
+                            (sa - sb).abs() < 1e-4,
+                            "score diverged for doc {da} on {terms:?} at k1={k1} b={b_param}: \
+                             {sa} vs {sb}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An override equal to what the column already declares is a no-op:
+    /// no rescaled table, no correction factor.
+    #[test]
+    fn an_override_matching_the_declared_pair_changes_nothing() {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "a b a").expect("doc 0");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let same = r.with_bm25_override(bm25::Bm25Params::STANDARD);
+        assert_eq!(same.columns[0].bound_scale, 1.0);
+        assert_eq!(same.columns[0].params, r.columns[0].params);
     }
 
     #[test]
