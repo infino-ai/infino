@@ -799,6 +799,28 @@ fn wb_joined(prev: u8, a: u8, b: u8, next: u8) -> bool {
     false
 }
 
+/// The joiner bytes — the classes whose effect depends on what sits
+/// either side of them. A 16-byte window holding none of these and no
+/// non-ASCII byte contains only `WB_ALETTER`, `WB_NUMERIC` and
+/// `WB_OTHER`, and over just those classes UAX #29 collapses to
+/// WB5/WB8/WB9/WB10: maximal runs of `[A-Za-z0-9]`, which is exactly
+/// [`AsciiLowerTokenizer`]'s rule. That equivalence is what lets the
+/// vector lane below drive such windows from bitmasks and leave only
+/// the neighbourhood of a joiner to the byte-at-a-time path.
+const WB_JOINER_BYTES: [u8; 6] = [b'_', b':', b',', b';', b'.', b'\''];
+
+/// Low-16 mask with the bottom `k` bits set (`k <= 16`).
+#[inline(always)]
+fn low_mask(k: usize) -> u32 {
+    ((1u32 << k) - 1) & LANE_BITMASK
+}
+
+/// Count of consecutive set bits starting at bit 0, capped at 16.
+#[inline(always)]
+fn leading_run(m: u32) -> usize {
+    ((!m) & (LANE_BITMASK | 0x1_0000)).trailing_zeros() as usize
+}
+
 /// Segment all-ASCII `bytes` on UAX #29 word boundaries, calling
 /// `f(start, end, has_upper)` for each segment that carries at least one
 /// alphanumeric. Segments of pure punctuation are dropped, matching
@@ -809,10 +831,150 @@ fn wb_joined(prev: u8, a: u8, b: u8, next: u8) -> bool {
 /// can reslice it at whatever lifetime it needs, which keeps the
 /// zero-copy query path free of any lifetime juggling.
 ///
+/// Runs a 16-byte vector lane over windows free of joiners and
+/// non-ASCII bytes (see [`WB_JOINER_BYTES`]) and the byte-at-a-time
+/// [`ascii_word_segments_scalar`] elsewhere. The two are held
+/// equivalent by an exhaustive differential test.
+///
 /// Callers must have established that the input is ASCII, so every index
 /// is a codepoint boundary.
 #[inline]
 fn ascii_word_segments<F: FnMut(usize, usize, bool)>(bytes: &[u8], mut f: F) {
+    const LANES: usize = 16;
+    let n = bytes.len();
+    // The segment under construction. `pure_alnum` tracks whether every
+    // byte of it so far is `[A-Za-z0-9]`, which is the precondition for
+    // handing the segment across into the vector lane: only then does
+    // "continues iff the next byte is alphanumeric" describe it.
+    let mut seg_start = 0usize;
+    let mut has_alnum = false;
+    let mut has_upper = false;
+    let mut pure_alnum = true;
+    let mut i = 0usize;
+
+    while i < n {
+        // The vector lane needs a full window, and needs the open
+        // segment to be one it can reason about: either nothing is open,
+        // or what is open is a plain alphanumeric run.
+        let lane_ok = i + LANES <= n && (i == seg_start || (pure_alnum && has_alnum));
+        if lane_ok {
+            // SAFETY: `i + LANES <= n` checked above, so 16 bytes from
+            // `bytes.as_ptr().add(i)` stay in bounds. The cast and deref
+            // copy the array by value into the SIMD register.
+            let arr: [u8; LANES] = unsafe { *(bytes.as_ptr().add(i) as *const [u8; LANES]) };
+            let chunk = u8x16::from(arr);
+            let is_digit = chunk.simd_ge(u8x16::splat(b'0')) & chunk.simd_le(u8x16::splat(b'9'));
+            let is_upper = chunk.simd_ge(u8x16::splat(b'A')) & chunk.simd_le(u8x16::splat(b'Z'));
+            let is_lower = chunk.simd_ge(u8x16::splat(b'a')) & chunk.simd_le(u8x16::splat(b'z'));
+            let mut is_complex = (chunk & u8x16::splat(NON_ASCII_BYTE_MIN))
+                .simd_eq(u8x16::splat(NON_ASCII_BYTE_MIN));
+            for joiner in WB_JOINER_BYTES {
+                is_complex |= chunk.simd_eq(u8x16::splat(joiner));
+            }
+            if (is_complex.to_bitmask() & LANE_BITMASK) == 0 {
+                let alnum = (is_digit | is_upper | is_lower).to_bitmask() & LANE_BITMASK;
+                let upper = is_upper.to_bitmask() & LANE_BITMASK;
+                let mut consumed = 0usize;
+
+                // Resolve the run handed in from the previous window.
+                if i > seg_start {
+                    if alnum & 1 == 0 {
+                        // Byte `i` is neither alphanumeric nor a joiner,
+                        // so it cannot extend the run: the segment ends.
+                        f(seg_start, i, has_upper);
+                        seg_start = i;
+                        has_alnum = false;
+                        has_upper = false;
+                    } else {
+                        let run = leading_run(alnum);
+                        has_upper |= (upper & low_mask(run)) != 0;
+                        if run == LANES {
+                            // Still open at the window's end; carry on.
+                            i += LANES;
+                            continue;
+                        }
+                        f(seg_start, i + run, has_upper);
+                        seg_start = i + run;
+                        has_alnum = false;
+                        has_upper = false;
+                        consumed = run;
+                    }
+                }
+
+                // Every further run lies wholly inside the window, so
+                // the byte after it is a plain separator and no
+                // lookahead past the window is needed — except for a run
+                // touching the last byte, which is carried instead.
+                let mut rest = alnum & !low_mask(consumed);
+                let mut carried = false;
+                while rest != 0 {
+                    let start = rest.trailing_zeros() as usize;
+                    let len = leading_run(rest >> start);
+                    let end = start + len;
+                    let run_upper = (upper >> start) & low_mask(len) != 0;
+                    if end >= LANES {
+                        seg_start = i + start;
+                        has_alnum = true;
+                        has_upper = run_upper;
+                        pure_alnum = true;
+                        carried = true;
+                        break;
+                    }
+                    f(i + start, i + end, run_upper);
+                    rest &= !low_mask(end);
+                }
+                if !carried {
+                    seg_start = i + LANES;
+                    has_alnum = false;
+                    has_upper = false;
+                    pure_alnum = true;
+                }
+                i += LANES;
+                continue;
+            }
+        }
+
+        // Byte-at-a-time step, identical in effect to the scalar
+        // segmenter: decide whether byte `i` joins the previous one and
+        // close the segment when it does not.
+        let cur = wb_class(bytes[i]);
+        if i > seg_start {
+            let a = wb_class(bytes[i - 1]);
+            let prev = if i >= 2 {
+                wb_class(bytes[i - 2])
+            } else {
+                WB_OTHER
+            };
+            let next = if i + 1 < n {
+                wb_class(bytes[i + 1])
+            } else {
+                WB_OTHER
+            };
+            if !wb_joined(prev, a, cur, next) {
+                if has_alnum {
+                    f(seg_start, i, has_upper);
+                }
+                seg_start = i;
+                has_alnum = false;
+                has_upper = false;
+                pure_alnum = true;
+            }
+        }
+        has_alnum |= cur & WB_ALNUM != 0;
+        has_upper |= bytes[i].is_ascii_uppercase();
+        pure_alnum &= bytes[i].is_ascii_alphanumeric();
+        i += 1;
+    }
+
+    if has_alnum && seg_start < n {
+        f(seg_start, n, has_upper);
+    }
+}
+
+/// Byte-at-a-time reference for [`ascii_word_segments`], kept as the
+/// implementation the vector lane is tested against. Same contract.
+#[cfg(test)]
+fn ascii_word_segments_scalar<F: FnMut(usize, usize, bool)>(bytes: &[u8], mut f: F) {
     let n = bytes.len();
     let mut seg_start = 0usize;
     let mut has_alnum = false;
@@ -986,6 +1148,126 @@ mod tests {
     // short inputs is cheap, and every joiner rule is context-sensitive
     // over at most one byte on each side, so short inputs are where any
     // divergence has to show up.
+
+    /// Segments from the byte-at-a-time reference, as owned strings.
+    fn ascii_scalar_segments(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        ascii_word_segments_scalar(text.as_bytes(), |start, end, _| {
+            out.push(text[start..end].to_owned());
+        });
+        out
+    }
+
+    /// Segments plus their `has_upper` flag, from both engines, so the
+    /// borrow-versus-case-fold decision is compared too and not just the
+    /// boundaries.
+    fn ascii_fast_flags(text: &str) -> Vec<(usize, usize, bool)> {
+        let mut out = Vec::new();
+        ascii_word_segments(text.as_bytes(), |s, e, u| out.push((s, e, u)));
+        out
+    }
+    fn ascii_scalar_flags(text: &str) -> Vec<(usize, usize, bool)> {
+        let mut out = Vec::new();
+        ascii_word_segments_scalar(text.as_bytes(), |s, e, u| out.push((s, e, u)));
+        out
+    }
+
+    /// The vector lane runs 16 bytes at a time and hands partial runs
+    /// across window boundaries, so a divergence from the reference
+    /// would most likely appear only at a particular length or offset.
+    /// Sweep every length across two full strides against a byte
+    /// alphabet that includes each joiner, so windows land clean,
+    /// dirty, and split across the boundary.
+    #[test]
+    fn simd_lane_matches_the_scalar_reference_across_window_boundaries() {
+        const STRIDE: usize = 16;
+        let alphabet = b"aB1_:,.' z9";
+        // A deterministic pseudo-random walk over the alphabet gives
+        // mixed windows; the fixed seed keeps a failure reproducible.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            alphabet[(state % alphabet.len() as u64) as usize]
+        };
+        for len in 0..=(3 * STRIDE + 3) {
+            for _trial in 0..300 {
+                let buf: Vec<u8> = (0..len).map(|_| next()).collect();
+                let text = std::str::from_utf8(&buf).expect("ascii is utf8");
+                assert_eq!(
+                    ascii_fast_flags(text),
+                    ascii_scalar_flags(text),
+                    "vector lane diverged from the reference on {text:?}"
+                );
+            }
+        }
+    }
+
+    /// Exhaustive where it matters: the five bytes straddling the
+    /// 16-byte window boundary, over every arrangement of the class
+    /// alphabet, against three different fillers and a range of
+    /// lengths. Varying the whole string instead would be astronomically
+    /// many cases for no extra coverage — the lane's only
+    /// position-dependent behaviour is how it hands a run across that
+    /// boundary, and these are the bytes that decide it.
+    #[test]
+    fn simd_lane_matches_the_scalar_reference_around_the_window_boundary() {
+        const BOUNDARY: usize = 16;
+        const VARY: usize = 5;
+        const VARY_AT: usize = BOUNDARY - 2;
+        let alphabet = b"a1_. ";
+        for filler in [b'a', b' ', b'B'] {
+            for len in (BOUNDARY + VARY)..=(BOUNDARY + VARY + 4) {
+                let mut counter = [0usize; VARY];
+                loop {
+                    let mut buf = vec![filler; len];
+                    for (k, &idx) in counter.iter().enumerate() {
+                        buf[VARY_AT + k] = alphabet[idx];
+                    }
+                    let text = std::str::from_utf8(&buf).expect("ascii is utf8");
+                    assert_eq!(
+                        ascii_fast_flags(text),
+                        ascii_scalar_flags(text),
+                        "vector lane diverged from the reference on {text:?}"
+                    );
+                    let mut k = 0;
+                    loop {
+                        if k == VARY {
+                            break;
+                        }
+                        counter[k] += 1;
+                        if counter[k] < alphabet.len() {
+                            break;
+                        }
+                        counter[k] = 0;
+                        k += 1;
+                    }
+                    if k == VARY {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// And the reference itself still agrees with the general
+    /// segmenter, so the chain vector lane == reference == `unicode_words`
+    /// is closed at both links.
+    #[test]
+    fn scalar_reference_matches_unicode_words_on_joiner_shapes() {
+        for text in [
+            "don't 3.14 a_b A:B 1,000 x''y a..b",
+            "_lead trail_ a1_2b 3.14.15 1,000,000",
+            "the quick brown fox jumps over the lazy dog again and again",
+        ] {
+            assert_eq!(
+                ascii_scalar_segments(text),
+                unicode_segments(text),
+                "on {text:?}"
+            );
+        }
+    }
 
     /// Segments the fast path yields, as owned strings.
     fn ascii_fast_segments(text: &str) -> Vec<String> {
@@ -1223,7 +1505,7 @@ mod tests {
         /// depend on.
         #[test]
         fn standard_tokens_match_the_general_segmenter_for_any_mixed_input(
-            indices in proptest::collection::vec(0..MIXED_ALPHABET.len(), 0..14)
+            indices in proptest::collection::vec(0..MIXED_ALPHABET.len(), 0..52)
         ) {
             let text: String = indices.iter().map(|&i| MIXED_ALPHABET[i]).collect();
             let mut got = Vec::new();
@@ -1239,7 +1521,7 @@ mod tests {
         /// so a divergence here is lost recall rather than a failure.
         #[test]
         fn standard_entry_points_agree_for_any_mixed_input(
-            indices in proptest::collection::vec(0..MIXED_ALPHABET.len(), 0..14)
+            indices in proptest::collection::vec(0..MIXED_ALPHABET.len(), 0..52)
         ) {
             let text: String = indices.iter().map(|&i| MIXED_ALPHABET[i]).collect();
             let via_tokenize: Vec<String> = StandardTokenizer.tokenize(&text).collect();
