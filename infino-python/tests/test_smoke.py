@@ -187,6 +187,30 @@ def test_fts_positional_arguments_keep_their_meaning():
         assert abs(a - b) < 1e-4
 
 
+def test_analysis_filter_names_resolve_at_create_table_exactly():
+    # The filters resolve in `to_rust()` at `create_table`, not at
+    # `fts()` — `fts` only records the strings — so this is where an
+    # unknown name surfaces, and neither binding covered it.
+    #
+    # Matched exactly, like the engine's own resolver: an earlier version
+    # of the node binding case-folded its argument, so `stopwords="English"`
+    # was accepted there and rejected here for the same call. Accepting
+    # more spellings later is additive; tightening later would not be.
+    db = infino.connect("memory://")
+    for bad, field in [("English", "stopwords"), ("ENGLISH", "stopwords"), ("german", "stopwords")]:
+        with pytest.raises(ValueError) as e:
+            db.create_table(
+                f"bad_{field}_{bad}", _title_schema(), infino.IndexSpec().fts("title", stopwords=bad)
+            )
+        assert bad in str(e.value)
+    for bad in ("English", "porter"):
+        with pytest.raises(ValueError) as e:
+            db.create_table(
+                f"bad_stem_{bad}", _title_schema(), infino.IndexSpec().fts("title", stemmer=bad)
+            )
+        assert bad in str(e.value)
+
+
 def test_analysis_options_are_keyword_only():
     # The analysis options sit behind `*`, so they can never be captured
     # positionally. That is what keeps the positional tail above stable

@@ -185,6 +185,8 @@ impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
 #[non_exhaustive] pub enum infino::Stemmer
 pub infino::Stemmer::English
 pub infino::Stemmer::None
+impl infino::Stemmer
+pub fn infino::Stemmer::from_name(&str) -> core::option::Option<Self>
 impl core::clone::Clone for infino::Stemmer
 pub fn infino::Stemmer::clone(&self) -> infino::Stemmer
 impl core::cmp::Eq for infino::Stemmer
@@ -206,6 +208,8 @@ impl core::panic::unwind_safe::UnwindSafe for infino::Stemmer
 #[non_exhaustive] pub enum infino::Stopwords
 pub infino::Stopwords::English
 pub infino::Stopwords::None
+impl infino::Stopwords
+pub fn infino::Stopwords::from_name(&str) -> core::option::Option<Self>
 impl core::clone::Clone for infino::Stopwords
 pub fn infino::Stopwords::clone(&self) -> infino::Stopwords
 impl core::cmp::Eq for infino::Stopwords

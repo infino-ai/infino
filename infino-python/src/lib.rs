@@ -230,26 +230,25 @@ struct FtsDecl {
     b: Option<f32>,
 }
 
-/// Resolve the `stopwords=` argument. Named built-in sets only; the
-/// error names the valid set rather than leaving the caller to guess.
+/// Resolve the `stopwords=` argument through the engine's own resolver,
+/// so this binding's accepted spellings are exactly the format's — see
+/// [`Stopwords::from_name`], which is exact and not case-folded.
 fn stopwords_from_name(name: &str) -> PyResult<Stopwords> {
-    match name {
-        "english" => Ok(Stopwords::English),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "IndexSpec.fts: unknown stopwords {other:?} (valid: \"english\")"
-        ))),
-    }
+    Stopwords::from_name(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "IndexSpec.fts: unknown stopwords {name:?} (valid: \"english\")"
+        ))
+    })
 }
 
-/// Resolve the `stemmer=` argument. Same shape as
+/// Resolve the `stemmer=` argument; same rule as
 /// [`stopwords_from_name`].
 fn stemmer_from_name(name: &str) -> PyResult<Stemmer> {
-    match name {
-        "english" => Ok(Stemmer::English),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "IndexSpec.fts: unknown stemmer {other:?} (valid: \"english\")"
-        ))),
-    }
+    Stemmer::from_name(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "IndexSpec.fts: unknown stemmer {name:?} (valid: \"english\")"
+        ))
+    })
 }
 
 /// Declares which columns are full-text (BM25) and which are vector

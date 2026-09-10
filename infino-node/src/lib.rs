@@ -134,27 +134,41 @@ fn metric_from_str(s: &str) -> Result<Metric> {
     }
 }
 
-/// Parse a stopword-set name. Named built-in sets only; the error
-/// names the valid set rather than leaving the caller to guess.
+/// Parse a stopword-set name. Named built-in sets only; the error names
+/// the valid set rather than leaving the caller to guess.
+///
+/// **Exact match, deliberately not case-folded.** These names are format
+/// vocabulary: the engine's own resolver is exact, and a column persists
+/// the name it was given. Accepting `"English"` here would mean this
+/// binding has a wider vocabulary than the format and must remember to
+/// normalize before persisting — a coupling that is one forgotten call
+/// away from writing a file the reader refuses. It would also diverge
+/// from the python binding, so the same call would work in one and throw
+/// in the other.
+///
+/// The asymmetry decides it: accepting more spellings later is additive,
+/// while tightening later breaks every caller who relied on the loose
+/// one. (The older `metric` argument *is* case-folded, which is an
+/// inconsistency in the other direction — worth reconciling, but not by
+/// widening a new surface to match an old one.)
 fn stopwords_from_name(s: &str) -> Result<Stopwords> {
-    match s.to_ascii_lowercase().as_str() {
-        "english" => Ok(Stopwords::English),
-        other => Err(Error::new(
+    Stopwords::from_name(s).ok_or_else(|| {
+        Error::new(
             Status::InvalidArg,
-            format!("unknown stopwords {other:?}; use 'english'"),
-        )),
-    }
+            format!("unknown stopwords {s:?} (valid: \"english\")"),
+        )
+    })
 }
 
-/// Parse a stemmer name. Same shape as [`stopwords_from_name`].
+/// Parse a stemmer name. Same exact-match rule as
+/// [`stopwords_from_name`], and for the same reasons.
 fn stemmer_from_name(s: &str) -> Result<Stemmer> {
-    match s.to_ascii_lowercase().as_str() {
-        "english" => Ok(Stemmer::English),
-        other => Err(Error::new(
+    Stemmer::from_name(s).ok_or_else(|| {
+        Error::new(
             Status::InvalidArg,
-            format!("unknown stemmer {other:?}; use 'english'"),
-        )),
-    }
+            format!("unknown stemmer {s:?} (valid: \"english\")"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -454,11 +454,21 @@ impl Stopwords {
         }
     }
 
-    /// Resolve a persisted name. `None` for a name this engine cannot
-    /// reproduce, which every caller turns into an error rather than a
-    /// silent fallback: analyzing with a set we do not have is not a
-    /// degradation, it is a different index.
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
+    /// Resolve a set by name — `"english"` — or `None` for a name this
+    /// engine cannot reproduce.
+    ///
+    /// **Exact match, and the single source of truth for the spelling.**
+    /// Every caller turns `None` into an error rather than a silent
+    /// fallback: analyzing with a set we do not have is not a degraded
+    /// index, it is a different one. Public because the language
+    /// bindings take this name as a string from their callers and must
+    /// resolve it the same way the format does — three private copies of
+    /// the same match is how they drift, and one of them case-folded
+    /// while the others did not.
+    ///
+    /// Case-folding is deliberately absent: accepting more spellings
+    /// later is additive, tightening later is not.
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "english" => Some(Stopwords::English),
             _ => None,
@@ -476,8 +486,9 @@ impl Stemmer {
         }
     }
 
-    /// Resolve a persisted name; see [`Stopwords::from_name`].
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
+    /// Resolve a stemmer by name — `"english"`; same exact-match rule and
+    /// same rationale as [`Stopwords::from_name`].
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "english" => Some(Stemmer::English),
             _ => None,
