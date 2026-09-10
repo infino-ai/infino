@@ -214,14 +214,18 @@ fn connect(
     Ok(Connection { inner })
 }
 
+/// One declared FTS column: `(column, analyzer, stored, k1, b)`.
+/// `analyzer` `None` means the default; `k1` / `b` `None` means the
+/// column takes the standard BM25 pair.
+type FtsDecl = (String, Option<String>, bool, Option<f32>, Option<f32>);
+
 /// Declares which columns are full-text (BM25) and which are vector
 /// (IVF kNN) indexed. Built fluently:
 /// `IndexSpec().fts("body").vector("emb", 384, "cosine")`.
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {
-    /// `(column, analyzer, stored)`; `analyzer` `None` means the default.
-    fts: Vec<(String, Option<String>, bool, Option<f32>, Option<f32>)>,
+    fts: Vec<FtsDecl>,
     /// `(column, dim, metric)`.
     vectors: Vec<(String, usize, String)>,
 }
