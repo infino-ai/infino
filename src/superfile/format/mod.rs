@@ -13,28 +13,47 @@ pub const PROJECT_MAGIC: &[u8; 3] = b"INF";
 
 /// File-format version. Semver string. Bump major to break compatibility.
 ///
+/// A minor is for a change a same-major reader could not otherwise
+/// tolerate — and by [`Version::is_compatible_with_current`]'s
+/// policy (unknown KV keys ignored, unknown JSON fields ignored) an
+/// additive field is already tolerated, so most additions do not earn
+/// one. What they do earn is a note here, because this doc-comment is
+/// the only written record of what a `1.x` superfile may contain.
+///
 /// 1.1.0: `inf.fts.columns` entries may carry `"stored":false` (index-only
 /// FTS columns, absent from the Parquet body); the field is emitted only
 /// when false, and same-major readers default a missing field to true.
 ///
-/// 1.2.0: `inf.fts.columns` entries carry `"k1"` / `"b"`, the BM25
-/// parameters a column's stored block-max bounds were baked at, written
-/// unconditionally. An entry without them predates the field and can
-/// only have been built at the standard `1.2` / `0.75`, so that default
-/// is **frozen** and must not follow a later change to what the API
-/// recommends.
+/// Since 1.1.0, additively, a column entry may also carry:
 ///
-/// 1.3.0: a column's `"tokenizer"` may name an analysis chain rather
-/// than a bare tokenizer — a base name followed by the filters applied
-/// to it, `"standard+stop=english+stem=english"`. Deliberately *not* an
-/// additive field: a same-major reader ignores an unknown field, and an
-/// ignored analysis filter means query text is tokenized differently
-/// than the postings were built, which is wrong answers rather than an
-/// error. The tokenizer name is instead the fail-loud channel every
-/// shipped reader already honours — an unrecognized name fails the open
-/// — so an engine predating a filter refuses the file. A column with no
-/// filter keeps its plain base name, so its entry stays byte-identical.
-pub const FORMAT_VERSION: &str = "1.3.0";
+/// - `"positions":true` — the column's index records token positions,
+///   which exact phrase queries need. Emitted only when true; a missing
+///   field means no positions, the only thing a file predating it can
+///   mean.
+/// - `"k1"` / `"b"` — the BM25 parameters a column's stored block-max
+///   bounds were baked at, written **unconditionally**, defaults
+///   included, because the pair is the provenance of those bounds and a
+///   reader that infers it will infer wrong the day the recommended
+///   default moves. An entry without them predates the field and can
+///   only have been built at the standard `1.2` / `0.75`, so that
+///   default is **frozen** and must not follow a later change to what
+///   the API recommends.
+///
+/// The one change since 1.1.0 that is *not* additive-and-ignorable, and
+/// deliberately so: a column's `"tokenizer"` may name an analysis chain
+/// rather than a bare tokenizer — a base name followed by the filters
+/// applied to it, `"standard+stop=english+stem=english"`. A filter
+/// could not have been a sibling field, because a same-major reader
+/// ignores an unknown field and an ignored analysis filter means query
+/// text is tokenized differently than the postings were built, which is
+/// wrong answers rather than an error. Nor does it take a version of
+/// its own: the tokenizer name is already the fail-loud channel every
+/// shipped reader honours — an unrecognized name fails the open — so an
+/// engine predating a filter refuses the file on the name alone, and a
+/// version bump would add nothing a reader consults. A column with no
+/// filter keeps its plain base name, so its entry stays byte-identical
+/// to one written before chains existed.
+pub const FORMAT_VERSION: &str = "1.1.0";
 
 /// CRC width in bytes (`u32` CRC-32C, little-endian) appended after a
 /// directory or after a subsection's payload. Defined once so the
