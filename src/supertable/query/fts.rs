@@ -2485,17 +2485,27 @@ mod tests {
     /// changes.
     #[test]
     fn global_stats_multi_superfile_matches_single_superfile() {
-        // 24 uniform-length (4-token) docs. The first three tokens carry
-        // the query terms (so df/idf drives ranking); the trailing `dNN`
-        // is a per-doc unique tag that keeps every title distinct without
-        // changing length. It never appears in a query, so it does not
-        // affect scores — it only lets us identify a doc across the two
-        // independently-built tables by content.
+        // 24 docs of *varying* length. The first three tokens carry the
+        // query terms (so df/idf drives ranking); the trailing `dNN` is
+        // a per-doc unique tag that keeps every title distinct, and a
+        // run of filler stretches some documents well past others. It
+        // never appears in a query, so it moves no term's weight — it
+        // only changes document length, and therefore the average.
+        //
+        // The lengths matter, and they used to be uniform on purpose:
+        // with every document the same size the per-superfile average
+        // equals the table-wide one no matter how the commits fall, so
+        // the test could not tell a globalized length normalizer from a
+        // per-superfile one. Varying them is what makes this an
+        // assertion about the normalizer and not only about idf. The
+        // filler is front-loaded so the four commits below get visibly
+        // different local averages.
         let titles: Vec<String> = (0..24)
             .map(|i| {
                 let topic = ["alpha", "beta", "gamma"][i % 3];
                 let band = ["red", "green"][(i / 3) % 2];
-                format!("{topic} shared {band} d{i:02}")
+                let filler = vec!["filler"; 1 + (23 - i) / 3].join(" ");
+                format!("{topic} shared {band} d{i:02} {filler}")
             })
             .collect();
         let refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
