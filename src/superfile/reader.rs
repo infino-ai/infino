@@ -1424,9 +1424,8 @@ impl SuperfileReader {
     /// cursors it fetched.
     ///
     /// `scoring` must be the same override the paired `prepare_clauses`
-    /// was given: the cursors carry `idf · (k1 + 1)` from the pair they
-    /// were built with, and scoring divides by a norm table derived
-    /// from that same override. `with_scoring_override` is deterministic, so
+    /// was given: the cursors carry the idf they were built with, and
+    /// scoring divides by a norm table derived from that same override. `with_scoring_override` is deterministic, so
     /// two separately-derived views of one pair agree bit for bit.
     pub(crate) fn run_prepared(
         &self,

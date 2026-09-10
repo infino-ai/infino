@@ -338,17 +338,15 @@ pub(super) struct BlockMeta {
 /// iteration.
 #[derive(Clone)]
 pub(crate) struct TermCursor {
-    /// Precomputed `idf * (k1 + 1)` — the score numerator's
-    /// per-cursor constant, built from the parameters this query is
-    /// scoring with. Computed once at cursor build so the hot inner
-    /// loop fits one multiply + add + divide per call.
+    /// The effective inverse document frequency this cursor scores
+    /// with: the table-wide value when the query uses table-wide
+    /// statistics, otherwise this superfile's own, with a repeated
+    /// term's query-side frequency already folded in.
+    ///
+    /// It is the whole per-cursor constant of the score numerator —
+    /// there is no separate `(k1 + 1)` factor to carry — so the hot
+    /// inner loop is one multiply, one add and one divide.
     pub(super) idf_weight: f32,
-    /// The bare effective idf (global override and repeated-term
-    /// `weight` already folded in). Kept alongside `idf_weight` because
-    /// a phrase cursor composes its members' idfs, and recovering one
-    /// by dividing by `(k1 + 1)` would silently use the wrong `k1` the
-    /// moment a column declares a non-standard pair.
-    pub(super) idf: f32,
     /// Maximum block-max-BM25 across all blocks. Used by the WAND
     /// pivot test (term-level upper bound).
     pub(super) term_max_bm25: f32,
@@ -464,10 +462,12 @@ impl TermCursor {
         //     idf; a global-statistics override or a repeated-term
         //     `weight` scales the score away from it. Exact, since the
         //     score is linear in idf.
-        //   bound_scale — the bounds were baked at the column's declared
-        //     BM25 pair; a query scoring at another needs them inflated
-        //     by the supremum of the ratio between the two. Loosening
-        //     rather than exact, because k1/b do not enter linearly.
+        //   bound_scale — everything else that moves the scored value
+        //     away from what the build baked: the average corrected to
+        //     the documents that carry tokens, a table-wide average, a
+        //     query-time parameter pair, and the scale correction an
+        //     older blob's bounds need. Loosening rather than exact,
+        //     because k1/b and the average do not enter linearly.
         //
         // Both are 1.0 on the default path (per-superfile stats, weight
         // 1, no parameter override), and the block loop then does no
@@ -506,7 +506,6 @@ impl TermCursor {
 
         let mut cursor = Self {
             idf_weight: idf,
-            idf,
             term_max_bm25,
             df: term_meta.df,
             blocks,
@@ -545,8 +544,7 @@ impl TermCursor {
     ) -> Self {
         // Fold the qtf `weight` into the effective idf so the single-doc block-max
         // (computed below from `idf_weight`) scales together with the score.
-        let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
-        let idf_weight = idf;
+        let idf_weight = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
 
         let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
@@ -566,7 +564,6 @@ impl TermCursor {
 
         Self {
             idf_weight,
-            idf,
             term_max_bm25: block_max_bm25,
             df: 1,
             blocks,

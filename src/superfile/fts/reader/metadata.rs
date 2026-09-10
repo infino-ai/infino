@@ -267,7 +267,7 @@ pub struct ColumnMeta {
     /// Per-doc BM25 length normalizer, byte-quantized — see
     /// [`NormTable`]. Computed once per reader at `open` time from the
     /// column's on-disk doc-lengths array. The hot scoring loop reads
-    /// `dl_norm_k1.get(d)` and multiplies-out to `idf · tf · (K1+1) /
+    /// `dl_norm_k1.get(d)` and multiplies-out to `idf · tf /
     /// (tf + dl_norm_k1.get(d))`.
     pub dl_norm_k1: NormTable,
     /// The parameters this column is being *scored* with. Equal to the

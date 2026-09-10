@@ -61,7 +61,7 @@ const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
-/// Per-term global BM25 idf (the raw `idf`, not `idf × (k1+1)`) keyed
+/// Per-term table-wide BM25 idf, keyed
 /// by term, used by [`Bm25Stats::Global`]. A term absent from the map
 /// falls back to that superfile's local idf.
 pub(crate) type GlobalTermIdf = std::collections::HashMap<String, f32>;
