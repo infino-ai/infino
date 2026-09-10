@@ -45,6 +45,21 @@ def bench_serve_tcp(
     as the result id (dataset id, 8-byte LE); otherwise the engine ``_id``
     (16-byte)."""
 
+def bench_serve_build_tcp(
+    data_path: str,
+    table: str,
+    col: str,
+    id_col: str,
+    addr: str,
+    cache_bytes: int,
+) -> None:
+    """EXPERIMENTAL build+serve mode (raw-TCP, opcode-tagged wire). Blocks
+    forever while a client drives create/append/optimize/search over TCP, so
+    build and serve can run on a machine separate from the driving client. Not a
+    production server (no auth/TLS/durability). Search returns the dataset id
+    (8-byte LE), mapped from the engine ``_id`` by an in-memory table built at
+    optimize; ``id_col`` names the dataset id column to store."""
+
 class InfinoError(Exception):
     """Base class for infino's errors. Catch it to handle any infino failure."""
 
