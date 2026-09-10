@@ -1885,6 +1885,12 @@ pub struct VectorSearchOptions {
     /// IVF probe override. `None` → engine default for the query path.
     pub nprobe: Option<usize>,
     rerank_mult: Option<usize>,
+    /// `hnsw_ivf` serve-time beam override. `None` → the stamped k→ef curve
+    /// (or the `vector.hnsw_ef_search` config), exactly as today; `Some(ef)`
+    /// with `ef > 0` walks this query at that fixed beam. A test-and-bench
+    /// instrument (recall/latency sweeps of an already-built graph); ignored
+    /// under any non-graph serving path.
+    ef: Option<usize>,
 }
 
 impl VectorSearchOptions {
@@ -1919,6 +1925,19 @@ impl VectorSearchOptions {
     /// The configured rerank multiplier, if one was set.
     pub fn rerank_mult(&self) -> Option<usize> {
         self.rerank_mult
+    }
+
+    /// Set the `hnsw_ivf` serve-time beam (`ef`) for this query. Higher improves
+    /// recall at the cost of more work; overrides the stamped k→ef curve for an
+    /// already-built graph without a rebuild.
+    pub fn with_ef(mut self, ef: usize) -> Self {
+        self.ef = Some(ef);
+        self
+    }
+
+    /// The configured serve-time `ef` beam, if one was set.
+    pub(crate) fn ef(&self) -> Option<usize> {
+        self.ef
     }
 
     /// Resolve `(nprobe, rerank_mult)` for this query path.

@@ -4046,6 +4046,7 @@ impl SupertableReader {
         column: &str,
         query: &[f32],
         k: usize,
+        ef_opt: Option<usize>,
     ) -> Result<IndexOutcome<Vec<SuperfileHit>>, QueryError> {
         if k == 0 {
             return Ok(IndexOutcome::Ready(Vec::new()));
@@ -4103,8 +4104,12 @@ impl SupertableReader {
         // pre-curve bundle returns its single stamped `ef` for every `k`. A
         // non-zero `hnsw_ef_search` config overrides the curve with a fixed
         // serve-time beam — a rebuild-free knob for sweeping an already-built
-        // graph's recall/latency curve.
-        let ef_override = config::global().vector.hnsw_ef_search;
+        // graph's recall/latency curve. A per-query `ef_opt` (from the
+        // test-and-bench `VectorSearchOptions::with_ef`) takes precedence over
+        // the config so a sweep can vary the beam per request without a restart.
+        let ef_override = ef_opt
+            .filter(|&e| e > 0)
+            .unwrap_or_else(|| config::global().vector.hnsw_ef_search);
         let ef = if ef_override > 0 {
             ef_override
         } else {
@@ -4815,7 +4820,7 @@ impl SupertableReader {
             && hidden_vector_index
             && vcfg.search_mode == config::VectorSearchMode::HnswIvf
             && let Some(hits) = self
-                .hnsw_search(column, query, k)
+                .hnsw_search(column, query, k, options.ef())
                 .await?
                 .or_warn("hnsw search")
         {
@@ -11809,7 +11814,7 @@ mod tests {
         );
         assert!(
             matches!(
-                block_on(bare.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+                block_on(bare.hnsw_search("emb", &query, 5, None)).expect("hnsw search"),
                 IndexOutcome::Unavailable(IndexUnavailable::NotHydrated)
             ),
             "the graph arm must decline an unpublished generation the same way"
@@ -11871,7 +11876,7 @@ mod tests {
         }
         // The mirror of `flat_search_declines_a_generation_that_published_a
         // _graph`: neither arm may answer from the other's index.
-        match block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search") {
+        match block_on(served.hnsw_search("emb", &query, 5, None)).expect("hnsw search") {
             IndexOutcome::Unavailable(IndexUnavailable::WrongKind { wanted }) => {
                 assert_eq!(wanted, "hnsw");
             }
@@ -11977,7 +11982,7 @@ mod tests {
         let served = hidden.reader().expect("hidden reader after publish");
 
         let hits = expect_ready(
-            block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+            block_on(served.hnsw_search("emb", &query, 5, None)).expect("hnsw search"),
             "the published graph",
         );
         assert!(!hits.is_empty(), "the graph must answer its own generation");
@@ -11994,19 +11999,19 @@ mod tests {
 
         assert!(
             matches!(
-                block_on(served.hnsw_search("emb", &query, 0)).expect("k=0"),
+                block_on(served.hnsw_search("emb", &query, 0, None)).expect("k=0"),
                 IndexOutcome::Ready(ref hits) if hits.is_empty()
             ),
             "k=0 is an empty answer, not a decline"
         );
-        match block_on(served.hnsw_search("sibling", &query, 5)).expect("column mismatch") {
+        match block_on(served.hnsw_search("sibling", &query, 5, None)).expect("column mismatch") {
             IndexOutcome::Unavailable(IndexUnavailable::ColumnMismatch { queried, index }) => {
                 assert_eq!(queried, "sibling");
                 assert_eq!(index, "emb");
             }
             other => panic!("expected ColumnMismatch, got {}", describe(other)),
         }
-        match block_on(served.hnsw_search("emb", &query[..GRAPH_FIXTURE_DIM - 1], 5))
+        match block_on(served.hnsw_search("emb", &query[..GRAPH_FIXTURE_DIM - 1], 5, None))
             .expect("dim mismatch")
         {
             IndexOutcome::Unavailable(IndexUnavailable::DimMismatch { queried, index }) => {
