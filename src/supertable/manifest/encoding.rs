@@ -959,8 +959,7 @@ mod decode_error_tests {
         decode_vector_summary, decode_vector_summary_map, encode_fts_summary, encode_length1_array,
         encode_scalar_stats, read_n, read_u32,
     };
-    use crate::superfile::fts::reader::ColumnLengthStats;
-    use crate::supertable::manifest::FtsSummaryAgg;
+    use crate::{superfile::fts::reader::ColumnLengthStats, supertable::manifest::FtsSummaryAgg};
 
     /// Hand-build a `decode_fts_summary` payload: no bloom, a given
     /// distinct count, then the `(min_term, max_term)` pair verbatim.

@@ -31,23 +31,25 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::superfile::fts::reader::ColumnLengthStats;
-use crate::supertable::{
-    manifest::{
-        add_sum_arrays,
-        bloom::Bloom,
-        column_hll, column_min_max, column_sum,
-        encoding::{
-            DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
-            decode_value_counts, encode_cluster_centroids, encode_length1_array,
-            encode_value_counts,
+use crate::{
+    superfile::fts::reader::ColumnLengthStats,
+    supertable::{
+        manifest::{
+            add_sum_arrays,
+            bloom::Bloom,
+            column_hll, column_min_max, column_sum,
+            encoding::{
+                DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
+                decode_value_counts, encode_cluster_centroids, encode_length1_array,
+                encode_value_counts,
+            },
+            hll::HllSketch,
+            merge_min_max_arrays,
+            part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
+            term_range::prefix_overlaps_range,
         },
-        hll::HllSketch,
-        merge_min_max_arrays,
-        part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
-        term_range::prefix_overlaps_range,
+        opann::RERANK_LAW_POOL_CELLS,
     },
-    opann::RERANK_LAW_POOL_CELLS,
 };
 
 /// Wire format version for the manifest list.

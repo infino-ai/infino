@@ -390,7 +390,6 @@ pub(crate) fn scalar_value_may_match(
 
 #[cfg(test)]
 mod tests {
-    use crate::superfile::fts::reader::ColumnLengthStats;
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{ArrayRef, Date32Array, Int64Array, LargeStringArray};
@@ -402,6 +401,7 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::reader::ColumnLengthStats,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{

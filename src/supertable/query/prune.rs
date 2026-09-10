@@ -256,7 +256,6 @@ fn and_into(dst: &mut [bool], src: &[bool]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::superfile::fts::reader::ColumnLengthStats;
     use std::{
         collections::{HashMap, HashSet},
         slice::from_ref,
@@ -269,7 +268,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
+        superfile::{
+            builder::FtsConfig, fts::reader::ColumnLengthStats, vector::layout::VectorLayout,
+        },
         supertable::{
             SupertableOptions,
             manifest::{

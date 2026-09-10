@@ -187,20 +187,22 @@ pub fn prune_parts_for_id_range(list: &Manifest, query_min: i128, query_max: i12
 
 #[cfg(test)]
 mod tests {
-    use crate::superfile::fts::reader::ColumnLengthStats;
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{ArrayRef, Decimal128Array, Int64Array};
     use uuid::Uuid;
 
     use super::*;
-    use crate::supertable::{
-        FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
-        manifest::{
-            aggregates,
-            bloom::BloomBuilder,
-            list::{FORMAT_VERSION, PartitionStrategy},
-            part::ContentHash,
+    use crate::{
+        superfile::fts::reader::ColumnLengthStats,
+        supertable::{
+            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
+            manifest::{
+                aggregates,
+                bloom::BloomBuilder,
+                list::{FORMAT_VERSION, PartitionStrategy},
+                part::ContentHash,
+            },
         },
     };
 

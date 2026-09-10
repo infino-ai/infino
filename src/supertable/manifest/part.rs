@@ -791,8 +791,9 @@ mod tests {
     //! property cross-version part-reuse rides on);
     //! format_version major/minor compat; corrupt zstd
     //! surfaces a typed error.
-    use crate::superfile::fts::reader::ColumnLengthStats;
     use std::{collections::HashMap, sync::Arc};
+
+    use crate::superfile::fts::reader::ColumnLengthStats;
 
     /// `from_hex` is the exact inverse of `to_hex` — the recovery path a
     /// content-addressed cache file name round-trips through — and
