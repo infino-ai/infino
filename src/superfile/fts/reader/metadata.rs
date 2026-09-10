@@ -411,8 +411,127 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+        bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
     };
+
+    // ── Corpus statistics over a sparse column ────────────────────────
+
+    /// Number of rows carrying text in the sparse fixture below.
+    const SPARSE_FILLED_ROWS: u32 = 2;
+    /// Rows whose cell is null, which ingest indexes as the empty
+    /// string so the doc-lengths array stays aligned with Parquet.
+    const SPARSE_EMPTY_ROWS: u32 = 6;
+
+    /// A column filled for two of eight rows: four tokens across two
+    /// documents, and six empty slots that can never match a term.
+    fn sparse_reader() -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "alpha beta").expect("doc 0");
+        b.add_doc(0, 1, "alpha gamma").expect("doc 1");
+        for row in 0..SPARSE_EMPTY_ROWS {
+            b.add_doc(0, SPARSE_FILLED_ROWS + row, "")
+                .expect("null row");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    #[test]
+    fn statistics_count_documents_with_tokens_not_rows() {
+        let r = sparse_reader();
+        let col = &r.columns[0];
+        // Four tokens over the two documents that have any.
+        assert_eq!(col.length_stats.total_tokens, 4);
+        assert_eq!(
+            col.length_stats.n_scored_docs,
+            u64::from(SPARSE_FILLED_ROWS),
+            "empty rows are not documents this column has"
+        );
+        assert_eq!(col.scored_doc_count(), u64::from(SPARSE_FILLED_ROWS));
+        // 4 / 2, not 4 / 8 — dividing by the row count would deflate the
+        // average by the fill rate and over-reward short documents.
+        assert_eq!(col.avgdl, 2.0);
+        // The doc-lengths array still has one slot per row: the array is
+        // indexed by local doc id and cannot skip rows.
+        assert_eq!(
+            col.dl_norm_k1.len(),
+            (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as usize
+        );
+    }
+
+    #[test]
+    fn sparse_column_bounds_stay_above_the_scores_they_cap() {
+        // Correcting the average raises it, which lowers the norm and
+        // raises every score, so the bounds baked at the row-count
+        // average would sit below the scores they exist to cap. If this
+        // regresses, block-max pruning silently drops documents from the
+        // top-k rather than failing.
+        let r = sparse_reader();
+        let col = &r.columns[0];
+        assert!(
+            col.bound_scale > 1.0,
+            "a corrected average owes an inflation factor, got {}",
+            col.bound_scale
+        );
+        // The factor is the supremum of the per-document ratio, so it
+        // must cover the worst occupied length at any term frequency.
+        // What the build recorded: the same token total over every row.
+        let rows = (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as f32;
+        let baked_avgdl = col.length_stats.total_tokens as f32 / rows;
+        let baked = col.dl_norm_k1.rescored(baked_avgdl, col.params);
+        for doc in 0..SPARSE_FILLED_ROWS {
+            for tf in 1..8u32 {
+                let at_baked = bm25::score_with_dl_norm_k1(1.0, tf, baked.get(doc));
+                let at_scored = bm25::score_with_dl_norm_k1(1.0, tf, col.dl_norm_k1.get(doc));
+                assert!(
+                    at_baked * col.bound_scale >= at_scored - f32::EPSILON,
+                    "doc {doc} tf {tf}: {at_baked} * {} < {at_scored}",
+                    col.bound_scale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bound_scale_reacts_to_the_average_alone() {
+        // The regression that made the correction above possible: the
+        // short-circuit compared only the parameter pair, so two tables
+        // at the same k1/b but different averages returned 1.0 and
+        // under-bounded every score.
+        let r = sparse_reader();
+        let col = &r.columns[0];
+        let wider = col.dl_norm_k1.rescored(col.avgdl * 2.0, col.params);
+        let factor = col.dl_norm_k1.bound_scale(&wider, col.params, col.params);
+        assert!(
+            factor > 1.0,
+            "same parameters, larger average: expected an inflation factor, got {factor}"
+        );
+        // And it is still exactly 1.0 when nothing moves at all.
+        let same = col.dl_norm_k1.rescored(col.avgdl, col.params);
+        assert_eq!(
+            col.dl_norm_k1.bound_scale(&same, col.params, col.params),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_column_with_no_text_is_never_scored() {
+        // Every row null: no document carries a token, so there is no
+        // average to normalize against and the table stays empty rather
+        // than dividing by zero.
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        for row in 0..4 {
+            b.add_doc(0, row, "").expect("null row");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let col = &r.columns[0];
+        assert_eq!(col.length_stats.n_scored_docs, 0);
+        assert_eq!(col.avgdl, 0.0);
+        assert_eq!(col.dl_norm_k1.len(), 0);
+    }
 
     // ── Additional coverage ───────────────────────────────────────────
 
