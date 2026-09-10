@@ -130,6 +130,24 @@ pub enum Stemmer {
 /// Lucene's English stopword set (`EnglishAnalyzer.ENGLISH_STOP_WORDS_SET`),
 /// **sorted** so [`Stopwords::contains`] can binary-search it.
 ///
+/// ## Frozen: this list is on-disk format state, not a tunable
+///
+/// A column persists the *name* `stop=english`, never the words — so
+/// this constant is what a reader reconstructs the column's analysis
+/// from, and editing it re-analyzes every column already built with it.
+/// Add a word and a query for it starts missing documents that contain
+/// it; remove one and queries tokenize differently than the postings
+/// were built. Both are wrong answers with no error, because the *name*
+/// still matches — exactly the failure the composite name exists to
+/// prevent, reached through the back door.
+///
+/// So it does not change. `english_stopword_set_is_frozen` pins every
+/// word and fails loudly if one moves. If a different list is ever
+/// genuinely wanted, it arrives as a **new name** (`stop=english2`)
+/// whose `parse_chain_name` arm is added beside this one, leaving files
+/// built under the old name reconstructible from the old list — never
+/// as an edit here.
+///
 /// Sorted-slice + binary search rather than a hash set: 33 short words
 /// are searched in ~5 comparisons with no hashing and no lazy-init, and
 /// the length pre-filter below rejects most corpus tokens before the
@@ -455,6 +473,89 @@ mod tests {
         let mut out = Vec::new();
         tok.tokenize_each_positioned(text, &mut |t, p| out.push((t.to_owned(), p)));
         out
+    }
+
+    /// The exact set a column declaring `stop=english` is analyzed
+    /// with, spelled out so a change to [`ENGLISH_STOPWORDS`] has to
+    /// come here and be argued for.
+    ///
+    /// This is not a restatement of the constant for its own sake. The
+    /// name `stop=english` is what reaches disk, so the words behind it
+    /// are format state: change them and every column already built
+    /// under that name is analyzed one way and queried another, with no
+    /// error, because the name still matches.
+    const FROZEN_ENGLISH_STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is",
+        "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there",
+        "these", "they", "this", "to", "was", "will", "with",
+    ];
+
+    /// If this fails, do **not** update the expectation to match the
+    /// code. The words behind `stop=english` are on-disk format state
+    /// (see [`ENGLISH_STOPWORDS`]): every column already built under
+    /// that name would be silently analyzed one way and queried
+    /// another. A different list arrives as a new name —
+    /// `stop=english2`, with its own `parse_chain_name` arm and its own
+    /// frozen list — so files under the old name stay reconstructible.
+    #[test]
+    fn english_stopword_set_is_frozen() {
+        assert_eq!(
+            ENGLISH_STOPWORDS, FROZEN_ENGLISH_STOPWORDS,
+            "the `stop=english` word list changed. This is a format \
+             change, not a tuning change: columns already built under \
+             that name would be analyzed with the old list and queried \
+             with the new one, silently. Ship a new name instead."
+        );
+    }
+
+    /// The stemmer has the same problem one layer out, and worse: the
+    /// rules behind `stem=english` live in `rust-stemmers`, whose
+    /// version range admits any `1.x`, so a routine dependency bump
+    /// could change how an existing column's postings *would* be
+    /// tokenized while the postings themselves keep the old forms.
+    ///
+    /// These pairs are the observable contract. If a bump breaks this,
+    /// the bump is a format change — reject it or ship `stem=english2`;
+    /// do not re-record the expectations.
+    #[test]
+    fn english_stemmer_output_is_frozen() {
+        // Chosen to cover the Porter2 steps that actually differ
+        // between implementations: -ing/-ed removal with and without
+        // stem doubling, -ies/-y, -ational/-ate, -ness/-ful/-ment
+        // suffixes, short-word protection, and the irregulars it has no
+        // rule for.
+        let cases = [
+            ("running", "run"),
+            ("runs", "run"),
+            ("run", "run"),
+            ("runner", "runner"),
+            ("ran", "ran"),
+            ("studies", "studi"),
+            ("study", "studi"),
+            ("cities", "citi"),
+            ("relational", "relat"),
+            ("hopping", "hop"),
+            ("hoping", "hope"),
+            ("happiness", "happi"),
+            ("hopeful", "hope"),
+            ("argument", "argument"),
+            ("agreed", "agre"),
+            ("news", "news"),
+            ("sky", "sky"),
+            ("is", "is"),
+        ];
+        let tok = chain("standard+stem=english");
+        for (word, want) in cases {
+            let got: Vec<String> = tok.tokenize(word).collect();
+            assert_eq!(
+                got,
+                vec![want.to_string()],
+                "`stem=english` changed for {word:?}. This is a format \
+                 change: columns already built under that name hold the \
+                 old stems and would now be queried with new ones. \
+                 Reject the bump or ship a new name."
+            );
+        }
     }
 
     #[test]
