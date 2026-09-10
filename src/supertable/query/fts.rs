@@ -125,8 +125,9 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
+                Bm25SearchOptions, Bm25Stats, ClauseLists, ColumnLengthStats, FetchedTermMemo,
+                GlobalTermIdf, LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
+                ScoringOverride,
             },
         },
     },
@@ -426,6 +427,33 @@ impl SupertableReader {
         }
     }
 
+    /// Table-wide document-length totals for `column`, summed from the
+    /// manifest's per-superfile summaries.
+    ///
+    /// This is the whole point of recording the totals on the manifest:
+    /// the sum is an in-memory fold over the pinned snapshot, so making
+    /// a score independent of which superfile its document lives in
+    /// costs no fetch and no fan-out.
+    ///
+    /// A superfile with no summary entry for `column` does not index it
+    /// and contributes nothing. A superfile that *does* index it but
+    /// recorded no totals was written before they existed, and there is
+    /// no way to recover them without opening it — so the whole fold
+    /// goes unknown rather than silently summing a subset, which would
+    /// be neither the table-wide average nor the local one. The caller
+    /// then keeps each superfile's own average, exactly as before, and
+    /// a rewrite (a fresh commit, or `optimize`) backfills.
+    fn column_corpus_stats(manifest: &ManifestSnapshot, column: &str) -> Option<ColumnLengthStats> {
+        let mut total = ColumnLengthStats::default();
+        for sf in &manifest.superfiles {
+            let Some(summary) = sf.fts_summary.get(column) else {
+                continue;
+            };
+            total.merge_with(&summary.length_stats?);
+        }
+        Some(total)
+    }
+
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(column = column, k = k, mode = ?opts.mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
@@ -449,12 +477,26 @@ impl SupertableReader {
         let Bm25SearchOptions {
             mode,
             stats,
-            bm25: bm25_override,
+            bm25: bm25_params,
         } = opts;
-        if let Some(p) = bm25_override {
+        if let Some(p) = bm25_params {
             Self::validate_bm25_override(p)?;
         }
         let manifest = self.manifest();
+        // Under global statistics the length normalizer uses the
+        // table-wide average too, not just the table-wide idf. Halving
+        // it — globalizing the term weight but leaving the normalizer
+        // per-superfile — would still let the same document score
+        // differently depending on which commit it landed in, which is
+        // the thing this mode exists to rule out.
+        let corpus = match stats {
+            Bm25Stats::PerSuperfile => None,
+            Bm25Stats::Global => Self::column_corpus_stats(manifest.as_ref(), column),
+        };
+        let bm25_override = ScoringOverride {
+            params: bm25_params,
+            avgdl: corpus.map(|c| c.avgdl()).filter(|a| *a > 0.0),
+        };
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
@@ -577,7 +619,7 @@ impl SupertableReader {
                     true => (None, None),
                     false => {
                         let (map, memos) = self
-                            .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept)
+                            .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept, corpus)
                             .await?;
                         (Some(Arc::new(map)), memos)
                     }
@@ -882,9 +924,18 @@ impl SupertableReader {
         column: &str,
         terms: &[String],
         kept: &[Arc<SuperfileEntry>],
+        corpus: Option<ColumnLengthStats>,
     ) -> Result<(GlobalTermIdf, PrefetchMemos), QueryError> {
         let mut map = GlobalTermIdf::with_capacity(terms.len());
-        let global_n = manifest.n_docs_total();
+        // The collection size idf is computed against: documents that
+        // carry tokens in this column, summed table-wide. It is the
+        // population the per-term document frequencies below are counted
+        // over, so the two have to come from the same corpus — a row
+        // that is null here can never contribute to a `df`, and counting
+        // it in `N` would weight the column's common terms too heavily
+        // against its rare ones. Falls back to the row count for a
+        // manifest whose summaries predate the totals.
+        let global_n = corpus.map_or_else(|| manifest.n_docs_total(), |c| c.n_scored_docs);
         if terms.is_empty() || global_n == 0 {
             return Ok((map, None));
         }
@@ -1158,11 +1209,11 @@ impl SupertableReader {
                                             f32::NEG_INFINITY,
                                             // Prefix search takes no
                                             // search options yet, so
-                                            // there is no pair to
+                                            // there is nothing to
                                             // override with; columns
                                             // score with what they
-                                            // declared.
-                                            None,
+                                            // baked in.
+                                            ScoringOverride::default(),
                                         )
                                     })
                                 },
@@ -1178,7 +1229,7 @@ impl SupertableReader {
                                     start,
                                     end,
                                     f32::NEG_INFINITY,
-                                    None,
+                                    ScoringOverride::default(),
                                 )
                             })
                             .map_err(fts_read_error)

@@ -2865,12 +2865,20 @@ pub(super) fn prepare_superfile_with_uri(
             for term in &terms {
                 bloom_builder.insert(term);
             }
+            // Recorded here so table-wide BM25 statistics are a fold over
+            // the manifest instead of a fan-out that reopens every
+            // superfile: the reader summed them during the pass it
+            // already makes over the doc-lengths array.
+            let length_stats = fts_reader
+                .column_length_stats(&fc.column)
+                .expect("column just registered in this superfile's FTS index");
             fts_summary.insert(
                 fc.column.clone(),
                 FtsSummaryAgg::new_with_params(
                     bloom_builder.finish(),
                     n_terms_distinct,
                     (min_term, max_term),
+                    length_stats,
                 ),
             );
         }

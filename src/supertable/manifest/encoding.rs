@@ -45,7 +45,7 @@ use datafusion::scalar::ScalarValue;
 use thiserror::Error;
 
 use crate::{
-    superfile::vector::distance::decode_f32_le_vec,
+    superfile::{fts::reader::ColumnLengthStats, vector::distance::decode_f32_le_vec},
     supertable::manifest::{
         ADMIT_CODE_WORD_BITS, CellVectorSummary, ClusterCentroids, FtsSummaryAgg, RabitqAdmitCodes,
         VectorSummary,
@@ -512,6 +512,18 @@ pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError
 //   [min_term bytes]
 //   u32 max_term_len
 //   [max_term bytes]               (empty min+max ⇒ no range, i.e. None)
+//   u64 total_tokens               ┐ optional tail: present together or
+//   u64 n_scored_docs              ┘ not at all (⇒ length_stats None)
+//
+// The trailing pair is a compatible extension in both directions, and
+// both directions are exercised by the round-trip tests. A summary
+// written before it existed simply ends after `max_term`, and the
+// decoder reads the absent tail as "no totals recorded"; a decoder that
+// predates it stops after `max_term` and ignores what follows, because
+// each summary is a length-delimited blob inside the manifest's binary
+// column rather than a stream this shares with anything else. That
+// second property is what makes appending safe here, so it is load
+// bearing: do not add a trailing-bytes rejection to this decoder.
 //
 // ---------------------------------------------------------
 
@@ -541,6 +553,10 @@ pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
     out.extend_from_slice(min_term);
     out.extend_from_slice(&(max_term.len() as u32).to_le_bytes());
     out.extend_from_slice(max_term);
+    if let Some(stats) = s.length_stats {
+        out.extend_from_slice(&stats.total_tokens.to_le_bytes());
+        out.extend_from_slice(&stats.n_scored_docs.to_le_bytes());
+    }
     out
 }
 
@@ -571,10 +587,22 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     } else {
         return Err(DecodeError::InvalidTermRange);
     };
+    // The totals are optional and go together: a summary that predates
+    // them ends here. Read both or neither — a tail carrying only one is
+    // a truncated write, not an older writer, so it is rejected rather
+    // than half-believed.
+    let length_stats = match c.get_ref().len() - c.position() as usize {
+        0 => None,
+        _ => Some(ColumnLengthStats {
+            total_tokens: read_u64(&mut c, "total_tokens")?,
+            n_scored_docs: read_u64(&mut c, "n_scored_docs")?,
+        }),
+    };
     Ok(FtsSummaryAgg {
         term_bloom,
         n_terms_distinct,
         term_range,
+        length_stats,
     })
 }
 

@@ -27,7 +27,8 @@ use rustc_hash::FxHashMap;
 use super::{
     cursor::{TermCursor, TermMeta},
     filter::ExcludeFilter,
-    metadata::{ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
+    metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
+    options::ScoringOverride,
     phrase::{AnyCursor, PhraseCursor},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
@@ -502,16 +503,24 @@ impl FtsReader {
     /// Cheap enough to do per query: the clone is a `Bytes`/`Arc` bump
     /// for the blob, one `String` and one 1 KiB table per re-derived
     /// column, and no pass over any per-doc array.
-    pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
+    pub(crate) fn with_scoring_override(&self, over: ScoringOverride) -> Self {
         let mut view = self.clone();
         for col in &mut view.columns {
-            if col.params == params {
+            let params = over.params.unwrap_or(col.params);
+            let avgdl = over.avgdl.unwrap_or(col.avgdl);
+            if params == col.params && avgdl == col.avgdl {
                 continue;
             }
-            let rescored = col.dl_norm_k1.rescored(col.avgdl, params);
-            col.bound_scale = col.dl_norm_k1.bound_scale(&rescored, col.params, params);
+            let rescored = col.dl_norm_k1.rescored(avgdl, params);
+            // Compose rather than replace: `bound_scale` already carries
+            // the correction from the average the bounds were baked at
+            // to the one this reader scores with, and that correction is
+            // still owed. Multiplying the two suprema loosens the bound
+            // slightly and cannot under-bound it.
+            col.bound_scale *= col.dl_norm_k1.bound_scale(&rescored, col.params, params);
             col.dl_norm_k1 = rescored;
             col.params = params;
+            col.avgdl = avgdl;
         }
         view
     }
@@ -910,21 +919,38 @@ impl FtsReader {
                 }
             }
 
-            let avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
-            // Per-doc length normalizer, byte-quantized (see `NormTable`).
-            // For avgdl == 0 (empty column) this is an empty table; it'll
-            // never be indexed since `search` short-circuits.
+            // What the build divided by: the token total over *rows*,
+            // including the rows this column is null for. It is what the
+            // stored per-block bounds were computed against, so it stays
+            // the reference `bound_scale` corrects from, but it is not
+            // what scoring should use.
+            let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             let n = n_docs as usize;
             // The column's declared parameters — recorded in the KV
             // entry by every writer since they became recordable, and
             // the standard pair for any file older than that.
             let params = col_cfg.params();
-            let dl_norm_k1 = NormTable::new(
+            // Per-doc length normalizer, byte-quantized (see `NormTable`).
+            // The same pass sums the lengths, so the average over the
+            // documents that carry tokens costs no extra read: the
+            // exact per-doc array is already being walked to quantize
+            // it. A column no document contributes to yields an empty
+            // table; it'll never be indexed since `search`
+            // short-circuits.
+            let (dl_norm_k1, length_stats) = NormTable::new(
                 (0..n).map(|d| read_u32_le(&array_region[d * 4..d * 4 + 4])),
                 n,
-                avgdl,
                 params,
             );
+            let avgdl = dl_norm_k1.avgdl();
+            // Inflate the stored bounds to cover the gap between the
+            // average they were baked at and the one being scored with.
+            // Correcting the average can only raise it (no more
+            // documents carry tokens than there are rows), which lowers
+            // the norm and raises the score, so the stored bounds would
+            // otherwise sit below scores they are meant to cap.
+            let baked = dl_norm_k1.rescored(baked_avgdl, params);
+            let bound_scale = baked.bound_scale(&dl_norm_k1, params, params);
             let tokenizer = tokenizer_for_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
@@ -935,11 +961,10 @@ impl FtsReader {
                 name: col_cfg.name.clone(),
                 doc_lengths_range: doc_lengths_offset..array_end,
                 avgdl,
+                length_stats,
                 dl_norm_k1,
                 params,
-                // Scoring with the pair the bounds were baked at, so no
-                // correction. `with_bm25_override` is what changes this.
-                bound_scale: 1.0,
+                bound_scale,
                 positions: col_cfg.positions,
                 tokenizer,
                 stored: col_cfg.stored,
@@ -977,6 +1002,16 @@ impl FtsReader {
 
     pub fn fts_columns_config(&self) -> impl Iterator<Item = &ColumnMeta> {
         self.columns.iter()
+    }
+
+    /// This superfile's document-length totals for `column`, as summed
+    /// when the reader opened. `None` if `column` is not an FTS column
+    /// here. The commit path records these on the manifest so table-wide
+    /// statistics are a fold over the summaries rather than a fan-out
+    /// that reopens every superfile.
+    pub fn column_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
+        let id = self.resolve_column_id(column).ok()?;
+        Some(self.columns[id as usize].length_stats)
     }
 
     /// Tokenizer configured for `column`, for tokenizing query text so
@@ -2290,7 +2325,10 @@ mod tests {
             // Same query parameters, reached two ways: an override on a
             // file baked at the standard pair, and a file baked at the
             // pair itself.
-            let overridden = baked_standard.with_bm25_override(params);
+            let overridden = baked_standard.with_scoring_override(ScoringOverride {
+                params: Some(params),
+                avgdl: None,
+            });
 
             for terms in [
                 &["common"][..],
@@ -2337,7 +2375,10 @@ mod tests {
         b.add_doc(0, 0, "a b a").expect("doc 0");
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        let same = r.with_bm25_override(bm25::Bm25Params::STANDARD);
+        let same = r.with_scoring_override(ScoringOverride {
+            params: Some(bm25::Bm25Params::STANDARD),
+            avgdl: None,
+        });
         assert_eq!(same.columns[0].bound_scale, 1.0);
         assert_eq!(same.columns[0].params, r.columns[0].params);
     }

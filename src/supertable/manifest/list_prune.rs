@@ -187,6 +187,7 @@ pub fn prune_parts_for_id_range(list: &Manifest, query_min: i128, query_max: i12
 
 #[cfg(test)]
 mod tests {
+    use crate::superfile::fts::reader::ColumnLengthStats;
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{ArrayRef, Decimal128Array, Int64Array};
@@ -244,6 +245,7 @@ mod tests {
                     bloom.finish(),
                     title_terms.len() as u32,
                     term_range,
+                    ColumnLengthStats::default(),
                 ),
             );
         }
@@ -352,6 +354,7 @@ mod tests {
                 BloomBuilder::with_n_blocks(16).finish(),
                 0,
                 (Vec::new(), Vec::new()),
+                ColumnLengthStats::default(),
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
@@ -387,6 +390,7 @@ mod tests {
                 BloomBuilder::with_n_blocks(16).finish(),
                 0,
                 (Vec::new(), Vec::new()),
+                ColumnLengthStats::default(),
             ),
         );
         let s = Arc::new(SuperfileEntry {

@@ -662,12 +662,18 @@ fn build_fts_summary(
         for term in &terms {
             bloom_builder.insert(term);
         }
+        // See the commit path's counterpart: the totals ride the summary
+        // so table-wide statistics stay a manifest fold.
+        let length_stats = fts_reader
+            .column_length_stats(&fc.column)
+            .expect("column just registered in this superfile's FTS index");
         out.insert(
             fc.column.clone(),
             FtsSummaryAgg::new_with_params(
                 bloom_builder.finish(),
                 n_terms_distinct,
                 (min_term, max_term),
+                length_stats,
             ),
         );
     }

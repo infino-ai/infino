@@ -42,41 +42,102 @@ pub struct NormTable {
     /// its supremum over lengths that occur rather than over all 256
     /// representable ones. `(0, 0)` for an empty column.
     occupied: (u8, u8),
+    /// The average document length `lut` was built at. Kept because it
+    /// is the other half of what determines the table — two tables can
+    /// share a parameter pair and still decode differently — so
+    /// [`NormTable::bound_scale`] can tell "nothing changed" from "the
+    /// average moved" without walking 256 buckets to find out.
+    avgdl: f32,
+}
+
+/// A column's document-length totals, summed over the stored
+/// doc-lengths array when the reader opens.
+///
+/// Both numbers are counted over the documents BM25's corpus
+/// statistics are actually defined over — the ones carrying at least
+/// one indexed token. A row whose cell was null occupies a slot in the
+/// doc-lengths array (the array is indexed by local doc id, so it
+/// cannot skip rows) with a length of zero, and a row whose text
+/// produced no tokens is indistinguishable from it; neither can match
+/// a term, and counting either would deflate the average and inflate
+/// the collection size for every term in the column.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ColumnLengthStats {
+    /// Exact sum of every document's token count in this column.
+    pub total_tokens: u64,
+    /// Documents carrying at least one indexed token in this column.
+    pub n_scored_docs: u64,
+}
+
+impl ColumnLengthStats {
+    /// Average length over the documents that carry tokens. `0.0` for a
+    /// column no document contributes to, which is the value
+    /// [`NormTable::new`] reads as "never scored".
+    pub fn avgdl(&self) -> f32 {
+        if self.n_scored_docs == 0 {
+            return 0.0;
+        }
+        (self.total_tokens as f64 / self.n_scored_docs as f64) as f32
+    }
+
+    /// Fold another column's totals in — the sum across superfiles that
+    /// turns per-file totals into table-wide ones.
+    pub fn merge_with(&mut self, other: &ColumnLengthStats) {
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.n_scored_docs = self.n_scored_docs.saturating_add(other.n_scored_docs);
+    }
 }
 
 impl NormTable {
-    /// Build from a column's per-doc lengths and average length. An
-    /// `avgdl` of `0.0` (empty column) yields an empty table; it is
+    /// Build from a column's per-doc lengths, returning the table
+    /// alongside the totals the pass produced.
+    ///
+    /// The average the table decodes at is derived here rather than
+    /// taken from the caller: it is `total_tokens / n_scored_docs`, and
+    /// only this pass knows how many documents actually carry tokens.
+    /// A column no document contributes to yields an empty table; it is
     /// never indexed because `search` short-circuits on empty columns.
+    ///
+    /// The lengths are summed exactly, so the average costs nothing
+    /// beyond the pass the per-doc buckets already require.
     pub(super) fn new(
         doc_lengths: impl Iterator<Item = u32>,
         n_docs: usize,
-        avgdl: f32,
         params: bm25::Bm25Params,
-    ) -> Self {
-        if avgdl <= 0.0 {
-            return Self::empty();
-        }
+    ) -> (Self, ColumnLengthStats) {
         let mut bytes = Vec::with_capacity(n_docs);
         let mut lo = u8::MAX;
         let mut hi = u8::MIN;
+        let mut stats = ColumnLengthStats::default();
         for dl in doc_lengths {
             let bucket = bm25::quantize_len(dl);
             lo = lo.min(bucket);
             hi = hi.max(bucket);
             bytes.push(bucket);
+            if dl > 0 {
+                stats.total_tokens += u64::from(dl);
+                stats.n_scored_docs += 1;
+            }
+        }
+        let avgdl = stats.avgdl();
+        if avgdl <= 0.0 {
+            return (Self::empty(), stats);
         }
         let occupied = if bytes.is_empty() { (0, 0) } else { (lo, hi) };
-        Self {
+        let table = Self {
             bytes: Arc::from(bytes),
             lut: build_lut(avgdl, params),
             occupied,
-        }
+            avgdl,
+        };
+        (table, stats)
     }
 
-    /// The same per-doc buckets decoded at different parameters — for a
-    /// query that overrides what its column declared. Shares `bytes`,
-    /// so the cost is one 256-entry table.
+    /// The same per-doc buckets decoded at a different average length
+    /// and/or parameter pair — for a query that overrides what the
+    /// column declared, and for the table-wide average that makes a
+    /// score independent of which superfile the document landed in.
+    /// Shares `bytes`, so the cost is one 256-entry table.
     pub(super) fn rescored(&self, avgdl: f32, params: bm25::Bm25Params) -> Self {
         if self.bytes.is_empty() {
             return Self::empty();
@@ -85,7 +146,13 @@ impl NormTable {
             bytes: Arc::clone(&self.bytes),
             lut: build_lut(avgdl, params),
             occupied: self.occupied,
+            avgdl,
         }
+    }
+
+    /// The average document length this table decodes at.
+    pub(super) fn avgdl(&self) -> f32 {
+        self.avgdl
     }
 
     /// The factor `R >= 1` by which every bound built at `baked` must be
@@ -107,14 +174,21 @@ impl NormTable {
     /// over `tf >= 1` is `max(1, (1+A)/(1+B))`; taking the max over the
     /// buckets docs actually occupy gives the supremum over the column.
     /// Loosening, never under-bounding, and exactly `1.0` when the two
-    /// parameter sets agree.
+    /// tables decode identically.
+    ///
+    /// The short-circuit tests the average as well as the parameters,
+    /// because either one moves the `lut` on its own: two tables at the
+    /// same `k1`/`b` but different averages produce different norms for
+    /// every bucket, and returning `1.0` for that pair would leave the
+    /// stored bounds below the scores they are supposed to cap — which
+    /// prunes documents out of the top-k with nothing to show for it.
     pub(super) fn bound_scale(
         &self,
         other: &NormTable,
         baked: bm25::Bm25Params,
         query: bm25::Bm25Params,
     ) -> f32 {
-        if baked == query || self.bytes.is_empty() {
+        if (baked == query && self.avgdl == other.avgdl) || self.bytes.is_empty() {
             return 1.0;
         }
         let (lo, hi) = self.occupied;
@@ -151,6 +225,7 @@ impl NormTable {
             bytes: Arc::from(Vec::new()),
             lut: Arc::new([0.0; 256]),
             occupied: (0, 0),
+            avgdl: 0.0,
         }
     }
 }
@@ -174,9 +249,21 @@ pub struct ColumnMeta {
     /// Byte range into [`FtsReader::blob`] holding this column's
     /// `u32` doc-lengths array (4 bytes per doc, length × n_docs).
     pub doc_lengths_range: Range<usize>,
-    /// Average doc length across this column. `0.0` if the column has
-    /// no docs.
+    /// Average doc length across this column — over the documents that
+    /// carry tokens, so a column that is null for most rows is
+    /// normalized against the documents it actually has. `0.0` if the
+    /// column has none.
+    ///
+    /// Derived at open from the stored lengths rather than read from
+    /// the doc-lengths directory: the directory records the average
+    /// over *rows*, which is the same number only for a column with no
+    /// gaps. The directory value is still what the stored per-block
+    /// bounds were built against, hence `bound_scale`.
     pub avgdl: f32,
+    /// This column's exact token total and the number of documents
+    /// carrying tokens, summed at open. Table-wide statistics are these
+    /// summed across superfiles.
+    pub length_stats: ColumnLengthStats,
     /// Per-doc BM25 length normalizer, byte-quantized — see
     /// [`NormTable`]. Computed once per reader at `open` time from the
     /// column's on-disk doc-lengths array. The hot scoring loop reads
@@ -189,12 +276,18 @@ pub struct ColumnMeta {
     /// `bound_scale` carries the correction for the stored bounds.
     pub params: bm25::Bm25Params,
     /// Factor to apply to every bound read out of the skip table or the
-    /// coarse table before comparing it against a score. `1.0` unless
-    /// the query overrode this column's parameters, in which case it is
-    /// [`NormTable::bound_scale`] between the baked pair and the
-    /// query's — the stored bounds belong to the baked pair, and
-    /// inflating them by this keeps them upper bounds under the pair
-    /// actually being scored.
+    /// coarse table before comparing it against a score.
+    ///
+    /// The stored bounds are exact scores under what the build baked
+    /// in: the column's declared parameter pair, and the average length
+    /// over rows that the doc-lengths directory records. Every reason
+    /// the scored value departs from that — the average corrected to
+    /// the documents that carry tokens, a table-wide average, a
+    /// query-time parameter override — is a [`NormTable::bound_scale`]
+    /// factor, and they compose by multiplication because each is a
+    /// supremum of a ratio (a product of suprema is never below the
+    /// supremum of the product, so composing loosens and cannot
+    /// under-bound).
     pub bound_scale: f32,
     /// Whether this column's index carries token positions (from
     /// `inf.fts.columns`); phrase queries require it.
@@ -209,6 +302,23 @@ pub struct ColumnMeta {
     /// but absent from the stored schema, so they cannot be read back;
     /// a rebuild carries their postings across instead of re-tokenizing.
     pub stored: bool,
+}
+
+impl ColumnMeta {
+    /// The collection size this column's inverse document frequency is
+    /// computed against: the documents that carry tokens here, not the
+    /// superfile's row count.
+    ///
+    /// The two differ by however many rows are null for this column,
+    /// and using the row count does not merely shift every term's
+    /// weight by a constant — the document frequency it is compared
+    /// against is not rescaled with it, so a column that is null for
+    /// most rows ends up weighting its common terms too heavily against
+    /// its rare ones. Counting only documents that could match keeps
+    /// each column's weighting independent of how often it is filled.
+    pub fn scored_doc_count(&self) -> u64 {
+        self.length_stats.n_scored_docs
+    }
 }
 
 /// JSON-deserialized form of one entry in `inf.fts.columns`. The KV

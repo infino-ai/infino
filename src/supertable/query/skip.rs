@@ -390,6 +390,7 @@ pub(crate) fn scalar_value_may_match(
 
 #[cfg(test)]
 mod tests {
+    use crate::superfile::fts::reader::ColumnLengthStats;
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{ArrayRef, Date32Array, Int64Array, LargeStringArray};
@@ -482,7 +483,12 @@ mod tests {
             (Some(min), Some(max)) => (min.as_bytes().to_vec(), max.as_bytes().to_vec()),
             _ => (Vec::new(), Vec::new()),
         };
-        let summary = FtsSummaryAgg::new_with_params(bb.finish(), terms.len() as u32, term_range);
+        let summary = FtsSummaryAgg::new_with_params(
+            bb.finish(),
+            terms.len() as u32,
+            term_range,
+            ColumnLengthStats::default(),
+        );
         (column.to_string(), summary)
     }
 

@@ -256,6 +256,7 @@ fn and_into(dst: &mut [bool], src: &[bool]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::superfile::fts::reader::ColumnLengthStats;
     use std::{
         collections::{HashMap, HashSet},
         slice::from_ref,
@@ -497,6 +498,7 @@ mod tests {
                 bb.finish(),
                 titles.len() as u32,
                 (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
+                ColumnLengthStats::default(),
             ),
         );
 
@@ -606,7 +608,12 @@ mod tests {
         let mut fts = HashMap::new();
         fts.insert(
             "title".to_string(),
-            FtsSummaryAgg::new_with_params(bb.finish(), bloom_tokens.len() as u32, term_range),
+            FtsSummaryAgg::new_with_params(
+                bb.finish(),
+                bloom_tokens.len() as u32,
+                term_range,
+                ColumnLengthStats::default(),
+            ),
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {

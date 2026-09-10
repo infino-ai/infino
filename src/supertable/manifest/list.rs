@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::superfile::fts::reader::ColumnLengthStats;
 use crate::supertable::{
     manifest::{
         add_sum_arrays,
@@ -1085,6 +1086,18 @@ pub struct FtsSummaryAgg {
     /// `(min, max)` lex term range. `None` if the FST was empty for this
     /// column (per-superfile) or every superfile's FST was empty (part).
     pub term_range: Option<(Vec<u8>, Vec<u8>)>,
+    /// This column's token total and count of documents carrying
+    /// tokens. Unlike the rest of this struct these drive *scoring*,
+    /// not skip-pruning: summed over the manifest they give the
+    /// table-wide average document length and collection size, so a
+    /// term is weighted the same way regardless of which superfile the
+    /// document it matched happens to live in.
+    ///
+    /// `None` on a summary written before the totals were recorded. A
+    /// reader falls back to that superfile's row count, which is what
+    /// it would have used anyway, so a partially backfilled manifest
+    /// degrades toward the old numbers rather than to anything new.
+    pub length_stats: Option<ColumnLengthStats>,
 }
 
 impl PartialEq for FtsSummaryAgg {
@@ -1100,6 +1113,7 @@ impl PartialEq for FtsSummaryAgg {
         bloom_eq
             && self.n_terms_distinct == other.n_terms_distinct
             && self.term_range == other.term_range
+            && self.length_stats == other.length_stats
     }
 }
 
@@ -1144,6 +1158,19 @@ impl FtsSummaryAgg {
             (None, None) => None,
         };
         self.n_terms_distinct = self.n_terms_distinct.max(other.n_terms_distinct);
+        // Plain sums, not a union or a max: these are corpus totals, and
+        // the whole point of rolling them up is that the average and the
+        // collection size come out the same as they would for one
+        // unfragmented file. A contributor that predates the totals has
+        // nothing to add, and folding it in as zero would silently
+        // shrink both — so an unknown side makes the result unknown.
+        self.length_stats = match (self.length_stats, other.length_stats) {
+            (Some(mut a), Some(b)) => {
+                a.merge_with(&b);
+                Some(a)
+            }
+            _ => None,
+        };
     }
 
     /// Merge two per-FTS-column summary tables
@@ -1175,7 +1202,8 @@ impl FtsSummaryAgg {
     }
 
     /// Build the per-superfile summary for one column from its freshly-built
-    /// bloom, distinct-term count, and `(min, max)` lex term range.
+    /// bloom, distinct-term count, `(min, max)` lex term range, and the
+    /// column's document-length totals.
     ///
     /// Adapts the per-superfile shape to this type: the bloom is always
     /// present (`Some`); the count widens `u32` → `u64`; and an empty
@@ -1185,6 +1213,7 @@ impl FtsSummaryAgg {
         term_bloom: Bloom,
         n_terms_distinct: u32,
         term_range: (Vec<u8>, Vec<u8>),
+        length_stats: ColumnLengthStats,
     ) -> Self {
         let term_range = if term_range.0.is_empty() && term_range.1.is_empty() {
             None
@@ -1195,6 +1224,7 @@ impl FtsSummaryAgg {
             term_bloom: Some(term_bloom),
             n_terms_distinct: u64::from(n_terms_distinct),
             term_range,
+            length_stats: Some(length_stats),
         }
     }
 
@@ -1531,6 +1561,17 @@ struct FtsSummaryAggDto {
     /// `null`-vs-`{"min":"","max":""}` ambiguity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     term_range_union: Option<TermRangeUnionDto>,
+    /// Token total and count of documents carrying tokens, for scoring
+    /// rather than pruning. `None` ↔ field absent, which is how a part
+    /// written before the totals existed decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    length_stats: Option<ColumnLengthStatsDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ColumnLengthStatsDto {
+    total_tokens: u64,
+    n_scored_docs: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1638,6 +1679,10 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
                             min: encode_b64(mn),
                             max: encode_b64(mx),
                         }),
+                        length_stats: v.length_stats.map(|ls| ColumnLengthStatsDto {
+                            total_tokens: ls.total_tokens,
+                            n_scored_docs: ls.n_scored_docs,
+                        }),
                     },
                 )
             })
@@ -1728,6 +1773,10 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
                         decode_b64(&tr.max, "term_range_union.max")?,
                     )),
                 },
+                length_stats: v.length_stats.map(|ls| ColumnLengthStats {
+                    total_tokens: ls.total_tokens,
+                    n_scored_docs: ls.n_scored_docs,
+                }),
             },
         );
     }
@@ -2687,6 +2736,7 @@ mod tests {
                 term_bloom: Some(title_bloom.finish()),
                 n_terms_distinct: 1_048_576,
                 term_range: Some((b"alpha".to_vec(), b"zulu".to_vec())),
+                length_stats: None,
             },
         );
         // "body": no bloom info, no range (the all-None / always-keep shape).
@@ -2696,6 +2746,7 @@ mod tests {
                 term_bloom: None,
                 n_terms_distinct: 0,
                 term_range: None,
+                length_stats: None,
             },
         );
 
@@ -3454,6 +3505,7 @@ mod tests {
             term_bloom: Some(b.finish()),
             n_terms_distinct: terms.len() as u64,
             term_range: range.map(|(mn, mx)| (mn.to_vec(), mx.to_vec())),
+            length_stats: None,
         }
     }
 
@@ -3512,7 +3564,12 @@ mod tests {
     fn fts_agg_from_superfile_adapts_per_superfile_shape() {
         let mut b = BloomBuilder::with_n_blocks(16);
         b.insert(b"alpha");
-        let agg = FtsSummaryAgg::new_with_params(b.finish(), 7, (b"a".to_vec(), b"z".to_vec()));
+        let agg = FtsSummaryAgg::new_with_params(
+            b.finish(),
+            7,
+            (b"a".to_vec(), b"z".to_vec()),
+            ColumnLengthStats::default(),
+        );
         assert!(
             agg.term_bloom
                 .as_ref()
@@ -3528,6 +3585,7 @@ mod tests {
             BloomBuilder::with_n_blocks(16).finish(),
             0,
             (Vec::new(), Vec::new()),
+            ColumnLengthStats::default(),
         );
         assert_eq!(empty.term_range, None);
         assert!(empty.term_bloom.is_some());
@@ -3541,6 +3599,7 @@ mod tests {
             term_bloom: Some(b.finish()),
             n_terms_distinct: 1,
             term_range: None,
+            length_stats: None,
         };
         assert!(agg.may_contain(b"present"));
         assert!(!agg.may_contain(b"definitely-absent-term"));
@@ -3554,6 +3613,7 @@ mod tests {
             term_bloom: None,
             n_terms_distinct: 0,
             term_range: Some((b"bravo".to_vec(), b"mango".to_vec())),
+            length_stats: None,
         };
         assert!(
             agg.may_match_prefix(b"echo"),
@@ -3810,6 +3870,7 @@ mod tests {
             term_bloom: Some(bloom),
             n_terms_distinct: 42,
             term_range: Some((b"apple".to_vec(), b"zebra".to_vec())),
+            length_stats: None,
         };
         other.insert("col1".to_string(), summary.clone());
         FtsSummaryAgg::merge(&mut into, &other);
@@ -3828,6 +3889,7 @@ mod tests {
             term_bloom: Some(bloom),
             n_terms_distinct: 10,
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
+            length_stats: None,
         };
         into.insert("only_in_into".to_string(), summary.clone());
         FtsSummaryAgg::merge(&mut into, &other);
@@ -3849,11 +3911,13 @@ mod tests {
             term_bloom: Some(bloom1),
             n_terms_distinct: 10,
             term_range: Some((b"apple".to_vec(), b"mango".to_vec())),
+            length_stats: None,
         };
         let summary2 = FtsSummaryAgg {
             term_bloom: Some(bloom2),
             n_terms_distinct: 15,
             term_range: Some((b"banana".to_vec(), b"zebra".to_vec())),
+            length_stats: None,
         };
         into.insert("shared".to_string(), summary1);
         other.insert("shared".to_string(), summary2);
@@ -3886,11 +3950,13 @@ mod tests {
             term_bloom: Some(bloom1),
             n_terms_distinct: 10,
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
+            length_stats: None,
         };
         let summary2 = FtsSummaryAgg {
             term_bloom: Some(bloom2),
             n_terms_distinct: 15,
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
+            length_stats: None,
         };
         into.insert("col".to_string(), summary1);
         other.insert("col".to_string(), summary2);
@@ -3916,6 +3982,7 @@ mod tests {
                 term_bloom: Some(bloom.clone()),
                 n_terms_distinct: 10,
                 term_range: Some((b"a".to_vec(), b"z".to_vec())),
+                length_stats: None,
             },
         );
         other.insert(
@@ -3924,6 +3991,7 @@ mod tests {
                 term_bloom: Some(bloom),
                 n_terms_distinct: 20,
                 term_range: Some((b"a".to_vec(), b"z".to_vec())),
+                length_stats: None,
             },
         );
         FtsSummaryAgg::merge(&mut into, &other);
@@ -3940,11 +4008,13 @@ mod tests {
             term_bloom: None,
             n_terms_distinct: 0,
             term_range: None,
+            length_stats: None,
         };
         let summary2 = FtsSummaryAgg {
             term_bloom: None,
             n_terms_distinct: 0,
             term_range: None,
+            length_stats: None,
         };
         into.insert("col".to_string(), summary1);
         other.insert("col".to_string(), summary2);

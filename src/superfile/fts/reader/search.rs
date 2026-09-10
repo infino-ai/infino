@@ -1030,7 +1030,7 @@ impl FtsReader {
                     true => 1,
                     false => tf,
                 };
-                let idf_t = global_idf.unwrap_or_else(|| bm25::idf(self.n_docs as u64, 1));
+                let idf_t = global_idf.unwrap_or_else(|| bm25::idf(col_meta.scored_doc_count(), 1));
                 let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
                 // Drop the lone match if a negated term excludes it.
                 // The inline slot read no postings-region bytes; the
@@ -1068,7 +1068,7 @@ impl FtsReader {
             self.has_coarse_block_max,
         )?;
 
-        let local_idf = bm25::idf(self.n_docs as u64, term_meta.df);
+        let local_idf = bm25::idf(col_meta.scored_doc_count(), term_meta.df);
         let idf_t = global_idf.unwrap_or(local_idf);
         let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
         // Stored block-max and coarse entries bake in the LOCAL idf. Scores
@@ -1540,7 +1540,7 @@ impl FtsReader {
                     cursors.push(Some(TermCursor::new_inline(
                         doc_id,
                         tf,
-                        self.n_docs as u64,
+                        col_meta.scored_doc_count(),
                         dl_norm_k1,
                         gidf,
                         weight,
@@ -1558,7 +1558,7 @@ impl FtsReader {
                 }) => {
                     let cursor = TermCursor::new(
                         bytes,
-                        self.n_docs as u64,
+                        col_meta.scored_doc_count(),
                         col_meta.positions,
                         gidf,
                         weight,
@@ -1585,7 +1585,7 @@ impl FtsReader {
                     let cursor = TermCursor::new_inline(
                         doc_id,
                         tf,
-                        self.n_docs as u64,
+                        col_meta.scored_doc_count(),
                         dl_norm_k1,
                         gidf,
                         weight,
@@ -1600,7 +1600,7 @@ impl FtsReader {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
                     let cursor = TermCursor::new(
                         term_bytes,
-                        self.n_docs as u64,
+                        col_meta.scored_doc_count(),
                         col_meta.positions,
                         gidf,
                         weight,

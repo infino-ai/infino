@@ -59,6 +59,32 @@ impl From<&str> for Bm25Stats {
     }
 }
 
+/// What one superfile is asked to score with when the query cannot
+/// simply use what that superfile baked in.
+///
+/// Both fields exist for the same reason and are corrected the same
+/// way: each moves the per-doc length normalizer away from the one the
+/// stored per-block bounds were computed against, so each contributes a
+/// factor that inflates those bounds back into upper bounds. The
+/// factors compose, and an empty override costs nothing — the query
+/// reads the superfile's own reader by reference.
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
+pub struct ScoringOverride {
+    /// Similarity parameters replacing what each column declared.
+    pub params: Option<Bm25Params>,
+    /// Average document length replacing this superfile's own — the
+    /// table-wide average, so that a document's score does not depend on
+    /// which superfile it happens to live in.
+    pub avgdl: Option<f32>,
+}
+
+impl ScoringOverride {
+    /// Nothing to override: score each column exactly as it was built.
+    pub fn is_empty(&self) -> bool {
+        self.params.is_none() && self.avgdl.is_none()
+    }
+}
+
 /// Options for a BM25 search: the boolean `mode` and the corpus-statistics
 /// `stats`. Set fields with the `with_*` builders; [`Default`] is
 /// [`BoolMode::Or`] with [`Bm25Stats::Global`].
