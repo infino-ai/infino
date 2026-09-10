@@ -232,8 +232,16 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
             };
             self.parse_unquoted_segment(&query[seg_start..unquoted_end], &mut parsed);
             let mut phrase: Phrase<Cow<'q, str>> = Phrase::default();
+            // Offsets are relative to the first *surviving* term. A
+            // leading token the analysis chain removed is unobservable
+            // — there is nothing before it to space it from — and
+            // normalizing here is what lets the verifier subtract an
+            // offset from a position without underflowing near the
+            // start of a document.
+            let mut first_position: Option<u64> = None;
             self.tokenize_each_query_positioned(&query[i + 1..close], &mut |t, position| {
-                phrase.push(t, position)
+                let first = *first_position.get_or_insert(position);
+                phrase.push(t, position.saturating_sub(first));
             });
             match (phrase.len(), sigil) {
                 // Empty quotes contribute nothing.
@@ -550,9 +558,6 @@ pub struct Phrase<T> {
     /// `offsets[i]` is `terms[i]`'s distance from `terms[0]`. Strictly
     /// ascending, and `offsets[0] == 0`.
     pub offsets: Vec<u32>,
-    /// Position of the first kept term, subtracted from every offset
-    /// pushed after it. Only meaningful while building.
-    first_position: Option<u64>,
 }
 
 impl<T> Default for Phrase<T> {
@@ -560,7 +565,6 @@ impl<T> Default for Phrase<T> {
         Self {
             terms: Vec::new(),
             offsets: Vec::new(),
-            first_position: None,
         }
     }
 }
@@ -570,23 +574,21 @@ impl<T> Phrase<T> {
     /// every phrase has on a column with no analysis chain.
     pub fn adjacent(terms: Vec<T>) -> Self {
         let offsets = (0..terms.len() as u32).collect();
-        Self {
-            terms,
-            offsets,
-            first_position: None,
-        }
+        Self { terms, offsets }
     }
 
-    /// Append `term`, which the tokenizer reported at gap-inclusive
-    /// `position`, normalizing the offset against the first term
-    /// appended.
-    fn push(&mut self, term: T, position: u64) {
-        let first = *self.first_position.get_or_insert(position);
-        // Saturating rather than panicking on a non-ascending position:
-        // a tokenizer is an extension point, and a misbehaving one
-        // should cost recall on its own column, not abort a query.
-        self.offsets
-            .push(position.saturating_sub(first).min(u32::MAX as u64) as u32);
+    /// Append `term` at `offset` from the phrase's first term. The
+    /// caller normalizes, so nothing about how the phrase was built
+    /// survives into the value — two phrases with the same terms and
+    /// the same spacing are the same phrase, however each was
+    /// assembled.
+    ///
+    /// `offset` saturates rather than panicking on a position a
+    /// tokenizer reported out of order: a tokenizer is an extension
+    /// point, and a misbehaving one should cost recall on its own
+    /// column, not abort a query.
+    fn push(&mut self, term: T, offset: u64) {
+        self.offsets.push(offset.min(u32::MAX as u64) as u32);
         self.terms.push(term);
     }
 
@@ -614,7 +616,6 @@ impl<T> Phrase<T> {
         Phrase {
             terms: self.terms.iter().map(f).collect(),
             offsets: self.offsets.clone(),
-            first_position: self.first_position,
         }
     }
 }
@@ -749,8 +750,31 @@ impl Tokenizer for AsciiLowerTokenizer {
     /// Zero-copy override: an already-lowercase token borrows from
     /// `text`; only a token that needs lowercasing is copied.
     fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
+        // One scan implementation — delegate and discard the position,
+        // so the two query entry points cannot disagree about which
+        // tokens a query has.
+        self.tokenize_each_query_positioned(text, &mut |t, _position| f(t));
+    }
+
+    /// Zero-copy *and* gap-aware: the same borrowed-where-possible
+    /// tokens as [`Self::tokenize_each_query`], each with the
+    /// gap-inclusive ordinal a dropped non-ASCII run leaves behind.
+    ///
+    /// The gap is why this is overridden rather than left to the
+    /// trait's consecutive default. A phrase query is verified against
+    /// the positions the *index* recorded, and the index has always
+    /// left a hole for a dropped run — so numbering the query's
+    /// surviving tokens consecutively asks for them closer together
+    /// than they were indexed, and `"new café york"` could never match
+    /// the text it was copied from.
+    fn tokenize_each_query_positioned<'q>(
+        &self,
+        text: &'q str,
+        f: &mut dyn FnMut(Cow<'q, str>, u64),
+    ) {
         let bytes = text.as_bytes();
         let mut pos = 0;
+        let mut position: u64 = 0;
         while pos < bytes.len() {
             pos = simd_skip_non_token(bytes, pos);
             if pos >= bytes.len() {
@@ -759,14 +783,22 @@ impl Tokenizer for AsciiLowerTokenizer {
             let start = pos;
             let (end, had_upper, had_non_ascii) = simd_scan_token_run(bytes, pos);
             pos = end;
-            if had_non_ascii || start == pos {
+            if start == pos {
+                continue;
+            }
+            // Every scanned run occupies one ordinal, dropped or not —
+            // the same rule `tokenize_each_inline_positioned` follows,
+            // so query and index agree on the spacing.
+            let this_position = position;
+            position += 1;
+            if had_non_ascii {
                 continue;
             }
             let s = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
             if had_upper {
-                f(Cow::Owned(s.to_ascii_lowercase()));
+                f(Cow::Owned(s.to_ascii_lowercase()), this_position);
             } else {
-                f(Cow::Borrowed(s));
+                f(Cow::Borrowed(s), this_position);
             }
         }
     }
@@ -1827,6 +1859,42 @@ mod tests {
         // trait object, confirming the right impl is wired.
         let tok = tokenizer_for_name(STANDARD_TOKENIZER).expect("standard");
         assert_eq!(tok.tokenize("Café").collect::<Vec<_>>(), vec!["café"]);
+    }
+
+    /// A phrase's offsets on a chainless tokenizer are its terms'
+    /// indices, and the parsed value equals the `adjacent` fixture the
+    /// tests build — nothing about *how* a phrase was assembled
+    /// survives into it, so two phrases with the same terms and the
+    /// same spacing are the same phrase.
+    #[test]
+    fn a_chainless_phrase_is_adjacent_and_compares_equal_to_the_fixture() {
+        let p = StandardTokenizer.parse("\"new york city\"");
+        let want = Phrase::adjacent(vec![
+            Cow::Borrowed("new"),
+            Cow::Borrowed("york"),
+            Cow::Borrowed("city"),
+        ]);
+        assert_eq!(p.positive_phrases, vec![want]);
+        assert_eq!(p.positive_phrases[0].offsets(), &[0, 1, 2]);
+    }
+
+    /// A tokenizer that drops tokens reports holes, and the parser
+    /// turns them into offsets normalized to the first surviving term.
+    /// `ascii_lower` drops non-ASCII runs, which is a hole with no
+    /// analysis chain involved — so the offset plumbing is exercised
+    /// by the tokenizer that has always left gaps.
+    #[test]
+    fn a_phrase_carries_the_holes_its_tokenizer_left() {
+        // `café` is dropped whole and consumes one ordinal, so `york`
+        // sits two positions after `new`.
+        let p = AsciiLowerTokenizer.parse("\"new café york\"");
+        assert_eq!(phrase_terms(&p.positive_phrases), vec![vec!["new", "york"]]);
+        assert_eq!(p.positive_phrases[0].offsets(), &[0, 2]);
+        // A *leading* dropped run is unobservable: there is nothing
+        // before it to space the phrase from, so the offsets still
+        // start at 0.
+        let p = AsciiLowerTokenizer.parse("\"café new york\"");
+        assert_eq!(p.positive_phrases[0].offsets(), &[0, 1]);
     }
 
     #[test]
