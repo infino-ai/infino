@@ -5021,29 +5021,41 @@ async fn group_multicell_rows(
 /// writes carries one (built from the just-written bytes at commit time), so
 /// a missing or empty summary is treated as a genuine error rather than a
 /// silent degrade.
-fn cell_doc_counts_for_entry(
+/// Per-cell physical doc counts held by `entry`, as `(cell, n_docs)` pairs,
+/// with superseded cells excluded. Served from the manifest's per-entry
+/// `VectorSummary` (no I/O); falls back to opening the superfile for an
+/// entry that carries no usable summary.
+async fn cell_doc_counts_for_entry(
     inner: &SupertableInner,
     entry: &Arc<SuperfileEntry>,
     superseded: Option<&BTreeSet<u32>>,
 ) -> Result<Vec<(u32, u32)>, BuildError> {
-    let column = vector_index_column(inner)
-        .ok_or_else(|| BuildError::Store("no vector index column configured".into()))?;
-    let summary = entry.vector_summary.get(&column).ok_or_else(|| {
-        BuildError::Store(format!(
-            "superfile {} missing vector summary for {column:?}",
-            entry.superfile_id
-        ))
-    })?;
+    if let Some(counts) = cell_doc_counts_from_summary(inner, entry, superseded) {
+        return Ok(counts);
+    }
+    warn!(
+        superfile = %entry.superfile_id,
+        "cell doc counts: no usable vector summary; opening the superfile"
+    );
+    cell_doc_counts_via_reader(inner, entry, superseded).await
+}
+
+/// Counts from the manifest summary, or `None` when it can't answer (no
+/// summary for the index column, or no cells) so the caller opens the file.
+fn cell_doc_counts_from_summary(
+    inner: &SupertableInner,
+    entry: &Arc<SuperfileEntry>,
+    superseded: Option<&BTreeSet<u32>>,
+) -> Option<Vec<(u32, u32)>> {
+    let column = vector_index_column(inner)?;
+    let summary = entry.vector_summary.get(&column)?;
     if summary.cells.is_empty() {
-        return Err(BuildError::Store(format!(
-            "superfile {} vector summary carries no cells",
-            entry.superfile_id
-        )));
+        return None;
     }
     let is_superseded = |cell: u32| superseded.is_some_and(|s| s.contains(&cell));
     if summary.cells.iter().any(|c| c.cell_id.is_none()) {
         let cell = entry.partition_hint.unwrap_or(0);
-        return Ok(if is_superseded(cell) {
+        return Some(if is_superseded(cell) {
             vec![]
         } else {
             vec![(cell, entry.n_docs as u32)]
@@ -5051,20 +5063,55 @@ fn cell_doc_counts_for_entry(
     }
     let mut out = Vec::with_capacity(summary.cells.len());
     for cell in &summary.cells {
-        // Every cell here has `cell_id: Some(_)` — the mixed-shape branch
-        // above already returned on the first `None`.
-        let id = cell
-            .cell_id
-            .expect("checked above: no unscoped cell in this summary");
+        // Some(_) guaranteed: the mixed-shape branch returned on any None.
+        let id = cell.cell_id?;
         if is_superseded(id) {
             continue;
         }
         let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
-        let n = u32::try_from(n)
-            .map_err(|_| BuildError::Store(format!("cell {id} doc count overflows u32: {n}")))?;
-        out.push((id, n));
+        out.push((id, u32::try_from(n).ok()?));
     }
-    Ok(out)
+    Some(out)
+}
+
+/// Counts by opening the superfile and reading its packed cell directory.
+async fn cell_doc_counts_via_reader(
+    inner: &SupertableInner,
+    entry: &Arc<SuperfileEntry>,
+    superseded: Option<&BTreeSet<u32>>,
+) -> Result<Vec<(u32, u32)>, BuildError> {
+    let storage = inner
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| BuildError::Store("cell maintenance requires storage".into()))?;
+    let reader = open_reader(
+        &inner.options.store,
+        inner.options.disk_cache.as_ref(),
+        Some(storage),
+        entry,
+        true,
+    )
+    .await
+    .map_err(|e| BuildError::Store(e.to_string()))?;
+    let v = reader
+        .vec()
+        .ok_or_else(|| BuildError::Store("IVF entry missing vector index".into()))?;
+    let is_superseded = |cell: u32| superseded.is_some_and(|s| s.contains(&cell));
+    if v.is_multi_cell() {
+        Ok(v.packed_cell_ids()
+            .iter()
+            .filter(|&&cell| !is_superseded(cell))
+            .filter_map(|&cell| Some((cell, v.packed_cell_n_docs(cell)?)))
+            .collect())
+    } else {
+        let cell = entry.partition_hint.unwrap_or(0);
+        if is_superseded(cell) {
+            Ok(vec![])
+        } else {
+            Ok(vec![(cell, entry.n_docs as u32)])
+        }
+    }
 }
 
 /// The vector column the hidden index is keyed on, or `None` if the table
@@ -6424,7 +6471,7 @@ pub(in crate::supertable) async fn scan_cell_parents(
     let mut parents_by_cell: HashMap<u32, Vec<Arc<SuperfileEntry>>> = HashMap::new();
     for entry in manifest.superfiles.iter() {
         let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
-        for (cell, n) in cell_doc_counts_for_entry(inner, entry, superseded)? {
+        for (cell, n) in cell_doc_counts_for_entry(inner, entry, superseded).await? {
             if only_cells.is_some_and(|want| !want.contains(&cell)) {
                 continue;
             }
@@ -7968,7 +8015,8 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     let mut total_docs = 0u64;
     for entry in manifest.superfiles.iter() {
         let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
-        let cells: Vec<(u32, u32)> = cell_doc_counts_for_entry(inner, entry, superseded)?
+        let cells: Vec<(u32, u32)> = cell_doc_counts_for_entry(inner, entry, superseded)
+            .await?
             .into_iter()
             .filter(|&(_, n)| n > 0)
             .collect();
@@ -11623,19 +11671,21 @@ mod tests {
         (dir, st, hidden)
     }
 
+    fn sorted(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+        v.sort_unstable();
+        v
+    }
+
     #[test]
-    fn cell_doc_counts_for_entry_matches_the_drained_cells() {
+    fn cell_doc_counts_from_summary_matches_the_drained_cells() {
         let (_dir, _st, hidden) = drained_hidden_two_cells();
         let inner = Arc::clone(hidden.inner());
         let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
-        assert!(
-            !manifest.superfiles.is_empty(),
-            "the drain must have packed at least one superfile"
-        );
+        assert!(!manifest.superfiles.is_empty());
 
         let mut populated: Vec<u32> = Vec::new();
         for entry in manifest.superfiles.iter() {
-            let counts = cell_doc_counts_for_entry(&inner, entry, None)
+            let counts = cell_doc_counts_from_summary(&inner, entry, None)
                 .expect("a drained superfile carries a per-cell summary");
             populated.extend(
                 counts
@@ -11648,37 +11698,46 @@ mod tests {
         populated.dedup();
         assert!(
             populated.len() >= 2,
-            "two distinct populated cells expected, got {populated:?}"
+            "expected two populated cells, got {populated:?}"
         );
 
         let dropped: BTreeSet<u32> = [populated[0]].into_iter().collect();
         for entry in manifest.superfiles.iter() {
-            let counts = cell_doc_counts_for_entry(&inner, entry, Some(&dropped))
+            let counts = cell_doc_counts_from_summary(&inner, entry, Some(&dropped))
                 .expect("summary still present");
             assert!(counts.iter().all(|&(cell, _)| cell != populated[0]));
         }
     }
 
     #[test]
-    fn cell_doc_counts_for_entry_errors_without_a_summary() {
+    fn cell_doc_counts_fall_back_to_the_reader_without_a_summary() {
         let (_dir, _st, hidden) = drained_hidden_two_cells();
         let inner = Arc::clone(hidden.inner());
         let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
         let entry = manifest.superfiles.first().expect("a packed superfile");
+        let expected = sorted(
+            hidden
+                .block_on_query(cell_doc_counts_via_reader(&inner, entry, None))
+                .expect("reader path"),
+        );
 
-        let mut stripped = (**entry).clone();
-        stripped.vector_summary.clear();
-        assert!(cell_doc_counts_for_entry(&inner, &Arc::new(stripped), None).is_err());
-
-        let mut empty_cells = (**entry).clone();
-        for summary in empty_cells.vector_summary.values_mut() {
-            summary.cells.clear();
+        for mutate in [
+            (|e: &mut SuperfileEntry| e.vector_summary.clear()) as fn(&mut SuperfileEntry),
+            |e: &mut SuperfileEntry| e.vector_summary.values_mut().for_each(|s| s.cells.clear()),
+        ] {
+            let mut broken = (**entry).clone();
+            mutate(&mut broken);
+            let broken = Arc::new(broken);
+            assert!(cell_doc_counts_from_summary(&inner, &broken, None).is_none());
+            let got = hidden
+                .block_on_query(cell_doc_counts_for_entry(&inner, &broken, None))
+                .expect("falls back to the reader");
+            assert_eq!(sorted(got), expected);
         }
-        assert!(cell_doc_counts_for_entry(&inner, &Arc::new(empty_cells), None).is_err());
     }
 
     #[test]
-    fn cell_doc_counts_for_entry_resolves_the_legacy_single_cell_shape() {
+    fn cell_doc_counts_from_summary_resolves_the_legacy_single_cell_shape() {
         let (_dir, _st, hidden) = drained_hidden_two_cells();
         let inner = Arc::clone(hidden.inner());
         let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
@@ -11701,14 +11760,13 @@ mod tests {
         );
         let legacy = Arc::new(legacy);
         assert_eq!(
-            cell_doc_counts_for_entry(&inner, &legacy, None).expect("legacy shape resolves"),
-            vec![(3, 5)]
+            cell_doc_counts_from_summary(&inner, &legacy, None),
+            Some(vec![(3, 5)])
         );
         let superseded: BTreeSet<u32> = [3].into_iter().collect();
         assert_eq!(
-            cell_doc_counts_for_entry(&inner, &legacy, Some(&superseded))
-                .expect("legacy shape resolves"),
-            vec![]
+            cell_doc_counts_from_summary(&inner, &legacy, Some(&superseded)),
+            Some(vec![])
         );
     }
 
