@@ -39,10 +39,7 @@ use infino::{
     Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
-        fts::{
-            reader::{Bm25Stats, BoolMode},
-            tokenize::Tokenizer,
-        },
+        fts::reader::{Bm25Stats, BoolMode},
     },
     supertable::{Supertable, SupertableOptions, query::SuperfileHit},
     test_helpers::{
@@ -149,33 +146,14 @@ fn corpus_with_prefix_terms() -> Vec<(u64, String)> {
 
 // ---- Supertable side -----------------------------------------------
 
+/// The fixture at the standard BM25 pair — the shape most of these
+/// tests want, so they do not have to name a pair they do not care
+/// about.
 fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable {
-    let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(RAYON_POOL_THREADS)
-            .build()
-            .expect("pool"),
-    );
-    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
-    let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
-        .expect("opts")
-        .with_writer_pool(pool);
-
-    let st = Supertable::create(opts).expect("create");
-    let mut w = st.writer().expect("writer");
-    let chunk_size = corpus.len().div_ceil(n_superfiles);
-    for chunk in corpus.chunks(chunk_size) {
-        let titles =
-            LargeStringArray::from(chunk.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
-        w.append(&batch).expect("append");
-        w.commit().expect("commit");
-    }
-    drop(w);
-    st
+    build_supertable_with_params(corpus, n_superfiles, OracleBm25Params::default())
 }
 
-/// Same fixture, but every FTS column declares `params` — so the build
+/// The fixture, with every FTS column declaring `params` — so the build
 /// bakes its block-max bounds at that pair and the reader scores with
 /// it.
 fn build_supertable_with_params(
