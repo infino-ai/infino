@@ -5220,9 +5220,14 @@ impl SupertableReader {
                     superseded,
                 )
             })?;
+            // Round-0 exact-score shortlist: anchor to the stamped
+            // (target-aware) width when the law is serving; the fixed
+            // fraction/floor is the legacy fallback for unstamped tables.
+            let round0_window =
+                law_width.unwrap_or_else(|| admit_shortlist_window(admit_ranking.len()));
             let mut admitted: HashSet<u32> = admit_ranking
                 .iter()
-                .take(admit_shortlist_window(admit_ranking.len()))
+                .take(round0_window)
                 .map(|(cell, _)| *cell)
                 .collect();
             admitted.extend(must_include.iter().copied());
@@ -5259,8 +5264,24 @@ impl SupertableReader {
             // estimates could plausibly land inside the serve window;
             // admission is evidence-bounded, no query-side fraction.
             let law_default = !filtered && options.nprobe.is_none() && law_width.is_some();
+            // Cap the #515 extension at a target-aware multiple of the stamped
+            // width, so a loose near-tie window cannot balloon the served cell
+            // count far past what the width targets (`mult=1` => width-only).
+            // Floor the cap at the grid cover-k picks so a large `must_include`
+            // (a coarse blended query) never counts against — and starve — the
+            // near-tie extension budget.
+            let admit_cap = law_width
+                .map(|w| {
+                    w.saturating_mul(config::global().vector.admit_extension_mult)
+                        .max(w)
+                        .max(must_include.len())
+                })
+                .unwrap_or(usize::MAX);
             if law_default {
                 loop {
+                    if admitted.len() >= admit_cap {
+                        break;
+                    }
                     let fine_ranked_now = op_stats::timed_kernel(&self.op_stats, || {
                         cells_ranked_by_fine_score(&candidates)
                     });
@@ -5270,12 +5291,19 @@ impl SupertableReader {
                     let serve_threshold = relative_score_window(best_exact, serve_near_tie_slack);
                     let exact_best_by_cell: HashMap<u32, f32> =
                         fine_ranked_now.into_iter().collect();
-                    let round = admit_extension_round(
+                    let mut round = admit_extension_round(
                         &admit_ranking,
                         &admitted,
                         &exact_best_by_cell,
                         serve_threshold,
                     );
+                    if round.is_empty() {
+                        break;
+                    }
+                    // Bound this round to the target-aware cap: a single round
+                    // can qualify many cells at once, so keep only the best
+                    // (admit_ranking is best-first) up to the cap.
+                    round.truncate(admit_cap.saturating_sub(admitted.len()));
                     if round.is_empty() {
                         break;
                     }
