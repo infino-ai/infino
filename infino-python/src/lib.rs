@@ -312,27 +312,35 @@ impl IndexSpec {
     /// may still score with a different pair (see `bm25_search`), which
     /// is the shape to reach for while tuning; declare the pair here
     /// once it is settled.
+    // The three new options are appended **after** `b`, and behind `*`
+    // so they are keyword-only. Inserting them mid-signature would have
+    // silently changed what `fts("body", "standard", False)` means for
+    // every positional caller — every call site in this repo passes
+    // keywords past `column`, so no test here would have caught it.
+    // Keyword-only also means the next option added cannot repeat the
+    // mistake.
     #[pyo3(signature = (
         column,
         analyzer = None,
-        stopwords = None,
-        stemmer = None,
-        positions = false,
         stored = true,
         k1 = None,
         b = None,
+        *,
+        stopwords = None,
+        stemmer = None,
+        positions = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn fts(
         &self,
         column: String,
         analyzer: Option<String>,
-        stopwords: Option<String>,
-        stemmer: Option<String>,
-        positions: bool,
         stored: bool,
         k1: Option<f32>,
         b: Option<f32>,
+        stopwords: Option<String>,
+        stemmer: Option<String>,
+        positions: bool,
     ) -> Self {
         let mut next = self.clone();
         next.fts.push(FtsDecl {
