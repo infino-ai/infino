@@ -51,7 +51,7 @@ use crate::superfile::{
         fst_value::FstValue,
         positions::decode_run,
         posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
-        tokenize::{Tokenizer, tokenizer_for_name},
+        tokenize::{Phrase, Tokenizer, tokenizer_for_name},
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
@@ -75,9 +75,9 @@ pub(crate) struct ClauseLists<'a> {
     pub musts: &'a [&'a str],
     pub shoulds: &'a [&'a str],
     pub negatives: &'a [&'a str],
-    pub must_phrases: &'a [Vec<String>],
-    pub should_phrases: &'a [Vec<String>],
-    pub negative_phrases: &'a [Vec<String>],
+    pub must_phrases: &'a [Phrase<String>],
+    pub should_phrases: &'a [Phrase<String>],
+    pub negative_phrases: &'a [Phrase<String>],
     /// Per-term global idf for [`Bm25Stats::Global`], the default;
     /// `None` scores with [`Bm25Stats::PerSuperfile`] local idf.
     pub global_idf: Option<&'a GlobalTermIdf>,
@@ -1169,7 +1169,7 @@ impl FtsReader {
         &self,
         column_id: u32,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         global_idf: Option<&GlobalTermIdf>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
@@ -1264,6 +1264,7 @@ impl FtsReader {
                 cursors,
                 positions,
                 positional,
+                phrase.offsets().to_vec(),
                 col_meta.params,
             )?)));
         }

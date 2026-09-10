@@ -97,6 +97,7 @@ use crate::superfile::{
         checksum::{crc32c, crc32c_append},
     },
     fts::{
+        analysis::ChainTokenizer,
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
@@ -1887,6 +1888,12 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
         let positional = self.columns[col_idx].positions;
@@ -1955,6 +1962,8 @@ impl FtsBuilder {
                 ascii.tokenize_each_inline(text, &mut on_token);
             } else if let Some(standard) = standard_tok {
                 standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -2017,13 +2026,22 @@ impl FtsBuilder {
                     record(tok, tokens_in_doc);
                     tokens_in_doc += 1;
                 });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
             } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals; a tokenizer that silently drops tokens will
-                // not leave phrase gaps (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
-                    record(tok, tokens_in_doc);
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait; the default numbering is
+                // consecutive, which is correct for one that drops
+                // nothing (see the `Tokenizer` trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2140,6 +2158,12 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
         let positional = self.columns[col_idx].positions;
 
@@ -2186,6 +2210,8 @@ impl FtsBuilder {
                 ascii.tokenize_each_inline(text, &mut on_token);
             } else if let Some(standard) = standard_tok {
                 standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -2255,12 +2281,21 @@ impl FtsBuilder {
                     record(tok, tokens_in_doc);
                     tokens_in_doc += 1;
                 });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
             } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
-                    record(tok, tokens_in_doc);
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait (see the `Tokenizer`
+                // trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -4093,7 +4128,7 @@ fn sort_partition_to_file<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::default_tokenizer as tokenizer;
+    use crate::{superfile::fts::tokenize::Phrase, test_helpers::default_tokenizer as tokenizer};
 
     /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
     /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
@@ -5102,7 +5137,9 @@ mod tests {
             (&["filler", "medium"], 79),
         ];
         for (terms, want) in phrases {
-            let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
+            let phrase = vec![Phrase::adjacent(
+                terms.iter().map(|t| t.to_string()).collect(),
+            )];
             let a = v3
                 .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
                 .await

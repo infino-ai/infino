@@ -435,6 +435,7 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes.fts_analyzers(),
+                    fts_positions: indexes.fts_positions(),
                     fts_stored: indexes.fts_stored(),
                     fts_k1: indexes.fts_bm25().iter().map(|p| p.k1).collect(),
                     fts_b: indexes.fts_bm25().iter().map(|p| p.b).collect(),
@@ -583,6 +584,11 @@ impl Connection {
                     // written before index-only columns existed can only
                     // mean the text is stored.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+                    // Same rule for positions: a catalog written before
+                    // they were declarable describes a table built
+                    // without them, because nothing could have asked
+                    // for them.
+                    let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
                     // And again for the BM25 pair: a catalog written before
                     // it was declarable can only describe a table built with
                     // the standard values, so the fallback is frozen there
@@ -592,6 +598,7 @@ impl Connection {
                     spec = spec.fts(
                         FtsField::new(column.clone())
                             .analyzer(analyzer)
+                            .positions(positions)
                             .stored(stored)
                             .bm25(k1, b),
                     );

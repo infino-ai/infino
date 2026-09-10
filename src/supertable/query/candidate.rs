@@ -847,6 +847,19 @@ enum Analyzer {
 }
 
 impl Analyzer {
+    /// Recognize a column's analyzer, or `None` for one whose token
+    /// rules this lowering cannot reason about — which drops the `LIKE`
+    /// constraint entirely and keeps every superfile.
+    ///
+    /// A column carrying an **analysis chain** lands in that `None`,
+    /// and must. The lowering bounds a `LIKE` fragment by the terms it
+    /// tokenizes to, which is only sound while a term in the index is a
+    /// substring-preserving image of the text: with a stemmer it is
+    /// not. `LIKE '%runni%'` matches the text `running`, whose indexed
+    /// term is `run` — so a prefix walk for `runni` finds nothing and
+    /// would drop a superfile that really matches. Nothing else here
+    /// needs to know about chains, because they never reach this
+    /// `match`: a chain's name is a composite one and no arm claims it.
     fn of(tok: &dyn Tokenizer) -> Option<Analyzer> {
         match tok.name() {
             ASCII_LOWER_TOKENIZER => Some(Analyzer::AsciiLower),
@@ -1024,7 +1037,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer};
+    use crate::superfile::fts::tokenize::{
+        AsciiLowerTokenizer, StandardTokenizer, tokenizer_for_name,
+    };
 
     fn fts_cols() -> HashSet<&'static str> {
         let mut s = HashSet::new();
@@ -1036,6 +1051,61 @@ mod tests {
     /// ASCII-lower analyzer.
     fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
         Some(Arc::new(AsciiLowerTokenizer))
+    }
+
+    /// Resolver whose column carries an analysis chain — the case the
+    /// `LIKE` lowering must refuse to bound.
+    fn stemming_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        tokenizer_for_name("standard+stem=english")
+    }
+
+    /// A stemmed column gets **no** `LIKE` constraint, in any fragment
+    /// shape. The lowering bounds a fragment by the terms it tokenizes
+    /// to, and stemming breaks the substring relationship that makes
+    /// that sound: `%runni%` matches the text `running`, which is
+    /// indexed as `run`, so a term or prefix bound built from `runni`
+    /// would drop a superfile that genuinely matches. Dropping the
+    /// constraint keeps a superset, which is always allowed; keeping a
+    /// wrong one is not.
+    #[test]
+    fn like_on_a_chained_column_is_unbounded() {
+        for pattern in ["running", "%runni%", "runn%", "%running", "run_ing"] {
+            let expr = col("title").like(lit(pattern));
+            assert_eq!(
+                CandidatePlan::from_filters(&[expr], &fts_cols(), &stemming_resolver),
+                CandidatePlan::Unbounded,
+                "LIKE {pattern:?} on a stemmed column must not be bounded"
+            );
+        }
+    }
+
+    /// Equality still lowers on a chained column, and soundly: the
+    /// literal runs through the *same* chain the postings did, so the
+    /// terms it yields are terms the index really holds, and requiring
+    /// them keeps a superset of the rows that actually compare equal.
+    /// A literal the chain reduces to nothing bounds nothing.
+    #[test]
+    fn equality_on_a_chained_column_lowers_to_the_chain_s_terms() {
+        let plan = CandidatePlan::from_filters(
+            &[col("title").eq(lit("running studies"))],
+            &fts_cols(),
+            &stemming_resolver,
+        );
+        assert_eq!(
+            plan,
+            CandidatePlan::TermsAll {
+                column: "title".to_string(),
+                tokens: vec!["run".to_string(), "studi".to_string()],
+            }
+        );
+        // Every token removed by the chain's stopword set: there is no
+        // term left to require, so the predicate bounds nothing rather
+        // than bounding it with an empty conjunction.
+        let stopping = |_col: &str| tokenizer_for_name("standard+stop=english");
+        assert_eq!(
+            CandidatePlan::from_filters(&[col("title").eq(lit("of the"))], &fts_cols(), &stopping),
+            CandidatePlan::Unbounded
+        );
     }
 
     fn plan(expr: Expr) -> CandidatePlan {

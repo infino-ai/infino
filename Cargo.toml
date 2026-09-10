@@ -141,6 +141,13 @@ static_assertions = "1"
 # Tokenization: UAX#29 word segmentation for the Unicode-aware standard
 # analyzer (keeps non-ASCII text), alongside the built-in ASCII tokenizer.
 unicode-segmentation = "1"
+# Snowball stemmers for the per-column analysis chain's `stem=` filter.
+# The de-facto Rust snowball port, dual MIT / BSD-3-Clause, and its only
+# transitive dependencies are serde + serde_derive, already direct
+# dependencies here — so the graph grows by one node, not a subtree.
+# Vendoring the stemmer tables instead would put us on the hook for
+# correctness fixes to algorithms we do not own.
+rust-stemmers = "1.2"
 
 # Numerics
 rand = "0.10"

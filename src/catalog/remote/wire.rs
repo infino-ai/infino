@@ -47,12 +47,19 @@ pub(crate) fn metric_str(metric: Metric) -> &'static str {
 /// are omitted (the server treats a missing key as "none").
 ///
 /// Each FTS entry is a `{column, analyzer, k1, b}` object — plus
-/// `stored: false` for an index-only column. The analyzer and the BM25
+/// `stored: false` for an index-only column and `positions: true` for a
+/// phrase-capable one. The analyzer and the BM25
 /// pair are always named rather than left to the server's own idea of a
 /// default, so a table is created with what this client resolved and the
 /// two can never drift apart. That matters most for the pair: it is the
 /// provenance of the stored score bounds, and a server that filled in
 /// its own default would build bounds the client never asked for.
+///
+/// `analyzer` carries a column's whole analysis chain as one canonical
+/// name (`"standard+stop=english+stem=english"`), so stopwords and
+/// stemming need no keys of their own — and a server that does not
+/// implement a filter rejects the unknown name instead of creating a
+/// table analyzed differently than the client asked for.
 /// One BM25 parameter widened for JSON without picking up the noise of a
 /// naive `f32 as f64`: that cast is exact, so `1.2_f32` widens to
 /// `1.2000000476837158` and crosses the wire as those seventeen digits.
@@ -75,7 +82,8 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
             .zip(spec.fts_analyzers())
             .zip(spec.fts_stored())
             .zip(spec.fts_bm25())
-            .map(|(((column, analyzer), stored), bm25)| {
+            .zip(spec.fts_positions())
+            .map(|((((column, analyzer), stored), bm25), positions)| {
                 let mut entry = serde_json::Map::new();
                 entry.insert("column".to_string(), json!(column));
                 entry.insert("analyzer".to_string(), json!(analyzer));
@@ -83,6 +91,9 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
                 entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
                 if !stored {
                     entry.insert("stored".to_string(), json!(false));
+                }
+                if positions {
+                    entry.insert("positions".to_string(), json!(true));
                 }
                 Value::Object(entry)
             })

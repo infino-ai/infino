@@ -8,7 +8,11 @@
 
 use crate::superfile::{
     builder::FtsConfig,
-    fts::{bm25::Bm25Params, tokenize::STANDARD_TOKENIZER},
+    fts::{
+        analysis::{Base, Stemmer, Stopwords, chain_name, parse_chain_name},
+        bm25::Bm25Params,
+        tokenize::STANDARD_TOKENIZER,
+    },
     vector::{builder::VectorConfig, distance::Metric},
 };
 
@@ -40,7 +44,14 @@ struct VectorIndex {
 #[derive(Debug, Clone)]
 pub struct FtsField {
     column: String,
+    /// The base analyzer name. The stopword set and stemmer are held
+    /// separately and composed onto it at lowering, so the two setters
+    /// and [`FtsField::analyzer`] may be called in any order and the
+    /// column still ends up with one canonical analyzer name.
     analyzer: String,
+    stopwords: Stopwords,
+    stemmer: Stemmer,
+    positions: bool,
     stored: bool,
     bm25: Bm25Params,
 }
@@ -54,6 +65,9 @@ impl FtsField {
         Self {
             column: column.into(),
             analyzer: STANDARD_TOKENIZER.to_string(),
+            stopwords: Stopwords::None,
+            stemmer: Stemmer::None,
+            positions: false,
             stored: true,
             bm25: Bm25Params::STANDARD,
         }
@@ -65,8 +79,100 @@ impl FtsField {
     /// FTS column is tokenized with its own, so columns in one table
     /// may use different analyzers. It is recorded with the table and
     /// cannot be changed afterwards.
+    ///
+    /// This names the *base* tokenizer. [`FtsField::stopwords`] and
+    /// [`FtsField::stemmer`] add filters on top of it, and the column's
+    /// recorded analyzer name is the whole chain
+    /// (`"standard+stop=english+stem=english"`). A composite name is
+    /// also accepted here, so a name read back from a table round-trips;
+    /// a filter setter then replaces that component of it.
+    ///
+    /// Validated at `create_table`, with the column named in the error.
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
-        self.analyzer = name.into();
+        let name = name.into();
+        match parse_chain_name(&name) {
+            // A composite name sets the components it *names* and
+            // clears none, so the three setters commute: a base name
+            // never undoes a `.stopwords()` that came before it, and a
+            // filter setter after a composite name replaces just that
+            // component. To turn a filter off, name its `None`.
+            Some((base, stopwords, stemmer)) => {
+                self.analyzer = base.name().to_string();
+                if stopwords != Stopwords::None {
+                    self.stopwords = stopwords;
+                }
+                if stemmer != Stemmer::None {
+                    self.stemmer = stemmer;
+                }
+            }
+            // Unresolvable: kept verbatim so `create_table`'s error
+            // names the analyzer the caller actually wrote, rather than
+            // some normalized form of it.
+            None => self.analyzer = name,
+        }
+        self
+    }
+
+    /// Remove this column's stopwords — the very common words whose
+    /// presence in a document says almost nothing about what it is
+    /// about. Off by default.
+    ///
+    /// Applies to both sides: the words leave the index, and they leave
+    /// a query too, so searching `"the climate policy"` searches
+    /// `climate policy`. Each removed word leaves a **hole** in the
+    /// token positions, so an exact phrase still knows the words it
+    /// matched were not adjacent in the text: with the English set,
+    /// `"new york"` does not match `new the york`, and
+    /// `"end of the world"` matches only text with two words between
+    /// `end` and `world`.
+    ///
+    /// The trade is index size and speed against the handful of queries
+    /// that are *about* a stopword: once `the` is not indexed, no query
+    /// can find it — `"to be or not to be"` matches everything, because
+    /// nothing is left of it. Declare it on a column of prose where the
+    /// common words carry no signal, not on one holding short identifiers
+    /// or titles.
+    ///
+    /// Recorded with the table and cannot be changed afterwards — it
+    /// decides what is in the index.
+    pub fn stopwords(mut self, stopwords: Stopwords) -> Self {
+        self.stopwords = stopwords;
+        self
+    }
+
+    /// Reduce this column's words to their stems, so a search for one
+    /// inflection finds the others. Off by default.
+    ///
+    /// Applies to both sides — index and query — so
+    /// [`Stemmer::English`] makes `running`, `runs` and `run` one term
+    /// and any of them find all of them. Irregular forms it has no rule
+    /// for (`ran`, `went`) stay distinct.
+    ///
+    /// The trade is precision: stemming conflates words that a reader
+    /// would not, so a query for an exact word can return documents
+    /// carrying a relative of it, and there is no way to ask for the
+    /// unstemmed form on a stemmed column. It also shifts the scoring —
+    /// folding inflections together raises the merged term's document
+    /// frequency, and so lowers its idf.
+    ///
+    /// Recorded with the table and cannot be changed afterwards — it
+    /// decides what is in the index.
+    pub fn stemmer(mut self, stemmer: Stemmer) -> Self {
+        self.stemmer = stemmer;
+        self
+    }
+
+    /// Record token positions for this column, which is what exact
+    /// phrase queries (`"climate policy"`) need. Off by default.
+    ///
+    /// The trade is index size: positions roughly double the column's
+    /// full-text index footprint, so they are a per-column opt-in
+    /// rather than something every column pays for. A column without
+    /// them answers a phrase query with an error naming the column,
+    /// never a silent bag-of-words fallback that would return the wrong
+    /// documents.
+    pub fn positions(mut self, positions: bool) -> Self {
+        self.positions = positions;
         self
     }
 
@@ -98,6 +204,23 @@ impl FtsField {
     pub fn bm25(mut self, k1: f32, b: f32) -> Self {
         self.bm25 = Bm25Params::new(k1, b);
         self
+    }
+
+    /// This column's whole analysis chain as one canonical analyzer
+    /// name — the single string that reaches the superfile's
+    /// `inf.fts.columns` entry, the catalog record, the remote wire and
+    /// the options-hash. A column with no filter yields its base name
+    /// unchanged, so a default column is byte-identical everywhere to
+    /// one declared before the chain existed.
+    ///
+    /// An analyzer name that does not resolve passes through untouched:
+    /// validation at `create_table` is what reports it, and it must
+    /// report the name as written.
+    fn chain_analyzer(&self) -> String {
+        match Base::from_name(&self.analyzer) {
+            Some(base) => chain_name(base, self.stopwords, self.stemmer).to_string(),
+            None => self.analyzer.clone(),
+        }
     }
 }
 
@@ -174,8 +297,20 @@ impl IndexSpec {
 
     /// FTS analyzer names, in declaration order (parallel to
     /// [`fts_columns`](Self::fts_columns)).
+    ///
+    /// Each is the column's **whole** analysis chain as one canonical
+    /// composite name, so this is all the catalog record, the remote
+    /// create-table wire and the options-hash have to carry for
+    /// stopwords and stemming — see
+    /// [`FtsField::chain_analyzer`].
     pub(crate) fn fts_analyzers(&self) -> Vec<String> {
-        self.fts.iter().map(|f| f.analyzer.clone()).collect()
+        self.fts.iter().map(|f| f.chain_analyzer()).collect()
+    }
+
+    /// FTS positions flags, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_positions(&self) -> Vec<bool> {
+        self.fts.iter().map(|f| f.positions).collect()
     }
 
     /// FTS stored flags, in declaration order (parallel to
@@ -208,7 +343,8 @@ impl IndexSpec {
             .iter()
             .map(|f| {
                 FtsConfig::new(f.column.clone())
-                    .analyzer(f.analyzer.clone())
+                    .analyzer(f.chain_analyzer())
+                    .positions(f.positions)
                     .stored(f.stored)
                     .bm25(f.bm25.k1, f.bm25.b)
             })

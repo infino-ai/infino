@@ -12,10 +12,29 @@ pub mod footer;
 pub const PROJECT_MAGIC: &[u8; 3] = b"INF";
 
 /// File-format version. Semver string. Bump major to break compatibility.
+///
 /// 1.1.0: `inf.fts.columns` entries may carry `"stored":false` (index-only
 /// FTS columns, absent from the Parquet body); the field is emitted only
 /// when false, and same-major readers default a missing field to true.
-pub const FORMAT_VERSION: &str = "1.1.0";
+///
+/// 1.2.0: `inf.fts.columns` entries carry `"k1"` / `"b"`, the BM25
+/// parameters a column's stored block-max bounds were baked at, written
+/// unconditionally. An entry without them predates the field and can
+/// only have been built at the standard `1.2` / `0.75`, so that default
+/// is **frozen** and must not follow a later change to what the API
+/// recommends.
+///
+/// 1.3.0: a column's `"tokenizer"` may name an analysis chain rather
+/// than a bare tokenizer — a base name followed by the filters applied
+/// to it, `"standard+stop=english+stem=english"`. Deliberately *not* an
+/// additive field: a same-major reader ignores an unknown field, and an
+/// ignored analysis filter means query text is tokenized differently
+/// than the postings were built, which is wrong answers rather than an
+/// error. The tokenizer name is instead the fail-loud channel every
+/// shipped reader already honours — an unrecognized name fails the open
+/// — so an engine predating a filter refuses the file. A column with no
+/// filter keeps its plain base name, so its entry stays byte-identical.
+pub const FORMAT_VERSION: &str = "1.3.0";
 
 /// CRC width in bytes (`u32` CRC-32C, little-endian) appended after a
 /// directory or after a subsection's payload. Defined once so the

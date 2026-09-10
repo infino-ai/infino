@@ -128,6 +128,7 @@ use crate::{
                 Bm25SearchOptions, Bm25Stats, ClauseLists, FetchedTermMemo, GlobalTermIdf,
                 LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
             },
+            tokenize::Phrase,
         },
     },
     supertable::{
@@ -242,7 +243,7 @@ impl GlobalIdfCache {
 /// side under the default operator otherwise.
 struct UnrankedMatchSet {
     terms: Vec<String>,
-    phrases: Vec<Vec<String>>,
+    phrases: Vec<Phrase<String>>,
     mode: BoolMode,
 }
 
@@ -267,7 +268,7 @@ impl UnrankedMatchSet {
 #[derive(Default)]
 struct UnrankedNegatives {
     terms: Vec<String>,
-    phrases: Vec<Vec<String>>,
+    phrases: Vec<Phrase<String>>,
 }
 
 impl UnrankedNegatives {
@@ -481,11 +482,11 @@ impl SupertableReader {
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
-        let own_phrases = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
-            phrases
-                .into_iter()
-                .map(|p| p.into_iter().map(Cow::into_owned).collect())
-                .collect()
+        // `Phrase::map` keeps each term's offset, which is what a
+        // phrase on a stopworded column needs: its terms were not
+        // adjacent in the query and must not be required adjacent here.
+        let own_phrases = |phrases: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+            phrases.iter().map(|p| p.map(|t| t.to_string())).collect()
         };
         let must_phrases = own_phrases(clauses.must_phrases);
         let should_phrases = own_phrases(clauses.should_phrases);
@@ -569,7 +570,7 @@ impl SupertableReader {
                     add(t);
                 }
                 for phrase in must_phrases.iter().chain(should_phrases.iter()) {
-                    for member in phrase {
+                    for member in phrase.iter() {
                         add(member);
                     }
                 }
@@ -610,9 +611,9 @@ impl SupertableReader {
         let must_arc: Arc<Vec<String>> = Arc::new(musts);
         let should_arc: Arc<Vec<String>> = Arc::new(shoulds);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
-        let must_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(must_phrases);
-        let should_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(should_phrases);
-        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negative_phrases);
+        let must_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(must_phrases);
+        let should_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(should_phrases);
+        let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negative_phrases);
         let column_arc = Arc::new(column_owned);
 
         // Cross-segment threshold sharing: each unit reads the global
@@ -1280,11 +1281,11 @@ impl SupertableReader {
         let musts: Vec<String> = dedup(clauses.musts);
         let shoulds: Vec<String> = dedup(clauses.shoulds);
         let negatives: Vec<String> = dedup(clauses.negatives);
-        let own_phrases = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
-            phrases
-                .into_iter()
-                .map(|p| p.into_iter().map(Cow::into_owned).collect())
-                .collect()
+        // `Phrase::map` keeps each term's offset, which is what a
+        // phrase on a stopworded column needs: its terms were not
+        // adjacent in the query and must not be required adjacent here.
+        let own_phrases = |phrases: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+            phrases.iter().map(|p| p.map(|t| t.to_string())).collect()
         };
         let must_phrases = own_phrases(clauses.must_phrases);
         let should_phrases = own_phrases(clauses.should_phrases);
@@ -1366,9 +1367,9 @@ impl SupertableReader {
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
-        let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
+        let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
-        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
+        let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negatives.phrases);
         let op_stats = self.op_stats.clone();
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
             let column_arc = Arc::clone(&column_arc);
@@ -1472,9 +1473,9 @@ impl SupertableReader {
         let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
-        let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
+        let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
-        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
+        let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negatives.phrases);
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
 
         // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
