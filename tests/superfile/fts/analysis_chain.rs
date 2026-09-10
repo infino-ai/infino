@@ -33,12 +33,13 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    Stemmer, Stopwords,
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::{
             reader::BoolMode,
-            tokenize::{Phrase, Tokenizer, tokenizer_for_name},
+            tokenize::{Phrase, Tokenizer},
         },
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids},
@@ -74,7 +75,11 @@ fn corpus() -> Vec<(u64, &'static str)> {
     ]
 }
 
-fn build(analyzer: &str) -> (SuperfileReader, BruteForceBm25, Arc<dyn Tokenizer>) {
+fn build(
+    stopwords: Stopwords,
+    stemmer: Stemmer,
+    analyzer: &str,
+) -> (SuperfileReader, BruteForceBm25, Arc<dyn Tokenizer>) {
     let corp = corpus();
     let schema = Arc::new(Schema::new(vec![
         Field::new("doc_id", DataType::Decimal128(38, 0), false),
@@ -83,7 +88,13 @@ fn build(analyzer: &str) -> (SuperfileReader, BruteForceBm25, Arc<dyn Tokenizer>
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig::new("title").analyzer(analyzer).positions(true)],
+        vec![
+            FtsConfig::new("title")
+                .analyzer(analyzer)
+                .stopwords(stopwords)
+                .stemmer(stemmer)
+                .positions(true),
+        ],
         vec![],
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -94,12 +105,51 @@ fn build(analyzer: &str) -> (SuperfileReader, BruteForceBm25, Arc<dyn Tokenizer>
     b.add_batch(&batch, &[]).expect("add_batch");
     let bytes = Bytes::from(b.finish().expect("finish builder"));
     let reader = SuperfileReader::open(bytes).expect("open superfile");
-    // The oracle indexes the same corpus through the same chain, which
-    // is the whole point: grading a chained column against the base
-    // tokenizer would compare two different formulas and pass nothing.
-    let tok = tokenizer_for_name(analyzer).expect("known analyzer");
+    // Take the tokenizer back off the *reader*, not from a name: it is
+    // the one the reader will tokenize queries with, so the oracle is
+    // graded against the engine's own analysis rather than a
+    // reconstruction of it that could drift.
+    let tok = Arc::clone(
+        &reader
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column")
+            .tokenizer,
+    );
     let oracle = BruteForceBm25::index(&corp, tok.as_ref());
     (reader, oracle, tok)
+}
+
+/// The chains under test, with the label used in assertion messages.
+fn chains() -> Vec<(&'static str, Stopwords, Stemmer, &'static str)> {
+    vec![
+        (
+            "standard+stop",
+            Stopwords::English,
+            Stemmer::None,
+            "standard",
+        ),
+        (
+            "standard+stem",
+            Stopwords::None,
+            Stemmer::English,
+            "standard",
+        ),
+        (
+            "standard+stop+stem",
+            Stopwords::English,
+            Stemmer::English,
+            "standard",
+        ),
+        (
+            "ascii_lower+stop+stem",
+            Stopwords::English,
+            Stemmer::English,
+            "ascii_lower",
+        ),
+    ]
 }
 
 /// Doc-ids a query matches, as a set.
@@ -189,13 +239,20 @@ async fn chained_columns_match_the_textbook_scorer() {
         // disagreement.
         "the and of",
     ];
-    for analyzer in [
-        "standard+stop=english",
-        "standard+stem=english",
-        "standard+stop=english+stem=english",
-        "ascii_lower+stop=english+stem=english",
-    ] {
-        let (reader, oracle, tok) = build(analyzer);
+    for (label, stopwords, stemmer, base) in chains() {
+        let (reader, oracle, tok) = build(stopwords, stemmer, base);
+        assert_eq!(
+            tok.name(),
+            reader
+                .fts()
+                .expect("fts index")
+                .fts_columns_config()
+                .next()
+                .expect("has column")
+                .tokenizer
+                .name(),
+            "{label}: fixture drift"
+        );
         for query in queries {
             for mode in [BoolMode::Or, BoolMode::And] {
                 assert_matches_oracle(&reader, &oracle, tok.as_ref(), query, mode).await;
@@ -211,7 +268,7 @@ async fn chained_columns_match_the_textbook_scorer() {
 /// implementations the same way still fails here.
 #[tokio::test]
 async fn phrase_holes_separate_documents_that_differ_only_by_a_stopword() {
-    let (reader, _, _) = build("standard+stop=english");
+    let (reader, _, _) = build(Stopwords::English, Stemmer::None, "standard");
     // Doc 2 is "new york city", doc 3 is "new the york city". Only the
     // first has the two words adjacent.
     assert_eq!(matching(&reader, "\"new york\"").await, HashSet::from([2]));
@@ -236,7 +293,7 @@ async fn phrase_holes_separate_documents_that_differ_only_by_a_stopword() {
 /// other spelling of it.
 #[tokio::test]
 async fn stemming_is_symmetric_across_inflections() {
-    let (reader, _, _) = build("standard+stem=english");
+    let (reader, _, _) = build(Stopwords::None, Stemmer::English, "standard");
     // "walking walked walks walk" (doc 10) is reachable by all four.
     for spelling in ["walking", "walked", "walks", "walk"] {
         let hits = matching(&reader, spelling).await;

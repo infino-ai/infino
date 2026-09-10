@@ -36,31 +36,43 @@
 //! gap in `standard` itself belongs to the tokenizer and the scorer,
 //! not here; this module only adds filters a caller asks for by name.
 //!
-//! ## The chain is its name
+//! ## Persistence: two additive fields, and a derived identity
 //!
-//! A chain persists as one composite analyzer name —
-//! `"standard+stop=english+stem=english"` — and nothing else. That is a
-//! deliberate choice over a sibling `"stemmer"` field in
-//! `inf.fts.columns`: an older reader *ignores* an unknown JSON field,
-//! and an ignored analysis filter means the reader tokenizes queries
-//! differently than the index was built, which is wrong answers rather
-//! than an error. The analyzer name is the one channel already shipped
-//! readers fail loud on — [`tokenizer_for_name`] returning `None` is an
-//! open error at every call site — so routing the whole chain through
-//! it makes an engine that predates a filter refuse the file instead of
-//! mis-ranking it.
+//! A column persists its base analyzer name plus, only when set, a
+//! `stopwords` and a `stemmer` field. Both are ordinary additive
+//! fields: absent means the filter is off, which is the one thing a
+//! file written before the filter existed can mean, so a current
+//! reader infers the right analysis from an old file with no special
+//! handling.
 //!
-//! Carrying the chain in the name also means nothing else has to learn
-//! about it. The name is already what the catalog record
-//! (`TableEntry::fts_analyzers`), the remote create-table wire and the
-//! options-hash's `fts_analyzers` block carry, so a chained column
-//! rides all three unchanged, and a plain column's bytes stay
-//! byte-identical to today's in every one of them.
+//! The chain also has a **name** — `"standard+stop=english+stem=english"`
+//! from [`chain_name`] — but it is derived in memory and never written.
+//! It exists because three places have to reason about a column's
+//! analysis as one value, and reading three fields at each of them
+//! would be three chances to forget one:
 //!
-//! Because the built-in sets are a closed set (no user-supplied word
-//! lists — those would need a sibling field and would give the name
-//! back its ambiguity), the reachable names are a finite table, which
-//! is what lets [`Tokenizer::name`] keep returning `&'static str`.
+//!   - the `LIKE` prune lowering, which recognizes analyzers by
+//!     [`Tokenizer::name`] and must decline to bound a column whose
+//!     terms are not substring-preserving images of its text;
+//!   - the merge carry check, which compares analyzer names to refuse
+//!     merging differently-analyzed superfiles;
+//!   - the table's options-hash, which needs analysis in its identity.
+//!
+//! Keeping the name out of the format is what makes a *rollback* a
+//! degradation rather than an outage. An engine predating a filter
+//! ignores its field and analyzes the column as unfiltered — wrong
+//! answers on that column until it rolls forward, recoverable — where a
+//! composite name it could not parse would make the table refuse to
+//! open. The precedent is deliberate: the same trade decided against
+//! marking these files with a new FTS section version, on the grounds
+//! that a lost-recall regression is recoverable and an unopenable table
+//! is an outage.
+//!
+//! What is *not* ignorable is an unrecognized **value** of a field the
+//! reader does know: `"stopwords":"german"` on an engine that ships no
+//! German list is refused, because there is no sound way to proceed —
+//! the analysis cannot be reproduced. Unknown field, degrade; unknown
+//! value, error.
 //!
 //! ## Positions
 //!
@@ -144,9 +156,9 @@ pub enum Stemmer {
 /// So it does not change. `english_stopword_set_is_frozen` pins every
 /// word and fails loudly if one moves. If a different list is ever
 /// genuinely wanted, it arrives as a **new name** (`stop=english2`)
-/// whose `parse_chain_name` arm is added beside this one, leaving files
-/// built under the old name reconstructible from the old list — never
-/// as an edit here.
+/// resolved by a new arm in [`Stopwords::from_name`] beside this one,
+/// leaving files built under the old name reconstructible from the old
+/// list — never as an edit here.
 ///
 /// Sorted-slice + binary search rather than a hash set: 33 short words
 /// are searched in ~5 comparisons with no hashing and no lazy-init, and
@@ -197,8 +209,7 @@ impl Base {
         chain_name(self, Stopwords::None, Stemmer::None)
     }
 
-    /// Resolve a base analyzer name. Rejects a composite name; use
-    /// [`parse_chain_name`] for one of those.
+    /// Resolve a base analyzer name.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             ASCII_LOWER_TOKENIZER => Some(Base::AsciiLower),
@@ -234,7 +245,7 @@ impl Base {
 
 /// A base tokenizer plus its stopword set and stemmer.
 ///
-/// Constructed only through [`chain_tokenizer`] / [`tokenizer_for_name`],
+/// Constructed only through [`chain_tokenizer`],
 /// so a `ChainTokenizer` always carries at least one active filter — a
 /// chain with neither is the base tokenizer itself, under the base's own
 /// plain name, and must not be wrapped (wrapping it would change the
@@ -365,17 +376,20 @@ impl Tokenizer for ChainTokenizer {
     }
 }
 
-/// The canonical composite name for a chain, or the base's own plain
-/// name when no filter is active.
+/// A chain's identity as one string — the base's plain name when no
+/// filter is active, otherwise the base followed by its filters.
 ///
-/// The whole reachable set, spelled out: with named built-ins only, the
-/// chain has two bases × two stopword settings × two stemmer settings,
-/// so every name a column can carry is a `&'static str` here. That is
-/// what lets [`Tokenizer::name`] stay `&'static str` and the persisted
-/// name stay a closed vocabulary a reader either knows or rejects.
+/// **Derived, never persisted.** It is what [`Tokenizer::name`] reports,
+/// so the three places that reason about a column's analysis as a single
+/// value get it from one place (see the module docs). The format stores
+/// the components as separate fields instead, and nothing parses this
+/// back — a chain is only ever built from its components.
 ///
-/// Component order is fixed (`stop` before `stem`, matching the order
-/// the filters run), so one chain has exactly one spelling.
+/// Every reachable string is a `&'static str` here because the built-in
+/// sets are a closed set: two bases × two stopword settings × two
+/// stemmer settings. Component order is fixed (`stop` before `stem`,
+/// matching the order the filters run), so one chain has exactly one
+/// spelling and the options-hash is stable.
 pub(crate) fn chain_name(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> &'static str {
     match (base, stopwords, stemmer) {
         (Base::Standard, Stopwords::None, Stemmer::None) => STANDARD_TOKENIZER,
@@ -422,36 +436,44 @@ pub(crate) fn chain_tokenizer(
     })
 }
 
-/// Parse a composite analyzer name into its components, or `None` for
-/// anything this engine does not implement — an unknown base, an
-/// unknown filter, a filter named twice, or components out of canonical
-/// order.
-///
-/// Strict on purpose. This is the fail-loud channel: a name an engine
-/// cannot reproduce exactly must be refused, because tokenizing a query
-/// with an approximation of the chain the postings were built with
-/// returns wrong answers instead of an error.
-pub(crate) fn parse_chain_name(name: &str) -> Option<(Base, Stopwords, Stemmer)> {
-    let mut parts = name.split('+');
-    let base = Base::from_name(parts.next()?)?;
-    let mut stopwords = Stopwords::None;
-    let mut stemmer = Stemmer::None;
-    for part in parts {
-        match part {
-            // `stop` must precede `stem`, so a `stop` arriving after one
-            // was set — or after `stem` was — is not canonical.
-            "stop=english" if stopwords == Stopwords::None && stemmer == Stemmer::None => {
-                stopwords = Stopwords::English;
-            }
-            "stem=english" if stemmer == Stemmer::None => stemmer = Stemmer::English,
-            _ => return None,
+impl Stopwords {
+    /// The name this set persists under, or `None` for
+    /// [`Stopwords::None`] — which is written by omitting the field.
+    pub(crate) fn as_str(self) -> Option<&'static str> {
+        match self {
+            Stopwords::None => None,
+            Stopwords::English => Some("english"),
         }
     }
-    // A filterless name reaches here only as the bare base name, which
-    // `chain_name` agrees on — so the round-trip below holds for it too.
-    match chain_name(base, stopwords, stemmer) == name {
-        true => Some((base, stopwords, stemmer)),
-        false => None,
+
+    /// Resolve a persisted name. `None` for a name this engine cannot
+    /// reproduce, which every caller turns into an error rather than a
+    /// silent fallback: analyzing with a set we do not have is not a
+    /// degradation, it is a different index.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "english" => Some(Stopwords::English),
+            _ => None,
+        }
+    }
+}
+
+impl Stemmer {
+    /// The name this stemmer persists under; see
+    /// [`Stopwords::as_str`].
+    pub(crate) fn as_str(self) -> Option<&'static str> {
+        match self {
+            Stemmer::None => None,
+            Stemmer::English => Some("english"),
+        }
+    }
+
+    /// Resolve a persisted name; see [`Stopwords::from_name`].
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "english" => Some(Stemmer::English),
+            _ => None,
+        }
     }
 }
 
@@ -459,9 +481,20 @@ pub(crate) fn parse_chain_name(name: &str) -> Option<(Base, Stopwords, Stemmer)>
 mod tests {
     use super::*;
 
+    /// Build the chain whose derived name is `name`. A test lookup, not
+    /// a parser — nothing in the engine turns a name back into
+    /// components, because the format stores the components.
     fn chain(name: &str) -> Arc<dyn Tokenizer> {
-        let (base, stop, stem) = parse_chain_name(name).expect("known chain");
-        chain_tokenizer(base, stop, stem)
+        for base in [Base::AsciiLower, Base::Standard] {
+            for stop in [Stopwords::None, Stopwords::English] {
+                for stem in [Stemmer::None, Stemmer::English] {
+                    if chain_name(base, stop, stem) == name {
+                        return chain_tokenizer(base, stop, stem);
+                    }
+                }
+            }
+        }
+        panic!("no chain has the name {name:?}");
     }
 
     fn tokens(name: &str, text: &str) -> Vec<String> {
@@ -495,8 +528,8 @@ mod tests {
     /// (see [`ENGLISH_STOPWORDS`]): every column already built under
     /// that name would be silently analyzed one way and queried
     /// another. A different list arrives as a new name —
-    /// `stop=english2`, with its own `parse_chain_name` arm and its own
-    /// frozen list — so files under the old name stay reconstructible.
+    /// `stop=english2`, with its own `from_name` arm and its own frozen
+    /// list — so files under the old name stay reconstructible.
     #[test]
     fn english_stopword_set_is_frozen() {
         assert_eq!(
@@ -598,17 +631,20 @@ mod tests {
         }
     }
 
+    /// Every chain has a distinct derived name, and the tokenizer built
+    /// from a set of components reports it. Distinctness is what the
+    /// three consumers of the name depend on: the `LIKE` lowering, the
+    /// merge carry check, and the options-hash all treat two columns as
+    /// differently analyzed exactly when their names differ.
     #[test]
-    fn chain_names_round_trip_and_reject_non_canonical_spellings() {
+    fn every_chain_has_a_distinct_derived_name() {
+        let mut seen: Vec<&str> = Vec::new();
         for base in [Base::AsciiLower, Base::Standard] {
             for stop in [Stopwords::None, Stopwords::English] {
                 for stem in [Stemmer::None, Stemmer::English] {
                     let name = chain_name(base, stop, stem);
-                    assert_eq!(
-                        parse_chain_name(name),
-                        Some((base, stop, stem)),
-                        "{name:?} must round-trip"
-                    );
+                    assert!(!seen.contains(&name), "{name:?} is not unique");
+                    seen.push(name);
                     assert_eq!(
                         chain_tokenizer(base, stop, stem).name(),
                         name,
@@ -617,20 +653,29 @@ mod tests {
                 }
             }
         }
-        // Every rejection below is a name that would otherwise be
-        // tokenized by an approximation of the chain it asks for.
-        for bad in [
-            "nonesuch",
-            "standard+stem=english+stop=english", // components out of order
-            "standard+stop=english+stop=english", // repeated
-            "standard+stop=german",               // set we do not ship
-            "standard+stem=porter",               // a different algorithm
-            "standard+",
-            "+standard",
-            "standard+stem=english+",
-            "STANDARD",
-        ] {
-            assert_eq!(parse_chain_name(bad), None, "{bad:?} must be rejected");
+        assert_eq!(
+            seen.len(),
+            8,
+            "two bases x two stopword sets x two stemmers"
+        );
+    }
+
+    /// The persisted field values round-trip, and a value this engine
+    /// cannot reproduce resolves to `None` so the caller can refuse the
+    /// file. An unknown *field* is ignorable — an unknown *value* of a
+    /// known field is not, because there is no sound way to proceed.
+    #[test]
+    fn filter_names_round_trip_and_unknown_values_are_refused() {
+        assert_eq!(Stopwords::English.as_str(), Some("english"));
+        assert_eq!(Stemmer::English.as_str(), Some("english"));
+        // `None` is written by omitting the field, so it has no name.
+        assert_eq!(Stopwords::None.as_str(), None);
+        assert_eq!(Stemmer::None.as_str(), None);
+        assert_eq!(Stopwords::from_name("english"), Some(Stopwords::English));
+        assert_eq!(Stemmer::from_name("english"), Some(Stemmer::English));
+        for unknown in ["german", "porter", "English", "", "none"] {
+            assert_eq!(Stopwords::from_name(unknown), None, "{unknown:?}");
+            assert_eq!(Stemmer::from_name(unknown), None, "{unknown:?}");
         }
     }
 

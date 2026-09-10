@@ -45,13 +45,14 @@ use crate::superfile::{
         },
     },
     fts::{
+        analysis::{Base, chain_tokenizer},
         bm25,
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,
         positions::decode_run,
         posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
-        tokenize::{Phrase, Tokenizer, tokenizer_for_name},
+        tokenize::{Phrase, Tokenizer},
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
@@ -925,12 +926,24 @@ impl FtsReader {
                 avgdl,
                 params,
             );
-            let tokenizer = tokenizer_for_name(&col_cfg.tokenizer).ok_or_else(|| {
+            let base = Base::from_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
                     col_cfg.tokenizer, col_cfg.name
                 )))
             })?;
+            // A filter the entry names but this engine does not ship
+            // cannot be worked around: analyzing without it would query
+            // the column differently than its postings were built. An
+            // *absent* filter field is the opposite case and needs no
+            // guess — it means the filter is off.
+            let (stopwords, stemmer) = col_cfg.filters().map_err(|(field, value)| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "inf.fts.columns: unknown {field} {value:?} for column {:?}",
+                    col_cfg.name
+                )))
+            })?;
+            let tokenizer = chain_tokenizer(base, stopwords, stemmer);
             columns.push(ColumnMeta {
                 name: col_cfg.name.clone(),
                 doc_lengths_range: doc_lengths_offset..array_end,
@@ -942,6 +955,9 @@ impl FtsReader {
                 bound_scale: 1.0,
                 positions: col_cfg.positions,
                 tokenizer,
+                base,
+                stopwords,
+                stemmer,
                 stored: col_cfg.stored,
             });
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);

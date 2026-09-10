@@ -85,7 +85,10 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
-        fts::bm25,
+        fts::{
+            analysis::{Stemmer, Stopwords},
+            bm25,
+        },
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
@@ -435,6 +438,16 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes.fts_analyzers(),
+                    fts_stopwords: indexes
+                        .fts_stopwords()
+                        .iter()
+                        .map(|s| s.as_str().unwrap_or_default().to_string())
+                        .collect(),
+                    fts_stemmers: indexes
+                        .fts_stemmers()
+                        .iter()
+                        .map(|s| s.as_str().unwrap_or_default().to_string())
+                        .collect(),
                     fts_positions: indexes.fts_positions(),
                     fts_stored: indexes.fts_stored(),
                     fts_k1: indexes.fts_bm25().iter().map(|p| p.k1).collect(),
@@ -589,6 +602,32 @@ impl Connection {
                     // without them, because nothing could have asked
                     // for them.
                     let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
+                    // Same rule for the analysis filters: a catalog
+                    // written before they existed, or one whose entry
+                    // is empty, describes a column with no filter. A
+                    // name that does not resolve is different — the
+                    // recorded analysis cannot be reproduced, so the
+                    // table is unusable rather than usable-with-a-guess.
+                    let stopwords = match entry.fts_stopwords.get(i).map(String::as_str) {
+                        None | Some("") => Stopwords::None,
+                        Some(set) => Stopwords::from_name(set).ok_or_else(|| {
+                            InfinoError::Backend(format!(
+                                "table '{name}' column {column:?} records unknown stopwords \
+                                 {set:?}"
+                            ))
+                            .with_context("open_table", Some(name))
+                        })?,
+                    };
+                    let stemmer = match entry.fts_stemmers.get(i).map(String::as_str) {
+                        None | Some("") => Stemmer::None,
+                        Some(stem) => Stemmer::from_name(stem).ok_or_else(|| {
+                            InfinoError::Backend(format!(
+                                "table '{name}' column {column:?} records unknown stemmer \
+                                 {stem:?}"
+                            ))
+                            .with_context("open_table", Some(name))
+                        })?,
+                    };
                     // And again for the BM25 pair: a catalog written before
                     // it was declarable can only describe a table built with
                     // the standard values, so the fallback is frozen there
@@ -598,6 +637,8 @@ impl Connection {
                     spec = spec.fts(
                         FtsField::new(column.clone())
                             .analyzer(analyzer)
+                            .stopwords(stopwords)
+                            .stemmer(stemmer)
                             .positions(positions)
                             .stored(stored)
                             .bm25(k1, b),
@@ -1874,24 +1915,21 @@ mod tests {
         );
     }
 
-    /// An analyzer name naming a filter this engine does not implement is
-    /// refused at create time rather than silently approximated — the
-    /// property the composite name exists to buy.
+    /// An unknown analyzer is refused at create time, naming what the
+    /// caller wrote. Filters are separate options now, so a
+    /// chain-shaped string is simply an analyzer name that does not
+    /// resolve — it must not be quietly interpreted as a chain.
     #[test]
-    fn an_unimplemented_analysis_filter_is_refused() {
+    fn an_unknown_analyzer_is_refused_and_a_chain_shaped_name_is_not_interpreted() {
         let conn = connect("memory://").expect("connect");
-        for name in [
-            "standard+stop=german",
-            "standard+stem=porter",
-            "standard+stem=english+stop=english",
-        ] {
+        for name in ["nonesuch", "standard+stop=english"] {
             let err = conn
                 .create_table(
                     "bad",
                     schema_id_title(),
                     IndexSpec::new().fts(FtsField::new("title").analyzer(name)),
                 )
-                .expect_err("an unimplemented chain must be rejected");
+                .expect_err("an unresolvable analyzer must be rejected");
             let msg = err.to_string();
             assert!(
                 msg.contains(name),

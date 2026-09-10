@@ -48,7 +48,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use wide::u8x16;
 
 use super::{
-    analysis::{chain_tokenizer, parse_chain_name},
+    analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
     reader::BoolMode,
 };
 
@@ -891,17 +891,14 @@ pub const STANDARD_TOKENIZER: &str = "standard";
 /// translate `None` into their own error — a malformed-superfile read
 /// error, or an invalid-argument error at table-create time.
 ///
-/// Accepts a bare base name (`"standard"`, `"ascii_lower"`) and the
-/// composite names of the analysis chain
-/// (`"standard+stop=english+stem=english"`), which is why this
-/// function is the format's fail-loud channel for analysis semantics:
-/// an engine that predates a filter does not know the composite name
-/// and refuses the file here, rather than tokenizing queries with a
-/// chain that is missing a filter and answering wrongly. See
+/// Resolves a **base** analyzer name only. A column's stopword set and
+/// stemmer are separate persisted fields, so a chained column's
+/// tokenizer is built by [`chain_tokenizer`] from all three rather than
+/// resolved from a single string here — see
 /// [`crate::superfile::fts::analysis`].
 pub fn tokenizer_for_name(name: &str) -> Option<Arc<dyn Tokenizer>> {
-    let (base, stopwords, stemmer) = parse_chain_name(name)?;
-    Some(chain_tokenizer(base, stopwords, stemmer))
+    let base = Base::from_name(name)?;
+    Some(chain_tokenizer(base, Stopwords::None, Stemmer::None))
 }
 
 // ── UAX #29 word breaks, restricted to ASCII ─────────────────────────

@@ -172,7 +172,14 @@ fn compute(
     if emit_analyzers {
         push_tag(&mut buf, b"fts_analyzers");
         for c in &opts.fts_columns {
-            push_str(&mut buf, &c.analyzer);
+            // The column's whole analysis as one derived string, not
+            // just its base name: two columns sharing a base but
+            // differing in a stopword set or stemmer are tokenized
+            // differently, so they must not hash alike. A column with
+            // no filter derives to its plain base name, keeping the
+            // stream byte-identical to hashes stamped before filters
+            // existed.
+            push_str(&mut buf, c.chain_name().unwrap_or(c.analyzer.as_str()));
         }
     }
     // 3d. stored flags — same only-when-non-default rule: an all-stored

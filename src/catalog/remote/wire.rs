@@ -55,11 +55,13 @@ pub(crate) fn metric_str(metric: Metric) -> &'static str {
 /// provenance of the stored score bounds, and a server that filled in
 /// its own default would build bounds the client never asked for.
 ///
-/// `analyzer` carries a column's whole analysis chain as one canonical
-/// name (`"standard+stop=english+stem=english"`), so stopwords and
-/// stemming need no keys of their own — and a server that does not
-/// implement a filter rejects the unknown name instead of creating a
-/// table analyzed differently than the client asked for.
+/// `analyzer` names the **base** tokenizer; a stopword set and a
+/// stemmer ride as their own `stopwords` / `stemmer` keys, each emitted
+/// only when set. A server that does not implement a named filter must
+/// reject the request rather than build a table analyzed differently
+/// than the client asked for — which is the request schema's job
+/// (`additionalProperties: false`), not something an encoding trick in
+/// this client can guarantee.
 /// One BM25 parameter widened for JSON without picking up the noise of a
 /// naive `f32 as f64`: that cast is exact, so `1.2_f32` widens to
 /// `1.2000000476837158` and crosses the wire as those seventeen digits.
@@ -83,20 +85,30 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
             .zip(spec.fts_stored())
             .zip(spec.fts_bm25())
             .zip(spec.fts_positions())
-            .map(|((((column, analyzer), stored), bm25), positions)| {
-                let mut entry = serde_json::Map::new();
-                entry.insert("column".to_string(), json!(column));
-                entry.insert("analyzer".to_string(), json!(analyzer));
-                entry.insert("k1".to_string(), json!(param_as_f64(bm25.k1)));
-                entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
-                if !stored {
-                    entry.insert("stored".to_string(), json!(false));
-                }
-                if positions {
-                    entry.insert("positions".to_string(), json!(true));
-                }
-                Value::Object(entry)
-            })
+            .zip(spec.fts_stopwords())
+            .zip(spec.fts_stemmers())
+            .map(
+                |((((((column, analyzer), stored), bm25), positions), stopwords), stemmer)| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("column".to_string(), json!(column));
+                    entry.insert("analyzer".to_string(), json!(analyzer));
+                    entry.insert("k1".to_string(), json!(param_as_f64(bm25.k1)));
+                    entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
+                    if !stored {
+                        entry.insert("stored".to_string(), json!(false));
+                    }
+                    if positions {
+                        entry.insert("positions".to_string(), json!(true));
+                    }
+                    if let Some(name) = stopwords.as_str() {
+                        entry.insert("stopwords".to_string(), json!(name));
+                    }
+                    if let Some(name) = stemmer.as_str() {
+                        entry.insert("stemmer".to_string(), json!(name));
+                    }
+                    Value::Object(entry)
+                },
+            )
             .collect();
         indexes.insert("fts".to_string(), Value::Array(fts));
     }

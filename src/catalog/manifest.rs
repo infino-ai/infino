@@ -67,6 +67,17 @@ pub(crate) struct TableEntry {
     /// table, not silently patched.
     #[serde(default)]
     pub(crate) fts_analyzers: Vec<String>,
+    /// FTS stopword-set names, parallel to `fts`; an empty string
+    /// means no set. Absent in catalogs written before the filter
+    /// existed, and a missing or short entry means no set — the only
+    /// thing such a catalog can describe, since nothing could have
+    /// asked for one.
+    #[serde(default)]
+    pub(crate) fts_stopwords: Vec<String>,
+    /// FTS stemmer names, parallel to `fts`; same empty-means-none and
+    /// same back-compat rule as `fts_stopwords`.
+    #[serde(default)]
+    pub(crate) fts_stemmers: Vec<String>,
     /// FTS positions flags, parallel to `fts` (`true` = token positions
     /// recorded, which exact-phrase queries need). Absent in catalogs
     /// written before positions were declarable; a missing or short
@@ -212,6 +223,8 @@ mod tests {
             schema_ipc: schema_to_ipc(&sample_schema()).expect("ipc"),
             fts: vec!["title".into()],
             fts_analyzers: vec!["ascii_lower".into()],
+            fts_stopwords: vec![String::new()],
+            fts_stemmers: vec![String::new()],
             fts_positions: vec![false],
             fts_stored: vec![true],
             fts_k1: vec![1.2],

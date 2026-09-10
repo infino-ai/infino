@@ -9,7 +9,11 @@ use std::{ops::Range, sync::Arc};
 
 use serde::Deserialize;
 
-use crate::superfile::fts::{bm25, tokenize::Tokenizer};
+use crate::superfile::fts::{
+    analysis::{Base, Stemmer, Stopwords},
+    bm25,
+    tokenize::Tokenizer,
+};
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
 ///
@@ -200,10 +204,21 @@ pub struct ColumnMeta {
     /// `inf.fts.columns`); phrase queries require it.
     pub positions: bool,
     /// Tokenizer for this column, reconstructed at open time from the
-    /// `tokenizer` name in `inf.fts.columns`. Query terms for this
-    /// column must be tokenized with it to match how the column was
-    /// indexed.
+    /// `tokenizer` name in `inf.fts.columns` plus its `stopwords` /
+    /// `stemmer` fields. Query terms for this column must be tokenized
+    /// with it to match how the column was indexed.
     pub tokenizer: Arc<dyn Tokenizer>,
+    /// The column's base tokenizer, kept beside the assembled
+    /// [`ColumnMeta::tokenizer`] so a rebuild can reconstruct the same
+    /// chain from its components. `Tokenizer::name` reports the chain's
+    /// derived identity, which is not a name any lookup accepts back.
+    pub(crate) base: Base,
+    /// The column's stopword set, kept for the same reason as
+    /// [`ColumnMeta::base`].
+    pub stopwords: Stopwords,
+    /// The column's stemmer, kept for the same reason as
+    /// [`ColumnMeta::base`].
+    pub stemmer: Stemmer,
     /// Whether the column's raw text is kept in the Parquet body (from
     /// `inf.fts.columns`). Index-only columns (`false`) are searchable
     /// but absent from the stored schema, so they cannot be read back;
@@ -247,12 +262,40 @@ pub struct FtsColumnConfig {
     /// default ([`bm25::B`]) as [`FtsColumnConfig::k1`].
     #[serde(default = "default_b")]
     pub b: f32,
+    /// Stopword set applied to this column, by name. Absent means no
+    /// set — the one thing a file written before the filter existed can
+    /// mean, so a missing field needs no guess. A *present* name this
+    /// engine does not ship is a different matter and fails the open:
+    /// there is no sound way to analyze without a set the index was
+    /// built with.
+    #[serde(default)]
+    pub stopwords: Option<String>,
+    /// Stemmer applied to this column, by name; same absent-means-off
+    /// and unknown-name-fails rules as [`FtsColumnConfig::stopwords`].
+    #[serde(default)]
+    pub stemmer: Option<String>,
 }
 
 impl FtsColumnConfig {
     /// The parameters this column's bounds were baked at.
     pub fn params(&self) -> bm25::Bm25Params {
         bm25::Bm25Params::new(self.k1, self.b)
+    }
+
+    /// This column's analysis filters. `Err` carries the offending
+    /// field name and value for an entry naming a filter this engine
+    /// cannot reproduce — the caller turns that into a read error
+    /// rather than analyzing the column some other way.
+    pub fn filters(&self) -> Result<(Stopwords, Stemmer), (&'static str, &str)> {
+        let stopwords = match &self.stopwords {
+            None => Stopwords::None,
+            Some(name) => Stopwords::from_name(name).ok_or(("stopwords", name.as_str()))?,
+        };
+        let stemmer = match &self.stemmer {
+            None => Stemmer::None,
+            Some(name) => Stemmer::from_name(name).ok_or(("stemmer", name.as_str()))?,
+        };
+        Ok((stopwords, stemmer))
     }
 }
 

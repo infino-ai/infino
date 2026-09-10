@@ -38,21 +38,21 @@ pub const PROJECT_MAGIC: &[u8; 3] = b"INF";
 ///   only have been built at the standard `1.2` / `0.75`, so that
 ///   default is **frozen** and must not follow a later change to what
 ///   the API recommends.
+/// - `"stopwords"` / `"stemmer"` — the analysis filters applied to the
+///   column, by name, each emitted only when set. Absent means the
+///   filter is off, which is the one thing a file written before it
+///   existed can mean, so a reader needs no guess. A reader that does
+///   not know the field at all treats the column as unfiltered, which
+///   costs that column's results until it rolls forward — the same
+///   trade taken for `k1` / `b`, and preferred over a marker that would
+///   make the file unopenable, because a lost-recall regression is
+///   recoverable and an unopenable table is an outage.
 ///
-/// The one change since 1.1.0 that is *not* additive-and-ignorable, and
-/// deliberately so: a column's `"tokenizer"` may name an analysis chain
-/// rather than a bare tokenizer — a base name followed by the filters
-/// applied to it, `"standard+stop=english+stem=english"`. A filter
-/// could not have been a sibling field, because a same-major reader
-/// ignores an unknown field and an ignored analysis filter means query
-/// text is tokenized differently than the postings were built, which is
-/// wrong answers rather than an error. Nor does it take a version of
-/// its own: the tokenizer name is already the fail-loud channel every
-/// shipped reader honours — an unrecognized name fails the open — so an
-/// engine predating a filter refuses the file on the name alone, and a
-/// version bump would add nothing a reader consults. A column with no
-/// filter keeps its plain base name, so its entry stays byte-identical
-/// to one written before chains existed.
+/// What is *not* ignorable is an unrecognized **value** of a field a
+/// reader does know — `"stopwords":"german"` on an engine shipping no
+/// German list. That fails the open, because there is no sound way to
+/// proceed: analyzing without a set the postings were built with is a
+/// different index, not a degraded one.
 pub const FORMAT_VERSION: &str = "1.1.0";
 
 /// CRC width in bytes (`u32` CRC-32C, little-endian) appended after a

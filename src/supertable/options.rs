@@ -66,7 +66,10 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::tokenize::{Tokenizer, tokenizer_for_name},
+        fts::{
+            analysis::{Base, chain_tokenizer},
+            tokenize::{Tokenizer, tokenizer_for_name},
+        },
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -730,9 +733,13 @@ impl SupertableOptions {
             }
         }
 
-        // 5. Each FTS column's analyzer name must resolve. Validating
-        //    here surfaces a typo at construction with a typed error,
-        //    instead of at the first commit's builder construction.
+        // 5. Each FTS column's base analyzer name must resolve.
+        //    Validating here surfaces a typo at construction with a
+        //    typed error, instead of at the first commit's builder
+        //    construction. The stopword set and stemmer need no check:
+        //    they arrive as enums, so an unrepresentable one cannot be
+        //    constructed. (A *persisted* filter name is different and is
+        //    validated where it is read.)
         for fc in &fts_columns {
             if tokenizer_for_name(&fc.analyzer).is_none() {
                 return Err(BuildError::UnknownAnalyzer {
@@ -900,10 +907,13 @@ impl SupertableOptions {
     /// resolution cannot fail for a registered column). The lookup is a
     /// single pass over `fts_columns`.
     pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
-        self.fts_columns
-            .iter()
-            .find(|c| c.column == column)
-            .and_then(|c| tokenizer_for_name(&c.analyzer))
+        let cfg = self.fts_columns.iter().find(|c| c.column == column)?;
+        // The whole chain, not the base: every caller here tokenizes
+        // query-side text — search terms, an equality literal, a `LIKE`
+        // fragment — and must produce the forms the column was indexed
+        // under.
+        let base = Base::from_name(&cfg.analyzer)?;
+        Some(chain_tokenizer(base, cfg.stopwords, cfg.stemmer))
     }
 
     /// Attach a disk cache for storage-backed reads.

@@ -96,10 +96,11 @@ use crate::superfile::{
         kv,
     },
     fts::{
+        analysis::{Base, Stemmer, Stopwords, chain_name, chain_tokenizer},
         bm25,
         builder::FtsBuilder,
         reader::ColumnMeta,
-        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, tokenizer_for_name},
+        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
     },
     stats::SuperfileStats,
     vector::{
@@ -130,12 +131,24 @@ use crate::superfile::{
 #[derive(Debug, Clone)]
 pub struct FtsConfig {
     pub column: String,
-    /// Analyzer (tokenizer) name applied to this column —
+    /// **Base** analyzer (tokenizer) name applied to this column —
     /// `"standard"` (the default) or `"ascii_lower"`. Resolved to a
-    /// tokenizer instance once, at builder construction; an unknown
+    /// tokenizer instance once, at builder construction, together with
+    /// [`FtsConfig::stopwords`] and [`FtsConfig::stemmer`]; an unknown
     /// name is a build error. Per column: each FTS column is tokenized
     /// with its own analyzer, so columns in one table may differ.
     pub analyzer: String,
+    /// Stopword set removed after the base tokenizer and before the
+    /// stemmer. Persisted in the column's `inf.fts.columns` entry as
+    /// `"stopwords"`, emitted only when set — so a column with no
+    /// stopwords keeps an entry byte-identical to one written before
+    /// the filter existed, and a reader of such an entry correctly
+    /// infers that no set was applied.
+    pub stopwords: Stopwords,
+    /// Stemmer applied to what survives the stopword set. Persisted as
+    /// `"stemmer"` under the same only-when-set rule as
+    /// [`FtsConfig::stopwords`].
+    pub stemmer: Stemmer,
     /// Record token positions for this column, enabling exact phrase
     /// queries against it. Off by default: positions roughly double
     /// the column's FTS index footprint, so the cost is a per-column
@@ -174,6 +187,8 @@ impl FtsConfig {
         Self {
             column: column.into(),
             analyzer: STANDARD_TOKENIZER.to_string(),
+            stopwords: Stopwords::None,
+            stemmer: Stemmer::None,
             positions: false,
             stored: true,
             bm25: bm25::Bm25Params::STANDARD,
@@ -184,6 +199,25 @@ impl FtsConfig {
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         self.analyzer = name.into();
         self
+    }
+
+    /// Set the stopword set (see the field docs).
+    pub fn stopwords(mut self, stopwords: Stopwords) -> Self {
+        self.stopwords = stopwords;
+        self
+    }
+
+    /// Set the stemmer (see the field docs).
+    pub fn stemmer(mut self, stemmer: Stemmer) -> Self {
+        self.stemmer = stemmer;
+        self
+    }
+
+    /// This column's analysis as one derived identity string — the
+    /// value [`Tokenizer::name`] reports for its tokenizer. Never
+    /// persisted; see [`crate::superfile::fts::analysis`].
+    pub(crate) fn chain_name(&self) -> Option<&'static str> {
+        Base::from_name(&self.analyzer).map(|b| chain_name(b, self.stopwords, self.stemmer))
     }
 
     /// Record token positions (see the field docs).
@@ -398,10 +432,13 @@ impl BuilderOptions {
     }
 
     pub fn new_from_reader(reader: &SuperfileReader) -> Self {
-        // Recover each FTS column's analyzer from the source reader so a
-        // rebuild carries the analyzer the postings were built with. This
-        // is why an existing table keeps its recorded analyzer through
-        // compaction and optimize no matter what the engine's default is.
+        // Recover each FTS column's whole analysis chain from the source
+        // reader — base tokenizer *and* both filters — so a rebuild
+        // carries the analysis the postings were built with. This is why
+        // an existing table keeps its recorded analyzer through
+        // compaction and optimize no matter what the engine's default
+        // is; dropping a filter here would re-tokenize the merged file's
+        // postings unfiltered.
         //
         // The BM25 pair rides along for the same reason and with a sharper
         // consequence: dropping it here would rebake the merged file's
@@ -413,7 +450,9 @@ impl BuilderOptions {
             fts.fts_columns_config()
                 .map(|c| {
                     FtsConfig::new(c.name.clone())
-                        .analyzer(c.tokenizer.name())
+                        .analyzer(c.base.name())
+                        .stopwords(c.stopwords)
+                        .stemmer(c.stemmer)
                         .positions(c.positions)
                         .stored(c.stored)
                         .bm25(c.params.k1, c.params.b)
@@ -498,11 +537,16 @@ impl BuilderOptions {
                     own.column, other.name
                 )));
             }
-            let other_analyzer = other.tokenizer.name();
-            if own.analyzer != other_analyzer {
+            // Compare the whole analysis, not the base name: two columns
+            // sharing a base but differing in a filter hold different
+            // terms, so carrying one's postings into the other silently
+            // mixes two tokenizations.
+            let own_analysis = own.chain_name().unwrap_or(own.analyzer.as_str());
+            let other_analysis = other.tokenizer.name();
+            if own_analysis != other_analysis {
                 return Err(BuildError::FTSSchemaMismatch(format!(
                     "column {}: mismatched analyzer. self {} vs other {}",
-                    own.column, own.analyzer, other_analyzer
+                    own.column, own_analysis, other_analysis
                 )));
             }
             if own.positions != other.positions {
@@ -728,12 +772,16 @@ impl SuperfileBuilder {
             // column below registers its own analyzer explicitly.
             let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
             for fc in &opts.fts_columns {
-                let tok = tokenizer_for_name(&fc.analyzer).ok_or_else(|| {
-                    BuildError::UnknownAnalyzer {
+                // The whole chain, not just the base: a column that
+                // declares a stopword set or a stemmer must be indexed
+                // through them, or the postings would hold unfiltered
+                // terms while every query filtered.
+                let base =
+                    Base::from_name(&fc.analyzer).ok_or_else(|| BuildError::UnknownAnalyzer {
                         column: fc.column.clone(),
                         analyzer: fc.analyzer.clone(),
-                    }
-                })?;
+                    })?;
+                let tok = chain_tokenizer(base, fc.stopwords, fc.stemmer);
                 fb.register_column_with_tokenizer(fc.column.clone(), fc.positions, tok, fc.bm25)?;
             }
             Some(fb)
@@ -2315,10 +2363,13 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 ///
 /// Output shape per column:
 /// `{"name":"<escaped>","tokenizer":"<name>","k1":<f>,"b":<f>}`.
-/// `tokenizer` is that column's analyzer name (`"ascii_lower"` or
-/// `"standard"`), straight from `FtsConfig.analyzer` — the reader
-/// reconstructs the matching tokenizer from it for query-time
-/// tokenization.
+/// `tokenizer` is that column's **base** analyzer name (`"ascii_lower"`
+/// or `"standard"`), straight from `FtsConfig.analyzer`. A stopword set
+/// and a stemmer ride as `"stopwords"` / `"stemmer"`, each emitted only
+/// when set; the reader reconstructs the column's tokenizer from all
+/// three for query-time tokenization, and a missing filter field means
+/// the filter is off — the one thing a file written before it existed
+/// can mean.
 ///
 /// `k1` / `b` are written **unconditionally, defaults included**,
 /// unlike `positions` and `stored`. Those two are booleans whose
@@ -2356,6 +2407,21 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         s.push_str(&fts_param_json(c.bm25.k1));
         s.push_str(r#","b":"#);
         s.push_str(&fts_param_json(c.bm25.b));
+        // Analysis filters, each emitted only when set, so a column
+        // with neither keeps JSON byte-identical to a file written
+        // before they existed. A reader that does not know the field
+        // treats the filter as off, which degrades that column's
+        // results rather than making the file unreadable.
+        if let Some(name) = c.stopwords.as_str() {
+            s.push_str(r#","stopwords":""#);
+            s.push_str(name);
+            s.push('"');
+        }
+        if let Some(name) = c.stemmer.as_str() {
+            s.push_str(r#","stemmer":""#);
+            s.push_str(name);
+            s.push('"');
+        }
         // Emitted only when set: a positionless column's JSON stays
         // byte-identical to files written before positions existed
         // (the reader defaults a missing field to false).
@@ -4958,13 +5024,19 @@ mod tests {
         // which turns the bug into a permanently failing background
         // compaction rather than wrong answers — still a bug, and one
         // nothing else here would catch.)
-        let chain = "standard+stop=english+stem=english";
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
-            vec![FtsConfig::new("title").analyzer(chain).positions(true)],
+            vec![
+                FtsConfig::new("title")
+                    .stopwords(Stopwords::English)
+                    .stemmer(Stemmer::English)
+                    .positions(true),
+            ],
             vec![],
         );
+        // The derived identity the reader will report for that column.
+        let chain = chain_name(Base::Standard, Stopwords::English, Stemmer::English);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
         b.add_batch(&batch_two_rows(&schema), &[])
@@ -4979,6 +5051,8 @@ mod tests {
             .next()
             .expect("has column");
         assert_eq!(source_cfg.tokenizer.name(), chain);
+        assert_eq!(source_cfg.stopwords, Stopwords::English);
+        assert_eq!(source_cfg.stemmer, Stemmer::English);
         assert!(source_cfg.positions, "positions must reach the built file");
 
         let (merged_bytes, _stats) =
@@ -4996,6 +5070,12 @@ mod tests {
             chain,
             "the analysis chain must survive a rebuild, or compaction \
              silently re-tokenizes the column"
+        );
+        assert_eq!(
+            (merged_cfg.stopwords, merged_cfg.stemmer),
+            (Stopwords::English, Stemmer::English),
+            "the filter components must survive too — the derived name is \
+             not something a rebuild can parse back"
         );
         assert!(
             merged_cfg.positions,

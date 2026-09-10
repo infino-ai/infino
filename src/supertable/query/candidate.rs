@@ -1037,8 +1037,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::superfile::fts::tokenize::{
-        AsciiLowerTokenizer, StandardTokenizer, tokenizer_for_name,
+    use crate::superfile::fts::{
+        analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
+        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, StandardTokenizer},
     };
 
     fn fts_cols() -> HashSet<&'static str> {
@@ -1056,7 +1057,46 @@ mod tests {
     /// Resolver whose column carries an analysis chain — the case the
     /// `LIKE` lowering must refuse to bound.
     fn stemming_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
-        tokenizer_for_name("standard+stem=english")
+        Some(chain_tokenizer(
+            Base::Standard,
+            Stopwords::None,
+            Stemmer::English,
+        ))
+    }
+
+    /// Resolver for a stopworded column.
+    fn stopping_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(chain_tokenizer(
+            Base::Standard,
+            Stopwords::English,
+            Stemmer::None,
+        ))
+    }
+
+    /// The guard is that a chain's *derived name* matches no arm of
+    /// `Analyzer::of`. Asserted directly, because every `LIKE` test
+    /// below would also pass if the resolver simply returned no
+    /// tokenizer at all — a false pass that would hide the guard
+    /// disappearing.
+    #[test]
+    fn a_chains_name_is_recognized_by_no_analyzer_arm() {
+        let plain = chain_tokenizer(Base::Standard, Stopwords::None, Stemmer::None);
+        assert_eq!(plain.name(), STANDARD_TOKENIZER);
+        assert!(
+            Analyzer::of(plain.as_ref()).is_some(),
+            "a plain column must still be bounded"
+        );
+        for chained in [
+            chain_tokenizer(Base::Standard, Stopwords::English, Stemmer::None),
+            chain_tokenizer(Base::Standard, Stopwords::None, Stemmer::English),
+            chain_tokenizer(Base::AsciiLower, Stopwords::English, Stemmer::English),
+        ] {
+            assert!(
+                Analyzer::of(chained.as_ref()).is_none(),
+                "{:?} must not be recognized as a bare analyzer",
+                chained.name()
+            );
+        }
     }
 
     /// A stemmed column gets **no** `LIKE` constraint, in any fragment
@@ -1101,9 +1141,12 @@ mod tests {
         // Every token removed by the chain's stopword set: there is no
         // term left to require, so the predicate bounds nothing rather
         // than bounding it with an empty conjunction.
-        let stopping = |_col: &str| tokenizer_for_name("standard+stop=english");
         assert_eq!(
-            CandidatePlan::from_filters(&[col("title").eq(lit("of the"))], &fts_cols(), &stopping),
+            CandidatePlan::from_filters(
+                &[col("title").eq(lit("of the"))],
+                &fts_cols(),
+                &stopping_resolver
+            ),
             CandidatePlan::Unbounded
         );
     }

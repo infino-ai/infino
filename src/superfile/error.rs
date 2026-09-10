@@ -34,9 +34,9 @@ pub enum BuildError {
     DuplicateColumnName(String),
 
     #[error(
-        "FTS column {column:?}: unknown analyzer {analyzer:?} (a base \
-         analyzer, \"standard\" or \"ascii_lower\", optionally followed \
-         by \"+stop=english\" and then \"+stem=english\")"
+        "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
+         \"standard\", \"ascii_lower\"; stopwords and stemming are \
+         separate options, not part of this name)"
     )]
     UnknownAnalyzer { column: String, analyzer: String },
 

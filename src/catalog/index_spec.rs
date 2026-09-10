@@ -9,7 +9,7 @@
 use crate::superfile::{
     builder::FtsConfig,
     fts::{
-        analysis::{Base, Stemmer, Stopwords, chain_name, parse_chain_name},
+        analysis::{Stemmer, Stopwords},
         bm25::Bm25Params,
         tokenize::STANDARD_TOKENIZER,
     },
@@ -81,35 +81,13 @@ impl FtsField {
     /// cannot be changed afterwards.
     ///
     /// This names the *base* tokenizer. [`FtsField::stopwords`] and
-    /// [`FtsField::stemmer`] add filters on top of it, and the column's
-    /// recorded analyzer name is the whole chain
-    /// (`"standard+stop=english+stem=english"`). A composite name is
-    /// also accepted here, so a name read back from a table round-trips;
-    /// a filter setter then replaces that component of it.
+    /// [`FtsField::stemmer`] add filters on top of it, and each is
+    /// recorded as its own option — so the three setters are
+    /// independent and may be called in any order.
     ///
     /// Validated at `create_table`, with the column named in the error.
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
-        let name = name.into();
-        match parse_chain_name(&name) {
-            // A composite name sets the components it *names* and
-            // clears none, so the three setters commute: a base name
-            // never undoes a `.stopwords()` that came before it, and a
-            // filter setter after a composite name replaces just that
-            // component. To turn a filter off, name its `None`.
-            Some((base, stopwords, stemmer)) => {
-                self.analyzer = base.name().to_string();
-                if stopwords != Stopwords::None {
-                    self.stopwords = stopwords;
-                }
-                if stemmer != Stemmer::None {
-                    self.stemmer = stemmer;
-                }
-            }
-            // Unresolvable: kept verbatim so `create_table`'s error
-            // names the analyzer the caller actually wrote, rather than
-            // some normalized form of it.
-            None => self.analyzer = name,
-        }
+        self.analyzer = name.into();
         self
     }
 
@@ -224,23 +202,6 @@ impl FtsField {
         self.bm25 = Bm25Params::new(k1, b);
         self
     }
-
-    /// This column's whole analysis chain as one canonical analyzer
-    /// name — the single string that reaches the superfile's
-    /// `inf.fts.columns` entry, the catalog record, the remote wire and
-    /// the options-hash. A column with no filter yields its base name
-    /// unchanged, so a default column is byte-identical everywhere to
-    /// one declared before the chain existed.
-    ///
-    /// An analyzer name that does not resolve passes through untouched:
-    /// validation at `create_table` is what reports it, and it must
-    /// report the name as written.
-    fn chain_analyzer(&self) -> String {
-        match Base::from_name(&self.analyzer) {
-            Some(base) => chain_name(base, self.stopwords, self.stemmer).to_string(),
-            None => self.analyzer.clone(),
-        }
-    }
 }
 
 impl From<&str> for FtsField {
@@ -314,16 +275,25 @@ impl IndexSpec {
         self.fts.iter().map(|f| f.column.clone()).collect()
     }
 
-    /// FTS analyzer names, in declaration order (parallel to
-    /// [`fts_columns`](Self::fts_columns)).
-    ///
-    /// Each is the column's **whole** analysis chain as one canonical
-    /// composite name, so this is all the catalog record, the remote
-    /// create-table wire and the options-hash have to carry for
-    /// stopwords and stemming — see
-    /// [`FtsField::chain_analyzer`].
+    /// FTS **base** analyzer names, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)). The stopword set and
+    /// stemmer are carried separately by
+    /// [`fts_stopwords`](Self::fts_stopwords) and
+    /// [`fts_stemmers`](Self::fts_stemmers).
     pub(crate) fn fts_analyzers(&self) -> Vec<String> {
-        self.fts.iter().map(|f| f.chain_analyzer()).collect()
+        self.fts.iter().map(|f| f.analyzer.clone()).collect()
+    }
+
+    /// FTS stopword sets, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_stopwords(&self) -> Vec<Stopwords> {
+        self.fts.iter().map(|f| f.stopwords).collect()
+    }
+
+    /// FTS stemmers, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_stemmers(&self) -> Vec<Stemmer> {
+        self.fts.iter().map(|f| f.stemmer).collect()
     }
 
     /// FTS positions flags, in declaration order (parallel to
@@ -362,7 +332,9 @@ impl IndexSpec {
             .iter()
             .map(|f| {
                 FtsConfig::new(f.column.clone())
-                    .analyzer(f.chain_analyzer())
+                    .analyzer(f.analyzer.clone())
+                    .stopwords(f.stopwords)
+                    .stemmer(f.stemmer)
                     .positions(f.positions)
                     .stored(f.stored)
                     .bm25(f.bm25.k1, f.bm25.b)
@@ -381,21 +353,32 @@ impl IndexSpec {
 mod tests {
     use super::*;
 
-    /// The lowered analyzer name for a single declared column.
-    fn analyzer_of(field: FtsField) -> String {
-        IndexSpec::new().fts(field).fts_analyzers().remove(0)
+    /// What a single declared column lowers to on each of the three
+    /// independent analysis surfaces.
+    fn analysis_of(field: FtsField) -> (String, Stopwords, Stemmer) {
+        let spec = IndexSpec::new().fts(field);
+        (
+            spec.fts_analyzers().remove(0),
+            spec.fts_stopwords().remove(0),
+            spec.fts_stemmers().remove(0),
+        )
     }
 
-    /// The three analysis setters commute. `FtsField` holds the base
-    /// name and the two filters separately and composes them only at
-    /// lowering, precisely so a caller cannot lose a filter by
-    /// declaring the base after it — which a naive "append to a string"
-    /// implementation would do.
+    /// The three analysis setters are independent: each carries its own
+    /// option through to its own persisted field, so they commute and
+    /// none can clobber another. Worth pinning even though it now falls
+    /// out of the representation — an earlier version composed them
+    /// into one string, where declaring the base last silently dropped
+    /// the filters.
     #[test]
     fn the_analysis_setters_commute() {
-        let want = "ascii_lower+stop=english+stem=english";
+        let want = (
+            "ascii_lower".to_string(),
+            Stopwords::English,
+            Stemmer::English,
+        );
         assert_eq!(
-            analyzer_of(
+            analysis_of(
                 FtsField::new("t")
                     .analyzer("ascii_lower")
                     .stopwords(Stopwords::English)
@@ -403,10 +386,8 @@ mod tests {
             ),
             want
         );
-        // Filters first, base last — the order that would drop them if
-        // `.analyzer()` reset the chain.
         assert_eq!(
-            analyzer_of(
+            analysis_of(
                 FtsField::new("t")
                     .stemmer(Stemmer::English)
                     .stopwords(Stopwords::English)
@@ -414,9 +395,8 @@ mod tests {
             ),
             want
         );
-        // And interleaved.
         assert_eq!(
-            analyzer_of(
+            analysis_of(
                 FtsField::new("t")
                     .stopwords(Stopwords::English)
                     .analyzer("ascii_lower")
@@ -426,47 +406,33 @@ mod tests {
         );
     }
 
-    /// A composite name round-trips through `.analyzer()`, which is
-    /// what `open_table` relies on: it rebuilds the spec by handing the
-    /// recorded name straight back, so a chain that did not survive
-    /// that would silently reopen a table with a different analyzer
-    /// than its postings were built with.
+    /// `.analyzer()` names the base tokenizer and nothing else. A
+    /// caller who passes a chain-shaped string gets it treated as an
+    /// analyzer name — which does not resolve, so `create_table`
+    /// rejects it naming what they wrote, rather than silently
+    /// interpreting it.
     #[test]
-    fn a_composite_name_round_trips_through_the_analyzer_setter() {
-        for name in [
-            "standard",
-            "ascii_lower",
-            "standard+stop=english",
-            "standard+stem=english",
-            "standard+stop=english+stem=english",
-            "ascii_lower+stop=english+stem=english",
-        ] {
-            assert_eq!(analyzer_of(FtsField::new("t").analyzer(name)), name);
-        }
-    }
-
-    /// A composite name sets the components it *names* and clears none,
-    /// so a filter setter after one replaces just that component and a
-    /// setter before one is not undone.
-    #[test]
-    fn a_composite_name_sets_only_what_it_names() {
-        // The name carries no stopword set, so the earlier setter stands.
+    fn the_analyzer_setter_names_only_the_base() {
+        let (analyzer, stop, stem) =
+            analysis_of(FtsField::new("t").analyzer("standard+stop=english"));
+        assert_eq!(analyzer, "standard+stop=english");
         assert_eq!(
-            analyzer_of(
+            (stop, stem),
+            (Stopwords::None, Stemmer::None),
+            "a chain-shaped string must not be silently decomposed"
+        );
+        // Turning a filter off is explicit, and independent of the base.
+        assert_eq!(
+            analysis_of(
                 FtsField::new("t")
                     .stopwords(Stopwords::English)
-                    .analyzer("standard+stem=english")
-            ),
-            "standard+stop=english+stem=english"
-        );
-        // Turning a filter back off is explicit, never implied by a name.
-        assert_eq!(
-            analyzer_of(
-                FtsField::new("t")
-                    .analyzer("standard+stop=english+stem=english")
                     .stopwords(Stopwords::None)
             ),
-            "standard+stem=english"
+            (
+                STANDARD_TOKENIZER.to_string(),
+                Stopwords::None,
+                Stemmer::None
+            )
         );
     }
 
@@ -475,8 +441,8 @@ mod tests {
     /// rather than a normalized form of it.
     #[test]
     fn an_unresolvable_analyzer_is_lowered_verbatim() {
-        for name in ["nonesuch", "standard+stop=german", "STANDARD"] {
-            assert_eq!(analyzer_of(FtsField::new("t").analyzer(name)), name);
+        for name in ["nonesuch", "STANDARD"] {
+            assert_eq!(analysis_of(FtsField::new("t").analyzer(name)).0, name);
         }
     }
 
