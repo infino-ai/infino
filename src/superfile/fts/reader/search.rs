@@ -1031,7 +1031,7 @@ impl FtsReader {
                     false => tf,
                 };
                 let idf_t = global_idf.unwrap_or_else(|| bm25::idf(self.n_docs as u64, 1));
-                let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
+                let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
                 // Drop the lone match if a negated term excludes it.
                 // The inline slot read no postings-region bytes; the
                 // work-stats byte count for this path is genuinely zero.
@@ -1070,17 +1070,25 @@ impl FtsReader {
 
         let local_idf = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_t = global_idf.unwrap_or(local_idf);
-        let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
+        let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
         // Stored block-max and coarse entries bake in the LOCAL idf. Scores
         // below use the (possibly overridden) effective idf, and the score
         // is linear in idf, so rescaling every stored bound by the ratio
         // keeps bounds exactly as tight as the per-superfile path — the
         // same exact rescale `TermCursor::new` applies (see cursor.rs).
-        let bound_rescale = if local_idf > 0.0 && idf_t != local_idf {
-            idf_t / local_idf
-        } else {
-            1.0
-        };
+        let bound_rescale = match local_idf > 0.0 && idf_t != local_idf {
+            true => idf_t / local_idf,
+            false => 1.0,
+        }
+        // And the same again for a parameter override: the stored bounds
+        // were baked at the column's declared pair, so scoring at
+        // another needs them inflated by the supremum of the ratio
+        // between the two. Both factors are linear multipliers on a
+        // stored bound, so they compose; both are 1.0 on the default
+        // path. See `ColumnMeta::bound_scale` and `TermCursor::new`,
+        // which does the identical composition for the multi-term
+        // kernels.
+        * col_meta.bound_scale;
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
@@ -1536,6 +1544,7 @@ impl FtsReader {
                         dl_norm_k1,
                         gidf,
                         weight,
+                        col_meta.params,
                     )));
                 }
                 Some(Resolved::Memo {
@@ -1556,6 +1565,8 @@ impl FtsReader {
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
+                        col_meta.params,
+                        col_meta.bound_scale,
                     )?;
                     cursors.push(Some(cursor));
                 }
@@ -1578,6 +1589,7 @@ impl FtsReader {
                         dl_norm_k1,
                         gidf,
                         weight,
+                        col_meta.params,
                     );
                     cursors.push(Some(cursor));
                 }
@@ -1595,6 +1607,8 @@ impl FtsReader {
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
+                        col_meta.params,
+                        col_meta.bound_scale,
                     )?;
                     cursors.push(Some(cursor));
                 }

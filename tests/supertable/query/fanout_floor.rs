@@ -46,6 +46,7 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
@@ -199,7 +200,12 @@ fn build_supertable() -> (Supertable, Vec<TempDir>) {
     let _ = consumer
         .reader()
         .expect("reader")
-        .bm25_hits("title", "common", K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "common",
+            K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("prewarm");
     consumer
         .wait_until_warm(WARM_PROMOTION_TIMEOUT)
@@ -349,7 +355,12 @@ fn fanout_floor_decomposition() {
             continue;
         }
         let hits = reader
-            .bm25_hits("title", term, K, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                term,
+                K,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("bm25_hits");
         assert_eq!(
             !hits.is_empty(),
@@ -365,7 +376,12 @@ fn fanout_floor_decomposition() {
         });
         let (hits_p50, hits_flt) = time_p50(|| {
             let h = reader
-                .bm25_hits("title", term, K, BoolMode::Or)
+                .bm25_hits(
+                    "title",
+                    term,
+                    K,
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                )
                 .expect("bm25_hits");
             std::hint::black_box(h);
         });
@@ -373,7 +389,15 @@ fn fanout_floor_decomposition() {
         // arithmetic `_id` resolve, no Parquet involvement.
         let (ids_p50, ids_flt) = time_p50(|| {
             let b = reader
-                .bm25_search("title", term, K, BoolMode::Or, Bm25Stats::Global, None)
+                .bm25_search(
+                    "title",
+                    term,
+                    K,
+                    Bm25SearchOptions::new()
+                        .with_mode(BoolMode::Or)
+                        .with_stats(Bm25Stats::Global),
+                    None,
+                )
                 .expect("bm25_search");
             std::hint::black_box(b);
         });
@@ -386,8 +410,9 @@ fn fanout_floor_decomposition() {
                     "title",
                     term,
                     K,
-                    BoolMode::Or,
-                    Bm25Stats::Global,
+                    Bm25SearchOptions::new()
+                        .with_mode(BoolMode::Or)
+                        .with_stats(Bm25Stats::Global),
                     Some(&["_id", "title", "score"]),
                 )
                 .expect("bm25_search");

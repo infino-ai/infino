@@ -85,6 +85,7 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
+        fts::bm25,
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
@@ -435,6 +436,8 @@ impl Connection {
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes.fts_analyzers(),
                     fts_stored: indexes.fts_stored(),
+                    fts_k1: indexes.fts_bm25().iter().map(|p| p.k1).collect(),
+                    fts_b: indexes.fts_bm25().iter().map(|p| p.b).collect(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
@@ -580,10 +583,17 @@ impl Connection {
                     // written before index-only columns existed can only
                     // mean the text is stored.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+                    // And again for the BM25 pair: a catalog written before
+                    // it was declarable can only describe a table built with
+                    // the standard values, so the fallback is frozen there
+                    // rather than tracking the crate default.
+                    let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
+                    let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
                     spec = spec.fts(
                         FtsField::new(column.clone())
                             .analyzer(analyzer)
-                            .stored(stored),
+                            .stored(stored)
+                            .bm25(k1, b),
                     );
                 }
                 for v in &entry.vectors {

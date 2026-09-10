@@ -10097,7 +10097,7 @@ mod tests {
         config::Config,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::{Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -10563,7 +10563,15 @@ mod tests {
         // Every doc's title contains "alpha" (see build_simple_batch); a match-all term must
         // surface hits from the one-piece index.
         let hits = st
-            .bm25_search("title", "alpha", 10, BoolMode::Or, Bm25Stats::Global, None)
+            .bm25_search(
+                "title",
+                "alpha",
+                10,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
+                None,
+            )
             .expect("bm25 over one-piece commit");
         let n: usize = hits.iter().map(|b| b.num_rows()).sum();
         assert!(n > 0, "single-shard FTS index must return hits");

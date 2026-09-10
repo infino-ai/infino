@@ -29,22 +29,24 @@
 #![deny(clippy::unwrap_used)]
 
 use std::{
-    cmp::Reverse,
+    cmp::{Ordering, Reverse},
     collections::HashSet,
+    slice::from_ref,
     sync::{Arc, LazyLock},
 };
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
-        fts::{
-            reader::{Bm25Stats, BoolMode},
-            tokenize::Tokenizer,
-        },
+        fts::reader::{Bm25Stats, BoolMode},
     },
     supertable::{Supertable, SupertableOptions, query::SuperfileHit},
-    test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer, schema_id_title},
+    test_helpers::{
+        brute_force_bm25::{BruteForceBm25, OracleBm25Params},
+        default_tokenizer, schema_id_title,
+    },
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -145,17 +147,41 @@ fn corpus_with_prefix_terms() -> Vec<(u64, String)> {
 
 // ---- Supertable side -----------------------------------------------
 
+/// The fixture at the standard BM25 pair — the shape most of these
+/// tests want, so they do not have to name a pair they do not care
+/// about.
 fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable {
+    build_supertable_with_params(corpus, n_superfiles, OracleBm25Params::default())
+}
+
+/// The fixture, with every FTS column declaring `params` — so the build
+/// bakes its block-max bounds at that pair and the reader scores with
+/// it.
+fn build_supertable_with_params(
+    corpus: &[(u64, String)],
+    n_superfiles: usize,
+    params: OracleBm25Params,
+) -> Supertable {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("pool"),
     );
-    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
-    let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
-        .expect("opts")
-        .with_writer_pool(pool);
+    let opts = SupertableOptions::new(
+        schema_id_title(),
+        // Positions are indexed so the phrase shape below is answerable.
+        // They change what the column can be asked, not how a term
+        // scores, so every non-phrase case grades the same as before.
+        vec![
+            FtsConfig::new("title")
+                .bm25(params.k1, params.b)
+                .positions(true),
+        ],
+        vec![],
+    )
+    .expect("opts")
+    .with_writer_pool(pool);
 
     let st = Supertable::create(opts).expect("create");
     let mut w = st.writer().expect("writer");
@@ -210,7 +236,12 @@ fn supertable_search_stats(
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits_stats("title", query, k, BoolMode::Or, stats)
+        .bm25_hits(
+            "title",
+            query,
+            k,
+            Bm25SearchOptions::new().with_stats(stats),
+        )
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -224,7 +255,14 @@ fn supertable_search_and_global(
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits_stats("title", query, k, BoolMode::And, Bm25Stats::PerSuperfile)
+        .bm25_hits(
+            "title",
+            query,
+            k,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::And)
+                .with_stats(Bm25Stats::PerSuperfile),
+        )
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -248,6 +286,19 @@ fn supertable_prefix_global(
 /// Build a per-superfile BruteForceBm25 oracle list. Index i scores
 /// superfile i with that superfile's own IDF/avgdl, mirroring the
 /// supertable's per-superfile scoring shape.
+/// Per-superfile oracles that score with `params` rather than the
+/// standard pair — the reference side of a declared-parameter fixture.
+fn build_oracles_with_params(
+    corpus: &[(u64, String)],
+    n_superfiles: usize,
+    params: OracleBm25Params,
+) -> Vec<BruteForceBm25> {
+    build_oracles(corpus, n_superfiles)
+        .into_iter()
+        .map(|o| o.with_params(params))
+        .collect()
+}
+
 fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForceBm25> {
     let tok = default_tokenizer();
     let chunk_size = corpus.len().div_ceil(n_superfiles);
@@ -262,21 +313,31 @@ fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForc
         .collect()
 }
 
-/// Run per-superfile brute-force BM25 and merge into a global top-k
-/// in the same shape the supertable's fan-out produces.
-fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
-    let tok = default_tokenizer();
-    let mut all: Vec<(u64, f32)> = Vec::new();
-    for o in oracles {
-        all.extend(o.top_k(query, k, tok.as_ref()));
-    }
+/// Merge per-superfile brute-force hits into a global top-k, in the
+/// same shape the supertable's fan-out produces: score descending,
+/// ties broken by ascending doc id.
+///
+/// Every oracle wrapper below differs only in which per-superfile
+/// scorer it calls, so the merge lives here once — four copies of a
+/// tie-break rule is four places for it to drift.
+fn merge_global_top_k(mut all: Vec<(u64, f32)>, k: usize) -> Vec<u64> {
     all.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
     all.truncate(k);
     all.into_iter().map(|(d, _)| d).collect()
+}
+
+/// Run per-superfile brute-force BM25 and merge into a global top-k.
+fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
+    let tok = default_tokenizer();
+    let all = oracles
+        .iter()
+        .flat_map(|o| o.top_k(query, k, tok.as_ref()))
+        .collect();
+    merge_global_top_k(all, k)
 }
 
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
@@ -287,33 +348,21 @@ fn brute_force_and_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> V
     let tok = default_tokenizer();
     let mut terms: Vec<String> = Vec::new();
     tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
-    let mut all: Vec<(u64, f32)> = Vec::new();
-    for o in oracles {
-        all.extend(o.top_k_terms_and(&terms, k));
-    }
-    all.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    all.truncate(k);
-    all.into_iter().map(|(d, _)| d).collect()
+    let all = oracles
+        .iter()
+        .flat_map(|o| o.top_k_terms_and(&terms, k))
+        .collect();
+    merge_global_top_k(all, k)
 }
 
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
 /// OR query (used to mirror the supertable's prefix expansion).
 fn brute_force_terms_top_k(oracles: &[BruteForceBm25], terms: &[String], k: usize) -> Vec<u64> {
-    let mut all: Vec<(u64, f32)> = Vec::new();
-    for o in oracles {
-        all.extend(o.top_k_terms(terms, k));
-    }
-    all.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    all.truncate(k);
-    all.into_iter().map(|(d, _)| d).collect()
+    let all = oracles
+        .iter()
+        .flat_map(|o| o.top_k_terms(terms, k))
+        .collect();
+    merge_global_top_k(all, k)
 }
 
 fn assert_top_k_sets_match(label: &str, supertable: Vec<u64>, oracle: Vec<u64>, head_size: usize) {
@@ -338,6 +387,179 @@ static STANDARD_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
     let oracles = build_oracles(&corp, SUPERFILES);
     StandardFixture { infino, oracles }
 });
+
+/// The same corpus with a declared, non-standard BM25 pair on both
+/// sides. The engine bakes its block-max bounds at this pair and scores
+/// with it; the oracle uses the identical formula, so a divergence is a
+/// real disagreement rather than two different similarity functions.
+const DECLARED_PARAMS: OracleBm25Params = OracleBm25Params { k1: 1.6, b: 0.4 };
+
+static DECLARED_PARAM_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
+    let corp = corpus_with_prefix_terms();
+    let infino = build_supertable_with_params(&corp, SUPERFILES, DECLARED_PARAMS);
+    let oracles = build_oracles_with_params(&corp, SUPERFILES, DECLARED_PARAMS);
+    StandardFixture { infino, oracles }
+});
+
+/// A query shape, carrying both the string the engine parses and the
+/// decomposition the oracle scores.
+///
+/// The two are derived from one value on purpose. Feeding the oracle
+/// from the engine's own parser — the convention elsewhere in the
+/// suite — makes a parsing change invisible here, because both sides
+/// would move together. These cases exist to grade *scoring* at a
+/// non-standard pair, so the clause structure is stated outright and a
+/// parser that stopped honouring a sigil would fail rather than agree
+/// with itself.
+enum QueryShape {
+    /// Bare terms, OR-combined — the default operator.
+    Or(&'static str),
+    /// Every term required (`+a +b`): the ranked-AND membership walk.
+    AllOf(&'static [&'static str]),
+    /// One exact phrase (`"a b"`): position-verified, and a different
+    /// kernel again — the phrase cursor composes its members' idfs and
+    /// its own term-level bound, so it reads a stored bound the single
+    /// and union paths never touch.
+    Phrase(&'static [&'static str]),
+}
+
+impl QueryShape {
+    /// The query string handed to the engine.
+    fn engine_query(&self) -> String {
+        match self {
+            Self::Or(q) => (*q).to_owned(),
+            Self::AllOf(terms) => terms
+                .iter()
+                .map(|t| format!("+{t}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Phrase(terms) => format!("\"{}\"", terms.join(" ")),
+        }
+    }
+
+    /// The reference top-k for the same shape.
+    fn oracle_top_k(&self, oracles: &[BruteForceBm25], k: usize) -> Vec<u64> {
+        match self {
+            Self::Or(q) => brute_force_top_k(oracles, q, k),
+            Self::AllOf(terms) => {
+                let musts: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+                let all = oracles
+                    .iter()
+                    .flat_map(|o| o.top_k_atoms(&musts, &[], &[], &[], &[], &[], k))
+                    .collect();
+                merge_global_top_k(all, k)
+            }
+            Self::Phrase(terms) => {
+                // A bare quoted run is a *should* phrase, matching how
+                // the engine's clause split reads it with no sigil.
+                let phrase: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+                let all = oracles
+                    .iter()
+                    .flat_map(|o| o.top_k_atoms(&[], &[], &[], from_ref(&phrase), &[], &[], k))
+                    .collect();
+                merge_global_top_k(all, k)
+            }
+        }
+    }
+}
+
+/// The shapes both parameter tests grade, so the declared-pair arm and
+/// the query-time-override arm cover exactly the same ground. Each
+/// entry is `(label, shape, k, head)`, where `head` is how many leading
+/// positions must match the reference exactly.
+///
+/// `+rust +async` and `"rust async"` are deliberately the same two
+/// terms: the phrase matches only where they are adjacent, while the
+/// must-query also takes `rust trait dyn impl async`. A phrase kernel
+/// that quietly degraded to an intersection would return that extra
+/// document and fail here.
+const QUERY_SHAPES: [(&str, QueryShape, usize, usize); 5] = [
+    (
+        "single_rare",
+        QueryShape::Or("rare-token-zzz"),
+        ORACLE_TOP_K_SMALL,
+        1,
+    ),
+    ("single_common", QueryShape::Or("rust"), ORACLE_TOP_K, 3),
+    ("two_term_or", QueryShape::Or("rust async"), ORACLE_TOP_K, 2),
+    // Both match sets are small and exact, so the head spans the whole
+    // result rather than a prefix of it. A prefix would compare only
+    // the top two, which both shapes agree on — the document that
+    // separates them (`rust trait dyn impl async`, matching the
+    // intersection but not the phrase) ranks third, and a head of 2
+    // would never look at it.
+    (
+        "two_term_and",
+        QueryShape::AllOf(&["rust", "async"]),
+        ORACLE_TOP_K,
+        ORACLE_TOP_K,
+    ),
+    (
+        "phrase",
+        QueryShape::Phrase(&["rust", "async"]),
+        ORACLE_TOP_K,
+        ORACLE_TOP_K,
+    ),
+];
+
+// ---- Tests: declared BM25 parameters ---------------------------------
+
+/// A column that declares a non-standard pair must rank exactly as the
+/// reference implementation does at the same pair — across the query
+/// shapes that exercise different kernels (single rare, single common,
+/// multi-term union).
+#[test]
+fn oracle_declared_bm25_params_match_across_query_shapes() {
+    let f = &*DECLARED_PARAM_FIXTURE;
+    for (label, shape, k, head) in QUERY_SHAPES {
+        let inf_hits = supertable_search_global(&f.infino, &shape.engine_query(), k, CHUNK_SIZE);
+        let ora_hits = shape.oracle_top_k(&f.oracles, k);
+        assert_top_k_sets_match(&format!("declared_{label}"), inf_hits, ora_hits, head);
+    }
+}
+
+/// A query-time override on a *standard* table must rank as the
+/// reference does at the override's pair. This is the pruning-correction
+/// path: the stored bounds belong to 1.2 / 0.75, so every bound is
+/// inflated by the correction factor, and a factor that came out too
+/// small would drop a qualifying doc and show up here as a set
+/// mismatch.
+#[test]
+fn oracle_query_time_override_matches_the_reference_at_that_pair() {
+    let f = &*STANDARD_FIXTURE;
+    let corp = corpus_with_prefix_terms();
+    for params in [
+        OracleBm25Params { k1: 1.6, b: 0.4 },
+        OracleBm25Params { k1: 0.6, b: 0.9 },
+        OracleBm25Params { k1: 1.2, b: 0.0 },
+    ] {
+        let oracles = build_oracles_with_params(&corp, SUPERFILES, params);
+        for (label, shape, k, head) in QUERY_SHAPES {
+            let query = shape.engine_query();
+            let hits = f
+                .infino
+                .reader()
+                .expect("reader")
+                .bm25_hits(
+                    "title",
+                    &query,
+                    k,
+                    Bm25SearchOptions::new()
+                        .with_stats(Bm25Stats::PerSuperfile)
+                        .with_bm25(params.k1, params.b),
+                )
+                .expect("bm25 with override");
+            let inf_hits = supertable_to_global_ids(&f.infino, hits, CHUNK_SIZE);
+            let ora_hits = shape.oracle_top_k(&oracles, k);
+            assert_top_k_sets_match(
+                &format!("override_k1={}_b={}_{label}", params.k1, params.b),
+                inf_hits,
+                ora_hits,
+                head,
+            );
+        }
+    }
+}
 
 // ---- Tests: query-shape coverage -------------------------------------
 
@@ -774,7 +996,14 @@ fn skip_path_hits(st: &Supertable, k: usize, chunk_size: usize) -> Vec<(u64, f32
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits_stats("title", "common", k, BoolMode::Or, Bm25Stats::Global)
+        .bm25_hits(
+            "title",
+            "common",
+            k,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
+        )
         .expect("single-term global search");
     let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
     supertable_to_global_ids(st, hits, chunk_size)

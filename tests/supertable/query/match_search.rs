@@ -26,6 +26,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -272,12 +273,13 @@ fn bm25_global_stats_keeps_the_per_superfile_membership() {
     let st = demo_two_superfiles();
     let reader = st.reader().expect("reader");
     let per_superfile_hits = reader
-        .bm25_hits_stats(
+        .bm25_hits(
             "title",
             "rust",
             TOP_K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::PerSuperfile),
         )
         .expect("per-superfile bm25");
     let global = reader
@@ -285,8 +287,9 @@ fn bm25_global_stats_keeps_the_per_superfile_membership() {
             "title",
             "rust",
             TOP_K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("global-stats bm25");
@@ -482,7 +485,12 @@ fn token_match_or_is_the_unranked_bm25_candidate_set() {
         .token_match("title", "rust", BoolMode::Or)
         .expect("token_match OR");
     let bm25 = reader
-        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "rust",
+            TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("bm25_search OR");
 
     assert!(
@@ -509,7 +517,12 @@ fn token_match_and_intersects_tokens() {
         .token_match("title", "rust systems", BoolMode::And)
         .expect("token_match AND");
     let bm25 = reader
-        .bm25_hits("title", "rust systems", TOP_K, BoolMode::And)
+        .bm25_hits(
+            "title",
+            "rust systems",
+            TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::And),
+        )
         .expect("bm25_search AND");
 
     assert!(!token.is_empty(), "AND of present tokens must match a doc");
@@ -573,7 +586,12 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
         )
         .expect("hybrid_search");
     let bm25 = reader
-        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "rust",
+            TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("bm25_search");
     let vector = reader
         .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
@@ -624,7 +642,12 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
         )
         .expect("hybrid_search");
     let bm25 = reader
-        .bm25_hits("title", "async", RANK_TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "async",
+            RANK_TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("bm25_search");
     let vector = reader
         .vector_hits("emb", &q, RANK_TOP_K, VectorSearchOptions::new(), None)

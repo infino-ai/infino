@@ -110,6 +110,65 @@ def test_bm25_stats_kwarg():
     assert global_hits.num_rows == 2
 
 
+def test_bm25_params_declared_and_overridden():
+    # `k1` / `b` declared on the column, and the same pair reached by
+    # overriding a default table at query time, must rank identically —
+    # the engine corrects the stored score bounds for the difference.
+    # Correctness of the correction is covered by the Rust oracle; here
+    # we exercise the binding, including that a declared table and an
+    # overridden one agree through it.
+    db = infino.connect("memory://")
+    titles = ["the quick brown fox", "a lazy dog", "quick thinking about foxes"]
+
+    declared = db.create_table(
+        "declared", _title_schema(), infino.IndexSpec().fts("title", k1=1.6, b=0.4)
+    )
+    plain = db.create_table("plain", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in titles:
+        declared.append(_title_batch([title]))
+        plain.append(_title_batch([title]))
+
+    from_declared = declared.bm25_search("title", "quick", 10, projection=["title", "score"])
+    from_override = plain.bm25_search(
+        "title", "quick", 10, projection=["title", "score"], k1=1.6, b=0.4
+    )
+
+    assert from_declared.num_rows == 2
+    assert from_declared.column("title").to_pylist() == from_override.column("title").to_pylist()
+    for a, b in zip(
+        from_declared.column("score").to_pylist(), from_override.column("score").to_pylist()
+    ):
+        assert abs(a - b) < 1e-4
+
+
+def test_bm25_params_must_be_passed_together():
+    # Overriding one parameter and inheriting the engine default for the
+    # other would score with a combination the caller never chose, since
+    # the two interact through the length norm. Both surfaces refuse it.
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox"]))
+
+    with pytest.raises(ValueError):
+        t.bm25_search("title", "fox", 10, k1=1.6)
+    with pytest.raises(ValueError):
+        t.bm25_search("title", "fox", 10, b=0.4)
+    with pytest.raises(ValueError):
+        db.create_table("half", _title_schema(), infino.IndexSpec().fts("title", k1=1.6))
+
+
+def test_bm25_params_out_of_range_is_rejected():
+    # Same bounds as the Rust surface: k1 > 0, b in [0, 1].
+    db = infino.connect("memory://")
+    for k1, b in [(0.0, 0.5), (-1.0, 0.5), (1.2, 1.5), (1.2, -0.1)]:
+        with pytest.raises(Exception):
+            db.create_table(
+                f"bad_{k1}_{b}",
+                _title_schema(),
+                infino.IndexSpec().fts("title", k1=k1, b=b),
+            )
+
+
 def test_bm25_unknown_stats_is_rejected():
     # An unknown stats mode is a configuration error, surfaced as ValueError.
     db = infino.connect("memory://")

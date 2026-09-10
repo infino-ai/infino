@@ -7532,6 +7532,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::IndexOutcome;
+    use crate::superfile::fts::reader::Bm25SearchOptions;
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
@@ -10680,7 +10681,15 @@ mod tests {
         let (_dir, st, _q, _k) = drained_three_direction_fixture();
         let reader = st.reader().expect("reader");
         let batches = reader
-            .bm25_search("title", "5", 8, BoolMode::And, Bm25Stats::Global, None)
+            .bm25_search(
+                "title",
+                "5",
+                8,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::And)
+                    .with_stats(Bm25Stats::Global),
+                None,
+            )
             .expect("global-stats bm25");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(

@@ -214,14 +214,18 @@ fn connect(
     Ok(Connection { inner })
 }
 
+/// One declared FTS column: `(column, analyzer, stored, k1, b)`.
+/// `analyzer` `None` means the default; `k1` / `b` `None` means the
+/// column takes the standard BM25 pair.
+type FtsDecl = (String, Option<String>, bool, Option<f32>, Option<f32>);
+
 /// Declares which columns are full-text (BM25) and which are vector
 /// (IVF kNN) indexed. Built fluently:
 /// `IndexSpec().fts("body").vector("emb", 384, "cosine")`.
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {
-    /// `(column, analyzer, stored)`; `analyzer` `None` means the default.
-    fts: Vec<(String, Option<String>, bool)>,
+    fts: Vec<FtsDecl>,
     /// `(column, dim, metric)`.
     vectors: Vec<(String, usize, String)>,
 }
@@ -241,10 +245,26 @@ impl IndexSpec {
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
-    #[pyo3(signature = (column, analyzer = None, stored = true))]
-    fn fts(&self, column: String, analyzer: Option<String>, stored: bool) -> Self {
+    ///
+    /// `k1` and `b` are the column's BM25 similarity parameters —
+    /// term-frequency saturation (`> 0`) and length normalization (in
+    /// `[0, 1]`), defaulting to `1.2` and `0.75`. They are recorded
+    /// with the table and the stored score bounds are built with them,
+    /// so a search that does not override them pays nothing. A search
+    /// may still score with a different pair (see `bm25_search`), which
+    /// is the shape to reach for while tuning; declare the pair here
+    /// once it is settled.
+    #[pyo3(signature = (column, analyzer = None, stored = true, k1 = None, b = None))]
+    fn fts(
+        &self,
+        column: String,
+        analyzer: Option<String>,
+        stored: bool,
+        k1: Option<f32>,
+        b: Option<f32>,
+    ) -> Self {
         let mut next = self.clone();
-        next.fts.push((column, analyzer, stored));
+        next.fts.push((column, analyzer, stored, k1, b));
         next
     }
 
@@ -262,10 +282,22 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> PyResult<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for (column, analyzer, stored) in &self.fts {
+        for (column, analyzer, stored, k1, b) in &self.fts {
             let mut field = infino::FtsField::new(column.clone()).stored(*stored);
             if let Some(a) = analyzer {
                 field = field.analyzer(a.clone());
+            }
+            // Both or neither, as at the search surface: the two
+            // parameters interact through the length norm, so
+            // half-overriding is a footgun rather than a shorthand.
+            match (k1, b) {
+                (Some(k1), Some(b)) => field = field.bm25(*k1, *b),
+                (None, None) => {}
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "IndexSpec.fts: pass k1 and b together, or neither",
+                    ));
+                }
             }
             spec = spec.fts(field);
         }
@@ -478,6 +510,15 @@ impl Table {
     /// `score` is a similarity (higher is better) — opposite direction
     /// from `vector_search`'s distance. Fuse with `hybrid_search`.
     ///
+    /// `k1` and `b` override the columns' declared BM25 similarity
+    /// parameters for this search only — pass both or neither. The
+    /// stored score bounds belong to the declared pair, so the reader
+    /// corrects them for the difference: results stay exact and only
+    /// pruning power is traded. Nothing is rebuilt, which is what makes
+    /// this the shape for relevance experimentation; a pair you mean to
+    /// keep belongs on the column (`IndexSpec.fts`), where the bounds
+    /// are built with it and the correction disappears.
+    ///
     /// `stats` selects the BM25 corpus statistics: `"global"` (default)
     /// scores against table-wide statistics gathered across all segments,
     /// so a fragmented table ranks like a single unified corpus, at the
@@ -486,7 +527,7 @@ impl Table {
     /// document count and term frequencies — fastest, and it skips that
     /// gather, but a term's idf depends on which segment a document
     /// landed in, so ranking drifts as the table fragments.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None))]
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None, k1=None, b=None))]
     #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
         &self,
@@ -497,10 +538,24 @@ impl Table {
         mode: Option<&str>,
         projection: Option<Vec<String>>,
         stats: Option<&str>,
+        k1: Option<f32>,
+        b: Option<f32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let opts = Bm25SearchOptions::new()
+        let mut opts = Bm25SearchOptions::new()
             .with_mode(parse_mode(mode)?)
             .with_stats(parse_stats(stats)?);
+        // Both or neither: overriding one parameter and silently
+        // keeping the engine default for the other is a footgun, since
+        // the two interact through the length norm.
+        opts = match (k1, b) {
+            (Some(k1), Some(b)) => opts.with_bm25(k1, b),
+            (None, None) => opts,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "bm25_search: pass k1 and b together, or neither",
+                ));
+            }
+        };
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);

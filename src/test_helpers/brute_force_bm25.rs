@@ -33,6 +33,25 @@ use crate::superfile::fts::tokenize::Tokenizer;
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
+/// The similarity parameters the oracle scores with. Defaults to the
+/// standard pair, so every existing caller is unaffected; a fixture
+/// whose column declares another pair — or whose query overrides one —
+/// sets this to the same values, or the comparison grades the engine
+/// against a different formula than the one it is running.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OracleBm25Params {
+    /// Term-frequency saturation.
+    pub k1: f32,
+    /// Length normalization.
+    pub b: f32,
+}
+
+impl Default for OracleBm25Params {
+    fn default() -> Self {
+        Self { k1: K1, b: B }
+    }
+}
+
 /// Number of times `phrase` occurs contiguously (in order) in
 /// `tokens` — the brute-force phrase tf.
 fn phrase_tf(tokens: &[String], phrase: &[String]) -> u32 {
@@ -70,6 +89,7 @@ pub struct BruteForceBm25 {
     df: HashMap<String, u32>,
     avgdl: f32,
     n: u32,
+    params: OracleBm25Params,
 }
 
 impl BruteForceBm25 {
@@ -111,7 +131,21 @@ impl BruteForceBm25 {
             total_tokens as f32 / n as f32
         };
 
-        Self { docs, df, avgdl, n }
+        Self {
+            docs,
+            df,
+            avgdl,
+            n,
+            params: OracleBm25Params::default(),
+        }
+    }
+
+    /// Score with `params` instead of the standard pair. Chain onto
+    /// [`BruteForceBm25::index`] for a fixture that declares or
+    /// overrides its parameters.
+    pub fn with_params(mut self, params: OracleBm25Params) -> Self {
+        self.params = params;
+        self
     }
 
     /// Brute-force top-k for a multi-term OR-mode BM25 query.
@@ -145,7 +179,8 @@ impl BruteForceBm25 {
         for doc in &self.docs {
             let mut score: f32 = 0.0;
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
             for term in terms {
                 let Some(&tf) = doc.tf.get(term) else {
                     continue;
@@ -156,7 +191,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
             }
             if score > 0.0 {
                 scored.push((doc.doc_id, score));
@@ -206,7 +241,8 @@ impl BruteForceBm25 {
                 }
             }
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
             let mut score: f32 = 0.0;
             let mut any_should = false;
             for term in musts.iter().chain(shoulds) {
@@ -220,7 +256,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
             }
             // With musts, every surviving doc matches (score > 0 since
             // idf is always positive); with none, only docs hit by at
@@ -302,8 +338,9 @@ impl BruteForceBm25 {
             }
 
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
-            let tf_factor = |tf: u32| -> f32 { tf as f32 * (K1 + 1.0) / (tf as f32 + dl_norm) };
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
+            let tf_factor = |tf: u32| -> f32 { tf as f32 * (k1 + 1.0) / (tf as f32 + dl_norm) };
 
             let mut score: f32 = 0.0;
             let mut matched_any_should = false;
@@ -359,7 +396,8 @@ impl BruteForceBm25 {
         let mut scored: Vec<(u64, f32)> = Vec::with_capacity(self.docs.len());
         'docs: for doc in &self.docs {
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
             let mut score: f32 = 0.0;
             for term in terms {
                 let Some(&tf) = doc.tf.get(term) else {
@@ -371,7 +409,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
             }
             scored.push((doc.doc_id, score));
         }

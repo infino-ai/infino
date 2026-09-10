@@ -85,14 +85,24 @@ class IndexSpec:
     def __init__(self) -> None: ...
     # `stored=False` declares an index-only column: searchable, but the raw
     # text is never kept, so it cannot be selected, projected, or filtered on.
+    # `k1` / `b` are the column's BM25 similarity parameters (defaults 1.2 and
+    # 0.75); pass both or neither. The stored score bounds are built with them.
     def fts(
-        self, column: str, analyzer: str | None = None, stored: bool = True
+        self,
+        column: str,
+        analyzer: str | None = None,
+        stored: bool = True,
+        k1: float | None = None,
+        b: float | None = None,
     ) -> IndexSpec: ...
     # `dim` must be in [16, 4096]; out-of-range raises at `create_table`.
     def vector(self, column: str, dim: int, metric: Metric) -> IndexSpec: ...
 
 class Table:
     def append(self, data: RowData) -> None: ...
+    # `k1` / `b` override the columns' declared parameters for this search
+    # only; pass both or neither. Results stay exact — only pruning power is
+    # traded — and nothing is rebuilt.
     def bm25_search(
         self,
         column: str,
@@ -101,6 +111,8 @@ class Table:
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
         stats: Bm25Stats | None = ...,
+        k1: float | None = ...,
+        b: float | None = ...,
     ) -> ArrowTable: ...
     def vector_search(
         self,

@@ -37,9 +37,8 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
-#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
-use std::collections::HashSet;
 use std::{
+    collections::HashSet,
     env,
     process::{Command, Stdio},
     sync::{
@@ -49,6 +48,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
+use infino::Bm25SearchOptions;
 use infino::{
     CompactionSettings, OptimizeOptions,
     supertable::{
@@ -1940,8 +1941,8 @@ pub mod fts {
                                 supertable::TEXT_COLUMN,
                                 &query,
                                 TOP_K,
-                                exec_fts::to_infino_mode(q.mode),
-                                infino::Bm25Stats::default(),
+                                Bm25SearchOptions::new()
+                                    .with_mode(exec_fts::to_infino_mode(q.mode)),
                                 None,
                             )
                             .expect("serving working-set bm25_search");
@@ -2135,7 +2136,12 @@ pub mod fts {
             consumer_meter,
             &|| {
                 let hits = reader
-                    .bm25_hits(supertable::TEXT_COLUMN, &query, TOP_K, mode)
+                    .bm25_hits(
+                        supertable::TEXT_COLUMN,
+                        &query,
+                        TOP_K,
+                        Bm25SearchOptions::new().with_mode(mode),
+                    )
                     .expect("routing-state bm25 hits");
                 let hidden_hits = hits
                     .iter()
@@ -2153,8 +2159,7 @@ pub mod fts {
                             supertable::TEXT_COLUMN,
                             &query,
                             TOP_K,
-                            mode,
-                            infino::Bm25Stats::default(),
+                            Bm25SearchOptions::new().with_mode(mode),
                             None,
                         )
                         .expect("routing-state warm bm25 search"),
@@ -2205,8 +2210,7 @@ pub mod fts {
                     supertable::TEXT_COLUMN,
                     &query,
                     TOP_K,
-                    exec_fts::to_infino_mode(q.mode),
-                    infino::Bm25Stats::default(),
+                    Bm25SearchOptions::new().with_mode(exec_fts::to_infino_mode(q.mode)),
                     None,
                 )
                 .expect("warm prewarm bm25_search");
@@ -2325,8 +2329,7 @@ pub mod fts {
                         supertable::TEXT_COLUMN,
                         &terms,
                         TOP_K,
-                        mode,
-                        infino::Bm25Stats::default(),
+                        Bm25SearchOptions::new().with_mode(mode),
                         None,
                     )
                     .expect("metered cold bm25_search");
@@ -2342,8 +2345,7 @@ pub mod fts {
                         supertable::TEXT_COLUMN,
                         &terms,
                         TOP_K,
-                        mode,
-                        infino::Bm25Stats::default(),
+                        Bm25SearchOptions::new().with_mode(mode),
                         None,
                     )
                     .expect("metered steady cold bm25_search");
@@ -2359,8 +2361,7 @@ pub mod fts {
                         supertable::TEXT_COLUMN,
                         &terms,
                         TOP_K,
-                        mode,
-                        infino::Bm25Stats::default(),
+                        Bm25SearchOptions::new().with_mode(mode),
                         None,
                     )
                     .expect("metered repeat cold bm25_search");
@@ -2402,7 +2403,13 @@ pub mod fts {
             self.consumer
                 .reader()
                 .expect("reader")
-                .bm25_search(column, query, k, mode, infino::Bm25Stats::default(), None)
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    Bm25SearchOptions::new().with_mode(mode),
+                    None,
+                )
                 .expect("cold bm25_search")
                 .iter()
                 .map(|b| b.num_rows())
@@ -2423,8 +2430,7 @@ pub mod fts {
                     column,
                     query,
                     k,
-                    mode,
-                    infino::Bm25Stats::default(),
+                    Bm25SearchOptions::new().with_mode(mode),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("cold bm25_search fetched")

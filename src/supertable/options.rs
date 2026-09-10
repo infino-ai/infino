@@ -657,6 +657,18 @@ impl SupertableOptions {
                     actual: format!("{:?}", f.data_type()),
                 });
             }
+            // BM25 parameters, validated here rather than at scoring
+            // time: the build bakes the block-max bounds with them, so a
+            // nonsense pair would otherwise be discovered as strange
+            // scores long after the bytes were written.
+            let (k1, b) = (fc.bm25.k1, fc.bm25.b);
+            if !k1.is_finite() || k1 <= 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
+                return Err(BuildError::FtsBm25ParamsOutOfRange {
+                    column: fc.column.clone(),
+                    k1,
+                    b,
+                });
+            }
         }
 
         // 3. Each vector column must exist in schema as
@@ -1446,6 +1458,57 @@ mod tests {
         assert!(
             matches!(err, BuildError::FtsColumnMustBeLargeUtf8 { column, .. } if column == "body")
         );
+    }
+
+    /// A declared pair outside its valid ranges is refused before
+    /// anything is written. The build bakes the block-max bounds with
+    /// these values, so accepting a nonsense pair would surface much
+    /// later as strange scores rather than as a rejected table.
+    #[test]
+    fn fts_bm25_params_out_of_range_rejected() {
+        let s = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        for (k1, b) in [
+            (0.0_f32, 0.75_f32),
+            (-1.0, 0.75),
+            (f32::NAN, 0.75),
+            (f32::INFINITY, 0.75),
+            (1.2, -0.01),
+            (1.2, 1.01),
+            (1.2, f32::NAN),
+        ] {
+            let err = SupertableOptions::new(Arc::clone(&s), vec![fc("body").bm25(k1, b)], vec![])
+                .expect_err("out-of-range pair must be refused");
+            assert!(
+                matches!(
+                    err,
+                    BuildError::FtsBm25ParamsOutOfRange { ref column, .. } if column == "body"
+                ),
+                "k1={k1} b={b} gave {err:?}"
+            );
+            // The message names both bounds, so a caller sees what is
+            // acceptable rather than only what was rejected.
+            let msg = err.to_string();
+            assert!(msg.contains("k1") && msg.contains("b"), "{msg}");
+        }
+    }
+
+    /// The boundary values are accepted: `b` is inclusive at both ends
+    /// and a large `k1` is legal.
+    #[test]
+    fn fts_bm25_params_boundaries_accepted() {
+        let s = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        for (k1, b) in [(1.2_f32, 0.0_f32), (1.2, 1.0), (0.001, 0.5), (100.0, 0.5)] {
+            SupertableOptions::new(Arc::clone(&s), vec![fc("body").bm25(k1, b)], vec![])
+                .unwrap_or_else(|e| panic!("k1={k1} b={b} should be accepted: {e}"));
+        }
     }
 
     #[test]

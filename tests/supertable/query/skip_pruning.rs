@@ -40,6 +40,7 @@ use std::{
 
 use bytes::Bytes;
 use infino::{
+    Bm25SearchOptions,
     superfile::{SuperfileReader, builder::FtsConfig, fts::tokenize::Tokenizer},
     supertable::{
         Supertable, SupertableOptions,
@@ -180,7 +181,7 @@ fn bm25_exact_term_skip_opens_only_matching_superfile() {
             "title",
             "nimblefox",
             BM25_TOP_K,
-            infino::supertable::query::fts::BoolMode::Or,
+            Bm25SearchOptions::new().with_mode(infino::supertable::query::fts::BoolMode::Or),
         )
         .expect("query");
     assert_eq!(hits.len(), 1, "exactly one doc matches `nimblefox`");
@@ -277,7 +278,7 @@ fn bm25_search_with_no_matching_superfiles_opens_no_superfiles_at_all() {
             "title",
             "definitelynotpresent",
             BM25_TOP_K,
-            infino::supertable::query::fts::BoolMode::Or,
+            Bm25SearchOptions::new().with_mode(infino::supertable::query::fts::BoolMode::Or),
         )
         .expect("query");
     assert!(hits.is_empty());
@@ -316,12 +317,13 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_superfile() {
 
     let before = store.snapshot();
     let _hits = r
-        .bm25_hits_stats(
+        .bm25_hits(
             "title",
             "alpha beta",
             BM25_TOP_K,
-            infino::supertable::query::fts::BoolMode::And,
-            infino::Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(infino::supertable::query::fts::BoolMode::And)
+                .with_stats(infino::Bm25Stats::PerSuperfile),
         )
         .expect("AND query");
 

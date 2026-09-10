@@ -68,6 +68,18 @@ pub(crate) struct TableEntry {
     /// defaults to stored on reopen.
     #[serde(default)]
     pub(crate) fts_stored: Vec<bool>,
+    /// FTS BM25 `k1` values, parallel to `fts`. Absent in catalogs
+    /// written before the parameters were declarable; a missing or
+    /// short entry defaults to the standard `1.2` on reopen — the only
+    /// value such a table can have been built with. Frozen, like the
+    /// superfile-side default: it must not follow a later change to
+    /// what the API recommends.
+    #[serde(default)]
+    pub(crate) fts_k1: Vec<f32>,
+    /// FTS BM25 `b` values, parallel to `fts`; same provenance and same
+    /// frozen default (`0.75`) as `fts_k1`.
+    #[serde(default)]
+    pub(crate) fts_b: Vec<f32>,
     /// Vector-indexed columns.
     pub(crate) vectors: Vec<VectorEntry>,
     /// Creation time, seconds since the Unix epoch.
@@ -184,6 +196,8 @@ mod tests {
             fts: vec!["title".into()],
             fts_analyzers: vec!["ascii_lower".into()],
             fts_stored: vec![true],
+            fts_k1: vec![1.2],
+            fts_b: vec![0.75],
             vectors: vec![VectorEntry {
                 column: "emb".into(),
                 dim: 8,
