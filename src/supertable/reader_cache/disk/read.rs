@@ -157,7 +157,7 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
-            if entry.mmap.is_some() {
+            if entry.is_mapped() {
                 entry.last_access_us.store(self.now_us(), Ordering::Release);
                 return Ok(Arc::clone(&entry.reader));
             }
@@ -276,7 +276,11 @@ impl DiskCacheStore {
         let start = Instant::now();
         loop {
             let pending = self.cached.iter().any(|entry| {
-                entry.value().fill_spawned.load(Ordering::Acquire) && entry.value().mmap.is_none()
+                // A Paged entry whose fill latched but hasn't promoted to Mapped yet.
+                entry
+                    .value()
+                    .fill_spawned()
+                    .is_some_and(|f| f.load(Ordering::Acquire))
             });
             if !pending {
                 return Ok(());

@@ -153,52 +153,77 @@ pub enum DiskCacheError {
     Config(String),
 }
 
-/// Live cache entry. Holds the cached `Arc<SuperfileReader>`
-/// (constructed once on cache fill); the `Bytes` inside the
-/// reader is mmap-backed via `Bytes::from_owner(ArcMmapOwner)`,
-/// so dropping the last `Arc<SuperfileReader>` (cache evict +
-/// no in-flight queries) drops the mmap and unmaps the file.
+/// Live cache entry: the cached [`SuperfileReader`] plus the [`Residency`] that says where its
+/// bytes currently live. Dropping the last `Arc<SuperfileReader>` (evicted, no in-flight query)
+/// releases whatever backs it, whether that is a heap buffer, an mmap, or the block source.
 ///
-/// In-flight queries pin the reader independently — the
-/// cache can evict the entry and unlink the on-disk file
-/// while a query still holds an `Arc<SuperfileReader>` over
-/// the now-unlinked-but-mmap'd bytes. POSIX semantics
-/// (mac/linux): the mmap stays valid until the last
+/// In-flight queries pin the reader independently, so the cache can evict the entry and unlink the
+/// file while a query still reads the mmapped bytes. POSIX keeps the mapping valid until the last
 /// reference drops.
-///
-/// `mmap` is `None` for in-memory-bytes-backed entries
-/// produced by the hybrid cold-fetch path (transient, before
-/// `finalize_to_mmap` runs); `Some` once the entry is
-/// mmap-backed. The idle-threshold sweep thread iterates
-/// entries with `Some(mmap)` and calls
-/// `madvise(MADV_DONTNEED)` on those that haven't been
-/// accessed in `mmap_cold_threshold_secs`.
 pub(crate) struct CachedEntry {
     reader: Arc<SuperfileReader>,
-    /// Separate handle on the mmap for `MADV_DONTNEED`. Same
-    /// `Arc<Mmap>` instance that backs the reader's `Bytes`
-    /// — both share the underlying OS mapping, so `madvise`
-    /// on either path affects the cached entry's resident
-    /// pages.
-    mmap: Option<Arc<Mmap>>,
-    /// Accounted bytes for this entry. For eager entries this is fixed at
-    /// insertion; for block-backed lazy entries this points at the block
-    /// source's live filled-bytes counter.
+    residency: Residency,
+    /// Bytes charged to the budget. Fixed at insertion for [`EntryAccounting::Eager`]; for
+    /// [`EntryAccounting::SourceOwned`] it tracks the block source's live filled-bytes counter.
     size_bytes: Arc<AtomicU64>,
-    /// Who owns accounting release for this entry.
+    /// Who releases `size_bytes` when the entry drops.
     accounting: EntryAccounting,
-    /// Identity of the sparse source currently allowed to grow this lazy
-    /// entry. `None` for eager and fully mmap-backed entries.
-    block_token: Option<Arc<()>>,
-    /// Live block-cache source for lazy (and hybrid mmap+hole) entries.
-    /// Retained across vector-excluding background fill so touched vector
-    /// ranges stay local after parquet/FTS promote to mmap.
-    block_source: Option<Arc<BlockCachedSource>>,
-    /// Whether a background fill task has been spawned for this URI.
-    /// Vector opens leave this false (block-cache only); an later FTS/SQL
-    /// open may flip it and start fill.
-    fill_spawned: AtomicBool,
     last_access_us: AtomicU64,
+}
+
+/// Where a cached entry's bytes currently live. Lines up with the three tiers
+/// [`DiskCacheStore::reader`] checks in order: memory, disk, then object store.
+enum Residency {
+    /// Whole superfile in an anonymous heap buffer, and the only copy. A background task writes it
+    /// to disk and promotes it to [`Residency::Mapped`].
+    Buffered,
+    /// Superfile mmapped from the local cache file. Usually the whole object; `vector_source` is
+    /// `Some` when the vector blob was deliberately left out of the file (vector search reads only
+    /// a few clusters, so downloading the whole blob is wasteful) and is served from the block
+    /// cache instead. Parquet and FTS always come from the mmap.
+    Mapped {
+        mmap: Arc<Mmap>,
+        vector_source: Option<Arc<BlockCachedSource>>,
+    },
+    /// Byte ranges fetched on demand from object storage and cached locally in blocks.
+    /// `fill_spawned` latches the single background download so it starts at most once.
+    Paged {
+        block_source: Arc<BlockCachedSource>,
+        fill_spawned: AtomicBool,
+    },
+}
+
+impl CachedEntry {
+    /// The mmap when this entry is [`Residency::Mapped`], for the idle-page sweep's `madvise`.
+    fn mmap(&self) -> Option<&Arc<Mmap>> {
+        match &self.residency {
+            Residency::Mapped { mmap, .. } => Some(mmap),
+            _ => None,
+        }
+    }
+
+    /// Whether the whole file is mmapped locally, so the hot path never reads object storage.
+    fn is_mapped(&self) -> bool {
+        matches!(self.residency, Residency::Mapped { .. })
+    }
+
+    /// The live block source: a [`Residency::Paged`] entry's source, or the retained vector hole of
+    /// a [`Residency::Mapped`] entry.
+    fn block_source(&self) -> Option<&Arc<BlockCachedSource>> {
+        match &self.residency {
+            Residency::Paged { block_source, .. } => Some(block_source),
+            Residency::Mapped { vector_source, .. } => vector_source.as_ref(),
+            Residency::Buffered => None,
+        }
+    }
+
+    /// The background-fill latch when this entry is [`Residency::Paged`].
+    fn fill_spawned(&self) -> Option<&AtomicBool> {
+        match &self.residency {
+            Residency::Paged { fill_spawned, .. } => Some(fill_spawned),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,10 +476,7 @@ impl DiskCacheStore {
     /// `LazyForegroundWithBackgroundFill` still holds the lazy
     /// in-memory reader or the background download is in flight.
     pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
-        self.cached
-            .get(uri)
-            .map(|e| e.mmap.is_some())
-            .unwrap_or(false)
+        self.cached.get(uri).map(|e| e.is_mapped()).unwrap_or(false)
     }
 
     /// Snapshot of the cache's load. Cheap; reads atomics +
@@ -615,17 +637,36 @@ mod test_support {
 
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::builder::{BuilderOptions, SuperfileBuilder},
+        superfile::{
+            BytesLazyByteSource, LazyByteSource,
+            builder::{BuilderOptions, SuperfileBuilder},
+        },
         supertable::{
             manifest::SuperfileUri,
             reader_cache::{
-                block_source::{CACHE_BLOCK_BYTES, serialize_index},
+                block_source::{BlockCachedSource, CACHE_BLOCK_BYTES, serialize_index},
                 config::DiskCacheConfig,
                 disk::*,
             },
         },
-        test_helpers::{decimal128_id_field, decimal128_ids},
+        test_helpers::{decimal128_id_field, decimal128_ids, default_vector_config},
     };
+
+    /// A block source over empty storage, for tests that only need a [`Residency::Paged`] entry to
+    /// exist. Does not own budget accounting, so dropping it never touches `current_bytes`.
+    pub(crate) fn dummy_block_source(
+        store: &Arc<DiskCacheStore>,
+        uri: SuperfileUri,
+    ) -> Arc<BlockCachedSource> {
+        let inner: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(Bytes::new()));
+        BlockCachedSource::new_pre_reserved(
+            inner,
+            Arc::downgrade(store),
+            uri,
+            store.blocks_path(&uri),
+            None,
+        )
+    }
 
     pub(crate) fn seed_valid_block_file(
         store: &Arc<DiskCacheStore>,
@@ -687,6 +728,29 @@ mod test_support {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Like [`tiny_superfile_bytes`] but with a 16-dim vector column, so the reader carries a real
+    /// vector blob. Needed to drive the cold-fetch promote down its vector-hole path, where the
+    /// blob stays on the block cache instead of the mmap.
+    pub(crate) fn tiny_vector_superfile_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![decimal128_id_field("doc_id")]));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(decimal128_ids(vec![10u64, 11]))])
+            .expect("batch");
+        // Two rows on distinct axes so IVF clustering has something to place.
+        let mut embeddings = vec![0.0f32; 2 * 16];
+        embeddings[0] = 1.0;
+        embeddings[16 + 1] = 1.0;
+        b.add_batch(&batch, &[embeddings.as_slice()])
+            .expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
     }
 

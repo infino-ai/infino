@@ -45,7 +45,7 @@ impl DiskCacheStore {
             .cached
             .iter()
             .filter_map(|e| {
-                let mmap = e.value().mmap.clone()?;
+                let mmap = e.value().mmap().cloned()?;
                 let last = e.value().last_access_us.load(Ordering::Acquire);
                 Some((*e.key(), mmap, last))
             })
@@ -91,7 +91,7 @@ impl DiskCacheStore {
     pub fn current_mmap_size_bytes(&self) -> u64 {
         self.cached
             .iter()
-            .filter_map(|e| e.value().mmap.as_ref().map(|m| m.len() as u64))
+            .filter_map(|e| e.value().mmap().map(|m| m.len() as u64))
             .sum()
     }
 
@@ -126,7 +126,7 @@ impl DiskCacheStore {
             .cached
             .iter()
             .filter_map(|e| {
-                let mmap = e.value().mmap.clone()?;
+                let mmap = e.value().mmap().cloned()?;
                 Some((
                     *e.key(),
                     mmap,
@@ -280,16 +280,11 @@ impl DiskCacheStore {
         self.current_bytes.fetch_sub(bytes, Ordering::Release);
     }
 
-    /// True when `token` still identifies the live lazy entry for `uri`.
+    /// True when `token` still identifies the live block source for `uri`.
     pub(crate) fn lazy_block_entry_is_current(&self, uri: &SuperfileUri, token: &Arc<()>) -> bool {
         self.cached
             .get(uri)
-            .and_then(|entry| {
-                entry
-                    .block_token
-                    .as_ref()
-                    .map(|current| Arc::ptr_eq(current, token))
-            })
+            .and_then(|entry| entry.block_source().map(|source| source.owns_token(token)))
             .unwrap_or(false)
     }
 
@@ -305,23 +300,23 @@ impl DiskCacheStore {
     pub(crate) fn install_block_entry_for_test(
         &self,
         uri: SuperfileUri,
-        filled: Arc<AtomicU64>,
-        block_token: Arc<()>,
+        block_source: Arc<crate::supertable::reader_cache::block_source::BlockCachedSource>,
     ) {
         let reader = SuperfileReader::open(
             crate::supertable::reader_cache::disk::test_support::tiny_superfile_bytes(),
         )
         .expect("tiny superfile opens");
+        let size_bytes = block_source.filled_bytes_handle();
         self.cached.insert(
             uri,
             Arc::new(CachedEntry {
                 reader: Arc::new(reader),
-                mmap: None,
-                size_bytes: filled,
+                residency: Residency::Paged {
+                    block_source,
+                    fill_spawned: AtomicBool::new(false),
+                },
+                size_bytes,
                 accounting: EntryAccounting::SourceOwned,
-                block_token: Some(block_token),
-                block_source: None,
-                fill_spawned: AtomicBool::new(false),
                 last_access_us: AtomicU64::new(self.now_us()),
             }),
         );

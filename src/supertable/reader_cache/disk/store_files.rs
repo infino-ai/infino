@@ -384,7 +384,7 @@ impl DiskCacheStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicU64};
+    use std::sync::Arc;
 
     use bytes::Bytes;
     use tempfile::TempDir;
@@ -546,9 +546,11 @@ mod tests {
         // second decrement here would underflow `current_bytes`.
         let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
-        let filled = Arc::new(AtomicU64::new(4096));
-        let token = Arc::new(());
-        store.install_block_entry_for_test(uri, Arc::clone(&filled), Arc::clone(&token));
+        let block_source = dummy_block_source(&store, uri);
+        block_source
+            .filled_bytes_handle()
+            .store(4096, Ordering::Release);
+        store.install_block_entry_for_test(uri, block_source);
         assert_eq!(store.stats().current_bytes, 0, "source owns these bytes");
 
         assert!(store.erase_superfile_local_copy(&uri), "entry was present");
