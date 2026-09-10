@@ -16,6 +16,13 @@ check:
 	# The `remote` transport is off in the shipped library, so the line above
 	# never lints it. Lint it explicitly (alongside `test-helpers`) or it rots.
 	cargo clippy --all-targets --features test-helpers,remote -- -D warnings
+	# `detailed-tracing` and `metering` are off by default, so neither line
+	# above compiles the `tracing::instrument` attributes they gate. Those
+	# attributes name a function's parameters, so a signature change breaks
+	# them while every default build stays green — and the break only
+	# surfaces in a downstream build that turns the feature on. Check them
+	# here instead of finding out there.
+	cargo check --features metering,detailed-tracing
 	$(MAKE) api-parity
 	$(MAKE) version-sync
 	$(MAKE) bench-gate
