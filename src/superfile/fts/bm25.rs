@@ -12,11 +12,20 @@
 //!   norm(dl, avgdl)       = 1 - b + b * dl / avgdl
 //!
 //!   tf_factor(tf, dl, avgdl)
-//!                         = tf * (k1 + 1) / ( tf + k1 * norm(dl, avgdl) )
+//!                         = tf / ( tf + k1 * norm(dl, avgdl) )
 //!
 //!   score(idf, tf, dl, avgdl)
 //!                         = idf * tf_factor(tf, dl, avgdl)
 //! ```
+//!
+//! The textbook statement of BM25 carries a `(k1 + 1)` in the numerator
+//! of `tf_factor`. It is a constant multiplier on every score a query
+//! produces, so it cannot change a ranking, and it is conventionally
+//! omitted — keeping it would make every score a fixed 2.2× (at the
+//! default `k1`) of what the same parameters produce elsewhere, which
+//! is invisible to anyone reading the order and wrong for anyone
+//! reading the number: a score threshold, a weighted fusion against
+//! vector distances, a table set beside another engine's.
 //!
 //! `idf(N, df)` is monotonic in `df` (smaller `df` → larger `idf`); always
 //! non-negative because we use the +0.5 / +0.5 form ("BM25+1") which keeps
@@ -80,12 +89,6 @@ impl Bm25Params {
             1.0
         };
         self.k1 * norm
-    }
-
-    /// `idf · (k1 + 1)` — the per-term factor the scorer multiplies by.
-    #[inline]
-    pub(crate) fn idf_x_k1p1(&self, idf: f32) -> f32 {
-        idf * (self.k1 + 1.0)
     }
 }
 
@@ -194,13 +197,13 @@ pub fn score(idf_t: f32, tf: u32, dl: u32, avgdl: f32, params: Bm25Params) -> f3
         // posting list membership), but stay defensive.
         return 0.0;
     }
-    params.idf_x_k1p1(idf_t) * tf / denom
+    idf_t * tf / denom
 }
 
 /// BM25 score using a precomputed `dl_norm_k1 = K1 * (1 - B + B * dl/avgdl)`
-/// and `idf_x_k1p1 = idf * (K1 + 1)`.
+/// and `idf_weight = idf` (folding in any query-term-frequency weight).
 ///
-/// Both `dl_norm_k1` (per doc) and `idf_x_k1p1` (per cursor) are
+/// Both `dl_norm_k1` (per doc) and `idf_weight` (per cursor) are
 /// computed once at reader open / cursor build. The hot inner loop
 /// drops to a single multiply + add + divide per call.
 ///
@@ -209,17 +212,17 @@ pub fn score(idf_t: f32, tf: u32, dl: u32, avgdl: f32, params: Bm25Params) -> f3
 /// `K1 > 0` and `1 - B + B * dl/avgdl > 0` for any non-negative dl).
 /// So the denominator is always positive.
 #[inline(always)]
-pub fn score_with_dl_norm_k1(idf_x_k1p1: f32, tf: u32, dl_norm_k1: f32) -> f32 {
+pub fn score_with_dl_norm_k1(idf_weight: f32, tf: u32, dl_norm_k1: f32) -> f32 {
     let tf = tf as f32;
-    idf_x_k1p1 * tf / (tf + dl_norm_k1)
+    idf_weight * tf / (tf + dl_norm_k1)
 }
 
 /// Score four cursors at the same doc in one SIMD operation. Pad
-/// unused lanes with `idf_x_k1p1 = 0` and `tf = 0` (yielding 0
+/// unused lanes with `idf_weight = 0` and `tf = 0` (yielding 0
 /// contribution; division by `dl_norm_k1` is finite). Returns the
 /// horizontal sum of the four lanes — the doc's combined score.
 ///
-/// `idfs_x_k1p1[i] = cursors[i].idf * (K1 + 1)` is precomputed at
+/// `idfs_weight[i] = cursors[i].idf` is precomputed at
 /// cursor build, so this fits one multiply + add + divide per lane.
 ///
 /// Used by the multi-term scoring path when 3-4 cursors are at the
@@ -228,11 +231,11 @@ pub fn score_with_dl_norm_k1(idf_x_k1p1: f32, tf: u32, dl_norm_k1: f32) -> f32 {
 /// scalar `score`).
 #[inline(always)]
 pub fn score_simd_x4(
-    idfs_x_k1p1: [f32; SCORE_SIMD_LANES],
+    idfs_weight: [f32; SCORE_SIMD_LANES],
     tfs: [f32; SCORE_SIMD_LANES],
     dl_norm_k1: f32,
 ) -> f32 {
-    let idf_v = f32x4::from(idfs_x_k1p1);
+    let idf_v = f32x4::from(idfs_weight);
     let tf_v = f32x4::from(tfs);
     let denom = tf_v + f32x4::splat(dl_norm_k1);
     let num = idf_v * tf_v;
@@ -242,18 +245,18 @@ pub fn score_simd_x4(
 
 /// Score one cursor at four documents in one SIMD operation. Each
 /// document has its own term frequency and length normalization; the
-/// cursor's precomputed `idf * (K1 + 1)` is shared across all lanes.
+/// cursor's precomputed `idf` is shared across all lanes.
 /// Returns the four independent contributions without reducing them.
 /// Callers pass posting-list term frequencies (`tf > 0`); unlike
 /// [`score_simd_x4`], this path does not use zero-padded lanes.
 #[inline(always)]
 pub(super) fn score_one_term_x4(
-    idf_x_k1p1: f32,
+    idf_weight: f32,
     tfs: [u32; SCORE_SIMD_LANES],
     dl_norm_k1: [f32; SCORE_SIMD_LANES],
 ) -> [f32; SCORE_SIMD_LANES] {
     let tf_v = f32x4::from([tfs[0] as f32, tfs[1] as f32, tfs[2] as f32, tfs[3] as f32]);
-    let scores = f32x4::splat(idf_x_k1p1) * tf_v / (tf_v + f32x4::from(dl_norm_k1));
+    let scores = f32x4::splat(idf_weight) * tf_v / (tf_v + f32x4::from(dl_norm_k1));
     scores.to_array()
 }
 
@@ -383,12 +386,12 @@ mod tests {
     #[test]
     fn score_at_avgdl_uses_unit_norm() {
         // When dl == avgdl, the length-norm factor is exactly 1.
-        // Then score reduces to: idf * tf * (k1+1) / (tf + k1).
+        // Then score reduces to: idf * tf / (tf + k1).
         let i = 2.0_f32;
         let tf = 5;
         let avgdl = 200.0;
         let dl = 200;
-        let expected = i * (tf as f32) * (K1 + 1.0) / ((tf as f32) + K1);
+        let expected = i * (tf as f32) / ((tf as f32) + K1);
         let actual = score(i, tf, dl, avgdl, Bm25Params::STANDARD);
         assert!(
             approx(actual, expected, 1e-5),
@@ -455,31 +458,26 @@ mod tests {
             .iter()
             .map(|(idf, tf)| score(*idf, *tf, dl, avgdl, Bm25Params::STANDARD))
             .sum();
-        let idfs_x_k1p1 = [
-            triples[0].0 * (K1 + 1.0),
-            triples[1].0 * (K1 + 1.0),
-            triples[2].0 * (K1 + 1.0),
-            triples[3].0 * (K1 + 1.0),
-        ];
+        let idfs_weight = [triples[0].0, triples[1].0, triples[2].0, triples[3].0];
         let tfs = [
             triples[0].1 as f32,
             triples[1].1 as f32,
             triples[2].1 as f32,
             triples[3].1 as f32,
         ];
-        let simd = score_simd_x4(idfs_x_k1p1, tfs, k1_norm);
+        let simd = score_simd_x4(idfs_weight, tfs, k1_norm);
         assert!((scalar - simd).abs() < 1e-4, "simd={simd} scalar={scalar}");
     }
 
     #[test]
     fn one_term_simd_x4_equals_scalar_lanes() {
-        let idf_x_k1p1 = idf(1_000_000, 10_000) * (K1 + 1.0);
+        let idf_weight = idf(1_000_000, 10_000);
         let tfs = [1, 2, 5, 9];
         let dl_norm_k1 = [0.4, 0.9, 1.2, 3.5];
-        let simd = score_one_term_x4(idf_x_k1p1, tfs, dl_norm_k1);
+        let simd = score_one_term_x4(idf_weight, tfs, dl_norm_k1);
 
         for lane in 0..SCORE_SIMD_LANES {
-            let scalar = score_with_dl_norm_k1(idf_x_k1p1, tfs[lane], dl_norm_k1[lane]);
+            let scalar = score_with_dl_norm_k1(idf_weight, tfs[lane], dl_norm_k1[lane]);
             assert!(
                 approx(simd[lane], scalar, 1e-6),
                 "lane {lane}: simd={} scalar={scalar}",

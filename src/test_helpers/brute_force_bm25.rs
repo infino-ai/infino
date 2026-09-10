@@ -11,7 +11,7 @@
 //!
 //! ```text
 //!   idf(t)      = ln(1 + (N - df(t) + 0.5) / (df(t) + 0.5))
-//!   tf_factor   = tf · (K1 + 1) / (tf + K1 · (1 - B + B · dl/avgdl))
+//!   tf_factor   = tf / (tf + K1 · (1 - B + B · dl/avgdl))
 //!   score(d, q) = Σ_{t ∈ q} idf(t) · tf_factor(tf(t, d), dl(d), avgdl)
 //!
 //!   K1 = 1.2,  B = 0.75            (standard BM25 defaults)
@@ -191,7 +191,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f / (tf_f + dl_norm);
             }
             if score > 0.0 {
                 scored.push((doc.doc_id, score));
@@ -256,7 +256,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f / (tf_f + dl_norm);
             }
             // With musts, every surviving doc matches (score > 0 since
             // idf is always positive); with none, only docs hit by at
@@ -340,7 +340,7 @@ impl BruteForceBm25 {
             let dl = doc.dl as f32;
             let (k1, b) = (self.params.k1, self.params.b);
             let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
-            let tf_factor = |tf: u32| -> f32 { tf as f32 * (k1 + 1.0) / (tf as f32 + dl_norm) };
+            let tf_factor = |tf: u32| -> f32 { tf as f32 / (tf as f32 + dl_norm) };
 
             let mut score: f32 = 0.0;
             let mut matched_any_should = false;
@@ -409,7 +409,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f / (tf_f + dl_norm);
             }
             scored.push((doc.doc_id, score));
         }

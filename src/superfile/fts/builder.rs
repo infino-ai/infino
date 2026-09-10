@@ -3399,7 +3399,7 @@ fn assemble_and_write_blob<W: Write>(
     // so the stored per-block bound is interpreted against the pair that
     // entry names. Nothing about the layout differs either way.
     let fts_version = if write_coarse {
-        format::fts::VERSION_V5
+        format::fts::VERSION_V6
     } else if finish_profile.saw_bitset_block {
         format::fts::VERSION_V4
     } else if positions_region.1 > format::CRC_BYTES as u64 {
@@ -4350,7 +4350,7 @@ mod tests {
         assert_eq!(&blob[0..8], format::fts::MAGIC);
         // Version — new code always writes V5 (coarse block-max table).
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_V5);
+        assert_eq!(version, format::fts::VERSION_V6);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -5122,7 +5122,7 @@ mod tests {
     /// identical ranked top-k as it does for the V5 blob of the same corpus —
     /// the backwards-compatibility contract for the coarse-table format bump.
     #[tokio::test]
-    async fn v5_reader_reads_legacy_v4_blob_identically() {
+    async fn current_reader_reads_legacy_v4_blob_identically() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
         let docs = positional_corpus();
@@ -5140,9 +5140,9 @@ mod tests {
         let ver = |b: &bytes::Bytes| u32::from_le_bytes(b[8..12].try_into().expect("version"));
         assert!(
             ver(&legacy) < format::fts::VERSION_V5,
-            "legacy must be < V5"
+            "legacy must predate the coarse table"
         );
-        assert_eq!(ver(&v5), format::fts::VERSION_V5);
+        assert_eq!(ver(&v5), format::fts::VERSION_V6);
 
         let r_legacy = FtsReader::open(legacy, title_json(false)).expect("legacy opens");
         let r_v5 = FtsReader::open(v5, title_json(false)).expect("v5 opens");
@@ -5318,7 +5318,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V5
+            format::fts::VERSION_V6
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

@@ -161,11 +161,11 @@ impl NormTable {
     /// `query`.
     ///
     /// The stored per-block bound is the block's true max of
-    /// `idf·tf·(k1+1) / (tf + dl_norm_k1)`. Between two parameter sets
-    /// the per-doc ratio is
+    /// `idf·tf / (tf + dl_norm_k1)`. Between two parameter sets the
+    /// per-doc ratio is
     ///
     /// ```text
-    ///   (k1'+1)/(k1+1) · (tf + A) / (tf + B),
+    ///   (tf + A) / (tf + B),
     ///       A = lut_baked[bucket],  B = lut_query[bucket]
     /// ```
     ///
@@ -198,7 +198,7 @@ impl NormTable {
             let b = other.lut[bucket as usize];
             worst = worst.max((1.0 + a) / (1.0 + b));
         }
-        worst * (query.k1 + 1.0) / (baked.k1 + 1.0)
+        worst
     }
 
     /// `dl_norm_k1` for a doc (length quantized): one per-doc byte load

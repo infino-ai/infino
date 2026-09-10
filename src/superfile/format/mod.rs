@@ -94,6 +94,33 @@ pub mod fts {
     /// table), so existing indices read unchanged and need no reindex.
     pub const VERSION_V5: u32 = 5;
 
+    /// The version new code writes. Layout is byte-for-byte
+    /// [`VERSION_V5`]; what changes is the **scale** the stored per-block
+    /// and coarse block-max bounds are expressed in.
+    ///
+    /// `V1`–`V5` bounds are maxima of `idf · tf · (k1 + 1) / (tf + k1 ·
+    /// norm)`. `V6` drops the `(k1 + 1)` factor, so a bound is a maximum
+    /// of `idf · tf / (tf + k1 · norm)` — the same quantity the scorer
+    /// now produces, and the one a BM25 implementation is conventionally
+    /// expected to report. The factor was a constant multiplier on every
+    /// score in a query, so it never changed a ranking; it did make
+    /// every published score a fixed multiple of what the same `k1` and
+    /// `b` produce elsewhere, which matters to anything reading the
+    /// number rather than the order — a score threshold, a weighted
+    /// fusion against vector distances, a comparison against another
+    /// engine.
+    ///
+    /// Readers accept `V1`–`V6`. An older blob's bounds are still exact
+    /// upper bounds in their own scale, and the reader brings them into
+    /// this one by folding `1 / (k1 + 1)` into the column's bound
+    /// correction — so existing indices read unchanged, keep their
+    /// pruning power, and need no reindex. Getting that gate wrong in
+    /// the other direction (treating a `V6` blob as older) would divide
+    /// a bound that is already correct and silently prune documents out
+    /// of the top-k, which is why the scale is version-stamped rather
+    /// than inferred.
+    pub const VERSION_V6: u32 = 6;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.

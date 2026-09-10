@@ -46,7 +46,6 @@ use crate::superfile::{
         },
     },
     fts::{
-        bm25,
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,
@@ -577,6 +576,7 @@ impl FtsReader {
             && version != format::fts::VERSION_V3
             && version != format::fts::VERSION_V4
             && version != format::fts::VERSION_V5
+            && version != format::fts::VERSION_V6
         {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
@@ -591,7 +591,8 @@ impl FtsReader {
             v if v == format::fts::VERSION_V2
                 || v == format::fts::VERSION_V3
                 || v == format::fts::VERSION_V4
-                || v == format::fts::VERSION_V5 =>
+                || v == format::fts::VERSION_V5
+                || v == format::fts::VERSION_V6 =>
             {
                 format::fts::HEADER_SIZE_V2
             }
@@ -682,6 +683,7 @@ impl FtsReader {
             v if v == format::fts::VERSION_V3 => true,
             v if v == format::fts::VERSION_V4 => true,
             v if v == format::fts::VERSION_V5 => true,
+            v if v == format::fts::VERSION_V6 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
@@ -690,11 +692,23 @@ impl FtsReader {
         };
         let has_position_subindex = version == format::fts::VERSION_V3
             || version == format::fts::VERSION_V4
-            || version == format::fts::VERSION_V5;
-        let has_bitset_blocks =
-            version == format::fts::VERSION_V4 || version == format::fts::VERSION_V5;
-        // V5 appends a per-term coarse block-max table; V1–V4 do not.
-        let has_coarse_block_max = version == format::fts::VERSION_V5;
+            || version == format::fts::VERSION_V5
+            || version == format::fts::VERSION_V6;
+        let has_bitset_blocks = version == format::fts::VERSION_V4
+            || version == format::fts::VERSION_V5
+            || version == format::fts::VERSION_V6;
+        // V5 and later append a per-term coarse block-max table; V1–V4
+        // do not.
+        let has_coarse_block_max =
+            version == format::fts::VERSION_V5 || version == format::fts::VERSION_V6;
+        // Blobs before V6 store bounds that include the `(k1 + 1)`
+        // factor the scorer no longer applies, so every stored bound is
+        // that much larger than the score it caps. Left alone it stays a
+        // valid upper bound — just a uniformly loose one, which costs
+        // block-max pruning on every file written before this. Dividing
+        // it out restores exactly the pruning those files had, and the
+        // factor is per column because `k1` is declared per column.
+        let bounds_carry_k1_plus_one = version != format::fts::VERSION_V6;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -950,7 +964,10 @@ impl FtsReader {
             // the norm and raises the score, so the stored bounds would
             // otherwise sit below scores they are meant to cap.
             let baked = dl_norm_k1.rescored(baked_avgdl, params);
-            let bound_scale = baked.bound_scale(&dl_norm_k1, params, params);
+            let mut bound_scale = baked.bound_scale(&dl_norm_k1, params, params);
+            if bounds_carry_k1_plus_one {
+                bound_scale /= params.k1 + 1.0;
+            }
             let tokenizer = tokenizer_for_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
@@ -1296,10 +1313,7 @@ impl FtsReader {
                 .collect();
             let positions = self.fetch_term_positions(&pos_ranges).await?;
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
-                cursors,
-                positions,
-                positional,
-                col_meta.params,
+                cursors, positions, positional,
             )?)));
         }
         Ok((out, dict_ranges))
@@ -1430,8 +1444,6 @@ impl FtsReader {
                         false,
                         false,
                         self.has_coarse_block_max,
-                        // Carry-only: no scores, so the pair is irrelevant.
-                        bm25::Bm25Params::STANDARD,
                         // This walk carries postings across into a merge; it
                         // reads doc ids, tfs and positions and never consults
                         // a score bound, so no correction applies.

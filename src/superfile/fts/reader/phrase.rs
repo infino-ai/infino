@@ -186,9 +186,9 @@ pub(super) struct PhraseCursor {
     pub(super) align_order: Vec<usize>,
     /// Σ member idf × (k1 + 1) — the phrase's scoring constant, built
     /// with the parameters this query scores with.
-    pub(super) idf_x_k1p1: f32,
+    pub(super) idf_weight: f32,
     /// Σ member idf, kept so a bound in the "scaled" form can be
-    /// recovered without dividing `idf_x_k1p1` by a `(k1 + 1)` the
+    /// recovered without dividing `idf_weight` by a `(k1 + 1)` the
     /// cursor would have to guess.
     pub(super) idf_sum: f32,
     /// Phrase-scaled term-level upper bound (see type docs).
@@ -212,7 +212,6 @@ impl PhraseCursor {
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
-        params: bm25::Bm25Params,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
@@ -224,7 +223,7 @@ impl PhraseCursor {
             .zip(positions)
             .zip(positional)
             .map(|((cursor, positions), (term_meta, inline_position))| {
-                // The member's own idf, not `idf_x_k1p1 / (K1 + 1)`:
+                // The member's own idf, not `idf_weight / (K1 + 1)`:
                 // dividing by the crate constant would recover the wrong
                 // value for a column scoring at a declared or overridden
                 // pair.
@@ -250,7 +249,7 @@ impl PhraseCursor {
         let mut align_order: Vec<usize> = (0..members.len()).collect();
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
-            idf_x_k1p1: params.idf_x_k1p1(idf_sum),
+            idf_weight: idf_sum,
             idf_sum,
             term_max_bm25: idf_sum * min_scaled_bound,
             members,
@@ -429,7 +428,7 @@ impl PhraseCursor {
                     .min()
                     .expect("members >= 2");
                 let ub =
-                    bm25::score_with_dl_norm_k1(self.idf_x_k1p1, min_tf, dl_norm_k1.get(aligned));
+                    bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, dl_norm_k1.get(aligned));
                 if ub < bar {
                     from = match aligned.checked_add(1) {
                         Some(next) => next,
@@ -532,7 +531,7 @@ impl PhraseCursor {
     /// per-doc BM25 normalization.
     #[inline]
     pub(super) fn score_current(&self, dl_norm_k1: f32) -> f32 {
-        bm25::score_with_dl_norm_k1(self.idf_x_k1p1, self.current_tf, dl_norm_k1)
+        bm25::score_with_dl_norm_k1(self.idf_weight, self.current_tf, dl_norm_k1)
     }
 
     /// Phrase-scaled block-level upper bound over `[range_start,
@@ -648,7 +647,7 @@ impl AnyCursor {
     pub(super) fn score_current(&self, dl_norm_k1: f32) -> f32 {
         match self {
             AnyCursor::Term(c) => {
-                bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), dl_norm_k1)
+                bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), dl_norm_k1)
             }
             AnyCursor::Phrase(c) => c.score_current(dl_norm_k1),
         }

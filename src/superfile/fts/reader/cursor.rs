@@ -342,9 +342,9 @@ pub(crate) struct TermCursor {
     /// per-cursor constant, built from the parameters this query is
     /// scoring with. Computed once at cursor build so the hot inner
     /// loop fits one multiply + add + divide per call.
-    pub(super) idf_x_k1p1: f32,
+    pub(super) idf_weight: f32,
     /// The bare effective idf (global override and repeated-term
-    /// `weight` already folded in). Kept alongside `idf_x_k1p1` because
+    /// `weight` already folded in). Kept alongside `idf_weight` because
     /// a phrase cursor composes its members' idfs, and recovering one
     /// by dividing by `(k1 + 1)` would silently use the wrong `k1` the
     /// moment a column declares a non-standard pair.
@@ -435,7 +435,6 @@ impl TermCursor {
         header_probed: bool,
         count_only: bool,
         has_coarse: bool,
-        params: bm25::Bm25Params,
         bound_scale: f32,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
@@ -453,9 +452,9 @@ impl TermCursor {
         // Stored per-block BMW upper bounds bake in the LOCAL idf, so any factor
         // that scales the score away from it — a global-idf override and/or a qtf
         // `weight` — must rescale them by the same ratio: block_max =
-        // local_idf_x_k1p1 × (an idf-independent tf-factor), so the linear rescale
+        // local_idf_weight × (an idf-independent tf-factor), so the linear rescale
         // is exact and keeps the BMW skip UBs consistent with the scores computed
-        // from `idf_x_k1p1` below. When `idf == local_idf` (the default
+        // from `idf_weight` below. When `idf == local_idf` (the default
         // per-superfile path with weight 1) the ratio is 1 and the block loop does
         // no extra work, matching the per-superfile scorer exactly.
         // Two independent reasons a stored bound needs scaling, and both
@@ -506,7 +505,7 @@ impl TermCursor {
             .collect();
 
         let mut cursor = Self {
-            idf_x_k1p1: params.idf_x_k1p1(idf),
+            idf_weight: idf,
             idf,
             term_max_bm25,
             df: term_meta.df,
@@ -543,13 +542,12 @@ impl TermCursor {
         dl_norm_k1: f32,
         global_idf: Option<f32>,
         weight: u32,
-        params: bm25::Bm25Params,
     ) -> Self {
         // Fold the qtf `weight` into the effective idf so the single-doc block-max
-        // (computed below from `idf_x_k1p1`) scales together with the score.
+        // (computed below from `idf_weight`) scales together with the score.
         let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
-        let idf_x_k1p1 = params.idf_x_k1p1(idf);
-        let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+        let idf_weight = idf;
+        let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
 
         let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
             last_doc_id: doc_id,
@@ -567,7 +565,7 @@ impl TermCursor {
         block_tfs[0] = tf;
 
         Self {
-            idf_x_k1p1,
+            idf_weight,
             idf,
             term_max_bm25: block_max_bm25,
             df: 1,
@@ -1171,7 +1169,7 @@ mod tests {
             let doc = cursor.current_doc_id();
             let tf = cursor.current_tf();
             let query_score =
-                bm25::score_with_dl_norm_k1(cursor.idf_x_k1p1, tf, col_meta.dl_norm_k1.get(doc));
+                bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, col_meta.dl_norm_k1.get(doc));
             let block_max = cursor.current_block_max_bm25();
             assert!(
                 block_max >= query_score,
