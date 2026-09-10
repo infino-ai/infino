@@ -1787,6 +1787,93 @@ mod tests {
         );
     }
 
+    /// The `positions` flag has to round-trip the catalog record, and
+    /// the failure is not the obvious one: the flag joins the table's
+    /// options-hash, so a record that lost it would make a positional
+    /// table fail its **own** hash check on reopen — refusing to open
+    /// at all — rather than merely forgetting how to answer a phrase.
+    #[test]
+    fn a_positional_column_reopens_and_still_answers_phrases() {
+        let (conn, dir) = storage_conn();
+        {
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema_id_title(),
+                    IndexSpec::new().fts(FtsField::new("title").positions(true)),
+                )
+                .expect("create_table");
+            table
+                .append(&build_title_batch(&["new york city", "york new city"]))
+                .expect("append");
+            // The phrase works before the reopen, so a failure after it
+            // is the round-trip and not the declaration.
+            assert_eq!(
+                n_rows(
+                    &table
+                        .bm25_search(
+                            "title",
+                            "\"new york\"",
+                            TOP_K,
+                            Bm25SearchOptions::new(),
+                            None
+                        )
+                        .expect("phrase search")
+                ),
+                1
+            );
+        }
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let reopened = connect(&uri).expect("reconnect");
+        let table = reopened
+            .open_table("docs")
+            .expect("a positional table must reopen — losing the flag fails the options-hash");
+        assert_eq!(
+            n_rows(
+                &table
+                    .bm25_search(
+                        "title",
+                        "\"new york\"",
+                        TOP_K,
+                        Bm25SearchOptions::new(),
+                        None
+                    )
+                    .expect("phrase search after reopen")
+            ),
+            1,
+            "the reopened table still records positions"
+        );
+    }
+
+    /// The other half of exposing `positions`: a column without them
+    /// answers a phrase query with an error naming the column, never a
+    /// silent bag-of-words fallback that would return documents holding
+    /// the words in the wrong order.
+    #[test]
+    fn a_positionless_column_rejects_a_phrase_query() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+        table
+            .append(&build_title_batch(&["york new city"]))
+            .expect("append");
+        let err = table
+            .bm25_search(
+                "title",
+                "\"new york\"",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect_err("a phrase on a positionless column must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title"),
+            "the error must name the column, got: {msg}"
+        );
+    }
+
     /// An analyzer name naming a filter this engine does not implement is
     /// refused at create time rather than silently approximated — the
     /// property the composite name exists to buy.

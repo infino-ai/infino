@@ -4946,6 +4946,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_from_readers_analysis_chain_preserved_by_new_from_reader() {
+        // Same failure shape as the pair above, one layer nastier.
+        // `new_from_reader` rebuilds a column's analyzer from
+        // `tokenizer.name()`, and for a chained column that name is the
+        // whole chain. Drop a filter there and the merged file's
+        // postings are re-tokenized *unfiltered* while the source's
+        // were filtered — so a compaction, not any user action, would
+        // change which terms exist. (In practice the merge's own
+        // carry-compatibility check would reject the mismatch first,
+        // which turns the bug into a permanently failing background
+        // compaction rather than wrong answers — still a bug, and one
+        // nothing else here would catch.)
+        let chain = "standard+stop=english+stem=english";
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").analyzer(chain).positions(true)],
+            vec![],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let source_bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(source_bytes)).expect("open reader");
+        let source_cfg = reader
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(source_cfg.tokenizer.name(), chain);
+        assert!(source_cfg.positions, "positions must reach the built file");
+
+        let (merged_bytes, _stats) =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let merged_cfg = merged
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            merged_cfg.tokenizer.name(),
+            chain,
+            "the analysis chain must survive a rebuild, or compaction \
+             silently re-tokenizes the column"
+        );
+        assert!(
+            merged_cfg.positions,
+            "the positions flag must survive a rebuild too"
+        );
+    }
+
+    #[tokio::test]
     async fn build_from_readers_fp32_codec_preserved_by_new_from_reader() {
         // new_from_reader previously omitted .with_rerank_codec, so an Fp32 source
         // produced a Sq8 merged output.  After the fix the codec round-trips exactly.

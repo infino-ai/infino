@@ -376,3 +376,119 @@ impl IndexSpec {
         (fts, vectors)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lowered analyzer name for a single declared column.
+    fn analyzer_of(field: FtsField) -> String {
+        IndexSpec::new().fts(field).fts_analyzers().remove(0)
+    }
+
+    /// The three analysis setters commute. `FtsField` holds the base
+    /// name and the two filters separately and composes them only at
+    /// lowering, precisely so a caller cannot lose a filter by
+    /// declaring the base after it — which a naive "append to a string"
+    /// implementation would do.
+    #[test]
+    fn the_analysis_setters_commute() {
+        let want = "ascii_lower+stop=english+stem=english";
+        assert_eq!(
+            analyzer_of(
+                FtsField::new("t")
+                    .analyzer("ascii_lower")
+                    .stopwords(Stopwords::English)
+                    .stemmer(Stemmer::English)
+            ),
+            want
+        );
+        // Filters first, base last — the order that would drop them if
+        // `.analyzer()` reset the chain.
+        assert_eq!(
+            analyzer_of(
+                FtsField::new("t")
+                    .stemmer(Stemmer::English)
+                    .stopwords(Stopwords::English)
+                    .analyzer("ascii_lower")
+            ),
+            want
+        );
+        // And interleaved.
+        assert_eq!(
+            analyzer_of(
+                FtsField::new("t")
+                    .stopwords(Stopwords::English)
+                    .analyzer("ascii_lower")
+                    .stemmer(Stemmer::English)
+            ),
+            want
+        );
+    }
+
+    /// A composite name round-trips through `.analyzer()`, which is
+    /// what `open_table` relies on: it rebuilds the spec by handing the
+    /// recorded name straight back, so a chain that did not survive
+    /// that would silently reopen a table with a different analyzer
+    /// than its postings were built with.
+    #[test]
+    fn a_composite_name_round_trips_through_the_analyzer_setter() {
+        for name in [
+            "standard",
+            "ascii_lower",
+            "standard+stop=english",
+            "standard+stem=english",
+            "standard+stop=english+stem=english",
+            "ascii_lower+stop=english+stem=english",
+        ] {
+            assert_eq!(analyzer_of(FtsField::new("t").analyzer(name)), name);
+        }
+    }
+
+    /// A composite name sets the components it *names* and clears none,
+    /// so a filter setter after one replaces just that component and a
+    /// setter before one is not undone.
+    #[test]
+    fn a_composite_name_sets_only_what_it_names() {
+        // The name carries no stopword set, so the earlier setter stands.
+        assert_eq!(
+            analyzer_of(
+                FtsField::new("t")
+                    .stopwords(Stopwords::English)
+                    .analyzer("standard+stem=english")
+            ),
+            "standard+stop=english+stem=english"
+        );
+        // Turning a filter back off is explicit, never implied by a name.
+        assert_eq!(
+            analyzer_of(
+                FtsField::new("t")
+                    .analyzer("standard+stop=english+stem=english")
+                    .stopwords(Stopwords::None)
+            ),
+            "standard+stem=english"
+        );
+    }
+
+    /// An unresolvable analyzer passes through untouched, so
+    /// `create_table`'s error can name what the caller actually wrote
+    /// rather than a normalized form of it.
+    #[test]
+    fn an_unresolvable_analyzer_is_lowered_verbatim() {
+        for name in ["nonesuch", "standard+stop=german", "STANDARD"] {
+            assert_eq!(analyzer_of(FtsField::new("t").analyzer(name)), name);
+        }
+    }
+
+    /// The defaults, asserted where they are declared: `standard`, no
+    /// filters, no positions. A default column's analyzer name is the
+    /// bare base name, which is what keeps it byte-identical on disk to
+    /// one declared before chains existed.
+    #[test]
+    fn a_bare_declaration_takes_the_plain_standard_analyzer() {
+        let spec = IndexSpec::new().fts("body");
+        assert_eq!(spec.fts_analyzers(), vec![STANDARD_TOKENIZER.to_string()]);
+        assert_eq!(spec.fts_positions(), vec![false]);
+        assert_eq!(spec.fts_stored(), vec![true]);
+    }
+}
