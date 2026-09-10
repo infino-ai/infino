@@ -12,47 +12,9 @@ pub mod footer;
 pub const PROJECT_MAGIC: &[u8; 3] = b"INF";
 
 /// File-format version. Semver string. Bump major to break compatibility.
-///
-/// A minor is for a change a same-major reader could not otherwise
-/// tolerate — and by [`Version::is_compatible_with_current`]'s
-/// policy (unknown KV keys ignored, unknown JSON fields ignored) an
-/// additive field is already tolerated, so most additions do not earn
-/// one. What they do earn is a note here, because this doc-comment is
-/// the only written record of what a `1.x` superfile may contain.
-///
 /// 1.1.0: `inf.fts.columns` entries may carry `"stored":false` (index-only
 /// FTS columns, absent from the Parquet body); the field is emitted only
 /// when false, and same-major readers default a missing field to true.
-///
-/// Since 1.1.0, additively, a column entry may also carry:
-///
-/// - `"positions":true` — the column's index records token positions,
-///   which exact phrase queries need. Emitted only when true; a missing
-///   field means no positions, the only thing a file predating it can
-///   mean.
-/// - `"k1"` / `"b"` — the BM25 parameters a column's stored block-max
-///   bounds were baked at, written **unconditionally**, defaults
-///   included, because the pair is the provenance of those bounds and a
-///   reader that infers it will infer wrong the day the recommended
-///   default moves. An entry without them predates the field and can
-///   only have been built at the standard `1.2` / `0.75`, so that
-///   default is **frozen** and must not follow a later change to what
-///   the API recommends.
-/// - `"stopwords"` / `"stemmer"` — the analysis filters applied to the
-///   column, by name, each emitted only when set. Absent means the
-///   filter is off, which is the one thing a file written before it
-///   existed can mean, so a reader needs no guess. A reader that does
-///   not know the field at all treats the column as unfiltered, which
-///   costs that column's results until it rolls forward — the same
-///   trade taken for `k1` / `b`, and preferred over a marker that would
-///   make the file unopenable, because a lost-recall regression is
-///   recoverable and an unopenable table is an outage.
-///
-/// What is *not* ignorable is an unrecognized **value** of a field a
-/// reader does know — `"stopwords":"german"` on an engine shipping no
-/// German list. That fails the open, because there is no sound way to
-/// proceed: analyzing without a set the postings were built with is a
-/// different index, not a degraded one.
 pub const FORMAT_VERSION: &str = "1.1.0";
 
 /// CRC width in bytes (`u32` CRC-32C, little-endian) appended after a
