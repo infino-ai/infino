@@ -86,7 +86,10 @@ class IndexSpec:
     # `stopwords="english"` drops the very common words from both the index
     # and queries; `stemmer="english"` folds inflections onto one term, so a
     # search for one finds the others. Both are off by default and recorded
-    # with the table — they decide what is in the index.
+    # with the table — they decide what is in the index, and there is no
+    # migration: changing either means re-ingesting from the source text.
+    # With `stored=False` that text is never kept, so the combination is
+    # permanent.
     # `positions=True` records token positions, which exact phrase queries
     # ('"climate policy"') need; off by default because positions roughly
     # double the column's index footprint.

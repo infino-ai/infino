@@ -305,6 +305,13 @@ impl IndexSpec {
     /// words a reader would not — so declare them on prose, not on
     /// short identifiers.
     ///
+    /// There is no migration: a removed stopword was never written and
+    /// a stem is not invertible, so changing either means building a
+    /// new table from the source text and re-ingesting. With
+    /// `stored=False` that source text is never kept, so the
+    /// combination is **permanent** — not even a full rebuild can undo
+    /// it.
+    ///
     /// `positions=True` records token positions, which is what exact
     /// phrase queries (`'"climate policy"'`) need. Off by default
     /// because positions roughly double the column's index footprint; a

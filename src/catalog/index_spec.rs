@@ -134,7 +134,16 @@ impl FtsField {
     /// or titles.
     ///
     /// Recorded with the table and cannot be changed afterwards — it
-    /// decides what is in the index.
+    /// decides what is in the index, and there is no migration. A
+    /// filter's effect is not recoverable from the index it produced:
+    /// the tokens it removed were never written, so changing it means
+    /// building a new table from the source text and re-ingesting.
+    ///
+    /// Which makes one combination permanent. On a
+    /// [`stored(false)`](FtsField::stored) column the source text is
+    /// never kept, so there is nothing left to re-analyze — not even a
+    /// full rebuild can undo the choice. Declare a filter with
+    /// `stored(false)` only once you are sure of it.
     pub fn stopwords(mut self, stopwords: Stopwords) -> Self {
         self.stopwords = stopwords;
         self
@@ -156,7 +165,17 @@ impl FtsField {
     /// frequency, and so lowers its idf.
     ///
     /// Recorded with the table and cannot be changed afterwards — it
-    /// decides what is in the index.
+    /// decides what is in the index, and there is no migration. A
+    /// stem is not invertible: the index holds `run`, never the
+    /// `running` it came from, so changing or removing the stemmer
+    /// means building a new table from the source text and
+    /// re-ingesting.
+    ///
+    /// Which makes one combination permanent. On a
+    /// [`stored(false)`](FtsField::stored) column the source text is
+    /// never kept, so there is nothing left to re-analyze — not even a
+    /// full rebuild can undo the choice. Declare a filter with
+    /// `stored(false)` only once you are sure of it.
     pub fn stemmer(mut self, stemmer: Stemmer) -> Self {
         self.stemmer = stemmer;
         self

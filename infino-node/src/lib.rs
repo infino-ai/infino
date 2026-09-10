@@ -577,7 +577,10 @@ pub struct FtsOptions {
     /// were not adjacent in the text. The trade is that once a word is
     /// not indexed, no query can find it — declare it on prose, not on
     /// short identifiers. Recorded with the table and unchangeable
-    /// afterwards, since it decides what is in the index.
+    /// afterwards, since it decides what is in the index: the words it
+    /// removed were never written, so changing it means re-ingesting
+    /// from the source text. With `stored: false` that text is never
+    /// kept, so the combination is permanent.
     pub stopwords: Option<String>,
     /// Reduce this column's words to their stems, so a search for one
     /// inflection finds the others (`running`, `runs`, `run`).
@@ -586,7 +589,11 @@ pub struct FtsOptions {
     /// Applies to both sides, like `stopwords`. The trade is precision:
     /// stemming conflates words a reader would not, and there is no way
     /// to ask for an unstemmed form on a stemmed column. Recorded with
-    /// the table and unchangeable afterwards.
+    /// the table and unchangeable afterwards: a stem is not invertible
+    /// — the index holds `run`, never the `running` it came from — so
+    /// changing it means re-ingesting from the source text, and with
+    /// `stored: false` that text is never kept, making the combination
+    /// permanent.
     pub stemmer: Option<String>,
     /// Record token positions, which is what exact phrase queries
     /// (`'"climate policy"'`) need. Default false: positions roughly
