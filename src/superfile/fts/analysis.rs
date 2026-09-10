@@ -7,11 +7,34 @@
 //! ## Shape
 //!
 //! One base tokenizer ([`AsciiLowerTokenizer`] or
-//! [`StandardTokenizer`]) followed by up to two token filters, applied
-//! in the order Lucene's `EnglishAnalyzer` applies them: stopwords are
-//! removed from the *unstemmed* token, then what survives is stemmed.
-//! The order is not configurable and is baked into the chain's name, so
-//! there is exactly one canonical spelling per chain.
+//! [`StandardTokenizer`]) followed by up to two token filters:
+//! stopwords are removed from the *unstemmed* token, then what
+//! survives is stemmed. The order is not configurable and is baked
+//! into the chain's name, so there is exactly one canonical spelling
+//! per chain.
+//!
+//! Stopwords have to precede stemming because a stopword list is
+//! written in surface forms — `are`, `their`, `these` — and stemming
+//! first would leave the list matching neither those nor their stems
+//! reliably. It is also the order every filter-chain analyzer applies
+//! them in.
+//!
+//! ## Every filter here is opt-in, and the default is untouched
+//!
+//! A column that declares no filter is not wrapped at all
+//! ([`chain_tokenizer`] hands back the bare base tokenizer), keeps its
+//! plain analyzer name, and takes the same monomorphized ingest scan
+//! it always did. So the default column is byte-identical and
+//! code-path-identical to one declared before chains existed.
+//!
+//! That matters because the default is the parity surface, and it is
+//! not this module's to move. `standard` — tokenize and lowercase,
+//! no stopwords, no stemming — is what Lucene's default analyzer does:
+//! `IndexWriterConfig` defaults to `StandardAnalyzer`, whose no-arg
+//! constructor is documented as "builds an analyzer with no stop
+//! words" and which never stemmed. Anything that closes a remaining
+//! gap in `standard` itself belongs to the tokenizer and the scorer,
+//! not here; this module only adds filters a caller asks for by name.
 //!
 //! ## The chain is its name
 //!
