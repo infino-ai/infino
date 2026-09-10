@@ -116,9 +116,9 @@ fn is_emoji_token_char(c: char) -> bool {
 /// and it costs phrase precision everywhere. Positions here are
 /// emission ordinals, so a discarded emoji leaves no gap and the words
 /// on either side of it become adjacent — `"cat <emoji> dog"` would
-/// match the exact phrase `"cat dog"`. Discarding *punctuation* without
-/// a gap is correct and is what Lucene does too; discarding something
-/// Lucene emits is not.
+/// match the exact phrase `"cat dog"`. Dropping *punctuation* without a
+/// gap is right, because punctuation is not a token; dropping something
+/// that is one is not.
 #[inline]
 fn is_token_segment(segment: &str) -> bool {
     segment
@@ -1704,9 +1704,9 @@ mod tests {
 
     #[test]
     fn long_run_is_chopped_not_dropped() {
-        // Lucene's cap chops: the text stays searchable, and the
-        // leading piece is a real term. Dropping would make the whole
-        // run unreachable and leave a hole where it stood.
+        // Chopping keeps the text searchable and makes the leading
+        // piece a real term. Dropping the run would make it wholly
+        // unreachable and leave a hole where it stood.
         for (len, want_pieces) in [
             (MAX_TOKEN_CHARS, 1),
             (OVER_CAP, 2),
