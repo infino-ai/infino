@@ -48,7 +48,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions, Stemmer,
+    Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,29 @@ fn metric_from_str(s: &str) -> Result<Metric> {
         other => Err(Error::new(
             Status::InvalidArg,
             format!("unknown metric {other:?}; use 'cosine', 'l2sq', or 'negdot'"),
+        )),
+    }
+}
+
+/// Parse a stopword-set name. Named built-in sets only; the error
+/// names the valid set rather than leaving the caller to guess.
+fn stopwords_from_name(s: &str) -> Result<Stopwords> {
+    match s.to_ascii_lowercase().as_str() {
+        "english" => Ok(Stopwords::English),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("unknown stopwords {other:?}; use 'english'"),
+        )),
+    }
+}
+
+/// Parse a stemmer name. Same shape as [`stopwords_from_name`].
+fn stemmer_from_name(s: &str) -> Result<Stemmer> {
+    match s.to_ascii_lowercase().as_str() {
+        "english" => Ok(Stemmer::English),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("unknown stemmer {other:?}; use 'english'"),
         )),
     }
 }
@@ -519,10 +543,19 @@ pub struct VectorFilter {
 #[napi]
 #[derive(Clone, Default)]
 pub struct IndexSpec {
-    /// `(column, analyzer, stored)`; `analyzer` `None` means the default.
-    fts: Vec<(String, Option<String>, bool, Option<f64>, Option<f64>)>,
+    /// One declared FTS column, as its options arrived.
+    fts: Vec<FtsDecl>,
     /// `(column, dim, metric)`.
     vectors: Vec<(String, u32, String)>,
+}
+
+/// One declared FTS column: the column name plus the options given for
+/// it, with the `Option`s still meaning "not given" so each falls back
+/// to the engine's own default rather than one restated here.
+#[derive(Clone)]
+struct FtsDecl {
+    column: String,
+    options: FtsOptions,
 }
 
 /// Per-column FTS options for `IndexSpec.fts`.
@@ -534,6 +567,33 @@ pub struct FtsOptions {
     /// split + lowercase, non-ASCII dropped). It is recorded with the
     /// table and cannot be changed afterwards.
     pub analyzer: Option<String>,
+    /// Remove this column's stopwords — the very common words whose
+    /// presence says almost nothing about what a document is about.
+    /// `"english"` is the only set; omit for none (the default).
+    ///
+    /// Applies to both sides: the words leave the index and they leave
+    /// a query, and each one removed leaves a hole in the token
+    /// positions, so an exact phrase still knows the words it matched
+    /// were not adjacent in the text. The trade is that once a word is
+    /// not indexed, no query can find it — declare it on prose, not on
+    /// short identifiers. Recorded with the table and unchangeable
+    /// afterwards, since it decides what is in the index.
+    pub stopwords: Option<String>,
+    /// Reduce this column's words to their stems, so a search for one
+    /// inflection finds the others (`running`, `runs`, `run`).
+    /// `"english"` is the only stemmer; omit for none (the default).
+    ///
+    /// Applies to both sides, like `stopwords`. The trade is precision:
+    /// stemming conflates words a reader would not, and there is no way
+    /// to ask for an unstemmed form on a stemmed column. Recorded with
+    /// the table and unchangeable afterwards.
+    pub stemmer: Option<String>,
+    /// Record token positions, which is what exact phrase queries
+    /// (`'"climate policy"'`) need. Default false: positions roughly
+    /// double the column's index footprint, so they are a per-column
+    /// opt-in. A column without them answers a phrase query with an
+    /// error naming the column, never a silent bag-of-words fallback.
+    pub positions: Option<bool>,
     /// Keep the raw text in the table (default true). `false` makes the
     /// column index-only: searchable, but the text is never stored, so
     /// it cannot be selected, projected, or filtered on (append/update
@@ -556,19 +616,16 @@ impl IndexSpec {
         Self::default()
     }
 
-    /// Mark `column` (a UTF-8 string column) as full-text indexed,
-    /// with optional per-column `options` (analyzer, stored, k1/b).
+    /// Mark `column` (a UTF-8 string column) as full-text indexed, with
+    /// optional per-column `options` (analyzer, stopwords, stemmer,
+    /// positions, stored, k1/b).
     #[napi]
     pub fn fts(&self, column: String, options: Option<FtsOptions>) -> Self {
         let mut next = self.clone();
-        let opts = options.unwrap_or_default();
-        next.fts.push((
+        next.fts.push(FtsDecl {
             column,
-            opts.analyzer,
-            opts.stored.unwrap_or(true),
-            opts.k1,
-            opts.b,
-        ));
+            options: options.unwrap_or_default(),
+        });
         next
     }
 
@@ -587,10 +644,27 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> Result<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for (column, analyzer, stored, k1, b) in &self.fts {
-            let mut field = infino::FtsField::new(column.clone()).stored(*stored);
+        for FtsDecl { column, options } in &self.fts {
+            let FtsOptions {
+                analyzer,
+                stopwords,
+                stemmer,
+                positions,
+                stored,
+                k1,
+                b,
+            } = options;
+            let mut field = infino::FtsField::new(column.clone())
+                .positions(positions.unwrap_or(false))
+                .stored(stored.unwrap_or(true));
             if let Some(a) = analyzer {
                 field = field.analyzer(a.clone());
+            }
+            if let Some(name) = stopwords {
+                field = field.stopwords(stopwords_from_name(name)?);
+            }
+            if let Some(name) = stemmer {
+                field = field.stemmer(stemmer_from_name(name)?);
             }
             // Both or neither: the two parameters interact through the
             // length norm, so half-overriding is a footgun.

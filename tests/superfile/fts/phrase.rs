@@ -13,7 +13,10 @@
 use std::collections::{HashMap, HashSet};
 
 use infino::{
-    superfile::{SuperfileReader, fts::reader::BoolMode},
+    superfile::{
+        SuperfileReader,
+        fts::{reader::BoolMode, tokenize::Phrase},
+    },
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 
@@ -57,10 +60,10 @@ async fn assert_matches_oracle(
     let own = |v: Vec<std::borrow::Cow<'_, str>>| -> Vec<String> {
         v.into_iter().map(|t| t.into_owned()).collect()
     };
-    let own_ph = |v: Vec<Vec<std::borrow::Cow<'_, str>>>| -> Vec<Vec<String>> {
-        v.into_iter()
-            .map(|p| p.into_iter().map(|t| t.into_owned()).collect())
-            .collect()
+    // `Phrase::map` carries each term's offset across, so the oracle
+    // grades the spacing the parser derived rather than adjacency.
+    let own_ph = |v: Vec<Phrase<std::borrow::Cow<'_, str>>>| -> Vec<Phrase<String>> {
+        v.iter().map(|p| p.map(|t| t.to_string())).collect()
     };
     let want = oracle.top_k_atoms(
         &own(clauses.musts),
@@ -382,16 +385,16 @@ async fn unranked_ids_and_count_agree_with_oracle() {
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&refs, tok.as_ref());
 
-    let alpha_beta = || vec![vec!["alpha".to_string(), "beta".to_string()]];
-    let shapes: Vec<(Vec<&str>, Vec<Vec<String>>)> = vec![
+    let adjacent = |terms: &[&str]| -> Phrase<String> {
+        Phrase::adjacent(terms.iter().map(|t| t.to_string()).collect())
+    };
+    let alpha_beta = || vec![adjacent(&["alpha", "beta"])];
+    let shapes: Vec<(Vec<&str>, Vec<Phrase<String>>)> = vec![
         (vec![], alpha_beta()),
         (vec!["gamma"], alpha_beta()),
         (
             vec![],
-            vec![
-                vec!["alpha".to_string(), "beta".to_string()],
-                vec!["gamma".to_string(), "delta".to_string()],
-            ],
+            vec![adjacent(&["alpha", "beta"]), adjacent(&["gamma", "delta"])],
         ),
     ];
     for (terms, phrases) in shapes {
@@ -457,7 +460,7 @@ async fn phrase_and_rare_term_two_phase_agrees() {
     let oracle = BruteForceBm25::index(&refs, tok.as_ref());
 
     let terms = vec!["uk"];
-    let phrases = vec![vec!["the".to_string(), "who".to_string()]];
+    let phrases = vec![Phrase::adjacent(vec!["the".to_string(), "who".to_string()])];
     let owned_terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
 
     let want: HashSet<u64> = oracle
@@ -529,7 +532,7 @@ async fn two_phase_phrase_with_dense_bitset_members_agrees() {
     let oracle = BruteForceBm25::index(&refs, tok.as_ref());
 
     let terms = vec!["uk"];
-    let phrases = vec![vec!["the".to_string(), "who".to_string()]];
+    let phrases = vec![Phrase::adjacent(vec!["the".to_string(), "who".to_string()])];
     let owned_terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
 
     let want: HashSet<u64> = oracle

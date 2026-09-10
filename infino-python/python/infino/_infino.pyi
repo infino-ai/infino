@@ -83,6 +83,13 @@ class Connection:
 
 class IndexSpec:
     def __init__(self) -> None: ...
+    # `stopwords="english"` drops the very common words from both the index
+    # and queries; `stemmer="english"` folds inflections onto one term, so a
+    # search for one finds the others. Both are off by default and recorded
+    # with the table — they decide what is in the index.
+    # `positions=True` records token positions, which exact phrase queries
+    # ('"climate policy"') need; off by default because positions roughly
+    # double the column's index footprint.
     # `stored=False` declares an index-only column: searchable, but the raw
     # text is never kept, so it cannot be selected, projected, or filtered on.
     # `k1` / `b` are the column's BM25 similarity parameters (defaults 1.2 and
@@ -91,6 +98,9 @@ class IndexSpec:
         self,
         column: str,
         analyzer: str | None = None,
+        stopwords: str | None = None,
+        stemmer: str | None = None,
+        positions: bool = False,
         stored: bool = True,
         k1: float | None = None,
         b: float | None = None,

@@ -33,7 +33,8 @@ use pyo3::types::{PyDict, PyList};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
+    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, Stemmer, Stopwords,
+    VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -214,10 +215,56 @@ fn connect(
     Ok(Connection { inner })
 }
 
-/// One declared FTS column: `(column, analyzer, stored, k1, b)`.
-/// `analyzer` `None` means the default; `k1` / `b` `None` means the
-/// column takes the standard BM25 pair.
-type FtsDecl = (String, Option<String>, bool, Option<f32>, Option<f32>);
+/// One declared FTS column, as its keyword arguments arrived.
+/// `analyzer` / `stopwords` / `stemmer` `None` mean the defaults;
+/// `k1` / `b` `None` mean the column takes the standard BM25 pair.
+struct FtsDecl {
+    column: String,
+    analyzer: Option<String>,
+    stopwords: Option<String>,
+    stemmer: Option<String>,
+    positions: bool,
+    stored: bool,
+    k1: Option<f32>,
+    b: Option<f32>,
+}
+
+impl Clone for FtsDecl {
+    fn clone(&self) -> Self {
+        Self {
+            column: self.column.clone(),
+            analyzer: self.analyzer.clone(),
+            stopwords: self.stopwords.clone(),
+            stemmer: self.stemmer.clone(),
+            positions: self.positions,
+            stored: self.stored,
+            k1: self.k1,
+            b: self.b,
+        }
+    }
+}
+
+/// Resolve the `stopwords=` argument. Named built-in sets only; the
+/// error names the valid set rather than leaving the caller to guess.
+fn stopwords_from_name(name: &str) -> PyResult<Stopwords> {
+    match name {
+        "english" => Ok(Stopwords::English),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "IndexSpec.fts: unknown stopwords {other:?} (valid: \"english\")"
+        ))),
+    }
+}
+
+/// Resolve the `stemmer=` argument. Same shape as
+/// [`stopwords_from_name`].
+fn stemmer_from_name(name: &str) -> PyResult<Stemmer> {
+    match name {
+        "english" => Ok(Stemmer::English),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "IndexSpec.fts: unknown stemmer {other:?} (valid: \"english\")"
+        ))),
+    }
+}
 
 /// Declares which columns are full-text (BM25) and which are vector
 /// (IVF kNN) indexed. Built fluently:
@@ -246,6 +293,24 @@ impl IndexSpec {
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
     ///
+    /// `stopwords="english"` removes the very common words — the ones
+    /// whose presence says almost nothing about what a document is
+    /// about — from both the index and queries. `stemmer="english"`
+    /// reduces words to their stems, so a search for one inflection
+    /// finds the others (`running`, `runs`, `run`). Both are off by
+    /// default, apply to both sides of the search, and are recorded
+    /// with the table: they decide what is in the index, so neither can
+    /// be changed afterwards. Each trades something back — once a word
+    /// is not indexed no query can find it, and stemming conflates
+    /// words a reader would not — so declare them on prose, not on
+    /// short identifiers.
+    ///
+    /// `positions=True` records token positions, which is what exact
+    /// phrase queries (`'"climate policy"'`) need. Off by default
+    /// because positions roughly double the column's index footprint; a
+    /// column without them answers a phrase query with an error naming
+    /// the column, never a silent bag-of-words fallback.
+    ///
     /// `k1` and `b` are the column's BM25 similarity parameters —
     /// term-frequency saturation (`> 0`) and length normalization (in
     /// `[0, 1]`), defaulting to `1.2` and `0.75`. They are recorded
@@ -254,17 +319,39 @@ impl IndexSpec {
     /// may still score with a different pair (see `bm25_search`), which
     /// is the shape to reach for while tuning; declare the pair here
     /// once it is settled.
-    #[pyo3(signature = (column, analyzer = None, stored = true, k1 = None, b = None))]
+    #[pyo3(signature = (
+        column,
+        analyzer = None,
+        stopwords = None,
+        stemmer = None,
+        positions = false,
+        stored = true,
+        k1 = None,
+        b = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn fts(
         &self,
         column: String,
         analyzer: Option<String>,
+        stopwords: Option<String>,
+        stemmer: Option<String>,
+        positions: bool,
         stored: bool,
         k1: Option<f32>,
         b: Option<f32>,
     ) -> Self {
         let mut next = self.clone();
-        next.fts.push((column, analyzer, stored, k1, b));
+        next.fts.push(FtsDecl {
+            column,
+            analyzer,
+            stopwords,
+            stemmer,
+            positions,
+            stored,
+            k1,
+            b,
+        });
         next
     }
 
@@ -282,10 +369,28 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> PyResult<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for (column, analyzer, stored, k1, b) in &self.fts {
-            let mut field = infino::FtsField::new(column.clone()).stored(*stored);
+        for decl in &self.fts {
+            let FtsDecl {
+                column,
+                analyzer,
+                stopwords,
+                stemmer,
+                positions,
+                stored,
+                k1,
+                b,
+            } = decl;
+            let mut field = infino::FtsField::new(column.clone())
+                .positions(*positions)
+                .stored(*stored);
             if let Some(a) = analyzer {
                 field = field.analyzer(a.clone());
+            }
+            if let Some(name) = stopwords {
+                field = field.stopwords(stopwords_from_name(name)?);
+            }
+            if let Some(name) = stemmer {
+                field = field.stemmer(stemmer_from_name(name)?);
             }
             // Both or neither, as at the search surface: the two
             // parameters interact through the length norm, so

@@ -1397,7 +1397,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency,
+        Bm25SearchOptions, BoolMode, Consistency, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
         supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
@@ -1591,6 +1591,226 @@ mod tests {
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
         ));
+    }
+
+    /// Stemming, end to end: one inflection finds the others because
+    /// both sides of the search run through the same chain.
+    #[test]
+    fn stemming_folds_inflections_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+        let stemmed = conn
+            .create_table(
+                "stemmed",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stemmer(Stemmer::English)),
+            )
+            .expect("create stemmed table");
+        stemmed
+            .append(&build_title_batch(&[
+                "running late",
+                "she runs fast",
+                "a walk",
+            ]))
+            .expect("append");
+
+        // Every inflection reaches both documents holding one, whichever
+        // one the query spells.
+        for query in ["running", "runs", "run"] {
+            let hits = stemmed
+                .bm25_search("title", query, TOP_K, Bm25SearchOptions::new(), None)
+                .expect("bm25_search");
+            assert_eq!(
+                n_rows(&hits),
+                2,
+                "{query:?} must reach both inflections on a stemmed column"
+            );
+        }
+
+        // And the same corpus without the stemmer separates them, so the
+        // declaration is what changed the answer.
+        let plain = conn
+            .create_table("plain", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create plain table");
+        plain
+            .append(&build_title_batch(&[
+                "running late",
+                "she runs fast",
+                "a walk",
+            ]))
+            .expect("append");
+        let hits = plain
+            .bm25_search("title", "run", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&hits),
+            0,
+            "an unstemmed column matches the word only"
+        );
+    }
+
+    /// Stopword removal, end to end, including the consequence worth
+    /// being explicit about: once a word is not indexed, no query can
+    /// find it.
+    #[test]
+    fn stopwords_leave_the_index_and_the_query() {
+        let conn = connect("memory://").expect("connect");
+        let stopped = conn
+            .create_table(
+                "stopped",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stopwords(Stopwords::English)),
+            )
+            .expect("create stopped table");
+        stopped
+            .append(&build_title_batch(&["the fox and the hound", "a cat"]))
+            .expect("append");
+
+        // The content words still search normally.
+        let hits = stopped
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(n_rows(&hits), 1);
+
+        // A stopword leaves the query too, so a query of nothing but
+        // stopwords has no term left to match — not an error, no rows.
+        let hits = stopped
+            .bm25_search("title", "the and", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("a stopword-only query is not an error");
+        assert_eq!(n_rows(&hits), 0, "nothing is left of the query to match");
+
+        // And a query mixing the two searches only what survives, so the
+        // stopword neither narrows nor widens the result.
+        let hits = stopped
+            .bm25_search("title", "the fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(n_rows(&hits), 1);
+    }
+
+    /// The hole a removed stopword leaves is what keeps a phrase honest:
+    /// `"new york"` must not match `new the york`, and
+    /// `"end of the world"` must still match the text it came from.
+    #[test]
+    fn stopword_holes_keep_phrase_spacing_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table(
+                "phrases",
+                schema_id_title(),
+                IndexSpec::new().fts(
+                    FtsField::new("title")
+                        .stopwords(Stopwords::English)
+                        .positions(true),
+                ),
+            )
+            .expect("create table");
+        table
+            .append(&build_title_batch(&[
+                "new york city",                // 0: the words are adjacent
+                "new the york city",            // 1: a removed word sits between them
+                "the end of the world is nigh", // 2
+                "end world",                    // 3: no gap where the phrase wants one
+            ]))
+            .expect("append");
+
+        let phrase = |q: &str| -> usize {
+            n_rows(
+                &table
+                    .bm25_search("title", q, TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("phrase search"),
+            )
+        };
+
+        // Adjacent in the text and adjacent in the phrase: a match. The
+        // document with a removed word between them is *not* one — its
+        // `york` sits one position further along, exactly where the hole
+        // left it.
+        assert_eq!(
+            phrase("\"new york\""),
+            1,
+            "only the text whose words are really adjacent"
+        );
+        // The query's own removed words become the spacing it asks for:
+        // `end` and `world` three positions apart, which is where the
+        // same chain put them in document 2 — and not in document 3,
+        // where they are adjacent.
+        assert_eq!(
+            phrase("\"end of the world\""),
+            1,
+            "the phrase asks for the spacing its own stopwords imply"
+        );
+        // Naming the surviving words as an adjacent phrase finds the
+        // document where they *are* adjacent, and only that one.
+        assert_eq!(phrase("\"end world\""), 1);
+    }
+
+    /// A chained column survives a reopen: the analyzer name carries the
+    /// whole chain through the catalog record, so query text is tokenized
+    /// the same way after reopening as before, and the table's
+    /// options-hash still verifies.
+    #[test]
+    fn a_chained_column_survives_reopen_on_storage() {
+        let (conn, _dir) = storage_conn();
+        {
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema_id_title(),
+                    IndexSpec::new().fts(
+                        FtsField::new("title")
+                            .stopwords(Stopwords::English)
+                            .stemmer(Stemmer::English),
+                    ),
+                )
+                .expect("create_table");
+            table
+                .append(&build_title_batch(&["the running studies"]))
+                .expect("append");
+        }
+        // A fresh connection over the same root, so the spec is rebuilt
+        // from the catalog rather than reused from memory.
+        let uri = _dir.path().to_str().expect("utf8 path").to_string();
+        let reopened = connect(&uri).expect("reconnect");
+        let table = reopened.open_table("docs").expect("open_table");
+        let hits = table
+            .bm25_search(
+                "title",
+                "the studies",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect("bm25_search after reopen");
+        assert_eq!(
+            n_rows(&hits),
+            1,
+            "the reopened table still stems and still drops stopwords"
+        );
+    }
+
+    /// An analyzer name naming a filter this engine does not implement is
+    /// refused at create time rather than silently approximated — the
+    /// property the composite name exists to buy.
+    #[test]
+    fn an_unimplemented_analysis_filter_is_refused() {
+        let conn = connect("memory://").expect("connect");
+        for name in [
+            "standard+stop=german",
+            "standard+stem=porter",
+            "standard+stem=english+stop=english",
+        ] {
+            let err = conn
+                .create_table(
+                    "bad",
+                    schema_id_title(),
+                    IndexSpec::new().fts(FtsField::new("title").analyzer(name)),
+                )
+                .expect_err("an unimplemented chain must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(name),
+                "the error must name the analyzer as written, got: {msg}"
+            );
+        }
     }
 
     #[test]

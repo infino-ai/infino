@@ -53,7 +53,10 @@
 use std::collections::HashSet;
 
 use infino::{
-    superfile::{SuperfileReader, fts::reader::BoolMode},
+    superfile::{
+        SuperfileReader,
+        fts::{reader::BoolMode, tokenize::Phrase},
+    },
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
@@ -244,10 +247,10 @@ fn run_case(
     let own = |v: Vec<std::borrow::Cow<'_, str>>| -> Vec<String> {
         v.into_iter().map(|t| t.into_owned()).collect()
     };
-    let own_ph = |v: Vec<Vec<std::borrow::Cow<'_, str>>>| -> Vec<Vec<String>> {
-        v.into_iter()
-            .map(|p| p.into_iter().map(|t| t.into_owned()).collect())
-            .collect()
+    // `Phrase::map` carries each term's offset across, so the oracle
+    // grades the spacing the parser derived rather than adjacency.
+    let own_ph = |v: Vec<Phrase<std::borrow::Cow<'_, str>>>| -> Vec<Phrase<String>> {
+        v.iter().map(|p| p.map(|t| t.to_string())).collect()
     };
     let want_full = oracle.top_k_atoms(
         &own(clauses.musts),
