@@ -40,7 +40,10 @@ use infino::{
     Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::{
+            reader::{Bm25Stats, BoolMode},
+            tokenize::Phrase,
+        },
     },
     supertable::{Supertable, SupertableOptions, query::SuperfileHit},
     test_helpers::{
@@ -452,7 +455,10 @@ impl QueryShape {
             Self::Phrase(terms) => {
                 // A bare quoted run is a *should* phrase, matching how
                 // the engine's clause split reads it with no sigil.
-                let phrase: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+                // Adjacent, which is every phrase on a column with no
+                // analysis chain.
+                let phrase =
+                    Phrase::adjacent(terms.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>());
                 let all = oracles
                     .iter()
                     .flat_map(|o| o.top_k_atoms(&[], &[], &[], from_ref(&phrase), &[], &[], k))

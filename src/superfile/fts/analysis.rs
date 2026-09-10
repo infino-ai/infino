@@ -70,17 +70,26 @@ use super::tokenize::{
 /// extension path stays open as a future `+stop=custom` name whose
 /// sibling word list an older engine rejects on the unknown name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// A second language is the obvious next addition, and adding an enum
+// variant is a breaking change unless the enum says otherwise. Callers
+// only ever *construct* these, never match on them, so the attribute
+// costs nothing and buys every later set a patch release.
+#[non_exhaustive]
 pub enum Stopwords {
     /// Keep every token (the default).
     #[default]
     None,
     /// Lucene's `EnglishAnalyzer.ENGLISH_STOP_WORDS_SET` — the 33-word
-    /// Snowball English list. See [`ENGLISH_STOPWORDS`].
+    /// Snowball English list: `a an and are as at be but by for if in
+    /// into is it no not of on or such that the their then there these
+    /// they this to was will with`.
     English,
 }
 
 /// Stemmer applied to a column, after stopword removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `#[non_exhaustive]` for the same reason as [`Stopwords`].
+#[non_exhaustive]
 pub enum Stemmer {
     /// Index tokens as written (the default).
     #[default]
@@ -102,7 +111,7 @@ pub enum Stemmer {
 /// are searched in ~5 comparisons with no hashing and no lazy-init, and
 /// the length pre-filter below rejects most corpus tokens before the
 /// search runs at all.
-pub const ENGLISH_STOPWORDS: &[&str] = &[
+pub(crate) const ENGLISH_STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
     "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
     "they", "this", "to", "was", "will", "with",
