@@ -29,21 +29,17 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
-use bytes::Bytes;
 use infino::{
     Stemmer, Stopwords,
     superfile::{
         SuperfileReader,
-        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::{
-            reader::BoolMode,
-            tokenize::{Phrase, Tokenizer},
-        },
+        builder::FtsConfig,
+        fts::{reader::BoolMode, tokenize::Tokenizer},
     },
-    test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids},
+    test_helpers::brute_force_bm25::BruteForceBm25,
 };
+
+use crate::fts::brute_force_oracle::{build_infino_superfile_with_fts, oracle_top_k_atoms};
 
 /// k large enough to capture every match on the corpus below.
 const K_ALL: usize = 64;
@@ -78,33 +74,17 @@ fn corpus() -> Vec<(u64, &'static str)> {
 fn build(
     stopwords: Stopwords,
     stemmer: Stemmer,
-    analyzer: &str,
+    tokenizer: &str,
 ) -> (SuperfileReader, BruteForceBm25, Arc<dyn Tokenizer>) {
     let corp = corpus();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::Decimal128(38, 0), false),
-        Field::new("title", DataType::LargeUtf8, false),
-    ]));
-    let opts = BuilderOptions::new(
-        schema.clone(),
-        "doc_id",
-        vec![
-            FtsConfig::new("title")
-                .analyzer(analyzer)
-                .stopwords(stopwords)
-                .stemmer(stemmer)
-                .positions(true),
-        ],
-        vec![],
+    let reader = build_infino_superfile_with_fts(
+        &corp,
+        FtsConfig::new("title")
+            .analyzer(tokenizer)
+            .stopwords(stopwords)
+            .stemmer(stemmer)
+            .positions(true),
     );
-    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-    let ids = decimal128_ids(corp.iter().map(|(i, _)| *i));
-    let titles = LargeStringArray::from(corp.iter().map(|(_, t)| *t).collect::<Vec<_>>());
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
-        .expect("build RecordBatch");
-    b.add_batch(&batch, &[]).expect("add_batch");
-    let bytes = Bytes::from(b.finish().expect("finish builder"));
-    let reader = SuperfileReader::open(bytes).expect("open superfile");
     // Take the tokenizer back off the *reader*, not from a name: it is
     // the one the reader will tokenize queries with, so the oracle is
     // graded against the engine's own analysis rather than a
@@ -173,22 +153,7 @@ async fn assert_matches_oracle(
     query: &str,
     mode: BoolMode,
 ) {
-    let clauses = tok.parse(query).into_clauses(mode);
-    let own = |v: Vec<std::borrow::Cow<'_, str>>| -> Vec<String> {
-        v.into_iter().map(|t| t.into_owned()).collect()
-    };
-    let own_ph = |v: Vec<Phrase<std::borrow::Cow<'_, str>>>| -> Vec<Phrase<String>> {
-        v.iter().map(|p| p.map(|t| t.to_string())).collect()
-    };
-    let want = oracle.top_k_atoms(
-        &own(clauses.musts),
-        &own_ph(clauses.must_phrases),
-        &own(clauses.shoulds),
-        &own_ph(clauses.should_phrases),
-        &own(clauses.negatives),
-        &own_ph(clauses.negative_phrases),
-        K_ALL,
-    );
+    let want = oracle_top_k_atoms(oracle, tok, query, mode, K_ALL);
     let got: Vec<(u64, f32)> = reader
         .bm25_hits_async("title", query, K_ALL, mode)
         .await

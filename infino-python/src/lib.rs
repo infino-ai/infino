@@ -218,6 +218,7 @@ fn connect(
 /// One declared FTS column, as its keyword arguments arrived.
 /// `analyzer` / `stopwords` / `stemmer` `None` mean the defaults;
 /// `k1` / `b` `None` mean the column takes the standard BM25 pair.
+#[derive(Clone)]
 struct FtsDecl {
     column: String,
     analyzer: Option<String>,
@@ -227,21 +228,6 @@ struct FtsDecl {
     stored: bool,
     k1: Option<f32>,
     b: Option<f32>,
-}
-
-impl Clone for FtsDecl {
-    fn clone(&self) -> Self {
-        Self {
-            column: self.column.clone(),
-            analyzer: self.analyzer.clone(),
-            stopwords: self.stopwords.clone(),
-            stemmer: self.stemmer.clone(),
-            positions: self.positions,
-            stored: self.stored,
-            k1: self.k1,
-            b: self.b,
-        }
-    }
 }
 
 /// Resolve the `stopwords=` argument. Named built-in sets only; the

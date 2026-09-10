@@ -2363,8 +2363,10 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 ///
 /// Output shape per column:
 /// `{"name":"<escaped>","tokenizer":"<name>","k1":<f>,"b":<f>}`.
-/// `tokenizer` is that column's **base** analyzer name (`"ascii_lower"`
-/// or `"standard"`), straight from `FtsConfig.analyzer`. A stopword set
+/// `tokenizer` holds the column's base tokenizer name (`"ascii_lower"`
+/// or `"standard"`), straight from `FtsConfig.analyzer` — whose field
+/// name says `analyzer` only because that is what the public option is
+/// called. A stopword set
 /// and a stemmer ride as `"stopwords"` / `"stemmer"`, each emitted only
 /// when set; the reader reconstructs the column's tokenizer from all
 /// three for query-time tokenization, and a missing filter field means

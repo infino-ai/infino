@@ -6,6 +6,14 @@
 //!
 //! ## Shape
 //!
+//! A word on names. Here *tokenizer* means the thing that splits text
+//! — `standard` or `ascii_lower` — and *analyzer* means the whole
+//! chain: that tokenizer plus its filters. The public builder's option
+//! is spelled `.analyzer(...)` for historical reasons but takes a
+//! tokenizer name, and the persisted field is spelled `"tokenizer"`,
+//! which is accurate. Before filters existed the two words were
+//! interchangeable for this engine; they no longer are.
+//!
 //! One base tokenizer ([`AsciiLowerTokenizer`] or
 //! [`StandardTokenizer`]) followed by up to two token filters:
 //! stopwords are removed from the *unstemmed* token, then what
@@ -23,7 +31,7 @@
 //!
 //! A column that declares no filter is not wrapped at all
 //! ([`chain_tokenizer`] hands back the bare base tokenizer), keeps its
-//! plain analyzer name, and takes the same monomorphized ingest scan
+//! plain tokenizer name, and takes the same monomorphized ingest scan
 //! it always did. So the default column is byte-identical and
 //! code-path-identical to one declared before chains existed.
 //!
@@ -38,7 +46,7 @@
 //!
 //! ## Persistence: two additive fields, and a derived identity
 //!
-//! A column persists its base analyzer name plus, only when set, a
+//! A column persists its base tokenizer name plus, only when set, a
 //! `stopwords` and a `stemmer` field. Both are ordinary additive
 //! fields: absent means the filter is off, which is the one thing a
 //! file written before the filter existed can mean, so a current
@@ -54,7 +62,7 @@
 //!   - the `LIKE` prune lowering, which recognizes analyzers by
 //!     [`Tokenizer::name`] and must decline to bound a column whose
 //!     terms are not substring-preserving images of its text;
-//!   - the merge carry check, which compares analyzer names to refuse
+//!   - the merge carry check, which compares these identities to refuse
 //!     merging differently-analyzed superfiles;
 //!   - the table's options-hash, which needs analysis in its identity.
 //!
@@ -100,7 +108,7 @@ use super::tokenize::{
 /// before the stemmer.
 ///
 /// Named built-ins only. A user-supplied word list would have to
-/// persist beside the analyzer name, which is exactly the
+/// persist beside the tokenizer name, which is exactly the
 /// additive-and-ignorable shape the composite name exists to avoid; the
 /// extension path stays open as a future `+stop=custom` name whose
 /// sibling word list an older engine rejects on the unknown name.
@@ -203,13 +211,13 @@ pub(crate) enum Base {
 }
 
 impl Base {
-    /// This base's own plain analyzer name — the chain name with no
-    /// filters.
+    /// This base's own plain tokenizer name — the chain identity with
+    /// no filters.
     pub(crate) fn name(self) -> &'static str {
         chain_name(self, Stopwords::None, Stemmer::None)
     }
 
-    /// Resolve a base analyzer name.
+    /// Resolve a base tokenizer name.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             ASCII_LOWER_TOKENIZER => Some(Base::AsciiLower),

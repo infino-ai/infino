@@ -1784,10 +1784,10 @@ mod tests {
         assert_eq!(phrase("\"end world\""), 1);
     }
 
-    /// A chained column survives a reopen: the analyzer name carries the
-    /// whole chain through the catalog record, so query text is tokenized
-    /// the same way after reopening as before, and the table's
-    /// options-hash still verifies.
+    /// A column with filters survives a reopen: the catalog record
+    /// carries the tokenizer and both filters, so query text is
+    /// tokenized the same way after reopening as before, and the
+    /// table's options-hash still verifies.
     #[test]
     fn a_chained_column_survives_reopen_on_storage() {
         let (conn, _dir) = storage_conn();
@@ -1915,9 +1915,57 @@ mod tests {
         );
     }
 
-    /// An unknown analyzer is refused at create time, naming what the
-    /// caller wrote. Filters are separate options now, so a
-    /// chain-shaped string is simply an analyzer name that does not
+    /// A catalog record naming a filter this engine cannot reproduce
+    /// makes the table unusable rather than usable-with-a-guess. Same
+    /// rule as the superfile entry: an *absent* filter means off, and a
+    /// *present* name that does not resolve is refused — analyzing
+    /// without the set the postings were built with is a different
+    /// index, not a degraded one.
+    #[test]
+    fn a_catalog_record_naming_an_unresolvable_filter_is_refused() {
+        for (field, bad) in [("fts_stopwords", "german"), ("fts_stemmers", "porter")] {
+            let (conn, dir) = storage_conn();
+            conn.create_table(
+                "docs",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stopwords(Stopwords::English)),
+            )
+            .expect("create_table");
+            // Rewrite just that column's filter name in the catalog,
+            // leaving everything else intact.
+            let path = dir.path().join(CATALOG_PATH);
+            let body = std::fs::read_to_string(&path).expect("read catalog");
+            let patched = body.replace(
+                &format!("\"{field}\":[\"english\"]"),
+                &format!("\"{field}\":[\"{bad}\"]"),
+            );
+            let patched = match patched == body {
+                // The stemmer list is empty in this fixture, so inject.
+                true => body.replace(
+                    &format!("\"{field}\":[\"\"]"),
+                    &format!("\"{field}\":[\"{bad}\"]"),
+                ),
+                false => patched,
+            };
+            assert_ne!(patched, body, "{field}: fixture did not patch");
+            std::fs::write(&path, &patched).expect("write catalog");
+
+            let uri = dir.path().to_str().expect("utf8 path").to_string();
+            let reopened = connect(&uri).expect("reconnect");
+            let err = reopened
+                .open_table("docs")
+                .expect_err("an unresolvable filter must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(bad) && msg.contains("title"),
+                "{field}: the error must name the value and the column, got: {msg}"
+            );
+        }
+    }
+
+    /// An unknown tokenizer is refused at create time, naming what the
+    /// caller wrote. The filters are separate options, so a
+    /// chain-shaped string is simply a tokenizer name that does not
     /// resolve — it must not be quietly interpreted as a chain.
     #[test]
     fn an_unknown_analyzer_is_refused_and_a_chain_shaped_name_is_not_interpreted() {

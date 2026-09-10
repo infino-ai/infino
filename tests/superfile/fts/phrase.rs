@@ -21,7 +21,7 @@ use infino::{
 };
 
 use crate::fts::brute_force_oracle::{
-    build_infino_superfile_positional, build_multi_block_corpus, corpus,
+    build_infino_superfile_positional, build_multi_block_corpus, corpus, oracle_top_k_atoms,
 };
 
 /// k large enough to capture every match on the 60-doc corpus.
@@ -56,24 +56,7 @@ async fn assert_matches_oracle(
     k: usize,
 ) {
     let tok = default_tokenizer();
-    let clauses = tok.parse(query).into_clauses(mode);
-    let own = |v: Vec<std::borrow::Cow<'_, str>>| -> Vec<String> {
-        v.into_iter().map(|t| t.into_owned()).collect()
-    };
-    // `Phrase::map` carries each term's offset across, so the oracle
-    // grades the spacing the parser derived rather than adjacency.
-    let own_ph = |v: Vec<Phrase<std::borrow::Cow<'_, str>>>| -> Vec<Phrase<String>> {
-        v.iter().map(|p| p.map(|t| t.to_string())).collect()
-    };
-    let want = oracle.top_k_atoms(
-        &own(clauses.musts),
-        &own_ph(clauses.must_phrases),
-        &own(clauses.shoulds),
-        &own_ph(clauses.should_phrases),
-        &own(clauses.negatives),
-        &own_ph(clauses.negative_phrases),
-        k,
-    );
+    let want = oracle_top_k_atoms(oracle, tok.as_ref(), query, mode, k);
     let got = search_hits(reader, query, k, mode).await;
 
     let got_ids: HashSet<u64> = got.iter().map(|(d, _)| *d).collect();

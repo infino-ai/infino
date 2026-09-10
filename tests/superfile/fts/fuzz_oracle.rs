@@ -53,15 +53,12 @@
 use std::collections::HashSet;
 
 use infino::{
-    superfile::{
-        SuperfileReader,
-        fts::{reader::BoolMode, tokenize::Phrase},
-    },
+    superfile::{SuperfileReader, fts::reader::BoolMode},
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
 
-use crate::fts::brute_force_oracle::build_infino_superfile_positional;
+use crate::fts::brute_force_oracle::{build_infino_superfile_positional, oracle_top_k_atoms};
 
 /// Small shared vocabulary. Kept short so terms co-occur, intersect,
 /// and (across enough docs) form dense bitset blocks — the shapes the
@@ -243,24 +240,7 @@ fn run_case(
 
     // Oracle full match set (k = n) via the same parsed clauses, so the
     // clause interpretation can never diverge from the reader's.
-    let clauses = tok.parse(&query).into_clauses(mode);
-    let own = |v: Vec<std::borrow::Cow<'_, str>>| -> Vec<String> {
-        v.into_iter().map(|t| t.into_owned()).collect()
-    };
-    // `Phrase::map` carries each term's offset across, so the oracle
-    // grades the spacing the parser derived rather than adjacency.
-    let own_ph = |v: Vec<Phrase<std::borrow::Cow<'_, str>>>| -> Vec<Phrase<String>> {
-        v.iter().map(|p| p.map(|t| t.to_string())).collect()
-    };
-    let want_full = oracle.top_k_atoms(
-        &own(clauses.musts),
-        &own_ph(clauses.must_phrases),
-        &own(clauses.shoulds),
-        &own_ph(clauses.should_phrases),
-        &own(clauses.negatives),
-        &own_ph(clauses.negative_phrases),
-        owned.len(),
-    );
+    let want_full = oracle_top_k_atoms(&oracle, tok.as_ref(), &query, mode, owned.len());
 
     let want_ids: HashSet<u64> = want_full.iter().map(|(d, _)| *d).collect();
     let got_ids: HashSet<u64> = got.iter().map(|(d, _)| *d).collect();

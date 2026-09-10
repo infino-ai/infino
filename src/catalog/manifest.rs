@@ -53,15 +53,13 @@ pub(crate) struct TableEntry {
     pub(crate) schema_ipc: Vec<u8>,
     /// FTS-indexed column names.
     pub(crate) fts: Vec<String>,
-    /// FTS analyzer names, parallel to `fts`. Each is a column's whole
-    /// analysis chain as one canonical name — a base tokenizer
-    /// (`"ascii_lower"` / `"standard"`) plus any stopword set and
-    /// stemmer (`"standard+stop=english+stem=english"`) — so the chain
-    /// needs no fields of its own here.
+    /// FTS **base tokenizer** names, parallel to `fts` (`"ascii_lower"`
+    /// / `"standard"`). A column's analyzer is one of these plus the
+    /// filters in `fts_stopwords` / `fts_stemmers`.
     ///
     /// Every entry `create_table` writes carries one name per FTS
     /// column; `open_table` requires the two lists to be the same
-    /// length rather than inferring an analyzer for a column that lacks
+    /// length rather than inferring a tokenizer for a column that lacks
     /// one. `serde(default)` only keeps the *rest* of the catalog
     /// decodable — an entry that decodes to a short list is rejected per
     /// table, not silently patched.

@@ -210,7 +210,7 @@ mod tests {
     use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 
     use super::*;
-    use crate::FtsField;
+    use crate::{FtsField, Stemmer, Stopwords};
 
     #[test]
     fn index_spec_json_shape() {
@@ -225,6 +225,51 @@ mod tests {
         assert_eq!(
             json["vector"][0],
             json!({"column": "embedding", "dim": 384, "metric": "cosine"})
+        );
+    }
+
+    /// The analysis filters cross as their own keys, only when set, so
+    /// the server builds the index the client declared. A column with
+    /// no filter sends neither key, which is what keeps a default
+    /// request byte-identical to one from before the filters existed.
+    ///
+    /// A server that does not implement a named filter has to reject
+    /// the request — that is the request schema's job
+    /// (`additionalProperties: false`), which is why this client does
+    /// not smuggle the filters into the `analyzer` string to force a
+    /// rejection.
+    #[test]
+    fn index_spec_json_carries_the_analysis_filters_only_when_set() {
+        let spec = IndexSpec::new().fts(
+            FtsField::new("body")
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
+        );
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{
+                "column": "body",
+                "analyzer": "standard",
+                "k1": 1.2,
+                "b": 0.75,
+                "stopwords": "english",
+                "stemmer": "english",
+            }])
+        );
+        // One filter, not both.
+        let spec = IndexSpec::new().fts(FtsField::new("body").stemmer(Stemmer::English));
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{
+                "column": "body", "analyzer": "standard",
+                "k1": 1.2, "b": 0.75, "stemmer": "english",
+            }])
+        );
+        // And neither: no keys at all, not empty strings.
+        let spec = IndexSpec::new().fts("body");
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
     }
 

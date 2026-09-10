@@ -891,7 +891,7 @@ pub const STANDARD_TOKENIZER: &str = "standard";
 /// translate `None` into their own error — a malformed-superfile read
 /// error, or an invalid-argument error at table-create time.
 ///
-/// Resolves a **base** analyzer name only. A column's stopword set and
+/// Resolves a **base tokenizer** name only. A column's stopword set and
 /// stemmer are separate persisted fields, so a chained column's
 /// tokenizer is built by [`chain_tokenizer`] from all three rather than
 /// resolved from a single string here — see

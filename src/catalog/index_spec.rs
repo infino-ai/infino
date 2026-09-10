@@ -44,10 +44,10 @@ struct VectorIndex {
 #[derive(Debug, Clone)]
 pub struct FtsField {
     column: String,
-    /// The base analyzer name. The stopword set and stemmer are held
-    /// separately and composed onto it at lowering, so the two setters
-    /// and [`FtsField::analyzer`] may be called in any order and the
-    /// column still ends up with one canonical analyzer name.
+    /// The **base tokenizer** name. Called `analyzer` because that is
+    /// what the option is named on the public builder, but the value is
+    /// a tokenizer: the column's *analyzer* is this tokenizer plus the
+    /// two filters below, each of which is carried as its own option.
     analyzer: String,
     stopwords: Stopwords,
     stemmer: Stemmer,
@@ -275,9 +275,9 @@ impl IndexSpec {
         self.fts.iter().map(|f| f.column.clone()).collect()
     }
 
-    /// FTS **base** analyzer names, in declaration order (parallel to
-    /// [`fts_columns`](Self::fts_columns)). The stopword set and
-    /// stemmer are carried separately by
+    /// FTS **base tokenizer** names, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)) — a column's analyzer is one
+    /// of these plus its filters, which are carried separately by
     /// [`fts_stopwords`](Self::fts_stopwords) and
     /// [`fts_stemmers`](Self::fts_stemmers).
     pub(crate) fn fts_analyzers(&self) -> Vec<String> {
@@ -408,7 +408,7 @@ mod tests {
 
     /// `.analyzer()` names the base tokenizer and nothing else. A
     /// caller who passes a chain-shaped string gets it treated as an
-    /// analyzer name — which does not resolve, so `create_table`
+    /// tokenizer name — which does not resolve, so `create_table`
     /// rejects it naming what they wrote, rather than silently
     /// interpreting it.
     #[test]
@@ -447,9 +447,9 @@ mod tests {
     }
 
     /// The defaults, asserted where they are declared: `standard`, no
-    /// filters, no positions. A default column's analyzer name is the
-    /// bare base name, which is what keeps it byte-identical on disk to
-    /// one declared before chains existed.
+    /// filters, no positions. A default column's recorded tokenizer is
+    /// the bare base name, which is what keeps it byte-identical on
+    /// disk to one declared before the filters existed.
     #[test]
     fn a_bare_declaration_takes_the_plain_standard_analyzer() {
         let spec = IndexSpec::new().fts("body");

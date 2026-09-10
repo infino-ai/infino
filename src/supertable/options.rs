@@ -733,7 +733,7 @@ impl SupertableOptions {
             }
         }
 
-        // 5. Each FTS column's base analyzer name must resolve.
+        // 5. Each FTS column's base tokenizer name must resolve.
         //    Validating here surfaces a typo at construction with a
         //    typed error, instead of at the first commit's builder
         //    construction. The stopword set and stemmer need no check:

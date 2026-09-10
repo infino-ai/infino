@@ -342,6 +342,47 @@ impl OpenOptions {
 mod tests {
     use bytes::Bytes;
 
+    /// The two boundary rules the analysis fields live by, asserted on
+    /// the deserializer directly because both are invisible in a
+    /// round-trip through our own writer.
+    ///
+    /// Absent means off: a file written before the filters existed has
+    /// no such field, and that can only mean it was built unfiltered —
+    /// so a current reader infers the right analysis with no guess. An
+    /// unrecognized *value* is the opposite case and must not be
+    /// tolerated: analyzing without a set the postings were built with
+    /// is a different index, not a degraded one.
+    #[test]
+    fn absent_analysis_fields_mean_off_and_unknown_values_are_refused() {
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard"}"#).expect("parse");
+        assert_eq!(entry.stopwords, None);
+        assert_eq!(entry.stemmer, None);
+        assert_eq!(
+            entry.filters().expect("no filters resolves"),
+            (Stopwords::None, Stemmer::None)
+        );
+
+        let entry: FtsColumnConfig = serde_json::from_str(
+            r#"{"name":"body","tokenizer":"standard","stopwords":"english","stemmer":"english"}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            entry.filters().expect("known filters resolve"),
+            (Stopwords::English, Stemmer::English)
+        );
+
+        // A filter this engine does not ship, in either field.
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stopwords":"german"}"#)
+                .expect("the field parses; resolving it is what fails");
+        assert_eq!(entry.filters(), Err(("stopwords", "german")));
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stemmer":"porter"}"#)
+                .expect("parse");
+        assert_eq!(entry.filters(), Err(("stemmer", "porter")));
+    }
+
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
