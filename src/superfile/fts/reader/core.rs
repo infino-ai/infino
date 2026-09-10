@@ -1876,6 +1876,36 @@ fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The reader refuses to open a column whose entry names a filter
+    /// this engine cannot reproduce, and names the field and the value
+    /// so the operator can see which engine version is needed.
+    ///
+    /// Asserted through `open` rather than on the resolver alone: the
+    /// resolver is where the decision is made, but the `map_err` that
+    /// turns it into a read error is the part a caller actually sees,
+    /// and a `?` dropped there would let the column open unfiltered.
+    #[tokio::test]
+    async fn open_refuses_a_column_naming_an_unreproducible_filter() {
+        let (blob, json) = build_blob();
+        // Sanity: the fixture opens before it is tampered with, so a
+        // failure below is the filter and not the fixture.
+        FtsReader::open(blob.clone(), &json).expect("untampered fixture opens");
+        for (field, value) in [("stopwords", "german"), ("stemmer", "porter")] {
+            let patched = json.replace(
+                r#""tokenizer":"#,
+                &format!(r#""{field}":"{value}","tokenizer":"#),
+            );
+            assert_ne!(patched, json, "{field}: fixture did not patch");
+            let err = FtsReader::open(blob.clone(), &patched)
+                .expect_err("an unreproducible filter must fail the open");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(field) && msg.contains(value),
+                "{field}: the error must name the field and value, got: {msg}"
+            );
+        }
+    }
     use std::collections::HashSet;
 
     use super::{super::test_util::*, *};
