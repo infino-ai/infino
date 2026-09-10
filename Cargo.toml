@@ -141,6 +141,15 @@ static_assertions = "1"
 # Tokenization: UAX#29 word segmentation for the Unicode-aware standard
 # analyzer (keeps non-ASCII text), alongside the built-in ASCII tokenizer.
 unicode-segmentation = "1"
+# Emoji properties (UTR #51) for the standard tokenizer, which must
+# emit emoji as tokens rather than discard them as punctuation. Same
+# maintainers as unicode-segmentation; only the emoji tables are pulled
+# in, and having them generated from the Unicode data is the point —
+# a hand-written range table in this repo would silently go stale with
+# every Unicode release.
+unicode-properties = { version = "0.1", default-features = false, features = [
+    "emoji",
+] }
 
 # Numerics
 rand = "0.10"

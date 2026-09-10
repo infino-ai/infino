@@ -43,6 +43,7 @@ use std::{
     sync::Arc,
 };
 
+use unicode_properties::{EmojiStatus, UnicodeEmoji};
 use unicode_segmentation::UnicodeSegmentation;
 use wide::u8x16;
 
@@ -78,6 +79,52 @@ const LANE_BITMASK: u32 = 0xFFFF;
 /// ones, which would tokenize the same sentence differently depending
 /// on the language it is written in.
 pub const MAX_TOKEN_CHARS: usize = 255;
+
+/// Whether `c` is an emoji this tokenizer emits as a token of its own.
+///
+/// The test is `Emoji_Presentation`, not the broader `Emoji`. `Emoji`
+/// is also true of `#`, `*` and the digits — which carry emoji meaning
+/// only inside a keycap sequence and are ordinary punctuation
+/// everywhere else — and of text-default symbols such as `™` and `©`.
+/// Emitting those would change how ordinary prose tokenizes, which is a
+/// far larger change than making emoji searchable, so the predicate is
+/// the narrower one: characters that render as emoji by default.
+///
+/// `EmojiStatus` is `#[non_exhaustive]`, so a future variant falls
+/// through to "not an emoji token" rather than silently joining the set.
+#[inline]
+fn is_emoji_token_char(c: char) -> bool {
+    matches!(
+        c.emoji_status(),
+        EmojiStatus::EmojiPresentation
+            | EmojiStatus::EmojiPresentationAndModifierBase
+            | EmojiStatus::EmojiPresentationAndEmojiComponent
+            | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+    )
+}
+
+/// Whether a UAX #29 word-boundary segment is a token this tokenizer
+/// emits, as opposed to whitespace or punctuation between tokens.
+///
+/// A segment carrying an alphanumeric is a word — the same rule the
+/// segmenter's own word iterator applies. A segment carrying an emoji
+/// is a token too, which that iterator does not accept: it filters on
+/// alphanumerics alone, so an emoji-only segment falls out as though it
+/// were punctuation.
+///
+/// Dropping emoji costs recall on corpora where they carry real signal,
+/// and it costs phrase precision everywhere. Positions here are
+/// emission ordinals, so a discarded emoji leaves no gap and the words
+/// on either side of it become adjacent — `"cat <emoji> dog"` would
+/// match the exact phrase `"cat dog"`. Discarding *punctuation* without
+/// a gap is correct and is what Lucene does too; discarding something
+/// Lucene emits is not.
+#[inline]
+fn is_token_segment(segment: &str) -> bool {
+    segment
+        .chars()
+        .any(|c| c.is_alphanumeric() || is_emoji_token_char(c))
+}
 
 /// Emit `tok`, chopped to [`MAX_TOKEN_CHARS`] characters per piece, and
 /// return how many pieces were emitted — a positional caller advances
@@ -1057,7 +1104,14 @@ impl StandardTokenizer {
             return;
         }
         let mut buf = String::new();
-        for word in text.unicode_words() {
+        // `split_word_bounds` rather than `unicode_words` because the
+        // latter's filter drops emoji; the segmentation itself is the
+        // same, and UAX #29 already holds a ZWJ emoji sequence together
+        // as one segment, so only which segments are kept differs.
+        for word in text.split_word_bounds() {
+            if !is_token_segment(word) {
+                continue;
+            }
             // Borrow directly when every cased character is already
             // lowercase (the common case for lowercased corpora); only
             // allocate to case-fold a word carrying an upper/title-case
@@ -1392,6 +1446,9 @@ mod tests {
         ] {
             let mut fast = Vec::new();
             StandardTokenizer.tokenize_each_inline(text, |t| fast.push(t.to_owned()));
+            // Equality holds because none of these fixtures carries an
+            // emoji; where one does, this tokenizer emits a token the
+            // segmenter's word filter drops. See the emoji tests.
             let expected: Vec<String> = text.unicode_words().map(|w| w.to_lowercase()).collect();
             assert_eq!(fast, expected, "tokens diverged on {text:?}");
         }
@@ -1519,6 +1576,9 @@ mod tests {
             let text: String = indices.iter().map(|&i| MIXED_ALPHABET[i]).collect();
             let mut got = Vec::new();
             StandardTokenizer.tokenize_each_inline(&text, |t| got.push(t.to_owned()));
+            // The alphabet is emoji-free, so the two agree exactly. On
+            // emoji input this tokenizer is a strict superset, which
+            // `standard_emits_emoji_the_word_filter_drops` pins.
             let expected: Vec<String> =
                 text.unicode_words().map(|w| w.to_lowercase()).collect();
             prop_assert_eq!(&got, &expected, "tokens diverged on {:?}", text);
@@ -1556,6 +1616,81 @@ mod tests {
         let mut out = Vec::new();
         StandardTokenizer.tokenize_each(text, &mut |t| out.push(t.to_owned()));
         out
+    }
+
+    // ---- emoji ----
+
+    #[test]
+    fn standard_emits_emoji_the_word_filter_drops() {
+        // The segmenter's word iterator keeps only segments carrying an
+        // alphanumeric, so an emoji-only segment falls out as though it
+        // were punctuation. It is a token here, and lowercasing leaves
+        // it alone.
+        assert_eq!(std_tokens("hello 🙂 world"), vec!["hello", "🙂", "world"]);
+        assert_eq!(std_tokens("🙂"), vec!["🙂"]);
+        assert_eq!(
+            std_tokens_each("hello 🙂 world"),
+            std_tokens("hello 🙂 world")
+        );
+        // A ZWJ sequence is one grapheme and one token: UAX #29 holds it
+        // together, so no extra rule is needed to avoid splitting it
+        // into its components.
+        assert_eq!(std_tokens("👩‍💻"), vec!["👩‍💻"]);
+    }
+
+    #[test]
+    fn emoji_token_breaks_phrase_adjacency() {
+        // The precision half of the same change. Positions are emission
+        // ordinals, so dropping the emoji would leave `cat` and `dog`
+        // adjacent and the exact phrase "cat dog" would match text that
+        // does not contain it.
+        let tokens = std_tokens("cat 🙂 dog");
+        let cat = tokens.iter().position(|t| t == "cat").expect("cat");
+        let dog = tokens.iter().position(|t| t == "dog").expect("dog");
+        assert_eq!(
+            dog - cat,
+            2,
+            "the emoji must occupy a position between them"
+        );
+    }
+
+    #[test]
+    fn text_default_symbols_and_keycap_bases_stay_punctuation() {
+        // `#`, `*` and the digits are `Emoji=YES` but carry that meaning
+        // only inside a keycap sequence, and `™`/`©` are emoji with a
+        // text presentation by default. Emitting any of them would
+        // change how ordinary prose tokenizes, so the predicate is
+        // `Emoji_Presentation` rather than `Emoji`.
+        assert_eq!(std_tokens("a # b"), vec!["a", "b"]);
+        assert_eq!(std_tokens("a * b"), vec!["a", "b"]);
+        assert_eq!(std_tokens("acme™ ©"), vec!["acme"]);
+        // And a digit is still a digit, not an emoji token.
+        assert_eq!(std_tokens("pick 3 now"), vec!["pick", "3", "now"]);
+    }
+
+    #[test]
+    fn emoji_only_adds_tokens_never_removes_them() {
+        // The relationship to the segmenter's own word iterator, stated
+        // as the invariant rather than as a fixture: every word it
+        // yields is still emitted, in order, and anything extra is an
+        // emoji it filtered out.
+        for text in [
+            "hello 🙂 world",
+            "café 🎉 42 ☕",
+            "🙂🙂 back to back",
+            "no emoji here at all",
+            "中文 🀄 text",
+        ] {
+            let got = std_tokens(text);
+            let words: Vec<String> = text.unicode_words().map(|w| w.to_lowercase()).collect();
+            let kept: Vec<String> = got
+                .iter()
+                .filter(|t| !t.chars().all(is_emoji_token_char))
+                .cloned()
+                .collect();
+            assert_eq!(kept, words, "non-emoji tokens changed on {text:?}");
+            assert!(got.len() >= words.len());
+        }
     }
 
     // ---- maximum token length ----
