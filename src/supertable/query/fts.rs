@@ -2250,7 +2250,10 @@ mod tests {
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-            fts::reader::{Bm25SearchOptions, top_k_initial_capacity},
+            fts::{
+                posting::BLOCK_LEN,
+                reader::{Bm25SearchOptions, top_k_initial_capacity},
+            },
             vector::layout::VectorLayout,
         },
         supertable::{
@@ -3655,12 +3658,116 @@ mod tests {
         }
     }
 
+    /// Docs in the block-skip fixture. `BLOCK_LEN` is 128, so a term
+    /// carried by every document spans several whole blocks and the
+    /// block-max skip has something to skip *over*. Three documents fit
+    /// in one partial block, where the skip path is unreachable.
+    const BLOCK_SKIP_DOCS: usize = 5 * BLOCK_LEN;
+
+    /// Longest document, in repetitions of the padding token. Lengths
+    /// sweep from 1 to this, so the length norm — the half of the score
+    /// `b` controls — varies widely across blocks. A uniform-length
+    /// corpus would make the correction factor's length term
+    /// degenerate and hide an under-tight bound.
+    const BLOCK_SKIP_MAX_PAD: usize = 24;
+
+    /// A corpus large enough that the block-max skip actually runs.
+    ///
+    /// Every document carries `quick`, so its posting list covers all
+    /// `BLOCK_SKIP_DOCS` and is split into whole blocks with a stored
+    /// per-block maximum. `brown` is planted on a sparse, irregular
+    /// subset, and both the term frequency and the document length
+    /// vary per document, so per-block maxima differ and a small `k`
+    /// prunes rather than walking everything.
+    fn seeded_block_skip_supertable() -> Supertable {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        let titles: Vec<String> = (0..BLOCK_SKIP_DOCS)
+            .map(|i| {
+                let mut t = String::from("quick");
+                // Term frequency varies: a repeated term saturates
+                // differently as k1 moves, so the tf half of the score
+                // is exercised too.
+                for _ in 0..(i % 3) {
+                    t.push_str(" quick");
+                }
+                if i % 7 == 0 {
+                    t.push_str(" brown");
+                }
+                // Length varies 1..=BLOCK_SKIP_MAX_PAD padding tokens.
+                for j in 0..(i % BLOCK_SKIP_MAX_PAD + 1) {
+                    t.push_str(&format!(" pad{j}"));
+                }
+                t
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        w.append(&build_batch(0, &refs)).expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
     /// A small `k` fills the top-k heap and engages the block-max skips;
     /// a `k` covering the whole match set does not. Under an override
     /// every stored bound is inflated by the correction factor, so a
     /// factor that came out too small would skip a block holding a
     /// qualifying document — visible only as the small-`k` result
     /// disagreeing with the head of the unpruned one.
+    ///
+    /// The corpus spans several whole blocks on purpose. The skip
+    /// compares a *stored per-block maximum* against the current
+    /// kth-best score, so a corpus that fits in one partial block never
+    /// reaches that comparison and cannot observe the correction at
+    /// all — the assertion would hold no matter how wrong the factor
+    /// was.
+    #[test]
+    fn an_override_prunes_without_dropping_hits_across_blocks() {
+        let st = seeded_block_skip_supertable();
+        let r = st.reader().expect("reader");
+        const K_ALL: usize = 4 * BLOCK_SKIP_DOCS;
+
+        for (k1, b) in [(1.6_f32, 0.4_f32), (0.5, 0.9), (1.2, 0.0), (2.0, 1.0)] {
+            let opts = || {
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_bm25(k1, b)
+            };
+            let unpruned = r
+                .bm25_hits("title", "quick brown", K_ALL, opts())
+                .expect("unpruned");
+            assert!(
+                unpruned.len() > BLOCK_LEN,
+                "fixture must span more than one block; got {}",
+                unpruned.len()
+            );
+            // Small k relative to the match set: the heap fills early
+            // and the kth-best score climbs above whole blocks' maxima.
+            for k in [1usize, 2, 10, 50] {
+                let pruned = r
+                    .bm25_hits("title", "quick brown", k, opts())
+                    .expect("pruned");
+                assert_eq!(
+                    pruned.len(),
+                    k.min(unpruned.len()),
+                    "k={k} at k1={k1} b={b}"
+                );
+                for (i, hit) in pruned.iter().enumerate() {
+                    assert_eq!(
+                        hit.local_doc_id, unpruned[i].local_doc_id,
+                        "k={k} at k1={k1} b={b}: pruning changed the top-{k} head"
+                    );
+                    assert!(
+                        (hit.score - unpruned[i].score).abs() < 1e-4,
+                        "k={k} at k1={k1} b={b}: pruning changed a score"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same property on a corpus too small to form a full block.
+    /// Kept alongside the multi-block case because it covers the
+    /// partial-block tail, which has its own bound handling.
     #[test]
     fn an_override_prunes_without_dropping_hits() {
         let st = seeded_three_doc_supertable();
