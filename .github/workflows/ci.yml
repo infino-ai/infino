@@ -73,9 +73,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Prebuilt binaries in seconds, instead of `cargo install` (minutes
       # on a cache miss) — and nothing to carry in a ~/.cargo/bin cache.
+      # Versions pinned: the coverage gate's margin is thin (functions
+      # 89.1% against an 89 floor), and a tool release that changes how
+      # regions are counted must not flip CI by itself — bump deliberately.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov,cargo-nextest
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.143
       - run: make coverage-ci
 
   tests-aux:
