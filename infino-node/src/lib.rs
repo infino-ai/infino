@@ -48,7 +48,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions, Stemmer,
+    Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,6 +132,43 @@ fn metric_from_str(s: &str) -> Result<Metric> {
             format!("unknown metric {other:?}; use 'cosine', 'l2sq', or 'negdot'"),
         )),
     }
+}
+
+/// Parse a stopword-set name. Named built-in sets only; the error names
+/// the valid set rather than leaving the caller to guess.
+///
+/// **Exact match, deliberately not case-folded.** These names are format
+/// vocabulary: the engine's own resolver is exact, and a column persists
+/// the name it was given. Accepting `"English"` here would mean this
+/// binding has a wider vocabulary than the format and must remember to
+/// normalize before persisting — a coupling that is one forgotten call
+/// away from writing a file the reader refuses. It would also diverge
+/// from the python binding, so the same call would work in one and throw
+/// in the other.
+///
+/// The asymmetry decides it: accepting more spellings later is additive,
+/// while tightening later breaks every caller who relied on the loose
+/// one. (The older `metric` argument *is* case-folded, which is an
+/// inconsistency in the other direction — worth reconciling, but not by
+/// widening a new surface to match an old one.)
+fn stopwords_from_name(s: &str) -> Result<Stopwords> {
+    Stopwords::from_name(s).ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("unknown stopwords {s:?} (valid: \"english\")"),
+        )
+    })
+}
+
+/// Parse a stemmer name. Same exact-match rule as
+/// [`stopwords_from_name`], and for the same reasons.
+fn stemmer_from_name(s: &str) -> Result<Stemmer> {
+    Stemmer::from_name(s).ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("unknown stemmer {s:?} (valid: \"english\")"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -389,14 +427,14 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
     }
 }
 
-/// Parse a BM25 statistics-scope string (`"per_superfile"` default, or
-/// `"global"` for corpus-wide IDF across superfiles).
+/// Parse a BM25 statistics-scope string: `"global"` (corpus-wide IDF, the
+/// default when omitted) or `"per_superfile"` (segment-local IDF).
 fn parse_stats(stats: Option<&str>) -> Result<Bm25Stats> {
-    match stats
-        .unwrap_or("per_superfile")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let Some(stats) = stats else {
+        // Omitted means the engine default.
+        return Ok(Bm25Stats::default());
+    };
+    match stats.to_ascii_lowercase().as_str() {
         "per_superfile" => Ok(Bm25Stats::PerSuperfile),
         "global" => Ok(Bm25Stats::Global),
         other => Err(Error::new(
@@ -519,25 +557,77 @@ pub struct VectorFilter {
 #[napi]
 #[derive(Clone, Default)]
 pub struct IndexSpec {
-    /// `(column, analyzer, stored)`; `analyzer` `None` means the default.
-    fts: Vec<(String, Option<String>, bool)>,
+    /// One declared FTS column, as its options arrived.
+    fts: Vec<FtsDecl>,
     /// `(column, dim, metric)`.
     vectors: Vec<(String, u32, String)>,
+}
+
+/// One declared FTS column: the column name plus the options given for
+/// it, with the `Option`s still meaning "not given" so each falls back
+/// to the engine's own default rather than one restated here.
+#[derive(Clone)]
+struct FtsDecl {
+    column: String,
+    options: FtsOptions,
 }
 
 /// Per-column FTS options for `IndexSpec.fts`.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FtsOptions {
-    /// Tokenizer: `"ascii_lower"` (default — ASCII split + lowercase,
-    /// non-ASCII dropped) or `"standard"` (the Unicode-aware UAX #29
-    /// tokenizer that keeps non-ASCII text).
+    /// Tokenizer: `"standard"` (the default — the Unicode-aware UAX #29
+    /// tokenizer that keeps non-ASCII text) or `"ascii_lower"` (ASCII
+    /// split + lowercase, non-ASCII dropped). It is recorded with the
+    /// table and cannot be changed afterwards.
     pub analyzer: Option<String>,
+    /// Remove this column's stopwords — the very common words whose
+    /// presence says almost nothing about what a document is about.
+    /// `"english"` is the only set; omit for none (the default).
+    ///
+    /// Applies to both sides: the words leave the index and they leave
+    /// a query, and each one removed leaves a hole in the token
+    /// positions, so an exact phrase still knows the words it matched
+    /// were not adjacent in the text. The trade is that once a word is
+    /// not indexed, no query can find it — declare it on prose, not on
+    /// short identifiers. Recorded with the table and unchangeable
+    /// afterwards, since it decides what is in the index: the words it
+    /// removed were never written, so changing it means re-ingesting
+    /// from the source text. With `stored: false` that text is never
+    /// kept, so the combination is permanent.
+    pub stopwords: Option<String>,
+    /// Reduce this column's words to their stems, so a search for one
+    /// inflection finds the others (`running`, `runs`, `run`).
+    /// `"english"` is the only stemmer; omit for none (the default).
+    ///
+    /// Applies to both sides, like `stopwords`. The trade is precision:
+    /// stemming conflates words a reader would not, and there is no way
+    /// to ask for an unstemmed form on a stemmed column. Recorded with
+    /// the table and unchangeable afterwards: a stem is not invertible
+    /// — the index holds `run`, never the `running` it came from — so
+    /// changing it means re-ingesting from the source text, and with
+    /// `stored: false` that text is never kept, making the combination
+    /// permanent.
+    pub stemmer: Option<String>,
+    /// Record token positions, which is what exact phrase queries
+    /// (`'"climate policy"'`) need. Default false: positions roughly
+    /// double the column's index footprint, so they are a per-column
+    /// opt-in. A column without them answers a phrase query with an
+    /// error naming the column, never a silent bag-of-words fallback.
+    pub positions: Option<bool>,
     /// Keep the raw text in the table (default true). `false` makes the
     /// column index-only: searchable, but the text is never stored, so
     /// it cannot be selected, projected, or filtered on (append/update
     /// batches still carry it).
     pub stored: Option<bool>,
+    /// BM25 term-frequency saturation, `> 0`; defaults to 1.2. Recorded
+    /// with the table, and the stored score bounds are built with it,
+    /// so a search that does not override it pays nothing. Pass with
+    /// `b` or not at all.
+    pub k1: Option<f64>,
+    /// BM25 length normalization, in `[0, 1]`; defaults to 0.75. Pass
+    /// with `k1` or not at all.
+    pub b: Option<f64>,
 }
 
 #[napi]
@@ -547,14 +637,16 @@ impl IndexSpec {
         Self::default()
     }
 
-    /// Mark `column` (a UTF-8 string column) as full-text indexed,
-    /// with optional per-column `options` (analyzer, stored).
+    /// Mark `column` (a UTF-8 string column) as full-text indexed, with
+    /// optional per-column `options` (analyzer, stopwords, stemmer,
+    /// positions, stored, k1/b).
     #[napi]
     pub fn fts(&self, column: String, options: Option<FtsOptions>) -> Self {
         let mut next = self.clone();
-        let opts = options.unwrap_or_default();
-        next.fts
-            .push((column, opts.analyzer, opts.stored.unwrap_or(true)));
+        next.fts.push(FtsDecl {
+            column,
+            options: options.unwrap_or_default(),
+        });
         next
     }
 
@@ -573,10 +665,38 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> Result<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for (column, analyzer, stored) in &self.fts {
-            let mut field = infino::FtsField::new(column.clone()).stored(*stored);
+        for FtsDecl { column, options } in &self.fts {
+            let FtsOptions {
+                analyzer,
+                stopwords,
+                stemmer,
+                positions,
+                stored,
+                k1,
+                b,
+            } = options;
+            let mut field = infino::FtsField::new(column.clone())
+                .positions(positions.unwrap_or(false))
+                .stored(stored.unwrap_or(true));
             if let Some(a) = analyzer {
                 field = field.analyzer(a.clone());
+            }
+            if let Some(name) = stopwords {
+                field = field.stopwords(stopwords_from_name(name)?);
+            }
+            if let Some(name) = stemmer {
+                field = field.stemmer(stemmer_from_name(name)?);
+            }
+            // Both or neither: the two parameters interact through the
+            // length norm, so half-overriding is a footgun.
+            match (k1, b) {
+                (Some(k1), Some(b)) => field = field.bm25(*k1 as f32, *b as f32),
+                (None, None) => {}
+                _ => {
+                    return Err(napi::Error::from_reason(
+                        "IndexSpec.fts: pass k1 and b together, or neither",
+                    ));
+                }
             }
             spec = spec.fts(field);
         }
@@ -723,13 +843,38 @@ impl Table {
             .map_err(map_err)
     }
 
+    /// `append`, naming the source the rows came from: the superfiles this
+    /// commit writes are keyed `data/<stem>-<uuid>.sf.parquet`, with the stem
+    /// the key-safe form of `sourceName` (lowercase `[a-z0-9_]`), so a bucket
+    /// listing shows where each came from. The table behaves exactly as
+    /// after `append`; the name is a label on the object key.
+    #[napi]
+    pub fn append_named(&self, data: Buffer, source_name: String) -> Result<()> {
+        let batches = read_batches_ipc(&data)?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .append_named(&self.align_batches(batches)?, &source_name)
+            .map_err(map_err)
+    }
+
     /// BM25 search over one FTS column. Returns matching rows as an Arrow
     /// IPC `Buffer` (read with `tableFromIPC`). `mode` is `"or"` (default)
     /// or `"and"`. `projection` selects the returned columns — pass
     /// `["_id", "score"]` for just id + score, or omit for full rows.
     /// `score` is a similarity (higher is better) — opposite direction
     /// from `vectorSearch`'s distance. Fuse with `hybridSearch`.
+    ///
+    /// `k1` / `b` override the columns' declared BM25 similarity
+    /// parameters for this search only — pass both or neither. The
+    /// stored score bounds belong to the declared pair, so the reader
+    /// corrects them for the difference: results stay exact and only
+    /// pruning power is traded, and nothing is rebuilt. A pair you mean
+    /// to keep belongs on the column (`IndexSpec.fts`), where the
+    /// bounds are built with it and the correction disappears.
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn bm25_search(
         &self,
         column: String,
@@ -738,10 +883,21 @@ impl Table {
         mode: Option<String>,
         stats: Option<String>,
         projection: Option<Vec<String>>,
+        k1: Option<f64>,
+        b: Option<f64>,
     ) -> Result<Buffer> {
-        let opts = Bm25SearchOptions::new()
+        let mut opts = Bm25SearchOptions::new()
             .with_mode(parse_mode(mode.as_deref())?)
             .with_stats(parse_stats(stats.as_deref())?);
+        opts = match (k1, b) {
+            (Some(k1), Some(b)) => opts.with_bm25(k1 as f32, b as f32),
+            (None, None) => opts,
+            _ => {
+                return Err(napi::Error::from_reason(
+                    "bm25Search: pass k1 and b together, or neither",
+                ));
+            }
+        };
         let proj: Option<Vec<&str>> = projection
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());

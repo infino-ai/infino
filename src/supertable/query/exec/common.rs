@@ -557,6 +557,7 @@ async fn resolve_columns(
             disk_cache,
             storage,
             &entry.uri,
+            &entry.storage_path(),
             entry.subsection_offsets.as_ref(),
             true,
         )
@@ -916,7 +917,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
-            fts::reader::{Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -1072,8 +1073,9 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["_id"]),
             )
             .expect("bm25_search _id");
@@ -1094,8 +1096,9 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 None,
             )
             .expect("bm25_search default");
@@ -1117,8 +1120,9 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["_id", "title", "score"]),
             )
             .expect("bm25_search title");
@@ -1141,8 +1145,9 @@ mod tests {
             "title",
             "rust",
             10,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["nope"]),
         );
         assert!(res.is_err(), "unknown projected column must error");
@@ -1158,8 +1163,9 @@ mod tests {
                 "title",
                 "nonexistentterm",
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["_id"]),
             )
             .expect("bm25_search empty");
@@ -1676,8 +1682,9 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["title", "score"]),
             )
             .expect("cold bm25 with scalar projection");
@@ -1716,8 +1723,9 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["_id", "title", "score"]),
             )
             .expect("cold bm25 with id and scalar projection");
@@ -1743,8 +1751,9 @@ mod tests {
                 "title",
                 "nonexistentterm",
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 Some(&["title", "score"]),
             )
             .expect("cold bm25 with no matches");

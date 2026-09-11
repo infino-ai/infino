@@ -19,7 +19,7 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue},
+        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue, tokenize::Phrase},
     },
 };
 
@@ -126,14 +126,14 @@ impl FtsReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         groups: &[Vec<String>],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, groups, None)
+            .build_atom_cursors(column_id, terms, phrases, groups, None, None)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -162,17 +162,17 @@ impl FtsReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         groups: &[Vec<String>],
         mode: BoolMode,
         neg_terms: &[&str],
-        neg_phrases: &[Vec<String>],
+        neg_phrases: &[Phrase<String>],
         neg_groups: &[Vec<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, groups, None)
+            .build_atom_cursors(column_id, terms, phrases, groups, None, None)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -189,7 +189,7 @@ impl FtsReader {
         let mut filter = None;
         if !neg_terms.is_empty() || !neg_phrases.is_empty() || !neg_groups.is_empty() {
             let (neg_built, neg_dict_ranges) = self
-                .build_atom_cursors(column_id, neg_terms, neg_phrases, neg_groups, None)
+                .build_atom_cursors(column_id, neg_terms, neg_phrases, neg_groups, None, None)
                 .await?;
             let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
             // Count the negated clause's posting work the same way the
@@ -246,7 +246,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None)
+            .build_term_cursors(column_id, tokens, None, true, None, None)
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -286,7 +286,7 @@ impl FtsReader {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None)
+            .build_term_cursors(column_id, tokens, None, true, None, None)
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += 1;
@@ -749,7 +749,7 @@ mod tests {
         // Prove `mix` really has both encodings — else the test silently checks
         // nothing about the transition.
         let cursors = r
-            .build_term_cursors(0, &["mix"], None, true, None)
+            .build_term_cursors(0, &["mix"], None, true, None, None)
             .await
             .expect("build cursors");
         let mix = &cursors[0];

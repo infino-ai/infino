@@ -9,7 +9,11 @@ use std::{ops::Range, sync::Arc};
 
 use serde::Deserialize;
 
-use crate::superfile::fts::{bm25, tokenize::Tokenizer};
+use crate::superfile::fts::{
+    analysis::{Base, Stemmer, Stopwords},
+    bm25,
+    tokenize::Tokenizer,
+};
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
 ///
@@ -26,36 +30,105 @@ use crate::superfile::fts::{bm25, tokenize::Tokenizer};
 #[derive(Debug, Clone)]
 pub struct NormTable {
     /// Per-doc quantized length bucket. Empty for a column with no docs.
-    bytes: Vec<u8>,
-    /// Bucket → `K1·(1 - B + B·dequantize_len(bucket)/avgdl)`. A fixed
+    /// Parameter-free — the buckets are lengths, not norms — and shared
+    /// rather than copied so [`NormTable::rescored`] costs one `Arc`
+    /// bump plus a 1 KiB table instead of a pass over every doc.
+    bytes: Arc<[u8]>,
+    /// Bucket → `k1·(1 - b + b·dequantize_len(bucket)/avgdl)`. A fixed
     /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
     /// scanned by non-scoring paths — column lookup, listing) while the
     /// `u8` bucket index into a fixed-length array lets the compiler drop
-    /// the bounds check in `get`.
-    lut: Box<[f32; 256]>,
+    /// the bounds check in `get`. This is the only parameter-dependent
+    /// part of the table.
+    lut: Arc<[f32; 256]>,
+    /// Lowest and highest bucket any doc in this column actually
+    /// occupies, tracked at build so [`NormTable::bound_scale`] takes
+    /// its supremum over lengths that occur rather than over all 256
+    /// representable ones. `(0, 0)` for an empty column.
+    occupied: (u8, u8),
 }
 
 impl NormTable {
     /// Build from a column's per-doc lengths and average length. An
     /// `avgdl` of `0.0` (empty column) yields an empty table; it is
     /// never indexed because `search` short-circuits on empty columns.
-    pub(super) fn new(doc_lengths: impl Iterator<Item = u32>, n_docs: usize, avgdl: f32) -> Self {
+    pub(super) fn new(
+        doc_lengths: impl Iterator<Item = u32>,
+        n_docs: usize,
+        avgdl: f32,
+        params: bm25::Bm25Params,
+    ) -> Self {
         if avgdl <= 0.0 {
             return Self::empty();
         }
-        let inv_avgdl = 1.0_f32 / avgdl;
-        // Fill the boxed table in place so the 256 f32s land on the heap
-        // directly rather than being built on the stack and moved.
-        let mut lut = Box::new([0.0_f32; 256]);
-        for (b, slot) in lut.iter_mut().enumerate() {
-            let dl = bm25::dequantize_len(b as u8) as f32;
-            *slot = bm25::K1 * (1.0 - bm25::B + bm25::B * dl * inv_avgdl);
-        }
         let mut bytes = Vec::with_capacity(n_docs);
+        let mut lo = u8::MAX;
+        let mut hi = u8::MIN;
         for dl in doc_lengths {
-            bytes.push(bm25::quantize_len(dl));
+            let bucket = bm25::quantize_len(dl);
+            lo = lo.min(bucket);
+            hi = hi.max(bucket);
+            bytes.push(bucket);
         }
-        Self { bytes, lut }
+        let occupied = if bytes.is_empty() { (0, 0) } else { (lo, hi) };
+        Self {
+            bytes: Arc::from(bytes),
+            lut: build_lut(avgdl, params),
+            occupied,
+        }
+    }
+
+    /// The same per-doc buckets decoded at different parameters — for a
+    /// query that overrides what its column declared. Shares `bytes`,
+    /// so the cost is one 256-entry table.
+    pub(super) fn rescored(&self, avgdl: f32, params: bm25::Bm25Params) -> Self {
+        if self.bytes.is_empty() {
+            return Self::empty();
+        }
+        Self {
+            bytes: Arc::clone(&self.bytes),
+            lut: build_lut(avgdl, params),
+            occupied: self.occupied,
+        }
+    }
+
+    /// The factor `R >= 1` by which every bound built at `baked` must be
+    /// inflated to stay an upper bound under `query`'s parameters, where
+    /// `self` is the norm table at `baked` and `other` the one at
+    /// `query`.
+    ///
+    /// The stored per-block bound is the block's true max of
+    /// `idf·tf·(k1+1) / (tf + dl_norm_k1)`. Between two parameter sets
+    /// the per-doc ratio is
+    ///
+    /// ```text
+    ///   (k1'+1)/(k1+1) · (tf + A) / (tf + B),
+    ///       A = lut_baked[bucket],  B = lut_query[bucket]
+    /// ```
+    ///
+    /// with `idf` cancelling — it carries no parameters. For a fixed
+    /// bucket that is monotone in `tf` and tends to 1, so its supremum
+    /// over `tf >= 1` is `max(1, (1+A)/(1+B))`; taking the max over the
+    /// buckets docs actually occupy gives the supremum over the column.
+    /// Loosening, never under-bounding, and exactly `1.0` when the two
+    /// parameter sets agree.
+    pub(super) fn bound_scale(
+        &self,
+        other: &NormTable,
+        baked: bm25::Bm25Params,
+        query: bm25::Bm25Params,
+    ) -> f32 {
+        if baked == query || self.bytes.is_empty() {
+            return 1.0;
+        }
+        let (lo, hi) = self.occupied;
+        let mut worst = 1.0_f32;
+        for bucket in lo..=hi {
+            let a = self.lut[bucket as usize];
+            let b = other.lut[bucket as usize];
+            worst = worst.max((1.0 + a) / (1.0 + b));
+        }
+        worst * (query.k1 + 1.0) / (baked.k1 + 1.0)
     }
 
     /// `dl_norm_k1` for a doc (length quantized): one per-doc byte load
@@ -79,10 +152,23 @@ impl NormTable {
     /// read.
     pub(super) fn empty() -> Self {
         Self {
-            bytes: Vec::new(),
-            lut: Box::new([0.0; 256]),
+            bytes: Arc::from(Vec::new()),
+            lut: Arc::new([0.0; 256]),
+            occupied: (0, 0),
         }
     }
+}
+
+/// Decode table for one parameter set: bucket → `dl_norm_k1`. Filled in
+/// place on the heap so the 256 `f32`s are not built on the stack and
+/// moved.
+fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
+    let mut lut = Box::new([0.0_f32; 256]);
+    for (bucket, slot) in lut.iter_mut().enumerate() {
+        let dl = bm25::dequantize_len(bucket as u8);
+        *slot = params.dl_norm_k1(dl, avgdl);
+    }
+    Arc::from(lut)
 }
 
 /// Per-column metadata, indexed by column_id (declaration order).
@@ -101,14 +187,38 @@ pub struct ColumnMeta {
     /// `dl_norm_k1.get(d)` and multiplies-out to `idf · tf · (K1+1) /
     /// (tf + dl_norm_k1.get(d))`.
     pub dl_norm_k1: NormTable,
+    /// The parameters this column is being *scored* with. Equal to the
+    /// pair recorded in the KV entry unless the query overrode it, in
+    /// which case `dl_norm_k1` has been re-decoded to match and
+    /// `bound_scale` carries the correction for the stored bounds.
+    pub params: bm25::Bm25Params,
+    /// Factor to apply to every bound read out of the skip table or the
+    /// coarse table before comparing it against a score. `1.0` unless
+    /// the query overrode this column's parameters, in which case it is
+    /// [`NormTable::bound_scale`] between the baked pair and the
+    /// query's — the stored bounds belong to the baked pair, and
+    /// inflating them by this keeps them upper bounds under the pair
+    /// actually being scored.
+    pub bound_scale: f32,
     /// Whether this column's index carries token positions (from
     /// `inf.fts.columns`); phrase queries require it.
     pub positions: bool,
     /// Tokenizer for this column, reconstructed at open time from the
-    /// `tokenizer` name in `inf.fts.columns`. Query terms for this
-    /// column must be tokenized with it to match how the column was
-    /// indexed.
+    /// `tokenizer` name in `inf.fts.columns` plus its `stopwords` /
+    /// `stemmer` fields. Query terms for this column must be tokenized
+    /// with it to match how the column was indexed.
     pub tokenizer: Arc<dyn Tokenizer>,
+    /// The column's base tokenizer, kept beside the assembled
+    /// [`ColumnMeta::tokenizer`] so a rebuild can reconstruct the same
+    /// chain from its components. `Tokenizer::name` reports the chain's
+    /// derived identity, which is not a name any lookup accepts back.
+    pub(crate) base: Base,
+    /// The column's stopword set, kept for the same reason as
+    /// [`ColumnMeta::base`].
+    pub stopwords: Stopwords,
+    /// The column's stemmer, kept for the same reason as
+    /// [`ColumnMeta::base`].
+    pub stemmer: Stemmer,
     /// Whether the column's raw text is kept in the Parquet body (from
     /// `inf.fts.columns`). Index-only columns (`false`) are searchable
     /// but absent from the stored schema, so they cannot be read back;
@@ -121,11 +231,10 @@ pub struct ColumnMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FtsColumnConfig {
     pub name: String,
-    /// The column's analyzer name: `"ascii_lower"` (the default) or
-    /// `"standard"`. A missing field deserializes to `"ascii_lower"`
-    /// for backward compatibility with files written before the
-    /// analyzer name was recorded.
-    #[serde(default = "default_tokenizer")]
+    /// The column's analyzer name: `"ascii_lower"` or `"standard"`.
+    /// Required — the builder has always emitted it, so a column entry
+    /// without it is a malformed footer and open fails rather than
+    /// guessing which analyzer produced the postings.
     pub tokenizer: String,
     /// Whether this column's index records token positions (phrase
     /// support). Files written before positions existed lack the
@@ -139,14 +248,67 @@ pub struct FtsColumnConfig {
     /// `true` (the writer emits it only when `false`).
     #[serde(default = "default_stored")]
     pub stored: bool,
+    /// BM25 term-frequency saturation this column's stored block-max
+    /// bounds were built with. Files written before the parameters were
+    /// recordable lack the field, and can only have been built with the
+    /// standard value — so the default here is frozen at
+    /// [`bm25::K1`] and must not follow a change to what the API
+    /// recommends. The writer emits it unconditionally, defaults
+    /// included, so no reader of a current file has to fall back on
+    /// this.
+    #[serde(default = "default_k1")]
+    pub k1: f32,
+    /// BM25 length normalization, same provenance and same frozen
+    /// default ([`bm25::B`]) as [`FtsColumnConfig::k1`].
+    #[serde(default = "default_b")]
+    pub b: f32,
+    /// Stopword set applied to this column, by name. Absent means no
+    /// set — the one thing a file written before the filter existed can
+    /// mean, so a missing field needs no guess. A *present* name this
+    /// engine does not ship is a different matter and fails the open:
+    /// there is no sound way to analyze without a set the index was
+    /// built with.
+    #[serde(default)]
+    pub stopwords: Option<String>,
+    /// Stemmer applied to this column, by name; same absent-means-off
+    /// and unknown-name-fails rules as [`FtsColumnConfig::stopwords`].
+    #[serde(default)]
+    pub stemmer: Option<String>,
 }
 
-pub(super) fn default_tokenizer() -> String {
-    "ascii_lower".to_string()
+impl FtsColumnConfig {
+    /// The parameters this column's bounds were baked at.
+    pub fn params(&self) -> bm25::Bm25Params {
+        bm25::Bm25Params::new(self.k1, self.b)
+    }
+
+    /// This column's analysis filters. `Err` carries the offending
+    /// field name and value for an entry naming a filter this engine
+    /// cannot reproduce — the caller turns that into a read error
+    /// rather than analyzing the column some other way.
+    pub fn filters(&self) -> Result<(Stopwords, Stemmer), (&'static str, &str)> {
+        let stopwords = match &self.stopwords {
+            None => Stopwords::None,
+            Some(name) => Stopwords::from_name(name).ok_or(("stopwords", name.as_str()))?,
+        };
+        let stemmer = match &self.stemmer {
+            None => Stemmer::None,
+            Some(name) => Stemmer::from_name(name).ok_or(("stemmer", name.as_str()))?,
+        };
+        Ok((stopwords, stemmer))
+    }
 }
 
 pub(super) fn default_stored() -> bool {
     true
+}
+
+pub(super) fn default_k1() -> f32 {
+    bm25::K1
+}
+
+pub(super) fn default_b() -> f32 {
+    bm25::B
 }
 
 /// Per-open knobs for [`FtsReader::open_with`]. Mirrors the
@@ -179,6 +341,47 @@ impl OpenOptions {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+
+    /// The two boundary rules the analysis fields live by, asserted on
+    /// the deserializer directly because both are invisible in a
+    /// round-trip through our own writer.
+    ///
+    /// Absent means off: a file written before the filters existed has
+    /// no such field, and that can only mean it was built unfiltered —
+    /// so a current reader infers the right analysis with no guess. An
+    /// unrecognized *value* is the opposite case and must not be
+    /// tolerated: analyzing without a set the postings were built with
+    /// is a different index, not a degraded one.
+    #[test]
+    fn absent_analysis_fields_mean_off_and_unknown_values_are_refused() {
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard"}"#).expect("parse");
+        assert_eq!(entry.stopwords, None);
+        assert_eq!(entry.stemmer, None);
+        assert_eq!(
+            entry.filters().expect("no filters resolves"),
+            (Stopwords::None, Stemmer::None)
+        );
+
+        let entry: FtsColumnConfig = serde_json::from_str(
+            r#"{"name":"body","tokenizer":"standard","stopwords":"english","stemmer":"english"}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            entry.filters().expect("known filters resolve"),
+            (Stopwords::English, Stemmer::English)
+        );
+
+        // A filter this engine does not ship, in either field.
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stopwords":"german"}"#)
+                .expect("the field parses; resolving it is what fails");
+        assert_eq!(entry.filters(), Err(("stopwords", "german")));
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stemmer":"porter"}"#)
+                .expect("parse");
+        assert_eq!(entry.filters(), Err(("stemmer", "porter")));
+    }
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
@@ -214,20 +417,18 @@ mod tests {
     }
 
     #[test]
-    fn default_tokenizer_helper_is_ascii_lower() {
-        assert_eq!(default_tokenizer(), "ascii_lower");
-    }
-
-    #[test]
-    fn fts_column_config_missing_tokenizer_defaults() {
-        // A column JSON without the optional `tokenizer` field decodes to
-        // the ascii_lower default (round-trips an old file written before
-        // the field existed).
+    fn fts_column_config_without_tokenizer_is_rejected() {
+        // The analyzer name is load-bearing: query terms must be
+        // tokenized the way the postings were. A column entry missing it
+        // is a malformed footer, so open fails instead of picking an
+        // analyzer for the caller.
         let (blob, _) = build_blob();
         let json = r#"[{"name":"body"}]"#;
-        let r = FtsReader::open(blob, json).expect("open with terse json");
-        let cfg = r.fts_columns_config().next().expect("one column");
-        assert_eq!(cfg.name, "body");
+        let err = FtsReader::open(blob, json).expect_err("missing tokenizer must fail open");
+        assert!(
+            err.to_string().contains("tokenizer"),
+            "error should name the missing field: {err}"
+        );
     }
 
     #[test]
@@ -266,7 +467,7 @@ mod tests {
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
         let nt = &r.columns[0].dl_norm_k1;
 
-        let per_doc = nt.bytes.capacity(); // 1 byte/doc
+        let per_doc = nt.bytes.len(); // 1 byte/doc
         let lut = std::mem::size_of_val(&*nt.lut); // 256 * 4 = 1 KiB
         let m2_bytes = per_doc + lut;
         let f32_baseline = N as usize * std::mem::size_of::<f32>();

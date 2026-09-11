@@ -186,7 +186,11 @@ pub use superfile::VectorSearchOptions;
 /// registers per column with `Supertable::set_query_expansion` or passes
 /// per call through `Bm25SearchOptions::with_expansion`.
 pub use superfile::{
-    fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode, QueryExpansion},
+    fts::{
+        analysis::{Stemmer, Stopwords},
+        bm25::Bm25Params,
+        reader::{Bm25SearchOptions, Bm25Stats, BoolMode, QueryExpansion},
+    },
     vector::distance::Metric,
 };
 pub use supertable::{

@@ -4,7 +4,7 @@
 //! BM25 oracle for the `standard` (UAX#29) analyzer.
 //!
 //! Every other oracle in this suite builds and queries under the
-//! default `ascii_lower` tokenizer. This module builds the superfile
+//! `ascii_lower` tokenizer. This module builds the superfile
 //! *and* indexes the brute-force reference under [`StandardTokenizer`],
 //! over a corpus whose text (non-ASCII letters, punctuation, digits)
 //! the two analyzers segment differently — so the reader's standard

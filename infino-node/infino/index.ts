@@ -21,8 +21,8 @@ const STREAM = "stream";
 export type Metric = "cosine" | "l2sq" | "negdot";
 /** Boolean mode for multi-term FTS queries. */
 export type BoolMode = "or" | "and";
-/** BM25 statistics scope: per-superfile IDF (default) or corpus-wide
- * `"global"` IDF across superfiles. */
+/** BM25 statistics scope: corpus-wide `"global"` IDF across superfiles
+ * (the default) or `"per_superfile"` segment-local IDF. */
 export type Bm25Stats = "per_superfile" | "global";
 /** A row from a query/search when not materializing to Arrow. */
 export type RowRecord = Record<string, unknown>;
@@ -114,7 +114,7 @@ export interface OptimizeOptions {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  /** BM25 statistics scope: `"per_superfile"` (default) or `"global"`. */
+  /** BM25 statistics scope: `"global"` (default) or `"per_superfile"`. */
   stats?: Bm25Stats;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
   projection?: string[];
@@ -370,6 +370,19 @@ export class Table {
   append(data: AppendData): void {
     const ipc = dataToIpc(data, () => this.schema());
     guard(this.remote, () => this.inner.append(ipc));
+  }
+
+  /**
+   * {@link append}, naming the source the rows came from. The superfiles
+   * this commit writes are keyed `data/<stem>-<uuid>.sf.parquet`, with the
+   * stem the key-safe form of `sourceName` (lowercase `[a-z0-9_]`), so a
+   * bucket listing shows where each came from. The table behaves exactly as
+   * after `append`; the name is a label on the object key. Not available on
+   * a hosted table.
+   */
+  appendNamed(data: AppendData, sourceName: string): void {
+    const ipc = dataToIpc(data, () => this.schema());
+    guard(this.remote, () => this.inner.appendNamed(ipc, sourceName));
   }
 
   /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a

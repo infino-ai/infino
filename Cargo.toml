@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -141,6 +141,25 @@ static_assertions = "1"
 # Tokenization: UAX#29 word segmentation for the Unicode-aware standard
 # analyzer (keeps non-ASCII text), alongside the built-in ASCII tokenizer.
 unicode-segmentation = "1"
+# Snowball stemmers for the per-column analysis chain's `stem=` filter.
+# The de-facto Rust snowball port, dual MIT / BSD-3-Clause, and its only
+# transitive dependencies are serde + serde_derive, already direct
+# dependencies here — so the graph grows by one node, not a subtree.
+# Vendoring the stemmer tables instead would put us on the hook for
+# correctness fixes to algorithms we do not own.
+#
+# The range is a normal caret on purpose, NOT pinned with `=`. What has
+# to be guarded is the crate's *output*, not its version number: a
+# column persists the name `stem=english`, so the stemmer's rules are
+# on-disk format state, and a bump that changes one would leave columns
+# holding the old stems while queries produced new ones — silently.
+# Pinning the version would only defer that to whenever someone bumps
+# it, and would fight dependency resolution for every downstream
+# consumer meanwhile. `english_stemmer_output_is_frozen` in
+# superfile/fts/analysis.rs pins the observable behaviour instead, so a
+# bump that changes any stem fails CI and becomes a deliberate
+# decision — reject it, or ship `stem=english2` beside the old name.
+rust-stemmers = "1.2"
 
 # Numerics
 rand = "0.10"

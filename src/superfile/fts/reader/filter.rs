@@ -117,7 +117,7 @@ mod tests {
     async fn exclude_filter_for(reader: &FtsReader, terms: &[&str]) -> ExcludeFilter {
         let column_id = reader.resolve_column_id("body").expect("column exists");
         let cursors = reader
-            .build_term_cursors(column_id, terms, None, false, None)
+            .build_term_cursors(column_id, terms, None, false, None, None)
             .await
             .expect("build cursors");
         ExcludeFilter::new(cursors)

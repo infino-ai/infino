@@ -42,6 +42,7 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, Rec
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use infino::{
+    Bm25SearchOptions,
     config::{
         CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
         SupertableSettings,
@@ -506,8 +507,9 @@ async fn supertable_real_azure_round_trip() {
                 "title",
                 "alpha",
                 10,
-                infino::superfile::fts::reader::BoolMode::Or,
-                infino::Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(infino::superfile::fts::reader::BoolMode::Or)
+                    .with_stats(infino::Bm25Stats::Global),
                 None,
             )
             .map_err(|e| format!("cold BM25 over real Azure: {e}"))?;

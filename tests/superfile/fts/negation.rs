@@ -12,7 +12,10 @@
 
 use std::collections::HashSet;
 
-use infino::superfile::{SuperfileReader, fts::reader::BoolMode};
+use infino::superfile::{
+    SuperfileReader,
+    fts::{reader::BoolMode, tokenize::Phrase},
+};
 
 use crate::fts::brute_force_oracle::{
     build_infino_superfile, build_infino_superfile_positional, build_multi_block_corpus,
@@ -64,9 +67,12 @@ fn docs_with_phrase(corp: &[(u64, &str)], phrase: &[&str]) -> HashSet<u64> {
         .collect()
 }
 
-/// A phrase as the `&[Vec<String>]` the count/search API expects.
-fn phrase(tokens: &[&str]) -> Vec<Vec<String>> {
-    vec![tokens.iter().map(|t| t.to_string()).collect()]
+/// A phrase as the `&[Phrase<String>]` the count/search API expects.
+/// Adjacent, which is every phrase on a column with no analysis chain.
+fn phrase(tokens: &[&str]) -> Vec<Phrase<String>> {
+    vec![Phrase::adjacent(
+        tokens.iter().map(|t| t.to_string()).collect(),
+    )]
 }
 
 /// Run a query and collect the result doc-ids as a set.
@@ -447,10 +453,10 @@ async fn count_negation_over_dense_bitset_corpus() {
     async fn cnt(
         r: &SuperfileReader,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
         neg_terms: &[&str],
-        neg_phrases: &[Vec<String>],
+        neg_phrases: &[Phrase<String>],
     ) -> u64 {
         r.atoms_match_count(
             "title",

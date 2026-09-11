@@ -164,9 +164,10 @@ impl BlockCachedSource {
         }
     }
 
-    /// Identity token installed on the cache entry that owns this source.
-    pub(crate) fn entry_token(&self) -> Arc<()> {
-        Arc::clone(&self.entry_token)
+    /// Whether `token` is this source's own identity token, compared by pointer. Lets the owning
+    /// cache entry check "is this source still current" without cloning the `Arc`.
+    pub(crate) fn owns_token(&self, token: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.entry_token, token)
     }
 
     /// Shared filled-bytes counter, installed as the cache entry's
@@ -658,7 +659,7 @@ mod tests {
             dir.path().join("t.blocks"),
         );
         // Install the source as current for its (synthetic) entry.
-        store.install_block_entry_for_test(uri, src.filled_bytes_handle(), src.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
 
         // Read spanning blocks 0..=2 (one contiguous missing run → 1 GET).
         let start = 100u64;
@@ -735,7 +736,7 @@ mod tests {
             uri,
             path.clone(),
         );
-        store.install_block_entry_for_test(uri, src1.filled_bytes_handle(), src1.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&src1));
         let start = 100u64;
         let len = 2 * CACHE_BLOCK_BYTES + 500;
         let first = src1.range(start, len).await.expect("gen1 read");
@@ -754,7 +755,7 @@ mod tests {
             uri,
             path.clone(),
         );
-        store.install_block_entry_for_test(uri, src2.filled_bytes_handle(), src2.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&src2));
 
         let again = src2.range(start, len).await.expect("gen2 read");
         assert_eq!(again, first);
@@ -788,7 +789,7 @@ mod tests {
             uri,
             path.clone(),
         );
-        store.install_block_entry_for_test(uri, src1.filled_bytes_handle(), src1.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&src1));
         let _ = src1
             .range(100, 2 * CACHE_BLOCK_BYTES + 500)
             .await
@@ -807,7 +808,7 @@ mod tests {
             uri,
             path.clone(),
         );
-        store.install_block_entry_for_test(uri, src2.filled_bytes_handle(), src2.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&src2));
         let _ = src2
             .range(100, 2 * CACHE_BLOCK_BYTES + 500)
             .await
@@ -879,7 +880,7 @@ mod tests {
             uri,
             path.clone(),
         );
-        store.install_block_entry_for_test(uri, a.filled_bytes_handle(), a.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&a));
         let start = 100u64;
         let len = 2 * CACHE_BLOCK_BYTES + 500;
         let want = inner_a.blob.slice(start as usize..(start + len) as usize);
@@ -901,7 +902,7 @@ mod tests {
             uri,
             path.clone(),
         );
-        store.install_block_entry_for_test(uri, b.filled_bytes_handle(), b.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&b));
         let tail = 3 * CACHE_BLOCK_BYTES + 10;
         let _ = b
             .range(tail, 50)
@@ -931,7 +932,7 @@ mod tests {
             uri,
             dir.path().join("runs.blocks"),
         );
-        store.install_block_entry_for_test(uri, src.filled_bytes_handle(), src.entry_token());
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
 
         // Fill block 2 first.
         let b = CACHE_BLOCK_BYTES;

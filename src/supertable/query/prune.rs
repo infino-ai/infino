@@ -294,6 +294,7 @@ mod tests {
             ),
         );
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -349,6 +350,8 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
+            term_stats: None,
             parts,
         }
     }
@@ -413,7 +416,7 @@ mod tests {
         let s = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
         let expr = col("x").eq(lit(5_i64)).or(col("x").eq(lit(205_i64)));
         let leaves =
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &|_| default_tokenizer());
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &|_| Some(default_tokenizer()));
         let (column, values) = match leaves.as_slice() {
             [PruneLeaf::ScalarValueSet { column, values }] => (column.as_str(), values.clone()),
             _ => panic!("expected one ScalarValueSet leaf from the OR"),
@@ -500,6 +503,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -608,6 +612,7 @@ mod tests {
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),

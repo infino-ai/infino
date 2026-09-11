@@ -69,9 +69,9 @@ def test_memory_roundtrip():
 
 
 def test_fts_standard_analyzer_keeps_non_ascii():
-    # The `analyzer` kwarg selects the tokenizer. The default ascii_lower
-    # drops non-ASCII (so "café" is unsearchable); the standard analyzer
-    # (UAX #29 + lowercase) keeps it.
+    # The `analyzer` kwarg selects the tokenizer. The default, standard
+    # (UAX #29 + lowercase), keeps non-ASCII; ascii_lower drops it, so
+    # "café" is unsearchable under it.
     db = infino.connect("memory://")
 
     std_tbl = db.create_table(
@@ -80,7 +80,9 @@ def test_fts_standard_analyzer_keeps_non_ascii():
     std_tbl.append(_title_batch(["café latte"]))
     assert std_tbl.bm25_search("title", "café", 10).num_rows == 1
 
-    ascii_tbl = db.create_table("ascii", _title_schema(), infino.IndexSpec().fts("title"))
+    ascii_tbl = db.create_table(
+        "ascii", _title_schema(), infino.IndexSpec().fts("title", analyzer="ascii_lower")
+    )
     ascii_tbl.append(_title_batch(["café latte"]))
     try:
         ascii_hits = ascii_tbl.bm25_search("title", "café", 10).num_rows
@@ -91,7 +93,7 @@ def test_fts_standard_analyzer_keeps_non_ascii():
 
 def test_bm25_stats_kwarg():
     # `stats` selects the BM25 corpus statistics. Both modes return the
-    # matching docs; the default is per-superfile. Correctness of the
+    # matching docs; the default is global. Correctness of the
     # global ranking is covered by the Rust oracle; here we just exercise
     # the binding and the string parsing.
     db = infino.connect("memory://")
@@ -106,6 +108,156 @@ def test_bm25_stats_kwarg():
     assert default_hits.num_rows == 2
     assert per_sf.num_rows == 2
     assert global_hits.num_rows == 2
+
+
+def test_bm25_params_declared_and_overridden():
+    # `k1` / `b` declared on the column, and the same pair reached by
+    # overriding a default table at query time, must rank identically —
+    # the engine corrects the stored score bounds for the difference.
+    # Correctness of the correction is covered by the Rust oracle; here
+    # we exercise the binding, including that a declared table and an
+    # overridden one agree through it.
+    db = infino.connect("memory://")
+    titles = ["the quick brown fox", "a lazy dog", "quick thinking about foxes"]
+
+    declared = db.create_table(
+        "declared", _title_schema(), infino.IndexSpec().fts("title", k1=1.6, b=0.4)
+    )
+    plain = db.create_table("plain", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in titles:
+        declared.append(_title_batch([title]))
+        plain.append(_title_batch([title]))
+
+    from_declared = declared.bm25_search("title", "quick", 10, projection=["title", "score"])
+    from_override = plain.bm25_search(
+        "title", "quick", 10, projection=["title", "score"], k1=1.6, b=0.4
+    )
+
+    assert from_declared.num_rows == 2
+    assert from_declared.column("title").to_pylist() == from_override.column("title").to_pylist()
+    for a, b in zip(
+        from_declared.column("score").to_pylist(), from_override.column("score").to_pylist()
+    ):
+        assert abs(a - b) < 1e-4
+
+
+def test_fts_positional_arguments_keep_their_meaning():
+    # `IndexSpec.fts`'s positional order is API surface, and nothing else
+    # in this suite exercises it: every other call here passes keywords
+    # past `column`. So an option inserted mid-signature silently
+    # repositions `stored` / `k1` / `b` for downstream positional callers
+    # and no test fails. This pins the order so that change has to break
+    # here first.
+    #
+    # It has happened: the stopwords/stemmer/positions options were first
+    # added *before* `stored`, which turned `fts("body", "standard",
+    # False)` into a `TypeError` — caught in review, not by CI.
+    db = infino.connect("memory://")
+    titles = ["the quick brown fox", "a lazy dog", "quick thinking about foxes"]
+
+    # Slot 3 is `stored`, so a bool is accepted there. Under the broken
+    # signature this raised TypeError before doing anything.
+    index_only = db.create_table(
+        "index_only", _title_schema(), infino.IndexSpec().fts("title", "standard", False)
+    )
+    for title in titles:
+        index_only.append(_title_batch([title]))
+    # Searchable, since `stored` governs readback and not the index.
+    assert index_only.bm25_search("title", "quick", 10).num_rows == 2
+
+    # Slots 4 and 5 are `k1` and `b`. Checked by ranking rather than by
+    # the call merely succeeding: two floats would be accepted by any
+    # signature whose tail is float-shaped, so only the scores prove the
+    # values landed on the parameters they were meant for.
+    positional = db.create_table(
+        "positional", _title_schema(), infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4)
+    )
+    keyword = db.create_table(
+        "keyword", _title_schema(), infino.IndexSpec().fts("title", k1=1.6, b=0.4)
+    )
+    for title in titles:
+        positional.append(_title_batch([title]))
+        keyword.append(_title_batch([title]))
+    from_positional = positional.bm25_search("title", "quick", 10, projection=["title", "score"])
+    from_keyword = keyword.bm25_search("title", "quick", 10, projection=["title", "score"])
+    assert from_positional.column("title").to_pylist() == from_keyword.column("title").to_pylist()
+    for a, b in zip(
+        from_positional.column("score").to_pylist(), from_keyword.column("score").to_pylist()
+    ):
+        assert abs(a - b) < 1e-4
+
+
+def test_analysis_filter_names_resolve_at_create_table_exactly():
+    # The filters resolve in `to_rust()` at `create_table`, not at
+    # `fts()` — `fts` only records the strings — so this is where an
+    # unknown name surfaces, and neither binding covered it.
+    #
+    # Matched exactly, like the engine's own resolver: an earlier version
+    # of the node binding case-folded its argument, so `stopwords="English"`
+    # was accepted there and rejected here for the same call. Accepting
+    # more spellings later is additive; tightening later would not be.
+    db = infino.connect("memory://")
+    for bad, field in [("English", "stopwords"), ("ENGLISH", "stopwords"), ("german", "stopwords")]:
+        with pytest.raises(ValueError) as e:
+            db.create_table(
+                f"bad_{field}_{bad}", _title_schema(), infino.IndexSpec().fts("title", stopwords=bad)
+            )
+        assert bad in str(e.value)
+    for bad in ("English", "porter"):
+        with pytest.raises(ValueError) as e:
+            db.create_table(
+                f"bad_stem_{bad}", _title_schema(), infino.IndexSpec().fts("title", stemmer=bad)
+            )
+        assert bad in str(e.value)
+
+
+def test_analysis_options_are_keyword_only():
+    # The analysis options sit behind `*`, so they can never be captured
+    # positionally. That is what keeps the positional tail above stable
+    # as more options are added — the next one cannot repeat the
+    # mid-signature insertion that broke it.
+    with pytest.raises(TypeError):
+        infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4, "english")
+    # And they still work by keyword, in any combination.
+    spec = infino.IndexSpec().fts(
+        "title", stopwords="english", stemmer="english", positions=True
+    )
+    db = infino.connect("memory://")
+    t = db.create_table("chained", _title_schema(), spec)
+    t.append(_title_batch(["the quick brown foxes are running"]))
+    # Stemming folds the inflection; the stopword never reaches the index.
+    assert t.bm25_search("title", "run", 10).num_rows == 1
+    assert t.bm25_search("title", "the", 10).num_rows == 0
+    # Positions were recorded, so an exact phrase resolves.
+    assert t.bm25_search("title", '"brown foxes"', 10).num_rows == 1
+
+
+def test_bm25_params_must_be_passed_together():
+    # Overriding one parameter and inheriting the engine default for the
+    # other would score with a combination the caller never chose, since
+    # the two interact through the length norm. Both surfaces refuse it.
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox"]))
+
+    with pytest.raises(ValueError):
+        t.bm25_search("title", "fox", 10, k1=1.6)
+    with pytest.raises(ValueError):
+        t.bm25_search("title", "fox", 10, b=0.4)
+    with pytest.raises(ValueError):
+        db.create_table("half", _title_schema(), infino.IndexSpec().fts("title", k1=1.6))
+
+
+def test_bm25_params_out_of_range_is_rejected():
+    # Same bounds as the Rust surface: k1 > 0, b in [0, 1].
+    db = infino.connect("memory://")
+    for k1, b in [(0.0, 0.5), (-1.0, 0.5), (1.2, 1.5), (1.2, -0.1)]:
+        with pytest.raises(Exception):
+            db.create_table(
+                f"bad_{k1}_{b}",
+                _title_schema(),
+                infino.IndexSpec().fts("title", k1=k1, b=b),
+            )
 
 
 def test_bm25_unknown_stats_is_rejected():

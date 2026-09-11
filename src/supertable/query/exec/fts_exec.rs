@@ -375,12 +375,20 @@ impl ExecutionPlan for Bm25Exec {
 
         let fut = async move {
             let hits = match &query {
-                // Per-superfile statistics and no per-call expansion: the
-                // SQL function has no argument for either, so the column's
-                // registered expansion (if any) applies.
+                // Default options apart from `mode` — global statistics,
+                // each column's declared parameters, no per-call
+                // expansion: the SQL function has no argument for any of
+                // them, so the column's registered expansion (if any)
+                // applies.
                 Bm25Query::Terms { query, mode } => {
-                    let opts = Bm25SearchOptions::new().with_mode(*mode);
-                    reader.bm25_search_async(&column, query, k, &opts).await
+                    reader
+                        .bm25_search_async(
+                            &column,
+                            query,
+                            k,
+                            Bm25SearchOptions::new().with_mode(*mode),
+                        )
+                        .await
                 }
                 Bm25Query::Prefix { prefix } => {
                     reader.bm25_search_prefix_async(&column, prefix, k).await

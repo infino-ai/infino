@@ -16,4 +16,5 @@ mod query_surface;
 pub mod skip_pruning;
 mod stats_fold;
 mod stored_fields;
+mod term_stats;
 pub mod tombstone_filter;

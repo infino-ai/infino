@@ -17,7 +17,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    InfinoError,
+    Bm25SearchOptions, InfinoError,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::FtsConfig,
@@ -188,8 +188,9 @@ async fn writer_delete_tombstones_matching_rows() {
             "title",
             "bravo",
             FTS_TOP_K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("fts");
@@ -271,8 +272,9 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
             "title",
             "bravo",
             FTS_TOP_K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("pre-delete fts")
@@ -300,8 +302,9 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
             "title",
             "bravo",
             FTS_TOP_K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("post-delete fts")

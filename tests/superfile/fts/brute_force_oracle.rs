@@ -28,6 +28,7 @@
 //! "ordered equality".
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -39,7 +40,10 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::reader::BoolMode,
+        fts::{
+            reader::BoolMode,
+            tokenize::{Phrase, Tokenizer},
+        },
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids, default_tokenizer},
 };
@@ -123,16 +127,18 @@ pub fn build_infino_superfile_positional(corpus: &[(u64, &str)]) -> SuperfileRea
 }
 
 fn build_infino_superfile_with(corpus: &[(u64, &str)], positions: bool) -> SuperfileReader {
+    build_infino_superfile_with_fts(corpus, FtsConfig::new("title").positions(positions))
+}
+
+/// Build the same single-superfile fixture under an arbitrary
+/// [`FtsConfig`], for tests that need a non-default analysis (a stopword
+/// set, a stemmer) rather than just positions on or off.
+pub fn build_infino_superfile_with_fts(corpus: &[(u64, &str)], fts: FtsConfig) -> SuperfileReader {
     let schema = Arc::new(Schema::new(vec![
         Field::new("doc_id", DataType::Decimal128(38, 0), false),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
-    let opts = BuilderOptions::new(
-        schema.clone(),
-        "doc_id",
-        vec![FtsConfig::new("title").positions(positions)],
-        vec![],
-    );
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![fts], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let ids = decimal128_ids(corpus.iter().map(|(i, _)| *i));
     let titles = LargeStringArray::from(corpus.iter().map(|(_, t)| *t).collect::<Vec<_>>());
@@ -141,6 +147,38 @@ fn build_infino_superfile_with(corpus: &[(u64, &str)], positions: bool) -> Super
     b.add_batch(&batch, &[]).expect("add_batch");
     let bytes = Bytes::from(b.finish().expect("finish builder"));
     SuperfileReader::open(bytes).expect("open superfile")
+}
+
+/// Oracle top-k for `query` under `mode`, parsed with `tok`.
+///
+/// Parsing here with the *same* tokenizer the reader uses is the point:
+/// it means a difference in how the query was split into clauses can
+/// never masquerade as a difference in scoring. `Phrase::map` carries
+/// each term's offset across, so a phrase is graded at the spacing the
+/// parser derived rather than at adjacency — which is what a stopworded
+/// column needs, and a no-op for every other column.
+pub fn oracle_top_k_atoms(
+    oracle: &BruteForceBm25,
+    tok: &dyn Tokenizer,
+    query: &str,
+    mode: BoolMode,
+    k: usize,
+) -> Vec<(u64, f32)> {
+    let clauses = tok.parse(query).into_clauses(mode);
+    let own =
+        |v: Vec<Cow<'_, str>>| -> Vec<String> { v.into_iter().map(Cow::into_owned).collect() };
+    let own_ph = |v: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+        v.iter().map(|p| p.map(|t| t.to_string())).collect()
+    };
+    oracle.top_k_atoms(
+        &own(clauses.musts),
+        &own_ph(clauses.must_phrases),
+        &own(clauses.shoulds),
+        &own_ph(clauses.should_phrases),
+        &own(clauses.negatives),
+        &own_ph(clauses.negative_phrases),
+        k,
+    )
 }
 
 /// Run infino's BM25 search and return doc_ids in score-descending

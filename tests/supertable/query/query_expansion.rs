@@ -306,10 +306,11 @@ fn tag_scores(batches: &[RecordBatch]) -> HashMap<String, f32> {
     out
 }
 
-/// Ranked hits as `tag → score`, through the options-taking entry.
+/// Ranked hits as `tag → score` under `opts` (cloned per call: the
+/// options carry an `Arc` and are passed by value).
 fn scored(st: &Supertable, query: &str, opts: &Bm25SearchOptions) -> HashMap<String, f32> {
     tag_scores(
-        &st.bm25_search_with_options("title", query, K_ALL, opts, Some(&["tag", "score"]))
+        &st.bm25_search("title", query, K_ALL, opts.clone(), Some(&["tag", "score"]))
             .expect("bm25_search"),
     )
 }
@@ -688,11 +689,11 @@ fn bm25_search_applies_the_registration_and_a_per_call_expansion_overrides_it() 
     // silent literal search.
     let bad = Arc::new(QueryExpansion::new().stop(["login page"]));
     let err = st
-        .bm25_search_with_options(
+        .bm25_search(
             "title",
             "run",
             K_ALL,
-            &Bm25SearchOptions::new().with_expansion(Some(bad)),
+            Bm25SearchOptions::new().with_expansion(Some(bad)),
             None,
         )
         .expect_err("two-word entry");
@@ -708,20 +709,20 @@ fn no_expansion_and_an_empty_expansion_return_identical_batches() {
         ("\"login page\" fails", BoolMode::Or),
     ] {
         let none = st
-            .bm25_search_with_options(
+            .bm25_search(
                 "title",
                 query,
                 K_ALL,
-                &Bm25SearchOptions::new().with_mode(mode),
+                Bm25SearchOptions::new().with_mode(mode),
                 Some(&["tag", "score"]),
             )
             .expect("bm25 without expansion");
         let empty = st
-            .bm25_search_with_options(
+            .bm25_search(
                 "title",
                 query,
                 K_ALL,
-                &Bm25SearchOptions::new()
+                Bm25SearchOptions::new()
                     .with_mode(mode)
                     .with_expansion(Some(Arc::new(QueryExpansion::new()))),
                 Some(&["tag", "score"]),

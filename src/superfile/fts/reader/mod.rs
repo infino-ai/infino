@@ -29,4 +29,6 @@ pub(crate) use expansion::NormalizedExpansion;
 pub use expansion::{ExpansionError, QueryExpansion};
 pub use metadata::{ColumnMeta, OpenOptions};
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
+pub(crate) use search::FetchedTermMemo;
+pub(crate) use sink::LiveFloor;
 pub use work::MatchWork;

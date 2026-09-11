@@ -97,12 +97,13 @@ use crate::superfile::{
         checksum::{crc32c, crc32c_append},
     },
     fts::{
+        analysis::ChainTokenizer,
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
-        tokenize::{AsciiLowerTokenizer, Tokenizer},
+        tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
 };
 
@@ -289,7 +290,7 @@ const ACCUM_POSTING_BYTES: usize = 8;
 /// `sort_unstable_by` instead of the counting/radix variant: under
 /// this count the histogram allocation outweighs the algorithmic
 /// savings.
-const RADIX_SORT_MIN_TRIPLES: usize = 256;
+pub(crate) const RADIX_SORT_MIN_TRIPLES: usize = 256;
 
 /// Upper bound on the initial in-RAM chunk capacity (in triples)
 /// during external merge sort. Caps the up-front `Vec` reservation
@@ -315,6 +316,11 @@ struct ColumnState {
     /// positional capture path in `add_doc` and the extended
     /// per-term layout at emit.
     positions: bool,
+    /// BM25 parameters for this column, from `FtsConfig::bm25`. The
+    /// per-block score bounds in the skip table are the block's true
+    /// max under this pair, and the pair itself is recorded in the
+    /// column's KV entry so the reader knows what the bounds mean.
+    params: bm25::Bm25Params,
 }
 
 /// Per-column posting accumulator. Starts in `InRam` mode; transitions
@@ -984,20 +990,27 @@ mod finish_debug {
 ///    `0..vocab_size`. The bench Zipfian column has ~10K vocab; even
 ///    a 10M-doc supertable column tops out around a few million —
 ///    the counts table fits comfortably in L2 either way.
-/// 2. The secondary key is *free*. Within a partition file, all
-///    triples for a fixed `term_id` are appended in strictly
-///    increasing `doc_id` order (`add_doc` is called with monotonic
-///    `local_doc_id` per `column_id`, and each call emits one
-///    triple per unique term in iteration order over
+/// 2. The secondary key is *almost* free. For the tokenizing ingest
+///    feed, all triples for a fixed `term_id` are appended in
+///    strictly increasing `doc_id` order (`add_doc` is called with
+///    monotonic `local_doc_id` per `column_id`, and each call emits
+///    one triple per unique term in iteration order over
 ///    `updated_terms`, with all triples for that doc emitted
-///    contiguously). So a *stable* sort on `lex_rank[term_id]`
-///    leaves the within-rank order as the original `doc_id` order
-///    — exactly the `(lex_rank, doc_id)` order the finish-time
-///    lex-order partition traversal needs.
+///    contiguously), so the *stable* scatter on `lex_rank[term_id]`
+///    already leaves the within-rank order as `doc_id` order. The
+///    compaction carry paths may not arrive ascending — the
+///    multi-cell merge remaps postings through the packed stable-id
+///    row order — so a verification pass (pass 4 below) scans each
+///    rank run and sorts only the runs with an inversion, restoring
+///    the `(lex_rank, doc_id)` order the finish-time lex-order
+///    partition traversal needs.
 /// 3. Counting sort is **one pass to histogram + one pass to
 ///    scatter**. No `O(log n)` compare chain (pdqsort), no 5–8
 ///    LSB-byte passes (radix), no comparator chasing `lex_rank`
-///    twice per call. Two reads of every triple and one write.
+///    twice per call. Three reads of every triple and one write
+///    (histogram, scatter, order verification) — the verification
+///    read is sequential and measured within noise on the 1M
+///    superfile build.
 ///
 /// **Memory shape**: `counts: Vec<u32>` of length
 /// `vocab_size + 1` (~40 KiB at 10K vocab), plus the `out: Vec
@@ -1055,10 +1068,11 @@ fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, l
 
     // Pass 3: scatter into `out`. Each triple lands at
     // `offsets[rank]`, then we bump that slot so the next triple
-    // for the same rank lands immediately after. Because we walk
-    // `triples` in arrival order and arrival order is `(doc_id,
-    // term_id_within_doc)`, the within-rank order in `out` is the
-    // partition's `doc_id` order — i.e. `(lex_rank, doc_id)`.
+    // for the same rank lands immediately after. The scatter is
+    // stable, so within a rank `out` holds arrival order — which is
+    // `doc_id` order for the tokenizing ingest feed, but not
+    // necessarily for the compaction carry feeds; pass 4 repairs
+    // any run that needs it.
     let mut out: Vec<[u32; N]> = vec![[0u32; N]; n];
     for t in triples.iter() {
         let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
@@ -1066,6 +1080,35 @@ fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, l
         unsafe {
             *out.get_unchecked_mut(dst) = *t;
             *offsets.get_unchecked_mut(rank) = (dst as u32).wrapping_add(1);
+        }
+    }
+
+    // Pass 4: repair within-rank doc order. The counting scatter above is
+    // stable, so within a rank `out` holds arrival order. The tokenizing
+    // ingest path always arrives in ascending doc order, but the
+    // compaction carry paths can feed a term's docs out of order (the
+    // multi-cell merge remaps postings through the packed row order), and
+    // the sorted-chunk contract downstream — the external-merge heap key
+    // and `encode_block`'s strictly-ascending doc ids — is `(lex_rank,
+    // doc_id)`. Scan each rank run and sort only the runs that need it:
+    // linear for the already-sorted ingest shape.
+    let mut run_start = 0usize;
+    let mut run_rank = lex_rank[triple_term_id(&out[0]) as usize];
+    let mut run_sorted = true;
+    for i in 1..=n {
+        let rank_at = |t: &[u32; N]| lex_rank[triple_term_id(t) as usize];
+        let boundary = i == n || rank_at(&out[i]) != run_rank;
+        if boundary {
+            if !run_sorted {
+                out[run_start..i].sort_unstable_by_key(triple_doc_id);
+            }
+            if i < n {
+                run_rank = rank_at(&out[i]);
+            }
+            run_start = i;
+            run_sorted = true;
+        } else if triple_doc_id(&out[i]) < triple_doc_id(&out[i - 1]) {
+            run_sorted = false;
         }
     }
 
@@ -1349,9 +1392,12 @@ impl FtsBuilder {
     /// Register an FTS column up-front, tokenized with the builder's
     /// default tokenizer. Returns its `column_id` (its index in
     /// declaration order).
+    /// Scores with the standard BM25 pair; use
+    /// [`FtsBuilder::register_column_with_tokenizer`] to declare
+    /// another.
     pub fn register_column(&mut self, name: String, positions: bool) -> Result<u32, BuildError> {
         let tokenizer = Arc::clone(&self.default_tokenizer);
-        self.register_column_with_tokenizer(name, positions, tokenizer)
+        self.register_column_with_tokenizer(name, positions, tokenizer, bm25::Bm25Params::STANDARD)
     }
 
     /// Register an FTS column tokenized with an explicit `tokenizer`,
@@ -1362,6 +1408,7 @@ impl FtsBuilder {
         name: String,
         positions: bool,
         tokenizer: Arc<dyn Tokenizer>,
+        params: bm25::Bm25Params,
     ) -> Result<u32, BuildError> {
         if name.as_bytes().contains(&FST_SEPARATOR) {
             return Err(BuildError::ReservedSeparatorInColumnName(name));
@@ -1378,6 +1425,7 @@ impl FtsBuilder {
             doc_lengths: Vec::new(),
             total_tokens: 0,
             positions,
+            params,
         });
         self.postings.push(ColumnPostings::new());
         self.column_tokenizers.push(tokenizer);
@@ -1566,12 +1614,17 @@ impl FtsBuilder {
     /// column's accumulator without tokenizing — the FTS-compaction-merge
     /// counterpart of [`add_doc`]. `positions` is empty for a non-positional
     /// column; otherwise it holds the `tf` token offsets for this `(term,
-    /// doc)`. Callers feed postings with each term's docs in ascending doc-id
-    /// order (the merge reads them that way), so a term's posting list stays
-    /// sorted — matching what `add_doc` produces. Mirrors the in-RAM drain in
-    /// [`add_doc_inram`], minus the tokenize + per-doc position-chain walk.
+    /// doc)`. The concatenating merges feed each term's docs in ascending
+    /// doc-id order (sequential inputs, dense remap), matching what
+    /// `add_doc` produces. The multi-cell merge does not — it remaps
+    /// postings through the packed stable-id row order — so it forces the
+    /// column into spill mode first, where the finish restores per-term
+    /// doc order (see `radix_sort_records_by_lex_rank`); the in-RAM
+    /// accumulator preserves insertion order and must only be fed
+    /// ascending. Mirrors the in-RAM drain in [`add_doc_inram`], minus the
+    /// tokenize + per-doc position-chain walk.
     ///
-    /// Doc lengths are fed separately via [`set_prebuilt_doc_lengths`] — the
+    /// Doc lengths are fed separately via [`append_prebuilt_doc_lengths`] — the
     /// merge carries the inputs' stored lengths rather than recomputing them.
     ///
     /// Memory-bounded: while in-RAM, a push that crosses `spill_threshold_bytes`
@@ -1827,6 +1880,20 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<AsciiLowerTokenizer>();
+        // `standard` is the default analyzer, so it needs the same
+        // monomorphized scan the ASCII tokenizer gets — through the
+        // trait object every token costs an indirect call and the
+        // interning closure cannot inline into the scan loop.
+        let standard_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
         let positional = self.columns[col_idx].positions;
@@ -1893,6 +1960,10 @@ impl FtsBuilder {
             };
             if let Some(ascii) = ascii_tok {
                 ascii.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(standard) = standard_tok {
+                standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -1946,13 +2017,31 @@ impl FtsBuilder {
                     record(tok, position);
                     tokens_in_doc += 1;
                 });
-            } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals; a tokenizer that silently drops tokens will
-                // not leave phrase gaps (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
+            } else if let Some(standard) = standard_tok {
+                // `standard` drops nothing — every segment carrying an
+                // alphanumeric is emitted — so an emission ordinal *is*
+                // the gap-inclusive position and no gap bookkeeping is
+                // needed. Monomorphized for the same reason as above.
+                standard.tokenize_each_inline(text, |tok| {
                     record(tok, tokens_in_doc);
+                    tokens_in_doc += 1;
+                });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
+            } else {
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait; the default numbering is
+                // consecutive, which is correct for one that drops
+                // nothing (see the `Tokenizer` trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2061,6 +2150,20 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<AsciiLowerTokenizer>();
+        // `standard` is the default analyzer, so it needs the same
+        // monomorphized scan the ASCII tokenizer gets — through the
+        // trait object every token costs an indirect call and the
+        // interning closure cannot inline into the scan loop.
+        let standard_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
         let positional = self.columns[col_idx].positions;
 
@@ -2105,6 +2208,10 @@ impl FtsBuilder {
             };
             if let Some(ascii) = ascii_tok {
                 ascii.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(standard) = standard_tok {
+                standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -2165,12 +2272,30 @@ impl FtsBuilder {
                     record(tok, position);
                     tokens_in_doc += 1;
                 });
-            } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
+            } else if let Some(standard) = standard_tok {
+                // `standard` drops nothing — every segment carrying an
+                // alphanumeric is emitted — so an emission ordinal *is*
+                // the gap-inclusive position and no gap bookkeeping is
+                // needed. Monomorphized for the same reason as above.
+                standard.tokenize_each_inline(text, |tok| {
                     record(tok, tokens_in_doc);
+                    tokens_in_doc += 1;
+                });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
+            } else {
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait (see the `Tokenizer`
+                // trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2469,6 +2594,7 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -2517,6 +2643,7 @@ impl FtsBuilder {
                     col_name_bytes,
                     col_doc_lengths,
                     avgdl,
+                    params,
                     n_docs,
                     &mut key_buf,
                     &mut postings_writer,
@@ -2679,6 +2806,7 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -2722,6 +2850,7 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
+                            params,
                             n_docs,
                             &mut key_buf,
                             &mut postings_writer,
@@ -2869,6 +2998,7 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
+                            params,
                             n_docs,
                             &mut key_buf,
                             &mut postings_writer,
@@ -2906,6 +3036,7 @@ impl FtsBuilder {
                                 col_name_bytes,
                                 col_doc_lengths,
                                 avgdl,
+                                params,
                                 n_docs,
                                 &mut key_buf,
                                 &mut postings_writer,
@@ -3298,6 +3429,10 @@ fn assemble_and_write_blob<W: Write>(
     // The legacy ladder (V2/V3/V4) is written only when the coarse table is
     // suppressed (test-only), so the backwards-compat tests can produce a
     // genuine pre-086 blob.
+    // A column's BM25 parameters do not move the version: they are
+    // recorded in its `inf.fts.columns` entry and read back from there,
+    // so the stored per-block bound is interpreted against the pair that
+    // entry names. Nothing about the layout differs either way.
     let fts_version = if write_coarse {
         format::fts::VERSION_V5
     } else if finish_profile.saw_bitset_block {
@@ -3435,6 +3570,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
+    params: bm25::Bm25Params,
     n_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
@@ -3546,6 +3682,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             col_name_bytes,
             col_doc_lengths,
             avgdl,
+            params,
             n_docs,
             key_buf,
             postings_writer,
@@ -3587,6 +3724,7 @@ fn encode_and_emit_term<W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
+    params: bm25::Bm25Params,
     n_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
@@ -3693,7 +3831,7 @@ fn encode_and_emit_term<W: Write>(
                 .map(|(&d, &t)| {
                     let reader_dl =
                         bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
-                    bm25::score(idf_t, t, reader_dl, avgdl)
+                    bm25::score(idf_t, t, reader_dl, avgdl, params)
                 })
                 .fold(0.0f32, f32::max);
             block_ub_per_block.push(block_ub);
@@ -3990,7 +4128,39 @@ fn sort_partition_to_file<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::default_tokenizer as tokenizer;
+    use crate::{superfile::fts::tokenize::Phrase, test_helpers::default_tokenizer as tokenizer};
+
+    /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
+    /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
+    /// order — the compaction carry paths feed postings remapped through
+    /// a packed row order, unlike the always-ascending ingest path. A
+    /// term-only stable scatter once preserved the unsorted arrival
+    /// order, and `encode_block` then indexed a bitset block out of
+    /// bounds on the merged output.
+    #[test]
+    fn radix_sort_orders_docs_within_term_for_unsorted_feeds() {
+        // 4 terms × enough triples to clear the radix threshold, docs
+        // deliberately fed in descending order per term.
+        let n_terms = 4u32;
+        let per_term = RADIX_SORT_MIN_TRIPLES as u32;
+        // Identity lex ranks (term ids already lexicographic).
+        let lex_rank: Vec<u32> = (0..n_terms).collect();
+        let mut triples: Vec<[u32; 3]> = Vec::new();
+        for doc in (0..per_term).rev() {
+            for term in 0..n_terms {
+                triples.push([term, doc, 1]);
+            }
+        }
+        assert!(triples.len() >= RADIX_SORT_MIN_TRIPLES);
+        radix_sort_records_by_lex_rank(&mut triples, &lex_rank);
+        let sorted = triples.windows(2).all(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let ka = (lex_rank[triple_term_id(a) as usize], triple_doc_id(a));
+            let kb = (lex_rank[triple_term_id(b) as usize], triple_doc_id(b));
+            ka < kb
+        });
+        assert!(sorted, "triples must come out in (lex_rank, doc_id) order");
+    }
 
     #[test]
     fn register_column_returns_sequential_ids() {
@@ -4967,7 +5137,9 @@ mod tests {
             (&["filler", "medium"], 79),
         ];
         for (terms, want) in phrases {
-            let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
+            let phrase = vec![Phrase::adjacent(
+                terms.iter().map(|t| t.to_string()).collect(),
+            )];
             let a = v3
                 .atoms_match_count("title", &[], &phrase, &[], BoolMode::And, &[], &[], &[])
                 .await

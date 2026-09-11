@@ -34,8 +34,13 @@ use crate::superfile::fts::bm25;
 pub(super) struct GroupCursor {
     /// Member cursors (the head first, then its surface forms).
     pub(super) members: Vec<TermCursor>,
-    /// The group's `idf × (K1 + 1)` — the scoring constant.
+    /// The group's `idf × (k1 + 1)` — the scoring constant, built with
+    /// the parameters this query scores with.
     idf_x_k1p1: f32,
+    /// The group's bare idf, kept beside `idf_x_k1p1` so the range
+    /// bound can scale by it without dividing by a `(k1 + 1)` the
+    /// cursor would have to guess.
+    idf: f32,
     /// Group-scaled term-level upper bound (see type docs).
     term_max_bm25: f32,
     /// Smallest current doc across live members, or `u32::MAX` when every
@@ -49,16 +54,22 @@ impl GroupCursor {
     /// Build from the present members' cursors (query order) and, under
     /// table-wide statistics, the group idf the caller derived from the
     /// members' table-wide document frequencies; `None` takes the
-    /// smallest member idf in this superfile.
-    pub(super) fn new(members: Vec<TermCursor>, global_idf: Option<f32>) -> Self {
+    /// smallest member idf in this superfile. `params` is the pair the
+    /// members were built with (the column's own, or the query's
+    /// override), so the group's scoring constant matches theirs.
+    pub(super) fn new(
+        members: Vec<TermCursor>,
+        global_idf: Option<f32>,
+        params: bm25::Bm25Params,
+    ) -> Self {
         debug_assert!(
             !members.is_empty(),
             "a group with no present member is absent"
         );
-        let local_min = members
-            .iter()
-            .map(TermCursor::idf)
-            .fold(f32::INFINITY, f32::min);
+        // Each member's own idf (the field, never `idf_x_k1p1 / (K1 +
+        // 1)`: dividing by the crate constant would recover the wrong
+        // value for a column scoring at a declared or overridden pair).
+        let local_min = members.iter().map(|m| m.idf).fold(f32::INFINITY, f32::min);
         let idf = global_idf.unwrap_or(local_min);
         // Same construction as `block_max_in_range`, over the whole list:
         // each member's term-level bound with its own idf divided out,
@@ -70,7 +81,8 @@ impl GroupCursor {
                 .sum::<f32>();
         let mut cursor = Self {
             members,
-            idf_x_k1p1: idf * (bm25::K1 + 1.0),
+            idf_x_k1p1: params.idf_x_k1p1(idf),
+            idf,
             term_max_bm25,
             current_doc: 0,
             current_tf: 0,
@@ -153,11 +165,11 @@ impl GroupCursor {
     /// place of `Σ`: a phrase's tf is at most every member's tf, a
     /// group's tf is their sum.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
-        let idf = self.idf_x_k1p1 / (bm25::K1 + 1.0);
-        idf * self
-            .members
-            .iter_mut()
-            .map(|m| m.block_max_tf_factor_in_range(range_start, range_end))
-            .sum::<f32>()
+        self.idf
+            * self
+                .members
+                .iter_mut()
+                .map(|m| m.block_max_tf_factor_in_range(range_start, range_end))
+                .sum::<f32>()
     }
 }

@@ -38,9 +38,17 @@ pub fn classify_batch_bytes(batch: &RecordBatch) -> (u64, u64) {
 /// zero-copy window into a larger buffer is billed for the rows it
 /// actually carries rather than for its parent's whole allocation.
 ///
-/// This is the right measure wherever bytes are *priced*. It is the wrong
-/// one for held-memory accounting (an auto-flush threshold, a scratch
-/// reserve), where the parent allocation really is what is resident.
+/// This is the right measure wherever bytes are *priced*, and wherever a
+/// figure scales with the rows something will read — the build-scratch
+/// reserve included, since the blobs and serialized file a build allocates
+/// are sized by the rows it decodes, not by the parent allocation those
+/// rows are a window into.
+///
+/// It is the wrong measure for held memory (the auto-flush threshold),
+/// where a slice really does pin its parent's whole allocation and cannot
+/// free it. Note that capacity is not right there either: summed across
+/// arrays that share one allocation it counts the same bytes once per
+/// array, so neither figure is the resident total.
 ///
 /// Two families need handling of their own, because Arrow's slice-aware
 /// sizing is not uniformly slice-aware:

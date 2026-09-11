@@ -46,6 +46,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         Supertable, SupertableOptions,
@@ -199,7 +200,12 @@ fn run_bm25(st: &Supertable) -> Vec<(String, u32)> {
     hit_key(
         &st.reader()
             .expect("reader")
-            .bm25_hits("title", "rust", K, BoolMode::Or)
+            .bm25_hits(
+                "title",
+                "rust",
+                K,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("bm25"),
     )
 }

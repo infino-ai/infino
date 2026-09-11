@@ -18,6 +18,7 @@ use std::{
 };
 
 use arrow_array::{Array, RecordBatch};
+use infino::Bm25SearchOptions;
 
 use crate::{
     cpu,
@@ -287,7 +288,7 @@ pub mod fts {
             SuperfileReader,
             fts::{
                 reader::BoolMode as InfinoBoolMode,
-                tokenize::{AsciiLowerTokenizer, Tokenizer},
+                tokenize::{AsciiLowerTokenizer, Phrase, Tokenizer},
             },
         },
         supertable::SupertableReader,
@@ -748,10 +749,11 @@ pub mod fts {
                 };
                 if !phrases.is_empty() {
                     let refs: Vec<&str> = terms.iter().map(|t| &**t).collect();
-                    let owned: Vec<Vec<String>> = phrases
-                        .into_iter()
-                        .map(|p| p.into_iter().map(|t| t.into_owned()).collect())
-                        .collect();
+                    // `Phrase::map` carries each term's offset across, so
+                    // a bench query on a stopworded column asks for the
+                    // spacing the parser derived rather than adjacency.
+                    let owned: Vec<Phrase<String>> =
+                        phrases.iter().map(|p| p.map(|t| t.to_string())).collect();
                     return self
                         .atoms_match_count(column, &refs, &owned, &[], eff_mode, &[], &[], &[])
                         .await
@@ -786,8 +788,7 @@ pub mod fts {
                 column,
                 query,
                 k,
-                mode,
-                infino::Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new().with_mode(mode),
                 None,
             )
             .expect("supertable bm25_search")
@@ -807,8 +808,7 @@ pub mod fts {
                 column,
                 query,
                 k,
-                mode,
-                infino::Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new().with_mode(mode),
                 Some(&["_id", column, "score"]),
             )
             .expect("supertable bm25_search fetched")
@@ -829,8 +829,7 @@ pub mod fts {
                     column,
                     query,
                     k,
-                    mode,
-                    infino::Bm25Stats::PerSuperfile,
+                    Bm25SearchOptions::new().with_mode(mode),
                     None,
                 )
                 .expect("supertable bm25_search payload");
@@ -839,8 +838,7 @@ pub mod fts {
                     column,
                     query,
                     k,
-                    mode,
-                    infino::Bm25Stats::PerSuperfile,
+                    Bm25SearchOptions::new().with_mode(mode),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("supertable bm25_search fetched payload");
@@ -2646,11 +2644,23 @@ pub mod sql {
     /// family split can never drift apart.
     pub const BULK_RANGE_SCAN: &str = "WHERE rating < N (range scan, returns rows)";
     pub const BULK_TOKEN_MATCH_ALL: &str = "token_match (all rows)";
-    /// A substring `LIKE` the default `ascii_lower` analyzer cannot bound:
-    /// a full column scan whose cost is the scan, not the rows it returns.
-    /// Classified with the bulk shapes so it never averages into the
-    /// point-lookup family the serving cost model prices per row.
-    pub const BULK_LIKE_SCAN: &str = "WHERE title LIKE '%term…%' (substring scan, ascii_lower)";
+
+    /// A substring `LIKE`, whose single token is open on both edges. Not a
+    /// bulk shape: its result is bounded (a Zipf-tail term, a few thousand
+    /// rows), so GB-returned never dominates its cost and it belongs with
+    /// the bounded-result families the split above is drawn against.
+    ///
+    /// How it is answered is analyzer- and corpus-dependent — an open-edged
+    /// token can only be required as a term after a walk of the column's
+    /// dictionary, which is taken only where the stored text is large
+    /// against the vocabulary — so the name states the query shape rather
+    /// than a plan. It moved out of the bulk family when the default
+    /// analyzer changed and the walk became worth taking here, turning a
+    /// full column scan into a dictionary-bounded lookup; the old name
+    /// asserted both a plan and an analyzer, so numbers recorded under it
+    /// are not comparable and it is deliberately renamed rather than
+    /// carried forward.
+    pub const LIKE_SUBSTRING: &str = "WHERE title LIKE '%term…%' (substring, open-edged token)";
 
     /// The one classification of a bulk / scan-priced shape by name. Both
     /// the warm/cold query table (this module) and the serving-cost family
@@ -2658,7 +2668,7 @@ pub mod sql {
     /// same name check, so the two tables can never classify the same shape
     /// differently.
     pub fn is_bulk_shape(name: &str) -> bool {
-        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL || name == BULK_LIKE_SCAN
+        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL
     }
 
     /// Scan-backed aggregates — realistic analytics shapes that provably
@@ -2835,13 +2845,14 @@ pub mod sql {
                 format!("SELECT key, rating FROM supertable WHERE title LIKE '{doc_token} %'"),
             ),
             (
-                // An open-edged token under the default `ascii_lower`
-                // analyzer cannot be bounded (a run holding a non-ASCII byte
-                // is dropped whole), so this stays a DataFusion column scan;
-                // `term09999` sits at the Zipf tail (the FTS battery's
-                // `single_rare` term), so the result stays small and the
-                // cost is the scan itself.
-                BULK_LIKE_SCAN,
+                // A substring pattern, whose only token is open on both
+                // edges. `term09999` sits at the Zipf tail (the FTS
+                // battery's `single_rare` term), so the result stays small
+                // either way; what varies is whether the token can be
+                // widened to the indexed terms it sits inside, which needs
+                // a walk of the column's dictionary and so depends on the
+                // column's analyzer and on stored text against vocabulary.
+                LIKE_SUBSTRING,
                 "SELECT key, rating FROM supertable WHERE title LIKE '%term09999%'".to_string(),
             ),
         ]

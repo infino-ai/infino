@@ -258,6 +258,7 @@ mod tests {
             );
         }
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -313,6 +314,8 @@ mod tests {
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
+            term_stats: None,
             parts: entries,
         }
     }
@@ -353,6 +356,7 @@ mod tests {
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -388,6 +392,7 @@ mod tests {
             ),
         );
         let s = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -427,6 +432,7 @@ mod tests {
             let mx: ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
             cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                stem: None,
                 birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
@@ -474,6 +480,7 @@ mod tests {
             );
             cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                stem: None,
                 birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),

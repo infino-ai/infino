@@ -19,6 +19,7 @@ use crate::{
         manifest::{
             SUPERFILE_DATA_DIR, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
+            term_stats::STORAGE_PREFIX as TERM_STATS_STORAGE_PREFIX,
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
         wal::persistence::{SUPERFILES_DIR, WalStore},
@@ -71,7 +72,7 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     // it cannot see as orphans. That is what the flag carries.
     let superfiles_complete = if let Some(superfiles) = manifest.complete_flat_superfiles() {
         for sf in superfiles {
-            live.insert(sf.uri.storage_path());
+            live.insert(sf.storage_path());
         }
         true
     } else {
@@ -89,12 +90,20 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     if let Some(graphs) = manifest.resident_vector_index_blob() {
         live.insert(graphs.uri.clone());
     }
+    if let Some(centroid_graph) = manifest.slow_vector_state_centroid_graph_blob() {
+        live.insert(centroid_graph.uri.clone());
+    }
+    // The global term-stats sidecar, same list-ref discipline: the current
+    // artifact is live; superseded generations age out past the safety gap.
+    if let Some(stats) = manifest.term_stats_blob() {
+        live.insert(stats.uri.clone());
+    }
 
     // Each resident superfile's tombstone sidecar. `superfiles/` is swept whatever the flag says,
     // so these have to be named here or a sidecar past the gap is deleted and its deleted rows
     // come back. The superfile paths repeat what the complete view above already inserted.
     for sf in manifest.get_all_superfiles() {
-        live.insert(sf.uri.storage_path());
+        live.insert(sf.storage_path());
         live.insert(WalStore::tombstones_path(sf.superfile_id));
     }
 
@@ -174,7 +183,7 @@ async fn live_set(
                 })
             })?;
         if let Some(pending) = state.pending_drain {
-            uris.extend(pending.entries.iter().map(|entry| entry.uri.storage_path()));
+            uris.extend(pending.entries.iter().map(|entry| entry.storage_path()));
         }
     }
 
@@ -217,6 +226,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
+        TERM_STATS_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
         SUPERFILES_DIR,
@@ -372,6 +382,7 @@ mod tests {
 
     fn sf_entry(uri: SuperfileUri) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
             uri,
@@ -404,6 +415,34 @@ mod tests {
         let (live, superfiles_complete) = build_live_set(&manifest);
         assert!(superfiles_complete);
         assert!(live.contains(&uri.storage_path()));
+    }
+
+    /// The keep-set names a source-named superfile by the key it actually
+    /// lives at, not the unnamed key its uuid alone would give — the one
+    /// mismatch that would make the sweep delete live data. And the cache
+    /// drop-through parses that key back to the uri, so the local copy goes
+    /// with the object.
+    #[test]
+    fn build_live_set_names_a_source_named_superfile_by_its_stem_key() {
+        let uri = SuperfileUri::new_v4();
+        let mut entry = (*sf_entry(uri)).clone();
+        entry.stem = Some("customers".into());
+        let named_key = entry.storage_path();
+        assert_eq!(named_key, format!("data/customers-{}.sf.parquet", uri.0));
+
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![Arc::new(entry)]);
+        let (live, superfiles_complete) = build_live_set(&manifest);
+        assert!(superfiles_complete);
+        assert!(live.contains(&named_key), "the named key is what is kept");
+        assert!(
+            !live.contains(&uri.storage_path()),
+            "the unnamed key is not where the bytes are, so it must not be what is kept"
+        );
+        assert_eq!(
+            SuperfileUri::from_storage_path(&named_key),
+            Some(uri),
+            "eviction parses the named key back to the cache's uri"
+        );
     }
 
     #[test]
@@ -439,6 +478,8 @@ mod tests {
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
+                slow_vector_state_centroid_graph: None,
+                term_stats: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -513,6 +554,8 @@ mod tests {
                     content_hash: section_hash,
                 }),
                 slow_vector_state_graphs: None,
+                slow_vector_state_centroid_graph: None,
+                term_stats: None,
                 parts: Vec::new(),
             }),
         );
@@ -533,5 +576,65 @@ mod tests {
         let (live, superfiles_complete) = build_live_set(&bare);
         assert!(superfiles_complete);
         assert!(!live.contains(&uri));
+    }
+
+    /// A referenced centroid-router section is live and survives a sweep. The
+    /// section lives under the swept `slow-vector-state/` prefix, so if it were
+    /// omitted from the live set GC would delete a referenced section and every
+    /// subsequent query would silently rebuild the router in memory.
+    #[test]
+    fn build_live_set_contains_centroid_graph_section() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let hash = ContentHash::of(b"slow state");
+        let uri = slow_vector_state::storage_path(&hash);
+        let centroid_graph_hash = ContentHash::of(b"centroid router section");
+        let centroid_graph_uri = slow_vector_state::storage_path(&centroid_graph_hash);
+        let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
+        let manifest = ManifestSnapshot::new(
+            TEST_MANIFEST_ID,
+            opts(),
+            Vec::new(),
+            Some(storage),
+            Some(Manifest {
+                tombstone_seqs: Default::default(),
+                superseded_cells: Default::default(),
+                format_version: FORMAT_VERSION.into(),
+                manifest_id: TEST_MANIFEST_ID,
+                options_hash: ContentHash::of(b"options"),
+                schema: Vec::new(),
+                id_column: "_id".into(),
+                fts_columns: Vec::new(),
+                vector_columns: Vec::new(),
+                partition_strategy: PartitionStrategy::Hash {
+                    column: "_id".into(),
+                    n_buckets: TEST_HASH_BUCKETS,
+                },
+                vector_index_storage_prefix: None,
+                global_vector_index: None,
+                drained_ranges: Default::default(),
+                deleted_user_ids_inline: None,
+                slow_vector_state_uri: Some(uri.clone()),
+                slow_vector_state_content_hash: Some(hash),
+                slow_vector_state_centroids: None,
+                slow_vector_state_graphs: None,
+                slow_vector_state_centroid_graph: Some(RoutingRef {
+                    uri: centroid_graph_uri.clone(),
+                    content_hash: centroid_graph_hash,
+                }),
+                term_stats: None,
+                parts: Vec::new(),
+            }),
+        );
+        let (live, _) = build_live_set(&manifest);
+        assert!(
+            live.contains(&centroid_graph_uri),
+            "referenced centroid-router section must be live"
+        );
+        assert!(
+            !live.contains(&orphan),
+            "unreferenced blob must still be sweepable"
+        );
     }
 }

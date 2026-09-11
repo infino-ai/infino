@@ -1,6 +1,6 @@
 [package]
 name = "infino-python"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -19,7 +19,12 @@ path = "src/lib.rs"
 # a Python extension module must not install a second global allocator
 # into the interpreter process (it segfaults), so the module uses the
 # system allocator.
-infino = { path = "..", default-features = false, features = ["remote"] }
+# `test-helpers` (dep-free; a cfg gate) exposes the test-and-bench search
+# overrides — `VectorSearchOptions` and `vector_search_with_options` — that the
+# EXPERIMENTAL benchmark serve mode uses to sweep the hnsw beam per query. It is
+# excluded from the `cargo-public-api` snapshot, so the engine's public API
+# stays self-calibrated with no tuning knobs.
+infino = { path = "..", default-features = false, features = ["remote", "test-helpers"] }
 # Arrow is the interchange. The `pyarrow` feature pulls `arrow-pyarrow`
 # (pyo3 0.28), so pyo3 here is pinned to the SAME version to share types.
 arrow = { version = "58", features = ["pyarrow"] }

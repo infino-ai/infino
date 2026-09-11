@@ -18,6 +18,7 @@ use std::sync::Arc;
 use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -108,8 +109,9 @@ fn bare_projection_ids_match_id_page_read_path() {
             "title",
             "common",
             K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("bare search");
@@ -126,8 +128,9 @@ fn bare_projection_ids_match_id_page_read_path() {
             "title",
             "common",
             K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "title", "score"]),
         )
         .expect("projected search");
@@ -154,8 +157,9 @@ fn bare_projection_ids_match_id_page_read_path() {
             "title",
             &probe_token,
             PROBE_K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("bare unique");
@@ -164,8 +168,9 @@ fn bare_projection_ids_match_id_page_read_path() {
             "title",
             &probe_token,
             PROBE_K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "title", "score"]),
         )
         .expect("projected unique");

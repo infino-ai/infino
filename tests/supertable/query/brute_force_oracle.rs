@@ -29,18 +29,27 @@
 #![deny(clippy::unwrap_used)]
 
 use std::{
+    cmp::{Ordering, Reverse},
     collections::HashSet,
+    slice::from_ref,
     sync::{Arc, LazyLock},
 };
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
-        fts::{reader::BoolMode, tokenize::Tokenizer},
+        fts::{
+            reader::{Bm25Stats, BoolMode},
+            tokenize::Phrase,
+        },
     },
     supertable::{Supertable, SupertableOptions, query::SuperfileHit},
-    test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer, schema_id_title},
+    test_helpers::{
+        brute_force_bm25::{BruteForceBm25, OracleBm25Params},
+        default_tokenizer, schema_id_title,
+    },
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -141,17 +150,41 @@ fn corpus_with_prefix_terms() -> Vec<(u64, String)> {
 
 // ---- Supertable side -----------------------------------------------
 
+/// The fixture at the standard BM25 pair — the shape most of these
+/// tests want, so they do not have to name a pair they do not care
+/// about.
 fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable {
+    build_supertable_with_params(corpus, n_superfiles, OracleBm25Params::default())
+}
+
+/// The fixture, with every FTS column declaring `params` — so the build
+/// bakes its block-max bounds at that pair and the reader scores with
+/// it.
+fn build_supertable_with_params(
+    corpus: &[(u64, String)],
+    n_superfiles: usize,
+    params: OracleBm25Params,
+) -> Supertable {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
             .build()
             .expect("pool"),
     );
-    let _tk: Arc<dyn Tokenizer> = default_tokenizer();
-    let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
-        .expect("opts")
-        .with_writer_pool(pool);
+    let opts = SupertableOptions::new(
+        schema_id_title(),
+        // Positions are indexed so the phrase shape below is answerable.
+        // They change what the column can be asked, not how a term
+        // scores, so every non-phrase case grades the same as before.
+        vec![
+            FtsConfig::new("title")
+                .bm25(params.k1, params.b)
+                .positions(true),
+        ],
+        vec![],
+    )
+    .expect("opts")
+    .with_writer_pool(pool);
 
     let st = Supertable::create(opts).expect("create");
     let mut w = st.writer().expect("writer");
@@ -189,10 +222,29 @@ fn supertable_to_global_ids(
 }
 
 fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
+    supertable_search_stats(st, query, k, chunk_size, Bm25Stats::PerSuperfile)
+}
+
+/// OR-mode supertable search under an explicit statistics scope. The
+/// per-superfile oracles below model local-idf scoring, so tests
+/// comparing against them pin `PerSuperfile`; the whole-corpus oracle
+/// arm compares against `Global`.
+fn supertable_search_stats(
+    st: &Supertable,
+    query: &str,
+    k: usize,
+    chunk_size: usize,
+    stats: Bm25Stats,
+) -> Vec<u64> {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", query, k, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            query,
+            k,
+            Bm25SearchOptions::new().with_stats(stats),
+        )
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -206,7 +258,14 @@ fn supertable_search_and_global(
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", query, k, BoolMode::And)
+        .bm25_hits(
+            "title",
+            query,
+            k,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::And)
+                .with_stats(Bm25Stats::PerSuperfile),
+        )
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -230,6 +289,19 @@ fn supertable_prefix_global(
 /// Build a per-superfile BruteForceBm25 oracle list. Index i scores
 /// superfile i with that superfile's own IDF/avgdl, mirroring the
 /// supertable's per-superfile scoring shape.
+/// Per-superfile oracles that score with `params` rather than the
+/// standard pair — the reference side of a declared-parameter fixture.
+fn build_oracles_with_params(
+    corpus: &[(u64, String)],
+    n_superfiles: usize,
+    params: OracleBm25Params,
+) -> Vec<BruteForceBm25> {
+    build_oracles(corpus, n_superfiles)
+        .into_iter()
+        .map(|o| o.with_params(params))
+        .collect()
+}
+
 fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForceBm25> {
     let tok = default_tokenizer();
     let chunk_size = corpus.len().div_ceil(n_superfiles);
@@ -244,21 +316,31 @@ fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForc
         .collect()
 }
 
-/// Run per-superfile brute-force BM25 and merge into a global top-k
-/// in the same shape the supertable's fan-out produces.
-fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
-    let tok = default_tokenizer();
-    let mut all: Vec<(u64, f32)> = Vec::new();
-    for o in oracles {
-        all.extend(o.top_k(query, k, tok.as_ref()));
-    }
+/// Merge per-superfile brute-force hits into a global top-k, in the
+/// same shape the supertable's fan-out produces: score descending,
+/// ties broken by ascending doc id.
+///
+/// Every oracle wrapper below differs only in which per-superfile
+/// scorer it calls, so the merge lives here once — four copies of a
+/// tie-break rule is four places for it to drift.
+fn merge_global_top_k(mut all: Vec<(u64, f32)>, k: usize) -> Vec<u64> {
     all.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
     all.truncate(k);
     all.into_iter().map(|(d, _)| d).collect()
+}
+
+/// Run per-superfile brute-force BM25 and merge into a global top-k.
+fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
+    let tok = default_tokenizer();
+    let all = oracles
+        .iter()
+        .flat_map(|o| o.top_k(query, k, tok.as_ref()))
+        .collect();
+    merge_global_top_k(all, k)
 }
 
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
@@ -269,33 +351,21 @@ fn brute_force_and_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> V
     let tok = default_tokenizer();
     let mut terms: Vec<String> = Vec::new();
     tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
-    let mut all: Vec<(u64, f32)> = Vec::new();
-    for o in oracles {
-        all.extend(o.top_k_terms_and(&terms, k));
-    }
-    all.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    all.truncate(k);
-    all.into_iter().map(|(d, _)| d).collect()
+    let all = oracles
+        .iter()
+        .flat_map(|o| o.top_k_terms_and(&terms, k))
+        .collect();
+    merge_global_top_k(all, k)
 }
 
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
 /// OR query (used to mirror the supertable's prefix expansion).
 fn brute_force_terms_top_k(oracles: &[BruteForceBm25], terms: &[String], k: usize) -> Vec<u64> {
-    let mut all: Vec<(u64, f32)> = Vec::new();
-    for o in oracles {
-        all.extend(o.top_k_terms(terms, k));
-    }
-    all.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    all.truncate(k);
-    all.into_iter().map(|(d, _)| d).collect()
+    let all = oracles
+        .iter()
+        .flat_map(|o| o.top_k_terms(terms, k))
+        .collect();
+    merge_global_top_k(all, k)
 }
 
 fn assert_top_k_sets_match(label: &str, supertable: Vec<u64>, oracle: Vec<u64>, head_size: usize) {
@@ -320,6 +390,182 @@ static STANDARD_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
     let oracles = build_oracles(&corp, SUPERFILES);
     StandardFixture { infino, oracles }
 });
+
+/// The same corpus with a declared, non-standard BM25 pair on both
+/// sides. The engine bakes its block-max bounds at this pair and scores
+/// with it; the oracle uses the identical formula, so a divergence is a
+/// real disagreement rather than two different similarity functions.
+const DECLARED_PARAMS: OracleBm25Params = OracleBm25Params { k1: 1.6, b: 0.4 };
+
+static DECLARED_PARAM_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
+    let corp = corpus_with_prefix_terms();
+    let infino = build_supertable_with_params(&corp, SUPERFILES, DECLARED_PARAMS);
+    let oracles = build_oracles_with_params(&corp, SUPERFILES, DECLARED_PARAMS);
+    StandardFixture { infino, oracles }
+});
+
+/// A query shape, carrying both the string the engine parses and the
+/// decomposition the oracle scores.
+///
+/// The two are derived from one value on purpose. Feeding the oracle
+/// from the engine's own parser — the convention elsewhere in the
+/// suite — makes a parsing change invisible here, because both sides
+/// would move together. These cases exist to grade *scoring* at a
+/// non-standard pair, so the clause structure is stated outright and a
+/// parser that stopped honouring a sigil would fail rather than agree
+/// with itself.
+enum QueryShape {
+    /// Bare terms, OR-combined — the default operator.
+    Or(&'static str),
+    /// Every term required (`+a +b`): the ranked-AND membership walk.
+    AllOf(&'static [&'static str]),
+    /// One exact phrase (`"a b"`): position-verified, and a different
+    /// kernel again — the phrase cursor composes its members' idfs and
+    /// its own term-level bound, so it reads a stored bound the single
+    /// and union paths never touch.
+    Phrase(&'static [&'static str]),
+}
+
+impl QueryShape {
+    /// The query string handed to the engine.
+    fn engine_query(&self) -> String {
+        match self {
+            Self::Or(q) => (*q).to_owned(),
+            Self::AllOf(terms) => terms
+                .iter()
+                .map(|t| format!("+{t}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Phrase(terms) => format!("\"{}\"", terms.join(" ")),
+        }
+    }
+
+    /// The reference top-k for the same shape.
+    fn oracle_top_k(&self, oracles: &[BruteForceBm25], k: usize) -> Vec<u64> {
+        match self {
+            Self::Or(q) => brute_force_top_k(oracles, q, k),
+            Self::AllOf(terms) => {
+                let musts: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+                let all = oracles
+                    .iter()
+                    .flat_map(|o| o.top_k_atoms(&musts, &[], &[], &[], &[], &[], k))
+                    .collect();
+                merge_global_top_k(all, k)
+            }
+            Self::Phrase(terms) => {
+                // A bare quoted run is a *should* phrase, matching how
+                // the engine's clause split reads it with no sigil.
+                // Adjacent, which is every phrase on a column with no
+                // analysis chain.
+                let phrase =
+                    Phrase::adjacent(terms.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>());
+                let all = oracles
+                    .iter()
+                    .flat_map(|o| o.top_k_atoms(&[], &[], &[], from_ref(&phrase), &[], &[], k))
+                    .collect();
+                merge_global_top_k(all, k)
+            }
+        }
+    }
+}
+
+/// The shapes both parameter tests grade, so the declared-pair arm and
+/// the query-time-override arm cover exactly the same ground. Each
+/// entry is `(label, shape, k, head)`, where `head` is how many leading
+/// positions must match the reference exactly.
+///
+/// `+rust +async` and `"rust async"` are deliberately the same two
+/// terms: the phrase matches only where they are adjacent, while the
+/// must-query also takes `rust trait dyn impl async`. A phrase kernel
+/// that quietly degraded to an intersection would return that extra
+/// document and fail here.
+const QUERY_SHAPES: [(&str, QueryShape, usize, usize); 5] = [
+    (
+        "single_rare",
+        QueryShape::Or("rare-token-zzz"),
+        ORACLE_TOP_K_SMALL,
+        1,
+    ),
+    ("single_common", QueryShape::Or("rust"), ORACLE_TOP_K, 3),
+    ("two_term_or", QueryShape::Or("rust async"), ORACLE_TOP_K, 2),
+    // Both match sets are small and exact, so the head spans the whole
+    // result rather than a prefix of it. A prefix would compare only
+    // the top two, which both shapes agree on — the document that
+    // separates them (`rust trait dyn impl async`, matching the
+    // intersection but not the phrase) ranks third, and a head of 2
+    // would never look at it.
+    (
+        "two_term_and",
+        QueryShape::AllOf(&["rust", "async"]),
+        ORACLE_TOP_K,
+        ORACLE_TOP_K,
+    ),
+    (
+        "phrase",
+        QueryShape::Phrase(&["rust", "async"]),
+        ORACLE_TOP_K,
+        ORACLE_TOP_K,
+    ),
+];
+
+// ---- Tests: declared BM25 parameters ---------------------------------
+
+/// A column that declares a non-standard pair must rank exactly as the
+/// reference implementation does at the same pair — across the query
+/// shapes that exercise different kernels (single rare, single common,
+/// multi-term union).
+#[test]
+fn oracle_declared_bm25_params_match_across_query_shapes() {
+    let f = &*DECLARED_PARAM_FIXTURE;
+    for (label, shape, k, head) in QUERY_SHAPES {
+        let inf_hits = supertable_search_global(&f.infino, &shape.engine_query(), k, CHUNK_SIZE);
+        let ora_hits = shape.oracle_top_k(&f.oracles, k);
+        assert_top_k_sets_match(&format!("declared_{label}"), inf_hits, ora_hits, head);
+    }
+}
+
+/// A query-time override on a *standard* table must rank as the
+/// reference does at the override's pair. This is the pruning-correction
+/// path: the stored bounds belong to 1.2 / 0.75, so every bound is
+/// inflated by the correction factor, and a factor that came out too
+/// small would drop a qualifying doc and show up here as a set
+/// mismatch.
+#[test]
+fn oracle_query_time_override_matches_the_reference_at_that_pair() {
+    let f = &*STANDARD_FIXTURE;
+    let corp = corpus_with_prefix_terms();
+    for params in [
+        OracleBm25Params { k1: 1.6, b: 0.4 },
+        OracleBm25Params { k1: 0.6, b: 0.9 },
+        OracleBm25Params { k1: 1.2, b: 0.0 },
+    ] {
+        let oracles = build_oracles_with_params(&corp, SUPERFILES, params);
+        for (label, shape, k, head) in QUERY_SHAPES {
+            let query = shape.engine_query();
+            let hits = f
+                .infino
+                .reader()
+                .expect("reader")
+                .bm25_hits(
+                    "title",
+                    &query,
+                    k,
+                    Bm25SearchOptions::new()
+                        .with_stats(Bm25Stats::PerSuperfile)
+                        .with_bm25(params.k1, params.b),
+                )
+                .expect("bm25 with override");
+            let inf_hits = supertable_to_global_ids(&f.infino, hits, CHUNK_SIZE);
+            let ora_hits = shape.oracle_top_k(&oracles, k);
+            assert_top_k_sets_match(
+                &format!("override_k1={}_b={}_{label}", params.k1, params.b),
+                inf_hits,
+                ora_hits,
+                head,
+            );
+        }
+    }
+}
 
 // ---- Tests: query-shape coverage -------------------------------------
 
@@ -590,6 +836,9 @@ fn oracle_zipfian_corpus_query_shapes_match() {
     let corp = zipfian_corpus(n_docs, 42);
     let infino = build_supertable(&corp, SUPERFILES);
     let oracles = build_oracles(&corp, SUPERFILES);
+    // One oracle over the WHOLE corpus = textbook BM25 with global idf —
+    // the ground truth for the `Global` (default) statistics scope.
+    let global_oracle = build_oracles(&corp, 1);
     let k = ZIPFIAN_TOP_K;
 
     let queries = [
@@ -604,7 +853,10 @@ fn oracle_zipfian_corpus_query_shapes_match() {
     ];
 
     for (label, q) in queries {
-        let inf = supertable_search_global(&infino, q, k, n_docs / SUPERFILES);
+        // Per-superfile arm: local-idf scoring parity against the
+        // per-shard oracles that model it.
+        let inf =
+            supertable_search_stats(&infino, q, k, n_docs / SUPERFILES, Bm25Stats::PerSuperfile);
         let ora = brute_force_top_k(&oracles, q, k);
         let inf_set: HashSet<u64> = inf.iter().copied().collect();
         let ora_set: HashSet<u64> = ora.iter().copied().collect();
@@ -620,5 +872,223 @@ fn oracle_zipfian_corpus_query_shapes_match() {
             "{label}: top-{k} overlap {common}/{target} below 60% threshold; \
              supertable={inf:?} oracle={ora:?}",
         );
+
+        // Global arm (the default): table-wide idf against the
+        // whole-corpus textbook oracle. Tighter threshold than the
+        // per-superfile arm — global idf matches the oracle exactly and
+        // this corpus has fixed-length docs, so per-superfile avgdl
+        // equals corpus avgdl; only the one-byte doc-length
+        // quantization and tie order remain.
+        let inf_g = supertable_search_stats(&infino, q, k, n_docs / SUPERFILES, Bm25Stats::Global);
+        let ora_g = brute_force_top_k(&global_oracle, q, k);
+        let inf_g_set: HashSet<u64> = inf_g.iter().copied().collect();
+        let ora_g_set: HashSet<u64> = ora_g.iter().copied().collect();
+        let common_g = inf_g_set.intersection(&ora_g_set).count();
+        let target_g = inf_g_set.len().min(ora_g_set.len());
+        let threshold_g = (target_g * 9) / 10;
+        assert!(
+            common_g >= threshold_g,
+            "{label} (global): top-{k} overlap {common_g}/{target_g} below 90% threshold; \
+             supertable={inf_g:?} oracle={ora_g:?}",
+        );
     }
+}
+
+// ---- single-term global-idf skip path ------------------------------
+//
+// A lone scored term takes the BlockMaxWAND walk, which prunes against
+// per-block upper bounds that were stored with the superfile's LOCAL
+// idf. Under global statistics the walk scores with the corpus idf
+// instead, so it rescales those bounds by `global_idf / local_idf` —
+// the score is linear in idf, which makes the rescale exact. If it were
+// wrong in either direction the walk would drop documents that belong
+// in the top-k or admit ones that do not, and only a fragmented table
+// shows it: on a single superfile local idf *is* the global idf and the
+// rescale is the identity.
+//
+// The fixture below therefore compares a fragmented table against a
+// single-superfile table holding the same corpus, and is built so the
+// comparison is exact and the rescale is never trivial:
+//
+//   * `common`'s local frequency differs in every superfile (all rows,
+//     an eighth, a half), so no superfile's local idf equals the global
+//     one and every walk rescales by a different ratio.
+//   * every document is the same token length, so per-superfile `avgdl`
+//     is identical across the fragmented layout and equal to the single
+//     superfile's — leaving idf as the only thing layout could change.
+//   * the term's frequency within a handful of documents is distinct
+//     (2..=9 against a baseline of 1), so the head of the ranking is
+//     ordered strictly by score, with no ties to make the comparison
+//     ambiguous, and those documents sit in different superfiles so the
+//     cross-superfile merge is part of what is being checked.
+//   * each superfile holds enough matching rows to span several posting
+//     blocks, so the skip table is genuinely consulted rather than the
+//     whole list being scored anyway.
+
+/// Superfiles in the fragmented arm.
+const SKIP_SUPERFILES: usize = 3;
+/// Rows per superfile — several 128-row posting blocks' worth, so the
+/// BlockMaxWAND skip table is exercised rather than bypassed.
+const SKIP_DOCS_PER_SUPERFILE: usize = 384;
+/// Tokens per document, uniform so `avgdl` is layout-independent.
+const SKIP_DOC_LEN: usize = 12;
+/// Top-k for the skip-path comparison: small enough that the walk's
+/// threshold rises early and prunes most blocks.
+const SKIP_TOP_K: usize = 5;
+/// `(global doc id, term frequency)` for the documents that carry a
+/// distinct `common` frequency; every other matching document has
+/// frequency 1.
+///
+/// Placement is the point of this fixture, not decoration. The walk
+/// skips a posting BLOCK whose stored upper bound cannot beat the
+/// running threshold, so a bound that is too low is only observable
+/// when a wrongly skipped block held a document that belongs in the
+/// top-k. Half of the top-k therefore sits deliberately LATE in its
+/// superfile's posting list — id 300 is in the third of the first
+/// superfile's three blocks, id 1068 in the second of the third
+/// superfile's two — while the rest sit in the first block, which fills
+/// the threshold early and makes those later blocks skippable. An
+/// earlier version of this fixture put every high-frequency document in
+/// the first block and passed even with the rescale removed.
+const SKIP_HOT_DOCS: &[(u64, usize)] = &[
+    // superfile 0 (every row matches, three posting blocks)
+    (300, 9),
+    (200, 6),
+    (10, 4),
+    // superfile 1 (every eighth row matches, one posting block)
+    (704, 7),
+    (392, 3),
+    // superfile 2 (every second row matches, two posting blocks)
+    (1068, 8),
+    (780, 5),
+    (900, 2),
+];
+
+/// The fixture corpus: `SKIP_SUPERFILES` blocks of rows in which
+/// `common` appears in every row, every eighth row, and every second
+/// row respectively.
+fn skip_path_corpus() -> Vec<(u64, String)> {
+    let hot: std::collections::HashMap<u64, usize> = SKIP_HOT_DOCS.iter().copied().collect();
+    let mut corpus = Vec::with_capacity(SKIP_SUPERFILES * SKIP_DOCS_PER_SUPERFILE);
+    for segment in 0..SKIP_SUPERFILES {
+        for row in 0..SKIP_DOCS_PER_SUPERFILE {
+            let id = (segment * SKIP_DOCS_PER_SUPERFILE + row) as u64;
+            let matches = match segment {
+                0 => true,
+                1 => row % 8 == 0,
+                _ => row % 2 == 0,
+            };
+            let tf = match matches {
+                false => 0,
+                true => hot.get(&id).copied().unwrap_or(1),
+            };
+            // `tf` copies of the term, filler to a fixed length, then a
+            // unique token so every row is identifiable.
+            let mut tokens: Vec<String> = std::iter::repeat_n("common".to_string(), tf).collect();
+            tokens.extend(std::iter::repeat_n(
+                "pad".to_string(),
+                SKIP_DOC_LEN - tf - 1,
+            ));
+            tokens.push(format!("d{id:05}"));
+            debug_assert_eq!(tokens.len(), SKIP_DOC_LEN);
+            corpus.push((id, tokens.join(" ")));
+        }
+    }
+    corpus
+}
+
+/// `(global id, score)` for a single-term global-stats search.
+fn skip_path_hits(st: &Supertable, k: usize, chunk_size: usize) -> Vec<(u64, f32)> {
+    let hits = st
+        .reader()
+        .expect("reader")
+        .bm25_hits(
+            "title",
+            "common",
+            k,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
+        )
+        .expect("single-term global search");
+    let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
+    supertable_to_global_ids(st, hits, chunk_size)
+        .into_iter()
+        .zip(scores)
+        .collect()
+}
+
+#[test]
+fn single_term_global_idf_skip_matches_a_single_superfile() {
+    let corpus = skip_path_corpus();
+    let fragmented = build_supertable(&corpus, SKIP_SUPERFILES);
+    let single = build_supertable(&corpus, 1);
+    assert_eq!(
+        fragmented.reader().expect("reader").n_superfiles(),
+        SKIP_SUPERFILES,
+        "fragmented arm must actually be fragmented"
+    );
+    assert_eq!(
+        single.reader().expect("reader").n_superfiles(),
+        1,
+        "single arm must be one superfile"
+    );
+
+    // The rescaled walk over three superfiles must return exactly what
+    // the un-rescaled walk over one superfile returns — same documents,
+    // same scores, same order.
+    let fragmented_top = skip_path_hits(&fragmented, SKIP_TOP_K, SKIP_DOCS_PER_SUPERFILE);
+    let single_top = skip_path_hits(&single, SKIP_TOP_K, corpus.len());
+    assert_eq!(
+        fragmented_top.len(),
+        SKIP_TOP_K,
+        "fixture must fill the top-k"
+    );
+    assert_eq!(
+        fragmented_top, single_top,
+        "the single-term global-idf walk ranked a fragmented table differently from one \
+         superfile holding the same corpus — the rescale of the stored block-max bounds \
+         does not match the idf the walk scores with"
+    );
+
+    // The head is ordered strictly by the planted frequencies, which is
+    // what makes the equality above unambiguous rather than a tie
+    // ordering that happened to agree.
+    let mut expected: Vec<(u64, usize)> = SKIP_HOT_DOCS.to_vec();
+    expected.sort_by_key(|(_, tf)| Reverse(*tf));
+    let expected_ids: Vec<u64> = expected
+        .iter()
+        .take(SKIP_TOP_K)
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        fragmented_top.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        expected_ids,
+        "top-k should be the documents with the highest planted term frequency"
+    );
+    for pair in fragmented_top.windows(2) {
+        assert!(
+            pair[0].1 > pair[1].1,
+            "planted frequencies must give strictly decreasing scores, got {:?}",
+            fragmented_top
+        );
+    }
+
+    // The fixture genuinely distinguishes the two statistics scopes: per
+    // superfile, `common` is in every row of the first superfile, so its
+    // local idf collapses to near zero there and that superfile's rows
+    // rank differently. Were this equal, the comparison above would pass
+    // no matter what the rescale did.
+    let per_superfile = st_hits_per_superfile(&fragmented, SKIP_TOP_K, SKIP_DOCS_PER_SUPERFILE);
+    assert_ne!(
+        per_superfile,
+        fragmented_top.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        "fixture does not distinguish global from per-superfile statistics, so it cannot \
+         be exercising the global-idf override"
+    );
+}
+
+/// Ids from a per-superfile-statistics search, for the contrast check.
+fn st_hits_per_superfile(st: &Supertable, k: usize, chunk_size: usize) -> Vec<u64> {
+    supertable_search_stats(st, "common", k, chunk_size, Bm25Stats::PerSuperfile)
 }

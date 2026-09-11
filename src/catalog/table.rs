@@ -20,8 +20,8 @@ use datafusion::prelude::Expr;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, QueryExpansion, VectorFilter, superfile::VectorSearchOptions,
-    supertable::Supertable as SupertableHandle,
+    OptimizeOptions, QueryExpansion, VectorFilter, catalog::ensure_expr_within_connective_cap,
+    superfile::VectorSearchOptions, supertable::Supertable as SupertableHandle,
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -31,6 +31,7 @@ use crate::{
 pub(crate) trait Table: Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError>;
+    fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError>;
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError>;
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError>;
     fn bm25_search(
@@ -102,6 +103,9 @@ impl Table for SupertableHandle {
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         SupertableHandle::append(self, batch)
     }
+    fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
+        SupertableHandle::append_named(self, batch, source_name)
+    }
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         SupertableHandle::update(self, predicate, batch)
     }
@@ -116,7 +120,7 @@ impl Table for SupertableHandle {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        SupertableHandle::bm25_search_with_options(self, column, query, k, &opts, projection)
+        SupertableHandle::bm25_search(self, column, query, k, opts, projection)
     }
     fn token_match(
         &self,
@@ -227,24 +231,49 @@ impl Supertable {
         self.inner.append(batch)
     }
 
+    /// Append a batch of rows, naming the source they came from.
+    ///
+    /// The superfiles this commit writes are keyed
+    /// `data/<stem>-<uuid>.sf.parquet` instead of `data/seg-<uuid>.sf.parquet`,
+    /// where the stem is `source_name` lowercased and reduced to `[a-z0-9_]`
+    /// — so rows ingested from `customers.parquet` land in objects a bucket
+    /// listing shows as `customers-….sf.parquet`. The uuid keeps every key
+    /// unique; the name is a label, and the table behaves exactly as with
+    /// [`Self::append`]. A merge of superfiles from different sources drops
+    /// the label; a name that reduces to nothing falls back to the unnamed
+    /// key.
+    ///
+    /// Readers of a table that has ever been appended to this way must be
+    /// at least this engine version: the manifest part carrying a named
+    /// superfile is written at a format version an older reader refuses,
+    /// so that its garbage collector cannot mistake the named objects for
+    /// orphans.
+    ///
+    /// Hosted tables do not accept a source name yet and return an error.
+    pub fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
+        self.inner.append_named(batch, source_name)
+    }
+
     /// Update rows matching `predicate` with values from `batch`.
     pub fn update(
         &self,
         predicate: Expr,
         batch: &RecordBatch,
     ) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
         self.inner.update(predicate, batch)
     }
 
     /// Delete rows matching `predicate`.
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
         self.inner.delete(predicate)
     }
 
     /// Ranked BM25 full-text search over one FTS column.
     ///
     /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and the
-    /// corpus-statistics selector: [`Bm25Stats::PerSuperfile`](crate::Bm25Stats::PerSuperfile)
+    /// corpus-statistics selector: [`Bm25Stats::Global`](crate::Bm25Stats::Global)
     /// (the default, each segment scored against its own local statistics) or
     /// [`Bm25Stats::Global`](crate::Bm25Stats::Global) (one table-wide idf
     /// across all segments, so a fragmented table ranks like a single unified

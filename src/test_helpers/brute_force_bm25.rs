@@ -26,22 +26,62 @@
 
 use std::{cmp::Ordering, collections::HashMap};
 
-use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::fts::tokenize::{Phrase, Tokenizer};
 
 /// Standard BM25 default parameters. Match the constants used by
 /// the production scoring path.
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
-/// Number of times `phrase` occurs contiguously (in order) in
-/// `tokens` — the brute-force phrase tf.
-fn phrase_tf(tokens: &[String], phrase: &[String]) -> u32 {
+/// The similarity parameters the oracle scores with. Defaults to the
+/// standard pair, so every existing caller is unaffected; a fixture
+/// whose column declares another pair — or whose query overrides one —
+/// sets this to the same values, or the comparison grades the engine
+/// against a different formula than the one it is running.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OracleBm25Params {
+    /// Term-frequency saturation.
+    pub k1: f32,
+    /// Length normalization.
+    pub b: f32,
+}
+
+impl Default for OracleBm25Params {
+    fn default() -> Self {
+        Self { k1: K1, b: B }
+    }
+}
+
+/// Number of times `phrase` occurs in `tokens` at the spacing its
+/// offsets declare — the brute-force phrase tf.
+///
+/// Walks positions rather than token indices because a doc's tokens are
+/// not necessarily consecutive: an analysis chain that removes a
+/// stopword leaves a hole where it was, and the phrase's own offsets
+/// carry the matching holes from the query side. With no chain both are
+/// dense and this reduces to "the phrase's words occur contiguously in
+/// order", which is what it checked before offsets existed.
+fn phrase_tf(tokens: &[(String, u64)], phrase: &Phrase<String>) -> u32 {
     if phrase.is_empty() || tokens.len() < phrase.len() {
         return 0;
     }
     let mut tf = 0u32;
-    for start in 0..=(tokens.len() - phrase.len()) {
-        if tokens[start..start + phrase.len()] == *phrase {
+    for (anchor, anchor_pos) in tokens {
+        if anchor != &phrase.terms[0] {
+            continue;
+        }
+        // Every later member must sit at the anchor's position plus its
+        // declared offset, carrying the same token.
+        let matched = phrase
+            .terms
+            .iter()
+            .zip(phrase.offsets())
+            .skip(1)
+            .all(|(term, off)| {
+                let want = anchor_pos + *off as u64;
+                tokens.iter().any(|(t, p)| *p == want && t == term)
+            });
+        if matched {
             tf += 1;
         }
     }
@@ -57,8 +97,11 @@ struct DocStats {
     dl: u32,
     /// Term frequencies for this doc: term → count.
     tf: HashMap<String, u32>,
-    /// The doc's token sequence, for phrase adjacency scans.
-    tokens: Vec<String>,
+    /// The doc's tokens with their gap-inclusive positions, for phrase
+    /// scans. Positions are not necessarily `0..n`: an analysis chain
+    /// that drops a token leaves its ordinal behind as a hole, exactly
+    /// as the index does.
+    tokens: Vec<(String, u64)>,
 }
 
 /// Every clause list a query can carry, for
@@ -68,13 +111,13 @@ struct DocStats {
 #[derive(Debug, Default, Clone)]
 pub struct OracleQuery {
     pub musts: Vec<String>,
-    pub must_phrases: Vec<Vec<String>>,
+    pub must_phrases: Vec<Phrase<String>>,
     pub must_groups: Vec<Vec<String>>,
     pub shoulds: Vec<String>,
-    pub should_phrases: Vec<Vec<String>>,
+    pub should_phrases: Vec<Phrase<String>>,
     pub should_groups: Vec<Vec<String>>,
     pub negatives: Vec<String>,
-    pub negative_phrases: Vec<Vec<String>>,
+    pub negative_phrases: Vec<Phrase<String>>,
     pub negative_groups: Vec<Vec<String>>,
 }
 
@@ -87,6 +130,7 @@ pub struct BruteForceBm25 {
     df: HashMap<String, u32>,
     avgdl: f32,
     n: u32,
+    params: OracleBm25Params,
 }
 
 impl BruteForceBm25 {
@@ -102,12 +146,17 @@ impl BruteForceBm25 {
 
         for (doc_id, text) in corpus {
             let mut tf: HashMap<String, u32> = HashMap::new();
-            let mut tokens: Vec<String> = Vec::new();
+            let mut tokens: Vec<(String, u64)> = Vec::new();
             let mut dl: u32 = 0;
-            tokenizer.tokenize_each(text, &mut |tok| {
+            // Positioned, so a chain's stopword holes reach the phrase
+            // scan. Doc length counts *emitted* tokens — what the
+            // engine counts, and what Lucene's norms count — so a
+            // dropped token advances the position without lengthening
+            // the document.
+            tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
                 dl += 1;
                 *tf.entry(tok.to_owned()).or_insert(0) += 1;
-                tokens.push(tok.to_owned());
+                tokens.push((tok.to_owned(), position));
             });
             for term in tf.keys() {
                 *df.entry(term.clone()).or_insert(0) += 1;
@@ -128,7 +177,21 @@ impl BruteForceBm25 {
             total_tokens as f32 / n as f32
         };
 
-        Self { docs, df, avgdl, n }
+        Self {
+            docs,
+            df,
+            avgdl,
+            n,
+            params: OracleBm25Params::default(),
+        }
+    }
+
+    /// Score with `params` instead of the standard pair. Chain onto
+    /// [`BruteForceBm25::index`] for a fixture that declares or
+    /// overrides its parameters.
+    pub fn with_params(mut self, params: OracleBm25Params) -> Self {
+        self.params = params;
+        self
     }
 
     /// Brute-force top-k for a multi-term OR-mode BM25 query.
@@ -162,7 +225,8 @@ impl BruteForceBm25 {
         for doc in &self.docs {
             let mut score: f32 = 0.0;
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
             for term in terms {
                 let Some(&tf) = doc.tf.get(term) else {
                     continue;
@@ -173,7 +237,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
             }
             if score > 0.0 {
                 scored.push((doc.doc_id, score));
@@ -223,7 +287,8 @@ impl BruteForceBm25 {
                 }
             }
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
             let mut score: f32 = 0.0;
             let mut any_should = false;
             for term in musts.iter().chain(shoulds) {
@@ -237,7 +302,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
             }
             // With musts, every surviving doc matches (score > 0 since
             // idf is always positive); with none, only docs hit by at
@@ -267,11 +332,11 @@ impl BruteForceBm25 {
     pub fn top_k_atoms(
         &self,
         musts: &[String],
-        must_phrases: &[Vec<String>],
+        must_phrases: &[Phrase<String>],
         shoulds: &[String],
-        should_phrases: &[Vec<String>],
+        should_phrases: &[Phrase<String>],
         negatives: &[String],
-        negative_phrases: &[Vec<String>],
+        negative_phrases: &[Phrase<String>],
         k: usize,
     ) -> Vec<(u64, f32)> {
         self.top_k_expanded(
@@ -314,7 +379,7 @@ impl BruteForceBm25 {
                 false => 0.0,
             }
         };
-        let phrase_idf = |p: &Vec<String>| -> f32 { p.iter().map(idf_of).sum() };
+        let phrase_idf = |p: &Phrase<String>| -> f32 { p.iter().map(idf_of).sum() };
         // The commonest member sets the group's rarity; members absent
         // from the corpus (df 0) never win the max.
         let group_idf = |g: &Vec<String>| -> f32 {
@@ -368,8 +433,9 @@ impl BruteForceBm25 {
             }
 
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
-            let tf_factor = |tf: u32| -> f32 { tf as f32 * (K1 + 1.0) / (tf as f32 + dl_norm) };
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
+            let tf_factor = |tf: u32| -> f32 { tf as f32 * (k1 + 1.0) / (tf as f32 + dl_norm) };
 
             let mut score: f32 = 0.0;
             let mut matched_any_should = false;
@@ -436,7 +502,8 @@ impl BruteForceBm25 {
         let mut scored: Vec<(u64, f32)> = Vec::with_capacity(self.docs.len());
         'docs: for doc in &self.docs {
             let dl = doc.dl as f32;
-            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let (k1, b) = (self.params.k1, self.params.b);
+            let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
             let mut score: f32 = 0.0;
             for term in terms {
                 let Some(&tf) = doc.tf.get(term) else {
@@ -448,7 +515,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
             }
             scored.push((doc.doc_id, score));
         }

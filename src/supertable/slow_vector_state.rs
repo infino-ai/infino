@@ -894,6 +894,7 @@ mod tests {
     fn entry(n_docs: u64, cell: u32) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 3,
             superfile_id: id,
             uri: SuperfileUri(id),

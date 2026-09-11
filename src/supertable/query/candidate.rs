@@ -190,12 +190,14 @@ impl CandidatePlan {
     /// provider's filters together) into one plan. `fts_cols` is the set
     /// of FTS-indexed column names; `resolve` maps an FTS column to the
     /// tokenizer it was indexed with, so per-column analyzers lower query
-    /// text the same way the column was tokenized at ingest. Empty
-    /// `fts_cols` ⇒ no FTS columns ⇒ always [`Unbounded`].
+    /// text the same way the column was tokenized at ingest. A column
+    /// `resolve` cannot answer for has no index to bound against, so its
+    /// predicate lowers to [`Unbounded`] — no analyzer is assumed on its
+    /// behalf. Empty `fts_cols` ⇒ no FTS columns ⇒ always [`Unbounded`].
     pub(crate) fn from_filters(
         filters: &[Expr],
         fts_cols: &HashSet<&str>,
-        resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+        resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     ) -> CandidatePlan {
         if fts_cols.is_empty() {
             return CandidatePlan::Unbounded;
@@ -617,7 +619,7 @@ async fn expand_like(
 fn lower(
     expr: &Expr,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     match expr {
         Expr::BinaryExpr(be) => match be.op {
@@ -647,7 +649,7 @@ fn eq_leaf(
     left: &Expr,
     right: &Expr,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     let (column, value) = match (left, right) {
         (Expr::Column(c), Expr::Literal(v, _)) => (&c.name, v),
@@ -661,7 +663,7 @@ fn eq_leaf(
 fn in_list_leaf(
     il: &InList,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     let Expr::Column(c) = il.expr.as_ref() else {
         return CandidatePlan::Unbounded;
@@ -688,7 +690,7 @@ fn in_list_leaf(
 fn like_leaf(
     like: &Like,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     // `NOT LIKE` excludes rows — no term set bounds an exclusion.
     if like.negated {
@@ -712,7 +714,9 @@ fn like_leaf(
     let Some(pattern) = scalar_str(v) else {
         return CandidatePlan::Unbounded;
     };
-    let tok = resolve(&c.name);
+    let Some(tok) = resolve(&c.name) else {
+        return CandidatePlan::Unbounded;
+    };
     let Some(analyzer) = Analyzer::of(tok.as_ref()) else {
         return CandidatePlan::Unbounded;
     };
@@ -843,6 +847,19 @@ enum Analyzer {
 }
 
 impl Analyzer {
+    /// Recognize a column's analyzer, or `None` for one whose token
+    /// rules this lowering cannot reason about — which drops the `LIKE`
+    /// constraint entirely and keeps every superfile.
+    ///
+    /// A column carrying an **analysis chain** lands in that `None`,
+    /// and must. The lowering bounds a `LIKE` fragment by the terms it
+    /// tokenizes to, which is only sound while a term in the index is a
+    /// substring-preserving image of the text: with a stemmer it is
+    /// not. `LIKE '%runni%'` matches the text `running`, whose indexed
+    /// term is `run` — so a prefix walk for `runni` finds nothing and
+    /// would drop a superfile that really matches. Nothing else here
+    /// needs to know about chains, because they never reach this
+    /// `match`: a chain's name is a composite one and no arm claims it.
     fn of(tok: &dyn Tokenizer) -> Option<Analyzer> {
         match tok.name() {
             ASCII_LOWER_TOKENIZER => Some(Analyzer::AsciiLower),
@@ -903,7 +920,7 @@ fn terms_all(
     column: &str,
     value: &ScalarValue,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     if !fts_cols.contains(column) {
         return CandidatePlan::Unbounded;
@@ -911,7 +928,9 @@ fn terms_all(
     let Some(s) = scalar_str(value) else {
         return CandidatePlan::Unbounded;
     };
-    let tok = resolve(column);
+    let Some(tok) = resolve(column) else {
+        return CandidatePlan::Unbounded;
+    };
     let tokens: Vec<String> = tok.tokenize(s).collect();
     if tokens.is_empty() {
         return CandidatePlan::Unbounded;
@@ -979,7 +998,7 @@ fn collapse(mut flat: Vec<CandidatePlan>, is_and: bool) -> CandidatePlan {
 pub(crate) fn like_prune_leaves(
     filters: &[Expr],
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> Vec<PruneLeaf> {
     let mut out = Vec::new();
     for filter in filters {
@@ -993,7 +1012,7 @@ pub(crate) fn like_prune_leaves(
 fn collect_like_leaves(
     expr: &Expr,
     fts_cols: &HashSet<&str>,
-    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     out: &mut Vec<PruneLeaf>,
 ) {
     match expr {
@@ -1018,7 +1037,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer};
+    use crate::superfile::fts::{
+        analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
+        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, StandardTokenizer},
+    };
 
     fn fts_cols() -> HashSet<&'static str> {
         let mut s = HashSet::new();
@@ -1028,8 +1050,105 @@ mod tests {
 
     /// Resolver for the lowering tests: every column tokenizes with the
     /// ASCII-lower analyzer.
-    fn ascii_resolver(_col: &str) -> Arc<dyn Tokenizer> {
-        Arc::new(AsciiLowerTokenizer)
+    fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(Arc::new(AsciiLowerTokenizer))
+    }
+
+    /// Resolver whose column carries an analysis chain — the case the
+    /// `LIKE` lowering must refuse to bound.
+    fn stemming_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(chain_tokenizer(
+            Base::Standard,
+            Stopwords::None,
+            Stemmer::English,
+        ))
+    }
+
+    /// Resolver for a stopworded column.
+    fn stopping_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(chain_tokenizer(
+            Base::Standard,
+            Stopwords::English,
+            Stemmer::None,
+        ))
+    }
+
+    /// The guard is that a chain's *derived name* matches no arm of
+    /// `Analyzer::of`. Asserted directly, because every `LIKE` test
+    /// below would also pass if the resolver simply returned no
+    /// tokenizer at all — a false pass that would hide the guard
+    /// disappearing.
+    #[test]
+    fn a_chains_name_is_recognized_by_no_analyzer_arm() {
+        let plain = chain_tokenizer(Base::Standard, Stopwords::None, Stemmer::None);
+        assert_eq!(plain.name(), STANDARD_TOKENIZER);
+        assert!(
+            Analyzer::of(plain.as_ref()).is_some(),
+            "a plain column must still be bounded"
+        );
+        for chained in [
+            chain_tokenizer(Base::Standard, Stopwords::English, Stemmer::None),
+            chain_tokenizer(Base::Standard, Stopwords::None, Stemmer::English),
+            chain_tokenizer(Base::AsciiLower, Stopwords::English, Stemmer::English),
+        ] {
+            assert!(
+                Analyzer::of(chained.as_ref()).is_none(),
+                "{:?} must not be recognized as a bare analyzer",
+                chained.name()
+            );
+        }
+    }
+
+    /// A stemmed column gets **no** `LIKE` constraint, in any fragment
+    /// shape. The lowering bounds a fragment by the terms it tokenizes
+    /// to, and stemming breaks the substring relationship that makes
+    /// that sound: `%runni%` matches the text `running`, which is
+    /// indexed as `run`, so a term or prefix bound built from `runni`
+    /// would drop a superfile that genuinely matches. Dropping the
+    /// constraint keeps a superset, which is always allowed; keeping a
+    /// wrong one is not.
+    #[test]
+    fn like_on_a_chained_column_is_unbounded() {
+        for pattern in ["running", "%runni%", "runn%", "%running", "run_ing"] {
+            let expr = col("title").like(lit(pattern));
+            assert_eq!(
+                CandidatePlan::from_filters(&[expr], &fts_cols(), &stemming_resolver),
+                CandidatePlan::Unbounded,
+                "LIKE {pattern:?} on a stemmed column must not be bounded"
+            );
+        }
+    }
+
+    /// Equality still lowers on a chained column, and soundly: the
+    /// literal runs through the *same* chain the postings did, so the
+    /// terms it yields are terms the index really holds, and requiring
+    /// them keeps a superset of the rows that actually compare equal.
+    /// A literal the chain reduces to nothing bounds nothing.
+    #[test]
+    fn equality_on_a_chained_column_lowers_to_the_chain_s_terms() {
+        let plan = CandidatePlan::from_filters(
+            &[col("title").eq(lit("running studies"))],
+            &fts_cols(),
+            &stemming_resolver,
+        );
+        assert_eq!(
+            plan,
+            CandidatePlan::TermsAll {
+                column: "title".to_string(),
+                tokens: vec!["run".to_string(), "studi".to_string()],
+            }
+        );
+        // Every token removed by the chain's stopword set: there is no
+        // term left to require, so the predicate bounds nothing rather
+        // than bounding it with an empty conjunction.
+        assert_eq!(
+            CandidatePlan::from_filters(
+                &[col("title").eq(lit("of the"))],
+                &fts_cols(),
+                &stopping_resolver
+            ),
+            CandidatePlan::Unbounded
+        );
     }
 
     fn plan(expr: Expr) -> CandidatePlan {
@@ -1207,8 +1326,8 @@ mod tests {
     }
 
     /// Resolver for the Unicode-aware analyzer.
-    fn standard_resolver(_col: &str) -> Arc<dyn Tokenizer> {
-        Arc::new(StandardTokenizer)
+    fn standard_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+        Some(Arc::new(StandardTokenizer))
     }
 
     fn standard_plan(expr: Expr) -> CandidatePlan {
@@ -1617,11 +1736,11 @@ mod tests {
         // `title` is analyzed with the Unicode-aware standard tokenizer,
         // which keeps non-ASCII letters; ascii_lower drops the whole
         // token. The lowering must pick the column's own analyzer.
-        let resolve = |col: &str| -> Arc<dyn Tokenizer> {
+        let resolve = |col: &str| -> Option<Arc<dyn Tokenizer>> {
             if col == "title" {
-                Arc::new(StandardTokenizer)
+                Some(Arc::new(StandardTokenizer))
             } else {
-                Arc::new(AsciiLowerTokenizer)
+                Some(Arc::new(AsciiLowerTokenizer))
             }
         };
         let bounded =

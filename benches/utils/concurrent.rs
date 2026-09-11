@@ -43,11 +43,10 @@ use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatc
 use arrow_schema::{DataType, Field, Schema};
 use futures::future::join_all;
 use infino::{
-    VectorSearchOptions,
+    Bm25SearchOptions, VectorSearchOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::{Bm25Stats, BoolMode},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{Supertable, SupertableOptions},
@@ -327,8 +326,7 @@ async fn reader_loop(
                     QUERY_FIELD,
                     QUERY_TERM,
                     TOP_K,
-                    BoolMode::Or,
-                    Bm25Stats::PerSuperfile,
+                    Bm25SearchOptions::new(),
                     None,
                 )
                 .expect("bm25_search"),

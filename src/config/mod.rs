@@ -314,6 +314,15 @@ const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
 const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
+/// Default `ivf_router = auto` concentration threshold: `centroid_graph` only
+/// when the calibrated fanout selects under half the fine clusters (a real
+/// subset to concentrate on). A documented starting point, tuned per corpus.
+const DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO: f64 = 0.5;
+/// Default `ivf_router = auto` scale floor: `centroid_graph` only at or above
+/// 10M docs, where the selected clusters coalesce into a cold-read win (the
+/// graph measured a win at 10M+, a loss at 1M). A documented starting point.
+const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 10_000_000;
+const DEFAULT_CENTROID_GRAPH_MAX_FANOUT: usize = 4096;
 /// Default upper bound on the `hnsw` calibration ef grid. High-dimensional
 /// cosine tables need a wide beam to reach the recall bar (e.g. glove-100
 /// clears ~0.99 only at ef=1024), so the ceiling allows that; the stamped
@@ -553,8 +562,15 @@ pub enum IvfRouter {
     Stamped,
     /// EXPERIMENTAL (opt-in): score fine centroids via an HNSW over the
     /// resident fp32 fine centroids and read the top `global_fine_fanout`
-    /// clusters, bypassing the grid. A cold-read win at scale.
+    /// clusters, bypassing the grid. A cold-read win at scale. Forced verbatim
+    /// (no per-table gating).
     CentroidGraph,
+    /// EXPERIMENTAL (opt-in): pick the router per hidden-vector table at query
+    /// time — `centroid_graph` only where it wins (a concentrated calibrated
+    /// fanout at large scale), else `stamped`. See
+    /// [`VectorSettings::centroid_graph_concentration_ratio`] and
+    /// [`VectorSettings::centroid_graph_scale_floor_docs`].
+    Auto,
 }
 
 /// Vector-index build / search / drain tuning knobs. Grouped so the
@@ -640,6 +656,30 @@ pub struct VectorSettings {
     /// For `ivf_router = centroid_graph`: the centroid-HNSW walk's `ef`
     /// (candidate breadth). `0` = auto (`fanout * 2`). Ignored otherwise.
     pub global_fine_graph_ef: usize,
+    /// For `ivf_router = auto`: the concentration threshold. `auto` uses
+    /// `centroid_graph` only when the calibrated fanout selects a real SUBSET
+    /// of the fine clusters — `stamped_fanout < ratio × total_fine_clusters`.
+    /// When the fanout clamped to ≈ the total there is no subset to concentrate
+    /// on, so the graph can buy nothing and `auto` picks `stamped`. Documented
+    /// starting point, tunable; the final value comes from a real-corpus sweep.
+    pub centroid_graph_concentration_ratio: f64,
+    /// For `ivf_router = auto`: the scale floor (hidden-table doc count) below
+    /// which `auto` picks `stamped`. The selected clusters coalesce into a
+    /// cold-read win only at large N — the centroid graph measured a win at 10M+
+    /// and a loss at 1M, where the selection is spread too thin across cells to
+    /// coalesce. Documented starting point, tunable; final value from a
+    /// real-corpus sweep.
+    pub centroid_graph_scale_floor_docs: u64,
+    /// Ceiling on the fanout the router's recall calibration considers — the
+    /// widest number of global fine clusters the calibration sweep selects and
+    /// scores per query, and thus the deepest fanout it can stamp. It bounds the
+    /// calibration cost regardless of corpus size (the total fine-cluster count
+    /// grows with N): the sweep never selects more than this many clusters, so
+    /// the single per-query cluster read the calibrator relies on stays bounded.
+    /// The grid's `width × fine` prior remains the sweep's lower seed. Reads at
+    /// query time are still governed by the stamped per-`k` fanout, which this
+    /// only caps. Default 4096 (≈ `512 · √(N/1e6)` at 100M).
+    pub centroid_graph_max_fanout: usize,
     /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
     /// the winning `ef` per table into the persisted bundle. Must be at least
@@ -799,6 +839,9 @@ impl Default for VectorSettings {
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
             global_fine_graph_ef: 0,
+            centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
+            centroid_graph_scale_floor_docs: DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
+            centroid_graph_max_fanout: DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: DEFAULT_VECTOR_HNSW_EF_SEARCH,
@@ -1121,9 +1164,10 @@ impl Config {
     /// overrides. Useful for tests and for documenting what the
     /// shipped default is independent of any host environment.
     pub fn defaults() -> Result<Self, ConfigError> {
-        let cfg: Config = Figment::new()
+        let mut cfg: Config = Figment::new()
             .merge(Yaml::string(EMBEDDED_DEFAULT))
             .extract()?;
+        cfg.clamp_vector_autotuning();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1137,9 +1181,60 @@ impl Config {
         // Before extraction, because extraction is exactly where a retired key
         // would vanish without trace.
         Self::reject_retired_keys(&fig)?;
-        let cfg: Config = fig.extract()?;
+        let mut cfg: Config = fig.extract()?;
+        cfg.clamp_vector_autotuning();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Warn on and clamp the `ivf_router = auto` tuning knobs, which arrive off
+    /// the same untrusted YAML surface as `target_recall` but — unlike it — had
+    /// no guard, so a NaN / negative / nonsensical value silently disabled the
+    /// gate (every `auto` table falling back to `stamped`) with no diagnostic.
+    /// Clamp rather than reject: these are optional tuning knobs, so a bad value
+    /// reverts to the shipped default with a loud warning instead of bricking
+    /// the whole process. Mirrors [`WidthLawCalibration::new`]'s target_recall
+    /// fallback, said once at load where the value is in hand.
+    fn clamp_vector_autotuning(&mut self) {
+        let v = &mut self.vector;
+        // Concentration ratio: `fanout < ratio × total_fine`. A non-finite or
+        // non-positive ratio makes the comparison meaningless (NaN is always
+        // false → gate disabled); a ratio above 1 is nonsensical (the fanout is
+        // clamped to the cluster total, so `> 1` makes concentration always
+        // true). Valid range is (0, 1].
+        if !(v.centroid_graph_concentration_ratio.is_finite()
+            && v.centroid_graph_concentration_ratio > 0.0
+            && v.centroid_graph_concentration_ratio <= 1.0)
+        {
+            tracing::warn!(
+                got = v.centroid_graph_concentration_ratio,
+                default = DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
+                "vector.centroid_graph_concentration_ratio must be finite and in (0, 1]; \
+                 falling back to the default (a bad value silently disables ivf_router = auto)"
+            );
+            v.centroid_graph_concentration_ratio = DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO;
+        }
+        // Scale floor: a 0 floor treats every table as "at scale", routing tiny
+        // tables to the graph the floor exists to keep them off of (measured
+        // loss below ~10M). Require a positive floor.
+        if v.centroid_graph_scale_floor_docs == 0 {
+            tracing::warn!(
+                default = DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
+                "vector.centroid_graph_scale_floor_docs must be positive; falling back to the \
+                 default (a 0 floor routes below-scale tables to a graph that loses there)"
+            );
+            v.centroid_graph_scale_floor_docs = DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS;
+        }
+        // Max fanout: the calibration sweep's ceiling. A 0 collapses the sweep
+        // to a single cluster (`max(1)`), stamping a degenerate fanout of 1.
+        if v.centroid_graph_max_fanout == 0 {
+            tracing::warn!(
+                default = DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
+                "vector.centroid_graph_max_fanout must be positive; falling back to the default \
+                 (a 0 ceiling collapses the fanout calibration sweep)"
+            );
+            v.centroid_graph_max_fanout = DEFAULT_CENTROID_GRAPH_MAX_FANOUT;
+        }
     }
 
     /// Fail the load if any [`RETIRED_CONFIG_KEYS`] entry is present, naming
@@ -1398,6 +1493,80 @@ mod tests {
         invalid(json!({ "vector": { "hnsw_m0": 1024, "hnsw_ef_construction": 200 } }));
         // A 0 probe cap divides by zero when the probe strides the corpus.
         invalid(json!({ "vector": { "hnsw_probe_max_docs": 0 } }));
+    }
+
+    /// The `ivf_router = auto` thresholds default to the documented values and
+    /// round-trip through a yaml/json override; the default router is unchanged.
+    #[test]
+    fn centroid_graph_auto_thresholds_default_and_override() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert_eq!(cfg.vector.centroid_graph_concentration_ratio, 0.5);
+        assert_eq!(cfg.vector.centroid_graph_scale_floor_docs, 10_000_000);
+        assert_eq!(
+            cfg.vector.ivf_router,
+            IvfRouter::Stamped,
+            "the default router stays stamped"
+        );
+
+        let overridden =
+            Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+                Serialized::defaults(json!({
+                    "vector": {
+                        "ivf_router": "auto",
+                        "centroid_graph_concentration_ratio": 0.25,
+                        "centroid_graph_scale_floor_docs": 5_000_000
+                    }
+                })),
+            ))
+            .expect("auto thresholds parse");
+        assert_eq!(overridden.vector.ivf_router, IvfRouter::Auto);
+        assert_eq!(overridden.vector.centroid_graph_concentration_ratio, 0.25);
+        assert_eq!(overridden.vector.centroid_graph_scale_floor_docs, 5_000_000);
+    }
+
+    /// A misconfigured `ivf_router = auto` threshold clamps to the shipped
+    /// default (with a load-time warning) instead of silently disabling the
+    /// gate. Load still succeeds — these are tuning knobs, not hard errors.
+    #[test]
+    fn centroid_graph_auto_thresholds_clamp_on_misconfig() {
+        let clamped = |patch: serde_json::Value| -> VectorSettings {
+            Config::from_figment(
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Serialized::defaults(patch)),
+            )
+            .expect("clamped config still loads")
+            .vector
+        };
+
+        // A negative / above-1 / NaN-equivalent ratio reverts to the default.
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_concentration_ratio": -0.2 } }))
+                .centroid_graph_concentration_ratio,
+            DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
+        );
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_concentration_ratio": 1.5 } }))
+                .centroid_graph_concentration_ratio,
+            DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
+        );
+        // A 0 scale floor and a 0 max fanout both revert to their defaults.
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_scale_floor_docs": 0 } }))
+                .centroid_graph_scale_floor_docs,
+            DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
+        );
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_max_fanout": 0 } }))
+                .centroid_graph_max_fanout,
+            DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
+        );
+        // A valid in-range ratio is left untouched.
+        assert_eq!(
+            clamped(json!({ "vector": { "centroid_graph_concentration_ratio": 0.75 } }))
+                .centroid_graph_concentration_ratio,
+            0.75,
+        );
     }
 
     #[test]

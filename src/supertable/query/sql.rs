@@ -65,6 +65,7 @@ use datafusion::{
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, LogicalPlan},
 };
+use tokio::runtime::Handle;
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
@@ -464,22 +465,32 @@ impl SupertableReader {
         let ctx = self.metered_session_context()?;
         let id_column = self.options().id_column.clone();
 
+        // Resolve on this runtime's 16 MiB workers, not the calling thread
+        // `block_on` polls on: predicate planning depth must not hang on a
+        // caller's stack. A panic surfaces through the join as a query error.
         let drive = async move {
-            let df = ctx
-                .table(TABLE_NAME)
+            Handle::current()
+                .spawn(async move {
+                    let df = ctx
+                        .table(TABLE_NAME)
+                        .await
+                        .map_err(|e| QueryError::Plan(e.to_string()))?
+                        .filter(expr)
+                        .map_err(|e| QueryError::Plan(e.to_string()))?
+                        .select_columns(&[id_column.as_str()])
+                        .map_err(|e| QueryError::Plan(e.to_string()))?;
+                    // Same three steps as `query_sql`, and for the same reason:
+                    // this scan's rows are real decoded rows. Collecting the
+                    // DataFrame directly reported CPU, page bytes and ranges for a
+                    // mutation's predicate resolve while leaving its row count at
+                    // zero.
+                    let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
+                    extract_id_column(&batches)
+                })
                 .await
-                .map_err(|e| QueryError::Plan(e.to_string()))?
-                .filter(expr)
-                .map_err(|e| QueryError::Plan(e.to_string()))?
-                .select_columns(&[id_column.as_str()])
-                .map_err(|e| QueryError::Plan(e.to_string()))?;
-            // Same three steps as `query_sql`, and for the same reason:
-            // this scan's rows are real decoded rows. Collecting the
-            // DataFrame directly reported CPU, page bytes and ranges for a
-            // mutation's predicate resolve while leaving its row count at
-            // zero.
-            let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
-            extract_id_column(&batches)
+                .map_err(|join| {
+                    QueryError::Plan(format!("predicate resolve task failed: {join}"))
+                })?
         };
 
         self.block_on(drive)
