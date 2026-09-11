@@ -45,7 +45,7 @@ use datafusion::{
 };
 
 use crate::{
-    superfile::fts::reader::{Bm25Stats, BoolMode},
+    superfile::fts::reader::{Bm25SearchOptions, BoolMode},
     supertable::{
         handle::{SupertableReader, WeakReader},
         query::exec::common::{
@@ -377,7 +377,12 @@ impl ExecutionPlan for Bm25Exec {
             let hits = match &query {
                 Bm25Query::Terms { query, mode } => {
                     reader
-                        .bm25_search_async(&column, query, k, *mode, Bm25Stats::PerSuperfile)
+                        .bm25_search_async(
+                            &column,
+                            query,
+                            k,
+                            Bm25SearchOptions::new().with_mode(*mode),
+                        )
                         .await
                 }
                 Bm25Query::Prefix { prefix } => {

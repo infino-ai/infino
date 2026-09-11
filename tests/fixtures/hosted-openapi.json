@@ -1383,7 +1383,7 @@
       },
       "FtsColumn": {
         "type": "object",
-        "description": "One FTS index declaration under `indexes.fts` — a column plus the analyzer\nits text is tokenized with (`{\"column\": \"body\", \"analyzer\": \"standard\"}`).\n`analyzer` is optional and, when omitted, the engine's default `ascii_lower`\napplies — the same default a bare-string entry gets (see [`FtsIndex`]).",
+        "description": "One FTS index declaration under `indexes.fts` — a column plus its\nper-column options (`{\"column\": \"body\", \"analyzer\": \"standard\", \"stored\":\nfalse}`). Every option is optional and, when omitted, takes the engine\ndefault — the same defaults a bare-string entry gets (see [`FtsIndex`]).\nThe object shape mirrors what the engine's hosted transport sends for a\nnon-default `FtsField`, so an option chosen through the SDK reaches the\nservice rather than being refused at the door.",
         "required": [
           "column"
         ],
@@ -1397,6 +1397,13 @@
           },
           "column": {
             "type": "string"
+          },
+          "stored": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the raw text is kept in the table. Omitted means the engine\ndefault, `true`. `false` declares an index-only column: the text is\nsearchable (BM25, token and phrase matching) but never stored, so it\ncannot be read back — not in SQL results, not in a search projection,\nnot in predicates. `append` and `update` batches still carry the\ncolumn; it is dropped at write time."
           }
         },
         "additionalProperties": false
@@ -1405,14 +1412,14 @@
         "oneOf": [
           {
             "type": "string",
-            "description": "`\"body\"` — index the column with the default analyzer."
+            "description": "`\"body\"` — index the column with the default options."
           },
           {
             "$ref": "#/components/schemas/FtsColumn",
-            "description": "`{\"column\": \"body\", \"analyzer\": \"standard\"}`."
+            "description": "`{\"column\": \"body\", \"analyzer\": \"standard\", \"stored\": false}`."
           }
         ],
-        "description": "One entry in `indexes.fts`. Either a bare column name — which uses the\nengine's default `ascii_lower` analyzer — or a `{column, analyzer}` object\nthat names the analyzer explicitly. The bare-string form keeps clients that\nsend `\"fts\": [\"body\"]` working unchanged. An analyzer applies per column,\nnot per table."
+        "description": "One entry in `indexes.fts`. Either a bare column name — which uses the\nengine defaults (`ascii_lower` analyzer, stored text) — or a `{column,\nanalyzer, stored}` object that sets options explicitly. The bare-string\nform keeps clients that send `\"fts\": [\"body\"]` working unchanged. Options\napply per column, not per table."
       },
       "HybridSearchRequest": {
         "type": "object",
@@ -1477,7 +1484,7 @@
             "items": {
               "$ref": "#/components/schemas/FtsIndex"
             },
-            "description": "FTS index declarations — a bare column name (default `ascii_lower`\nanalyzer) or a `{column, analyzer}` object per column."
+            "description": "FTS index declarations — a bare column name (engine defaults) or a\n`{column, analyzer, stored}` object per column."
           },
           "vector": {
             "type": [

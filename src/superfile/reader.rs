@@ -52,11 +52,12 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
+            bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
                 PreparedClauses, TermPattern,
             },
-            tokenize::{AsciiLowerTokenizer, Tokenizer},
+            tokenize::{Phrase, Tokenizer},
         },
         vector::{
             layout::VectorLayout,
@@ -1095,15 +1096,15 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        // Tokenize with the target column's configured tokenizer so
-        // query terms match how the column was indexed (ascii_lower /
-        // standard). Falls back to ascii_lower when there is no FTS
-        // index or column; the search then fails downstream as before.
-        let tok: Arc<dyn Tokenizer> = self
-            .fts
-            .as_ref()
-            .and_then(|f| f.column_tokenizer(column).ok())
-            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        // Tokenize with the target column's configured tokenizer so query
+        // terms match how the column was indexed (ascii_lower / standard).
+        // A column this superfile has no full-text index for fails here,
+        // where the reason is still nameable, rather than after a pass with
+        // some other column's analyzer.
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let tok: Arc<dyn Tokenizer> = fts.column_tokenizer(column)?;
 
         // Split the query into clause lists and resolve the bare
         // tokens' polarity from the default operator. The parsed
@@ -1112,11 +1113,11 @@ impl SuperfileReader {
         let musts: Vec<&str> = clauses.musts.iter().map(|t| &**t).collect();
         let shoulds: Vec<&str> = clauses.shoulds.iter().map(|t| &**t).collect();
         let negatives: Vec<&str> = clauses.negatives.iter().map(|t| &**t).collect();
-        let own = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
-            phrases
-                .into_iter()
-                .map(|p| p.into_iter().map(Cow::into_owned).collect())
-                .collect()
+        // `Phrase::map` keeps each term's offset, which is what a
+        // phrase on a stopworded column needs: its terms were not
+        // adjacent in the query and must not be required adjacent here.
+        let own = |phrases: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+            phrases.iter().map(|p| p.map(|t| t.to_string())).collect()
         };
         let must_phrases = own(clauses.must_phrases);
         let should_phrases = own(clauses.should_phrases);
@@ -1131,6 +1132,8 @@ impl SuperfileReader {
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
                 global_idf: None,
+                prefetched: None,
+                live_floor: None,
             },
             k,
             f32::NEG_INFINITY,
@@ -1247,7 +1250,7 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
@@ -1265,10 +1268,10 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
         neg_terms: &[&str],
-        neg_phrases: &[Vec<String>],
+        neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
@@ -1304,6 +1307,20 @@ impl SuperfileReader {
         Ok(fts.term_dfs(column, tokens).await?)
     }
 
+    /// Open-wave fetch of `terms`' dictionary slots + postings ranges
+    /// with per-term df, for the fused global-stats gather. Delegates to
+    /// [`FtsReader::fetch_scored_terms`].
+    pub(crate) async fn fetch_scored_terms(
+        &self,
+        column: &str,
+        terms: &[&str],
+    ) -> Result<fts_reader::FetchedTermMemo, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.fetch_scored_terms(column, terms).await?)
+    }
+
     /// Two-pass exact match of a **raw string** `value` against
     /// `column`'s stored values. The input is a raw string, **not**
     /// tokens — tokenization is used only to prune candidates, never as
@@ -1327,12 +1344,13 @@ impl SuperfileReader {
     ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
         // string's tokens (a superset of the exact matches). Tokenize
-        // with the column's configured tokenizer to match the index.
-        let tok: Arc<dyn Tokenizer> = self
-            .fts
-            .as_ref()
-            .and_then(|f| f.column_tokenizer(column).ok())
-            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        // with the column's configured tokenizer to match the index; a
+        // column with no full-text index here has no dictionary to prune
+        // through, so it fails rather than pruning with a foreign analyzer.
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let tok: Arc<dyn Tokenizer> = fts.column_tokenizer(column)?;
         let tokens: Vec<String> = tok.tokenize(value).collect();
         let (candidates, work): (Vec<u32>, MatchWork) = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
@@ -1397,20 +1415,46 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
+        bm25: Option<Bm25Params>,
     ) -> Result<PreparedClauses, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.prepare_clauses(column, lists, k, floor).await?)
     }
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched.
-    pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, ReadError> {
+    ///
+    /// `bm25` must be the same override the paired `prepare_clauses`
+    /// was given: the cursors carry `idf · (k1 + 1)` from the pair they
+    /// were built with, and scoring divides by a norm table derived
+    /// from the same pair. `with_bm25_override` is deterministic, so
+    /// two separately-derived views of one pair agree bit for bit.
+    pub(crate) fn run_prepared(
+        &self,
+        prep: PreparedClauses,
+        bm25: Option<Bm25Params>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self.fts_scored(bm25)?;
+        Ok(fts.run_prepared(prep)?)
+    }
+
+    /// The FTS reader a scored query should read through: this
+    /// superfile's own, or a view of it that scores with `bm25`
+    /// instead of what each column declared.
+    ///
+    /// Borrowed when there is no override, which is the default path
+    /// and costs nothing. An override clones the reader — an `Arc` bump
+    /// for the blob plus one 1 KiB decode table per column whose pair
+    /// actually differs — and records the factor that keeps each
+    /// column's stored bounds upper bounds under the new pair.
+    fn fts_scored(&self, bm25: Option<Bm25Params>) -> Result<Cow<'_, FtsReader>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.run_prepared(prep)?)
+        Ok(match bm25 {
+            Some(params) => Cow::Owned(fts.with_bm25_override(params)),
+            None => Cow::Borrowed(fts),
+        })
     }
 
     /// Prefix-expanded BM25 search.
@@ -1533,11 +1577,14 @@ impl SuperfileReader {
         column: &str,
         terms: &[&str],
         global_idf: Option<&fts_reader::GlobalTermIdf>,
+        prefetched: Option<&fts_reader::FetchedTermMemo>,
     ) -> Result<OrCursorSet, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.build_or_cursor_set(column, terms, global_idf).await?)
+        Ok(fts
+            .build_or_cursor_set(column, terms, global_idf, prefetched)
+            .await?)
     }
 
     /// Expand `prefix` via the FST and build its OR cursor set, for
@@ -1563,7 +1610,9 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
             .collect();
-        Ok(fts.build_or_cursor_set(column, &term_strings, None).await?)
+        Ok(fts
+            .build_or_cursor_set(column, &term_strings, None, None)
+            .await?)
     }
 
     /// Ranged multi-term OR against prebuilt cursors — see
@@ -1576,10 +1625,9 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        bm25: Option<Bm25Params>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
     }
 
@@ -1604,7 +1652,16 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let set = self.bm25_prefix_cursor_set(column, prefix, pool).await?;
-        self.bm25_search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, f32::NEG_INFINITY)
+        // Prefix search has no search-options surface, so columns score
+        // with the pair they declared.
+        self.bm25_search_or_range_prebuilt(
+            &set,
+            k,
+            doc_id_start,
+            doc_id_end,
+            f32::NEG_INFINITY,
+            None,
+        )
     }
 
     /// Multi-column BM25 search with per-column weights ("most
@@ -1828,6 +1885,12 @@ pub struct VectorSearchOptions {
     /// IVF probe override. `None` → engine default for the query path.
     pub nprobe: Option<usize>,
     rerank_mult: Option<usize>,
+    /// `hnsw_ivf` serve-time beam override. `None` → the stamped k→ef curve
+    /// (or the `vector.hnsw_ef_search` config), exactly as today; `Some(ef)`
+    /// with `ef > 0` walks this query at that fixed beam. A test-and-bench
+    /// instrument (recall/latency sweeps of an already-built graph); ignored
+    /// under any non-graph serving path.
+    ef: Option<usize>,
 }
 
 impl VectorSearchOptions {
@@ -1862,6 +1925,19 @@ impl VectorSearchOptions {
     /// The configured rerank multiplier, if one was set.
     pub fn rerank_mult(&self) -> Option<usize> {
         self.rerank_mult
+    }
+
+    /// Set the `hnsw_ivf` serve-time beam (`ef`) for this query. Higher improves
+    /// recall at the cost of more work; overrides the stamped k→ef curve for an
+    /// already-built graph without a rebuild.
+    pub fn with_ef(mut self, ef: usize) -> Self {
+        self.ef = Some(ef);
+        self
+    }
+
+    /// The configured serve-time `ef` beam, if one was set.
+    pub(crate) fn ef(&self) -> Option<usize> {
+        self.ef
     }
 
     /// Resolve `(nprobe, rerank_mult)` for this query path.
@@ -3147,12 +3223,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_match_on_non_text_column_errors() {
-        // `exact_match` only supports LargeUtf8 columns. Querying the
-        // Decimal128 `doc_id` column drives the non-LargeUtf8 downcast
-        // failure. The value tokenizes to nothing (punctuation only),
-        // so every row becomes a candidate and the verify pass reaches
-        // the downcast on the decimal column.
+    async fn exact_match_on_a_column_without_a_full_text_index_errors() {
+        // `exact_match` prunes through the column's own term dictionary,
+        // so a column with no full-text index — here the Decimal128
+        // `doc_id` — is rejected by name. It used to tokenize the value
+        // with a fallback analyzer and fail later on the text downcast,
+        // which said nothing about the real problem.
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         let err = r
@@ -3160,10 +3236,37 @@ mod tests {
             .await
             .expect_err("expected error");
         match err {
-            ReadError::Io(e) => {
-                assert!(e.to_string().contains("not LargeUtf8"));
+            ReadError::Fts(inner) => {
+                let rendered = inner.to_string();
+                assert!(
+                    rendered.contains("doc_id"),
+                    "error must name the column: {rendered}"
+                );
             }
-            other => panic!("expected ReadError::Io, got {:?}", other),
+            other => panic!("expected ReadError::Fts, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bm25_hits_on_a_column_without_a_full_text_index_errors() {
+        // Same rule for the scored path: without an index there is no
+        // analyzer to tokenize the query with, so it fails up front
+        // rather than after a pass with some other column's analyzer.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let err = r
+            .bm25_hits_async("doc_id", "anything", 10, BoolMode::Or)
+            .await
+            .expect_err("expected error");
+        match err {
+            ReadError::Fts(inner) => {
+                let rendered = inner.to_string();
+                assert!(
+                    rendered.contains("doc_id"),
+                    "error must name the column: {rendered}"
+                );
+            }
+            other => panic!("expected ReadError::Fts, got {other:?}"),
         }
     }
 }

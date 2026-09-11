@@ -19,6 +19,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -108,8 +109,9 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("bm25 over index-only column");
@@ -122,8 +124,9 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("stored projection");
@@ -137,8 +140,9 @@ fn index_only_column_searches_but_rejects_projection() {
             "body",
             "signal",
             K,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             Some(&["_id", "body", "score"]),
         )
         .expect_err("index-only column must not be projectable");

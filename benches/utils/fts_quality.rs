@@ -20,7 +20,7 @@
 //!   (`stored_len`): exact below 16 tokens, truncated downward by up to
 //!   one bucket above. On a corpus with realistic length variation this
 //!   reorders near-ties.
-//! * **Sharded statistics.** Under the default [`Bm25Stats::PerSuperfile`]
+//! * **Sharded statistics.** Under [`Bm25Stats::PerSuperfile`]
 //!   each superfile scores with its own document count and term
 //!   frequencies; [`Bm25Stats::Global`] uses table-wide idf but still each
 //!   superfile's own average document length.
@@ -33,7 +33,7 @@
 //! | column | definition |
 //! |---|---|
 //! | recall vs BM25 | engine top-k under `Global` graded against T — the user-facing quality, including the quantization and avgdl costs |
-//! | recall (default stats) | the same under `PerSuperfile` — the default mode's sharded-idf drift |
+//! | recall (per-superfile stats) | the same under `PerSuperfile` — the opt-in mode's sharded-idf drift |
 //! | recall vs engine BM25 | engine top-k under `Global` graded against Q, a hit allowed to fall short of the k-th score by the avgdl residual — must be ≈ 1.0; a drop is a kernel or pruning bug. **Gated.** |
 //! | max score Δ | largest relative gap between an engine score and Q for the same document (`Global`). **Gated** at the avgdl residual. |
 //!
@@ -65,6 +65,7 @@ use std::{borrow::Cow, cmp::Ordering, collections::HashMap, time::Instant};
 
 use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch, StringArray};
 use infino::{
+    Bm25SearchOptions,
     superfile::fts::{
         bm25::stored_len,
         reader::{Bm25Stats, BoolMode},
@@ -647,7 +648,13 @@ fn engine_hits(
     stats: Bm25Stats,
 ) -> Vec<EngineHit> {
     let batches = reader
-        .bm25_search(column, q.query, k, q.mode, stats, Some(&[column, "score"]))
+        .bm25_search(
+            column,
+            q.query,
+            k,
+            Bm25SearchOptions::new().with_mode(q.mode).with_stats(stats),
+            Some(&[column, "score"]),
+        )
         .expect("quality bm25_search");
     let mut hits = Vec::with_capacity(k);
     for batch in &batches {
@@ -720,7 +727,7 @@ struct GradedRow {
     k: usize,
     n_matches: usize,
     recall_textbook: f64,
-    recall_default_stats: f64,
+    recall_per_superfile_stats: f64,
     recall_engine_model: f64,
     max_delta: f64,
 }
@@ -771,7 +778,7 @@ pub fn run(
         for (ki, &k) in QUALITY_KS.iter().enumerate() {
             let expected = k.min(top.n_matches);
             let global = engine_hits(reader, column, q, k, Bm25Stats::Global);
-            let default = engine_hits(reader, column, q, k, Bm25Stats::PerSuperfile);
+            let per_superfile = engine_hits(reader, column, q, k, Bm25Stats::PerSuperfile);
             let textbook_of = |row| oracle.score_row(row, rq).map(|(t, _)| t);
             let engine_model_of = |row| oracle.score_row(row, rq).map(|(_, e)| e);
             let recall_textbook = tie_aware_recall(
@@ -781,8 +788,8 @@ pub fn run(
                 TIE_TOLERANCE,
                 textbook_of,
             );
-            let recall_default_stats = tie_aware_recall(
-                &default,
+            let recall_per_superfile_stats = tie_aware_recall(
+                &per_superfile,
                 expected,
                 top.textbook_kth[ki],
                 TIE_TOLERANCE,
@@ -807,7 +814,7 @@ pub fn run(
                 k,
                 n_matches: top.n_matches,
                 recall_textbook,
-                recall_default_stats,
+                recall_per_superfile_stats,
                 recall_engine_model,
                 max_delta,
             });
@@ -857,7 +864,7 @@ fn emit(
                 "Query".into(),
                 "matches".into(),
                 "recall vs BM25".into(),
-                "recall (default stats)".into(),
+                "recall (per-superfile stats)".into(),
                 "recall vs engine BM25".into(),
                 "max score Δ".into(),
             ],
@@ -869,7 +876,7 @@ fn emit(
                         text(r.name),
                         text(fmt_count(r.n_matches)),
                         recall_cell(r.recall_textbook, false),
-                        recall_cell(r.recall_default_stats, false),
+                        recall_cell(r.recall_per_superfile_stats, false),
                         recall_cell(r.recall_engine_model, true),
                         metric(
                             r.max_delta,
@@ -893,8 +900,8 @@ fn emit(
              tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). \
              `recall vs BM25` = `Bm25Stats::Global` against textbook BM25 with exact doc \
              lengths — the user-facing quality, which pays for the one-byte length \
-             quantization and per-superfile avgdl. `recall (default stats)` = the same under \
-             the default `PerSuperfile` idf. `recall vs engine BM25` = `Global` against BM25 \
+             quantization and per-superfile avgdl. `recall (per-superfile stats)` = the same under \
+             segment-local `PerSuperfile` idf (the pre-0.7 default). `recall vs engine BM25` = `Global` against BM25 \
              with the engine's stored (quantized) lengths, a hit allowed to fall short of the \
              k-th score by the avgdl residual ({tol:.1}% at this scale: the oracle normalizes \
              with the corpus-wide average length, the engine with each superfile's own) — \

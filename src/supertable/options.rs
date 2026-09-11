@@ -66,7 +66,10 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer, tokenizer_for_name},
+        fts::{
+            analysis::{Base, chain_tokenizer},
+            tokenize::{Tokenizer, tokenizer_for_name},
+        },
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -407,14 +410,30 @@ pub struct SupertableOptions {
     /// Warm queries never touch it — they resolve on the cache mutex's fast
     /// path — so the download never serializes steady-state serving.
     pub(crate) graph_hydration_lock: Arc<TokioMutex<()>>,
-    /// Build-once cache for the in-memory centroid-router HNSW (an HNSW over
+    /// Single-slot cache for the in-memory centroid-router HNSW (an HNSW over
     /// the resident fp32 fine centroids, used by `ivf_router = centroid_graph`
-    /// to select clusters). Built from the resident centroid section at the
-    /// first such query, so testing it needs no re-drain; the persisted
-    /// centroid graph is a follow-on. Only populated when the centroid-graph
-    /// router is enabled.
+    /// to select clusters). The cached graph is stamped with the `(generation,
+    /// column)` it was built for — the hidden manifest generation and the
+    /// vector column its nodes index — and a query reuses it only while both
+    /// match its own pinned manifest generation and queried column, otherwise
+    /// it rebuilds and restamps. A drain/compaction advances the generation and
+    /// renumbers the fine clusters, so the stamp alone invalidates a stale
+    /// graph — no explicit clear, and a late-storing stale build is rejected by
+    /// the next comparison. The column is part of the stamp because the slot is
+    /// shared across a table's vector columns; a graph built for column A must
+    /// never serve a query on column B (its nodes carry A's flat cluster ids).
+    /// Populated eagerly by the drain/optimize path (when the router is
+    /// enabled) and lazily by the query path as a fallback. `ArcSwapOption` so
+    /// the steady-state hot path loads lock-free.
     pub(crate) centroid_router_cache:
-        Arc<tokio::sync::OnceCell<Arc<crate::supertable::query::vector::CentroidRouterGraph>>>,
+        Arc<arc_swap::ArcSwapOption<crate::supertable::query::vector::StampedCentroidRouter>>,
+    /// Single-flight gate for [`Self::centroid_router_cache`] builds. The HNSW
+    /// build over every fine centroid is expensive at scale, so a miss holds
+    /// this lock across the build while concurrent misses park and then find
+    /// the published entry — exactly one build per `(generation, column)`.
+    /// Steady-state queries never touch it: they resolve on the cache's
+    /// lock-free fast path.
+    pub(crate) centroid_router_build_lock: Arc<TokioMutex<()>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar
     /// projection over gapped user superfiles, so a hit resolves in O(k) after
     /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
@@ -641,6 +660,18 @@ impl SupertableOptions {
                     actual: format!("{:?}", f.data_type()),
                 });
             }
+            // BM25 parameters, validated here rather than at scoring
+            // time: the build bakes the block-max bounds with them, so a
+            // nonsense pair would otherwise be discovered as strange
+            // scores long after the bytes were written.
+            let (k1, b) = (fc.bm25.k1, fc.bm25.b);
+            if !k1.is_finite() || k1 <= 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
+                return Err(BuildError::FtsBm25ParamsOutOfRange {
+                    column: fc.column.clone(),
+                    k1,
+                    b,
+                });
+            }
         }
 
         // 3. Each vector column must exist in schema as
@@ -702,9 +733,13 @@ impl SupertableOptions {
             }
         }
 
-        // 5. Each FTS column's analyzer name must resolve. Validating
-        //    here surfaces a typo at construction with a typed error,
-        //    instead of at the first commit's builder construction.
+        // 5. Each FTS column's base tokenizer name must resolve.
+        //    Validating here surfaces a typo at construction with a
+        //    typed error, instead of at the first commit's builder
+        //    construction. The stopword set and stemmer need no check:
+        //    they arrive as enums, so an unrepresentable one cannot be
+        //    constructed. (A *persisted* filter name is different and is
+        //    validated where it is read.)
         for fc in &fts_columns {
             if tokenizer_for_name(&fc.analyzer).is_none() {
                 return Err(BuildError::UnknownAnalyzer {
@@ -738,7 +773,8 @@ impl SupertableOptions {
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
             resident_index_cache: Arc::new(TokioMutex::new(None)),
             graph_hydration_lock: Arc::new(TokioMutex::new(())),
-            centroid_router_cache: Arc::new(tokio::sync::OnceCell::new()),
+            centroid_router_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
+            centroid_router_build_lock: Arc::new(TokioMutex::new(())),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
@@ -871,19 +907,13 @@ impl SupertableOptions {
     /// resolution cannot fail for a registered column). The lookup is a
     /// single pass over `fts_columns`.
     pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
-        self.fts_columns
-            .iter()
-            .find(|c| c.column == column)
-            .and_then(|c| tokenizer_for_name(&c.analyzer))
-    }
-
-    /// Tokenizer configured for `column`, for tokenizing query text so
-    /// it matches how the column was indexed. Falls back to the ASCII
-    /// default when `column` is not a registered FTS column; a caller that
-    /// must distinguish that case uses [`Self::try_fts_tokenizer_for`].
-    pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
-        self.try_fts_tokenizer_for(column)
-            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer))
+        let cfg = self.fts_columns.iter().find(|c| c.column == column)?;
+        // The whole chain, not the base: every caller here tokenizes
+        // query-side text — search terms, an equality literal, a `LIKE`
+        // fragment — and must produce the forms the column was indexed
+        // under.
+        let base = Base::from_name(&cfg.analyzer)?;
+        Some(chain_tokenizer(base, cfg.stopwords, cfg.stemmer))
     }
 
     /// Attach a disk cache for storage-backed reads.
@@ -1438,6 +1468,57 @@ mod tests {
         assert!(
             matches!(err, BuildError::FtsColumnMustBeLargeUtf8 { column, .. } if column == "body")
         );
+    }
+
+    /// A declared pair outside its valid ranges is refused before
+    /// anything is written. The build bakes the block-max bounds with
+    /// these values, so accepting a nonsense pair would surface much
+    /// later as strange scores rather than as a rejected table.
+    #[test]
+    fn fts_bm25_params_out_of_range_rejected() {
+        let s = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        for (k1, b) in [
+            (0.0_f32, 0.75_f32),
+            (-1.0, 0.75),
+            (f32::NAN, 0.75),
+            (f32::INFINITY, 0.75),
+            (1.2, -0.01),
+            (1.2, 1.01),
+            (1.2, f32::NAN),
+        ] {
+            let err = SupertableOptions::new(Arc::clone(&s), vec![fc("body").bm25(k1, b)], vec![])
+                .expect_err("out-of-range pair must be refused");
+            assert!(
+                matches!(
+                    err,
+                    BuildError::FtsBm25ParamsOutOfRange { ref column, .. } if column == "body"
+                ),
+                "k1={k1} b={b} gave {err:?}"
+            );
+            // The message names both bounds, so a caller sees what is
+            // acceptable rather than only what was rejected.
+            let msg = err.to_string();
+            assert!(msg.contains("k1") && msg.contains("b"), "{msg}");
+        }
+    }
+
+    /// The boundary values are accepted: `b` is inclusive at both ends
+    /// and a large `k1` is legal.
+    #[test]
+    fn fts_bm25_params_boundaries_accepted() {
+        let s = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        for (k1, b) in [(1.2_f32, 0.0_f32), (1.2, 1.0), (0.001, 0.5), (100.0, 0.5)] {
+            SupertableOptions::new(Arc::clone(&s), vec![fc("body").bm25(k1, b)], vec![])
+                .unwrap_or_else(|e| panic!("k1={k1} b={b} should be accepted: {e}"));
+        }
     }
 
     #[test]

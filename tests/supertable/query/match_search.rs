@@ -26,6 +26,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    Bm25SearchOptions,
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -262,30 +263,41 @@ fn count_dedups_repeated_negatives_and_required_excluded() {
 /// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
 /// across every superfile before scoring. Statistics change SCORES,
 /// never MEMBERSHIP: with `k` covering every match, the global-stats
-/// result holds the same number of rows as the default per-superfile
-/// mode's hit set.
+/// result holds the same number of rows as the per-superfile mode's hit
+/// set. The per-superfile arm is requested explicitly — `bm25_hits`
+/// scores with the crate default, which is `Global`, so relying on it
+/// here would compare global statistics against themselves and assert
+/// nothing.
 #[test]
-fn bm25_global_stats_keeps_the_default_modes_membership() {
+fn bm25_global_stats_keeps_the_per_superfile_membership() {
     let st = demo_two_superfiles();
     let reader = st.reader().expect("reader");
-    let default_hits = reader
-        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+    let per_superfile_hits = reader
+        .bm25_hits(
+            "title",
+            "rust",
+            TOP_K,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::PerSuperfile),
+        )
         .expect("per-superfile bm25");
     let global = reader
         .bm25_search(
             "title",
             "rust",
             TOP_K,
-            BoolMode::Or,
-            Bm25Stats::Global,
+            Bm25SearchOptions::new()
+                .with_mode(BoolMode::Or)
+                .with_stats(Bm25Stats::Global),
             None,
         )
         .expect("global-stats bm25");
     let global_rows: usize = global.iter().map(|b| b.num_rows()).sum();
-    assert!(!default_hits.is_empty(), "the corpus has rust docs");
+    assert!(!per_superfile_hits.is_empty(), "the corpus has rust docs");
     assert_eq!(
         global_rows,
-        default_hits.len(),
+        per_superfile_hits.len(),
         "global statistics rescore the same match set"
     );
 }
@@ -473,7 +485,12 @@ fn token_match_or_is_the_unranked_bm25_candidate_set() {
         .token_match("title", "rust", BoolMode::Or)
         .expect("token_match OR");
     let bm25 = reader
-        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "rust",
+            TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("bm25_search OR");
 
     assert!(
@@ -500,7 +517,12 @@ fn token_match_and_intersects_tokens() {
         .token_match("title", "rust systems", BoolMode::And)
         .expect("token_match AND");
     let bm25 = reader
-        .bm25_hits("title", "rust systems", TOP_K, BoolMode::And)
+        .bm25_hits(
+            "title",
+            "rust systems",
+            TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::And),
+        )
         .expect("bm25_search AND");
 
     assert!(!token.is_empty(), "AND of present tokens must match a doc");
@@ -564,7 +586,12 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
         )
         .expect("hybrid_search");
     let bm25 = reader
-        .bm25_hits("title", "rust", TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "rust",
+            TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("bm25_search");
     let vector = reader
         .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
@@ -615,7 +642,12 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
         )
         .expect("hybrid_search");
     let bm25 = reader
-        .bm25_hits("title", "async", RANK_TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "async",
+            RANK_TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("bm25_search");
     let vector = reader
         .vector_hits("emb", &q, RANK_TOP_K, VectorSearchOptions::new(), None)

@@ -30,6 +30,65 @@ pub const K1: f32 = 1.2;
 /// Standard BM25 default `b` — length-normalization parameter.
 pub const B: f32 = 0.75;
 
+/// A column's BM25 similarity parameters.
+///
+/// [`Default`] is the standard pair (`k1 = 1.2`, `b = 0.75`) — the values every
+/// superfile written before the parameters were recordable was built
+/// with, and the values a column that declares nothing still uses. That
+/// meaning is frozen: a file whose column entry carries no parameters
+/// can only have been built with this pair, so the default here must
+/// never track a change to what the *API* recommends.
+///
+/// `#[non_exhaustive]`: build with [`Bm25Params::new`] so a further
+/// similarity parameter can be added without breaking callers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct Bm25Params {
+    /// Term-frequency saturation. Must be `> 0` and finite.
+    pub k1: f32,
+    /// Length normalization, in `[0, 1]`. `0` disables it entirely.
+    pub b: f32,
+}
+
+impl Default for Bm25Params {
+    fn default() -> Self {
+        Self { k1: K1, b: B }
+    }
+}
+
+impl Bm25Params {
+    /// The standard pair — `k1 = 1.2`, `b = 0.75`.
+    pub const STANDARD: Self = Self { k1: K1, b: B };
+
+    /// Unvalidated constructor. Callers that accept these from a user
+    /// validate first (`SupertableOptions::new` for a declared column,
+    /// the search options for an override) so the error names the
+    /// column or argument at fault.
+    pub const fn new(k1: f32, b: f32) -> Self {
+        Self { k1, b }
+    }
+
+    /// `k1 · (1 − b + b·dl/avgdl)` — the per-doc length normalizer the
+    /// scorer divides by, precomputed per length bucket in the reader's
+    /// norm table. `avgdl <= 0` (an empty column) yields `k1`, the
+    /// unit-norm value; such a column is never scored.
+    #[inline]
+    pub(crate) fn dl_norm_k1(&self, dl: u32, avgdl: f32) -> f32 {
+        let norm = if avgdl > 0.0 {
+            1.0 - self.b + self.b * (dl as f32) / avgdl
+        } else {
+            1.0
+        };
+        self.k1 * norm
+    }
+
+    /// `idf · (k1 + 1)` — the per-term factor the scorer multiplies by.
+    #[inline]
+    pub(crate) fn idf_x_k1p1(&self, idf: f32) -> f32 {
+        idf * (self.k1 + 1.0)
+    }
+}
+
 /// Plus-half IDF smoothing term. Added to both the numerator and
 /// denominator of the IDF log argument so it stays ≥ 1 (hence
 /// `idf >= 0`) for every valid `(N, df)` — the "BM25+1" form.
@@ -118,28 +177,24 @@ pub fn idf(n_docs: u64, df: u64) -> f32 {
 
 /// Per-doc BM25 contribution for a single (column, term, doc).
 ///
-/// `tf`    — term frequency in this document, this column.
-/// `dl`    — this document's length in this column (in tokens).
-/// `avgdl` — average document length across the superfile, this column.
+/// `tf`     — term frequency in this document, this column.
+/// `dl`     — this document's length in this column (in tokens).
+/// `avgdl`  — average document length across the superfile, this column.
+/// `params` — the column's similarity parameters.
 #[inline(always)]
-pub fn score(idf_t: f32, tf: u32, dl: u32, avgdl: f32) -> f32 {
+pub fn score(idf_t: f32, tf: u32, dl: u32, avgdl: f32, params: Bm25Params) -> f32 {
     let tf = tf as f32;
     // avgdl is precomputed at build time and stored in the doc-lengths
     // directory; if a superfile has zero docs we wouldn't be calling this
     // function, but guard anyway against a divide-by-zero on degenerate
     // input.
-    let norm = if avgdl > 0.0 {
-        1.0 - B + B * (dl as f32) / avgdl
-    } else {
-        1.0
-    };
-    let denom = tf + K1 * norm;
+    let denom = tf + params.dl_norm_k1(dl, avgdl);
     if denom == 0.0 {
         // tf=0 should never reach this function (callers gate on
         // posting list membership), but stay defensive.
         return 0.0;
     }
-    idf_t * tf * (K1 + 1.0) / denom
+    params.idf_x_k1p1(idf_t) * tf / denom
 }
 
 /// BM25 score using a precomputed `dl_norm_k1 = K1 * (1 - B + B * dl/avgdl)`
@@ -276,10 +331,10 @@ mod tests {
         for tf in [1, 2, 5, 10, 100] {
             for dl in [1, 10, 100, 1_000, 10_000] {
                 for avgdl in [10.0, 100.0, 1_000.0] {
-                    let s = score(i, tf, dl, avgdl);
+                    let s = score(i, tf, dl, avgdl, Bm25Params::STANDARD);
                     assert!(
                         s >= 0.0,
-                        "score(i={i}, tf={tf}, dl={dl}, avgdl={avgdl}) = {s}"
+                        "score(i={i}, tf={tf}, dl={dl}, avgdl={avgdl}, Bm25Params::STANDARD) = {s}"
                     );
                     assert!(s.is_finite());
                 }
@@ -292,9 +347,9 @@ mod tests {
         // Holding everything else fixed, more occurrences of the query
         // term in this doc should increase the score.
         let i = idf(1_000_000, 100);
-        let s1 = score(i, 1, 200, 200.0);
-        let s2 = score(i, 5, 200, 200.0);
-        let s3 = score(i, 100, 200, 200.0);
+        let s1 = score(i, 1, 200, 200.0, Bm25Params::STANDARD);
+        let s2 = score(i, 5, 200, 200.0, Bm25Params::STANDARD);
+        let s3 = score(i, 100, 200, 200.0, Bm25Params::STANDARD);
         assert!(s1 < s2 && s2 < s3);
     }
 
@@ -303,9 +358,9 @@ mod tests {
         // BM25's whole point: tf saturation. score(tf=1000) is not
         // ~1000× score(tf=1); the gap shrinks as tf grows.
         let i = idf(1_000_000, 100);
-        let s_low = score(i, 1, 200, 200.0);
-        let s_mid = score(i, 10, 200, 200.0);
-        let s_high = score(i, 1_000, 200, 200.0);
+        let s_low = score(i, 1, 200, 200.0, Bm25Params::STANDARD);
+        let s_mid = score(i, 10, 200, 200.0, Bm25Params::STANDARD);
+        let s_high = score(i, 1_000, 200, 200.0, Bm25Params::STANDARD);
 
         // Linear scaling would predict s_high ≈ 100 × s_mid.
         // Saturating scaling predicts s_high < 2 × s_mid (rough bound).
@@ -320,8 +375,8 @@ mod tests {
     fn score_decreases_with_doc_length() {
         // Longer docs should score lower for the same (term, tf).
         let i = idf(1_000_000, 100);
-        let s_short = score(i, 3, 50, 200.0);
-        let s_long = score(i, 3, 800, 200.0);
+        let s_short = score(i, 3, 50, 200.0, Bm25Params::STANDARD);
+        let s_long = score(i, 3, 800, 200.0, Bm25Params::STANDARD);
         assert!(s_short > s_long);
     }
 
@@ -334,7 +389,7 @@ mod tests {
         let avgdl = 200.0;
         let dl = 200;
         let expected = i * (tf as f32) * (K1 + 1.0) / ((tf as f32) + K1);
-        let actual = score(i, tf, dl, avgdl);
+        let actual = score(i, tf, dl, avgdl, Bm25Params::STANDARD);
         assert!(
             approx(actual, expected, 1e-5),
             "expected {expected}, got {actual}"
@@ -344,7 +399,7 @@ mod tests {
     #[test]
     fn score_handles_degenerate_avgdl_zero() {
         // Defensive: avgdl=0 must not panic or NaN.
-        let s = score(1.0, 1, 100, 0.0);
+        let s = score(1.0, 1, 100, 0.0, Bm25Params::STANDARD);
         assert!(s.is_finite());
         assert!(s >= 0.0);
     }
@@ -359,8 +414,8 @@ mod tests {
         // This test instead verifies that a small dl drives norm < 1
         // and therefore score *up* relative to dl=avgdl.
         let i = 2.0_f32;
-        let s_at_avgdl = score(i, 5, 200, 200.0);
-        let s_short = score(i, 5, 1, 200.0);
+        let s_at_avgdl = score(i, 5, 200, 200.0, Bm25Params::STANDARD);
+        let s_short = score(i, 5, 1, 200.0, Bm25Params::STANDARD);
         assert!(s_short > s_at_avgdl);
     }
 
@@ -370,8 +425,8 @@ mod tests {
         // (with default b=0.75). Score should be max for the (idf, tf)
         // shape — strictly larger than any positive-length variant.
         let i = 2.0_f32;
-        let s_zero_dl = score(i, 5, 0, 200.0);
-        let s_one_dl = score(i, 5, 1, 200.0);
+        let s_zero_dl = score(i, 5, 0, 200.0, Bm25Params::STANDARD);
+        let s_one_dl = score(i, 5, 1, 200.0, Bm25Params::STANDARD);
         assert!(s_zero_dl > s_one_dl);
     }
 
@@ -398,7 +453,7 @@ mod tests {
         let triples: [(f32, u32); 4] = [(1.5, 1), (1.7, 2), (2.0, 1), (1.2, 3)];
         let scalar: f32 = triples
             .iter()
-            .map(|(idf, tf)| score(*idf, *tf, dl, avgdl))
+            .map(|(idf, tf)| score(*idf, *tf, dl, avgdl, Bm25Params::STANDARD))
             .sum();
         let idfs_x_k1p1 = [
             triples[0].0 * (K1 + 1.0),

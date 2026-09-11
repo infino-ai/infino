@@ -34,7 +34,19 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use dashmap::DashMap;
-use datafusion::{config::Dialect, error::DataFusionError, execution::context::SQLOptions};
+use datafusion::{
+    common::tree_node::{TreeNode, TreeNodeRecursion},
+    config::Dialect,
+    error::DataFusionError,
+    execution::context::SQLOptions,
+    logical_expr::{BinaryExpr, Operator},
+    prelude::Expr,
+    sql::sqlparser::{
+        dialect::GenericDialect,
+        keywords::Keyword,
+        tokenizer::{Token, Tokenizer as SqlTokenizer},
+    },
+};
 use futures::future::try_join_all;
 pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
@@ -42,9 +54,18 @@ use manifest::{
 };
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tracing::{debug, info};
 use uri::{Backend, parse_uri};
+
+/// Most `AND` / `OR` connectives allowed in one SQL statement or mutation predicate: past a few
+/// thousand, DataFusion's planner recursion overflows the stack and aborts. `IN (...)` is one
+/// node, never counted.
+pub(crate) const MAX_PREDICATE_CONNECTIVES: usize = 1024;
+
+/// Fewest bytes one connective can occupy in SQL text; text shorter than
+/// `MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES` cannot reach the cap and skips the scan.
+const MIN_BYTES_PER_CONNECTIVE: usize = 3;
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
@@ -64,7 +85,10 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
-        fts::tokenize::ASCII_LOWER_TOKENIZER,
+        fts::{
+            analysis::{Stemmer, Stopwords},
+            bm25,
+        },
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
@@ -414,7 +438,20 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes.fts_analyzers(),
+                    fts_stopwords: indexes
+                        .fts_stopwords()
+                        .iter()
+                        .map(|s| s.as_str().unwrap_or_default().to_string())
+                        .collect(),
+                    fts_stemmers: indexes
+                        .fts_stemmers()
+                        .iter()
+                        .map(|s| s.as_str().unwrap_or_default().to_string())
+                        .collect(),
+                    fts_positions: indexes.fts_positions(),
                     fts_stored: indexes.fts_stored(),
+                    fts_k1: indexes.fts_bm25().iter().map(|p| p.k1).collect(),
+                    fts_b: indexes.fts_bm25().iter().map(|p| p.b).collect(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
@@ -541,22 +578,70 @@ impl Connection {
                 // the defaults it applies (rotation seed, rerank codec) are
                 // identical and the table's options-hash check passes.
                 let mut spec = IndexSpec::new();
+                // The analyzer decides how query text is tokenized, so it
+                // cannot be inferred: a record that does not name one per
+                // full-text column is unusable, and guessing would return
+                // wrong results rather than an error.
+                if entry.fts_analyzers.len() != entry.fts.len() {
+                    return Err(InfinoError::Backend(format!(
+                        "table '{name}' has {} full-text columns but {} analyzer names recorded; \
+                         the table record is incomplete",
+                        entry.fts.len(),
+                        entry.fts_analyzers.len()
+                    ))
+                    .with_context("open_table", Some(name)));
+                }
                 for (i, column) in entry.fts.iter().enumerate() {
-                    // Catalogs written before per-column analyzers omit
-                    // `fts_analyzers`; those columns default to ascii_lower.
-                    let analyzer = entry
-                        .fts_analyzers
-                        .get(i)
-                        .map(String::as_str)
-                        .unwrap_or(ASCII_LOWER_TOKENIZER);
-                    // Same back-compat rule for `fts_stored`: a catalog
+                    let analyzer = entry.fts_analyzers[i].as_str();
+                    // `fts_stored` keeps its back-compat rule: a catalog
                     // written before index-only columns existed can only
                     // mean the text is stored.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+                    // Same rule for positions: a catalog written before
+                    // they were declarable describes a table built
+                    // without them, because nothing could have asked
+                    // for them.
+                    let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
+                    // Same rule for the analysis filters: a catalog
+                    // written before they existed, or one whose entry
+                    // is empty, describes a column with no filter. A
+                    // name that does not resolve is different — the
+                    // recorded analysis cannot be reproduced, so the
+                    // table is unusable rather than usable-with-a-guess.
+                    let stopwords = match entry.fts_stopwords.get(i).map(String::as_str) {
+                        None | Some("") => Stopwords::None,
+                        Some(set) => Stopwords::from_name(set).ok_or_else(|| {
+                            InfinoError::Backend(format!(
+                                "table '{name}' column {column:?} records unknown stopwords \
+                                 {set:?}"
+                            ))
+                            .with_context("open_table", Some(name))
+                        })?,
+                    };
+                    let stemmer = match entry.fts_stemmers.get(i).map(String::as_str) {
+                        None | Some("") => Stemmer::None,
+                        Some(stem) => Stemmer::from_name(stem).ok_or_else(|| {
+                            InfinoError::Backend(format!(
+                                "table '{name}' column {column:?} records unknown stemmer \
+                                 {stem:?}"
+                            ))
+                            .with_context("open_table", Some(name))
+                        })?,
+                    };
+                    // And again for the BM25 pair: a catalog written before
+                    // it was declarable can only describe a table built with
+                    // the standard values, so the fallback is frozen there
+                    // rather than tracking the crate default.
+                    let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
+                    let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
                     spec = spec.fts(
                         FtsField::new(column.clone())
                             .analyzer(analyzer)
-                            .stored(stored),
+                            .stopwords(stopwords)
+                            .stemmer(stemmer)
+                            .positions(positions)
+                            .stored(stored)
+                            .bm25(k1, b),
                     );
                 }
                 for v in &entry.vectors {
@@ -840,6 +925,9 @@ impl Connection {
             return c.query_sql(sql);
         }
 
+        // Past the cap the planner aborts instead of erroring; refuse before any planning work.
+        ensure_sql_within_connective_cap(sql)?;
+
         // Gate SQL heap on the connection budget: DataFusion allocates the
         // working set (sort / aggregate / join), so its pool is the gate.
         let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
@@ -886,37 +974,53 @@ impl Connection {
         // poll on runtime threads where the scope's slot is invisible.
         let op_stats = op_stats::current();
         let drive = async move {
-            // Plan, check, execute. `SessionContext::sql` would run a DDL or session statement while
-            // producing the DataFrame, so the read-only check sits between planning and execution.
-            // It runs on the planned tree, so spelling is irrelevant: `SELECT ... INTO` is a CREATE
-            // TABLE, and an INSERT behind a comment or an EXPLAIN is the same DML node. Planning has
-            // no side effects; a refused statement has touched nothing.
-            let plan =
-                ctx.state().create_logical_plan(&sql).await.map_err(|e| {
-                    InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                })?;
+            // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
+            // planner recursion depth must not hang on a stack the engine does not own. A panic
+            // surfaces through the join as a query error.
+            let planner_ctx = ctx.clone();
+            let (task_ctx, plan) = Handle::current()
+                .spawn(async move {
+                    // Plan, check, execute. `SessionContext::sql` would run a DDL or session
+                    // statement while producing the DataFrame, so the read-only check sits between
+                    // planning and execution. It runs on the planned tree, so spelling is
+                    // irrelevant: `SELECT ... INTO` is a CREATE TABLE, and an INSERT behind a
+                    // comment or an EXPLAIN is the same DML node. Planning has no side effects; a
+                    // refused statement has touched nothing.
+                    let plan = planner_ctx
+                        .state()
+                        .create_logical_plan(&sql)
+                        .await
+                        .map_err(|e| {
+                            InfinoError::Query(e.to_string()).with_context("query_sql", None)
+                        })?;
 
-            read_only_sql_options().verify_plan(&plan).map_err(|e| {
-                InfinoError::Query(format!(
-                    "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
-                ))
-                .with_context("query_sql", None)
-            })?;
+                    read_only_sql_options().verify_plan(&plan).map_err(|e| {
+                        InfinoError::Query(format!(
+                            "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
+                        ))
+                        .with_context("query_sql", None)
+                    })?;
 
-            let df = ctx
-                .execute_logical_plan(plan)
+                    let df = planner_ctx.execute_logical_plan(plan).await.map_err(|e| {
+                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
+                    })?;
+
+                    // Execute through the physical plan (what `DataFrame::collect`
+                    // does internally) so the plan handle survives execution and
+                    // DataFusion's own operator metrics — elapsed compute, scan
+                    // output rows — can be folded into the per-query stats.
+                    let task_ctx = planner_ctx.task_ctx();
+                    let plan = df
+                        .create_physical_plan()
+                        .await
+                        .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+                    Ok::<_, InfinoError>((task_ctx, plan))
+                })
                 .await
-                .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
-
-            // Execute through the physical plan (what `DataFrame::collect`
-            // does internally) so the plan handle survives execution and
-            // DataFusion's own operator metrics — elapsed compute, scan
-            // output rows — can be folded into the per-query stats.
-            let task_ctx = ctx.task_ctx();
-            let plan = df
-                .create_physical_plan()
-                .await
-                .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+                .map_err(|join| {
+                    InfinoError::Query(format!("planning task failed: {join}"))
+                        .with_context("query_sql", None)
+                })??;
             // The shared meter-collect-harvest step: the root wrapper
             // meters the whole plan (aggregation, sort and join work sits
             // above the scan and is this query's CPU too), the scan
@@ -965,6 +1069,104 @@ fn read_only_sql_options() -> SQLOptions {
         .with_allow_ddl(false)
         .with_allow_dml(false)
         .with_allow_statements(false)
+}
+
+/// Occurrences of `or` / `and` as case-insensitive substrings: an upper bound on the true
+/// connective count (`ORDER` or a literal only overcount), provable in one byte pass.
+fn connective_upper_bound(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i].eq_ignore_ascii_case(&b'o') && bytes[i + 1].eq_ignore_ascii_case(&b'r') {
+            count += 1;
+            i += 2;
+        } else if i + 2 < bytes.len()
+            && bytes[i].eq_ignore_ascii_case(&b'a')
+            && bytes[i + 1].eq_ignore_ascii_case(&b'n')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'd')
+        {
+            count += 1;
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn connective_cap_error(surface: &str) -> InfinoError {
+    InfinoError::Query(format!(
+        "{surface} has more than {MAX_PREDICATE_CONNECTIVES} AND/OR connectives; rewrite long value lists as IN (...)"
+    ))
+}
+
+/// Refuse SQL with more than [`MAX_PREDICATE_CONNECTIVES`] `AND` / `OR` tokens, before planning.
+/// Cheapest stage that can decide wins:
+///
+/// - shorter than the cap could occupy: pass, no scan,
+/// - substring bound under the cap: pass, one byte scan, no lexing,
+/// - exact token count decides: a keyword inside a string literal does not count, `BETWEEN`'s
+///   `AND` does (refuses sooner, never admits more).
+///
+/// Text that fails to tokenize passes; the parser reports it right after.
+fn ensure_sql_within_connective_cap(sql: &str) -> Result<(), InfinoError> {
+    if sql.len() < MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES {
+        return Ok(());
+    }
+
+    if connective_upper_bound(sql) <= MAX_PREDICATE_CONNECTIVES {
+        return Ok(());
+    }
+
+    if connective_count(sql).is_some_and(|count| count > MAX_PREDICATE_CONNECTIVES) {
+        return Err(connective_cap_error("query").with_context("query_sql", None));
+    }
+
+    Ok(())
+}
+
+/// Exact `AND` / `OR` keyword count over the token stream; `None` when the text does not tokenize.
+fn connective_count(sql: &str) -> Option<usize> {
+    let tokens = SqlTokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
+    Some(
+        tokens
+            .iter()
+            .filter(|token| {
+                matches!(token, Token::Word(word) if matches!(word.keyword, Keyword::AND | Keyword::OR))
+            })
+            .count(),
+    )
+}
+
+/// Mutation-predicate side of [`ensure_sql_within_connective_cap`]: count `AND` / `OR` nodes in
+/// a built `Expr`. The stack-protected `TreeNode` walk is safe on the input it refuses; stops at
+/// the first node past the cap.
+pub(crate) fn ensure_expr_within_connective_cap(predicate: &Expr) -> Result<(), InfinoError> {
+    let mut connectives = 0usize;
+    predicate
+        .apply(|expr| {
+            if let Expr::BinaryExpr(BinaryExpr {
+                op: Operator::And | Operator::Or,
+                ..
+            }) = expr
+            {
+                connectives += 1;
+            }
+
+            Ok(if connectives > MAX_PREDICATE_CONNECTIVES {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        })
+        .expect("invariant: the counting visitor never errors");
+
+    if connectives > MAX_PREDICATE_CONNECTIVES {
+        return Err(connective_cap_error("predicate"));
+    }
+
+    Ok(())
 }
 
 /// Build `SupertableOptions` from a schema + lowered configs, attaching
@@ -1232,10 +1434,12 @@ mod tests {
         logical_expr::LogicalPlan,
         prelude::{SessionContext, col, lit},
     };
+    use proptest::prelude::*;
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency,
+        Bm25SearchOptions, BoolMode, Consistency, Stemmer, Stopwords,
+        catalog::manifest::CATALOG_PATH,
         supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
     };
@@ -1430,13 +1634,369 @@ mod tests {
         ));
     }
 
+    /// Stemming, end to end: one inflection finds the others because
+    /// both sides of the search run through the same chain.
+    #[test]
+    fn stemming_folds_inflections_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+        let stemmed = conn
+            .create_table(
+                "stemmed",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stemmer(Stemmer::English)),
+            )
+            .expect("create stemmed table");
+        stemmed
+            .append(&build_title_batch(&[
+                "running late",
+                "she runs fast",
+                "a walk",
+            ]))
+            .expect("append");
+
+        // Every inflection reaches both documents holding one, whichever
+        // one the query spells.
+        for query in ["running", "runs", "run"] {
+            let hits = stemmed
+                .bm25_search("title", query, TOP_K, Bm25SearchOptions::new(), None)
+                .expect("bm25_search");
+            assert_eq!(
+                n_rows(&hits),
+                2,
+                "{query:?} must reach both inflections on a stemmed column"
+            );
+        }
+
+        // And the same corpus without the stemmer separates them, so the
+        // declaration is what changed the answer.
+        let plain = conn
+            .create_table("plain", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create plain table");
+        plain
+            .append(&build_title_batch(&[
+                "running late",
+                "she runs fast",
+                "a walk",
+            ]))
+            .expect("append");
+        let hits = plain
+            .bm25_search("title", "run", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&hits),
+            0,
+            "an unstemmed column matches the word only"
+        );
+    }
+
+    /// Stopword removal, end to end, including the consequence worth
+    /// being explicit about: once a word is not indexed, no query can
+    /// find it.
+    #[test]
+    fn stopwords_leave_the_index_and_the_query() {
+        let conn = connect("memory://").expect("connect");
+        let stopped = conn
+            .create_table(
+                "stopped",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stopwords(Stopwords::English)),
+            )
+            .expect("create stopped table");
+        stopped
+            .append(&build_title_batch(&["the fox and the hound", "a cat"]))
+            .expect("append");
+
+        // The content words still search normally.
+        let hits = stopped
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(n_rows(&hits), 1);
+
+        // A stopword leaves the query too, so a query of nothing but
+        // stopwords has no term left to match — not an error, no rows.
+        let hits = stopped
+            .bm25_search("title", "the and", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("a stopword-only query is not an error");
+        assert_eq!(n_rows(&hits), 0, "nothing is left of the query to match");
+
+        // And a query mixing the two searches only what survives, so the
+        // stopword neither narrows nor widens the result.
+        let hits = stopped
+            .bm25_search("title", "the fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(n_rows(&hits), 1);
+    }
+
+    /// The hole a removed stopword leaves is what keeps a phrase honest:
+    /// `"new york"` must not match `new the york`, and
+    /// `"end of the world"` must still match the text it came from.
+    #[test]
+    fn stopword_holes_keep_phrase_spacing_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table(
+                "phrases",
+                schema_id_title(),
+                IndexSpec::new().fts(
+                    FtsField::new("title")
+                        .stopwords(Stopwords::English)
+                        .positions(true),
+                ),
+            )
+            .expect("create table");
+        table
+            .append(&build_title_batch(&[
+                "new york city",                // 0: the words are adjacent
+                "new the york city",            // 1: a removed word sits between them
+                "the end of the world is nigh", // 2
+                "end world",                    // 3: no gap where the phrase wants one
+            ]))
+            .expect("append");
+
+        let phrase = |q: &str| -> usize {
+            n_rows(
+                &table
+                    .bm25_search("title", q, TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("phrase search"),
+            )
+        };
+
+        // Adjacent in the text and adjacent in the phrase: a match. The
+        // document with a removed word between them is *not* one — its
+        // `york` sits one position further along, exactly where the hole
+        // left it.
+        assert_eq!(
+            phrase("\"new york\""),
+            1,
+            "only the text whose words are really adjacent"
+        );
+        // The query's own removed words become the spacing it asks for:
+        // `end` and `world` three positions apart, which is where the
+        // same chain put them in document 2 — and not in document 3,
+        // where they are adjacent.
+        assert_eq!(
+            phrase("\"end of the world\""),
+            1,
+            "the phrase asks for the spacing its own stopwords imply"
+        );
+        // Naming the surviving words as an adjacent phrase finds the
+        // document where they *are* adjacent, and only that one.
+        assert_eq!(phrase("\"end world\""), 1);
+    }
+
+    /// A column with filters survives a reopen: the catalog record
+    /// carries the tokenizer and both filters, so query text is
+    /// tokenized the same way after reopening as before, and the
+    /// table's options-hash still verifies.
+    #[test]
+    fn a_chained_column_survives_reopen_on_storage() {
+        let (conn, _dir) = storage_conn();
+        {
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema_id_title(),
+                    IndexSpec::new().fts(
+                        FtsField::new("title")
+                            .stopwords(Stopwords::English)
+                            .stemmer(Stemmer::English),
+                    ),
+                )
+                .expect("create_table");
+            table
+                .append(&build_title_batch(&["the running studies"]))
+                .expect("append");
+        }
+        // A fresh connection over the same root, so the spec is rebuilt
+        // from the catalog rather than reused from memory.
+        let uri = _dir.path().to_str().expect("utf8 path").to_string();
+        let reopened = connect(&uri).expect("reconnect");
+        let table = reopened.open_table("docs").expect("open_table");
+        let hits = table
+            .bm25_search(
+                "title",
+                "the studies",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect("bm25_search after reopen");
+        assert_eq!(
+            n_rows(&hits),
+            1,
+            "the reopened table still stems and still drops stopwords"
+        );
+    }
+
+    /// The `positions` flag has to round-trip the catalog record, and
+    /// the failure is not the obvious one: the flag joins the table's
+    /// options-hash, so a record that lost it would make a positional
+    /// table fail its **own** hash check on reopen — refusing to open
+    /// at all — rather than merely forgetting how to answer a phrase.
+    #[test]
+    fn a_positional_column_reopens_and_still_answers_phrases() {
+        let (conn, dir) = storage_conn();
+        {
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema_id_title(),
+                    IndexSpec::new().fts(FtsField::new("title").positions(true)),
+                )
+                .expect("create_table");
+            table
+                .append(&build_title_batch(&["new york city", "york new city"]))
+                .expect("append");
+            // The phrase works before the reopen, so a failure after it
+            // is the round-trip and not the declaration.
+            assert_eq!(
+                n_rows(
+                    &table
+                        .bm25_search(
+                            "title",
+                            "\"new york\"",
+                            TOP_K,
+                            Bm25SearchOptions::new(),
+                            None
+                        )
+                        .expect("phrase search")
+                ),
+                1
+            );
+        }
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let reopened = connect(&uri).expect("reconnect");
+        let table = reopened
+            .open_table("docs")
+            .expect("a positional table must reopen — losing the flag fails the options-hash");
+        assert_eq!(
+            n_rows(
+                &table
+                    .bm25_search(
+                        "title",
+                        "\"new york\"",
+                        TOP_K,
+                        Bm25SearchOptions::new(),
+                        None
+                    )
+                    .expect("phrase search after reopen")
+            ),
+            1,
+            "the reopened table still records positions"
+        );
+    }
+
+    /// The other half of exposing `positions`: a column without them
+    /// answers a phrase query with an error naming the column, never a
+    /// silent bag-of-words fallback that would return documents holding
+    /// the words in the wrong order.
+    #[test]
+    fn a_positionless_column_rejects_a_phrase_query() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+        table
+            .append(&build_title_batch(&["york new city"]))
+            .expect("append");
+        let err = table
+            .bm25_search(
+                "title",
+                "\"new york\"",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect_err("a phrase on a positionless column must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title"),
+            "the error must name the column, got: {msg}"
+        );
+    }
+
+    /// A catalog record naming a filter this engine cannot reproduce
+    /// makes the table unusable rather than usable-with-a-guess. Same
+    /// rule as the superfile entry: an *absent* filter means off, and a
+    /// *present* name that does not resolve is refused — analyzing
+    /// without the set the postings were built with is a different
+    /// index, not a degraded one.
+    #[test]
+    fn a_catalog_record_naming_an_unresolvable_filter_is_refused() {
+        for (field, bad) in [("fts_stopwords", "german"), ("fts_stemmers", "porter")] {
+            let (conn, dir) = storage_conn();
+            conn.create_table(
+                "docs",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stopwords(Stopwords::English)),
+            )
+            .expect("create_table");
+            // Rewrite just that column's filter name in the catalog,
+            // leaving everything else intact.
+            let path = dir.path().join(CATALOG_PATH);
+            let body = std::fs::read_to_string(&path).expect("read catalog");
+            let patched = body.replace(
+                &format!("\"{field}\":[\"english\"]"),
+                &format!("\"{field}\":[\"{bad}\"]"),
+            );
+            let patched = match patched == body {
+                // The stemmer list is empty in this fixture, so inject.
+                true => body.replace(
+                    &format!("\"{field}\":[\"\"]"),
+                    &format!("\"{field}\":[\"{bad}\"]"),
+                ),
+                false => patched,
+            };
+            assert_ne!(patched, body, "{field}: fixture did not patch");
+            std::fs::write(&path, &patched).expect("write catalog");
+
+            let uri = dir.path().to_str().expect("utf8 path").to_string();
+            let reopened = connect(&uri).expect("reconnect");
+            let err = reopened
+                .open_table("docs")
+                .expect_err("an unresolvable filter must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(bad) && msg.contains("title"),
+                "{field}: the error must name the value and the column, got: {msg}"
+            );
+        }
+    }
+
+    /// An unknown tokenizer is refused at create time, naming what the
+    /// caller wrote. The filters are separate options, so a
+    /// chain-shaped string is simply a tokenizer name that does not
+    /// resolve — it must not be quietly interpreted as a chain.
+    #[test]
+    fn an_unknown_analyzer_is_refused_and_a_chain_shaped_name_is_not_interpreted() {
+        let conn = connect("memory://").expect("connect");
+        for name in ["nonesuch", "standard+stop=english"] {
+            let err = conn
+                .create_table(
+                    "bad",
+                    schema_id_title(),
+                    IndexSpec::new().fts(FtsField::new("title").analyzer(name)),
+                )
+                .expect_err("an unresolvable analyzer must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(name),
+                "the error must name the analyzer as written, got: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn standard_analyzer_keeps_non_ascii_end_to_end() {
         let conn = connect("memory://").expect("connect");
 
-        // Default (ascii_lower) drops non-ASCII, so "café" is unsearchable.
+        // Explicit ascii_lower drops non-ASCII, so "café" is unsearchable.
         let ascii = conn
-            .create_table("ascii", schema_id_title(), IndexSpec::new().fts("title"))
+            .create_table(
+                "ascii",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("ascii_lower")),
+            )
             .expect("create ascii table");
         ascii
             .append(&build_title_batch(&["café latte"]))
@@ -1467,6 +2027,23 @@ mod tests {
             n_rows(&hits),
             1,
             "standard analyzer matches the non-ASCII term"
+        );
+
+        // A column declared without an analyzer gets `standard`, so it
+        // behaves like the explicit table above rather than the ascii one.
+        let default_tbl = conn
+            .create_table("dflt", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create default table");
+        default_tbl
+            .append(&build_title_batch(&["café latte"]))
+            .expect("append");
+        let default_hits = default_tbl
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&default_hits),
+            1,
+            "a bare declaration keeps the non-ASCII term"
         );
 
         // An unknown analyzer is a configuration error at create time.
@@ -1590,6 +2167,53 @@ mod tests {
         assert_eq!(
             body_cafe, 0,
             "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_table_rejects_a_record_missing_its_analyzer_names() {
+        // The analyzer names are what let a reopened table tokenize query
+        // text the way its postings were built. A record that has full-text
+        // columns but no name for one of them cannot be reopened
+        // correctly, so `open_table` says so and names the table instead
+        // of picking an analyzer and returning wrong results.
+        let dir = std::env::temp_dir().join(format!("infino-noanalyzer-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+        let schema = schema_title_body();
+        {
+            let conn = connect(&uri).expect("connect");
+            conn.create_table(
+                "docs",
+                schema.clone(),
+                IndexSpec::new().fts("title").fts("body"),
+            )
+            .expect("create_table");
+        }
+        // Strip the analyzer list from the stored record, the shape a
+        // record written before analyzers were recorded per column has.
+        let catalog_file = dir.join(CATALOG_PATH);
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_file).expect("read catalog"))
+                .expect("catalog json");
+        body["tables"]["docs"]
+            .as_object_mut()
+            .expect("table entry")
+            .remove("fts_analyzers");
+        fs::write(
+            &catalog_file,
+            serde_json::to_vec(&body).expect("encode catalog"),
+        )
+        .expect("write catalog");
+
+        let conn = connect(&uri).expect("reconnect");
+        let err = conn.open_table("docs").expect_err("incomplete record");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docs"), "must name the table: {rendered}");
+        assert!(
+            rendered.contains("analyzer"),
+            "must say what is missing: {rendered}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3698,6 +4322,8 @@ mod tests {
             "SELECT (SELECT COUNT(*) FROM docs) AS scalar",
             "SELECT * FROM (SELECT title FROM docs) AS sub",
             "EXPLAIN SELECT title FROM docs",
+            "WITH ranked AS (SELECT title, ROW_NUMBER() OVER (ORDER BY title) AS rn, COUNT(*) OVER () AS total FROM docs), top AS (SELECT title, rn FROM ranked WHERE rn <= 10 OR total < 100) SELECT title FROM top WHERE rn > 0 AND title <> '' ORDER BY rn",
+            "SELECT title, SUM(CHAR_LENGTH(title)) OVER (ORDER BY title ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM docs ORDER BY title LIMIT 5",
         ] {
             conn.query_sql(sql)
                 .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
@@ -3762,6 +4388,135 @@ mod tests {
             assert_eq!(plan_has_side_effect(&plan), side_effect, "{sql}");
             assert_eq!(options.verify_plan(&plan).is_err(), side_effect, "{sql}");
         }
+    }
+
+    /// `SELECT ... WHERE _id=0 OR _id=1 OR ...`: `terms` equality terms, `terms - 1` connectives.
+    fn or_chain(terms: usize) -> String {
+        let clause: Vec<String> = (0..terms).map(|i| format!("_id={i}")).collect();
+        format!("SELECT title FROM docs WHERE {}", clause.join(" OR "))
+    }
+
+    #[test]
+    fn query_sql_refuses_a_boolean_chain_over_the_connective_cap() {
+        // Twice the cap; without the cap this aborts the test binary, not the assertion.
+        let conn = conn_with_docs();
+        let err = conn.query_sql(&or_chain(2 * MAX_PREDICATE_CONNECTIVES));
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("connectives")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_sql_allows_a_boolean_chain_at_the_connective_cap() {
+        // Exactly the cap plans and runs.
+        let conn = conn_with_docs();
+        conn.query_sql(&or_chain(MAX_PREDICATE_CONNECTIVES + 1))
+            .expect("at-cap chain plans");
+    }
+
+    #[test]
+    fn query_sql_in_list_is_not_capped() {
+        // IN is one node however long; ten times the cap plans fine.
+        let conn = conn_with_docs();
+        let values: Vec<String> = (0..10 * MAX_PREDICATE_CONNECTIVES)
+            .map(|i| i.to_string())
+            .collect();
+        let sql = format!(
+            "SELECT title FROM docs WHERE _id IN ({})",
+            values.join(", ")
+        );
+        conn.query_sql(&sql).expect("long IN list plans");
+    }
+
+    #[test]
+    fn query_sql_connectives_inside_a_string_literal_do_not_count() {
+        // Past the length pre-filter, but every OR is inside one literal: none count.
+        let conn = conn_with_docs();
+        let literal = "x OR ".repeat(MAX_PREDICATE_CONNECTIVES);
+        let sql = format!("SELECT title FROM docs WHERE title = '{literal}'");
+        conn.query_sql(&sql)
+            .expect("literal ORs are not connectives");
+    }
+
+    #[test]
+    fn delete_allows_a_predicate_at_the_connective_cap() {
+        // Exactly the cap resolves (zero rows match). Storage-backed table: mutations refuse
+        // memory:// before the predicate matters.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new())
+            .expect("create docs");
+        docs.append(&build_title_batch(&["one row"]))
+            .expect("append docs");
+        let predicate = (0..MAX_PREDICATE_CONNECTIVES + 1)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        docs.delete(predicate).expect("at-cap predicate resolves");
+    }
+
+    proptest! {
+        // Stage two skips the lexer on this inequality: the byte-scan bound never undercounts
+        // the true keyword count, on any input.
+        #[test]
+        fn connective_upper_bound_never_undercounts(sql in ".{0,4096}") {
+            if let Some(exact) = connective_count(&sql) {
+                prop_assert!(connective_upper_bound(&sql) >= exact);
+            }
+        }
+    }
+
+    #[test]
+    fn prefilter_floor_holds_for_the_densest_chain() {
+        // Densest lexable chain, `(1)OR(1)...`, spends 5 bytes per connective, so text under the
+        // pre-filter length tops out near 614 connectives: under the cap, stage one is sound.
+        let limit = MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES;
+        let mut sql = String::from("(1");
+        while sql.len() + 6 < limit {
+            sql.push_str(")OR(1");
+        }
+        sql.push(')');
+        assert!(sql.len() < limit);
+        let count = connective_count(&sql).expect("chain tokenizes");
+        assert!(
+            count <= MAX_PREDICATE_CONNECTIVES,
+            "{count} connectives fit under the pre-filter length"
+        );
+    }
+
+    #[test]
+    fn update_refuses_a_predicate_over_the_connective_cap() {
+        // Same gate as delete; refusal comes before storage or batch shape is looked at.
+        let conn = conn_with_docs();
+        let docs = conn.open_table("docs").expect("open docs");
+        let predicate = (0..MAX_PREDICATE_CONNECTIVES + 2)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        let err = docs.update(predicate, &build_title_batch(&["replacement"]));
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("connectives")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn delete_refuses_a_predicate_over_the_connective_cap() {
+        // One connective past the cap, refused before any id capture.
+        let conn = conn_with_docs();
+        let docs = conn.open_table("docs").expect("open docs");
+        let predicate = (0..MAX_PREDICATE_CONNECTIVES + 2)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        let err = docs.delete(predicate);
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("connectives")),
+            "got {err:?}"
+        );
     }
 
     #[test]

@@ -37,9 +37,8 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
-#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
-use std::collections::HashSet;
 use std::{
+    collections::HashSet,
     env,
     process::{Command, Stdio},
     sync::{
@@ -49,8 +48,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
+use infino::Bm25SearchOptions;
 use infino::{
-    OptimizeOptions,
+    CompactionSettings, OptimizeOptions,
     supertable::{
         Supertable,
         manifest::{ClusterCentroids, SuperfileEntry},
@@ -913,6 +914,16 @@ const WARM_ITERS: usize = 20;
 // and every deterministic cold assertion (GET counts, byte ceilings, cost
 // tables) is per-iteration and unaffected by the count.
 const COLD_ITERS: usize = 3;
+/// FTS-only cold sampling: one fresh-cache pass per shape. The FTS cold
+/// battery is the most byte-bound cell in the suite (realistic text
+/// barely compresses, and every iteration re-pays the whole fan from
+/// the object store) and its latencies are informational — the merge
+/// gate reads warm p90, and the deterministic cold assertions (GET
+/// counts, byte ceilings, cost tables) hold per iteration. One pass
+/// keeps every column populated at a third of the wall time; the
+/// vector and sql cells keep [`COLD_ITERS`] for outlier-discarding
+/// medians.
+const FTS_COLD_ITERS: usize = 1;
 const TOP_K: usize = 10;
 
 /// Selected phases for a per-modality supertable runner.
@@ -1723,6 +1734,30 @@ pub mod fts {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
+        // Maintenance parity for the global-stats default: publish the
+        // term-stats sidecar over the fresh fragmented layout via a
+        // stats-only optimize (both merge triggers disabled, so the
+        // superfile layout is untouched). The read phases then measure
+        // the maintained shape a production table sits in. On an engine
+        // without the sidecar this is a no-op maintenance pass.
+        if corpus.is_some() && phases.reads() {
+            let (cache_dir, admin) = open_consumer(Modality::Fts, &built);
+            let stats_only = OptimizeOptions::compact(CompactionSettings {
+                min_fill_percent: 100,
+                min_superfiles_for_merge: u64::MAX,
+                ..CompactionSettings::default()
+            });
+            let (result, wall, _cpu) = cpu::timed(|| admin.optimize(&stats_only));
+            result.expect("stats-only optimize");
+            eprintln!(
+                "[supertable_fts] term-stats maintenance (stats-only optimize): {:.1}s, {} superfiles",
+                wall.as_secs_f64(),
+                admin.reader().expect("reader").n_superfiles()
+            );
+            drop(admin);
+            drop(cache_dir);
+        }
+
         // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
         // → compact → post-compact) on a fresh ingest in this process —
         // same gate as the vector cell. Drain is a no-op without a hidden
@@ -1906,8 +1941,8 @@ pub mod fts {
                                 supertable::TEXT_COLUMN,
                                 &query,
                                 TOP_K,
-                                exec_fts::to_infino_mode(q.mode),
-                                infino::Bm25Stats::PerSuperfile,
+                                Bm25SearchOptions::new()
+                                    .with_mode(exec_fts::to_infino_mode(q.mode)),
                                 None,
                             )
                             .expect("serving working-set bm25_search");
@@ -2101,7 +2136,12 @@ pub mod fts {
             consumer_meter,
             &|| {
                 let hits = reader
-                    .bm25_hits(supertable::TEXT_COLUMN, &query, TOP_K, mode)
+                    .bm25_hits(
+                        supertable::TEXT_COLUMN,
+                        &query,
+                        TOP_K,
+                        Bm25SearchOptions::new().with_mode(mode),
+                    )
                     .expect("routing-state bm25 hits");
                 let hidden_hits = hits
                     .iter()
@@ -2119,8 +2159,7 @@ pub mod fts {
                             supertable::TEXT_COLUMN,
                             &query,
                             TOP_K,
-                            mode,
-                            infino::Bm25Stats::PerSuperfile,
+                            Bm25SearchOptions::new().with_mode(mode),
                             None,
                         )
                         .expect("routing-state warm bm25 search"),
@@ -2171,8 +2210,7 @@ pub mod fts {
                     supertable::TEXT_COLUMN,
                     &query,
                     TOP_K,
-                    exec_fts::to_infino_mode(q.mode),
-                    infino::Bm25Stats::PerSuperfile,
+                    Bm25SearchOptions::new().with_mode(exec_fts::to_infino_mode(q.mode)),
                     None,
                 )
                 .expect("warm prewarm bm25_search");
@@ -2242,7 +2280,7 @@ pub mod fts {
             FTS_BATTERY,
             supertable::TEXT_COLUMN,
             TOP_K,
-            COLD_ITERS,
+            FTS_COLD_ITERS,
             true,
             "supertable_fts",
         )
@@ -2291,8 +2329,7 @@ pub mod fts {
                         supertable::TEXT_COLUMN,
                         &terms,
                         TOP_K,
-                        mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        Bm25SearchOptions::new().with_mode(mode),
                         None,
                     )
                     .expect("metered cold bm25_search");
@@ -2308,8 +2345,7 @@ pub mod fts {
                         supertable::TEXT_COLUMN,
                         &terms,
                         TOP_K,
-                        mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        Bm25SearchOptions::new().with_mode(mode),
                         None,
                     )
                     .expect("metered steady cold bm25_search");
@@ -2325,8 +2361,7 @@ pub mod fts {
                         supertable::TEXT_COLUMN,
                         &terms,
                         TOP_K,
-                        mode,
-                        infino::Bm25Stats::PerSuperfile,
+                        Bm25SearchOptions::new().with_mode(mode),
                         None,
                     )
                     .expect("metered repeat cold bm25_search");
@@ -2372,8 +2407,7 @@ pub mod fts {
                     column,
                     query,
                     k,
-                    mode,
-                    infino::Bm25Stats::PerSuperfile,
+                    Bm25SearchOptions::new().with_mode(mode),
                     None,
                 )
                 .expect("cold bm25_search")
@@ -2396,8 +2430,7 @@ pub mod fts {
                     column,
                     query,
                     k,
-                    mode,
-                    infino::Bm25Stats::PerSuperfile,
+                    Bm25SearchOptions::new().with_mode(mode),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("cold bm25_search fetched")

@@ -24,6 +24,9 @@
 //! "schema"       | n_fields u64 | for each field: name_len u64 | name | dt_str_len u64 | dt_str | nullable u8
 //! "id_column"    | len u64 | bytes
 //! "fts_columns"  | count u64 | for each: name_len u64 | name
+//! "fts_positions"  | for each column: u8         (only when some column opts in)
+//! "fts_analyzers"  | for each column: len u64 | name   (whenever there is an FTS column)
+//! "fts_stored"     | for each column: u8         (only when some column is index-only)
 //! "vector_columns" | count u64 | for each: name_len u64 | name | dim u64 | rot_seed u64 | metric_len u64 | metric_str | codec
 //! "partition_strategy" | variant_tag | per-variant fields
 //! ```
@@ -59,10 +62,60 @@ use crate::{
     },
 };
 
+/// How the per-column analyzer block is encoded. A full-text table's
+/// analyzers are part of its identity under the current encoding; an
+/// earlier one left the block out whenever every column used
+/// `ascii_lower`, so a hash stamped then is a byte-stream short of one
+/// block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyzerBlock {
+    /// Current: one name per full-text column, always.
+    Always,
+    /// Superseded: omitted when every column used `ascii_lower`.
+    OmittedWhenAllAsciiLower,
+}
+
 /// Compute the canonical options-hash from `opts` + the
 /// resolved `strategy`. See the module-level docs for the
 /// encoding layout.
 pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrategy) -> ContentHash {
+    compute(opts, strategy, AnalyzerBlock::Always)
+}
+
+/// The hash `opts` would have stamped under the superseded analyzer-block
+/// rule, or `None` when the two rules produce the same stream (no
+/// full-text columns, or one of them already names a non-`ascii_lower`
+/// analyzer).
+///
+/// Bridge for one release so a table stamped by an earlier engine still
+/// opens; the next commit re-stamps it under the current rule. Delete
+/// this together with its two call sites' fallback comparison once no
+/// stored hash predates the current rule — nothing else may depend on
+/// it.
+fn superseded_options_hash(
+    opts: &SupertableOptions,
+    strategy: &PartitionStrategy,
+) -> Option<ContentHash> {
+    if opts.fts_columns.is_empty()
+        || opts
+            .fts_columns
+            .iter()
+            .any(|c| c.analyzer != ASCII_LOWER_TOKENIZER)
+    {
+        return None;
+    }
+    Some(compute(
+        opts,
+        strategy,
+        AnalyzerBlock::OmittedWhenAllAsciiLower,
+    ))
+}
+
+fn compute(
+    opts: &SupertableOptions,
+    strategy: &PartitionStrategy,
+    analyzer_block: AnalyzerBlock,
+) -> ContentHash {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
     // 1. schema (field-by-field).
@@ -100,22 +153,33 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
             buf.push(c.positions as u8);
         }
     }
-    // 3c. per-column analyzer names — appended as a tagged block, and
-    //     ONLY when some column uses a non-default (non-ascii_lower)
-    //     analyzer. An all-ascii_lower table's stream stays
-    //     byte-identical to hashes stamped before per-column analyzers
-    //     existed, so pre-existing manifests keep verifying; a table
-    //     built with a different analyzer hashes differently (its
-    //     superfiles are tokenized differently, so the options identity
-    //     must differ too).
-    if opts
-        .fts_columns
-        .iter()
-        .any(|c| c.analyzer != ASCII_LOWER_TOKENIZER)
-    {
+    // 3c. per-column analyzer names — a tagged block whenever the table
+    //     has any full-text column. The analyzer decides how the
+    //     postings were tokenized, so it belongs in the table's identity
+    //     unconditionally: reopening with a different analyzer must
+    //     mismatch, and no analyzer name may be inferred from the block
+    //     being absent. (`AnalyzerBlock::OmittedWhenAllAsciiLower`
+    //     reproduces the earlier stream for the one-release bridge in
+    //     `superseded_options_hash`.)
+    let emit_analyzers = !opts.fts_columns.is_empty()
+        && match analyzer_block {
+            AnalyzerBlock::Always => true,
+            AnalyzerBlock::OmittedWhenAllAsciiLower => opts
+                .fts_columns
+                .iter()
+                .any(|c| c.analyzer != ASCII_LOWER_TOKENIZER),
+        };
+    if emit_analyzers {
         push_tag(&mut buf, b"fts_analyzers");
         for c in &opts.fts_columns {
-            push_str(&mut buf, &c.analyzer);
+            // The column's whole analysis as one derived string, not
+            // just its base name: two columns sharing a base but
+            // differing in a stopword set or stemmer are tokenized
+            // differently, so they must not hash alike. A column with
+            // no filter derives to its plain base name, keeping the
+            // stream byte-identical to hashes stamped before filters
+            // existed.
+            push_str(&mut buf, c.chain_name().unwrap_or(c.analyzer.as_str()));
         }
     }
     // 3d. stored flags — same only-when-non-default rule: an all-stored
@@ -202,26 +266,32 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
     ContentHash(*h.as_bytes())
 }
 
-/// Compare `expected` (caller-side recomputed from current
-/// options) against `actual` (stored on the manifest list).
+/// Check `stored` — the hash a manifest list or a drain checkpoint
+/// carries — against what `opts` + `strategy` hash to now.
 ///
-/// Returns `Ok(())` if the two match, OR if `actual` is the
-/// all-zero sentinel (older manifests + synthetic test
-/// fixtures bypass validation).
+/// Returns `Ok(())` if the two match, if `stored` was stamped under the
+/// superseded analyzer-block rule (see [`superseded_options_hash`]), or
+/// if `stored` is the all-zero sentinel (older manifests + synthetic
+/// test fixtures bypass validation).
 pub fn verify_options_hash(
-    expected: ContentHash,
-    actual: ContentHash,
+    opts: &SupertableOptions,
+    strategy: &PartitionStrategy,
+    stored: ContentHash,
 ) -> Result<(), OptionsHashMismatch> {
-    if actual.0 == [0u8; 32] {
+    if stored.0 == [0u8; 32] {
         // Legacy / synthetic — skip validation.
         return Ok(());
     }
-    if expected.0 == actual.0 {
+    let expected = compute_options_hash(opts, strategy);
+    if expected.0 == stored.0 {
+        return Ok(());
+    }
+    if superseded_options_hash(opts, strategy).is_some_and(|h| h.0 == stored.0) {
         return Ok(());
     }
     Err(OptionsHashMismatch {
         expected: expected.to_hex(),
-        actual: actual.to_hex(),
+        actual: stored.to_hex(),
     })
 }
 
@@ -270,6 +340,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        Stemmer, Stopwords,
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -435,12 +506,19 @@ mod tests {
             Field::new("title", DataType::LargeUtf8, false),
             Field::new("subtitle", DataType::LargeUtf8, false),
         ]));
+        // The golden below is an all-ascii_lower table's stream, so the
+        // fixture names that analyzer rather than taking the engine
+        // default, which is `standard`.
         let opts = |title_pos: bool, subtitle_pos: bool| {
             SupertableOptions::new(
                 schema_two.clone(),
                 vec![
-                    FtsConfig::new("title").positions(title_pos),
-                    FtsConfig::new("subtitle").positions(subtitle_pos),
+                    FtsConfig::new("title")
+                        .analyzer(ASCII_LOWER_TOKENIZER)
+                        .positions(title_pos),
+                    FtsConfig::new("subtitle")
+                        .analyzer(ASCII_LOWER_TOKENIZER)
+                        .positions(subtitle_pos),
                 ],
                 vec![],
             )
@@ -453,11 +531,13 @@ mod tests {
         assert_ne!(h_tf.0, h_ft.0, "which column is positional must matter");
 
         // Golden: the all-false stream contains no positions block, so
-        // this value equals what pre-positions code produced for the
-        // same options. If this assertion ever fails, the encoding
-        // drifted and every existing table would fail open-validation.
-        let hex: String = h_ff.0.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, ALL_FALSE_GOLDEN_HEX);
+        // under the superseded analyzer rule this fixture hashes to
+        // exactly what pre-positions code produced. If this assertion
+        // ever fails, the encoding drifted and every table stamped by an
+        // earlier release would fail open-validation.
+        let superseded =
+            superseded_options_hash(&opts(false, false), &time_range()).expect("all ascii_lower");
+        assert_eq!(superseded.to_hex(), SUPERSEDED_GOLDEN_HEX);
     }
 
     /// The stored flag follows the same only-when-non-default rule as
@@ -476,9 +556,11 @@ mod tests {
                 schema_two.clone(),
                 vec![
                     FtsConfig::new("title")
+                        .analyzer(ASCII_LOWER_TOKENIZER)
                         .positions(false)
                         .stored(title_stored),
                     FtsConfig::new("subtitle")
+                        .analyzer(ASCII_LOWER_TOKENIZER)
                         .positions(false)
                         .stored(subtitle_stored),
                 ],
@@ -492,18 +574,22 @@ mod tests {
         assert_ne!(h_tt.0, h_ft.0, "index-only column must change the hash");
         assert_ne!(h_ft.0, h_tf.0, "which column is index-only must matter");
 
-        // All-stored equals the pre-flag golden — existing manifests
-        // keep verifying.
-        let hex: String = h_tt.0.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, ALL_FALSE_GOLDEN_HEX);
+        // All-stored carries no `fts_stored` block, so under the
+        // superseded analyzer rule it lands on the same golden the
+        // positions test pins — the two only-when-non-default blocks
+        // compose.
+        let superseded =
+            superseded_options_hash(&opts(true, true), &time_range()).expect("all ascii_lower");
+        assert_eq!(superseded.to_hex(), SUPERSEDED_GOLDEN_HEX);
     }
 
-    /// blake3 of the two-fts-column, all-positions-false fixture in
-    /// [`compute_options_hash_positions_flag`], captured from the
-    /// encoding as it existed before the positions flag — the
-    /// all-false stream appends no positions block, so the bytes are
-    /// identical by construction.
-    const ALL_FALSE_GOLDEN_HEX: &str =
+    /// blake3 of the two-fts-column, all-positions-false, all-stored,
+    /// all-`ascii_lower` fixture used by the two tests above, under the
+    /// superseded analyzer-block rule — which appends none of the three
+    /// only-when-non-default blocks, so the bytes are identical to what
+    /// the encoding produced before any of them existed. Pins the bridge
+    /// [`verify_options_hash`] relies on to keep such a table openable.
+    const SUPERSEDED_GOLDEN_HEX: &str =
         "a89715d00cba061aed0b06910a2fde77a9b980c1f7a25c1d5eca901790c6f24a";
 
     #[test]
@@ -516,14 +602,56 @@ mod tests {
         let standard = compute_options_hash(&fts_opts_analyzer("standard"), &strat);
         assert_ne!(ascii.0, standard.0, "analyzer choice must change the hash");
 
-        // Explicit ascii_lower equals the default: the analyzer block is
-        // emitted only for a non-ascii_lower analyzer, so all-ascii_lower
-        // tables keep the pre-analyzer hash (see ALL_FALSE_GOLDEN_HEX).
+        // Two declarations naming the same analyzer hash identically —
+        // the analyzer enters the identity by name, never by whether it
+        // happens to be the engine default.
         let ascii_explicit = compute_options_hash(&fts_opts_analyzer("ascii_lower"), &strat);
         assert_eq!(
             ascii.0, ascii_explicit.0,
-            "all-ascii_lower hash must be unchanged"
+            "the same analyzer name must hash the same"
         );
+
+        // And the analyzer block is present even for an all-ascii_lower
+        // table: its hash differs from the superseded stream that left
+        // the block out.
+        let superseded = superseded_options_hash(&fts_opts(), &strat).expect("all ascii_lower");
+        assert_ne!(
+            ascii.0, superseded.0,
+            "the analyzer block must be part of an ascii_lower table's identity"
+        );
+    }
+
+    #[test]
+    fn superseded_options_hash_only_applies_where_the_rules_differ() {
+        let strat = time_range();
+        // No full-text columns ⇒ no analyzer block under either rule, so
+        // a vector-only or plain table's identity is untouched and needs
+        // no bridge.
+        let no_fts = SupertableOptions::new(schema_title_only(), vec![], vec![]).expect("opts");
+        assert_eq!(superseded_options_hash(&no_fts, &strat), None);
+
+        // A non-ascii_lower analyzer already emitted the block, so its
+        // stored hash is already the current one.
+        assert_eq!(
+            superseded_options_hash(&fts_opts_analyzer("standard"), &strat),
+            None
+        );
+    }
+
+    #[test]
+    fn verify_options_hash_accepts_a_superseded_analyzer_block() {
+        // An all-ascii_lower table stamped by an earlier release carries
+        // the block-less hash. It must still open — the next commit
+        // re-stamps it under the current rule.
+        let opts = fts_opts();
+        let strat = time_range();
+        let stored = superseded_options_hash(&opts, &strat).expect("all ascii_lower");
+        verify_options_hash(&opts, &strat, stored).expect("superseded hash accepted");
+
+        // The bridge is exact, not a blanket pass: a genuinely different
+        // table still mismatches.
+        let other = fts_opts_analyzer("standard");
+        verify_options_hash(&other, &strat, stored).expect_err("wrong analyzer must mismatch");
     }
 
     #[test]
@@ -734,7 +862,7 @@ mod tests {
     fn verify_options_hash_accepts_matching_pair() {
         let opts = fts_opts();
         let h = compute_options_hash(&opts, &time_range());
-        verify_options_hash(h, h).expect("matching pair accepted");
+        verify_options_hash(&opts, &time_range(), h).expect("matching pair accepted");
     }
 
     #[test]
@@ -743,9 +871,9 @@ mod tests {
         // all-zero stored hash bypass validation: the caller's
         // computed hash can be anything.
         let opts = fts_opts();
-        let computed = compute_options_hash(&opts, &time_range());
         let zero = ContentHash([0u8; 32]);
-        verify_options_hash(computed, zero).expect("zero sentinel bypasses verification");
+        verify_options_hash(&opts, &time_range(), zero)
+            .expect("zero sentinel bypasses verification");
     }
 
     #[test]
@@ -753,18 +881,77 @@ mod tests {
         // Two clearly different hashes must produce
         // OptionsHashMismatch whose Display includes both hex
         // strings prefixed with `blake3:`.
-        let h_a = ContentHash([1u8; 32]);
-        let h_b = ContentHash([2u8; 32]);
-        let err = verify_options_hash(h_a, h_b).expect_err("mismatch must error");
+        let opts = fts_opts();
+        let expected = compute_options_hash(&opts, &time_range());
+        let stored = ContentHash([2u8; 32]);
+        let err =
+            verify_options_hash(&opts, &time_range(), stored).expect_err("mismatch must error");
         let rendered = format!("{err}");
         assert!(
             rendered.contains("options_hash mismatch"),
             "got: {rendered}"
         );
         assert!(rendered.contains("blake3:"), "got: {rendered}");
-        // 32 bytes of 0x01 → 64-char hex string.
-        assert!(rendered.contains(&"01".repeat(32)), "got: {rendered}");
+        assert!(rendered.contains(&expected.to_hex()), "got: {rendered}");
+        // 32 bytes of 0x02 → 64-char hex string.
         assert!(rendered.contains(&"02".repeat(32)), "got: {rendered}");
+    }
+
+    /// A column's analysis filters join the table's identity, and a
+    /// filterless table's identity does not move.
+    ///
+    /// Both halves matter. The first: two tables differing only in a
+    /// stopword set hold different terms, so reopening one with the
+    /// other's options must mismatch rather than silently query a
+    /// differently-analyzed index. The second: the filters ride the
+    /// *derived* analyzer identity rather than a block of their own, and
+    /// a column with no filter derives to its plain tokenizer name — so
+    /// the byte stream for every table that predates the filters is
+    /// unchanged and its stored hash still verifies.
+    #[test]
+    fn analysis_filters_join_the_hash_and_a_filterless_table_is_unchanged() {
+        let strategy = time_range();
+        let hash_of = |fts: FtsConfig| {
+            let opts =
+                SupertableOptions::new(schema_title_only(), vec![fts], vec![]).expect("options");
+            compute_options_hash(&opts, &strategy)
+        };
+
+        let plain = hash_of(FtsConfig::new("title"));
+        let stopped = hash_of(FtsConfig::new("title").stopwords(Stopwords::English));
+        let stemmed = hash_of(FtsConfig::new("title").stemmer(Stemmer::English));
+        let both = hash_of(
+            FtsConfig::new("title")
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
+        );
+        for (label, h) in [
+            ("stopwords", &stopped),
+            ("stemmer", &stemmed),
+            ("both", &both),
+        ] {
+            assert_ne!(
+                &plain, h,
+                "{label}: a filtered column must not hash like an unfiltered one"
+            );
+        }
+        assert_ne!(&stopped, &stemmed, "the two filters are distinguishable");
+        assert_ne!(&stopped, &both);
+        assert_ne!(&stemmed, &both);
+
+        // Declaring the filters off explicitly is the same table as not
+        // mentioning them, so an existing table's stored hash still
+        // verifies after this feature ships.
+        assert_eq!(
+            plain,
+            hash_of(
+                FtsConfig::new("title")
+                    .stopwords(Stopwords::None)
+                    .stemmer(Stemmer::None)
+            ),
+            "a filterless column must hash exactly as it did before \
+             filters existed"
+        );
     }
 
     #[test]
@@ -773,9 +960,9 @@ mod tests {
         // `impl std::error::Error for OptionsHashMismatch` — a
         // no-op body but the impl block needs to compile and
         // the dyn-error conversion needs to succeed.
-        let h_a = ContentHash([3u8; 32]);
-        let h_b = ContentHash([4u8; 32]);
-        let err = verify_options_hash(h_a, h_b).expect_err("mismatch");
+        let opts = fts_opts();
+        let err = verify_options_hash(&opts, &time_range(), ContentHash([4u8; 32]))
+            .expect_err("mismatch");
         let dyn_err: Box<dyn Error> = Box::new(err);
         assert!(dyn_err.to_string().contains("options_hash mismatch"));
     }

@@ -18,7 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -28,6 +28,7 @@ use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use tokio::runtime::Runtime;
 use tracing::{Instrument, debug, warn};
+use uuid::Uuid;
 
 use super::{
     error::{BuildError, CommitError, OpenError},
@@ -35,6 +36,7 @@ use super::{
     manifest::{
         ManifestSnapshot,
         list::{CellRoutingParams, PartitionStrategy},
+        term_stats::{self, TermStatsSidecar},
     },
     options::SupertableOptions,
 };
@@ -54,6 +56,7 @@ use crate::{
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         query::{
+            fts::GlobalIdfCache,
             scalar_cache::DecodedScalarCache,
             sql::{SqlSchemas, build_sql_schemas},
         },
@@ -76,6 +79,30 @@ use crate::{
 #[derive(Clone)]
 pub struct Supertable {
     inner: Arc<SupertableInner>,
+}
+
+/// The parsed global term-stats artifact plus the verdict of checking
+/// its coverage, so neither cost is repaid per query.
+///
+/// Two things are memoized here because each is invariant over a
+/// different key. The parsed FST is keyed by the artifact's
+/// content-addressed `uri`: an append carries the same reference
+/// forward, so successive generations reuse it and only a maintenance
+/// republish refetches. The coverage verdict is keyed by manifest
+/// generation, because a manifest pins both its superfile list and its
+/// artifact reference — so `usable` is a pure function of
+/// `checked_generation`, and one check per generation serves every
+/// query on that snapshot.
+pub(super) struct CachedTermStats {
+    /// The artifact's content-addressed storage uri.
+    pub(super) uri: String,
+    /// Manifest generation `usable` was evaluated against.
+    pub(super) checked_generation: u64,
+    /// Whether every superfile the artifact covers was still listed by
+    /// that generation's manifest. `false` means callers must read df
+    /// from the superfile dictionaries instead.
+    pub(super) usable: bool,
+    pub(super) sidecar: Arc<TermStatsSidecar>,
 }
 
 /// Internal shared state. Every `Supertable` clone holds one Arc
@@ -147,6 +174,15 @@ pub(super) struct SupertableInner {
     /// Bounded decoded-row cache shared by all readers of this immutable
     /// supertable handle.
     pub(super) decoded_scalar_cache: DecodedScalarCache,
+    /// Per-generation cache of global BM25 idf per (column, term),
+    /// shared by every reader minted from this handle so repeat
+    /// queries under `Bm25Stats::Global` skip the dictionary gather
+    /// fan — see [`GlobalIdfCache`].
+    pub(super) global_idf_cache: GlobalIdfCache,
+    /// Lazily loaded + verified global term-stats sidecar. `None` until
+    /// first use or when the manifest carries no ref — see
+    /// [`CachedTermStats`] for what the entry holds and why.
+    pub(super) term_stats_cache: StdRwLock<Option<CachedTermStats>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -868,6 +904,14 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
+    /// Build and publish the global term-stats sidecar over the current
+    /// membership (see `manifest::term_stats`). Not part of the public
+    /// API — [`Supertable::optimize`] calls this after compaction so the
+    /// artifact describes the post-merge superfile set.
+    pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
+        self.block_on_query(super::writer::stamp_term_stats(&self.inner))
+    }
+
     /// Route undrained user superfiles into the hidden per-cell index. Not part
     /// of the public API — [`Supertable::optimize`] calls this before compact;
     /// tests and benches may invoke it directly via
@@ -887,6 +931,62 @@ impl Supertable {
         // copy of the vector payload — so the cache budget floor moves.
         self.reconcile_cache_budget();
         Ok(())
+    }
+
+    /// Eagerly (re)build the centroid-router graph once a mutation has settled
+    /// the hidden centroids, publishing it stamped with the resulting hidden
+    /// manifest generation so a steady-state `ivf_router = centroid_graph`
+    /// query loads a matching-generation graph instead of building on the hot
+    /// path. Gated on the router being enabled, so a table that never uses it
+    /// pays nothing. Best-effort: the stamp + lazy query rebuild remain the
+    /// correctness guarantee, so a build failure here is logged, not
+    /// propagated. Call at the OUTERMOST settle point of a mutation cycle — a
+    /// standalone drain after the drain, `optimize` after its compaction — so
+    /// the graph is built once, at the final generation, and an
+    /// intermediate-generation graph is not built only to be superseded.
+    pub(crate) fn refresh_centroid_router_cache(&self) {
+        let vcfg = &config::global().vector;
+        let Some(column) = crate::supertable::query::vector::select_eager_router_column(
+            vcfg.search_mode,
+            vcfg.ivf_router,
+            vcfg.global_fine_fanout,
+            &self.inner.options.vector_columns,
+        ) else {
+            return;
+        };
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return;
+        };
+        // Under `auto`, only pin the resident graph when the table actually
+        // resolves to `centroid_graph`. The settle-side calibration ran (the
+        // column gate above fires for `auto` too, so the fanout is stamped), but
+        // an `auto` table that routes `stamped` never consults the resident
+        // graph — building and holding it would be pure wasted memory. Explicit
+        // `centroid_graph` always pins. Skipping is never a correctness risk:
+        // the query path rebuilds the router lazily if it ever needs it.
+        if config::global().vector.ivf_router == config::IvfRouter::Auto {
+            let manifest = hidden.inner.manifest.load_full();
+            if !crate::supertable::query::vector::auto_prefers_centroid_graph(
+                &manifest,
+                &column,
+                &config::global().vector,
+            ) {
+                return;
+            }
+        }
+        let reader = match hidden.reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                warn!(%error, "eager centroid-router build: hidden reader unavailable");
+                return;
+            }
+        };
+        if let Err(error) = bridge_on_runtime(
+            reader.build_and_cache_centroid_router(&column),
+            &self.query_runtime(),
+        ) {
+            warn!(%error, "eager centroid-router build failed; query path will rebuild lazily");
+        }
     }
 
     /// Total on-storage bytes of the committed superfiles across the user
@@ -971,7 +1071,13 @@ impl Supertable {
     /// (it owns the hidden `vector_index_table`); benches invoke it between the
     /// pre-drain and post-drain search phases.
     fn drain_vectors_to_cells_sync(&self) -> Result<(), BuildError> {
-        self.drain_hidden_vector_cells_sync()
+        self.drain_hidden_vector_cells_sync()?;
+        // Standalone drain is the outermost settle point here (no compaction
+        // follows), so pre-warm the centroid router at the post-drain
+        // generation. `optimize` instead warms after its compaction, so the
+        // graph is never built at an intermediate generation.
+        self.refresh_centroid_router_cache();
+        Ok(())
     }
     }
 
@@ -1540,7 +1646,7 @@ pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
 }
 
 fn generate_vector_index_storage_prefix() -> String {
-    format!("_infino_{}_vector_index", uuid::Uuid::new_v4())
+    format!("_infino_{}_vector_index", Uuid::new_v4())
 }
 
 fn resolve_vector_index_storage_prefix(
@@ -1668,6 +1774,8 @@ async fn build_handle(
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
+        global_idf_cache: GlobalIdfCache::default(),
+        term_stats_cache: StdRwLock::new(None),
         tombstone_cache,
         handle_id,
         vector_index_table,
@@ -2008,6 +2116,104 @@ impl SupertableReader {
         &self.inner.decoded_scalar_cache
     }
 
+    /// Per-generation global BM25 idf cache shared across every reader
+    /// minted from this supertable — see [`GlobalIdfCache`].
+    pub(crate) fn global_idf_cache(&self) -> &GlobalIdfCache {
+        &self.inner.global_idf_cache
+    }
+
+    /// The manifest-referenced global term-stats sidecar, loaded (and
+    /// hash-verified) once per artifact and cached on the handle by its
+    /// content-addressed URI. Returns `None` when the manifest carries
+    /// no reference, when no storage is attached, or when the load
+    /// fails — global-stats queries then fall back to the query-time
+    /// gather wave, trading latency for availability.
+    pub(crate) async fn term_stats_sidecar(&self) -> Option<Arc<TermStatsSidecar>> {
+        let reference = self.manifest.term_stats_blob()?.clone();
+        let generation = self.manifest.get_manifest_id();
+        // Already parsed AND already checked against this generation's
+        // superfiles: the whole call is one cache read.
+        {
+            let cached = self
+                .inner
+                .term_stats_cache
+                .read()
+                .expect("term stats cache lock");
+            if let Some(entry) = cached.as_ref()
+                && entry.uri == reference.uri
+                && entry.checked_generation == generation
+            {
+                return entry.usable.then(|| Arc::clone(&entry.sidecar));
+            }
+        }
+        // Same artifact, new generation (an append carries the
+        // reference forward): keep the parsed FST and re-check its
+        // coverage rather than refetching.
+        let parsed = {
+            let cached = self
+                .inner
+                .term_stats_cache
+                .read()
+                .expect("term stats cache lock");
+            cached
+                .as_ref()
+                .filter(|entry| entry.uri == reference.uri)
+                .map(|entry| Arc::clone(&entry.sidecar))
+        };
+        let sidecar = match parsed {
+            Some(sidecar) => sidecar,
+            None => {
+                let storage = self.manifest.options.storage.as_ref()?;
+                match term_stats::load(storage.as_ref(), &reference).await {
+                    Ok(sidecar) => Arc::new(sidecar),
+                    Err(e) => {
+                        warn!(error = %e, uri = %reference.uri, "term-stats sidecar load failed; falling back to the query-time df gather");
+                        return None;
+                    }
+                }
+            }
+        };
+        // Coverage check, once per (artifact, generation). The artifact's
+        // sums are aggregates over the superfiles it names, so a
+        // superfile that has since left the manifest cannot be
+        // subtracted back out — serving df from it would over-count and
+        // depress idf for the affected terms. The manifest carry rule
+        // drops the reference on any commit that removes superfiles,
+        // which is what makes a stale artifact unreachable; this is the
+        // belt to those braces, and it runs in every build because the
+        // failure mode is silently wrong ranking rather than an error.
+        // Rejecting an artifact costs latency, never correctness: with
+        // no artifact, callers read df from every superfile's own
+        // dictionary.
+        let current: HashSet<Uuid> = self
+            .manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.superfile_id)
+            .collect();
+        let usable = sidecar.covered().iter().all(|id| current.contains(id));
+        if !usable {
+            warn!(
+                uri = %reference.uri,
+                generation,
+                "term-stats sidecar covers a superfile this manifest no longer lists; \
+                 ignoring it and reading document frequency from the superfile \
+                 dictionaries instead"
+            );
+        }
+        *self
+            .inner
+            .term_stats_cache
+            .write()
+            .expect("term stats cache lock") = Some(CachedTermStats {
+            uri: reference.uri.clone(),
+            checked_generation: generation,
+            usable,
+            sidecar: Arc::clone(&sidecar),
+        });
+        usable.then_some(sidecar)
+    }
+
     /// The shared `Arc<SupertableInner>` backing this reader. Used to
     /// build a [`WeakReader`] that retains the snapshot without an
     /// owning cycle through a cached `SessionContext`. Module-private:
@@ -2142,6 +2348,7 @@ mod tests {
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::reader::Bm25SearchOptions,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -4230,8 +4437,9 @@ mod tests {
                 "title",
                 "doc",
                 5,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 None,
             )
             .expect("bm25 pre-optimize");
@@ -4246,8 +4454,9 @@ mod tests {
                 "title",
                 "doc",
                 5,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 None,
             )
             .expect("bm25 post-optimize");
@@ -6764,6 +6973,150 @@ mod tests {
         }
     }
 
+    /// The centroid-router graph is cached stamped with the hidden manifest
+    /// generation it was built against, and a query reuses it only while that
+    /// stamp matches its own pinned generation. Both a drain and a compaction
+    /// advance the hidden manifest generation and renumber the fine clusters,
+    /// so an entry stamped at an older generation is rejected and rebuilt. This
+    /// pins: (1) `manifest_id` advances on BOTH a drain and a compaction, so it
+    /// is a sound generation key; (2) the eager drain/optimize build stamps the
+    /// current generation; (3) after a later compaction the cached stamp no
+    /// longer matches, which is what forces the query-path rebuild; (4) an
+    /// eager rebuild restamps to the new generation so the next query loads it.
+    #[test]
+    fn centroid_router_cache_rebuilds_across_drain_and_compaction() {
+        const DIM: usize = 16;
+        const MODES: usize = 8;
+        const DOCS_PER_MODE: usize = 64;
+        const N: usize = MODES * DOCS_PER_MODE;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        // One hidden cell drained into, then split by the modality plan under
+        // optimize — the cluster renumbering the stamp must invalidate across.
+        .with_vector_cell_counts(1, 1);
+        let st = Supertable::create(options).expect("create");
+
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * DIM];
+        for r in 0..N {
+            let mode = r / DOCS_PER_MODE;
+            flat[r * DIM + mode] = 1.0;
+            flat[r * DIM + MODES + mode] = ((r % 5) as f32 - 2.0) * 1e-3;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        let hidden = st
+            .inner
+            .vector_index_table
+            .as_ref()
+            .expect("hidden index")
+            .clone();
+        // The stamped cache slot, shared across every manifest generation.
+        let cache = Arc::clone(&hidden.inner.options.centroid_router_cache);
+        let hidden_gen = || hidden.reader().expect("reader").manifest().manifest_id;
+        // Drive the eager drain-build path directly (the process-global router
+        // config can't be flipped to `centroid_graph` per-test, so the gated
+        // `refresh_centroid_router_cache` is exercised via its inner builder).
+        let eager_build = || {
+            let reader = hidden.reader().expect("reader");
+            bridge_sync_to_async(reader.build_and_cache_centroid_router("emb"))
+                .expect("eager centroid-router build");
+        };
+
+        let gen_before_drain = hidden_gen();
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+        let gen_after_drain = hidden_gen();
+        assert!(
+            gen_after_drain > gen_before_drain,
+            "a drain must advance the hidden manifest generation ({gen_before_drain} -> \
+             {gen_after_drain})"
+        );
+
+        // Eager build at the post-drain generation.
+        eager_build();
+        let after_drain = cache
+            .load_full()
+            .expect("router cached after the eager drain-build");
+        assert_eq!(
+            after_drain.generation, gen_after_drain,
+            "the eager build stamps the current (post-drain) generation"
+        );
+
+        // A compaction (the split `optimize` runs) advances the generation and
+        // renumbers the fine clusters.
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        let gen_after_compaction = hidden_gen();
+        assert!(
+            gen_after_compaction > gen_after_drain,
+            "a compaction must advance the hidden manifest generation ({gen_after_drain} -> \
+             {gen_after_compaction})"
+        );
+
+        // The default router config is `stamped`, so `optimize`'s gated eager
+        // build is a no-op here and the pre-compaction entry is still cached —
+        // now stamped at a generation the current manifest no longer matches.
+        // A query pinned to the new generation therefore rebuilds instead of
+        // routing off the stale graph.
+        let stale = cache
+            .load_full()
+            .expect("pre-compaction entry still present");
+        assert_eq!(stale.generation, gen_after_drain);
+        assert_ne!(
+            stale.generation, gen_after_compaction,
+            "the stamp mismatch is what forces the query-path rebuild after a compaction"
+        );
+
+        // Eager rebuild at the new generation restamps to match, so the next
+        // query loads it rather than rebuilding.
+        eager_build();
+        let rebuilt = cache.load_full().expect("router cached after the rebuild");
+        assert_eq!(
+            rebuilt.generation, gen_after_compaction,
+            "the rebuild stamps the current generation so the next query loads it"
+        );
+    }
+
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most
     /// N packed shard objects and stamps partition_hint = shard_id (cell % N).
     #[test]
@@ -8104,8 +8457,9 @@ mod tests {
                 "title",
                 query,
                 10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
                 None,
             )
             .expect("bm25 search")

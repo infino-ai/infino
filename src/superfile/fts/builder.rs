@@ -97,12 +97,13 @@ use crate::superfile::{
         checksum::{crc32c, crc32c_append},
     },
     fts::{
+        analysis::ChainTokenizer,
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
-        tokenize::{AsciiLowerTokenizer, Tokenizer},
+        tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
 };
 
@@ -315,6 +316,11 @@ struct ColumnState {
     /// positional capture path in `add_doc` and the extended
     /// per-term layout at emit.
     positions: bool,
+    /// BM25 parameters for this column, from `FtsConfig::bm25`. The
+    /// per-block score bounds in the skip table are the block's true
+    /// max under this pair, and the pair itself is recorded in the
+    /// column's KV entry so the reader knows what the bounds mean.
+    params: bm25::Bm25Params,
 }
 
 /// Per-column posting accumulator. Starts in `InRam` mode; transitions
@@ -1386,9 +1392,12 @@ impl FtsBuilder {
     /// Register an FTS column up-front, tokenized with the builder's
     /// default tokenizer. Returns its `column_id` (its index in
     /// declaration order).
+    /// Scores with the standard BM25 pair; use
+    /// [`FtsBuilder::register_column_with_tokenizer`] to declare
+    /// another.
     pub fn register_column(&mut self, name: String, positions: bool) -> Result<u32, BuildError> {
         let tokenizer = Arc::clone(&self.default_tokenizer);
-        self.register_column_with_tokenizer(name, positions, tokenizer)
+        self.register_column_with_tokenizer(name, positions, tokenizer, bm25::Bm25Params::STANDARD)
     }
 
     /// Register an FTS column tokenized with an explicit `tokenizer`,
@@ -1399,6 +1408,7 @@ impl FtsBuilder {
         name: String,
         positions: bool,
         tokenizer: Arc<dyn Tokenizer>,
+        params: bm25::Bm25Params,
     ) -> Result<u32, BuildError> {
         if name.as_bytes().contains(&FST_SEPARATOR) {
             return Err(BuildError::ReservedSeparatorInColumnName(name));
@@ -1415,6 +1425,7 @@ impl FtsBuilder {
             doc_lengths: Vec::new(),
             total_tokens: 0,
             positions,
+            params,
         });
         self.postings.push(ColumnPostings::new());
         self.column_tokenizers.push(tokenizer);
@@ -1869,6 +1880,20 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<AsciiLowerTokenizer>();
+        // `standard` is the default analyzer, so it needs the same
+        // monomorphized scan the ASCII tokenizer gets — through the
+        // trait object every token costs an indirect call and the
+        // interning closure cannot inline into the scan loop.
+        let standard_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
         let positional = self.columns[col_idx].positions;
@@ -1935,6 +1960,10 @@ impl FtsBuilder {
             };
             if let Some(ascii) = ascii_tok {
                 ascii.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(standard) = standard_tok {
+                standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -1988,13 +2017,31 @@ impl FtsBuilder {
                     record(tok, position);
                     tokens_in_doc += 1;
                 });
-            } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals; a tokenizer that silently drops tokens will
-                // not leave phrase gaps (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
+            } else if let Some(standard) = standard_tok {
+                // `standard` drops nothing — every segment carrying an
+                // alphanumeric is emitted — so an emission ordinal *is*
+                // the gap-inclusive position and no gap bookkeeping is
+                // needed. Monomorphized for the same reason as above.
+                standard.tokenize_each_inline(text, |tok| {
                     record(tok, tokens_in_doc);
+                    tokens_in_doc += 1;
+                });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
+            } else {
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait; the default numbering is
+                // consecutive, which is correct for one that drops
+                // nothing (see the `Tokenizer` trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2103,6 +2150,20 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<AsciiLowerTokenizer>();
+        // `standard` is the default analyzer, so it needs the same
+        // monomorphized scan the ASCII tokenizer gets — through the
+        // trait object every token costs an indirect call and the
+        // interning closure cannot inline into the scan loop.
+        let standard_tok = tokenizer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
         let positional = self.columns[col_idx].positions;
 
@@ -2147,6 +2208,10 @@ impl FtsBuilder {
             };
             if let Some(ascii) = ascii_tok {
                 ascii.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(standard) = standard_tok {
+                standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -2207,12 +2272,30 @@ impl FtsBuilder {
                     record(tok, position);
                     tokens_in_doc += 1;
                 });
-            } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
+            } else if let Some(standard) = standard_tok {
+                // `standard` drops nothing — every segment carrying an
+                // alphanumeric is emitted — so an emission ordinal *is*
+                // the gap-inclusive position and no gap bookkeeping is
+                // needed. Monomorphized for the same reason as above.
+                standard.tokenize_each_inline(text, |tok| {
                     record(tok, tokens_in_doc);
+                    tokens_in_doc += 1;
+                });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
+            } else {
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait (see the `Tokenizer`
+                // trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2511,6 +2594,7 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -2559,6 +2643,7 @@ impl FtsBuilder {
                     col_name_bytes,
                     col_doc_lengths,
                     avgdl,
+                    params,
                     n_docs,
                     &mut key_buf,
                     &mut postings_writer,
@@ -2721,6 +2806,7 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -2764,6 +2850,7 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
+                            params,
                             n_docs,
                             &mut key_buf,
                             &mut postings_writer,
@@ -2911,6 +2998,7 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
+                            params,
                             n_docs,
                             &mut key_buf,
                             &mut postings_writer,
@@ -2948,6 +3036,7 @@ impl FtsBuilder {
                                 col_name_bytes,
                                 col_doc_lengths,
                                 avgdl,
+                                params,
                                 n_docs,
                                 &mut key_buf,
                                 &mut postings_writer,
@@ -3340,6 +3429,10 @@ fn assemble_and_write_blob<W: Write>(
     // The legacy ladder (V2/V3/V4) is written only when the coarse table is
     // suppressed (test-only), so the backwards-compat tests can produce a
     // genuine pre-086 blob.
+    // A column's BM25 parameters do not move the version: they are
+    // recorded in its `inf.fts.columns` entry and read back from there,
+    // so the stored per-block bound is interpreted against the pair that
+    // entry names. Nothing about the layout differs either way.
     let fts_version = if write_coarse {
         format::fts::VERSION_V5
     } else if finish_profile.saw_bitset_block {
@@ -3477,6 +3570,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
+    params: bm25::Bm25Params,
     n_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
@@ -3588,6 +3682,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             col_name_bytes,
             col_doc_lengths,
             avgdl,
+            params,
             n_docs,
             key_buf,
             postings_writer,
@@ -3629,6 +3724,7 @@ fn encode_and_emit_term<W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
+    params: bm25::Bm25Params,
     n_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
@@ -3735,7 +3831,7 @@ fn encode_and_emit_term<W: Write>(
                 .map(|(&d, &t)| {
                     let reader_dl =
                         bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
-                    bm25::score(idf_t, t, reader_dl, avgdl)
+                    bm25::score(idf_t, t, reader_dl, avgdl, params)
                 })
                 .fold(0.0f32, f32::max);
             block_ub_per_block.push(block_ub);
@@ -4032,7 +4128,7 @@ fn sort_partition_to_file<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::default_tokenizer as tokenizer;
+    use crate::{superfile::fts::tokenize::Phrase, test_helpers::default_tokenizer as tokenizer};
 
     /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
     /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
@@ -5041,7 +5137,9 @@ mod tests {
             (&["filler", "medium"], 79),
         ];
         for (terms, want) in phrases {
-            let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
+            let phrase = vec![Phrase::adjacent(
+                terms.iter().map(|t| t.to_string()).collect(),
+            )];
             let a = v3
                 .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
                 .await

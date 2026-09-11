@@ -33,7 +33,8 @@ use pyo3::types::{PyDict, PyList};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
+    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, Stemmer, Stopwords,
+    VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -214,14 +215,49 @@ fn connect(
     Ok(Connection { inner })
 }
 
+/// One declared FTS column, as its keyword arguments arrived.
+/// `analyzer` / `stopwords` / `stemmer` `None` mean the defaults;
+/// `k1` / `b` `None` mean the column takes the standard BM25 pair.
+#[derive(Clone)]
+struct FtsDecl {
+    column: String,
+    analyzer: Option<String>,
+    stopwords: Option<String>,
+    stemmer: Option<String>,
+    positions: bool,
+    stored: bool,
+    k1: Option<f32>,
+    b: Option<f32>,
+}
+
+/// Resolve the `stopwords=` argument through the engine's own resolver,
+/// so this binding's accepted spellings are exactly the format's — see
+/// [`Stopwords::from_name`], which is exact and not case-folded.
+fn stopwords_from_name(name: &str) -> PyResult<Stopwords> {
+    Stopwords::from_name(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "IndexSpec.fts: unknown stopwords {name:?} (valid: \"english\")"
+        ))
+    })
+}
+
+/// Resolve the `stemmer=` argument; same rule as
+/// [`stopwords_from_name`].
+fn stemmer_from_name(name: &str) -> PyResult<Stemmer> {
+    Stemmer::from_name(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "IndexSpec.fts: unknown stemmer {name:?} (valid: \"english\")"
+        ))
+    })
+}
+
 /// Declares which columns are full-text (BM25) and which are vector
 /// (IVF kNN) indexed. Built fluently:
 /// `IndexSpec().fts("body").vector("emb", 384, "cosine")`.
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {
-    /// `(column, analyzer, stored)`; `analyzer` `None` means the default.
-    fts: Vec<(String, Option<String>, bool)>,
+    fts: Vec<FtsDecl>,
     /// `(column, dim, metric)`.
     vectors: Vec<(String, usize, String)>,
 }
@@ -234,16 +270,88 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed.
-    /// `analyzer` selects the tokenizer: `"ascii_lower"` (default —
-    /// ASCII split + lowercase, non-ASCII dropped) or `"standard"` (the
-    /// Unicode-aware UAX #29 tokenizer that keeps non-ASCII text).
+    /// `analyzer` selects the tokenizer: `"standard"` (the default —
+    /// the Unicode-aware UAX #29 tokenizer that keeps non-ASCII text)
+    /// or `"ascii_lower"` (ASCII split + lowercase, non-ASCII dropped).
+    /// It is recorded with the table and cannot be changed afterwards.
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
-    #[pyo3(signature = (column, analyzer = None, stored = true))]
-    fn fts(&self, column: String, analyzer: Option<String>, stored: bool) -> Self {
+    ///
+    /// `stopwords="english"` removes the very common words — the ones
+    /// whose presence says almost nothing about what a document is
+    /// about — from both the index and queries. `stemmer="english"`
+    /// reduces words to their stems, so a search for one inflection
+    /// finds the others (`running`, `runs`, `run`). Both are off by
+    /// default, apply to both sides of the search, and are recorded
+    /// with the table: they decide what is in the index, so neither can
+    /// be changed afterwards. Each trades something back — once a word
+    /// is not indexed no query can find it, and stemming conflates
+    /// words a reader would not — so declare them on prose, not on
+    /// short identifiers.
+    ///
+    /// There is no migration: a removed stopword was never written and
+    /// a stem is not invertible, so changing either means building a
+    /// new table from the source text and re-ingesting. With
+    /// `stored=False` that source text is never kept, so the
+    /// combination is **permanent** — not even a full rebuild can undo
+    /// it.
+    ///
+    /// `positions=True` records token positions, which is what exact
+    /// phrase queries (`'"climate policy"'`) need. Off by default
+    /// because positions roughly double the column's index footprint; a
+    /// column without them answers a phrase query with an error naming
+    /// the column, never a silent bag-of-words fallback.
+    ///
+    /// `k1` and `b` are the column's BM25 similarity parameters —
+    /// term-frequency saturation (`> 0`) and length normalization (in
+    /// `[0, 1]`), defaulting to `1.2` and `0.75`. They are recorded
+    /// with the table and the stored score bounds are built with them,
+    /// so a search that does not override them pays nothing. A search
+    /// may still score with a different pair (see `bm25_search`), which
+    /// is the shape to reach for while tuning; declare the pair here
+    /// once it is settled.
+    // The three new options are appended **after** `b`, and behind `*`
+    // so they are keyword-only. Inserting them mid-signature would have
+    // silently changed what `fts("body", "standard", False)` means for
+    // every positional caller — every call site in this repo passes
+    // keywords past `column`, so no test here would have caught it.
+    // Keyword-only also means the next option added cannot repeat the
+    // mistake.
+    #[pyo3(signature = (
+        column,
+        analyzer = None,
+        stored = true,
+        k1 = None,
+        b = None,
+        *,
+        stopwords = None,
+        stemmer = None,
+        positions = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn fts(
+        &self,
+        column: String,
+        analyzer: Option<String>,
+        stored: bool,
+        k1: Option<f32>,
+        b: Option<f32>,
+        stopwords: Option<String>,
+        stemmer: Option<String>,
+        positions: bool,
+    ) -> Self {
         let mut next = self.clone();
-        next.fts.push((column, analyzer, stored));
+        next.fts.push(FtsDecl {
+            column,
+            analyzer,
+            stopwords,
+            stemmer,
+            positions,
+            stored,
+            k1,
+            b,
+        });
         next
     }
 
@@ -261,10 +369,40 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> PyResult<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for (column, analyzer, stored) in &self.fts {
-            let mut field = infino::FtsField::new(column.clone()).stored(*stored);
+        for decl in &self.fts {
+            let FtsDecl {
+                column,
+                analyzer,
+                stopwords,
+                stemmer,
+                positions,
+                stored,
+                k1,
+                b,
+            } = decl;
+            let mut field = infino::FtsField::new(column.clone())
+                .positions(*positions)
+                .stored(*stored);
             if let Some(a) = analyzer {
                 field = field.analyzer(a.clone());
+            }
+            if let Some(name) = stopwords {
+                field = field.stopwords(stopwords_from_name(name)?);
+            }
+            if let Some(name) = stemmer {
+                field = field.stemmer(stemmer_from_name(name)?);
+            }
+            // Both or neither, as at the search surface: the two
+            // parameters interact through the length norm, so
+            // half-overriding is a footgun rather than a shorthand.
+            match (k1, b) {
+                (Some(k1), Some(b)) => field = field.bm25(*k1, *b),
+                (None, None) => {}
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "IndexSpec.fts: pass k1 and b together, or neither",
+                    ));
+                }
             }
             spec = spec.fts(field);
         }
@@ -501,14 +639,25 @@ impl Table {
     /// `score` is a similarity (higher is better) — opposite direction
     /// from `vector_search`'s distance. Fuse with `hybrid_search`.
     ///
-    /// `stats` selects the BM25 corpus statistics: `"per_superfile"`
-    /// (default) scores each segment against its own local document
-    /// count and term frequencies — fastest, but ranking drifts as the
-    /// table fragments across many segments. `"global"` scores against
-    /// table-wide statistics gathered across all segments, so a
-    /// fragmented table ranks like a single unified corpus (the accurate
-    /// choice) at the cost of an extra statistics-gathering pass.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None))]
+    /// `k1` and `b` override the columns' declared BM25 similarity
+    /// parameters for this search only — pass both or neither. The
+    /// stored score bounds belong to the declared pair, so the reader
+    /// corrects them for the difference: results stay exact and only
+    /// pruning power is traded. Nothing is rebuilt, which is what makes
+    /// this the shape for relevance experimentation; a pair you mean to
+    /// keep belongs on the column (`IndexSpec.fts`), where the bounds
+    /// are built with it and the correction disappears.
+    ///
+    /// `stats` selects the BM25 corpus statistics: `"global"` (default)
+    /// scores against table-wide statistics gathered across all segments,
+    /// so a fragmented table ranks like a single unified corpus, at the
+    /// cost of a document-frequency gather before scoring.
+    /// `"per_superfile"` scores each segment against its own local
+    /// document count and term frequencies — fastest, and it skips that
+    /// gather, but a term's idf depends on which segment a document
+    /// landed in, so ranking drifts as the table fragments.
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None, k1=None, b=None))]
+    #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
         &self,
         py: Python<'py>,
@@ -518,10 +667,24 @@ impl Table {
         mode: Option<&str>,
         projection: Option<Vec<String>>,
         stats: Option<&str>,
+        k1: Option<f32>,
+        b: Option<f32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let opts = Bm25SearchOptions::new()
+        let mut opts = Bm25SearchOptions::new()
             .with_mode(parse_mode(mode)?)
             .with_stats(parse_stats(stats)?);
+        // Both or neither: overriding one parameter and silently
+        // keeping the engine default for the other is a footgun, since
+        // the two interact through the length norm.
+        opts = match (k1, b) {
+            (Some(k1), Some(b)) => opts.with_bm25(k1, b),
+            (None, None) => opts,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "bm25_search: pass k1 and b together, or neither",
+                ));
+            }
+        };
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
@@ -956,11 +1119,11 @@ fn parse_filter<'a>(
 }
 
 fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
-    match stats
-        .unwrap_or("per_superfile")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let Some(stats) = stats else {
+        // Omitted means the engine default.
+        return Ok(Bm25Stats::default());
+    };
+    match stats.to_ascii_lowercase().as_str() {
         "per_superfile" => Ok(Bm25Stats::PerSuperfile),
         "global" => Ok(Bm25Stats::Global),
         other => Err(PyValueError::new_err(format!(
@@ -1045,6 +1208,7 @@ fn coerce_to_record_batch(
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(bench_serve::bench_serve_tcp, m)?)?;
+    m.add_function(wrap_pyfunction!(bench_serve::bench_serve_build_tcp, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<Table>()?;
     m.add_class::<IndexSpec>()?;

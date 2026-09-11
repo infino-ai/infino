@@ -21,8 +21,8 @@ const STREAM = "stream";
 export type Metric = "cosine" | "l2sq" | "negdot";
 /** Boolean mode for multi-term FTS queries. */
 export type BoolMode = "or" | "and";
-/** BM25 statistics scope: per-superfile IDF (default) or corpus-wide
- * `"global"` IDF across superfiles. */
+/** BM25 statistics scope: corpus-wide `"global"` IDF across superfiles
+ * (the default) or `"per_superfile"` segment-local IDF. */
 export type Bm25Stats = "per_superfile" | "global";
 /** A row from a query/search when not materializing to Arrow. */
 export type RowRecord = Record<string, unknown>;
@@ -114,7 +114,7 @@ export interface OptimizeOptions {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  /** BM25 statistics scope: `"per_superfile"` (default) or `"global"`. */
+  /** BM25 statistics scope: `"global"` (default) or `"per_superfile"`. */
   stats?: Bm25Stats;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
   projection?: string[];

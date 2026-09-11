@@ -69,7 +69,7 @@ jobs:
           # its own VM. Ceilings are sized per leg for two A/B arms plus
           # VM provision and compile.
           - { bench: supertable_fts_warm, docs: "1000000", suffix: st-fts-warm, corpus: realistic, timeout_minutes: "75" }
-          - { bench: supertable_fts_cold, docs: "1000000", suffix: st-fts-cold, corpus: realistic, timeout_minutes: "100" }
+          - { bench: supertable_fts_cold, docs: "1000000", suffix: st-fts-cold, corpus: realistic, timeout_minutes: "75" }
           - { bench: supertable_vector, docs: "1000000", suffix: st-vec }
           # Non-cosine (L2) leg: exercises the Sq16Adaptive default codec
           # (the cosine leg above stays on the fixed-grid Sq16).

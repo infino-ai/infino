@@ -50,6 +50,10 @@ use tracing::{Instrument, Span};
 /// parallelism can't be determined.
 const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
 
+/// 16 MiB workers instead of tokio's 2 MiB default: DataFusion planning recurses heavily on large
+/// queries (2 MiB overflows near 1000 OR terms), and a stack overflow aborts, it does not error.
+const QUERY_RUNTIME_WORKER_STACK: usize = 16 * 1024 * 1024;
+
 /// Drive `fut` to completion from a sync context. Uses the ambient
 /// tokio runtime if present (via `block_in_place + Handle::block_on`),
 /// otherwise builds a tiny `current_thread` runtime for the call.
@@ -206,6 +210,7 @@ fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
     Arc::new(
         runtime::Builder::new_multi_thread()
             .worker_threads(workers)
+            .thread_stack_size(QUERY_RUNTIME_WORKER_STACK)
             .enable_all()
             .thread_name(thread_name)
             .build()

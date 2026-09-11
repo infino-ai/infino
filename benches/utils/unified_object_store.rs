@@ -96,6 +96,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    Bm25SearchOptions,
     config::{
         CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
         SupertableSettings,
@@ -1767,7 +1768,7 @@ pub(crate) mod diag {
             let bm25_t0 = Instant::now();
             let bm25_hits = consumer
                 .reader().expect("reader")
-                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, Bm25SearchOptions::new().with_mode(BoolMode::Or))
                 .expect("cold BM25 over real S3 supertable");
             let cold_bm25 = bm25_t0.elapsed();
             eprintln!(
@@ -1794,7 +1795,7 @@ pub(crate) mod diag {
             let warm_bm25_t0 = Instant::now();
             let warm_bm25_hits = consumer
                 .reader().expect("reader")
-                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, Bm25SearchOptions::new().with_mode(BoolMode::Or))
                 .expect("warm BM25 over real S3 supertable");
             let warm_bm25 = warm_bm25_t0.elapsed();
             let cache_stats = consumer
@@ -2192,7 +2193,12 @@ pub(crate) mod diag {
         let _ = consumer
             .reader()
             .expect("reader")
-            .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+            .bm25_hits(
+                FTS_COLUMN,
+                FTS_QUERY_TERM,
+                TOP_K,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("warm-up bm25");
         let _ = consumer
             .reader()
@@ -2247,7 +2253,12 @@ pub(crate) mod diag {
             let _ = consumer
                 .reader()
                 .expect("reader")
-                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(
+                    FTS_COLUMN,
+                    FTS_QUERY_TERM,
+                    TOP_K,
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                )
                 .expect("kernel bm25");
             kernel_bm25.push(t.elapsed());
         }

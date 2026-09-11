@@ -338,13 +338,17 @@ pub(super) struct BlockMeta {
 /// iteration.
 #[derive(Clone)]
 pub(crate) struct TermCursor {
-    /// Precomputed `idf * (K1 + 1)` — the score numerator's
-    /// per-cursor constant. Computed once at cursor build so the
-    /// hot inner loop fits one multiply + add + divide per call.
-    /// (The bare `idf` value isn't kept on the cursor — every hot
-    /// scoring path uses `score_with_dl_norm_k1` which takes
-    /// `idf_x_k1p1` directly.)
+    /// Precomputed `idf * (k1 + 1)` — the score numerator's
+    /// per-cursor constant, built from the parameters this query is
+    /// scoring with. Computed once at cursor build so the hot inner
+    /// loop fits one multiply + add + divide per call.
     pub(super) idf_x_k1p1: f32,
+    /// The bare effective idf (global override and repeated-term
+    /// `weight` already folded in). Kept alongside `idf_x_k1p1` because
+    /// a phrase cursor composes its members' idfs, and recovering one
+    /// by dividing by `(k1 + 1)` would silently use the wrong `k1` the
+    /// moment a column declares a non-standard pair.
+    pub(super) idf: f32,
     /// Maximum block-max-BM25 across all blocks. Used by the WAND
     /// pivot test (term-level upper bound).
     pub(super) term_max_bm25: f32,
@@ -431,6 +435,8 @@ impl TermCursor {
         header_probed: bool,
         count_only: bool,
         has_coarse: bool,
+        params: bm25::Bm25Params,
+        bound_scale: f32,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -452,10 +458,25 @@ impl TermCursor {
         // from `idf_x_k1p1` below. When `idf == local_idf` (the default
         // per-superfile path with weight 1) the ratio is 1 and the block loop does
         // no extra work, matching the per-superfile scorer exactly.
-        let idf_rescale = if local_idf > 0.0 && idf != local_idf {
-            Some(idf / local_idf)
-        } else {
-            None
+        // Two independent reasons a stored bound needs scaling, and both
+        // are linear multipliers on it, so they compose into one:
+        //
+        //   idf / local_idf — the bounds bake in this superfile's own
+        //     idf; a global-statistics override or a repeated-term
+        //     `weight` scales the score away from it. Exact, since the
+        //     score is linear in idf.
+        //   bound_scale — the bounds were baked at the column's declared
+        //     BM25 pair; a query scoring at another needs them inflated
+        //     by the supremum of the ratio between the two. Loosening
+        //     rather than exact, because k1/b do not enter linearly.
+        //
+        // Both are 1.0 on the default path (per-superfile stats, weight
+        // 1, no parameter override), and the block loop then does no
+        // extra work at all.
+        let idf_ratio = (local_idf > 0.0 && idf != local_idf).then(|| idf / local_idf);
+        let idf_rescale = match (idf_ratio, bound_scale != 1.0) {
+            (None, false) => None,
+            (ratio, _) => Some(ratio.unwrap_or(1.0) * bound_scale),
         };
 
         // Collect straight into the `Arc` allocation: `0..num_blocks` is
@@ -485,7 +506,8 @@ impl TermCursor {
             .collect();
 
         let mut cursor = Self {
-            idf_x_k1p1: idf * (bm25::K1 + 1.0),
+            idf_x_k1p1: params.idf_x_k1p1(idf),
+            idf,
             term_max_bm25,
             df: term_meta.df,
             blocks,
@@ -521,11 +543,12 @@ impl TermCursor {
         dl_norm_k1: f32,
         global_idf: Option<f32>,
         weight: u32,
+        params: bm25::Bm25Params,
     ) -> Self {
         // Fold the qtf `weight` into the effective idf so the single-doc block-max
         // (computed below from `idf_x_k1p1`) scales together with the score.
         let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
-        let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
+        let idf_x_k1p1 = params.idf_x_k1p1(idf);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
         let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
@@ -545,6 +568,7 @@ impl TermCursor {
 
         Self {
             idf_x_k1p1,
+            idf,
             term_max_bm25: block_max_bm25,
             df: 1,
             blocks,
@@ -1130,7 +1154,7 @@ mod tests {
         let reader = FtsReader::open(bytes, json).expect("open FtsReader");
 
         let mut cursors = reader
-            .build_term_cursors(0, &["common"], None, false, None)
+            .build_term_cursors(0, &["common"], None, false, None, None)
             .await
             .expect("build term cursors");
         let cursor = cursors.first_mut().expect("`common` present in dictionary");

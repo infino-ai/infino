@@ -65,7 +65,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    VectorSearchOptions,
+    Bm25SearchOptions, VectorSearchOptions,
     config::{
         CompactionSettings, Config, OptimizeOptions, StorageBackend, StorageColdFetchMode,
         StorageSettings, SupertableSettings, ThreadCount,
@@ -291,8 +291,9 @@ fn run_bm25_queries(st: &Supertable) -> Vec<Vec<i128>> {
                     "title",
                     q,
                     BM25_K,
-                    BoolMode::Or,
-                    Bm25Stats::PerSuperfile,
+                    Bm25SearchOptions::new()
+                        .with_mode(BoolMode::Or)
+                        .with_stats(Bm25Stats::Global),
                     None,
                 )
                 .unwrap_or_else(|e| panic!("bm25_search({q:?}) failed: {e}"));

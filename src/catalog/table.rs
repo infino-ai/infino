@@ -20,8 +20,8 @@ use datafusion::prelude::Expr;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, VectorFilter, superfile::VectorSearchOptions,
-    supertable::Supertable as SupertableHandle,
+    OptimizeOptions, VectorFilter, catalog::ensure_expr_within_connective_cap,
+    superfile::VectorSearchOptions, supertable::Supertable as SupertableHandle,
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -115,7 +115,7 @@ impl Table for SupertableHandle {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        SupertableHandle::bm25_search(self, column, query, k, opts.mode, opts.stats, projection)
+        SupertableHandle::bm25_search(self, column, query, k, opts, projection)
     }
     fn token_match(
         &self,
@@ -248,18 +248,20 @@ impl Supertable {
         predicate: Expr,
         batch: &RecordBatch,
     ) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
         self.inner.update(predicate, batch)
     }
 
     /// Delete rows matching `predicate`.
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
         self.inner.delete(predicate)
     }
 
     /// Ranked BM25 full-text search over one FTS column.
     ///
     /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and the
-    /// corpus-statistics selector: [`Bm25Stats::PerSuperfile`](crate::Bm25Stats::PerSuperfile)
+    /// corpus-statistics selector: [`Bm25Stats::Global`](crate::Bm25Stats::Global)
     /// (the default, each segment scored against its own local statistics) or
     /// [`Bm25Stats::Global`](crate::Bm25Stats::Global) (one table-wide idf
     /// across all segments, so a fragmented table ranks like a single unified
