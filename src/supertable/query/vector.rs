@@ -108,7 +108,9 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             cell_posting::EncodedCellRow,
-            distance::{Metric, distance, normalize, relative_score_window},
+            distance::{
+                Metric, dequantize_sq16_adaptive_into, distance, normalize, relative_score_window,
+            },
             flat::Sq4FlatIndex,
             hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
@@ -2714,18 +2716,82 @@ const HNSW_CALIB_SEED: u64 = 0x_C0FF_EE00_CA11_B000;
 /// in the same order). `stride_step = Some(k)` keeps only every k-th row — a
 /// coarse, deterministic, evenly-spread sample that lets the probe bound its
 /// memory to ~`n/k` rows instead of the whole plane; `None` collects every row.
-async fn collect_hnsw_codes(
+/// The node-ordered rerank plane a resident-index build gathers, in the form the
+/// column's ruler needs. Cosine keeps the raw fixed-grid Sq16 codes (used
+/// verbatim); a fitted-ruler metric (`Sq16Adaptive`, whose codes are
+/// per-cluster) is decoded to fp32 so the caller can refit it onto ONE global
+/// ruler. Node ordering is identical either way — the gather iteration is what
+/// defines what node index N means, and the metric only changes the payload.
+enum GatheredPlane {
+    /// `rows × dim × 2` fixed-grid Sq16 code bytes (cosine).
+    Codes(Vec<u8>),
+    /// `rows × dim` decoded fp32, row-major (a fitted-ruler metric).
+    Fp32(Vec<f32>),
+}
+
+impl Default for GatheredPlane {
+    /// An empty cosine plane — the placeholder `std::mem::take` leaves behind
+    /// once the build has consumed the gathered plane.
+    fn default() -> Self {
+        GatheredPlane::Codes(Vec::new())
+    }
+}
+
+impl GatheredPlane {
+    /// Decoded/carried row count implied by the payload length and `dim`.
+    fn rows(&self, dim: usize) -> usize {
+        match self {
+            GatheredPlane::Codes(b) => b.len() / (dim * 2),
+            GatheredPlane::Fp32(f) => f.len() / dim,
+        }
+    }
+
+    /// Build the resident scorer this plane serves: the fixed cosine grid for
+    /// raw codes, or a freshly-fitted global ruler over the decoded fp32.
+    fn into_scorer(self, dim: usize, len: usize, metric: Metric) -> Sq16Scorer {
+        match self {
+            GatheredPlane::Codes(b) => Sq16Scorer::from_codes(b, dim, len),
+            GatheredPlane::Fp32(f) => Sq16Scorer::from_fp32_metric(&f, dim, len, metric),
+        }
+    }
+
+    /// The raw Sq16 code bytes; valid only for the cosine (`Codes`) plane the
+    /// flat arm gathers (it is metric-gated to cosine, so it never sees fp32).
+    fn expect_codes(self) -> Vec<u8> {
+        match self {
+            GatheredPlane::Codes(b) => b,
+            GatheredPlane::Fp32(_) => {
+                unreachable!("flat index build gathers a cosine (Codes) plane")
+            }
+        }
+    }
+}
+
+/// Decode one materialized single-`u16` rerank row (`Sq16Adaptive`) to fp32
+/// through its per-cluster ruler — the reconstruction the metric-aware graph
+/// refits onto one global ruler at drain, the same transient fp32 the IVF merge
+/// transcode already produces. `out.len() == dim`.
+fn decode_adaptive_row_into(enc: &EncodedCellRow, out: &mut [f32]) {
+    dequantize_sq16_adaptive_into(&enc.codes, &enc.scale, &enc.offset, out);
+}
+
+async fn collect_hnsw_plane(
     manifest: &ManifestSnapshot,
     column: &str,
-    stride: usize,
+    dim: usize,
     stride_step: Option<usize>,
-) -> Result<Vec<u8>, QueryError> {
+    metric: Metric,
+) -> Result<GatheredPlane, QueryError> {
+    let stride = dim * 2;
+    let metric_aware = metric != Metric::Cosine;
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.clone();
     let storage = manifest.options.storage.clone();
     let empty_superseded = BTreeMap::new();
     let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
     let mut codes: Vec<u8> = Vec::new();
+    let mut fp32: Vec<f32> = Vec::new();
+    let mut scratch = vec![0.0f32; dim];
     let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
         let reader =
@@ -2750,12 +2816,21 @@ async fn collect_hnsw_codes(
                 None => true,
             };
             if keep {
-                codes.extend_from_slice(&row.encoded.codes);
+                if metric_aware {
+                    decode_adaptive_row_into(&row.encoded, &mut scratch);
+                    fp32.extend_from_slice(&scratch);
+                } else {
+                    codes.extend_from_slice(&row.encoded.codes);
+                }
             }
             gi += 1;
         }
     }
-    Ok(codes)
+    Ok(if metric_aware {
+        GatheredPlane::Fp32(fp32)
+    } else {
+        GatheredPlane::Codes(codes)
+    })
 }
 
 /// Cheap metadata-only row count for `column` across all superfiles, excluding
@@ -2821,6 +2896,18 @@ pub(crate) enum IndexUnavailable {
     CodecUnsupported { column: String, codec: &'static str },
     /// The column's metric is not the one these scorers rank under.
     MetricUnsupported { column: String, metric: Metric },
+    /// The resident graph was built for a different metric than the column now
+    /// declares (a metric change, or a pre-metric-aware cosine graph on a column
+    /// since re-declared) — serve ivf until the next drain rebuilds it.
+    MetricMismatch {
+        column: String,
+        built: Metric,
+        declared: Metric,
+    },
+    /// Incremental extend of a fitted-ruler (non-cosine) graph is not yet
+    /// supported — the caller does a full rebuild, which refits the global ruler
+    /// over the whole corpus. (Extend inheriting the prior ruler is a follow-up.)
+    IncrementalMetricUnsupported { column: String, metric: Metric },
     /// No rows materialized for the column.
     NoRows { column: String },
     /// The corpus is past the index's document ceiling.
@@ -2873,6 +2960,20 @@ impl std::fmt::Display for IndexUnavailable {
                 f,
                 "column `{column}` uses metric {metric:?}; the resident scorers rank \
                  by inner product, which orders neighbours correctly only under Cosine"
+            ),
+            IndexUnavailable::MetricMismatch {
+                column,
+                built,
+                declared,
+            } => write!(
+                f,
+                "the resident graph for `{column}` was built for metric {built:?}, but \
+                 the column now declares {declared:?}"
+            ),
+            IndexUnavailable::IncrementalMetricUnsupported { column, metric } => write!(
+                f,
+                "column `{column}` uses metric {metric:?}; incremental extend of a \
+                 fitted-ruler graph is not yet supported — rebuilding in full"
             ),
             IndexUnavailable::NoRows { column } => {
                 write!(f, "no rows materialized for column `{column}`")
@@ -3060,8 +3161,14 @@ async fn gather_sq16_rows(
     op_stats: &Option<Arc<OpStatsCollector>>,
     n: usize,
     probe_step: Option<usize>,
-) -> Result<Option<(Vec<i128>, Vec<u8>)>, QueryError> {
+    metric: Metric,
+) -> Result<Option<(Vec<i128>, GatheredPlane)>, QueryError> {
     let stride = dim * 2;
+    // A fitted-ruler metric (Sq16Adaptive) carries per-cluster codes, so the raw
+    // bytes are meaningless as one plane; decode each row to fp32 through its own
+    // ruler and refit onto a single global ruler in the caller. Cosine's fixed
+    // grid is one ruler already, so its codes ride verbatim.
+    let metric_aware = metric != Metric::Cosine;
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.clone();
     let storage = manifest.options.storage.clone();
@@ -3070,6 +3177,8 @@ async fn gather_sq16_rows(
 
     let mut doc_ids: Vec<i128> = Vec::with_capacity(n);
     let mut carried_codes: Vec<u8> = Vec::new();
+    let mut carried_fp32: Vec<f32> = Vec::new();
+    let mut scratch = vec![0.0f32; dim];
     let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
         let reader =
@@ -3099,12 +3208,17 @@ async fn gather_sq16_rows(
                 ))
             })?;
             doc_ids.push(stable_id);
-            match probe_step {
-                Some(step) if gi.is_multiple_of(step) => {
+            let keep = match probe_step {
+                Some(step) => gi.is_multiple_of(step),
+                None => true,
+            };
+            if keep {
+                if metric_aware {
+                    decode_adaptive_row_into(&row.encoded, &mut scratch);
+                    carried_fp32.extend_from_slice(&scratch);
+                } else {
                     carried_codes.extend_from_slice(&row.encoded.codes);
                 }
-                Some(_) => {}
-                None => carried_codes.extend_from_slice(&row.encoded.codes),
             }
             gi += 1;
         }
@@ -3120,7 +3234,12 @@ async fn gather_sq16_rows(
     if doc_ids.is_empty() {
         return Ok(None);
     }
-    Ok(Some((doc_ids, carried_codes)))
+    let plane = if metric_aware {
+        GatheredPlane::Fp32(carried_fp32)
+    } else {
+        GatheredPlane::Codes(carried_codes)
+    };
+    Ok(Some((doc_ids, plane)))
 }
 
 /// Build and encode the flat 4-bit index for `column` — the drain path for
@@ -3193,14 +3312,17 @@ pub(crate) async fn assemble_flat_sections(
     // of a graph build - the calibration sweep - does not exist here; the fit
     // is one pass, and the gate below runs against the real plane rather than
     // a subsample whose recall would be optimistic.
-    let Some((doc_ids, sq16_codes)) =
-        gather_sq16_rows(manifest, column, dim, op_stats, n, None).await?
+    // The flat arm is metric-gated to cosine above, so the gather always yields
+    // the raw fixed-grid Sq16 codes this build fits from.
+    let Some((doc_ids, plane)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, None, Metric::Cosine).await?
     else {
         return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
             column: column.to_string(),
             pre_count: n,
         }));
     };
+    let sq16_codes = plane.expect_codes();
     // The bare 4-bit plane, always. The 1.0 B/dim residual rung was carved out
     // pending a matched-bytes comparison against a single 8-bit plane — the
     // Sq16-vs-Sq8Residual theorem says a uniform plane beats coarse+residual
@@ -3277,7 +3399,20 @@ pub(crate) async fn assemble_hnsw_sections(
                 .collect(),
         }));
     };
-    if !vc.rerank_codec.is_sq16() {
+    let metric = vc.metric;
+    // The graph serves the fixed cosine grid (`Sq16`) and, via one fitted global
+    // ruler, the per-cluster `Sq16Adaptive` plane that L2Sq/NegDot columns store.
+    // Cosine keeps the fixed grid; every other metric requires the fitted-ruler
+    // single-u16 codec (a fixed-grid `Sq16` carries no per-cluster ruler to
+    // decode its rows through, and its `[-1, 1]` grid is cosine-only anyway).
+    // (The flat arm and centroid router stay cosine-only via `metric_supported`
+    // — this arm's own scorer is metric-aware, so it does not gate on it.)
+    let codec_ok = if metric == Metric::Cosine {
+        vc.rerank_codec.is_sq16()
+    } else {
+        vc.rerank_codec.writes_single_u16_plane() && vc.rerank_codec.fits_per_cluster_ruler()
+    };
+    if !codec_ok {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::CodecUnsupported {
                 column: column.to_string(),
@@ -3285,11 +3420,7 @@ pub(crate) async fn assemble_hnsw_sections(
             },
         ));
     }
-    if let Some(reason) = metric_supported(manifest, column) {
-        return Ok(IndexOutcome::Unavailable(reason));
-    }
     let dim = vc.dim;
-    let stride = dim * 2;
 
     // Gather the stable doc-ids (cheap: 16 B/row) and the row count first. The
     // Sq16 code plane itself (dim*2 B/row — GBs at scale) is gathered LATER: a
@@ -3335,8 +3466,8 @@ pub(crate) async fn assemble_hnsw_sections(
     // the sample is ~probe_cap rows. `None` = small corpus, no probe.
     let probe_step: Option<usize> = (n > probe_cap).then(|| (n / probe_cap).max(1));
 
-    let Some((doc_ids, mut carried_codes)) =
-        gather_sq16_rows(manifest, column, dim, op_stats, n, probe_step).await?
+    let Some((doc_ids, mut carried_plane)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, probe_step, metric).await?
     else {
         return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
             column: column.to_string(),
@@ -3346,10 +3477,12 @@ pub(crate) async fn assemble_hnsw_sections(
 
     if probe_step.is_some() {
         // Reuse the strided sample gathered in the merged pass above — no second
-        // decode. (Byte-identical to the prior `collect_hnsw_codes(Some(step))`.)
-        let pcodes = std::mem::take(&mut carried_codes);
-        let pn = pcodes.len() / stride;
-        let pscorer = Sq16Scorer::from_codes(pcodes, dim, pn);
+        // decode. For a fitted-ruler metric the sample fits its OWN ruler (the
+        // probe only sizes `m0` against scale, so a sample ruler is fine here);
+        // the full-corpus pass below fits the authoritative one.
+        let psample = std::mem::take(&mut carried_plane);
+        let pn = psample.rows(dim);
+        let pscorer = psample.into_scorer(dim, pn, metric);
         // The calibrate build is pure CPU; run it on the reader pool (not the
         // global rayon pool, and not inline on the tokio worker) per the
         // concurrency contract. The candidate grids are tiny, so clone them
@@ -3422,10 +3555,10 @@ pub(crate) async fn assemble_hnsw_sections(
     // above (no probe was taken from `carried_codes`); the probe path re-reads
     // the plane here, having kept it out of RAM through the probe to bound peak
     // memory at scale.
-    let codes = if probe_step.is_none() {
-        std::mem::take(&mut carried_codes)
+    let full_plane = if probe_step.is_none() {
+        std::mem::take(&mut carried_plane)
     } else {
-        collect_hnsw_codes(manifest, column, stride, None).await?
+        collect_hnsw_plane(manifest, column, dim, None, metric).await?
     };
     // Size the scorer from the DECODED plane, not the metadata pre-count `n`
     // (which only sizes the probe step). The decode can skip a superfile the
@@ -3435,7 +3568,7 @@ pub(crate) async fn assemble_hnsw_sections(
     // plane and the doc-id pass disagree, a transient fault desynced the two
     // reads and a graph built now would mismap nodes to ids: skip it and serve
     // ivf; the next drain rebuilds.
-    let decoded_rows = codes.len() / stride;
+    let decoded_rows = full_plane.rows(dim);
     if decoded_rows != doc_ids.len() {
         tracing::warn!(
             column,
@@ -3450,7 +3583,10 @@ pub(crate) async fn assemble_hnsw_sections(
             },
         ));
     }
-    let scorer = Sq16Scorer::from_codes(codes, dim, decoded_rows);
+    // For a fitted-ruler metric this fits the authoritative global ruler over
+    // the full corpus and re-encodes the single-u16 plane; cosine adopts the raw
+    // codes verbatim.
+    let scorer = full_plane.into_scorer(dim, decoded_rows, metric);
     // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
     // once at m0_max, prune down, sweep ef by re-search — free). The m0
     // requirement is scale-dependent, so this full-corpus pass is authoritative
@@ -3474,7 +3610,21 @@ pub(crate) async fn assemble_hnsw_sections(
         vcfg.hnsw_register_floor,
         vcfg.hnsw_ef_construction,
     );
-    let walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
+    let mut walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
+    // The SQ8 / 4-bit walk planes are code-space proxies fitted to the uniform
+    // fixed cosine grid; they do not carry the per-dim fitted ruler, so on a
+    // metric-aware plane their navigation is wrong. Walk the metric-aware Sq16
+    // plane directly for non-cosine columns (the refine is Sq16 regardless, so
+    // only per-candidate walk cost changes, never the order returned). A
+    // ruler-aware coarse walk is a follow-up.
+    if metric != Metric::Cosine && walk != hnsw::WalkCodec::Sq16 {
+        tracing::debug!(
+            column,
+            ?walk,
+            "hnsw: non-cosine column walks the ruler-aware Sq16 plane (coarse walk planes are not ruler-aware yet)"
+        );
+        walk = hnsw::WalkCodec::Sq16;
+    }
     let n_rows = doc_ids.len();
     let (scorer, sq4, choice, ef_curve, graph) = run_on_pool(
         Some(&manifest.options.reader_pool),
@@ -3573,6 +3723,9 @@ pub(crate) async fn assemble_hnsw_sections(
         column,
         walk,
         sq4.as_ref(),
+        scorer.metric(),
+        scorer.ruler(),
+        scorer.node_norms(),
     )))
 }
 
@@ -3613,7 +3766,13 @@ pub(crate) async fn assemble_hnsw_incremental(
         }));
     };
     let dim = prior.dim;
-    if !vc.rerank_codec.is_sq16() {
+    let metric = vc.metric;
+    let codec_ok = if metric == Metric::Cosine {
+        vc.rerank_codec.is_sq16()
+    } else {
+        vc.rerank_codec.writes_single_u16_plane() && vc.rerank_codec.fits_per_cluster_ruler()
+    };
+    if !codec_ok {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::CodecUnsupported {
                 column: column.to_string(),
@@ -3626,6 +3785,18 @@ pub(crate) async fn assemble_hnsw_incremental(
             queried: vc.dim,
             index: dim,
         }));
+    }
+    // A fitted-ruler (non-cosine) delta must re-encode onto the prior global
+    // ruler, and the recall re-check below grades on the fixed grid — neither is
+    // wired yet. Decline to a full rebuild, which refits the ruler over the whole
+    // corpus and is correct; the cosine incremental path is unchanged.
+    if metric != Metric::Cosine {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::IncrementalMetricUnsupported {
+                column: column.to_string(),
+                metric,
+            },
+        ));
     }
     let stride = dim * 2;
     let store = Arc::clone(&manifest.options.store);
@@ -3912,6 +4083,9 @@ pub(crate) async fn assemble_hnsw_incremental(
             column,
             inherited_walk,
             sq4.as_ref(),
+            scorer.metric(),
+            scorer.ruler(),
+            scorer.node_norms(),
         ),
         new_high_water,
         inserted,
@@ -4089,11 +4263,21 @@ impl SupertableReader {
         if data.doc_ids.is_empty() {
             return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
         }
-        // A graph published before the build-side metric gate existed can still
-        // be resident, and it ranks by inner product regardless of what the
-        // column's metric says.
-        if let Some(reason) = metric_supported(self.manifest(), column) {
-            return Ok(IndexOutcome::Unavailable(reason));
+        // Reject a graph built for a different metric than the column now
+        // declares — a metric change, or a pre-metric-aware cosine graph on a
+        // column since re-declared — rather than serve the wrong geometry at the
+        // right latency. The resident scorer knows which metric it serves (the
+        // fixed grid serves Cosine; a fitted ruler serves its own metric).
+        let served = data.scorer.served_metric();
+        let declared = column_metric(&self.manifest().options.vector_columns, column);
+        if declared != Some(served) {
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::MetricMismatch {
+                    column: column.to_string(),
+                    built: served,
+                    declared: declared.unwrap_or(served),
+                },
+            ));
         }
         let k_fetch = replica_fetch_width(k);
         // The calibrated per-`k` beam from the stamped k→ef curve drives the
@@ -4142,7 +4326,18 @@ impl SupertableReader {
                 // monomorphized walk. A coarse plane re-ranks its beam on Sq16
                 // (`refine_k`), so the plane changes which candidates are
                 // considered, never the order returned.
-                let walked = if let Some(sq4) = &data.sq4 {
+                //
+                // A fitted-ruler (non-cosine) graph MUST walk the metric-aware
+                // Sq16 plane directly: the SQ8 / 4-bit walk planes are code-space
+                // `−dot` proxies that assume the UNIFORM fixed cosine grid (one
+                // scale/offset for every dim), so on a per-dim ruler their
+                // navigation is meaningless and the beam that reaches the refine
+                // is wrong. (`decode_hnsw` may still have derived an SQ8 plane
+                // because the running `hnsw_plane` config asked for it; ignore it
+                // here rather than mis-navigate.)
+                let walked = if served != Metric::Cosine {
+                    data.graph.search(&data.scorer, &query_owned, k_fetch, ef)
+                } else if let Some(sq4) = &data.sq4 {
                     data.search_walk_refine(sq4, &query_owned, k_fetch, ef, refine_k)
                 } else if !data.sq8_plane.is_empty() {
                     data.search_sq8_refine(&query_owned, k_fetch, ef, refine_k)
@@ -4152,15 +4347,21 @@ impl SupertableReader {
                 walked
                     .into_iter()
                     .filter_map(|(node, dist)| {
-                        // Shift the graph's `−dot` onto the ivf/scan arm's
-                        // `1 − dot` cosine scale so the cross-arm merge
-                        // (top_k_ascending) compares like with like. Monotonic
-                        // in `dist`, so intra-arm order is unchanged; the public
-                        // `score` column stays non-negative.
+                        // Publish the metric's own distance so the cross-arm
+                        // merge (top_k_ascending) compares like with like: the
+                        // cosine grid walks `−dot` and shifts onto the scan arm's
+                        // `1 − dot` scale (monotonic, non-negative), while L2Sq /
+                        // NegDot already score the exact distance the scan emits
+                        // (squared distance, `−dot`) and pass it straight through.
+                        let score = if served == Metric::Cosine {
+                            1.0 + dist
+                        } else {
+                            dist
+                        };
                         Some(SuperfileHit {
                             superfile: SuperfileUri(Uuid::nil()),
                             local_doc_id: 0,
-                            score: 1.0 + dist,
+                            score,
                             stable_id: Some(*data.doc_ids.get(node as usize)?),
                         })
                     })
@@ -11344,6 +11545,32 @@ mod tests {
         options_one_col_sq16_metric(dim, Metric::Cosine)
     }
 
+    /// A one-column table under a non-cosine metric, whose rerank codec is the
+    /// per-cluster-fitted `Sq16Adaptive` the engine picks for L2Sq/NegDot (the
+    /// fixed-grid `Sq16` is cosine-only and config validation rejects it here).
+    fn options_one_col_adaptive_metric(dim: usize, metric: Metric) -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(
+            schema_with_vector(dim),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric,
+                rerank_codec: RerankCodec::Sq16Adaptive,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
     fn options_one_col_sq16_metric(dim: usize, metric: Metric) -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
@@ -11412,6 +11639,129 @@ mod tests {
             hits[0].score < 0.05,
             "an exact match is distance ~0 on the cosine scale, got {}",
             hits[0].score
+        );
+    }
+
+    /// A drained L2Sq table (rerank codec `Sq16Adaptive`) with a GRAPH published
+    /// and stamped — the l2sq peer of [`drained_graph_fixture`], used to pin that
+    /// `hnsw_ivf` now serves the resident graph for non-cosine metrics instead of
+    /// declining every one to the ivf scan.
+    fn drained_l2sq_graph_fixture() -> (Supertable, TempDir, Arc<Supertable>) {
+        let schema = schema_with_vector(GRAPH_FIXTURE_DIM);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let opts =
+            options_one_col_adaptive_metric(GRAPH_FIXTURE_DIM, Metric::L2Sq).with_storage(storage);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(
+            0,
+            GRAPH_FIXTURE_ROWS,
+            GRAPH_FIXTURE_DIM,
+            schema,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+        let manifest = reader.manifest();
+        // The build fix: an L2Sq column no longer declines the graph at the codec
+        // gate (`Sq16Adaptive` is not `is_sq16`) or the cosine-only metric gate —
+        // before it, this `expect_ready` panicked with `CodecUnsupported`.
+        let graph = expect_ready(
+            block_on(assemble_hnsw_sections(manifest, "emb", &None)).expect("assemble ok"),
+            "a drained L2Sq corpus",
+        );
+        // The metric-aware plane is stamped in the v06 bundle.
+        use crate::superfile::vector::hnsw::{HNSW_DATA_MAGIC_LEN, HNSW_DATA_MAGIC_V6};
+        assert_eq!(
+            &graph[..HNSW_DATA_MAGIC_LEN],
+            HNSW_DATA_MAGIC_V6,
+            "a fitted-ruler (non-cosine) graph stamps the v06 metric-aware magic"
+        );
+        let storage = manifest.options.storage.clone().expect("storage");
+        let blob = encode_resident_envelope(0, 0, &[], Some((PayloadKind::Graph, &graph)));
+        let reference =
+            block_on(write_resident_index_blob(storage.as_ref(), blob)).expect("publish");
+        let stamped = manifest.with_slow_vector_state_graphs(Some(reference));
+        drop(reader);
+        hidden.inner().manifest.store(Arc::new(stamped));
+        (st, dir, hidden)
+    }
+
+    /// The metric-aware graph fix (infino-ai/infino#757): under `hnsw_ivf` an
+    /// L2Sq column now BUILDS and SERVES the resident graph, where before the
+    /// build declined it (the `Sq16Adaptive` codec fails `is_sq16`, and the
+    /// serve/build metric gate was cosine-only) and every query fell back to the
+    /// ivf scan. The regression is twofold: the graph must answer, and it must
+    /// answer on the L2Sq distance scale (squared distance, ~0 for an exact
+    /// match) rather than the cosine `1 − dot` the old publish shifted onto.
+    #[test]
+    fn hnsw_ivf_serves_the_graph_for_l2sq() {
+        let (_st, _dir, hidden) = drained_l2sq_graph_fixture();
+        let served = hidden.reader().expect("hidden reader after publish");
+
+        // The resident graph is metric-aware: it serves the column's own L2Sq,
+        // not the fixed-grid cosine every pre-fix graph carried.
+        let resident = block_on(served.resident_vector_index()).expect("the ref must hydrate");
+        let data = resident
+            .data
+            .as_ref()
+            .and_then(ResidentIndexKind::graph)
+            .expect("the fixture publishes a decodable graph");
+        assert_eq!(
+            data.scorer.served_metric(),
+            Metric::L2Sq,
+            "the resident graph must serve the column's L2Sq metric"
+        );
+        // A fitted-ruler graph must carry NO coarse walk plane: the SQ8 / 4-bit
+        // walks are code-space `−dot` proxies for the uniform cosine grid and
+        // mis-navigate a per-dim ruler, so decode derives none and the serve
+        // path walks the metric-aware Sq16 plane directly. Before this, decode
+        // derived an SQ8 plane (config default `hnsw_plane = sq8`) and the walk
+        // returned near-random neighbours (recall collapsed to ~0 at scale).
+        assert!(
+            data.sq8_plane.is_empty() && data.sq4.is_none(),
+            "a metric-aware graph must serve the Sq16 walk, not a coarse proxy plane"
+        );
+
+        // An exact one-hot match (direction 5) is L2Sq distance ~0. Before the
+        // fix, hnsw_search declined L2Sq outright and this was `Unavailable`.
+        let mut q = vec![0.0f32; GRAPH_FIXTURE_DIM];
+        q[5] = 1.0;
+        let hits = expect_ready(
+            block_on(served.hnsw_search("emb", &q, 5, None)).expect("hnsw search"),
+            "the published L2Sq graph",
+        );
+        assert!(!hits.is_empty(), "the graph must answer its own generation");
+        assert!(
+            hits.windows(2).all(|w| w[0].score <= w[1].score),
+            "hits must be ascending by distance"
+        );
+        assert!(
+            hits[0].score < 0.05,
+            "an exact match is L2Sq distance ~0, got {}",
+            hits[0].score
+        );
+
+        // L2Sq scale, not the cosine `1 − dot`: scaling the query to magnitude 2
+        // leaves the nearest one-hot row PARALLEL (cosine distance 0) but at L2Sq
+        // distance ‖2·e5 − e5‖² = 1. A score near 1 proves the graph publishes the
+        // metric's own distance; the pre-fix cosine shift would report ~0.
+        let q2: Vec<f32> = q.iter().map(|x| x * 2.0).collect();
+        let hits2 = expect_ready(
+            block_on(served.hnsw_search("emb", &q2, 5, None)).expect("hnsw search x2"),
+            "the published L2Sq graph",
+        );
+        assert!(
+            (hits2[0].score - 1.0).abs() < 0.1,
+            "a magnitude-2 query is L2Sq distance ~1 from a parallel unit row \
+             (cosine would report ~0), got {}",
+            hits2[0].score
         );
     }
 
@@ -11676,11 +12026,15 @@ mod tests {
             other => panic!("expected CodecUnsupported, got {}", describe(other)),
         }
 
-        // A non-cosine column. Both resident index types rank by `-dot`, which
-        // is the column's own ordering only under Cosine — and the register
-        // gate cannot catch it, because `probe_recall` grades a `-dot` scan
-        // against a `-dot` exhaustive scan and so measures a mis-metriced
-        // index as perfect. Declined at build, for BOTH arms.
+        // A non-cosine column stored under the fixed-grid `Sq16` codec. The
+        // FLAT arm is cosine-only: it ranks by `-dot` mapped onto `1 - dot`,
+        // which is the column's own ordering only under Cosine, so it declines
+        // as MetricUnsupported. The HNSW arm is metric-aware, but a fitted-ruler
+        // graph needs the fitted-ruler codec — the fixed `[-1, 1]` grid carries
+        // no per-cluster ruler to decode these rows through — so it declines the
+        // fixed-grid codec as CodecUnsupported (a real L2Sq table stores the
+        // `Sq16Adaptive` codec and builds the graph; see
+        // `hnsw_ivf_serves_the_graph_for_l2sq`).
         for metric in [Metric::L2Sq, Metric::NegDot] {
             let metric_dir = TempDir::new().expect("tempdir");
             let metric_storage: Arc<dyn StorageProvider> =
@@ -11690,29 +12044,29 @@ mod tests {
             )
             .expect("create non-cosine table");
             let reader = table.reader().expect("reader");
-            for (arm, outcome) in [
-                (
-                    "flat",
-                    block_on(assemble_flat_sections(reader.manifest(), "emb", &None)),
-                ),
-                (
-                    "hnsw",
-                    block_on(assemble_hnsw_sections(reader.manifest(), "emb", &None)),
-                ),
-            ] {
-                match outcome.expect("ok") {
-                    IndexOutcome::Unavailable(IndexUnavailable::MetricUnsupported {
-                        column,
-                        metric: named,
-                    }) => {
-                        assert_eq!(column, "emb");
-                        assert_eq!(named, metric);
-                    }
-                    other => panic!(
-                        "the {arm} arm must decline {metric:?} as MetricUnsupported, got {}",
-                        describe(other)
-                    ),
+            match block_on(assemble_flat_sections(reader.manifest(), "emb", &None)).expect("ok") {
+                IndexOutcome::Unavailable(IndexUnavailable::MetricUnsupported {
+                    column,
+                    metric: named,
+                }) => {
+                    assert_eq!(column, "emb");
+                    assert_eq!(named, metric);
                 }
+                other => panic!(
+                    "the flat arm must decline {metric:?} as MetricUnsupported, got {}",
+                    describe(other)
+                ),
+            }
+            match block_on(assemble_hnsw_sections(reader.manifest(), "emb", &None)).expect("ok") {
+                IndexOutcome::Unavailable(IndexUnavailable::CodecUnsupported { column, codec }) => {
+                    assert_eq!(column, "emb");
+                    assert_eq!(codec, RerankCodec::Sq16.name());
+                }
+                other => panic!(
+                    "the hnsw arm must decline the fixed-grid codec under {metric:?} as \
+                     CodecUnsupported, got {}",
+                    describe(other)
+                ),
             }
         }
 
