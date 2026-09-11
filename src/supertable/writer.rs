@@ -171,8 +171,8 @@ use crate::{
             ClusterCentroids, RabitqAdmitContext,
             commit::{get_current_manifest_etag, manifest_uri},
             list::{
-                CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy,
-                WIDTH_LAW_KS,
+                CellRoutingParams, CellSplitCheck, DrainedVersionRanges, GlobalVectorIndex,
+                PartitionStrategy, WIDTH_LAW_KS,
             },
             options_hash,
             part::{self as part_mod, ContentHash, PartId},
@@ -1903,6 +1903,7 @@ impl SupertableWriter {
             global_vector_index: pending_gvi.clone(),
             drained_ranges: None,
             superseded_cells_additions: None,
+            split_checks_additions: None,
             graph_ref: None,
         };
 
@@ -4788,6 +4789,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             drained_ranges: Some(new_drained),
             global_vector_index: None,
             superseded_cells_additions: None,
+            split_checks_additions: None,
             graph_ref: None,
         };
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -6510,6 +6512,49 @@ pub(in crate::supertable) async fn scan_cell_parents(
     Ok((cell_counts, parents_by_cell))
 }
 
+/// Version of the split-check logic. Folded into every fingerprint, so
+/// bumping it invalidates all stored verdicts at once.
+pub(in crate::supertable) const CELL_SPLIT_CHECK_VERSION: u32 = 1;
+
+/// Hashes a cell's identity: its live (non-superseded) superfile ids, the
+/// modality threshold, and the check version. Read straight from the
+/// manifest, so it costs no I/O — two cells with the same fingerprint hold
+/// the same rows.
+///
+/// The id set alone is a complete key because the check reads physical rows:
+/// a delete doesn't rewrite a superfile (its rows drop only at query time),
+/// so only a rewrite — which changes the id set — alters the check's input.
+/// A change that makes the check honor deletes must bump the version above.
+fn cell_content_fingerprint(
+    parents: &[Arc<SuperfileEntry>],
+    superseded_map: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
+    cell: u32,
+    modality_d: f64,
+) -> u64 {
+    let mut ids: Vec<Uuid> = parents
+        .iter()
+        .filter(|entry| {
+            !superseded_map
+                .and_then(|m| m.get(&entry.superfile_id))
+                .is_some_and(|s| s.contains(&cell))
+        })
+        .map(|entry| entry.superfile_id)
+        .collect();
+    ids.sort_unstable();
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(&CELL_SPLIT_CHECK_VERSION.to_le_bytes());
+    hasher.update(&modality_d.to_bits().to_le_bytes());
+    for id in ids {
+        hasher.update(id.as_bytes());
+    }
+    let hash = hasher.finalize();
+    u64::from_le_bytes(
+        hash.as_bytes()[..8]
+            .try_into()
+            .expect("invariant: blake3 digest is 32 bytes"),
+    )
+}
+
 /// One batch cell's extracted live rows plus the parents that held them.
 struct ExtractedCellRows {
     cell: u32,
@@ -7177,6 +7222,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         drained_ranges: None,
         global_vector_index: None,
         superseded_cells_additions: Some(superseded_additions),
+        split_checks_additions: None,
         graph_ref: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -7658,6 +7704,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         drained_ranges: None,
         global_vector_index: None,
         superseded_cells_additions: Some(superseded_additions),
+        split_checks_additions: None,
         graph_ref: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -7826,6 +7873,36 @@ pub(in crate::supertable) async fn split_overflow_cells(
     let mut splits_committed = 0usize;
     let budget_bytes = split_batch_memory_budget_bytes();
 
+    // Skip cells whose fingerprint still matches a stored verdict — their
+    // contents haven't changed since the last check. Only the modality trigger
+    // memoizes; an over-cap cell always splits. A hit is marked unsplittable so
+    // it is never extracted; a miss is re-checked and recorded after the pass.
+    let modality_d = opann::cell_split_modality_d();
+    let superseded_map = manifest.get_superseded_cells();
+    let stored_checks = manifest.get_split_checks().cloned().unwrap_or_default();
+    let mut pending_fingerprints: HashMap<u32, u64> = HashMap::new();
+    if modality_d > 0.0 {
+        for (&cell, &n) in &cell_counts {
+            if opann::split_overflow_needed(n) || !opann::split_candidate(n) {
+                continue;
+            }
+            let parents = parents_by_cell
+                .get(&cell)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let fingerprint = cell_content_fingerprint(parents, superseded_map, cell, modality_d);
+            let want = CellSplitCheck {
+                fingerprint,
+                version: CELL_SPLIT_CHECK_VERSION,
+            };
+            if stored_checks.get(&cell) == Some(&want) {
+                unsplittable.insert(cell);
+            } else {
+                pending_fingerprints.insert(cell, fingerprint);
+            }
+        }
+    }
+
     // Bulk-reshape detection: when a large fraction of the grid is
     // split-eligible (a bulk load's first optimize), take the repack path —
     // children are born in their final packed shards and the table is
@@ -7953,6 +8030,46 @@ pub(in crate::supertable) async fn split_overflow_cells(
             unsplittable = unsplittable.len(),
             "cell split pass done"
         );
+    }
+
+    // Record a verdict for each cell we checked and left whole, so the next
+    // pass can skip it. Split cells are gone; whole ones are in `unsplittable`.
+    // Nothing new to record means no commit.
+    let mut new_checks: BTreeMap<u32, CellSplitCheck> = BTreeMap::new();
+    for (cell, fingerprint) in pending_fingerprints {
+        let count = cell_counts.get(&cell).copied().unwrap_or(0);
+        if !opann::split_overflow_needed(count) && unsplittable.contains(&cell) {
+            new_checks.insert(
+                cell,
+                CellSplitCheck {
+                    fingerprint,
+                    version: CELL_SPLIT_CHECK_VERSION,
+                },
+            );
+        }
+    }
+    if let Some(storage) = inner
+        .options
+        .storage
+        .clone()
+        .filter(|_| !new_checks.is_empty())
+    {
+        let list_metadata = CommitListMetadata {
+            split_checks_additions: Some(new_checks),
+            ..CommitListMetadata::empty()
+        };
+        let committed = persist_commit_async(
+            &inner,
+            storage,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+            list_metadata,
+        )
+        .await
+        .map_err(BuildError::from)?;
+        inner.manifest.store(Arc::new(committed));
     }
     Ok(())
 }
@@ -8329,6 +8446,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            split_checks_additions: None,
             graph_ref: None,
         };
         let base = Arc::new(list_metadata.apply(&manifest));
@@ -9259,6 +9377,9 @@ pub(crate) struct CommitListMetadata {
     /// superfiles here so their now-dead blocks are excluded from reads,
     /// counts, and merges without rewriting the parents.
     pub(crate) superseded_cells_additions: Option<BTreeMap<Uuid, BTreeSet<u32>>>,
+    /// Split-check verdicts to record this commit, merged into the memo (last
+    /// writer wins per cell).
+    pub(crate) split_checks_additions: Option<BTreeMap<u32, CellSplitCheck>>,
     /// The resident `hnsw` graph ref to stamp in THIS commit (`Some(inner)`
     /// where `inner` is the built ref, or `None` if the graph declined). The
     /// graph gates query visibility, so a drain builds it against the
@@ -9280,6 +9401,7 @@ impl CommitListMetadata {
             && self.global_vector_index.is_none()
             && self.drained_ranges.is_none()
             && self.superseded_cells_additions.is_none()
+            && self.split_checks_additions.is_none()
             && self.graph_ref.is_none()
     }
 
@@ -9299,6 +9421,9 @@ impl CommitListMetadata {
         }
         if let Some(additions) = &self.superseded_cells_additions {
             out = out.with_superseded_cells_added(additions);
+        }
+        if let Some(additions) = &self.split_checks_additions {
+            out = out.with_split_checks_added(additions);
         }
         if let Some(graphs) = &self.graph_ref {
             // Stamp the graph ref so it lands atomically with membership +
@@ -10420,6 +10545,56 @@ mod tests {
                 bytes_for_cache: None,
             },
         )
+    }
+
+    fn fp_entry(id: u128) -> Arc<SuperfileEntry> {
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: Uuid::from_u128(id),
+            uri: SuperfileUri(Uuid::from_u128(id)),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
+
+    #[test]
+    fn cell_content_fingerprint_is_order_independent_and_change_sensitive() {
+        let a = fp_entry(1);
+        let b = fp_entry(2);
+        let forward = [Arc::clone(&a), Arc::clone(&b)];
+        let reversed = [Arc::clone(&b), Arc::clone(&a)];
+        let base = cell_content_fingerprint(&forward, None, 0, 8.0);
+        // Parent order must not matter — the id list is sorted.
+        assert_eq!(base, cell_content_fingerprint(&reversed, None, 0, 8.0));
+        // A new superfile in the cell changes the fingerprint.
+        let grown = [Arc::clone(&a), Arc::clone(&b), fp_entry(3)];
+        assert_ne!(base, cell_content_fingerprint(&grown, None, 0, 8.0));
+        // A different modality threshold invalidates the verdict.
+        assert_ne!(base, cell_content_fingerprint(&forward, None, 0, 9.0));
+    }
+
+    #[test]
+    fn cell_content_fingerprint_excludes_superseded_parents() {
+        let a = fp_entry(1);
+        let b = fp_entry(2);
+        let parents = [Arc::clone(&a), Arc::clone(&b)];
+        // `b` has cell 0 superseded, so it contributes nothing: the fingerprint
+        // matches the one for `a` alone.
+        let mut superseded: BTreeMap<Uuid, BTreeSet<u32>> = BTreeMap::new();
+        superseded.insert(b.superfile_id, [0u32].into_iter().collect());
+        let only_a = [Arc::clone(&a)];
+        assert_eq!(
+            cell_content_fingerprint(&parents, Some(&superseded), 0, 8.0),
+            cell_content_fingerprint(&only_a, None, 0, 8.0),
+        );
     }
 
     /// The uploader returns shards in shard-id order no matter what order
