@@ -39,6 +39,7 @@ use std::{
     any::Any,
     borrow::Cow,
     collections::BTreeSet,
+    ops::Deref,
     str::{from_utf8, from_utf8_unchecked},
     sync::Arc,
 };
@@ -47,7 +48,10 @@ use unicode_properties::{EmojiStatus, UnicodeEmoji};
 use unicode_segmentation::UnicodeSegmentation;
 use wide::u8x16;
 
-use super::reader::BoolMode;
+use super::{
+    analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
+    reader::BoolMode,
+};
 
 /// Smallest byte value that is non-ASCII (has the high bit set). The
 /// v1 ASCII-only rule drops any token containing a byte `>= this`.
@@ -202,18 +206,14 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
     ///
     /// ## Phrase positions and dropped tokens
     ///
-    /// The positional index numbers tokens by the order this trait
-    /// yields them, and exact-phrase matching checks those numbers for
+    /// The positional index numbers tokens by the position this trait
+    /// reports, and exact-phrase matching checks those numbers for
     /// adjacency. A tokenizer that *drops* an input token (a stopword
-    /// filter, a non-ASCII skip, etc.) without otherwise signalling it
-    /// makes the tokens on either side of the dropped one look
-    /// adjacent — so a phrase can match text that isn't actually
-    /// contiguous. The built-in [`AsciiLowerTokenizer`] avoids this on
-    /// its positional build path by leaving a position gap for each
-    /// dropped run; a custom tokenizer that drops tokens and needs
-    /// exact phrase semantics must not rely on this trait to preserve
-    /// gaps (position increments through the trait are a planned
-    /// extension, not yet available).
+    /// filter, a non-ASCII skip) must leave the dropped token's
+    /// ordinal behind as a hole, or the tokens on either side of it
+    /// look adjacent and a phrase matches text that is not contiguous.
+    /// [`Tokenizer::tokenize_each_positioned`] is that channel; a
+    /// tokenizer that drops tokens overrides it.
     fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a>;
 
     /// Call `f(&token)` for each token. The `&str` passed to `f` is
@@ -229,6 +229,28 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
         }
     }
 
+    /// Call `f(&token, position)` for each token, where `position` is
+    /// the token's **gap-inclusive** ordinal: every input token the
+    /// scan considers consumes one, including the ones this tokenizer
+    /// drops. The positional index build reads positions from here, so
+    /// a dropped token's skipped ordinal is the phrase hole that keeps
+    /// its neighbours non-adjacent (see the note on
+    /// [`Tokenizer::tokenize`]).
+    ///
+    /// The `&str` lifetime rule is [`Tokenizer::tokenize_each`]'s.
+    ///
+    /// Default impl numbers the emitted tokens consecutively, which is
+    /// correct for any tokenizer that drops nothing. A tokenizer that
+    /// drops tokens **must** override this, or it silently reports no
+    /// holes.
+    fn tokenize_each_positioned(&self, text: &str, f: &mut dyn FnMut(&str, u64)) {
+        let mut position = 0u64;
+        self.tokenize_each(text, &mut |t| {
+            f(t, position);
+            position += 1;
+        });
+    }
+
     /// Downcast hatch for the FTS build hot path. Default impl
     /// returns `self` cast to `&dyn Any`; concrete impls should
     /// not override unless they wrap another tokenizer.
@@ -238,6 +260,29 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
     /// as long as `text` (the query) is alive.
     fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
         self.tokenize_each(text, &mut |t| f(Cow::Owned(t.to_owned())));
+    }
+
+    /// [`Tokenizer::tokenize_each_query`] plus each token's
+    /// gap-inclusive position — the query-side counterpart of
+    /// [`Tokenizer::tokenize_each_positioned`], and what lets a quoted
+    /// phrase keep the holes this tokenizer left in it.
+    ///
+    /// Default impl numbers the emitted tokens consecutively, keeping
+    /// the borrowing `tokenize_each_query` override a tokenizer may
+    /// have. A tokenizer that drops tokens **must** override this, for
+    /// the same reason it must override the indexing counterpart: a
+    /// phrase whose holes are not reported matches text where the words
+    /// are not that far apart.
+    fn tokenize_each_query_positioned<'q>(
+        &self,
+        text: &'q str,
+        f: &mut dyn FnMut(Cow<'q, str>, u64),
+    ) {
+        let mut position = 0u64;
+        self.tokenize_each_query(text, &mut |t| {
+            f(t, position);
+            position += 1;
+        });
     }
 
     /// Used to parse a query into its clauses by leading sigil:
@@ -287,19 +332,31 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
                 None => i,
             };
             self.parse_unquoted_segment(&query[seg_start..unquoted_end], &mut parsed);
-            let mut terms: Vec<Cow<'q, str>> = Vec::new();
-            self.tokenize_each_query(&query[i + 1..close], &mut |t| terms.push(t));
-            match (terms.len(), sigil) {
+            let mut phrase: Phrase<Cow<'q, str>> = Phrase::default();
+            // Offsets are relative to the first *surviving* term. A
+            // leading token the analysis chain removed is unobservable
+            // — there is nothing before it to space it from — and
+            // normalizing here is what lets the verifier subtract an
+            // offset from a position without underflowing near the
+            // start of a document.
+            let mut first_position: Option<u64> = None;
+            self.tokenize_each_query_positioned(&query[i + 1..close], &mut |t, position| {
+                let first = *first_position.get_or_insert(position);
+                phrase.push(t, position.saturating_sub(first));
+            });
+            match (phrase.len(), sigil) {
                 // Empty quotes contribute nothing.
                 (0, _) => {}
                 // A single-token phrase is just that term — degrade to
-                // the term list of the same polarity.
-                (1, Some(b'-')) => parsed.negatives.push(terms.pop().expect("one term")),
-                (1, Some(b'+')) => parsed.musts.push(terms.pop().expect("one term")),
-                (1, _) => parsed.positives.push(terms.pop().expect("one term")),
-                (_, Some(b'-')) => parsed.negative_phrases.push(terms),
-                (_, Some(b'+')) => parsed.must_phrases.push(terms),
-                (_, _) => parsed.positive_phrases.push(terms),
+                // the term list of the same polarity. Its offset is
+                // necessarily 0 and carries no information: a lone
+                // token has nothing to be spaced from.
+                (1, Some(b'-')) => parsed.negatives.push(phrase.pop_term()),
+                (1, Some(b'+')) => parsed.musts.push(phrase.pop_term()),
+                (1, _) => parsed.positives.push(phrase.pop_term()),
+                (_, Some(b'-')) => parsed.negative_phrases.push(phrase),
+                (_, Some(b'+')) => parsed.must_phrases.push(phrase),
+                (_, _) => parsed.positive_phrases.push(phrase),
             }
             i = close + 1;
             seg_start = i;
@@ -585,6 +642,106 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
     (pos, had_upper, had_non_ascii)
 }
 
+/// One quoted phrase: its terms in query order, plus each term's
+/// **offset** — how far that term sits from the phrase's first term in
+/// token positions.
+///
+/// Offsets exist because an analysis chain can remove a token from the
+/// middle of a phrase. `"end of the world"` on a column whose stopword
+/// set drops `of` and `the` keeps two terms that were *four* positions
+/// apart in the query, so requiring them adjacent would match nothing
+/// and requiring them merely co-present would match `end world`.
+/// Carrying the offsets keeps the phrase meaning what it says: the
+/// index must hold `end` and `world` three positions apart, which is
+/// exactly where the same chain put them at index time.
+///
+/// Offsets are relative to the first *kept* term, so they always start
+/// at 0. A leading token the chain removed is unobservable — there is
+/// nothing before it to space it from — and normalizing here is what
+/// lets the verifier subtract an offset from a position without
+/// underflowing near the start of a document.
+///
+/// Without a chain every offset is its term's index, so a phrase
+/// behaves exactly as it did before offsets existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phrase<T> {
+    /// The phrase's terms, in query order.
+    pub terms: Vec<T>,
+    /// `offsets[i]` is `terms[i]`'s distance from `terms[0]`. Strictly
+    /// ascending, and `offsets[0] == 0`.
+    pub offsets: Vec<u32>,
+}
+
+impl<T> Default for Phrase<T> {
+    fn default() -> Self {
+        Self {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+        }
+    }
+}
+
+impl<T> Phrase<T> {
+    /// A phrase whose terms are adjacent — offsets `0..n`. The shape
+    /// every phrase has on a column with no analysis chain.
+    pub fn adjacent(terms: Vec<T>) -> Self {
+        let offsets = (0..terms.len() as u32).collect();
+        Self { terms, offsets }
+    }
+
+    /// Append `term` at `offset` from the phrase's first term. The
+    /// caller normalizes, so nothing about how the phrase was built
+    /// survives into the value — two phrases with the same terms and
+    /// the same spacing are the same phrase, however each was
+    /// assembled.
+    ///
+    /// `offset` saturates rather than panicking on a position a
+    /// tokenizer reported out of order: a tokenizer is an extension
+    /// point, and a misbehaving one should cost recall on its own
+    /// column, not abort a query.
+    fn push(&mut self, term: T, offset: u64) {
+        self.offsets.push(offset.min(u32::MAX as u64) as u32);
+        self.terms.push(term);
+    }
+
+    /// Take the sole term of a one-term phrase, which degrades to a
+    /// plain term clause.
+    fn pop_term(&mut self) -> T {
+        self.terms.pop().expect("one term")
+    }
+
+    pub fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// The offsets, for the positional verification.
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    /// Rebuild the phrase over owned terms, preserving the offsets.
+    pub fn map<U>(&self, f: impl FnMut(&T) -> U) -> Phrase<U> {
+        Phrase {
+            terms: self.terms.iter().map(f).collect(),
+            offsets: self.offsets.clone(),
+        }
+    }
+}
+
+impl<T> Deref for Phrase<T> {
+    type Target = [T];
+
+    /// Derefs to the term slice so a phrase reads as its terms
+    /// wherever the offsets are not the point.
+    fn deref(&self) -> &[T] {
+        &self.terms
+    }
+}
+
 /// A parsed BM25 query, split into its clause lists by leading sigil:
 /// `+term` → `musts`, bare `term` → `positives`, `-term` →
 /// `negatives`. Tokens may borrow the query string, so this can't
@@ -603,13 +760,13 @@ pub struct ParsedQuery<'q> {
     /// `+"…"`-quoted runs of two or more tokens: the doc must contain
     /// the exact token sequence. (Single-token phrases degrade into
     /// `musts`.)
-    pub must_phrases: Vec<Vec<Cow<'q, str>>>,
+    pub must_phrases: Vec<Phrase<Cow<'q, str>>>,
     /// Bare-quoted multi-token runs; polarity resolved from the
     /// default operator like bare terms.
-    pub positive_phrases: Vec<Vec<Cow<'q, str>>>,
+    pub positive_phrases: Vec<Phrase<Cow<'q, str>>>,
     /// `-"…"`-quoted multi-token runs: any doc containing the exact
     /// sequence is excluded.
-    pub negative_phrases: Vec<Vec<Cow<'q, str>>>,
+    pub negative_phrases: Vec<Phrase<Cow<'q, str>>>,
 }
 
 /// A query's clause lists with the default operator already applied —
@@ -625,12 +782,12 @@ pub struct QueryClauses<'q> {
     /// Docs containing any of these are excluded.
     pub negatives: Vec<Cow<'q, str>>,
     /// Multi-token phrases every doc in the result must contain.
-    pub must_phrases: Vec<Vec<Cow<'q, str>>>,
+    pub must_phrases: Vec<Phrase<Cow<'q, str>>>,
     /// Scoring-only phrases when `musts`/`must_phrases` is non-empty;
     /// otherwise part of the union match.
-    pub should_phrases: Vec<Vec<Cow<'q, str>>>,
+    pub should_phrases: Vec<Phrase<Cow<'q, str>>>,
     /// Docs containing any of these exact sequences are excluded.
-    pub negative_phrases: Vec<Vec<Cow<'q, str>>>,
+    pub negative_phrases: Vec<Phrase<Cow<'q, str>>>,
 }
 
 impl<'q> ParsedQuery<'q> {
@@ -701,6 +858,13 @@ impl Tokenizer for AsciiLowerTokenizer {
         self.tokenize_each_inline(text, |s| f(s));
     }
 
+    /// Overridden because this tokenizer drops non-ASCII runs: the
+    /// default consecutive numbering would report no hole where one
+    /// was left.
+    fn tokenize_each_positioned(&self, text: &str, f: &mut dyn FnMut(&str, u64)) {
+        self.tokenize_each_inline_positioned(text, |s, position| f(s, position));
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -708,8 +872,31 @@ impl Tokenizer for AsciiLowerTokenizer {
     /// Zero-copy override: an already-lowercase token borrows from
     /// `text`; only a token that needs lowercasing is copied.
     fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
+        // One scan implementation — delegate and discard the position,
+        // so the two query entry points cannot disagree about which
+        // tokens a query has.
+        self.tokenize_each_query_positioned(text, &mut |t, _position| f(t));
+    }
+
+    /// Zero-copy *and* gap-aware: the same borrowed-where-possible
+    /// tokens as [`Self::tokenize_each_query`], each with the
+    /// gap-inclusive ordinal a dropped non-ASCII run leaves behind.
+    ///
+    /// The gap is why this is overridden rather than left to the
+    /// trait's consecutive default. A phrase query is verified against
+    /// the positions the *index* recorded, and the index has always
+    /// left a hole for a dropped run — so numbering the query's
+    /// surviving tokens consecutively asks for them closer together
+    /// than they were indexed, and `"new café york"` could never match
+    /// the text it was copied from.
+    fn tokenize_each_query_positioned<'q>(
+        &self,
+        text: &'q str,
+        f: &mut dyn FnMut(Cow<'q, str>, u64),
+    ) {
         let bytes = text.as_bytes();
         let mut pos = 0;
+        let mut position: u64 = 0;
         while pos < bytes.len() {
             pos = simd_skip_non_token(bytes, pos);
             if pos >= bytes.len() {
@@ -718,14 +905,22 @@ impl Tokenizer for AsciiLowerTokenizer {
             let start = pos;
             let (end, had_upper, had_non_ascii) = simd_scan_token_run(bytes, pos);
             pos = end;
-            if had_non_ascii || start == pos {
+            if start == pos {
+                continue;
+            }
+            // Every scanned run occupies one ordinal, dropped or not —
+            // the same rule `tokenize_each_inline_positioned` follows,
+            // so query and index agree on the spacing.
+            let this_position = position;
+            position += 1;
+            if had_non_ascii {
                 continue;
             }
             let s = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
             if had_upper {
-                f(Cow::Owned(s.to_ascii_lowercase()));
+                f(Cow::Owned(s.to_ascii_lowercase()), this_position);
             } else {
-                f(Cow::Borrowed(s));
+                f(Cow::Borrowed(s), this_position);
             }
         }
     }
@@ -744,19 +939,22 @@ pub const ASCII_LOWER_TOKENIZER: &str = "ascii_lower";
 /// config, and the analyzer a column gets when none is named.
 pub const STANDARD_TOKENIZER: &str = "standard";
 
-/// Resolve a tokenizer name to an instance, or `None` for an
-/// unrecognized name. The single routing point shared by the build
-/// path (mapping a chosen analyzer to the tokenizer used at index
-/// time) and the read path (reconstructing a column's tokenizer from
-/// the name recorded in its stored config). Callers translate `None`
-/// into their own error — a malformed-superfile read error, or an
-/// invalid-argument error at table-create time.
+/// Resolve an analyzer name to a tokenizer instance, or `None` for a
+/// name this engine cannot reproduce. The single routing point shared
+/// by the build path (mapping a chosen analyzer to the tokenizer used
+/// at index time) and the read path (reconstructing a column's
+/// tokenizer from the name recorded in its stored config). Callers
+/// translate `None` into their own error — a malformed-superfile read
+/// error, or an invalid-argument error at table-create time.
+///
+/// Resolves a **base tokenizer** name only. A column's stopword set and
+/// stemmer are separate persisted fields, so a chained column's
+/// tokenizer is built by [`chain_tokenizer`] from all three rather than
+/// resolved from a single string here — see
+/// [`crate::superfile::fts::analysis`].
 pub fn tokenizer_for_name(name: &str) -> Option<Arc<dyn Tokenizer>> {
-    match name {
-        ASCII_LOWER_TOKENIZER => Some(Arc::new(AsciiLowerTokenizer)),
-        STANDARD_TOKENIZER => Some(Arc::new(StandardTokenizer)),
-        _ => None,
-    }
+    let base = Base::from_name(name)?;
+    Some(chain_tokenizer(base, Stopwords::None, Stemmer::None))
 }
 
 // ── UAX #29 word breaks, restricted to ASCII ─────────────────────────
@@ -1188,6 +1386,17 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    /// A parsed query's phrases as plain term lists. `Phrase`'s own
+    /// equality includes the offsets; these assertions are about which
+    /// terms a phrase parsed to, and the offsets of a phrase with no
+    /// analysis chain are always `0..n` (covered on its own below).
+    fn phrase_terms<'q>(phrases: &'q [Phrase<Cow<'q, str>>]) -> Vec<Vec<&'q str>> {
+        phrases
+            .iter()
+            .map(|p| p.iter().map(|t| &**t).collect())
+            .collect()
+    }
 
     fn tokens(text: &str) -> Vec<String> {
         AsciiLowerTokenizer.tokenize(text).collect()
@@ -1868,6 +2077,42 @@ mod tests {
         assert_eq!(tok.tokenize("Café").collect::<Vec<_>>(), vec!["café"]);
     }
 
+    /// A phrase's offsets on a chainless tokenizer are its terms'
+    /// indices, and the parsed value equals the `adjacent` fixture the
+    /// tests build — nothing about *how* a phrase was assembled
+    /// survives into it, so two phrases with the same terms and the
+    /// same spacing are the same phrase.
+    #[test]
+    fn a_chainless_phrase_is_adjacent_and_compares_equal_to_the_fixture() {
+        let p = StandardTokenizer.parse("\"new york city\"");
+        let want = Phrase::adjacent(vec![
+            Cow::Borrowed("new"),
+            Cow::Borrowed("york"),
+            Cow::Borrowed("city"),
+        ]);
+        assert_eq!(p.positive_phrases, vec![want]);
+        assert_eq!(p.positive_phrases[0].offsets(), &[0, 1, 2]);
+    }
+
+    /// A tokenizer that drops tokens reports holes, and the parser
+    /// turns them into offsets normalized to the first surviving term.
+    /// `ascii_lower` drops non-ASCII runs, which is a hole with no
+    /// analysis chain involved — so the offset plumbing is exercised
+    /// by the tokenizer that has always left gaps.
+    #[test]
+    fn a_phrase_carries_the_holes_its_tokenizer_left() {
+        // `café` is dropped whole and consumes one ordinal, so `york`
+        // sits two positions after `new`.
+        let p = AsciiLowerTokenizer.parse("\"new café york\"");
+        assert_eq!(phrase_terms(&p.positive_phrases), vec![vec!["new", "york"]]);
+        assert_eq!(p.positive_phrases[0].offsets(), &[0, 2]);
+        // A *leading* dropped run is unobservable: there is nothing
+        // before it to space the phrase from, so the offsets still
+        // start at 0.
+        let p = AsciiLowerTokenizer.parse("\"café new york\"");
+        assert_eq!(p.positive_phrases[0].offsets(), &[0, 1]);
+    }
+
     #[test]
     fn positioned_leaves_a_gap_for_dropped_runs() {
         // No drops: positions are dense emission ordinals, and the
@@ -2194,7 +2439,10 @@ mod tests {
     #[test]
     fn parse_pure_phrase() {
         let p = parse(r#""griffith observatory""#);
-        assert_eq!(p.positive_phrases, vec![vec!["griffith", "observatory"]]);
+        assert_eq!(
+            phrase_terms(&p.positive_phrases),
+            vec![vec!["griffith", "observatory"]]
+        );
         assert!(p.positives.is_empty());
         assert!(p.musts.is_empty());
     }
@@ -2202,15 +2450,18 @@ mod tests {
     #[test]
     fn parse_phrase_polarities() {
         let p = parse(r#"+"the who" -"memory unsafe" "new york""#);
-        assert_eq!(p.must_phrases, vec![vec!["the", "who"]]);
-        assert_eq!(p.negative_phrases, vec![vec!["memory", "unsafe"]]);
-        assert_eq!(p.positive_phrases, vec![vec!["new", "york"]]);
+        assert_eq!(phrase_terms(&p.must_phrases), vec![vec!["the", "who"]]);
+        assert_eq!(
+            phrase_terms(&p.negative_phrases),
+            vec![vec!["memory", "unsafe"]]
+        );
+        assert_eq!(phrase_terms(&p.positive_phrases), vec![vec!["new", "york"]]);
     }
 
     #[test]
     fn parse_phrase_mixes_with_terms() {
         let p = parse(r#"+"the who" +uk rust -python"#);
-        assert_eq!(p.must_phrases, vec![vec!["the", "who"]]);
+        assert_eq!(phrase_terms(&p.must_phrases), vec![vec!["the", "who"]]);
         assert_eq!(p.musts, vec!["uk"]);
         assert_eq!(p.positives, vec!["rust"]);
         assert_eq!(p.negatives, vec!["python"]);
@@ -2248,7 +2499,10 @@ mod tests {
         // Phrase innards run through the same tokenizer: lowercased,
         // punctuation split.
         let p = parse(r#""New-York City""#);
-        assert_eq!(p.positive_phrases, vec![vec!["new", "york", "city"]]);
+        assert_eq!(
+            phrase_terms(&p.positive_phrases),
+            vec![vec!["new", "york", "city"]]
+        );
     }
 
     #[test]
@@ -2258,26 +2512,29 @@ mod tests {
         // unquoted segment (its trailing `+` strips as punctuation).
         let p = parse(r#"abc+"x y""#);
         assert_eq!(p.positives, vec!["abc"]);
-        assert_eq!(p.positive_phrases, vec![vec!["x", "y"]]);
+        assert_eq!(phrase_terms(&p.positive_phrases), vec![vec!["x", "y"]]);
         assert!(p.must_phrases.is_empty());
     }
 
     #[test]
     fn parse_adjacent_phrases() {
         let p = parse(r#""a b""c d""#);
-        assert_eq!(p.positive_phrases, vec![vec!["a", "b"], vec!["c", "d"]]);
+        assert_eq!(
+            phrase_terms(&p.positive_phrases),
+            vec![vec!["a", "b"], vec!["c", "d"]]
+        );
     }
 
     #[test]
     fn into_clauses_resolves_phrase_polarity_by_mode() {
         let c = parse(r#""new york" +"the who" -"bad seq" rust"#).into_clauses(BoolMode::Or);
-        assert_eq!(c.should_phrases, vec![vec!["new", "york"]]);
-        assert_eq!(c.must_phrases, vec![vec!["the", "who"]]);
-        assert_eq!(c.negative_phrases, vec![vec!["bad", "seq"]]);
+        assert_eq!(phrase_terms(&c.should_phrases), vec![vec!["new", "york"]]);
+        assert_eq!(phrase_terms(&c.must_phrases), vec![vec!["the", "who"]]);
+        assert_eq!(phrase_terms(&c.negative_phrases), vec![vec!["bad", "seq"]]);
         assert_eq!(c.shoulds, vec!["rust"]);
 
         let c = parse(r#""new york" rust"#).into_clauses(BoolMode::And);
-        assert_eq!(c.must_phrases, vec![vec!["new", "york"]]);
+        assert_eq!(phrase_terms(&c.must_phrases), vec![vec!["new", "york"]]);
         assert!(c.should_phrases.is_empty());
         assert_eq!(c.musts, vec!["rust"]);
     }

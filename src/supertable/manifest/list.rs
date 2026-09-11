@@ -3563,6 +3563,58 @@ mod tests {
     }
 
     #[test]
+    fn merging_summaries_sums_their_length_totals() {
+        // These are corpus totals, so the rollup is a plain sum — unlike
+        // the bloom and the range, which union.
+        let mut a = fts_agg(&[b"alpha"], 16, Some((b"alpha", b"mango")));
+        a.length_stats = Some(ColumnLengthStats {
+            total_tokens: 100,
+            n_scored_docs: 10,
+        });
+        let mut b = fts_agg(&[b"omega"], 16, Some((b"beta", b"zulu")));
+        b.length_stats = Some(ColumnLengthStats {
+            total_tokens: 50,
+            n_scored_docs: 15,
+        });
+        a.merge_with(&b);
+        let got = a.length_stats.expect("both sides known");
+        assert_eq!(got.total_tokens, 150);
+        assert_eq!(got.n_scored_docs, 25);
+    }
+
+    #[test]
+    fn one_summary_without_totals_makes_the_rollup_unknown() {
+        // The rule that keeps a partially backfilled manifest honest. A
+        // contributor written before the totals existed has nothing to
+        // add, and folding it in as zero would quietly shrink both the
+        // average and the collection size — producing a number that is
+        // neither the table-wide statistic nor the per-superfile one,
+        // with no error to notice. Unknown on either side means unknown,
+        // and the reader then keeps each superfile's own average.
+        let mut a = fts_agg(&[b"alpha"], 16, Some((b"alpha", b"mango")));
+        a.length_stats = Some(ColumnLengthStats {
+            total_tokens: 100,
+            n_scored_docs: 10,
+        });
+        let mut legacy = fts_agg(&[b"omega"], 16, Some((b"beta", b"zulu")));
+        legacy.length_stats = None;
+
+        let mut known_then_unknown = a.clone();
+        known_then_unknown.merge_with(&legacy);
+        assert_eq!(known_then_unknown.length_stats, None);
+
+        // And in the other order, so the fold cannot depend on which
+        // superfile the manifest happens to list first.
+        let mut unknown_then_known = legacy.clone();
+        unknown_then_known.merge_with(&a);
+        assert_eq!(unknown_then_known.length_stats, None);
+
+        // The bloom and range still merge — only the totals go unknown.
+        assert!(known_then_unknown.term_bloom.is_some());
+        assert!(known_then_unknown.term_range.is_some());
+    }
+
+    #[test]
     fn fts_agg_from_superfile_adapts_per_superfile_shape() {
         let mut b = BloomBuilder::with_n_blocks(16);
         b.insert(b"alpha");

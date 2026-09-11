@@ -26,7 +26,7 @@
 
 use std::{cmp::Ordering, collections::HashMap};
 
-use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::fts::tokenize::{Phrase, Tokenizer};
 
 /// Standard BM25 default parameters. Match the constants used by
 /// the production scoring path.
@@ -52,15 +52,36 @@ impl Default for OracleBm25Params {
     }
 }
 
-/// Number of times `phrase` occurs contiguously (in order) in
-/// `tokens` — the brute-force phrase tf.
-fn phrase_tf(tokens: &[String], phrase: &[String]) -> u32 {
+/// Number of times `phrase` occurs in `tokens` at the spacing its
+/// offsets declare — the brute-force phrase tf.
+///
+/// Walks positions rather than token indices because a doc's tokens are
+/// not necessarily consecutive: an analysis chain that removes a
+/// stopword leaves a hole where it was, and the phrase's own offsets
+/// carry the matching holes from the query side. With no chain both are
+/// dense and this reduces to "the phrase's words occur contiguously in
+/// order", which is what it checked before offsets existed.
+fn phrase_tf(tokens: &[(String, u64)], phrase: &Phrase<String>) -> u32 {
     if phrase.is_empty() || tokens.len() < phrase.len() {
         return 0;
     }
     let mut tf = 0u32;
-    for start in 0..=(tokens.len() - phrase.len()) {
-        if tokens[start..start + phrase.len()] == *phrase {
+    for (anchor, anchor_pos) in tokens {
+        if anchor != &phrase.terms[0] {
+            continue;
+        }
+        // Every later member must sit at the anchor's position plus its
+        // declared offset, carrying the same token.
+        let matched = phrase
+            .terms
+            .iter()
+            .zip(phrase.offsets())
+            .skip(1)
+            .all(|(term, off)| {
+                let want = anchor_pos + *off as u64;
+                tokens.iter().any(|(t, p)| *p == want && t == term)
+            });
+        if matched {
             tf += 1;
         }
     }
@@ -76,8 +97,11 @@ struct DocStats {
     dl: u32,
     /// Term frequencies for this doc: term → count.
     tf: HashMap<String, u32>,
-    /// The doc's token sequence, for phrase adjacency scans.
-    tokens: Vec<String>,
+    /// The doc's tokens with their gap-inclusive positions, for phrase
+    /// scans. Positions are not necessarily `0..n`: an analysis chain
+    /// that drops a token leaves its ordinal behind as a hole, exactly
+    /// as the index does.
+    tokens: Vec<(String, u64)>,
 }
 
 /// Pre-tokenized corpus + per-term df + corpus avgdl. Construct
@@ -105,12 +129,17 @@ impl BruteForceBm25 {
 
         for (doc_id, text) in corpus {
             let mut tf: HashMap<String, u32> = HashMap::new();
-            let mut tokens: Vec<String> = Vec::new();
+            let mut tokens: Vec<(String, u64)> = Vec::new();
             let mut dl: u32 = 0;
-            tokenizer.tokenize_each(text, &mut |tok| {
+            // Positioned, so a chain's stopword holes reach the phrase
+            // scan. Doc length counts *emitted* tokens — what the
+            // engine counts, and what Lucene's norms count — so a
+            // dropped token advances the position without lengthening
+            // the document.
+            tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
                 dl += 1;
                 *tf.entry(tok.to_owned()).or_insert(0) += 1;
-                tokens.push(tok.to_owned());
+                tokens.push((tok.to_owned(), position));
             });
             for term in tf.keys() {
                 *df.entry(term.clone()).or_insert(0) += 1;
@@ -124,7 +153,13 @@ impl BruteForceBm25 {
             });
         }
 
-        let n = docs.len() as u32;
+        // Corpus statistics are defined over the documents that carry
+        // tokens, not over every row handed in. A document whose text
+        // analyzes to nothing — trivially, one that is all stopwords
+        // once the chain has run — cannot match any term, so counting
+        // it would deflate the average length and inflate the
+        // collection size for every term in the column.
+        let n = docs.iter().filter(|d| d.dl > 0).count() as u32;
         let avgdl = if n == 0 {
             0.0
         } else {
@@ -285,11 +320,11 @@ impl BruteForceBm25 {
     pub fn top_k_atoms(
         &self,
         musts: &[String],
-        must_phrases: &[Vec<String>],
+        must_phrases: &[Phrase<String>],
         shoulds: &[String],
-        should_phrases: &[Vec<String>],
+        should_phrases: &[Phrase<String>],
         negatives: &[String],
-        negative_phrases: &[Vec<String>],
+        negative_phrases: &[Phrase<String>],
         k: usize,
     ) -> Vec<(u64, f32)> {
         let no_positive = musts.is_empty()
@@ -308,7 +343,7 @@ impl BruteForceBm25 {
                 false => 0.0,
             }
         };
-        let phrase_idf = |p: &Vec<String>| -> f32 { p.iter().map(idf_of).sum() };
+        let phrase_idf = |p: &Phrase<String>| -> f32 { p.iter().map(idf_of).sum() };
 
         let avgdl = self.avgdl;
         let mut scored: Vec<(u64, f32)> = Vec::with_capacity(self.docs.len());

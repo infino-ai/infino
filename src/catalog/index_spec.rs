@@ -8,7 +8,11 @@
 
 use crate::superfile::{
     builder::FtsConfig,
-    fts::{bm25::Bm25Params, tokenize::STANDARD_TOKENIZER},
+    fts::{
+        analysis::{Stemmer, Stopwords},
+        bm25::Bm25Params,
+        tokenize::STANDARD_TOKENIZER,
+    },
     vector::{builder::VectorConfig, distance::Metric},
 };
 
@@ -40,7 +44,14 @@ struct VectorIndex {
 #[derive(Debug, Clone)]
 pub struct FtsField {
     column: String,
+    /// The **base tokenizer** name. Called `analyzer` because that is
+    /// what the option is named on the public builder, but the value is
+    /// a tokenizer: the column's *analyzer* is this tokenizer plus the
+    /// two filters below, each of which is carried as its own option.
     analyzer: String,
+    stopwords: Stopwords,
+    stemmer: Stemmer,
+    positions: bool,
     stored: bool,
     bm25: Bm25Params,
 }
@@ -54,6 +65,9 @@ impl FtsField {
         Self {
             column: column.into(),
             analyzer: STANDARD_TOKENIZER.to_string(),
+            stopwords: Stopwords::None,
+            stemmer: Stemmer::None,
+            positions: false,
             stored: true,
             bm25: Bm25Params::STANDARD,
         }
@@ -65,8 +79,97 @@ impl FtsField {
     /// FTS column is tokenized with its own, so columns in one table
     /// may use different analyzers. It is recorded with the table and
     /// cannot be changed afterwards.
+    ///
+    /// This names the *base* tokenizer. [`FtsField::stopwords`] and
+    /// [`FtsField::stemmer`] add filters on top of it, and each is
+    /// recorded as its own option — so the three setters are
+    /// independent and may be called in any order.
+    ///
+    /// Validated at `create_table`, with the column named in the error.
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         self.analyzer = name.into();
+        self
+    }
+
+    /// Remove this column's stopwords — the very common words whose
+    /// presence in a document says almost nothing about what it is
+    /// about. Off by default.
+    ///
+    /// Applies to both sides: the words leave the index, and they leave
+    /// a query too, so searching `"the climate policy"` searches
+    /// `climate policy`. Each removed word leaves a **hole** in the
+    /// token positions, so an exact phrase still knows the words it
+    /// matched were not adjacent in the text: with the English set,
+    /// `"new york"` does not match `new the york`, and
+    /// `"end of the world"` matches only text with two words between
+    /// `end` and `world`.
+    ///
+    /// The trade is index size and speed against the handful of queries
+    /// that are *about* a stopword: once `the` is not indexed, no query
+    /// can find it — `"to be or not to be"` matches everything, because
+    /// nothing is left of it. Declare it on a column of prose where the
+    /// common words carry no signal, not on one holding short identifiers
+    /// or titles.
+    ///
+    /// Recorded with the table and cannot be changed afterwards — it
+    /// decides what is in the index, and there is no migration. A
+    /// filter's effect is not recoverable from the index it produced:
+    /// the tokens it removed were never written, so changing it means
+    /// building a new table from the source text and re-ingesting.
+    ///
+    /// Which makes one combination permanent. On a
+    /// [`stored(false)`](FtsField::stored) column the source text is
+    /// never kept, so there is nothing left to re-analyze — not even a
+    /// full rebuild can undo the choice. Declare a filter with
+    /// `stored(false)` only once you are sure of it.
+    pub fn stopwords(mut self, stopwords: Stopwords) -> Self {
+        self.stopwords = stopwords;
+        self
+    }
+
+    /// Reduce this column's words to their stems, so a search for one
+    /// inflection finds the others. Off by default.
+    ///
+    /// Applies to both sides — index and query — so
+    /// [`Stemmer::English`] makes `running`, `runs` and `run` one term
+    /// and any of them find all of them. Irregular forms it has no rule
+    /// for (`ran`, `went`) stay distinct.
+    ///
+    /// The trade is precision: stemming conflates words that a reader
+    /// would not, so a query for an exact word can return documents
+    /// carrying a relative of it, and there is no way to ask for the
+    /// unstemmed form on a stemmed column. It also shifts the scoring —
+    /// folding inflections together raises the merged term's document
+    /// frequency, and so lowers its idf.
+    ///
+    /// Recorded with the table and cannot be changed afterwards — it
+    /// decides what is in the index, and there is no migration. A
+    /// stem is not invertible: the index holds `run`, never the
+    /// `running` it came from, so changing or removing the stemmer
+    /// means building a new table from the source text and
+    /// re-ingesting.
+    ///
+    /// Which makes one combination permanent. On a
+    /// [`stored(false)`](FtsField::stored) column the source text is
+    /// never kept, so there is nothing left to re-analyze — not even a
+    /// full rebuild can undo the choice. Declare a filter with
+    /// `stored(false)` only once you are sure of it.
+    pub fn stemmer(mut self, stemmer: Stemmer) -> Self {
+        self.stemmer = stemmer;
+        self
+    }
+
+    /// Record token positions for this column, which is what exact
+    /// phrase queries (`"climate policy"`) need. Off by default.
+    ///
+    /// The trade is index size: positions roughly double the column's
+    /// full-text index footprint, so they are a per-column opt-in
+    /// rather than something every column pays for. A column without
+    /// them answers a phrase query with an error naming the column,
+    /// never a silent bag-of-words fallback that would return the wrong
+    /// documents.
+    pub fn positions(mut self, positions: bool) -> Self {
+        self.positions = positions;
         self
     }
 
@@ -172,10 +275,31 @@ impl IndexSpec {
         self.fts.iter().map(|f| f.column.clone()).collect()
     }
 
-    /// FTS analyzer names, in declaration order (parallel to
-    /// [`fts_columns`](Self::fts_columns)).
+    /// FTS **base tokenizer** names, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)) — a column's analyzer is one
+    /// of these plus its filters, which are carried separately by
+    /// [`fts_stopwords`](Self::fts_stopwords) and
+    /// [`fts_stemmers`](Self::fts_stemmers).
     pub(crate) fn fts_analyzers(&self) -> Vec<String> {
         self.fts.iter().map(|f| f.analyzer.clone()).collect()
+    }
+
+    /// FTS stopword sets, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_stopwords(&self) -> Vec<Stopwords> {
+        self.fts.iter().map(|f| f.stopwords).collect()
+    }
+
+    /// FTS stemmers, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_stemmers(&self) -> Vec<Stemmer> {
+        self.fts.iter().map(|f| f.stemmer).collect()
+    }
+
+    /// FTS positions flags, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_positions(&self) -> Vec<bool> {
+        self.fts.iter().map(|f| f.positions).collect()
     }
 
     /// FTS stored flags, in declaration order (parallel to
@@ -209,6 +333,9 @@ impl IndexSpec {
             .map(|f| {
                 FtsConfig::new(f.column.clone())
                     .analyzer(f.analyzer.clone())
+                    .stopwords(f.stopwords)
+                    .stemmer(f.stemmer)
+                    .positions(f.positions)
                     .stored(f.stored)
                     .bm25(f.bm25.k1, f.bm25.b)
             })
@@ -219,5 +346,115 @@ impl IndexSpec {
             .map(|v| VectorConfig::new(v.column.clone(), v.dim, DEFAULT_ROT_SEED, v.metric))
             .collect();
         (fts, vectors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a single declared column lowers to on each of the three
+    /// independent analysis surfaces.
+    fn analysis_of(field: FtsField) -> (String, Stopwords, Stemmer) {
+        let spec = IndexSpec::new().fts(field);
+        (
+            spec.fts_analyzers().remove(0),
+            spec.fts_stopwords().remove(0),
+            spec.fts_stemmers().remove(0),
+        )
+    }
+
+    /// The three analysis setters are independent: each carries its own
+    /// option through to its own persisted field, so they commute and
+    /// none can clobber another. Worth pinning even though it now falls
+    /// out of the representation — an earlier version composed them
+    /// into one string, where declaring the base last silently dropped
+    /// the filters.
+    #[test]
+    fn the_analysis_setters_commute() {
+        let want = (
+            "ascii_lower".to_string(),
+            Stopwords::English,
+            Stemmer::English,
+        );
+        assert_eq!(
+            analysis_of(
+                FtsField::new("t")
+                    .analyzer("ascii_lower")
+                    .stopwords(Stopwords::English)
+                    .stemmer(Stemmer::English)
+            ),
+            want
+        );
+        assert_eq!(
+            analysis_of(
+                FtsField::new("t")
+                    .stemmer(Stemmer::English)
+                    .stopwords(Stopwords::English)
+                    .analyzer("ascii_lower")
+            ),
+            want
+        );
+        assert_eq!(
+            analysis_of(
+                FtsField::new("t")
+                    .stopwords(Stopwords::English)
+                    .analyzer("ascii_lower")
+                    .stemmer(Stemmer::English)
+            ),
+            want
+        );
+    }
+
+    /// `.analyzer()` names the base tokenizer and nothing else. A
+    /// caller who passes a chain-shaped string gets it treated as an
+    /// tokenizer name — which does not resolve, so `create_table`
+    /// rejects it naming what they wrote, rather than silently
+    /// interpreting it.
+    #[test]
+    fn the_analyzer_setter_names_only_the_base() {
+        let (analyzer, stop, stem) =
+            analysis_of(FtsField::new("t").analyzer("standard+stop=english"));
+        assert_eq!(analyzer, "standard+stop=english");
+        assert_eq!(
+            (stop, stem),
+            (Stopwords::None, Stemmer::None),
+            "a chain-shaped string must not be silently decomposed"
+        );
+        // Turning a filter off is explicit, and independent of the base.
+        assert_eq!(
+            analysis_of(
+                FtsField::new("t")
+                    .stopwords(Stopwords::English)
+                    .stopwords(Stopwords::None)
+            ),
+            (
+                STANDARD_TOKENIZER.to_string(),
+                Stopwords::None,
+                Stemmer::None
+            )
+        );
+    }
+
+    /// An unresolvable analyzer passes through untouched, so
+    /// `create_table`'s error can name what the caller actually wrote
+    /// rather than a normalized form of it.
+    #[test]
+    fn an_unresolvable_analyzer_is_lowered_verbatim() {
+        for name in ["nonesuch", "STANDARD"] {
+            assert_eq!(analysis_of(FtsField::new("t").analyzer(name)).0, name);
+        }
+    }
+
+    /// The defaults, asserted where they are declared: `standard`, no
+    /// filters, no positions. A default column's recorded tokenizer is
+    /// the bare base name, which is what keeps it byte-identical on
+    /// disk to one declared before the filters existed.
+    #[test]
+    fn a_bare_declaration_takes_the_plain_standard_analyzer() {
+        let spec = IndexSpec::new().fts("body");
+        assert_eq!(spec.fts_analyzers(), vec![STANDARD_TOKENIZER.to_string()]);
+        assert_eq!(spec.fts_positions(), vec![false]);
+        assert_eq!(spec.fts_stored(), vec![true]);
     }
 }

@@ -53,15 +53,41 @@ pub(crate) struct TableEntry {
     pub(crate) schema_ipc: Vec<u8>,
     /// FTS-indexed column names.
     pub(crate) fts: Vec<String>,
-    /// FTS analyzer names, parallel to `fts` (`"ascii_lower"` /
-    /// `"standard"`). Every entry `create_table` writes carries one name
-    /// per FTS column; `open_table` requires the two lists to be the
-    /// same length rather than inferring an analyzer for a column that
-    /// lacks one. `serde(default)` only keeps the *rest* of the catalog
+    /// FTS **base tokenizer** names, parallel to `fts` (`"ascii_lower"`
+    /// / `"standard"`). A column's analyzer is one of these plus the
+    /// filters in `fts_stopwords` / `fts_stemmers`.
+    ///
+    /// Every entry `create_table` writes carries one name per FTS
+    /// column; `open_table` requires the two lists to be the same
+    /// length rather than inferring a tokenizer for a column that lacks
+    /// one. `serde(default)` only keeps the *rest* of the catalog
     /// decodable — an entry that decodes to a short list is rejected per
     /// table, not silently patched.
     #[serde(default)]
     pub(crate) fts_analyzers: Vec<String>,
+    /// FTS stopword-set names, parallel to `fts`; an empty string
+    /// means no set. Absent in catalogs written before the filter
+    /// existed, and a missing or short entry means no set — the only
+    /// thing such a catalog can describe, since nothing could have
+    /// asked for one.
+    #[serde(default)]
+    pub(crate) fts_stopwords: Vec<String>,
+    /// FTS stemmer names, parallel to `fts`; same empty-means-none and
+    /// same back-compat rule as `fts_stopwords`.
+    #[serde(default)]
+    pub(crate) fts_stemmers: Vec<String>,
+    /// FTS positions flags, parallel to `fts` (`true` = token positions
+    /// recorded, which exact-phrase queries need). Absent in catalogs
+    /// written before positions were declarable; a missing or short
+    /// entry defaults to `false` on reopen — the only value such a
+    /// table can have been built with, since nothing could turn them on.
+    ///
+    /// Load-bearing on reopen beyond the query path: the flag joins the
+    /// table's options-hash, so losing it here would make a positional
+    /// table fail its own hash check rather than merely forget how to
+    /// answer a phrase.
+    #[serde(default)]
+    pub(crate) fts_positions: Vec<bool>,
     /// FTS stored flags, parallel to `fts` (`false` = index-only, the
     /// raw text is not kept in the table). Absent in catalogs written
     /// before index-only columns existed; a missing or short entry
@@ -195,6 +221,9 @@ mod tests {
             schema_ipc: schema_to_ipc(&sample_schema()).expect("ipc"),
             fts: vec!["title".into()],
             fts_analyzers: vec!["ascii_lower".into()],
+            fts_stopwords: vec![String::new()],
+            fts_stemmers: vec![String::new()],
+            fts_positions: vec![false],
             fts_stored: vec![true],
             fts_k1: vec![1.2],
             fts_b: vec![0.75],

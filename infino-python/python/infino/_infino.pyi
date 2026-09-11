@@ -83,10 +83,22 @@ class Connection:
 
 class IndexSpec:
     def __init__(self) -> None: ...
+    # `stopwords="english"` drops the very common words from both the index
+    # and queries; `stemmer="english"` folds inflections onto one term, so a
+    # search for one finds the others. Both are off by default and recorded
+    # with the table — they decide what is in the index, and there is no
+    # migration: changing either means re-ingesting from the source text.
+    # With `stored=False` that text is never kept, so the combination is
+    # permanent.
+    # `positions=True` records token positions, which exact phrase queries
+    # ('"climate policy"') need; off by default because positions roughly
+    # double the column's index footprint.
     # `stored=False` declares an index-only column: searchable, but the raw
     # text is never kept, so it cannot be selected, projected, or filtered on.
     # `k1` / `b` are the column's BM25 similarity parameters (defaults 1.2 and
     # 0.75); pass both or neither. The stored score bounds are built with them.
+    # The three analysis options are keyword-only and come after `b`, so
+    # existing positional calls keep their meaning.
     def fts(
         self,
         column: str,
@@ -94,6 +106,10 @@ class IndexSpec:
         stored: bool = True,
         k1: float | None = None,
         b: float | None = None,
+        *,
+        stopwords: str | None = None,
+        stemmer: str | None = None,
+        positions: bool = False,
     ) -> IndexSpec: ...
     # `dim` must be in [16, 4096]; out-of-range raises at `create_table`.
     def vector(self, column: str, dim: int, metric: Metric) -> IndexSpec: ...

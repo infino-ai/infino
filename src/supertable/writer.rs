@@ -2772,6 +2772,61 @@ impl PreparedSuperfile {
 /// both, and consumers decode the slab at hydration instead of
 /// re-deriving one rotation per centroid. Shared by the commit staging
 /// path and the WAL update pipeline.
+/// Per-FTS-column skip summary for one freshly built superfile: the
+/// term-presence bloom, the distinct-term count, the lex term range,
+/// and the column's document-length totals.
+///
+/// Shared with the update pipeline, which builds the same summaries for
+/// the superfiles it rewrites. Two copies of this drifted apart once
+/// already — the totals landed in one and not the other — and a
+/// superfile whose summary omits them silently disables table-wide
+/// statistics for the whole manifest, which is a ranking change with no
+/// error attached.
+pub(crate) fn build_fts_summary(
+    reader: &SuperfileReader,
+    options: &SupertableOptions,
+) -> HashMap<String, FtsSummaryAgg> {
+    let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
+    let Some(fts_reader) = reader.fts() else {
+        return out;
+    };
+    for fc in &options.fts_columns {
+        let terms = fts_reader
+            .iter_column_terms(&fc.column)
+            .expect("FST bytes valid: superfile just built");
+        let n_terms_distinct = terms.len() as u32;
+        let (min_term, max_term) = match (terms.first(), terms.last()) {
+            (Some(min), Some(max)) => (min.clone(), max.clone()),
+            _ => (Vec::new(), Vec::new()),
+        };
+        // Size the bloom to this superfile's distinct-term count rather
+        // than a fixed 64 KiB, which is ~1000x over-provisioned for a
+        // small superfile. Readers derive the block count from the byte
+        // length, so heterogeneous sizes coexist across superfiles.
+        let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
+        for term in &terms {
+            bloom_builder.insert(term);
+        }
+        // Recorded here so table-wide BM25 statistics are a fold over the
+        // manifest instead of a fan-out that reopens every superfile: the
+        // reader summed them during the pass it already makes over the
+        // doc-lengths array.
+        let length_stats = fts_reader
+            .column_length_stats(&fc.column)
+            .expect("column just registered in this superfile's FTS index");
+        out.insert(
+            fc.column.clone(),
+            FtsSummaryAgg::new_with_params(
+                bloom_builder.finish(),
+                n_terms_distinct,
+                (min_term, max_term),
+                length_stats,
+            ),
+        );
+    }
+    out
+}
+
 pub(crate) fn build_column_vector_summary(
     vec_reader: &VectorReader,
     vc: &VectorConfig,
@@ -2846,43 +2901,7 @@ pub(super) fn prepare_superfile_with_uri(
         SuperfileReader::open_with(shard.bytes.clone(), inner.options.superfile_open_options())
             .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
 
-    let mut fts_summary: HashMap<String, FtsSummaryAgg> = HashMap::new();
-    if let Some(fts_reader) = reader.fts() {
-        for fc in &inner.options.fts_columns {
-            let terms = fts_reader
-                .iter_column_terms(&fc.column)
-                .expect("FST bytes valid: superfile just built");
-            let n_terms_distinct = terms.len() as u32;
-            let (min_term, max_term) = match (terms.first(), terms.last()) {
-                (Some(min), Some(max)) => (min.clone(), max.clone()),
-                _ => (Vec::new(), Vec::new()),
-            };
-            // Size the bloom to this superfile's distinct-term count rather
-            // than a fixed 64 KiB, which is ~1000x over-provisioned for a small
-            // superfile. Readers derive the block count from the byte length,
-            // so heterogeneous sizes coexist across superfiles.
-            let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
-            for term in &terms {
-                bloom_builder.insert(term);
-            }
-            // Recorded here so table-wide BM25 statistics are a fold over
-            // the manifest instead of a fan-out that reopens every
-            // superfile: the reader summed them during the pass it
-            // already makes over the doc-lengths array.
-            let length_stats = fts_reader
-                .column_length_stats(&fc.column)
-                .expect("column just registered in this superfile's FTS index");
-            fts_summary.insert(
-                fc.column.clone(),
-                FtsSummaryAgg::new_with_params(
-                    bloom_builder.finish(),
-                    n_terms_distinct,
-                    (min_term, max_term),
-                    length_stats,
-                ),
-            );
-        }
-    }
+    let fts_summary = build_fts_summary(&reader, &inner.options);
 
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {

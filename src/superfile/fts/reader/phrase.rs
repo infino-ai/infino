@@ -166,8 +166,8 @@ impl PhraseMember {
 
 /// Doc-at-a-time cursor over an exact phrase: the members'
 /// intersection drives doc alignment, and a doc matches only when the
-/// members' positions verify adjacency (member `i` at `p + i` for
-/// some anchor `p`). Scores as one BM25 atom with `tf` = the number
+/// members' positions verify the phrase's spacing (member `i` at
+/// `p + position_offsets[i]` for some anchor `p`). Scores as one BM25 atom with `tf` = the number
 /// of verified anchors and `idf` = Σ member idf. Exposes the same
 /// notion of term- and block-level upper bounds as [`TermCursor`], so
 /// the atom walks can prune with it:
@@ -176,6 +176,22 @@ impl PhraseMember {
 /// the BM25 tf-factor is monotone in tf.
 pub(super) struct PhraseCursor {
     pub(super) members: Vec<PhraseMember>,
+    /// Each member's **token-position** offset from the phrase's first
+    /// member, in `members` (query) order — strictly ascending, first
+    /// entry `0`.
+    ///
+    /// Named for the unit on purpose: [`PhraseMember`] also carries
+    /// `run_offsets` and `cached_run_offset`, which are **byte** offsets
+    /// into a term's positions blob. Confusing the two would be a
+    /// correctness bug, not a type error.
+    ///
+    /// Plain `0..n` for a phrase whose words were adjacent in the
+    /// query, which is every phrase on a column with no analysis
+    /// chain. A column whose stopword set removed a word from the
+    /// middle of the phrase gets a gap here, so the verification asks
+    /// for the members exactly as far apart as the same chain put them
+    /// at index time — see `Phrase` in `fts::tokenize`.
+    pub(super) position_offsets: Vec<u32>,
     /// Member indices in ascending posting-list length (rarest first).
     /// The doc-alignment in [`Self::seek_match`] is a set intersection —
     /// order-independent — so it probes members rarest-first: the short
@@ -209,10 +225,17 @@ impl PhraseCursor {
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
+        offsets: Vec<u32>,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
         debug_assert_eq!(cursors.len(), positional.len());
+        debug_assert_eq!(cursors.len(), offsets.len());
+        debug_assert_eq!(offsets.first(), Some(&0), "offsets are normalized");
+        debug_assert!(
+            offsets.windows(2).all(|w| w[0] < w[1]),
+            "offsets are strictly ascending"
+        );
         let mut idf_sum = 0.0f32;
         let mut min_scaled_bound = f32::INFINITY;
         let members: Vec<PhraseMember> = cursors
@@ -245,6 +268,7 @@ impl PhraseCursor {
             idf_weight: idf_sum,
             term_max_bm25: idf_sum * min_scaled_bound,
             members,
+            position_offsets: offsets,
             align_order,
             current_doc: 0,
             current_tf: 0,
@@ -459,7 +483,9 @@ impl PhraseCursor {
     /// probe is a binary search over a per-doc-tf-sized slice.
     pub(super) fn verify_at_aligned(&mut self, aligned: u32) -> Result<u32, FtsError> {
         // Staged, rarest-first, lazy-decode verification. A phrase match
-        // starting at position `s` has member `j` at `s + j`, so any
+        // starting at position `s` has member `j` at
+        // `s + position_offsets[j]`,
+        // so any
         // member can seed the candidate starts: the rarest member (by
         // posting length — `align_order[0]`) seeds them, then each
         // remaining member filters the survivors *in rarest-first order*.
@@ -479,7 +505,7 @@ impl PhraseCursor {
         // bit-test and its block is not yet decoded; on the ranked path it
         // was already decoded by `skip_to`, so this is a no-op there.
         let anchor = self.align_order[0];
-        let anchor_off = anchor as u32;
+        let anchor_off = self.position_offsets[anchor];
         self.members[anchor].cursor.materialize_at(aligned);
         self.members[anchor].decode_current_positions()?;
         self.verify_scratch.clear();
@@ -496,9 +522,9 @@ impl PhraseCursor {
             self.members[j].cursor.materialize_at(aligned);
             self.members[j].decode_current_positions()?;
             let plist = &self.members[j].pos_scratch;
-            let off = j as u32;
+            let off = self.position_offsets[j];
             // Compact the survivors in place: keep a start iff member `j`
-            // holds `start + j`.
+            // holds `start + position_offsets[j]`.
             let mut w = 0usize;
             for r in 0..self.verify_scratch.len() {
                 let start = self.verify_scratch[r];
@@ -666,10 +692,15 @@ impl AnyCursor {
 #[cfg(test)]
 mod tests {
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::reader::{FtsReader, core::ClauseLists};
+    use crate::superfile::fts::{
+        reader::{FtsReader, core::ClauseLists},
+        tokenize::Phrase,
+    };
 
-    fn phrase(terms: &[&str]) -> Vec<Vec<String>> {
-        vec![terms.iter().map(|t| t.to_string()).collect()]
+    fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
+        vec![Phrase::adjacent(
+            terms.iter().map(|t| t.to_string()).collect(),
+        )]
     }
 
     #[tokio::test]

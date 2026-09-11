@@ -19,7 +19,7 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue},
+        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue, tokenize::Phrase},
     },
 };
 
@@ -125,7 +125,7 @@ impl FtsReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
@@ -157,10 +157,10 @@ impl FtsReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
         neg_terms: &[&str],
-        neg_phrases: &[Vec<String>],
+        neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.

@@ -9,7 +9,11 @@ use std::{ops::Range, sync::Arc};
 
 use serde::Deserialize;
 
-use crate::superfile::fts::{bm25, tokenize::Tokenizer};
+use crate::superfile::fts::{
+    analysis::{Base, Stemmer, Stopwords},
+    bm25,
+    tokenize::Tokenizer,
+};
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
 ///
@@ -293,10 +297,21 @@ pub struct ColumnMeta {
     /// `inf.fts.columns`); phrase queries require it.
     pub positions: bool,
     /// Tokenizer for this column, reconstructed at open time from the
-    /// `tokenizer` name in `inf.fts.columns`. Query terms for this
-    /// column must be tokenized with it to match how the column was
-    /// indexed.
+    /// `tokenizer` name in `inf.fts.columns` plus its `stopwords` /
+    /// `stemmer` fields. Query terms for this column must be tokenized
+    /// with it to match how the column was indexed.
     pub tokenizer: Arc<dyn Tokenizer>,
+    /// The column's base tokenizer, kept beside the assembled
+    /// [`ColumnMeta::tokenizer`] so a rebuild can reconstruct the same
+    /// chain from its components. `Tokenizer::name` reports the chain's
+    /// derived identity, which is not a name any lookup accepts back.
+    pub(crate) base: Base,
+    /// The column's stopword set, kept for the same reason as
+    /// [`ColumnMeta::base`].
+    pub stopwords: Stopwords,
+    /// The column's stemmer, kept for the same reason as
+    /// [`ColumnMeta::base`].
+    pub stemmer: Stemmer,
     /// Whether the column's raw text is kept in the Parquet body (from
     /// `inf.fts.columns`). Index-only columns (`false`) are searchable
     /// but absent from the stored schema, so they cannot be read back;
@@ -357,12 +372,40 @@ pub struct FtsColumnConfig {
     /// default ([`bm25::B`]) as [`FtsColumnConfig::k1`].
     #[serde(default = "default_b")]
     pub b: f32,
+    /// Stopword set applied to this column, by name. Absent means no
+    /// set — the one thing a file written before the filter existed can
+    /// mean, so a missing field needs no guess. A *present* name this
+    /// engine does not ship is a different matter and fails the open:
+    /// there is no sound way to analyze without a set the index was
+    /// built with.
+    #[serde(default)]
+    pub stopwords: Option<String>,
+    /// Stemmer applied to this column, by name; same absent-means-off
+    /// and unknown-name-fails rules as [`FtsColumnConfig::stopwords`].
+    #[serde(default)]
+    pub stemmer: Option<String>,
 }
 
 impl FtsColumnConfig {
     /// The parameters this column's bounds were baked at.
     pub fn params(&self) -> bm25::Bm25Params {
         bm25::Bm25Params::new(self.k1, self.b)
+    }
+
+    /// This column's analysis filters. `Err` carries the offending
+    /// field name and value for an entry naming a filter this engine
+    /// cannot reproduce — the caller turns that into a read error
+    /// rather than analyzing the column some other way.
+    pub fn filters(&self) -> Result<(Stopwords, Stemmer), (&'static str, &str)> {
+        let stopwords = match &self.stopwords {
+            None => Stopwords::None,
+            Some(name) => Stopwords::from_name(name).ok_or(("stopwords", name.as_str()))?,
+        };
+        let stemmer = match &self.stemmer {
+            None => Stemmer::None,
+            Some(name) => Stemmer::from_name(name).ok_or(("stemmer", name.as_str()))?,
+        };
+        Ok((stopwords, stemmer))
     }
 }
 
@@ -409,10 +452,98 @@ impl OpenOptions {
 mod tests {
     use bytes::Bytes;
 
+    /// The two boundary rules the analysis fields live by, asserted on
+    /// the deserializer directly because both are invisible in a
+    /// round-trip through our own writer.
+    ///
+    /// Absent means off: a file written before the filters existed has
+    /// no such field, and that can only mean it was built unfiltered —
+    /// so a current reader infers the right analysis with no guess. An
+    /// unrecognized *value* is the opposite case and must not be
+    /// tolerated: analyzing without a set the postings were built with
+    /// is a different index, not a degraded one.
+    #[test]
+    fn absent_analysis_fields_mean_off_and_unknown_values_are_refused() {
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard"}"#).expect("parse");
+        assert_eq!(entry.stopwords, None);
+        assert_eq!(entry.stemmer, None);
+        assert_eq!(
+            entry.filters().expect("no filters resolves"),
+            (Stopwords::None, Stemmer::None)
+        );
+
+        let entry: FtsColumnConfig = serde_json::from_str(
+            r#"{"name":"body","tokenizer":"standard","stopwords":"english","stemmer":"english"}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            entry.filters().expect("known filters resolve"),
+            (Stopwords::English, Stemmer::English)
+        );
+
+        // A filter this engine does not ship, in either field.
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stopwords":"german"}"#)
+                .expect("the field parses; resolving it is what fails");
+        assert_eq!(entry.filters(), Err(("stopwords", "german")));
+        let entry: FtsColumnConfig =
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stemmer":"porter"}"#)
+                .expect("parse");
+        assert_eq!(entry.filters(), Err(("stemmer", "porter")));
+    }
+
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
     };
+
+    // ── Column length totals ──────────────────────────────────────────
+
+    #[test]
+    fn length_totals_sum_and_average_over_documents_that_carry_tokens() {
+        let mut a = ColumnLengthStats {
+            total_tokens: 40,
+            n_scored_docs: 4,
+        };
+        assert_eq!(a.avgdl(), 10.0);
+        a.merge_with(&ColumnLengthStats {
+            total_tokens: 20,
+            n_scored_docs: 1,
+        });
+        // 60 tokens over 5 documents — the fold is a plain sum, which is
+        // what makes a fragmented table average the same as one file.
+        assert_eq!(a.total_tokens, 60);
+        assert_eq!(a.n_scored_docs, 5);
+        assert_eq!(a.avgdl(), 12.0);
+    }
+
+    #[test]
+    fn a_column_no_document_contributes_to_has_no_average() {
+        // Not a division by zero and not a 1.0 default: zero is the value
+        // `NormTable::new` reads as "never scored", which keeps an empty
+        // column off the scoring path entirely.
+        let empty = ColumnLengthStats::default();
+        assert_eq!(empty.avgdl(), 0.0);
+        let mut a = empty;
+        a.merge_with(&empty);
+        assert_eq!(a.avgdl(), 0.0);
+    }
+
+    #[test]
+    fn merging_an_empty_contributor_changes_nothing() {
+        // A superfile that indexes the column but holds no document with
+        // tokens in it must leave the table-wide average alone rather
+        // than pulling it toward zero.
+        let mut a = ColumnLengthStats {
+            total_tokens: 99,
+            n_scored_docs: 9,
+        };
+        let before = a.avgdl();
+        a.merge_with(&ColumnLengthStats::default());
+        assert_eq!(a.avgdl(), before);
+        assert_eq!(a.n_scored_docs, 9);
+    }
 
     // ── Corpus statistics over a sparse column ────────────────────────
 

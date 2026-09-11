@@ -63,7 +63,7 @@ use crate::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
                 PreparedClauses, ScoringOverride, TermPattern,
             },
-            tokenize::Tokenizer,
+            tokenize::{Phrase, Tokenizer},
         },
         vector::{
             layout::VectorLayout,
@@ -1156,11 +1156,11 @@ impl SuperfileReader {
         let musts: Vec<&str> = clauses.musts.iter().map(|t| &**t).collect();
         let shoulds: Vec<&str> = clauses.shoulds.iter().map(|t| &**t).collect();
         let negatives: Vec<&str> = clauses.negatives.iter().map(|t| &**t).collect();
-        let own = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
-            phrases
-                .into_iter()
-                .map(|p| p.into_iter().map(Cow::into_owned).collect())
-                .collect()
+        // `Phrase::map` keeps each term's offset, which is what a
+        // phrase on a stopworded column needs: its terms were not
+        // adjacent in the query and must not be required adjacent here.
+        let own = |phrases: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+            phrases.iter().map(|p| p.map(|t| t.to_string())).collect()
         };
         let must_phrases = own(clauses.must_phrases);
         let should_phrases = own(clauses.should_phrases);
@@ -1293,7 +1293,7 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
@@ -1311,10 +1311,10 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
         neg_terms: &[&str],
-        neg_phrases: &[Vec<String>],
+        neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()

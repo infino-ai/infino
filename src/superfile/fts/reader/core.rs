@@ -46,12 +46,13 @@ use crate::superfile::{
         },
     },
     fts::{
+        analysis::{Base, chain_tokenizer},
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,
         positions::decode_run,
         posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
-        tokenize::{Tokenizer, tokenizer_for_name},
+        tokenize::{Phrase, Tokenizer},
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
@@ -75,9 +76,9 @@ pub(crate) struct ClauseLists<'a> {
     pub musts: &'a [&'a str],
     pub shoulds: &'a [&'a str],
     pub negatives: &'a [&'a str],
-    pub must_phrases: &'a [Vec<String>],
-    pub should_phrases: &'a [Vec<String>],
-    pub negative_phrases: &'a [Vec<String>],
+    pub must_phrases: &'a [Phrase<String>],
+    pub should_phrases: &'a [Phrase<String>],
+    pub negative_phrases: &'a [Phrase<String>],
     /// Per-term global idf for [`Bm25Stats::Global`], the default;
     /// `None` scores with [`Bm25Stats::PerSuperfile`] local idf.
     pub global_idf: Option<&'a GlobalTermIdf>,
@@ -968,12 +969,24 @@ impl FtsReader {
             if bounds_carry_k1_plus_one {
                 bound_scale /= params.k1 + 1.0;
             }
-            let tokenizer = tokenizer_for_name(&col_cfg.tokenizer).ok_or_else(|| {
+            let base = Base::from_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
                     col_cfg.tokenizer, col_cfg.name
                 )))
             })?;
+            // A filter the entry names but this engine does not ship
+            // cannot be worked around: analyzing without it would query
+            // the column differently than its postings were built. An
+            // *absent* filter field is the opposite case and needs no
+            // guess — it means the filter is off.
+            let (stopwords, stemmer) = col_cfg.filters().map_err(|(field, value)| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "inf.fts.columns: unknown {field} {value:?} for column {:?}",
+                    col_cfg.name
+                )))
+            })?;
+            let tokenizer = chain_tokenizer(base, stopwords, stemmer);
             columns.push(ColumnMeta {
                 name: col_cfg.name.clone(),
                 doc_lengths_range: doc_lengths_offset..array_end,
@@ -984,6 +997,9 @@ impl FtsReader {
                 bound_scale,
                 positions: col_cfg.positions,
                 tokenizer,
+                base,
+                stopwords,
+                stemmer,
                 stored: col_cfg.stored,
             });
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
@@ -1221,7 +1237,7 @@ impl FtsReader {
         &self,
         column_id: u32,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         global_idf: Option<&GlobalTermIdf>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
@@ -1313,7 +1329,10 @@ impl FtsReader {
                 .collect();
             let positions = self.fetch_term_positions(&pos_ranges).await?;
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
-                cursors, positions, positional,
+                cursors,
+                positions,
+                positional,
+                phrase.offsets().to_vec(),
             )?)));
         }
         Ok((out, dict_ranges))
@@ -1906,6 +1925,36 @@ fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The reader refuses to open a column whose entry names a filter
+    /// this engine cannot reproduce, and names the field and the value
+    /// so the operator can see which engine version is needed.
+    ///
+    /// Asserted through `open` rather than on the resolver alone: the
+    /// resolver is where the decision is made, but the `map_err` that
+    /// turns it into a read error is the part a caller actually sees,
+    /// and a `?` dropped there would let the column open unfiltered.
+    #[tokio::test]
+    async fn open_refuses_a_column_naming_an_unreproducible_filter() {
+        let (blob, json) = build_blob();
+        // Sanity: the fixture opens before it is tampered with, so a
+        // failure below is the filter and not the fixture.
+        FtsReader::open(blob.clone(), &json).expect("untampered fixture opens");
+        for (field, value) in [("stopwords", "german"), ("stemmer", "porter")] {
+            let patched = json.replace(
+                r#""tokenizer":"#,
+                &format!(r#""{field}":"{value}","tokenizer":"#),
+            );
+            assert_ne!(patched, json, "{field}: fixture did not patch");
+            let err = FtsReader::open(blob.clone(), &patched)
+                .expect_err("an unreproducible filter must fail the open");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(field) && msg.contains(value),
+                "{field}: the error must name the field and value, got: {msg}"
+            );
+        }
+    }
     use std::collections::HashSet;
 
     use super::{super::test_util::*, *};
@@ -1913,6 +1962,182 @@ mod tests {
         BytesLazyByteSource,
         fts::{bm25, builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer},
     };
+
+    /// Byte offset of the blob's version field.
+    const VERSION_FIELD: std::ops::Range<usize> = 8..12;
+
+    /// A corpus big enough to produce several posting blocks, so the
+    /// blob carries a real skip table (and, when coarse is on, a coarse
+    /// table) rather than a single degenerate block.
+    fn versioned_blob(write_coarse: bool) -> (Bytes, &'static str) {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.write_coarse = write_coarse;
+        b.register_column("body".into(), false).expect("register");
+        for doc in 0..600u32 {
+            let text = match doc % 3 {
+                0 => format!("common shared alpha d{doc}"),
+                1 => format!("common beta d{doc}"),
+                _ => format!("common shared gamma delta d{doc}"),
+            };
+            b.add_doc(0, doc, &text).expect("add doc");
+        }
+        (
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+        )
+    }
+
+    /// The `(k1 + 1)` the score no longer carries, which every stored
+    /// bound written before the current blob version still does.
+    fn legacy_bound_factor() -> f32 {
+        1.0 / (bm25::Bm25Params::STANDARD.k1 + 1.0)
+    }
+
+    #[test]
+    fn current_version_bounds_need_no_scale_correction() {
+        let (blob, json) = versioned_blob(true);
+        assert_eq!(
+            read_u32_le(&blob[VERSION_FIELD]),
+            format::fts::VERSION_V6,
+            "the builder writes the current version"
+        );
+        let r = FtsReader::open(blob, json).expect("open");
+        assert_eq!(
+            r.columns[0].bound_scale, 1.0,
+            "bounds baked at the current scale need no correction"
+        );
+    }
+
+    #[test]
+    fn pre_current_version_bounds_are_corrected_to_the_current_scale() {
+        // A no-coarse build still stamps a pre-V6 version, so its bounds
+        // carry the factor the scorer dropped and must be divided out —
+        // otherwise they sit a uniform 2.2x above the scores they cap
+        // and block-max pruning stops doing its job on every file
+        // written before this.
+        let (blob, json) = versioned_blob(false);
+        assert!(
+            read_u32_le(&blob[VERSION_FIELD]) < format::fts::VERSION_V6,
+            "a no-coarse build must stamp a pre-current version"
+        );
+        let r = FtsReader::open(blob, json).expect("open");
+        assert!(
+            (r.columns[0].bound_scale - legacy_bound_factor()).abs() < 1e-6,
+            "expected the legacy bound factor, got {}",
+            r.columns[0].bound_scale
+        );
+    }
+
+    #[test]
+    fn the_version_before_current_is_read_as_legacy_scale() {
+        // The builder can no longer emit it — it writes the current
+        // version or drops to the no-coarse one — but it is what the
+        // released engine wrote, so every file already on disk is this
+        // version and it is the read path that matters most.
+        //
+        // The layout is byte-for-byte identical to the current one and
+        // only the bound *scale* differs, so stamping the version is
+        // enough to exercise the classification: what must hold is that
+        // it is treated as legacy and its bounds corrected. Reading it
+        // as current would leave them 2.2x too large — sound but with
+        // pruning disabled — and the opposite mistake, reading a
+        // current blob as legacy, would divide bounds that are already
+        // right and silently prune real hits out of the top-k.
+        let (current, json) = versioned_blob(true);
+        let mut bytes = current.to_vec();
+        bytes[VERSION_FIELD].copy_from_slice(&format::fts::VERSION_V5.to_le_bytes());
+        let previous = Bytes::from(bytes);
+
+        let r = FtsReader::open(previous, json).expect("the previous version still opens");
+        assert!(
+            (r.columns[0].bound_scale - legacy_bound_factor()).abs() < 1e-6,
+            "expected the legacy bound factor, got {}",
+            r.columns[0].bound_scale
+        );
+        // And it is genuinely the version-gated half doing the work: the
+        // same bytes read at the current version take no correction.
+        let r_current = FtsReader::open(current, json).expect("open");
+        assert_eq!(r_current.columns[0].bound_scale, 1.0);
+    }
+
+    #[test]
+    fn every_accepted_version_still_opens_and_searches() {
+        // A guard on the accept list itself: a version dropped from it
+        // turns every file written by that release into an open error.
+        for v in [
+            format::fts::VERSION_V4,
+            format::fts::VERSION_V5,
+            format::fts::VERSION_V6,
+        ] {
+            let (current, json) = versioned_blob(true);
+            let mut bytes = current.to_vec();
+            bytes[VERSION_FIELD].copy_from_slice(&v.to_le_bytes());
+            let r = FtsReader::open(Bytes::from(bytes), json)
+                .unwrap_or_else(|e| panic!("version {v} must open: {e}"));
+            assert!(
+                r.columns[0].bound_scale > 0.0,
+                "version {v} must yield a usable bound correction"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reused_scored_view_matches_a_freshly_derived_one() {
+        // The view is memoized on the reader so it is not rebuilt per
+        // call. Reuse is only safe because deriving it is a pure
+        // function of the override, so a cached view and a fresh one
+        // must agree on everything scoring reads — otherwise a query
+        // would score differently depending on whether it happened to
+        // be the first to ask.
+        let (blob, json) = versioned_blob(true);
+        let r = FtsReader::open(blob, json).expect("open");
+        let over = ScoringOverride {
+            params: Some(bm25::Bm25Params::new(1.4, 0.6)),
+            avgdl: Some(r.columns[0].avgdl * 1.5),
+        };
+        let first = r.with_scoring_override(over);
+        let second = r.with_scoring_override(over);
+        let a = &first.columns[0];
+        let b = &second.columns[0];
+        assert_eq!(a.params, b.params);
+        assert_eq!(a.avgdl, b.avgdl);
+        assert_eq!(a.bound_scale, b.bound_scale);
+        assert_eq!(a.length_stats, b.length_stats);
+        for doc in 0..r.n_docs() {
+            assert_eq!(
+                a.dl_norm_k1.get(doc),
+                b.dl_norm_k1.get(doc),
+                "doc {doc} normalizer differs between two derivations"
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_that_only_moves_the_average_still_rescales() {
+        // The parameter pair is unchanged here, so a correction keyed on
+        // the pair alone would return the file's own table untouched and
+        // score against the wrong average while claiming otherwise.
+        let (blob, json) = versioned_blob(true);
+        let r = FtsReader::open(blob, json).expect("open");
+        let baseline = r.columns[0].dl_norm_k1.get(0);
+        let view = r.with_scoring_override(ScoringOverride {
+            params: None,
+            avgdl: Some(r.columns[0].avgdl * 2.0),
+        });
+        assert_eq!(
+            view.columns[0].params, r.columns[0].params,
+            "pair unchanged"
+        );
+        assert_ne!(
+            view.columns[0].dl_norm_k1.get(0),
+            baseline,
+            "a doubled average must change the per-doc normalizer"
+        );
+        assert!(
+            view.columns[0].bound_scale > r.columns[0].bound_scale,
+            "and must inflate the stored bounds to stay above the scores"
+        );
+    }
 
     #[test]
     fn open_accepts_valid_blob() {

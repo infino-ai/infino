@@ -73,10 +73,7 @@ use crate::{
         ManifestSnapshot, SupertableOptions,
         error::CommitError as ManifestCommitError,
         handle::{Supertable, SupertableInner},
-        manifest::{
-            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
-            bloom::BloomBuilder,
-        },
+        manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::superfile_reader::superfile_reader,
         utils::vector_split::split_vectors,
@@ -89,9 +86,9 @@ use crate::{
             tombstones_codec::TombstonesSidecar,
         },
         writer::{
-            CommitListMetadata, build_column_vector_summary, build_packed_update_superfile,
-            build_subsection_offsets, owned_vector_arrays, persist_commit,
-            read_vector_layout_from_bytes, stamp_tombstone_seqs,
+            CommitListMetadata, build_column_vector_summary, build_fts_summary,
+            build_packed_update_superfile, build_subsection_offsets, owned_vector_arrays,
+            persist_commit, read_vector_layout_from_bytes, stamp_tombstone_seqs,
         },
     },
 };
@@ -633,51 +630,6 @@ fn prepend_id_column(
             message: format!("RecordBatch::try_new with _id prepended: {e}"),
         }
     })
-}
-
-/// Per-FTS-column bloom + range summary derived from the
-/// just-built superfile's `SuperfileReader`. Mirrors the shape
-/// the writer's `prepare_superfile` builds so summaries match
-/// regardless of which code path produced the superfile.
-fn build_fts_summary(
-    reader: &SuperfileReader,
-    options: &SupertableOptions,
-) -> HashMap<String, FtsSummaryAgg> {
-    let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
-    let Some(fts_reader) = reader.fts() else {
-        return out;
-    };
-    for fc in &options.fts_columns {
-        let terms = fts_reader
-            .iter_column_terms(&fc.column)
-            .expect("FST bytes valid: superfile just built");
-        let n_terms_distinct = terms.len() as u32;
-        let (min_term, max_term) = match (terms.first(), terms.last()) {
-            (Some(min), Some(max)) => (min.clone(), max.clone()),
-            _ => (Vec::new(), Vec::new()),
-        };
-        // Size the bloom to this superfile's distinct-term count rather than a
-        // fixed 64 KiB. Readers derive the block count from the byte length.
-        let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
-        for term in &terms {
-            bloom_builder.insert(term);
-        }
-        // See the commit path's counterpart: the totals ride the summary
-        // so table-wide statistics stay a manifest fold.
-        let length_stats = fts_reader
-            .column_length_stats(&fc.column)
-            .expect("column just registered in this superfile's FTS index");
-        out.insert(
-            fc.column.clone(),
-            FtsSummaryAgg::new_with_params(
-                bloom_builder.finish(),
-                n_terms_distinct,
-                (min_term, max_term),
-                length_stats,
-            ),
-        );
-    }
-    out
 }
 
 /// Per-vector-column centroid summary (fp32 + 1-bit admit slab; see

@@ -172,7 +172,14 @@ fn compute(
     if emit_analyzers {
         push_tag(&mut buf, b"fts_analyzers");
         for c in &opts.fts_columns {
-            push_str(&mut buf, &c.analyzer);
+            // The column's whole analysis as one derived string, not
+            // just its base name: two columns sharing a base but
+            // differing in a stopword set or stemmer are tokenized
+            // differently, so they must not hash alike. A column with
+            // no filter derives to its plain base name, keeping the
+            // stream byte-identical to hashes stamped before filters
+            // existed.
+            push_str(&mut buf, c.chain_name().unwrap_or(c.analyzer.as_str()));
         }
     }
     // 3d. stored flags — same only-when-non-default rule: an all-stored
@@ -333,6 +340,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        Stemmer, Stopwords,
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -887,6 +895,63 @@ mod tests {
         assert!(rendered.contains(&expected.to_hex()), "got: {rendered}");
         // 32 bytes of 0x02 → 64-char hex string.
         assert!(rendered.contains(&"02".repeat(32)), "got: {rendered}");
+    }
+
+    /// A column's analysis filters join the table's identity, and a
+    /// filterless table's identity does not move.
+    ///
+    /// Both halves matter. The first: two tables differing only in a
+    /// stopword set hold different terms, so reopening one with the
+    /// other's options must mismatch rather than silently query a
+    /// differently-analyzed index. The second: the filters ride the
+    /// *derived* analyzer identity rather than a block of their own, and
+    /// a column with no filter derives to its plain tokenizer name — so
+    /// the byte stream for every table that predates the filters is
+    /// unchanged and its stored hash still verifies.
+    #[test]
+    fn analysis_filters_join_the_hash_and_a_filterless_table_is_unchanged() {
+        let strategy = time_range();
+        let hash_of = |fts: FtsConfig| {
+            let opts =
+                SupertableOptions::new(schema_title_only(), vec![fts], vec![]).expect("options");
+            compute_options_hash(&opts, &strategy)
+        };
+
+        let plain = hash_of(FtsConfig::new("title"));
+        let stopped = hash_of(FtsConfig::new("title").stopwords(Stopwords::English));
+        let stemmed = hash_of(FtsConfig::new("title").stemmer(Stemmer::English));
+        let both = hash_of(
+            FtsConfig::new("title")
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
+        );
+        for (label, h) in [
+            ("stopwords", &stopped),
+            ("stemmer", &stemmed),
+            ("both", &both),
+        ] {
+            assert_ne!(
+                &plain, h,
+                "{label}: a filtered column must not hash like an unfiltered one"
+            );
+        }
+        assert_ne!(&stopped, &stemmed, "the two filters are distinguishable");
+        assert_ne!(&stopped, &both);
+        assert_ne!(&stemmed, &both);
+
+        // Declaring the filters off explicitly is the same table as not
+        // mentioning them, so an existing table's stored hash still
+        // verifies after this feature ships.
+        assert_eq!(
+            plain,
+            hash_of(
+                FtsConfig::new("title")
+                    .stopwords(Stopwords::None)
+                    .stemmer(Stemmer::None)
+            ),
+            "a filterless column must hash exactly as it did before \
+             filters existed"
+        );
     }
 
     #[test]
