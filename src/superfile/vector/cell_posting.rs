@@ -767,6 +767,13 @@ pub(crate) fn transcode_clamped_components() -> u64 {
     TRANSCODE_CLAMPED_COMPONENTS.load(AtomicOrdering::Relaxed)
 }
 
+/// Serializes tests — in this module and others (e.g. `ivf_merge`) — that
+/// assert an exact delta on the process-wide [`TRANSCODE_CLAMPED_COMPONENTS`]
+/// counter. cargo runs tests in parallel, so without this each would observe
+/// another's increments in its before/after window and see the wrong count.
+#[cfg(test)]
+pub(crate) static TRANSCODE_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Add to the transcode-clamp tally. Used by single-plane codecs whose merge
 /// re-encode lives outside this module (the Sq8 residual transcode above bumps
 /// the counter inline); a no-op for the common zero-clamp row.
@@ -973,15 +980,9 @@ pub fn load_encoded_rows_from_blob(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::{Arc, PoisonError};
 
     use super::*;
-
-    /// Serializes the tests that assert an exact delta on the process-wide
-    /// [`TRANSCODE_CLAMPED_COMPONENTS`] counter. cargo runs tests in parallel,
-    /// so without this each would observe the other's increments in its
-    /// before/after window and see the wrong count.
-    static TRANSCODE_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
     use crate::superfile::{
         builder::VectorConfig,
         vector::{

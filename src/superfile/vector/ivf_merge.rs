@@ -234,22 +234,88 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
         (vec![1.0f32; n_cent * dim], vec![0.0f32; n_cent * dim])
     };
     if has_cluster_quant {
-        // Copy the first contributing input's per-cluster ruler as the
-        // destination grid; per-row transcode below re-encodes the other inputs
-        // onto it (clamping any out-of-range component). This matches the
-        // existing merge behavior for every fitted/fixed cluster-quant codec.
-        // (Sizing the destination grid to cover every input's range so no
-        // component clamps is a separate future change, not bundled here.)
-        for c in 0..n_cent {
-            for inp in parsed {
-                let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
-                if count == 0 {
+        if codec.fits_per_cluster_ruler() {
+            // Fitted/adaptive cluster-quant codecs (`Sq8Residual`,
+            // `Sq16Adaptive`) fit each cluster's ruler to that input's own
+            // `[min, max]`, so different inputs contributing to the same merged
+            // cluster carry DIFFERENT grids. Sizing the destination to the FIRST
+            // input's grid clamps every later input's out-of-range components —
+            // at 100M a compaction merges cells with divergent magnitude ranges,
+            // so hundreds of millions of components saturate and recall craters.
+            // Instead size the destination grid to the per-component UNION of
+            // every contributing input's range, so no component clamps.
+            //
+            // Input `i` covers `[offset_i, offset_i + scale_i * code_max]` for a
+            // component (its ruler was fit as `scale_i = (max - min) / code_max`,
+            // `offset_i = min`). The union is `[min offset_i, max hi_i]`, and the
+            // merged ruler is `offset = lo`, `scale = (hi - lo) / code_max`.
+            let code_max = codec.code_max();
+            let mut lo = vec![0f32; dim];
+            let mut hi = vec![0f32; dim];
+            let mut min_scale = vec![0f32; dim];
+            for c in 0..n_cent {
+                let base = c * dim;
+                let mut any = false;
+                for inp in parsed {
+                    let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+                    if count == 0 {
+                        continue;
+                    }
+                    let s = &inp.scale[base..base + dim];
+                    let o = &inp.offset[base..base + dim];
+                    if !any {
+                        for d in 0..dim {
+                            lo[d] = o[d];
+                            hi[d] = o[d] + s[d] * code_max;
+                            min_scale[d] = s[d];
+                        }
+                        any = true;
+                    } else {
+                        for d in 0..dim {
+                            lo[d] = lo[d].min(o[d]);
+                            hi[d] = hi[d].max(o[d] + s[d] * code_max);
+                            min_scale[d] = min_scale[d].min(s[d]);
+                        }
+                    }
+                }
+                if !any {
+                    // Cluster empty in every input: keep the neutral 1.0/0.0
+                    // seed. Its slot is never read for a fitted codec.
                     continue;
                 }
-                let off = c * dim;
-                dst_scale[off..off + dim].copy_from_slice(&inp.scale[off..off + dim]);
-                dst_offset[off..off + dim].copy_from_slice(&inp.offset[off..off + dim]);
-                break;
+                for d in 0..dim {
+                    dst_offset[base + d] = lo[d];
+                    // Guard a zero-span union (every contributing input pinned
+                    // the same constant offset with `scale == 0`): fall back to
+                    // the smallest input scale when it is positive, else a tiny
+                    // epsilon, so decode never divides by zero / yields a
+                    // zero-width grid. A positive scale in any input forces
+                    // `hi > lo`, so this branch is defensive.
+                    dst_scale[base + d] = if hi[d] > lo[d] {
+                        (hi[d] - lo[d]) / code_max
+                    } else if min_scale[d] > 0.0 {
+                        min_scale[d]
+                    } else {
+                        f32::EPSILON
+                    };
+                }
+            }
+        } else {
+            // Fixed-grid cluster-quant codec (`Sq8FixedResidual`): every input
+            // shares one pinned grid, so copying the first contributing input's
+            // ruler is already exact — no union needed. The per-row transcode
+            // below finds source == destination and copies bytes verbatim.
+            for c in 0..n_cent {
+                for inp in parsed {
+                    let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+                    if count == 0 {
+                        continue;
+                    }
+                    let off = c * dim;
+                    dst_scale[off..off + dim].copy_from_slice(&inp.scale[off..off + dim]);
+                    dst_offset[off..off + dim].copy_from_slice(&inp.offset[off..off + dim]);
+                    break;
+                }
             }
         }
     }
@@ -1330,5 +1396,137 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    /// Merging two fitted-ruler (`Sq16Adaptive`) cells whose per-cluster rulers
+    /// cover DISJOINT magnitude ranges must size the destination grid to the
+    /// UNION of both inputs, so the per-row transcode re-encodes every input
+    /// without clamping a single component. The pre-fix merge copied the FIRST
+    /// input's ruler as the destination and clamped every out-of-range component
+    /// of the other input — at 100M that saturated hundreds of millions of
+    /// components and cratered recall. The tripwire counter must stay flat.
+    #[test]
+    fn sq16_adaptive_merge_union_ruler_never_clamps() {
+        use std::sync::PoisonError;
+
+        use crate::superfile::vector::{
+            cell_posting::{TRANSCODE_COUNTER_TEST_LOCK, transcode_clamped_components},
+            distance::{dequantize_sq16_adaptive_into, encode_sq16_adaptive_row},
+        };
+
+        // Serialize against the other tests that read the process-wide
+        // transcode-clamp counter (see `TRANSCODE_COUNTER_TEST_LOCK`).
+        let _serialize = TRANSCODE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        const D: usize = 8;
+        const NR: usize = 32;
+
+        // One centroid at the origin so every row lands in cluster 0 and each
+        // input fits its own cluster-0 ruler over its own magnitude band.
+        let adaptive_cell = |shift: f32, id_base: i128| -> MergedIvfSubsection {
+            let mut vectors = Vec::with_capacity(NR * D);
+            for r in 0..NR {
+                for d in 0..D {
+                    // A tight band around `shift`: the two cells (shift 0 vs
+                    // shift 100) fit rulers that do not overlap.
+                    vectors.push(shift + ((r * 3 + d) % 5) as f32 * 0.1);
+                }
+            }
+            let ids: Vec<i128> = (0..NR as i128).map(|i| id_base + i).collect();
+            let cfg = VectorConfig {
+                column: "emb".into(),
+                dim: D,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Sq16Adaptive,
+                provided_centroids: Some(Arc::from(vec![0.0f32; D])),
+            };
+            build_merged_subsection_from_fp32(cfg, 1, Arc::new(vectors), &ids)
+                .expect("Sq16Adaptive cell build")
+        };
+
+        let parse = |sub: &MergedIvfSubsection| {
+            sq8_ivf_merge_input_from_subsection(
+                &sub.bytes,
+                D,
+                sub.n_cent,
+                sub.n_docs,
+                Metric::L2Sq,
+                RerankCodec::Sq16Adaptive,
+                None,
+            )
+            .expect("parse Sq16Adaptive merge input")
+        };
+
+        let low = adaptive_cell(0.0, 1_000);
+        let high = adaptive_cell(100.0, 2_000);
+        let inputs = [parse(&low), parse(&high)];
+        let code_max = RerankCodec::Sq16Adaptive.code_max();
+
+        // Per-component grid span `[offset, offset + scale*code_max]` for a
+        // cluster-0 dim of one input.
+        let grid = |inp: &Sq8IvfMergeInput, d: usize| -> (f32, f32) {
+            (inp.offset[d], inp.offset[d] + inp.scale[d] * code_max)
+        };
+
+        // Precondition: the second input's ruler runs outside the first's grid
+        // on some dims, so the pre-fix copy-first-input destination could not
+        // have represented it without clamping. (Rotation can leave a stray dim
+        // overlapping, so this is a per-fixture count, not an every-dim claim.)
+        let old_grid_would_clamp = (0..D)
+            .filter(|&d| {
+                let (lo_a, hi_a) = grid(&inputs[0], d);
+                let (lo_b, hi_b) = grid(&inputs[1], d);
+                hi_b > hi_a || lo_b < lo_a
+            })
+            .count();
+        assert!(
+            old_grid_would_clamp > 0,
+            "fixture must force the pre-fix first-input grid to clamp the second input"
+        );
+
+        let before = transcode_clamped_components();
+        let merged = merge_sq8_ivf_subsections_from_parsed(&inputs).expect("union merge");
+        assert_eq!(
+            transcode_clamped_components() - before,
+            0,
+            "a union-covering destination grid must clamp zero components across the merge"
+        );
+
+        // The merged ruler must cover the union of both inputs' ranges per dim.
+        let merged_input = parse(&merged);
+        for d in 0..D {
+            let (lo_a, hi_a) = grid(&inputs[0], d);
+            let (lo_b, hi_b) = grid(&inputs[1], d);
+            let (m_lo, m_hi) = grid(&merged_input, d);
+            let want_lo = lo_a.min(lo_b);
+            let want_hi = hi_a.max(hi_b);
+            let tol = (want_hi - want_lo).abs() * 1e-4 + 1e-3;
+            assert!(
+                m_lo <= want_lo + tol && m_hi >= want_hi - tol,
+                "dim {d}: merged grid [{m_lo},{m_hi}] must cover union [{want_lo},{want_hi}]"
+            );
+
+            // Round-trip the union extremes through the merged ruler: with the
+            // covering grid both encode without clamping and decode within one
+            // (wider) code step — the intended precision tradeoff.
+            let scale = &merged_input.scale[d..d + 1];
+            let offset = &merged_input.offset[d..d + 1];
+            for &v in &[want_lo, want_hi, 0.5 * (want_lo + want_hi)] {
+                let mut bytes = [0u8; 2];
+                let clamped = encode_sq16_adaptive_row(&[v], scale, offset, &mut bytes);
+                assert_eq!(clamped, 0, "dim {d}: value {v} must fit the union grid");
+                let mut decoded = [0f32; 1];
+                dequantize_sq16_adaptive_into(&bytes, scale, offset, &mut decoded);
+                assert!(
+                    (decoded[0] - v).abs() <= merged_input.scale[d] + 1e-6,
+                    "dim {d}: {v} round-trips to {} within one merged step {}",
+                    decoded[0],
+                    merged_input.scale[d]
+                );
+            }
+        }
     }
 }
