@@ -2270,6 +2270,7 @@ mod tests {
     fn manifest_entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -4224,6 +4225,7 @@ mod tests {
         let id = Uuid::new_v4();
         // One large superfile, well above SUBRANGE_MIN_DOCS (50k).
         let big = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),

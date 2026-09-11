@@ -49,13 +49,20 @@ impl DiskCacheStore {
     ///   directly — `DiskCacheStore::reader` rejects this mode
     ///   because the disk-cache layer isn't the right entry
     ///   point — `RangeOnly` bypasses the cache by design.
+    ///
+    /// Takes only the uri, so it is for a superfile with the unnamed key
+    /// shape (`data/seg-<uuid>.sf.parquet`): tests and benches that mint
+    /// their own. A query path holds the manifest entry and goes through
+    /// [`Self::reader_with_hints`] with `entry.storage_path()`, which is the
+    /// key a source-named superfile actually lives at.
     pub async fn reader(
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         // Default allows fill — same as FTS/SQL. Vector search must call
         // [`Self::reader_with_hints`] with `allow_background_fill = false`.
-        self.reader_with_hints(uri, None, None, true).await
+        self.reader_with_hints(uri, &uri.storage_path(), None, None, true)
+            .await
     }
 
     /// like [`Self::reader`] but takes a precomputed
@@ -75,23 +82,37 @@ impl DiskCacheStore {
     /// `None` falls back to the 2-RTT shape — same shape,
     /// slower. The other cold-fetch modes (`HybridWithPrefetch`,
     /// `RangeOnly`) ignore the hint today.
+    ///
+    /// `storage_key` is the object key the bytes live at — the manifest
+    /// entry's `storage_path()`. It travels beside `uri` because a
+    /// source-named superfile's key is not a function of its uuid; every
+    /// cache slot, coordinator and on-disk filename stays keyed by `uri`.
     pub async fn reader_with_hints(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
         allow_background_fill: bool,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         match self.config.cold_fetch_mode {
-            ColdFetchMode::HybridWithPrefetch => self.reader_hybrid(uri, storage).await,
+            ColdFetchMode::HybridWithPrefetch => {
+                self.reader_hybrid(uri, storage_key, storage).await
+            }
             ColdFetchMode::RangeOnly => Err(DiskCacheError::SuperfileOpen(
                 "ColdFetchMode::RangeOnly bypasses the disk cache; \
                  construct StorageRangeSource + open_lazy directly"
                     .into(),
             )),
             ColdFetchMode::LazyForegroundWithBackgroundFill => {
-                self.reader_lazy_with_bg_fill_hinted(uri, offsets, storage, allow_background_fill)
-                    .await
+                self.reader_lazy_with_bg_fill_hinted(
+                    uri,
+                    storage_key,
+                    offsets,
+                    storage,
+                    allow_background_fill,
+                )
+                .await
             }
         }
     }
@@ -106,14 +127,17 @@ impl DiskCacheStore {
     /// The query still succeeds by issuing range GETs for only the
     /// bytes the reader touches; nothing is admitted, so there's
     /// nothing to evict.
+    ///
+    /// Takes the object key alone: nothing here is keyed by uri, since no
+    /// cache entry is created.
     pub async fn open_range_only(
         self: &Arc<Self>,
-        uri: &SuperfileUri,
+        storage_key: &str,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         let fetch_storage = self.resolve_storage(storage);
-        let storage_uri = Self::storage_path(uri);
+        let storage_uri = storage_key.to_owned();
         let range_src: Arc<dyn LazyByteSource> = match offsets {
             Some(o) if o.total_size > 0 => Arc::new(StorageRangeSource::with_known_size(
                 fetch_storage,
@@ -137,12 +161,15 @@ impl DiskCacheStore {
     /// + fsync + mmap before returning. Public for integration
     /// tests that want this deterministic behavior; the
     /// production reader path uses `reader_hybrid`.
+    ///
+    /// Uri-only, so for the unnamed key shape (see [`Self::reader`]).
     pub async fn reader_synchronous(
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         let storage = Arc::clone(&self.storage);
-        self.reader_synchronous_with_storage(uri, storage).await
+        self.reader_synchronous_with_storage(uri, &uri.storage_path(), storage)
+            .await
     }
 
     /// Like [`Self::reader_synchronous`], but fetches a cache miss through
@@ -154,6 +181,7 @@ impl DiskCacheStore {
     pub async fn reader_synchronous_with_storage(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
@@ -166,7 +194,9 @@ impl DiskCacheStore {
                 self.release_entry_accounting(&removed);
             }
             self.coordinators.remove(uri);
-            let replacement = self.cold_fetch(uri, Arc::clone(&fetch_storage)).await?;
+            let replacement = self
+                .cold_fetch(uri, storage_key, Arc::clone(&fetch_storage))
+                .await?;
             return Ok(Arc::clone(&replacement.reader));
         }
         let cell = self
@@ -175,7 +205,10 @@ impl DiskCacheStore {
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
         let result = cell
-            .get_or_init(|| async { self.cold_fetch(uri, Arc::clone(&fetch_storage)).await })
+            .get_or_init(|| async {
+                self.cold_fetch(uri, storage_key, Arc::clone(&fetch_storage))
+                    .await
+            })
             .await;
         match result {
             Ok(entry) => {
@@ -185,7 +218,7 @@ impl DiskCacheStore {
             Err(_e) => {
                 self.coordinators.remove(uri);
                 Err(self
-                    .cold_fetch(uri, Arc::clone(&fetch_storage))
+                    .cold_fetch(uri, storage_key, Arc::clone(&fetch_storage))
                     .await
                     .err()
                     .unwrap_or(DiskCacheError::SuperfileOpen("cold fetch error".into())))
@@ -200,6 +233,7 @@ impl DiskCacheStore {
     pub(crate) async fn reader_hybrid(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
@@ -220,7 +254,8 @@ impl DiskCacheStore {
         let result = cell
             .get_or_init(|| async {
                 let fetch_storage = self.resolve_storage(storage);
-                self.cold_fetch_hybrid(uri, fetch_storage).await
+                self.cold_fetch_hybrid(uri, storage_key, fetch_storage)
+                    .await
             })
             .await;
         match result {
@@ -234,7 +269,7 @@ impl DiskCacheStore {
                 // and BudgetExceeded arms skip the clone.
                 self.coordinators.remove(uri);
                 let fetch_storage = self.resolve_storage(storage);
-                self.cold_fetch_hybrid(uri, fetch_storage)
+                self.cold_fetch_hybrid(uri, storage_key, fetch_storage)
                     .await
                     .map(|entry| Arc::clone(&entry.reader))
             }
@@ -391,7 +426,7 @@ mod tests {
 
         // Query path admission: lazy reader with no resident parquet bytes.
         let lazy = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .reader_with_hints(&uri, &uri.storage_path(), None, Some(&hidden_storage), true)
             .await
             .expect("lazy cold fetch via caller storage");
         assert!(
@@ -401,7 +436,7 @@ mod tests {
 
         // Compaction path must force an eager reopen via caller storage.
         let eager = cache
-            .reader_synchronous_with_storage(&uri, Arc::clone(&hidden_storage))
+            .reader_synchronous_with_storage(&uri, &uri.storage_path(), Arc::clone(&hidden_storage))
             .await
             .expect("synchronous compaction open");
         assert!(
@@ -438,7 +473,7 @@ mod tests {
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
         // offsets = None → unknown-size StorageRangeSource.
         let r = store
-            .open_range_only(&uri, None, None)
+            .open_range_only(&uri.storage_path(), None, None)
             .await
             .expect("range open");
         assert_eq!(r.n_docs(), 1);
@@ -463,7 +498,7 @@ mod tests {
             open_blob: Vec::new(),
         };
         let r = store
-            .open_range_only(&uri, Some(&offsets), None)
+            .open_range_only(&uri.storage_path(), Some(&offsets), None)
             .await
             .expect("known-size range open");
         assert_eq!(r.n_docs(), 1);

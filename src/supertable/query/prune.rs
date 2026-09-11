@@ -294,6 +294,7 @@ mod tests {
             ),
         );
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -502,6 +503,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -610,6 +612,7 @@ mod tests {
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),

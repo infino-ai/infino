@@ -47,7 +47,7 @@ mydb/                                     database root (the connect() path)
 │   │                  every superfile's own term dictionary
 │   │
 │   ├── data/
-│   │   └── <superfile>.sf.parquet        the superfiles (files prefixed seg-)
+│   │   └── <superfile>.sf.parquet        the superfiles: seg-<uuid>, or <stem>-<uuid> when appended with a source name
 │   │       ├ stores : valid Parquet columns + embedded BM25 + vector index,
 │   │       │          all in one file
 │   │       └ used   : the actual data + search; immutable, never rewritten
@@ -111,7 +111,9 @@ Who points to whom, and how many. The catalog lists many tables; each table pins
                     └──────────────────────┘  pass has run yet
 
    Legend
-     seg-X            = data/seg-<id>.sf.parquet   (the superfile: Parquet + BM25 + vector)
+     seg-X            = data/seg-<id>.sf.parquet   (the superfile: Parquet + BM25 + vector;
+                        data/<stem>-<id>.sf.parquet when the rows were appended with a
+                        source name — the stem is a label, the id keeps the key unique)
      X.tombstones     = superfiles/<id>.tombstones (shares the superfile's id)
      stats-<blake3>   = term-stats/stats-<blake3>.bin
 
@@ -139,6 +141,7 @@ Anchored by symbol so they survive line moves:
 | `_supertable/current` pointer text format + atomic-rename commit | `PointerFile`, `POINTER_PATH`, `commit_manifest` | [src/supertable/manifest/commit.rs](../../src/supertable/manifest/commit.rs) |
 | `manifest/manifest-NNNNNN.json` and `manifest-parts/part-<hash>.avro.zst` names | `MANIFEST_DIR`, `MANIFEST_PARTS_DIR`, `manifest_uri` | [src/supertable/manifest/commit.rs](../../src/supertable/manifest/commit.rs) |
 | `data/seg-<uuid>.sf.parquet` name | `SuperfileUri::storage_path` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
+| `data/<stem>-<uuid>.sf.parquet` name (source-named) | `SuperfileEntry::storage_path`, `superfile_stem` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | manifest-part Avro schema (`superfiles[].uri`, summaries) | `SuperfileEntry` schema | [src/supertable/manifest/part.rs](../../src/supertable/manifest/part.rs) |
 | `wal/mutations/` state-doc + `.arrow` sidecar | `WAL_DIR`, `WalStore` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | `superfiles/<id>.tombstones` sidecar paths | `SUPERFILES_DIR`, `tombstones_path` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |

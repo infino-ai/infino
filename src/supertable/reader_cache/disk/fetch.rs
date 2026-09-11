@@ -134,9 +134,10 @@ impl DiskCacheStore {
     pub(crate) async fn cold_fetch_hybrid(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
-        let storage_uri = Self::storage_path(uri);
+        let storage_uri = storage_key.to_owned();
 
         // A finished cache file may already be on disk; use it before fetching.
         if let Some(entry) = self.try_reuse_cached_file(uri, None).await? {
@@ -325,6 +326,7 @@ impl DiskCacheStore {
     pub(crate) async fn reader_lazy_with_bg_fill_hinted(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
         allow_background_fill: bool,
@@ -332,7 +334,7 @@ impl DiskCacheStore {
         if let Some(entry) = self.cached.get(uri) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
             if allow_background_fill {
-                self.maybe_spawn_background_fill(uri, &entry, storage);
+                self.maybe_spawn_background_fill(uri, storage_key, &entry, storage);
             }
             return Ok(Arc::clone(&entry.reader));
         }
@@ -344,27 +346,39 @@ impl DiskCacheStore {
         let result = cell
             .get_or_init(|| async {
                 let fetch_storage = self.resolve_storage(storage);
-                self.cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
-                    .await
+                self.cold_fetch_lazy(
+                    uri,
+                    storage_key,
+                    offsets,
+                    fetch_storage,
+                    allow_background_fill,
+                )
+                .await
             })
             .await;
         let fetch_storage = self.resolve_storage(storage);
         match result {
             Ok(entry) => {
                 if allow_background_fill {
-                    self.maybe_spawn_background_fill(uri, entry, storage);
+                    self.maybe_spawn_background_fill(uri, storage_key, entry, storage);
                 }
                 Ok(Arc::clone(&entry.reader))
             }
             Err(_e) => {
                 self.coordinators.remove(uri);
                 match self
-                    .cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
+                    .cold_fetch_lazy(
+                        uri,
+                        storage_key,
+                        offsets,
+                        fetch_storage,
+                        allow_background_fill,
+                    )
                     .await
                 {
                     Ok(entry) => {
                         if allow_background_fill {
-                            self.maybe_spawn_background_fill(uri, &entry, storage);
+                            self.maybe_spawn_background_fill(uri, storage_key, &entry, storage);
                         }
                         Ok(Arc::clone(&entry.reader))
                     }
@@ -380,6 +394,7 @@ impl DiskCacheStore {
     pub(crate) fn maybe_spawn_background_fill(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         entry: &CachedEntry,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) {
@@ -410,7 +425,7 @@ impl DiskCacheStore {
         let store = Arc::downgrade(self);
         let reader = Arc::downgrade(&entry.reader);
         let uri_owned = *uri;
-        let storage_uri_owned = Self::storage_path(uri);
+        let storage_uri_owned = storage_key.to_owned();
         let fetch_storage = self.resolve_storage(storage);
         // Detached, and deliberately long-lived: the fill waits for the
         // foreground's lazy readers to release before it downloads. Parenting
@@ -466,11 +481,12 @@ impl DiskCacheStore {
     pub(crate) async fn cold_fetch_lazy(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         offsets: Option<&SubsectionOffsets>,
         fetch_storage: Arc<dyn StorageProvider>,
         allow_background_fill: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
-        let storage_uri = Self::storage_path(uri);
+        let storage_uri = storage_key.to_owned();
 
         // A finished cache file may already be on disk; use it before fetching.
         if let Some(entry) = self
@@ -666,9 +682,10 @@ impl DiskCacheStore {
     pub(crate) async fn cold_fetch(
         &self,
         uri: &SuperfileUri,
+        storage_key: &str,
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
-        let storage_uri = Self::storage_path(uri);
+        let storage_uri = storage_key.to_owned();
 
         // A finished cache file may already be on disk; use it before fetching.
         if let Some(entry) = self.try_reuse_cached_file(uri, None).await? {
@@ -1551,7 +1568,7 @@ mod tests {
             .expect("put at hidden prefix");
 
         let reader = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .reader_with_hints(&uri, &uri.storage_path(), None, Some(&hidden_storage), true)
             .await
             .expect("cold fetch via caller storage");
         assert_eq!(reader.n_docs(), 1);
@@ -1594,7 +1611,7 @@ mod tests {
             .expect("put at hidden prefix");
 
         let reader = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .reader_with_hints(&uri, &uri.storage_path(), None, Some(&hidden_storage), true)
             .await
             .expect("lazy cold fetch via caller storage");
         assert_eq!(reader.n_docs(), 1);
@@ -1649,7 +1666,7 @@ mod tests {
             open_blob: Vec::new(),
         };
         let r = store
-            .reader_with_hints(&uri, Some(&offsets), None, true)
+            .reader_with_hints(&uri, &uri.storage_path(), Some(&offsets), None, true)
             .await
             .expect("lazy hinted cold");
         assert_eq!(r.n_docs(), 1);
@@ -1660,7 +1677,7 @@ mod tests {
             .await
             .expect("background promotion");
         let r2 = store
-            .reader_with_hints(&uri, Some(&offsets), None, true)
+            .reader_with_hints(&uri, &uri.storage_path(), Some(&offsets), None, true)
             .await
             .expect("warm hinted mmap");
         assert_eq!(store.stats().n_cold_fetches, 1);
@@ -1678,7 +1695,7 @@ mod tests {
 
         // Vector modality: block-cache only — no background fill.
         let vector_reader = store
-            .reader_with_hints(&uri, None, None, false)
+            .reader_with_hints(&uri, &uri.storage_path(), None, None, false)
             .await
             .expect("vector lazy open");
         drop(vector_reader);
@@ -1690,7 +1707,7 @@ mod tests {
 
         // FTS/SQL modality on the same URI starts fill after the fact.
         let fts_reader = store
-            .reader_with_hints(&uri, None, None, true)
+            .reader_with_hints(&uri, &uri.storage_path(), None, None, true)
             .await
             .expect("fts lazy open");
         drop(fts_reader);
@@ -1715,14 +1732,14 @@ mod tests {
 
         // Vector modality: lazy, block-cache only, no fill.
         let vector_reader = store
-            .reader_with_hints(&uri, None, None, false)
+            .reader_with_hints(&uri, &uri.storage_path(), None, None, false)
             .await
             .expect("vector open");
         drop(vector_reader);
 
         // FTS modality starts the fill, which promotes while leaving the vector blob sparse.
         let fts_reader = store
-            .reader_with_hints(&uri, None, None, true)
+            .reader_with_hints(&uri, &uri.storage_path(), None, None, true)
             .await
             .expect("fts open");
         drop(fts_reader);

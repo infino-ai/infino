@@ -617,12 +617,6 @@ impl DiskCacheStore {
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config.cache_root.join(uri.cache_tmp_filename())
     }
-
-    /// The storage-side URI for a superfile, mirroring the
-    /// writer's persist layout.
-    pub(crate) fn storage_path(uri: &SuperfileUri) -> String {
-        uri.storage_path()
-    }
 }
 
 #[cfg(test)]

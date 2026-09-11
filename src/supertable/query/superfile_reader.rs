@@ -49,6 +49,12 @@ use crate::{
 /// configured. See the module-level docs for the precise
 /// policy.
 ///
+/// `storage_key` is the object key the superfile's bytes live at — the
+/// manifest entry's `storage_path()`, which carries a source stem when the
+/// superfile was ingested with one. It is passed alongside `uri` rather
+/// than re-derived from it because a named superfile's key is not a
+/// function of its uuid; `uri` still keys every cache tier.
+///
 /// `offsets` is an optional pre-known layout hint
 /// pulled from the manifest's [`SubsectionOffsets`]. When `Some`
 /// the disk-cache cold-fetch path fires the parquet-footer,
@@ -61,6 +67,7 @@ pub async fn superfile_reader(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,
     uri: &SuperfileUri,
+    storage_key: &str,
     offsets: Option<&SubsectionOffsets>,
     allow_background_fill: bool,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
@@ -76,7 +83,7 @@ pub async fn superfile_reader(
     // 2. Disk cache fallback (when attached).
     if let Some(cache) = disk_cache {
         match cache
-            .reader_with_hints(uri, offsets, storage, allow_background_fill)
+            .reader_with_hints(uri, storage_key, offsets, storage, allow_background_fill)
             .await
         {
             Ok(reader) => return Ok(reader),
@@ -85,7 +92,7 @@ pub async fn superfile_reader(
             // of failing the query.
             Err(DiskCacheError::BudgetExceeded) => {
                 return cache
-                    .open_range_only(uri, offsets, storage)
+                    .open_range_only(storage_key, offsets, storage)
                     .await
                     .map_err(cache_open_failed);
             }
@@ -98,13 +105,15 @@ pub async fn superfile_reader(
     // It is intentionally whole-object: callers who need bounded
     // memory attach `DiskCacheStore`, which uses lazy/range opens.
     if let Some(storage) = storage {
-        let path = uri.storage_path();
-        let (bytes, _) = storage
-            .get(&path)
-            .await
-            .map_err(|e| ReaderCacheError::OpenFailed {
-                source: ReadError::Io(io::Error::other(format!("storage fetch {path}: {e}"))),
-            })?;
+        let (bytes, _) =
+            storage
+                .get(storage_key)
+                .await
+                .map_err(|e| ReaderCacheError::OpenFailed {
+                    source: ReadError::Io(io::Error::other(format!(
+                        "storage fetch {storage_key}: {e}"
+                    ))),
+                })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
         return Ok(Arc::new(reader));
@@ -210,7 +219,7 @@ mod tests {
 
         // No disk cache, no storage attached: if the in-memory tier is
         // consulted first (it is), neither fallback is needed.
-        let reader = superfile_reader(&store, None, None, &uri, None, true)
+        let reader = superfile_reader(&store, None, None, &uri, &uri.storage_path(), None, true)
             .await
             .expect("in-memory hit");
         assert_eq!(reader.n_docs(), N_DOCS);
@@ -247,9 +256,17 @@ mod tests {
         // A working fallback is attached; the in-memory error must win.
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
 
-        let err = superfile_reader(&store, None, Some(&storage), &uri, None, true)
-            .await
-            .expect_err("in-memory error must propagate");
+        let err = superfile_reader(
+            &store,
+            None,
+            Some(&storage),
+            &uri,
+            &uri.storage_path(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("in-memory error must propagate");
         assert!(
             matches!(err, ReaderCacheError::OpenFailed { .. }),
             "expected the in-memory OpenFailed to surface, got {err:?}",
@@ -266,9 +283,17 @@ mod tests {
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
         let cache = disk_cache(&dir, &storage, |_| {});
 
-        let reader = superfile_reader(&empty_store(), Some(&cache), None, &uri, None, true)
-            .await
-            .expect("disk cache cold fetch");
+        let reader = superfile_reader(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            true,
+        )
+        .await
+        .expect("disk cache cold fetch");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -284,9 +309,17 @@ mod tests {
             cfg.disk_budget_bytes = TINY_BUDGET_BYTES;
         });
 
-        let reader = superfile_reader(&empty_store(), Some(&cache), None, &uri, None, true)
-            .await
-            .expect("range-only fallback on budget exceeded");
+        let reader = superfile_reader(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            true,
+        )
+        .await
+        .expect("range-only fallback on budget exceeded");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -298,9 +331,17 @@ mod tests {
         // Nothing put at storage: the cold fetch can't find the bytes.
         let uri = SuperfileUri::new_v4();
 
-        let err = superfile_reader(&empty_store(), Some(&cache), None, &uri, None, true)
-            .await
-            .expect_err("missing storage object must error");
+        let err = superfile_reader(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("missing storage object must error");
         assert!(
             matches!(err, ReaderCacheError::OpenFailed { .. }),
             "expected OpenFailed, got {err:?}",
@@ -317,9 +358,17 @@ mod tests {
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
 
         // No disk cache, but durable storage attached: whole-object open.
-        let reader = superfile_reader(&empty_store(), None, Some(&storage), &uri, None, true)
-            .await
-            .expect("storage-only fallback");
+        let reader = superfile_reader(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &uri,
+            &uri.storage_path(),
+            None,
+            true,
+        )
+        .await
+        .expect("storage-only fallback");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -330,9 +379,17 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         // Nothing put at storage → the GET fails.
 
-        let err = superfile_reader(&empty_store(), None, Some(&storage), &uri, None, true)
-            .await
-            .expect_err("missing object must error");
+        let err = superfile_reader(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &uri,
+            &uri.storage_path(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("missing object must error");
         assert!(
             matches!(err, ReaderCacheError::OpenFailed { .. }),
             "expected OpenFailed, got {err:?}",
@@ -344,9 +401,17 @@ mod tests {
     #[tokio::test]
     async fn no_cache_no_storage_returns_not_found() {
         let uri = SuperfileUri::new_v4();
-        let err = superfile_reader(&empty_store(), None, None, &uri, None, true)
-            .await
-            .expect_err("in-process-only miss must be NotFound");
+        let err = superfile_reader(
+            &empty_store(),
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("in-process-only miss must be NotFound");
         match err {
             ReaderCacheError::NotFound { uri: got } => assert_eq!(got, uri),
             other => panic!("expected NotFound, got {other:?}"),
