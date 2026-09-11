@@ -204,18 +204,20 @@ vector:
   search_mode: ivf
 
   # For search_mode = ivf: the cluster router.
-  #   stamped        — DEFAULT. Grid routing to cells, then the manifest's
-  #                    stamped per-cell width. The established path. Honored
-  #                    verbatim (no per-table gating).
-  #   centroid_graph — EXPERIMENTAL: score fine centroids via an HNSW over the
+  #   auto           — DEFAULT. Pick per hidden-vector table at query time:
+  #                    centroid_graph only where it wins (a concentrated
+  #                    calibrated fanout at or above the scale floor), else
+  #                    stamped. The floor is kept equal to hnsw_max_docs so the
+  #                    graph takes over exactly where the resident HNSW drops
+  #                    out. See the two centroid_graph_* thresholds below.
+  #   stamped        — Grid routing to cells, then the manifest's stamped
+  #                    per-cell width. The established path; an explicit opt-out
+  #                    from auto, honored verbatim (no per-table gating).
+  #   centroid_graph — Opt-in: score fine centroids via an HNSW over the
   #                    resident fp32 fine centroids and read the top fanout
   #                    clusters, bypassing the grid. A cold-read win at scale
   #                    (10M+). Forced verbatim on every table.
-  #   auto           — EXPERIMENTAL: pick per hidden-vector table at query time
-  #                    — centroid_graph only where it wins (a concentrated
-  #                    calibrated fanout at large scale), else stamped. See the
-  #                    two centroid_graph_* thresholds below.
-  ivf_router: stamped
+  ivf_router: auto
 
   # For ivf_router = centroid_graph: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
