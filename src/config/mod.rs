@@ -556,20 +556,22 @@ pub enum VectorSearchMode {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IvfRouter {
-    /// DEFAULT. Grid routing to cells, then the manifest's stamped per-cell
-    /// width. The established path.
-    #[default]
+    /// Grid routing to cells, then the manifest's stamped per-cell width — the
+    /// established path. An explicit opt-out from `auto`: forced verbatim, no
+    /// per-table gating.
     Stamped,
-    /// EXPERIMENTAL (opt-in): score fine centroids via an HNSW over the
-    /// resident fp32 fine centroids and read the top `global_fine_fanout`
-    /// clusters, bypassing the grid. A cold-read win at scale. Forced verbatim
-    /// (no per-table gating).
+    /// Opt-in: score fine centroids via an HNSW over the resident fp32 fine
+    /// centroids and read the top `global_fine_fanout` clusters, bypassing the
+    /// grid. A cold-read win at scale. Forced verbatim (no per-table gating).
     CentroidGraph,
-    /// EXPERIMENTAL (opt-in): pick the router per hidden-vector table at query
-    /// time — `centroid_graph` only where it wins (a concentrated calibrated
-    /// fanout at large scale), else `stamped`. See
+    /// DEFAULT. Pick the router per hidden-vector table at query time —
+    /// `centroid_graph` only where it wins (a concentrated calibrated fanout at
+    /// large scale, at or above the scale floor), else `stamped`. The floor is
+    /// kept equal to `hnsw_max_docs` so the graph takes over exactly where the
+    /// resident HNSW drops out. See
     /// [`VectorSettings::centroid_graph_concentration_ratio`] and
     /// [`VectorSettings::centroid_graph_scale_floor_docs`].
+    #[default]
     Auto,
 }
 
@@ -834,7 +836,7 @@ impl Default for VectorSettings {
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             search_mode: VectorSearchMode::Ivf,
             hnsw_plane: VectorHnswPlane::default(),
-            ivf_router: IvfRouter::Stamped,
+            ivf_router: IvfRouter::Auto,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
@@ -1496,7 +1498,7 @@ mod tests {
     }
 
     /// The `ivf_router = auto` thresholds default to the documented values and
-    /// round-trip through a yaml/json override; the default router is unchanged.
+    /// round-trip through a yaml/json override; the default router is `auto`.
     #[test]
     fn centroid_graph_auto_thresholds_default_and_override() {
         let cfg = Config::defaults().expect("defaults parse");
@@ -1504,22 +1506,22 @@ mod tests {
         assert_eq!(cfg.vector.centroid_graph_scale_floor_docs, 10_000_000);
         assert_eq!(
             cfg.vector.ivf_router,
-            IvfRouter::Stamped,
-            "the default router stays stamped"
+            IvfRouter::Auto,
+            "the default router is auto"
         );
 
         let overridden =
             Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
                 Serialized::defaults(json!({
                     "vector": {
-                        "ivf_router": "auto",
+                        "ivf_router": "stamped",
                         "centroid_graph_concentration_ratio": 0.25,
                         "centroid_graph_scale_floor_docs": 5_000_000
                     }
                 })),
             ))
             .expect("auto thresholds parse");
-        assert_eq!(overridden.vector.ivf_router, IvfRouter::Auto);
+        assert_eq!(overridden.vector.ivf_router, IvfRouter::Stamped);
         assert_eq!(overridden.vector.centroid_graph_concentration_ratio, 0.25);
         assert_eq!(overridden.vector.centroid_graph_scale_floor_docs, 5_000_000);
     }

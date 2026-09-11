@@ -7087,7 +7087,8 @@ mod tests {
              {gen_after_compaction})"
         );
 
-        // The default router config is `stamped`, so `optimize`'s gated eager
+        // The default router config is `auto`, but this table is below the
+        // scale floor so `auto` resolves to `stamped`: `optimize`'s gated eager
         // build is a no-op here and the pre-compaction entry is still cached —
         // now stamped at a generation the current manifest no longer matches.
         // A query pinned to the new generation therefore rebuilds instead of
