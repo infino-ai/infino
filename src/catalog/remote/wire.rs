@@ -47,12 +47,21 @@ pub(crate) fn metric_str(metric: Metric) -> &'static str {
 /// are omitted (the server treats a missing key as "none").
 ///
 /// Each FTS entry is a `{column, analyzer, k1, b}` object — plus
-/// `stored: false` for an index-only column. The analyzer and the BM25
+/// `stored: false` for an index-only column and `positions: true` for a
+/// phrase-capable one. The analyzer and the BM25
 /// pair are always named rather than left to the server's own idea of a
 /// default, so a table is created with what this client resolved and the
 /// two can never drift apart. That matters most for the pair: it is the
 /// provenance of the stored score bounds, and a server that filled in
 /// its own default would build bounds the client never asked for.
+///
+/// `analyzer` names the **base** tokenizer; a stopword set and a
+/// stemmer ride as their own `stopwords` / `stemmer` keys, each emitted
+/// only when set. A server that does not implement a named filter must
+/// reject the request rather than build a table analyzed differently
+/// than the client asked for — which is the request schema's job
+/// (`additionalProperties: false`), not something an encoding trick in
+/// this client can guarantee.
 /// One BM25 parameter widened for JSON without picking up the noise of a
 /// naive `f32 as f64`: that cast is exact, so `1.2_f32` widens to
 /// `1.2000000476837158` and crosses the wire as those seventeen digits.
@@ -75,17 +84,31 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
             .zip(spec.fts_analyzers())
             .zip(spec.fts_stored())
             .zip(spec.fts_bm25())
-            .map(|(((column, analyzer), stored), bm25)| {
-                let mut entry = serde_json::Map::new();
-                entry.insert("column".to_string(), json!(column));
-                entry.insert("analyzer".to_string(), json!(analyzer));
-                entry.insert("k1".to_string(), json!(param_as_f64(bm25.k1)));
-                entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
-                if !stored {
-                    entry.insert("stored".to_string(), json!(false));
-                }
-                Value::Object(entry)
-            })
+            .zip(spec.fts_positions())
+            .zip(spec.fts_stopwords())
+            .zip(spec.fts_stemmers())
+            .map(
+                |((((((column, analyzer), stored), bm25), positions), stopwords), stemmer)| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("column".to_string(), json!(column));
+                    entry.insert("analyzer".to_string(), json!(analyzer));
+                    entry.insert("k1".to_string(), json!(param_as_f64(bm25.k1)));
+                    entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
+                    if !stored {
+                        entry.insert("stored".to_string(), json!(false));
+                    }
+                    if positions {
+                        entry.insert("positions".to_string(), json!(true));
+                    }
+                    if let Some(name) = stopwords.as_str() {
+                        entry.insert("stopwords".to_string(), json!(name));
+                    }
+                    if let Some(name) = stemmer.as_str() {
+                        entry.insert("stemmer".to_string(), json!(name));
+                    }
+                    Value::Object(entry)
+                },
+            )
             .collect();
         indexes.insert("fts".to_string(), Value::Array(fts));
     }
@@ -187,7 +210,7 @@ mod tests {
     use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 
     use super::*;
-    use crate::FtsField;
+    use crate::{FtsField, Stemmer, Stopwords};
 
     #[test]
     fn index_spec_json_shape() {
@@ -202,6 +225,51 @@ mod tests {
         assert_eq!(
             json["vector"][0],
             json!({"column": "embedding", "dim": 384, "metric": "cosine"})
+        );
+    }
+
+    /// The analysis filters cross as their own keys, only when set, so
+    /// the server builds the index the client declared. A column with
+    /// no filter sends neither key, which is what keeps a default
+    /// request byte-identical to one from before the filters existed.
+    ///
+    /// A server that does not implement a named filter has to reject
+    /// the request — that is the request schema's job
+    /// (`additionalProperties: false`), which is why this client does
+    /// not smuggle the filters into the `analyzer` string to force a
+    /// rejection.
+    #[test]
+    fn index_spec_json_carries_the_analysis_filters_only_when_set() {
+        let spec = IndexSpec::new().fts(
+            FtsField::new("body")
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
+        );
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{
+                "column": "body",
+                "analyzer": "standard",
+                "k1": 1.2,
+                "b": 0.75,
+                "stopwords": "english",
+                "stemmer": "english",
+            }])
+        );
+        // One filter, not both.
+        let spec = IndexSpec::new().fts(FtsField::new("body").stemmer(Stemmer::English));
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{
+                "column": "body", "analyzer": "standard",
+                "k1": 1.2, "b": 0.75, "stemmer": "english",
+            }])
+        );
+        // And neither: no keys at all, not empty strings.
+        let spec = IndexSpec::new().fts("body");
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
     }
 

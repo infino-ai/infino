@@ -45,13 +45,14 @@ use crate::superfile::{
         },
     },
     fts::{
+        analysis::{Base, chain_tokenizer},
         bm25,
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,
         positions::decode_run,
         posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
-        tokenize::{Tokenizer, tokenizer_for_name},
+        tokenize::{Phrase, Tokenizer},
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
@@ -75,9 +76,9 @@ pub(crate) struct ClauseLists<'a> {
     pub musts: &'a [&'a str],
     pub shoulds: &'a [&'a str],
     pub negatives: &'a [&'a str],
-    pub must_phrases: &'a [Vec<String>],
-    pub should_phrases: &'a [Vec<String>],
-    pub negative_phrases: &'a [Vec<String>],
+    pub must_phrases: &'a [Phrase<String>],
+    pub should_phrases: &'a [Phrase<String>],
+    pub negative_phrases: &'a [Phrase<String>],
     /// Per-term global idf for [`Bm25Stats::Global`], the default;
     /// `None` scores with [`Bm25Stats::PerSuperfile`] local idf.
     pub global_idf: Option<&'a GlobalTermIdf>,
@@ -925,12 +926,24 @@ impl FtsReader {
                 avgdl,
                 params,
             );
-            let tokenizer = tokenizer_for_name(&col_cfg.tokenizer).ok_or_else(|| {
+            let base = Base::from_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
                     col_cfg.tokenizer, col_cfg.name
                 )))
             })?;
+            // A filter the entry names but this engine does not ship
+            // cannot be worked around: analyzing without it would query
+            // the column differently than its postings were built. An
+            // *absent* filter field is the opposite case and needs no
+            // guess — it means the filter is off.
+            let (stopwords, stemmer) = col_cfg.filters().map_err(|(field, value)| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "inf.fts.columns: unknown {field} {value:?} for column {:?}",
+                    col_cfg.name
+                )))
+            })?;
+            let tokenizer = chain_tokenizer(base, stopwords, stemmer);
             columns.push(ColumnMeta {
                 name: col_cfg.name.clone(),
                 doc_lengths_range: doc_lengths_offset..array_end,
@@ -942,6 +955,9 @@ impl FtsReader {
                 bound_scale: 1.0,
                 positions: col_cfg.positions,
                 tokenizer,
+                base,
+                stopwords,
+                stemmer,
                 stored: col_cfg.stored,
             });
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
@@ -1169,7 +1185,7 @@ impl FtsReader {
         &self,
         column_id: u32,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         global_idf: Option<&GlobalTermIdf>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
@@ -1264,6 +1280,7 @@ impl FtsReader {
                 cursors,
                 positions,
                 positional,
+                phrase.offsets().to_vec(),
                 col_meta.params,
             )?)));
         }
@@ -1859,6 +1876,36 @@ fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The reader refuses to open a column whose entry names a filter
+    /// this engine cannot reproduce, and names the field and the value
+    /// so the operator can see which engine version is needed.
+    ///
+    /// Asserted through `open` rather than on the resolver alone: the
+    /// resolver is where the decision is made, but the `map_err` that
+    /// turns it into a read error is the part a caller actually sees,
+    /// and a `?` dropped there would let the column open unfiltered.
+    #[tokio::test]
+    async fn open_refuses_a_column_naming_an_unreproducible_filter() {
+        let (blob, json) = build_blob();
+        // Sanity: the fixture opens before it is tampered with, so a
+        // failure below is the filter and not the fixture.
+        FtsReader::open(blob.clone(), &json).expect("untampered fixture opens");
+        for (field, value) in [("stopwords", "german"), ("stemmer", "porter")] {
+            let patched = json.replace(
+                r#""tokenizer":"#,
+                &format!(r#""{field}":"{value}","tokenizer":"#),
+            );
+            assert_ne!(patched, json, "{field}: fixture did not patch");
+            let err = FtsReader::open(blob.clone(), &patched)
+                .expect_err("an unreproducible filter must fail the open");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(field) && msg.contains(value),
+                "{field}: the error must name the field and value, got: {msg}"
+            );
+        }
+    }
     use std::collections::HashSet;
 
     use super::{super::test_util::*, *};

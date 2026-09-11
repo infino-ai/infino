@@ -141,6 +141,97 @@ def test_bm25_params_declared_and_overridden():
         assert abs(a - b) < 1e-4
 
 
+def test_fts_positional_arguments_keep_their_meaning():
+    # `IndexSpec.fts`'s positional order is API surface, and nothing else
+    # in this suite exercises it: every other call here passes keywords
+    # past `column`. So an option inserted mid-signature silently
+    # repositions `stored` / `k1` / `b` for downstream positional callers
+    # and no test fails. This pins the order so that change has to break
+    # here first.
+    #
+    # It has happened: the stopwords/stemmer/positions options were first
+    # added *before* `stored`, which turned `fts("body", "standard",
+    # False)` into a `TypeError` — caught in review, not by CI.
+    db = infino.connect("memory://")
+    titles = ["the quick brown fox", "a lazy dog", "quick thinking about foxes"]
+
+    # Slot 3 is `stored`, so a bool is accepted there. Under the broken
+    # signature this raised TypeError before doing anything.
+    index_only = db.create_table(
+        "index_only", _title_schema(), infino.IndexSpec().fts("title", "standard", False)
+    )
+    for title in titles:
+        index_only.append(_title_batch([title]))
+    # Searchable, since `stored` governs readback and not the index.
+    assert index_only.bm25_search("title", "quick", 10).num_rows == 2
+
+    # Slots 4 and 5 are `k1` and `b`. Checked by ranking rather than by
+    # the call merely succeeding: two floats would be accepted by any
+    # signature whose tail is float-shaped, so only the scores prove the
+    # values landed on the parameters they were meant for.
+    positional = db.create_table(
+        "positional", _title_schema(), infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4)
+    )
+    keyword = db.create_table(
+        "keyword", _title_schema(), infino.IndexSpec().fts("title", k1=1.6, b=0.4)
+    )
+    for title in titles:
+        positional.append(_title_batch([title]))
+        keyword.append(_title_batch([title]))
+    from_positional = positional.bm25_search("title", "quick", 10, projection=["title", "score"])
+    from_keyword = keyword.bm25_search("title", "quick", 10, projection=["title", "score"])
+    assert from_positional.column("title").to_pylist() == from_keyword.column("title").to_pylist()
+    for a, b in zip(
+        from_positional.column("score").to_pylist(), from_keyword.column("score").to_pylist()
+    ):
+        assert abs(a - b) < 1e-4
+
+
+def test_analysis_filter_names_resolve_at_create_table_exactly():
+    # The filters resolve in `to_rust()` at `create_table`, not at
+    # `fts()` — `fts` only records the strings — so this is where an
+    # unknown name surfaces, and neither binding covered it.
+    #
+    # Matched exactly, like the engine's own resolver: an earlier version
+    # of the node binding case-folded its argument, so `stopwords="English"`
+    # was accepted there and rejected here for the same call. Accepting
+    # more spellings later is additive; tightening later would not be.
+    db = infino.connect("memory://")
+    for bad, field in [("English", "stopwords"), ("ENGLISH", "stopwords"), ("german", "stopwords")]:
+        with pytest.raises(ValueError) as e:
+            db.create_table(
+                f"bad_{field}_{bad}", _title_schema(), infino.IndexSpec().fts("title", stopwords=bad)
+            )
+        assert bad in str(e.value)
+    for bad in ("English", "porter"):
+        with pytest.raises(ValueError) as e:
+            db.create_table(
+                f"bad_stem_{bad}", _title_schema(), infino.IndexSpec().fts("title", stemmer=bad)
+            )
+        assert bad in str(e.value)
+
+
+def test_analysis_options_are_keyword_only():
+    # The analysis options sit behind `*`, so they can never be captured
+    # positionally. That is what keeps the positional tail above stable
+    # as more options are added — the next one cannot repeat the
+    # mid-signature insertion that broke it.
+    with pytest.raises(TypeError):
+        infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4, "english")
+    # And they still work by keyword, in any combination.
+    spec = infino.IndexSpec().fts(
+        "title", stopwords="english", stemmer="english", positions=True
+    )
+    db = infino.connect("memory://")
+    t = db.create_table("chained", _title_schema(), spec)
+    t.append(_title_batch(["the quick brown foxes are running"]))
+    # Stemming folds the inflection; the stopword never reaches the index.
+    assert t.bm25_search("title", "run", 10).num_rows == 1
+    assert t.bm25_search("title", "the", 10).num_rows == 0
+    # Positions were recorded, so an exact phrase resolves.
+    assert t.bm25_search("title", '"brown foxes"', 10).num_rows == 1
+
+
 def test_bm25_params_must_be_passed_together():
     # Overriding one parameter and inheriting the engine default for the
     # other would score with a combination the caller never chose, since

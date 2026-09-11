@@ -182,6 +182,52 @@ impl core::marker::Unpin for infino::OptimizeError
 impl core::marker::UnsafeUnpin for infino::OptimizeError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
 impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
+#[non_exhaustive] pub enum infino::Stemmer
+pub infino::Stemmer::English
+pub infino::Stemmer::None
+impl infino::Stemmer
+pub fn infino::Stemmer::from_name(&str) -> core::option::Option<Self>
+impl core::clone::Clone for infino::Stemmer
+pub fn infino::Stemmer::clone(&self) -> infino::Stemmer
+impl core::cmp::Eq for infino::Stemmer
+impl core::cmp::PartialEq for infino::Stemmer
+pub fn infino::Stemmer::eq(&self, &infino::Stemmer) -> bool
+impl core::default::Default for infino::Stemmer
+pub fn infino::Stemmer::default() -> infino::Stemmer
+impl core::fmt::Debug for infino::Stemmer
+pub fn infino::Stemmer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Stemmer
+impl core::marker::StructuralPartialEq for infino::Stemmer
+impl core::marker::Freeze for infino::Stemmer
+impl core::marker::Send for infino::Stemmer
+impl core::marker::Sync for infino::Stemmer
+impl core::marker::Unpin for infino::Stemmer
+impl core::marker::UnsafeUnpin for infino::Stemmer
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Stemmer
+impl core::panic::unwind_safe::UnwindSafe for infino::Stemmer
+#[non_exhaustive] pub enum infino::Stopwords
+pub infino::Stopwords::English
+pub infino::Stopwords::None
+impl infino::Stopwords
+pub fn infino::Stopwords::from_name(&str) -> core::option::Option<Self>
+impl core::clone::Clone for infino::Stopwords
+pub fn infino::Stopwords::clone(&self) -> infino::Stopwords
+impl core::cmp::Eq for infino::Stopwords
+impl core::cmp::PartialEq for infino::Stopwords
+pub fn infino::Stopwords::eq(&self, &infino::Stopwords) -> bool
+impl core::default::Default for infino::Stopwords
+pub fn infino::Stopwords::default() -> infino::Stopwords
+impl core::fmt::Debug for infino::Stopwords
+pub fn infino::Stopwords::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Stopwords
+impl core::marker::StructuralPartialEq for infino::Stopwords
+impl core::marker::Freeze for infino::Stopwords
+impl core::marker::Send for infino::Stopwords
+impl core::marker::Sync for infino::Stopwords
+impl core::marker::Unpin for infino::Stopwords
+impl core::marker::UnsafeUnpin for infino::Stopwords
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Stopwords
+impl core::panic::unwind_safe::UnwindSafe for infino::Stopwords
 #[non_exhaustive] pub struct infino::Bm25Params
 pub infino::Bm25Params::b: f32
 pub infino::Bm25Params::k1: f32
@@ -305,6 +351,9 @@ impl infino::FtsField
 pub fn infino::FtsField::analyzer(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::FtsField::bm25(self, f32, f32) -> Self
 pub fn infino::FtsField::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::FtsField::positions(self, bool) -> Self
+pub fn infino::FtsField::stemmer(self, infino::Stemmer) -> Self
+pub fn infino::FtsField::stopwords(self, infino::Stopwords) -> Self
 pub fn infino::FtsField::stored(self, bool) -> Self
 impl core::clone::Clone for infino::FtsField
 pub fn infino::FtsField::clone(&self) -> infino::FtsField

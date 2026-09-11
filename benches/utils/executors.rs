@@ -288,7 +288,7 @@ pub mod fts {
             SuperfileReader,
             fts::{
                 reader::BoolMode as InfinoBoolMode,
-                tokenize::{AsciiLowerTokenizer, Tokenizer},
+                tokenize::{AsciiLowerTokenizer, Phrase, Tokenizer},
             },
         },
         supertable::SupertableReader,
@@ -749,10 +749,11 @@ pub mod fts {
                 };
                 if !phrases.is_empty() {
                     let refs: Vec<&str> = terms.iter().map(|t| &**t).collect();
-                    let owned: Vec<Vec<String>> = phrases
-                        .into_iter()
-                        .map(|p| p.into_iter().map(|t| t.into_owned()).collect())
-                        .collect();
+                    // `Phrase::map` carries each term's offset across, so
+                    // a bench query on a stopworded column asks for the
+                    // spacing the parser derived rather than adjacency.
+                    let owned: Vec<Phrase<String>> =
+                        phrases.iter().map(|p| p.map(|t| t.to_string())).collect();
                     return self
                         .atoms_match_count(column, &refs, &owned, eff_mode, &[], &[])
                         .await

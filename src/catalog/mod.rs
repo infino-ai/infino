@@ -85,7 +85,10 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
-        fts::bm25,
+        fts::{
+            analysis::{Stemmer, Stopwords},
+            bm25,
+        },
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
@@ -435,6 +438,17 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes.fts_analyzers(),
+                    fts_stopwords: indexes
+                        .fts_stopwords()
+                        .iter()
+                        .map(|s| s.as_str().unwrap_or_default().to_string())
+                        .collect(),
+                    fts_stemmers: indexes
+                        .fts_stemmers()
+                        .iter()
+                        .map(|s| s.as_str().unwrap_or_default().to_string())
+                        .collect(),
+                    fts_positions: indexes.fts_positions(),
                     fts_stored: indexes.fts_stored(),
                     fts_k1: indexes.fts_bm25().iter().map(|p| p.k1).collect(),
                     fts_b: indexes.fts_bm25().iter().map(|p| p.b).collect(),
@@ -583,6 +597,37 @@ impl Connection {
                     // written before index-only columns existed can only
                     // mean the text is stored.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+                    // Same rule for positions: a catalog written before
+                    // they were declarable describes a table built
+                    // without them, because nothing could have asked
+                    // for them.
+                    let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
+                    // Same rule for the analysis filters: a catalog
+                    // written before they existed, or one whose entry
+                    // is empty, describes a column with no filter. A
+                    // name that does not resolve is different — the
+                    // recorded analysis cannot be reproduced, so the
+                    // table is unusable rather than usable-with-a-guess.
+                    let stopwords = match entry.fts_stopwords.get(i).map(String::as_str) {
+                        None | Some("") => Stopwords::None,
+                        Some(set) => Stopwords::from_name(set).ok_or_else(|| {
+                            InfinoError::Backend(format!(
+                                "table '{name}' column {column:?} records unknown stopwords \
+                                 {set:?}"
+                            ))
+                            .with_context("open_table", Some(name))
+                        })?,
+                    };
+                    let stemmer = match entry.fts_stemmers.get(i).map(String::as_str) {
+                        None | Some("") => Stemmer::None,
+                        Some(stem) => Stemmer::from_name(stem).ok_or_else(|| {
+                            InfinoError::Backend(format!(
+                                "table '{name}' column {column:?} records unknown stemmer \
+                                 {stem:?}"
+                            ))
+                            .with_context("open_table", Some(name))
+                        })?,
+                    };
                     // And again for the BM25 pair: a catalog written before
                     // it was declarable can only describe a table built with
                     // the standard values, so the fallback is frozen there
@@ -592,6 +637,9 @@ impl Connection {
                     spec = spec.fts(
                         FtsField::new(column.clone())
                             .analyzer(analyzer)
+                            .stopwords(stopwords)
+                            .stemmer(stemmer)
+                            .positions(positions)
                             .stored(stored)
                             .bm25(k1, b),
                     );
@@ -1390,7 +1438,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency,
+        Bm25SearchOptions, BoolMode, Consistency, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
         supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
@@ -1584,6 +1632,358 @@ mod tests {
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
         ));
+    }
+
+    /// Stemming, end to end: one inflection finds the others because
+    /// both sides of the search run through the same chain.
+    #[test]
+    fn stemming_folds_inflections_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+        let stemmed = conn
+            .create_table(
+                "stemmed",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stemmer(Stemmer::English)),
+            )
+            .expect("create stemmed table");
+        stemmed
+            .append(&build_title_batch(&[
+                "running late",
+                "she runs fast",
+                "a walk",
+            ]))
+            .expect("append");
+
+        // Every inflection reaches both documents holding one, whichever
+        // one the query spells.
+        for query in ["running", "runs", "run"] {
+            let hits = stemmed
+                .bm25_search("title", query, TOP_K, Bm25SearchOptions::new(), None)
+                .expect("bm25_search");
+            assert_eq!(
+                n_rows(&hits),
+                2,
+                "{query:?} must reach both inflections on a stemmed column"
+            );
+        }
+
+        // And the same corpus without the stemmer separates them, so the
+        // declaration is what changed the answer.
+        let plain = conn
+            .create_table("plain", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create plain table");
+        plain
+            .append(&build_title_batch(&[
+                "running late",
+                "she runs fast",
+                "a walk",
+            ]))
+            .expect("append");
+        let hits = plain
+            .bm25_search("title", "run", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&hits),
+            0,
+            "an unstemmed column matches the word only"
+        );
+    }
+
+    /// Stopword removal, end to end, including the consequence worth
+    /// being explicit about: once a word is not indexed, no query can
+    /// find it.
+    #[test]
+    fn stopwords_leave_the_index_and_the_query() {
+        let conn = connect("memory://").expect("connect");
+        let stopped = conn
+            .create_table(
+                "stopped",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stopwords(Stopwords::English)),
+            )
+            .expect("create stopped table");
+        stopped
+            .append(&build_title_batch(&["the fox and the hound", "a cat"]))
+            .expect("append");
+
+        // The content words still search normally.
+        let hits = stopped
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(n_rows(&hits), 1);
+
+        // A stopword leaves the query too, so a query of nothing but
+        // stopwords has no term left to match — not an error, no rows.
+        let hits = stopped
+            .bm25_search("title", "the and", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("a stopword-only query is not an error");
+        assert_eq!(n_rows(&hits), 0, "nothing is left of the query to match");
+
+        // And a query mixing the two searches only what survives, so the
+        // stopword neither narrows nor widens the result.
+        let hits = stopped
+            .bm25_search("title", "the fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(n_rows(&hits), 1);
+    }
+
+    /// The hole a removed stopword leaves is what keeps a phrase honest:
+    /// `"new york"` must not match `new the york`, and
+    /// `"end of the world"` must still match the text it came from.
+    #[test]
+    fn stopword_holes_keep_phrase_spacing_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table(
+                "phrases",
+                schema_id_title(),
+                IndexSpec::new().fts(
+                    FtsField::new("title")
+                        .stopwords(Stopwords::English)
+                        .positions(true),
+                ),
+            )
+            .expect("create table");
+        table
+            .append(&build_title_batch(&[
+                "new york city",                // 0: the words are adjacent
+                "new the york city",            // 1: a removed word sits between them
+                "the end of the world is nigh", // 2
+                "end world",                    // 3: no gap where the phrase wants one
+            ]))
+            .expect("append");
+
+        let phrase = |q: &str| -> usize {
+            n_rows(
+                &table
+                    .bm25_search("title", q, TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("phrase search"),
+            )
+        };
+
+        // Adjacent in the text and adjacent in the phrase: a match. The
+        // document with a removed word between them is *not* one — its
+        // `york` sits one position further along, exactly where the hole
+        // left it.
+        assert_eq!(
+            phrase("\"new york\""),
+            1,
+            "only the text whose words are really adjacent"
+        );
+        // The query's own removed words become the spacing it asks for:
+        // `end` and `world` three positions apart, which is where the
+        // same chain put them in document 2 — and not in document 3,
+        // where they are adjacent.
+        assert_eq!(
+            phrase("\"end of the world\""),
+            1,
+            "the phrase asks for the spacing its own stopwords imply"
+        );
+        // Naming the surviving words as an adjacent phrase finds the
+        // document where they *are* adjacent, and only that one.
+        assert_eq!(phrase("\"end world\""), 1);
+    }
+
+    /// A column with filters survives a reopen: the catalog record
+    /// carries the tokenizer and both filters, so query text is
+    /// tokenized the same way after reopening as before, and the
+    /// table's options-hash still verifies.
+    #[test]
+    fn a_chained_column_survives_reopen_on_storage() {
+        let (conn, _dir) = storage_conn();
+        {
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema_id_title(),
+                    IndexSpec::new().fts(
+                        FtsField::new("title")
+                            .stopwords(Stopwords::English)
+                            .stemmer(Stemmer::English),
+                    ),
+                )
+                .expect("create_table");
+            table
+                .append(&build_title_batch(&["the running studies"]))
+                .expect("append");
+        }
+        // A fresh connection over the same root, so the spec is rebuilt
+        // from the catalog rather than reused from memory.
+        let uri = _dir.path().to_str().expect("utf8 path").to_string();
+        let reopened = connect(&uri).expect("reconnect");
+        let table = reopened.open_table("docs").expect("open_table");
+        let hits = table
+            .bm25_search(
+                "title",
+                "the studies",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect("bm25_search after reopen");
+        assert_eq!(
+            n_rows(&hits),
+            1,
+            "the reopened table still stems and still drops stopwords"
+        );
+    }
+
+    /// The `positions` flag has to round-trip the catalog record, and
+    /// the failure is not the obvious one: the flag joins the table's
+    /// options-hash, so a record that lost it would make a positional
+    /// table fail its **own** hash check on reopen — refusing to open
+    /// at all — rather than merely forgetting how to answer a phrase.
+    #[test]
+    fn a_positional_column_reopens_and_still_answers_phrases() {
+        let (conn, dir) = storage_conn();
+        {
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema_id_title(),
+                    IndexSpec::new().fts(FtsField::new("title").positions(true)),
+                )
+                .expect("create_table");
+            table
+                .append(&build_title_batch(&["new york city", "york new city"]))
+                .expect("append");
+            // The phrase works before the reopen, so a failure after it
+            // is the round-trip and not the declaration.
+            assert_eq!(
+                n_rows(
+                    &table
+                        .bm25_search(
+                            "title",
+                            "\"new york\"",
+                            TOP_K,
+                            Bm25SearchOptions::new(),
+                            None
+                        )
+                        .expect("phrase search")
+                ),
+                1
+            );
+        }
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let reopened = connect(&uri).expect("reconnect");
+        let table = reopened
+            .open_table("docs")
+            .expect("a positional table must reopen — losing the flag fails the options-hash");
+        assert_eq!(
+            n_rows(
+                &table
+                    .bm25_search(
+                        "title",
+                        "\"new york\"",
+                        TOP_K,
+                        Bm25SearchOptions::new(),
+                        None
+                    )
+                    .expect("phrase search after reopen")
+            ),
+            1,
+            "the reopened table still records positions"
+        );
+    }
+
+    /// The other half of exposing `positions`: a column without them
+    /// answers a phrase query with an error naming the column, never a
+    /// silent bag-of-words fallback that would return documents holding
+    /// the words in the wrong order.
+    #[test]
+    fn a_positionless_column_rejects_a_phrase_query() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+        table
+            .append(&build_title_batch(&["york new city"]))
+            .expect("append");
+        let err = table
+            .bm25_search(
+                "title",
+                "\"new york\"",
+                TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect_err("a phrase on a positionless column must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title"),
+            "the error must name the column, got: {msg}"
+        );
+    }
+
+    /// A catalog record naming a filter this engine cannot reproduce
+    /// makes the table unusable rather than usable-with-a-guess. Same
+    /// rule as the superfile entry: an *absent* filter means off, and a
+    /// *present* name that does not resolve is refused — analyzing
+    /// without the set the postings were built with is a different
+    /// index, not a degraded one.
+    #[test]
+    fn a_catalog_record_naming_an_unresolvable_filter_is_refused() {
+        for (field, bad) in [("fts_stopwords", "german"), ("fts_stemmers", "porter")] {
+            let (conn, dir) = storage_conn();
+            conn.create_table(
+                "docs",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").stopwords(Stopwords::English)),
+            )
+            .expect("create_table");
+            // Rewrite just that column's filter name in the catalog,
+            // leaving everything else intact.
+            let path = dir.path().join(CATALOG_PATH);
+            let body = std::fs::read_to_string(&path).expect("read catalog");
+            let patched = body.replace(
+                &format!("\"{field}\":[\"english\"]"),
+                &format!("\"{field}\":[\"{bad}\"]"),
+            );
+            let patched = match patched == body {
+                // The stemmer list is empty in this fixture, so inject.
+                true => body.replace(
+                    &format!("\"{field}\":[\"\"]"),
+                    &format!("\"{field}\":[\"{bad}\"]"),
+                ),
+                false => patched,
+            };
+            assert_ne!(patched, body, "{field}: fixture did not patch");
+            std::fs::write(&path, &patched).expect("write catalog");
+
+            let uri = dir.path().to_str().expect("utf8 path").to_string();
+            let reopened = connect(&uri).expect("reconnect");
+            let err = reopened
+                .open_table("docs")
+                .expect_err("an unresolvable filter must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(bad) && msg.contains("title"),
+                "{field}: the error must name the value and the column, got: {msg}"
+            );
+        }
+    }
+
+    /// An unknown tokenizer is refused at create time, naming what the
+    /// caller wrote. The filters are separate options, so a
+    /// chain-shaped string is simply a tokenizer name that does not
+    /// resolve — it must not be quietly interpreted as a chain.
+    #[test]
+    fn an_unknown_analyzer_is_refused_and_a_chain_shaped_name_is_not_interpreted() {
+        let conn = connect("memory://").expect("connect");
+        for name in ["nonesuch", "standard+stop=english"] {
+            let err = conn
+                .create_table(
+                    "bad",
+                    schema_id_title(),
+                    IndexSpec::new().fts(FtsField::new("title").analyzer(name)),
+                )
+                .expect_err("an unresolvable analyzer must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(name),
+                "the error must name the analyzer as written, got: {msg}"
+            );
+        }
     }
 
     #[test]
