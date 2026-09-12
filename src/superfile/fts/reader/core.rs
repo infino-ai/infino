@@ -480,6 +480,11 @@ pub struct FtsReader {
     /// ends with a coarse block-max table. `V1`–`V4` blobs lack it, so the
     /// ranked walk skips the coarse level and the threshold seed there.
     pub(super) has_coarse_block_max: bool,
+    /// Whether every term carries a competitive-frontier table. Only the
+    /// current blob version writes one; older blobs fall back to scaling
+    /// their baked bound, which is why the version gates this rather
+    /// than it being inferred per term.
+    pub(super) has_block_frontier: bool,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -702,6 +707,7 @@ impl FtsReader {
         // do not.
         let has_coarse_block_max =
             version == format::fts::VERSION_V5 || version == format::fts::VERSION_V6;
+        let has_block_frontier = version == format::fts::VERSION_V6;
         // Blobs before V6 store bounds that include the `(k1 + 1)`
         // factor the scorer no longer applies, so every stored bound is
         // that much larger than the score it caps. Left alone it stays a
@@ -1015,6 +1021,7 @@ impl FtsReader {
             has_position_subindex,
             has_bitset_blocks,
             has_coarse_block_max,
+            has_block_frontier,
             columns,
             column_id_by_name,
         })
@@ -1298,6 +1305,7 @@ impl FtsReader {
                             true,
                             self.has_position_subindex,
                             self.has_coarse_block_max,
+                            self.has_block_frontier,
                         )?;
                         positional.push((Some(term_meta), None));
                     }
@@ -1436,6 +1444,7 @@ impl FtsReader {
                             true,
                             false,
                             self.has_coarse_block_max,
+                            self.has_block_frontier,
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
@@ -1463,10 +1472,12 @@ impl FtsReader {
                         false,
                         false,
                         self.has_coarse_block_max,
+                        self.has_block_frontier,
                         // This walk carries postings across into a merge; it
                         // reads doc ids, tfs and positions and never consults
                         // a score bound, so no correction applies.
                         1.0,
+                        None,
                     )?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {

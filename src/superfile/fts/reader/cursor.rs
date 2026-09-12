@@ -68,6 +68,13 @@ pub(super) struct TermMeta {
     /// minus the coarse table's bytes. The blocks end here; the coarse
     /// table follows.
     pub(super) blocks_end_in_term: usize,
+    /// Term-relative start of the competitive-frontier table, after the
+    /// coarse table. Only meaningful when `has_frontier`.
+    pub(super) frontier_start: usize,
+    /// Whether this term carries a competitive-frontier table, which is
+    /// what lets a bound be recomputed at an average document length
+    /// other than the one the build baked in.
+    pub(super) has_frontier: bool,
     /// Whether this term carries a coarse block-max table (V5 blobs).
     /// `false` for V1–V4 — the ranked walk then skips the coarse level.
     pub(super) has_coarse: bool,
@@ -84,6 +91,7 @@ impl TermMeta {
         positional: bool,
         has_subindex: bool,
         has_coarse: bool,
+        has_frontier: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -166,13 +174,22 @@ impl TermMeta {
             true => num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * U32_BYTES,
             false => 0,
         };
-        if coarse_size > postings_length {
+        // Competitive-frontier table, written after the coarse table on
+        // blobs that carry it. Both sit at the tail, so the blocks end
+        // where the first of them begins.
+        let frontier_size = match has_frontier {
+            true => num_blocks * format::fts::BLOCK_FRONTIER_BYTES,
+            false => 0,
+        };
+        let tail_size = coarse_size + frontier_size;
+        if tail_size > postings_length {
             return Err(FtsError::Read(ReadError::MalformedVersion(
-                "coarse block-max table larger than the term region".into(),
+                "block-max tables larger than the term region".into(),
             )));
         }
-        let blocks_end_in_term = postings_length - coarse_size;
+        let blocks_end_in_term = postings_length - tail_size;
         let coarse_start = metadata_offset + blocks_end_in_term;
+        let frontier_start = coarse_start + coarse_size;
         Ok(Self {
             df,
             num_blocks,
@@ -181,8 +198,10 @@ impl TermMeta {
             positions_length,
             subindex_start,
             coarse_start,
+            frontier_start,
             blocks_end_in_term,
             has_coarse,
+            has_frontier,
         })
     }
 
@@ -205,6 +224,18 @@ impl TermMeta {
         } else {
             raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
         }
+    }
+
+    /// This block's stored competitive-frontier slot, or `None` when the
+    /// blob predates the table.
+    #[inline]
+    pub(super) fn frontier_slot<'a>(&self, postings: &'a [u8], block: usize) -> Option<&'a [u8]> {
+        if !self.has_frontier {
+            return None;
+        }
+        let w = format::fts::BLOCK_FRONTIER_BYTES;
+        let at = self.frontier_start + block * w;
+        postings.get(at..at + w)
     }
 
     /// Decode coarse block-max entry `g` into a guaranteed upper bound
@@ -433,7 +464,9 @@ impl TermCursor {
         header_probed: bool,
         count_only: bool,
         has_coarse: bool,
+        has_frontier: bool,
         bound_scale: f32,
+        rescore_from_frontier: Option<(f32, bm25::Bm25Params)>,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -442,7 +475,14 @@ impl TermCursor {
         // sub-index (it reads block offsets straight from the skip table).
         // `has_coarse` (V5) tells it the last block ends before the coarse
         // table, not at `postings_length`.
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false, has_coarse)?;
+        let term_meta = TermMeta::parse(
+            postings,
+            metadata_offset,
+            positional,
+            false,
+            has_coarse,
+            has_frontier,
+        )?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         // Effective idf folds in the query-term-frequency `weight` (> 1 only for a
         // deduplicated repeated term) on top of any global-idf override.
@@ -489,9 +529,25 @@ impl TermCursor {
             .map(|i| {
                 let (last_doc_id, block_offset_in_term, raw_block_max) =
                     term_meta.skip_entry(postings, i);
-                let block_max_bm25 = match idf_rescale {
-                    Some(ratio) => raw_block_max * ratio,
-                    None => raw_block_max,
+                // A stored bound is a score, so it is frozen at the
+                // average length the build divided by; scoring against
+                // another one leaves it needing inflation, and a common
+                // term's block maxima sit close enough together that
+                // even a percent of inflation admits blocks a tight
+                // bound would skip. Where the block's competitive
+                // frontier is stored, recompute the bound exactly at the
+                // average actually in use instead — no inflation, and
+                // the same pruning the file was built for.
+                let block_max_bm25 = match rescore_from_frontier.and_then(|(avgdl, params)| {
+                    term_meta
+                        .frontier_slot(postings, i)
+                        .map(|slot| bm25::block_frontier_bound(slot, idf, avgdl, params))
+                }) {
+                    Some(exact) => exact,
+                    None => match idf_rescale {
+                        Some(ratio) => raw_block_max * ratio,
+                        None => raw_block_max,
+                    },
                 };
                 term_max_bm25 = term_max_bm25.max(block_max_bm25);
 
@@ -1083,7 +1139,10 @@ mod tests {
     use bytes::Bytes;
 
     use crate::superfile::fts::{
-        bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+        bm25,
+        builder::FtsBuilder,
+        reader::{FtsReader, ScoringOverride},
+        tokenize::AsciiLowerTokenizer,
     };
 
     /// The per-block BM25 upper bound stored in the skip table must be a
@@ -1101,6 +1160,377 @@ mod tests {
     /// Without the length-consistent block bound the assertion fires on the
     /// highest-tf doc in each block; a small-doc corpus (every length in the
     /// exact-quantization region) never exercises it.
+    /// End to end: scoring against a different average must not cost
+    /// pruning.
+    ///
+    /// This is the regression the frontier exists for. Inflating a
+    /// stored bound to cover a moved average admits blocks a tight bound
+    /// would skip — measured at seven times the blocks for one percent
+    /// of inflation — because a common term's block maxima sit within a
+    /// few percent of each other. Recomputing from the frontier has to
+    /// stay both sound and *tight*, and tightness is the half a
+    /// correctness test would miss.
+    #[tokio::test]
+    async fn a_moved_average_keeps_bounds_exact_not_inflated() {
+        const N_DOCS: u32 = 4000;
+        const TERM_DOCS: u32 = 3000;
+        /// A stand-in for the gap between one file's average and a
+        /// table-wide one, at the top of the range measured across a
+        /// realistic corpus's superfiles.
+        const AVERAGE_SHIFT: f32 = 1.06;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for doc_id in 0..N_DOCS {
+            let len = 40 + (doc_id as usize * 7) % 500;
+            let mut text = String::new();
+            if doc_id < TERM_DOCS {
+                for _ in 0..=(doc_id % 3) {
+                    text.push_str("common ");
+                }
+            }
+            for i in 0..len {
+                text.push_str(&format!("f{} ", (doc_id as usize + i) % 997));
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
+        }
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(bytes, json).expect("open");
+        let baked_avgdl = reader.columns[0].avgdl;
+
+        // Score against a shifted average, the way table-wide statistics do.
+        let shifted = reader.with_scoring_override(ScoringOverride {
+            params: None,
+            avgdl: Some(baked_avgdl * AVERAGE_SHIFT),
+        });
+        let col = &shifted.columns[0];
+        assert!(
+            col.bound_scale > 1.0,
+            "the shifted average must be one a stored bound would need inflating for"
+        );
+
+        let cursors = shifted
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let cursor = cursors.first().expect("term present");
+        let derived: Vec<f32> = cursor.blocks.iter().map(|b| b.block_max_bm25).collect();
+
+        // What the old correction would have produced from the same file.
+        let baked = reader
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let inflated: Vec<f32> = baked
+            .first()
+            .expect("term present")
+            .blocks
+            .iter()
+            .map(|b| b.block_max_bm25 * col.bound_scale)
+            .collect();
+
+        assert_eq!(derived.len(), inflated.len());
+        for (i, (d, infl)) in derived.iter().zip(inflated.iter()).enumerate() {
+            assert!(
+                d <= infl,
+                "block {i}: recomputed bound {d} above the inflated one {infl},                  so it cannot be tighter"
+            );
+        }
+        // Tighter in aggregate, not merely no worse: the inflation is
+        // what the regression was made of.
+        let sum_d: f32 = derived.iter().sum();
+        let sum_i: f32 = inflated.iter().sum();
+        assert!(
+            sum_d < sum_i,
+            "recomputed bounds ({sum_d}) must beat inflated ones ({sum_i})"
+        );
+
+        // And still sound: no document outscores its own block's bound.
+        let mut walk = shifted
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let c = walk.first_mut().expect("term present");
+        let idf = c.idf_weight;
+        while !c.is_exhausted() {
+            let doc = c.current_doc_id();
+            let score = bm25::score_with_dl_norm_k1(idf, c.current_tf(), col.dl_norm_k1.get(doc));
+            let bound = c.current_block_max_bm25();
+            assert!(
+                bound >= score,
+                "doc {doc}: bound {bound} below its own score {score}"
+            );
+            c.next();
+        }
+    }
+
+    /// How many competitive `(tf, length)` pairs a block actually has.
+    ///
+    /// A document is competitive only if no other document in the block
+    /// has both a higher term frequency and a shorter length — score
+    /// rises with the first and falls with the second, so everything
+    /// else is dominated and can never be the block's maximum at any
+    /// average document length. Keeping that frontier makes a bound
+    /// exact at whatever average a query scores with, which is the only
+    /// property that survives the average moving; its cost is how many
+    /// pairs have to be kept, which is what this measures.
+    #[tokio::test]
+    async fn competitive_frontier_size_per_block() {
+        const N_DOCS: u32 = 4000;
+        const TERM_DOCS: u32 = 3000;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for doc_id in 0..N_DOCS {
+            let len = 40 + (doc_id as usize * 7) % 500;
+            let mut text = String::new();
+            if doc_id < TERM_DOCS {
+                for _ in 0..=(doc_id % 3) {
+                    text.push_str("common ");
+                }
+            }
+            for i in 0..len {
+                text.push_str(&format!("f{} ", (doc_id as usize + i) % 997));
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
+        }
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(bytes, json).expect("open");
+        let col = &reader.columns[0];
+
+        let mut cursors = reader
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let cursor = cursors.first_mut().expect("term present");
+        let idf = cursor.idf_weight;
+        let last_ids: Vec<u32> = cursor.blocks.iter().map(|b| b.last_doc_id).collect();
+
+        let mut per_block: Vec<Vec<(u32, u32)>> = vec![Vec::new(); last_ids.len()];
+        let mut exact = vec![0.0f32; last_ids.len()];
+        let mut blk = 0usize;
+        while !cursor.is_exhausted() {
+            let doc = cursor.current_doc_id();
+            while blk + 1 < last_ids.len() && doc > last_ids[blk] {
+                blk += 1;
+            }
+            let tf = cursor.current_tf();
+            let dl = col.dl_norm_k1.stored_length(doc);
+            per_block[blk].push((tf, dl));
+            exact[blk] = exact[blk].max(bm25::score_with_dl_norm_k1(
+                idf,
+                tf,
+                col.dl_norm_k1.get(doc),
+            ));
+            cursor.next();
+        }
+
+        let mut sizes: Vec<usize> = Vec::new();
+        for pairs in &per_block {
+            // Pareto-maximal: nothing else has >= tf and <= length.
+            let front: Vec<(u32, u32)> = pairs
+                .iter()
+                .copied()
+                .filter(|&(tf, dl)| {
+                    !pairs
+                        .iter()
+                        .any(|&(t2, d2)| (t2, d2) != (tf, dl) && t2 >= tf && d2 <= dl)
+                })
+                .collect();
+            let mut uniq = front.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            sizes.push(uniq.len());
+        }
+        sizes.sort_unstable();
+        eprintln!(
+            "[frontier] {} blocks, {} postings/block: frontier size min {} median {} p90 {} max {}",
+            sizes.len(),
+            per_block[0].len(),
+            sizes[0],
+            sizes[sizes.len() / 2],
+            sizes[(sizes.len() as f32 * 0.9) as usize],
+            sizes[sizes.len() - 1]
+        );
+        let total: usize = sizes.iter().sum();
+        eprintln!(
+            "[frontier] total pairs {total} over {} blocks ({:.1} per block)",
+            sizes.len(),
+            total as f32 / sizes.len() as f32
+        );
+        assert!(sizes.iter().all(|&n| n >= 1));
+    }
+
+    /// How much pruning a bound derived from a block's `(max_tf,
+    /// min_dl)` gives up against the exact per-block maximum stored
+    /// today.
+    ///
+    /// The derived form is what makes a bound independent of the
+    /// average document length — it is recomputed at whatever average
+    /// the query scores with, so it never goes stale — but it is
+    /// reached at a document that may not exist: the block's highest
+    /// term frequency paired with its shortest length. This measures
+    /// that slack on the distribution it matters for, a common term,
+    /// and prices it in the only currency that counts here, blocks
+    /// admitted.
+    #[tokio::test]
+    async fn derived_bound_tightness_versus_the_exact_block_max() {
+        const N_DOCS: u32 = 4000;
+        const TERM_DOCS: u32 = 3000;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for doc_id in 0..N_DOCS {
+            let len = 40 + (doc_id as usize * 7) % 500;
+            let mut text = String::new();
+            if doc_id < TERM_DOCS {
+                for _ in 0..=(doc_id % 3) {
+                    text.push_str("common ");
+                }
+            }
+            for i in 0..len {
+                text.push_str(&format!("f{} ", (doc_id as usize + i) % 997));
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
+        }
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(bytes, json).expect("open");
+        let col = &reader.columns[0];
+
+        let mut cursors = reader
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let cursor = cursors.first_mut().expect("term present");
+        let idf = cursor.idf_weight;
+        let last_ids: Vec<u32> = cursor.blocks.iter().map(|b| b.last_doc_id).collect();
+
+        // Per block: the true maximum score, and the inputs a derived
+        // bound would be built from.
+        let mut exact = vec![0.0f32; last_ids.len()];
+        let mut max_tf = vec![0u32; last_ids.len()];
+        let mut min_norm = vec![f32::INFINITY; last_ids.len()];
+        let mut blk = 0usize;
+        while !cursor.is_exhausted() {
+            let doc = cursor.current_doc_id();
+            while blk + 1 < last_ids.len() && doc > last_ids[blk] {
+                blk += 1;
+            }
+            let tf = cursor.current_tf();
+            let norm = col.dl_norm_k1.get(doc);
+            exact[blk] = exact[blk].max(bm25::score_with_dl_norm_k1(idf, tf, norm));
+            max_tf[blk] = max_tf[blk].max(tf);
+            min_norm[blk] = min_norm[blk].min(norm);
+            cursor.next();
+        }
+        let derived: Vec<f32> = (0..last_ids.len())
+            .map(|i| bm25::score_with_dl_norm_k1(idf, max_tf[i], min_norm[i]))
+            .collect();
+
+        let mut slack: Vec<f32> = (0..exact.len()).map(|i| derived[i] / exact[i]).collect();
+        slack.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        eprintln!(
+            "[derived-tightness] {} blocks: slack min {:.4} median {:.4} max {:.4}",
+            slack.len(),
+            slack[0],
+            slack[slack.len() / 2],
+            slack[slack.len() - 1]
+        );
+
+        let mut sorted = exact.clone();
+        sorted.sort_by(|a, b| b.partial_cmp(a).expect("finite"));
+        let threshold = sorted[(sorted.len() / 10).max(1) - 1];
+        let admit = |v: &[f32]| v.iter().filter(|m| **m >= threshold).count();
+        eprintln!(
+            "[derived-tightness] admitted at the same threshold: exact {} / {}, derived {} / {}",
+            admit(&exact),
+            exact.len(),
+            admit(&derived),
+            derived.len()
+        );
+        // Whatever the slack, the derived form must never sit below the
+        // true maximum — that would drop documents rather than merely
+        // visit extra blocks.
+        for i in 0..exact.len() {
+            assert!(
+                derived[i] >= exact[i],
+                "block {i}: derived {} < exact {}",
+                derived[i],
+                exact[i]
+            );
+        }
+    }
+
+    /// How sensitive block-max pruning is to inflating the stored
+    /// bounds — the question behind a regression on common-term queries
+    /// after the length normalizer moved to a table-wide average.
+    ///
+    /// Prints rather than asserts a threshold: the point is the shape of
+    /// the curve, and pinning a number here would pin this corpus's
+    /// score distribution rather than anything about the engine.
+    #[tokio::test]
+    async fn bound_inflation_versus_blocks_admitted() {
+        const N_DOCS: u32 = 4000;
+        const TERM_DOCS: u32 = 3000;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for doc_id in 0..N_DOCS {
+            // Lengths spread the way prose does rather than uniformly,
+            // so the block maxima cluster instead of separating cleanly.
+            let len = 40 + (doc_id as usize * 7) % 500;
+            let mut text = String::new();
+            if doc_id < TERM_DOCS {
+                for _ in 0..=(doc_id % 3) {
+                    text.push_str("common ");
+                }
+            }
+            for i in 0..len {
+                text.push_str(&format!("f{} ", (doc_id as usize + i) % 997));
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
+        }
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(bytes, json).expect("open");
+
+        let cursors = reader
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let cursor = cursors.first().expect("term present");
+        let maxima: Vec<f32> = cursor.blocks.iter().map(|b| b.block_max_bm25).collect();
+        let mut sorted = maxima.clone();
+        sorted.sort_by(|a, b| b.partial_cmp(a).expect("finite"));
+        // A top-k walk prunes against roughly the k-th best score; the
+        // highest block max is the optimistic stand-in for it.
+        let threshold = sorted[(sorted.len() / 10).max(1) - 1];
+
+        eprintln!(
+            "[bound-sensitivity] {} blocks, max {:.4}, p10 {:.4}, min {:.4}",
+            maxima.len(),
+            sorted[0],
+            threshold,
+            sorted[sorted.len() - 1]
+        );
+        for infl in [1.0_f32, 1.01, 1.02, 1.05, 1.10, 1.20, 2.2] {
+            let admitted = maxima.iter().filter(|m| **m * infl >= threshold).count();
+            eprintln!(
+                "[bound-sensitivity] inflation {infl:.2}x -> {admitted:4} / {} blocks admitted ({:.1}%)",
+                maxima.len(),
+                100.0 * admitted as f32 / maxima.len() as f32
+            );
+        }
+        assert!(!maxima.is_empty());
+    }
+
     #[tokio::test]
     async fn block_max_bounds_query_time_score() {
         // A length that truncates under the one-byte length quantizer:

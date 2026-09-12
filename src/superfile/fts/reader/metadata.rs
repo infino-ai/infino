@@ -212,6 +212,14 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
+    /// The length the scorer normalizes this doc by — the stored
+    /// bucket decoded, not the doc's true token count. Test-only: the
+    /// scoring path reads the norm straight out of the table.
+    #[cfg(test)]
+    pub(super) fn stored_length(&self, doc: u32) -> u32 {
+        bm25::dequantize_len(self.bytes[doc as usize])
+    }
+
     /// Number of docs in the table. Test-only: the query path indexes
     /// by doc id and never needs the count.
     #[cfg(test)]
@@ -320,6 +328,17 @@ pub struct ColumnMeta {
 }
 
 impl ColumnMeta {
+    /// The average length and parameters a block bound should be
+    /// recomputed at, when this column is scored against anything other
+    /// than what its file baked in.
+    ///
+    /// `None` when nothing moved, which is the case a stored bound is
+    /// already exact for — recomputing then would be work for an
+    /// identical answer.
+    pub(crate) fn frontier_rescore(&self) -> Option<(f32, bm25::Bm25Params)> {
+        (self.bound_scale != 1.0).then_some((self.avgdl, self.params))
+    }
+
     /// The collection size this column's inverse document frequency is
     /// computed against: the documents that carry tokens here, not the
     /// superfile's row count.

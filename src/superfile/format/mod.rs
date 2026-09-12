@@ -94,9 +94,21 @@ pub mod fts {
     /// table), so existing indices read unchanged and need no reindex.
     pub const VERSION_V5: u32 = 5;
 
-    /// The version new code writes. Layout is byte-for-byte
-    /// [`VERSION_V5`]; what changes is the **scale** the stored per-block
-    /// and coarse block-max bounds are expressed in.
+    /// The version new code writes. Two changes over [`VERSION_V5`]: the
+    /// **scale** the stored bounds are expressed in, and a per-term
+    /// **competitive-frontier table** at the tail of the postings
+    /// region, after the coarse table — [`BLOCK_FRONTIER_BYTES`] per
+    /// block.
+    ///
+    /// The frontier is what makes a bound survive the average document
+    /// length moving. A stored bound is a *score*, so it is frozen at
+    /// whatever average the build divided by; scoring against a
+    /// table-wide average then needs it inflated, and a common term's
+    /// block maxima sit so close together that even a one-percent
+    /// inflation admits most of the blocks a tight bound would skip.
+    /// Storing the competitive `(term frequency, length)` pairs instead
+    /// lets the bound be recomputed exactly at whatever average the
+    /// query uses, so nothing is inflated and pruning is unchanged.
     ///
     /// `V1`–`V5` bounds are maxima of `idf · tf · (k1 + 1) / (tf + k1 ·
     /// norm)`. `V6` drops the `(k1 + 1)` factor, so a bound is a maximum
@@ -120,6 +132,34 @@ pub mod fts {
     /// of the top-k, which is why the scale is version-stamped rather
     /// than inferred.
     pub const VERSION_V6: u32 = 6;
+
+    /// Bytes per block in a term's competitive-frontier table (V6).
+    ///
+    /// Holds [`BLOCK_FRONTIER_POINTS`] `(term-frequency, length-bucket)`
+    /// pairs, one byte each, so a block's bound can be recomputed at
+    /// whatever average document length a query scores with instead of
+    /// being frozen at the one the build divided by.
+    ///
+    /// Fixed-width rather than the variable-length form the frontier
+    /// would compress to, because the ranked walk reaches a block by
+    /// index — the threshold seed picks blocks out of order and the
+    /// coarse level jumps whole spans — so the table has to be
+    /// randomly addressable. A variable-length region would need an
+    /// offset per block, which costs half the saving and puts a
+    /// dependent load in the skip loop.
+    pub const BLOCK_FRONTIER_BYTES: usize = 8;
+
+    /// Competitive pairs stored per block. A document is competitive
+    /// only if no other in the block has both a higher term frequency
+    /// and a shorter length; score rises with the first and falls with
+    /// the second, so everything else is dominated and can never be the
+    /// block's maximum at any average length.
+    ///
+    /// Four is headroom: a measured common term's frontier runs to
+    /// three. A block with more keeps its most competitive pairs plus a
+    /// synthetic `(max tf, min length)` point, which dominates every
+    /// pair and so stays a sound bound, at the cost of some tightness.
+    pub const BLOCK_FRONTIER_POINTS: usize = 4;
 
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode

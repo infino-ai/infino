@@ -1066,6 +1066,7 @@ impl FtsReader {
             col_meta.positions,
             false,
             self.has_coarse_block_max,
+            self.has_block_frontier,
         )?;
 
         let local_idf = bm25::idf(col_meta.scored_doc_count(), term_meta.df);
@@ -1406,6 +1407,7 @@ impl FtsReader {
                         col_meta.positions,
                         false,
                         self.has_coarse_block_max,
+                        self.has_block_frontier,
                     )?;
                     Some(FetchedTermSlot::Pfor {
                         bytes,
@@ -1564,7 +1566,9 @@ impl FtsReader {
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
+                        self.has_block_frontier,
                         col_meta.bound_scale,
+                        col_meta.frontier_rescore(),
                     )?;
                     cursors.push(Some(cursor));
                 }
@@ -1604,7 +1608,9 @@ impl FtsReader {
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
+                        self.has_block_frontier,
                         col_meta.bound_scale,
+                        col_meta.frontier_rescore(),
                     )?;
                     cursors.push(Some(cursor));
                 }
