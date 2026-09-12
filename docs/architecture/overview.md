@@ -82,7 +82,10 @@ connection's `query_sql`. From that connection you work with tables:
   `hybrid_search` (full-text, vector kNN, and RRF-fused, returning Arrow
   rows), the unranked `token_match` / `exact_match`, and `schema`. The
   same retrievers are also SQL table-valued functions, so search composes
-  with the rest of a query.
+  with the rest of a query. A caller who knows a column's vocabulary can
+  register it (`set_query_expansion`: stop terms and word families) and
+  every full-text query over that column applies it at query time, the
+  index untouched.
 
 The connection is the only entry point; everything below it (manifest,
 storage, cache, query fan-out) is internal.

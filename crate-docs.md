@@ -123,14 +123,18 @@ live on the [`Connection`] and [`Supertable`] pages:
     [`token_match`](Supertable::token_match),
     [`exact_match`](Supertable::exact_match), and
     [`count`](Supertable::count). Each search returns Arrow rows as
-    `Vec<RecordBatch>`.
+    `Vec<RecordBatch>`. [`set_query_expansion`](Supertable::set_query_expansion)
+    registers a per-column [`QueryExpansion`] — stop terms and term
+    groups — that the full-text methods apply at query time without
+    touching the index.
   - **Write** — [`append`](Supertable::append),
     [`update`](Supertable::update), [`delete`](Supertable::delete).
   - **Maintain** — [`optimize`](Supertable::optimize),
     [`gc`](Supertable::gc), and [`schema`](Supertable::schema).
 
 Supporting types: [`IndexSpec`], [`Metric`], [`BoolMode`],
-[`VectorFilter`], [`ConnectOptions`], [`MutationStats`],
+[`Bm25SearchOptions`], [`QueryExpansion`], [`VectorFilter`],
+[`ConnectOptions`], [`MutationStats`],
 [`GcReport`], and the [`InfinoError`], [`OptimizeError`], and [`GcError`] error
 enums.
 

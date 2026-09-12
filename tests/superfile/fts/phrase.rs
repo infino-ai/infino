@@ -395,7 +395,7 @@ async fn unranked_ids_and_count_agree_with_oracle() {
                 .collect();
 
             let ids = r
-                .atoms_match_ids("title", &terms, &phrases, mode)
+                .atoms_match_ids("title", &terms, &phrases, &[], mode)
                 .await
                 .expect("atoms_match_ids")
                 .0;
@@ -406,7 +406,7 @@ async fn unranked_ids_and_count_agree_with_oracle() {
             );
 
             let count = r
-                .atoms_match_count("title", &terms, &phrases, mode, &[], &[])
+                .atoms_match_count("title", &terms, &phrases, &[], mode, &[], &[], &[])
                 .await
                 .expect("atoms_match_count")
                 .0;
@@ -458,7 +458,7 @@ async fn phrase_and_rare_term_two_phase_agrees() {
     );
 
     let ids = r
-        .atoms_match_ids("title", &terms, &phrases, BoolMode::And)
+        .atoms_match_ids("title", &terms, &phrases, &[], BoolMode::And)
         .await
         .expect("atoms_match_ids")
         .0;
@@ -466,7 +466,7 @@ async fn phrase_and_rare_term_two_phase_agrees() {
     assert_eq!(got, want, "two-phase AND ids for phrase + rare term");
 
     let count = r
-        .atoms_match_count("title", &terms, &phrases, BoolMode::And, &[], &[])
+        .atoms_match_count("title", &terms, &phrases, &[], BoolMode::And, &[], &[], &[])
         .await
         .expect("atoms_match_count")
         .0;
@@ -529,7 +529,7 @@ async fn two_phase_phrase_with_dense_bitset_members_agrees() {
     assert!(!want.is_empty(), "corpus must plant some matches");
 
     let ids = r
-        .atoms_match_ids("title", &terms, &phrases, BoolMode::And)
+        .atoms_match_ids("title", &terms, &phrases, &[], BoolMode::And)
         .await
         .expect("atoms_match_ids")
         .0;
@@ -537,7 +537,7 @@ async fn two_phase_phrase_with_dense_bitset_members_agrees() {
     assert_eq!(got, want, "dense two-phase AND ids");
 
     let count = r
-        .atoms_match_count("title", &terms, &phrases, BoolMode::And, &[], &[])
+        .atoms_match_count("title", &terms, &phrases, &[], BoolMode::And, &[], &[], &[])
         .await
         .expect("atoms_match_count")
         .0;

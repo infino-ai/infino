@@ -49,6 +49,7 @@ use crate::{
     storage::{PrefixedStorageProvider, StorageError},
     superfile::{
         builder::VectorConfig,
+        fts::reader::NormalizedExpansion,
         vector::{kmeans::kmeans, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -72,6 +73,12 @@ use crate::{
     },
     utils::trace::{TableRole, record},
 };
+
+/// Per-column query-time expansions registered on a handle, keyed by
+/// FTS column name and already normalized through that column's
+/// analyzer. Held behind an `ArcSwap` so registration is a
+/// copy-on-write swap and a query pins one map for its whole run.
+pub(crate) type QueryExpansions = HashMap<String, Arc<NormalizedExpansion>>;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -240,6 +247,13 @@ pub(super) struct SupertableInner {
     /// top: decode the inline bytes once per manifest version, not once per
     /// query. Keyed by `manifest_id`, which bumps on every deleted-id stamp.
     pub(super) hidden_deleted_cache: Mutex<Option<(u64, Arc<Vec<i128>>)>>,
+    /// Query-time expansions (stop terms + term groups) registered per
+    /// FTS column on this open handle. Not persisted — the engine never
+    /// remembers a vocabulary it did not compute, so a reopened table
+    /// starts empty and the caller re-registers. Readers snapshot the map
+    /// at pin time, beside the manifest, so one query sees one vocabulary
+    /// even while another thread re-registers.
+    pub(super) query_expansions: ArcSwap<QueryExpansions>,
 }
 
 impl SupertableInner {
@@ -717,6 +731,7 @@ impl Supertable {
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
             tombstone_cache: self.inner.tombstone_cache.clone(),
+            query_expansions: self.inner.query_expansions.load_full(),
             inner: Arc::clone(&self.inner),
             op_stats,
         }
@@ -860,6 +875,31 @@ impl Supertable {
     /// swallows errors by design, so this latch is how that fact escapes.
     pub(crate) fn pointer_vanished(&self) -> bool {
         self.inner.pointer_vanished.get().is_some()
+    }
+
+    /// Swap `column`'s registered query-time expansion (`None` removes
+    /// it). Copy-on-write under `rcu`, so two threads registering
+    /// different columns at once both land; readers pinned before the
+    /// swap keep the map they snapshotted. The normalization against the
+    /// column's analyzer happened before this call — the map only ever
+    /// holds vocabularies the column can match.
+    pub(crate) fn replace_query_expansion(
+        &self,
+        column: &str,
+        expansion: Option<Arc<NormalizedExpansion>>,
+    ) {
+        self.inner.query_expansions.rcu(|current| {
+            let mut next: QueryExpansions = (**current).clone();
+            match &expansion {
+                Some(normalized) => {
+                    next.insert(column.to_owned(), Arc::clone(normalized));
+                }
+                None => {
+                    next.remove(column);
+                }
+            }
+            next
+        });
     }
 
     test_visible! {
@@ -1785,6 +1825,7 @@ async fn build_handle(
         pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: OnceLock::new(),
+        query_expansions: ArcSwap::from_pointee(QueryExpansions::new()),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
@@ -1989,6 +2030,11 @@ pub struct SupertableReader {
     /// returning per-superfile hits so tombstoned rows never
     /// reach callers. `None` for in-memory-only supertables.
     pub(crate) tombstone_cache: Option<Arc<SidecarCache>>,
+    /// Per-column query-time expansions as registered when this reader
+    /// was pinned. Snapshotted with the manifest so one query sees one
+    /// vocabulary from parse to prune to fan-out, whatever another thread
+    /// registers meanwhile.
+    query_expansions: Arc<QueryExpansions>,
     /// Shared inner state, held only so the reader's sync read
     /// methods can drive their async kernels on the supertable's
     /// `query_runtime` — the same `Arc<SupertableInner>` the writer
@@ -2021,6 +2067,9 @@ pub(crate) struct WeakReader {
     inner: Weak<SupertableInner>,
     manifest: Arc<ManifestSnapshot>,
     tombstone_cache: Option<Arc<SidecarCache>>,
+    /// The reader's pinned expansion registrations, carried like the
+    /// manifest so the rebuilt reader sees the same vocabulary.
+    query_expansions: Arc<QueryExpansions>,
     /// Per-query work collector carried through the weak round-trip. Safe
     /// because TVF exec plans are built per query; state that outlives a
     /// query (the cached SQL `SessionContext`) is constructed under
@@ -2042,6 +2091,7 @@ impl WeakReader {
             inner: Arc::downgrade(reader.inner_arc()),
             manifest: Arc::clone(reader.manifest()),
             tombstone_cache: reader.tombstone_cache.clone(),
+            query_expansions: Arc::clone(&reader.query_expansions),
             op_stats: reader.op_stats.clone(),
         }
     }
@@ -2054,6 +2104,7 @@ impl WeakReader {
             inner,
             Arc::clone(&self.manifest),
             self.tombstone_cache.clone(),
+            Arc::clone(&self.query_expansions),
             self.op_stats.clone(),
         )))
     }
@@ -2110,6 +2161,13 @@ impl SupertableReader {
     /// + summaries directly.
     pub fn manifest(&self) -> &Arc<ManifestSnapshot> {
         &self.manifest
+    }
+
+    /// The query-time expansion registered for `column` when this reader
+    /// was pinned, if any — already normalized through the column's
+    /// analyzer, so the search paths apply it without further work.
+    pub(crate) fn query_expansion_for(&self, column: &str) -> Option<&Arc<NormalizedExpansion>> {
+        self.query_expansions.get(column)
     }
 
     pub(crate) fn decoded_scalar_cache(&self) -> &DecodedScalarCache {
@@ -2234,11 +2292,13 @@ impl SupertableReader {
         inner: Arc<SupertableInner>,
         manifest: Arc<ManifestSnapshot>,
         tombstone_cache: Option<Arc<SidecarCache>>,
+        query_expansions: Arc<QueryExpansions>,
         op_stats: Option<Arc<OpStatsCollector>>,
     ) -> Self {
         Self {
             manifest,
             tombstone_cache,
+            query_expansions,
             inner,
             op_stats,
         }

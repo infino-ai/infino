@@ -29,3 +29,4 @@ connect	covered	(impl AsRef<str>) -> Result<Connection, InfinoError>
 connect_with	covered	(impl AsRef<str>, ConnectOptions) -> Result<Connection, InfinoError>
 
 Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface.
+Supertable::set_query_expansion	exempt	Registers a query-time vocabulary (stop terms + term groups) on an open handle; the bindings gain it together with the platform's vocabulary tier, not as a bare engine wrapper.

@@ -5,6 +5,9 @@
 //! the [`Bm25Stats`] idf-source selector, and the [`Bm25SearchOptions`]
 //! builder. Part of the `fts::reader::*` public surface.
 
+use std::sync::Arc;
+
+use super::expansion::QueryExpansion;
 use crate::superfile::fts::bm25::Bm25Params;
 
 /// Default operator for a query's bare (sigil-less) terms. Terms
@@ -59,15 +62,19 @@ impl From<&str> for Bm25Stats {
     }
 }
 
-/// Options for a BM25 search: the boolean `mode` and the corpus-statistics
-/// `stats`. Set fields with the `with_*` builders; [`Default`] is
-/// [`BoolMode::Or`] with [`Bm25Stats::Global`].
+/// Options for a BM25 search: the boolean `mode`, the corpus-statistics
+/// `stats`, an optional per-query `bm25` parameter override, and an
+/// optional per-call query `expansion`. Set fields with the `with_*`
+/// builders; [`Default`] is [`BoolMode::Or`] with [`Bm25Stats::Global`],
+/// each column's own declared parameters, and no expansion.
 ///
 /// ```ignore
 /// // OR mode, global stats (the defaults):
 /// Bm25SearchOptions::new()
 /// // AND mode, per-superfile (segment-local) stats:
 /// Bm25SearchOptions::new().with_mode(BoolMode::And).with_stats(Bm25Stats::PerSuperfile)
+/// // A vocabulary for this call only:
+/// Bm25SearchOptions::new().with_expansion(Some(Arc::new(QueryExpansion::new().stop(["the"]))))
 /// ```
 /// `#[non_exhaustive]`: construct with [`Bm25SearchOptions::new`] and
 /// the `with_*` setters. The attribute is what lets a further search
@@ -77,8 +84,11 @@ impl From<&str> for Bm25Stats {
 /// every field.
 ///
 /// `Eq` is deliberately absent: [`Bm25SearchOptions::bm25`] holds
-/// `f32`s, which have no total equality. `PartialEq` is derived.
-#[derive(Debug, Copy, Clone, PartialEq, Default)]
+/// `f32`s, which have no total equality. `PartialEq` is derived. `Copy`
+/// is absent too: [`Bm25SearchOptions::expansion`] is an `Arc`, so the
+/// options are passed by value and cloned (an `Arc` bump) where a
+/// caller reuses them.
+#[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct Bm25SearchOptions {
     /// Boolean mode for the query's bare terms (`Or` = should, `And` = must).
@@ -96,10 +106,16 @@ pub struct Bm25SearchOptions {
     /// traded. A column whose declared pair already equals the override
     /// pays nothing either.
     pub bm25: Option<Bm25Params>,
+    /// Stop terms and term groups applied to this call's query. `None`
+    /// (the default) applies whatever expansion is registered on the
+    /// table for the searched column; `Some` overrides that registration
+    /// for this call. See [`QueryExpansion`].
+    pub expansion: Option<Arc<QueryExpansion>>,
 }
 
 impl Bm25SearchOptions {
-    /// Default options: `Or` mode, global statistics.
+    /// Default options: `Or` mode, global statistics, each column's
+    /// declared parameters, no per-call expansion.
     pub fn new() -> Self {
         Self::default()
     }
@@ -128,6 +144,13 @@ impl Bm25SearchOptions {
     /// are built with it and the correction disappears.
     pub fn with_bm25(mut self, k1: f32, b: f32) -> Self {
         self.bm25 = Some(Bm25Params::new(k1, b));
+        self
+    }
+
+    /// Apply a query-time expansion to this call only, overriding the
+    /// column's registration; `None` (the default) falls back to it.
+    pub fn with_expansion(mut self, expansion: Option<Arc<QueryExpansion>>) -> Self {
+        self.expansion = expansion;
         self
     }
 }

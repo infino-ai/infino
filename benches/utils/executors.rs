@@ -755,7 +755,7 @@ pub mod fts {
                     let owned: Vec<Phrase<String>> =
                         phrases.iter().map(|p| p.map(|t| t.to_string())).collect();
                     return self
-                        .atoms_match_count(column, &refs, &owned, eff_mode, &[], &[])
+                        .atoms_match_count(column, &refs, &owned, &[], eff_mode, &[], &[], &[])
                         .await
                         .expect("superfile atoms_match_count")
                         .0;

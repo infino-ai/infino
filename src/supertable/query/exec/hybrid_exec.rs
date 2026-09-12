@@ -151,6 +151,9 @@ impl SupertableReader {
         let q_vec = calibrated_query(self, vec_col, q_vec);
         // Both retrievers run concurrently on the query runtime; each
         // inherits its own manifest skip and returns hits best-first.
+        // The text arm takes the default options apart from `mode` — no
+        // per-call expansion, so it applies whatever expansion is
+        // registered for `text_col`.
         let (bm25_res, vector_res) = future::join(
             self.bm25_search_async(
                 text_col,

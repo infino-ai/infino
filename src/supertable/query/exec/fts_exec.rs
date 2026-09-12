@@ -375,6 +375,11 @@ impl ExecutionPlan for Bm25Exec {
 
         let fut = async move {
             let hits = match &query {
+                // Default options apart from `mode` — global statistics,
+                // each column's declared parameters, no per-call
+                // expansion: the SQL function has no argument for any of
+                // them, so the column's registered expansion (if any)
+                // applies.
                 Bm25Query::Terms { query, mode } => {
                     reader
                         .bm25_search_async(
