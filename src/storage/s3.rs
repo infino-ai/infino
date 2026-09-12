@@ -330,6 +330,19 @@ fn tuned_client_options() -> ClientOptions {
 /// storage fault that will pass on its own, and the one remedy that would
 /// fix it — minting a fresh credential — is never reached. It does not pass
 /// on its own.
+///
+/// The test for membership here is not "does this code concern credentials"
+/// but "does a fresh credential fix it". All four mean the token or key
+/// identity is dead, and a mint replaces it.
+///
+/// `SignatureDoesNotMatch` is deliberately NOT one of them, though it reads
+/// like it belongs: it means the key exists and the request's signature did
+/// not verify, which is usually clock skew, a region or endpoint mismatch, or
+/// a signing fault — none of them cured by a new credential. On a minted
+/// credential it cannot mean expiry at all, because expiry says
+/// `ExpiredToken`. Classifying it here would turn a configuration fault into
+/// a mint loop: mint, fail, mint, fail, spending STS calls and hiding the
+/// real cause behind credential churn. Retrying is the better failure there.
 const REFUSED_CREDENTIAL_CODES: [&str; 4] = [
     "ExpiredToken",
     "TokenRefreshRequired",
