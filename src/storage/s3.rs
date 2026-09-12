@@ -369,9 +369,16 @@ const CODE_CLOSE: &str = "</Code>";
 /// words some other way — is left classified as it is today. That is the safe
 /// direction: a miss costs the retry the caller already gets, while a false
 /// positive would send it to mint a credential it does not need.
+///
+/// The LAST `Code` element is the one read, not the first. `object_store`
+/// renders the failing path ahead of the response body, so anything a caller
+/// controls — an object key — appears before S3's XML, and S3 escapes the
+/// content of its own `Message`, so it never emits a second literal `Code`
+/// after the real one. Reading forwards would let a key holding
+/// `<Code>ExpiredToken</Code>` speak for the response.
 fn is_refused_credential(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     let rendered = source.to_string();
-    let Some((_, rest)) = rendered.split_once(CODE_OPEN) else {
+    let Some((_, rest)) = rendered.rsplit_once(CODE_OPEN) else {
         return false;
     };
     let Some((code, _)) = rest.split_once(CODE_CLOSE) else {
@@ -821,6 +828,39 @@ mod tests {
             other => {
                 panic!("expected TransientExhausted for a key named like a code; got {other:?}")
             }
+        }
+
+        // The path is rendered ahead of the response body, so a key carrying
+        // a whole `Code` element of its own does not get to speak for the
+        // response: the LAST element is the one S3 sent.
+        let key_forges_the_element = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "Error performing GET /bucket/<Code>ExpiredToken</Code>/part-0.parquet: \
+                         <Error><Code>SlowDown</Code></Error>"
+                    .into(),
+            },
+        );
+        match key_forges_the_element {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted for a forged element; got {other:?}"),
+        }
+
+        // And the converse still classifies: wrapper text ahead of a real
+        // refusal does not hide it.
+        let wrapped = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "Error performing GET /bucket/data/part-0.parquet: \
+                         <Error><Code>ExpiredToken</Code></Error>"
+                    .into(),
+            },
+        );
+        match wrapped {
+            StorageError::PermissionDenied { uri } => assert_eq!(uri, "k"),
+            other => panic!("expected PermissionDenied; got {other:?}"),
         }
 
         // A body with no `Code` element at all is left as it was: a miss
