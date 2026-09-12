@@ -1196,13 +1196,18 @@ impl SuperfileBuilder {
         Ok(())
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Merge Sq8 IVF superfiles without fp32 corpus decode — byte-splices
     /// per-cluster IVF blocks and remaps doc ids.
     pub fn build_from_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_sq8_ivf_readers_to(readers, &mut buf)?;
+        let stats = Self::build_from_sq8_ivf_readers_to(readers, &HashMap::new(), &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -1212,10 +1217,12 @@ impl SuperfileBuilder {
     /// the compaction caller can stream to a temp file.
     pub(crate) fn build_from_sq8_ivf_readers_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let vec_col = first
@@ -1269,6 +1276,11 @@ impl SuperfileBuilder {
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Merge multi-cell (v2) Sq8 IVF superfiles **per global cell id**, then
     /// repack into one multi-cell output. Never flattens different cells into
     /// one IVF. Parquet `_id` rows follow cell-directory order (same as drain).
@@ -1283,6 +1295,7 @@ impl SuperfileBuilder {
         let stats = Self::build_from_multi_cell_sq8_ivf_readers_to(
             readers,
             superseded_per_reader,
+            &HashMap::new(),
             &mut buf,
         )?;
         Ok((buf, stats))
@@ -1294,10 +1307,12 @@ impl SuperfileBuilder {
     pub(crate) fn build_from_multi_cell_sq8_ivf_readers_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         superseded_per_reader: &[BTreeSet<u32>],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
             return Err(BuildError::VectorSchemaMismatch(
                 "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
@@ -1723,12 +1738,17 @@ impl SuperfileBuilder {
         Ok(superfile_stats)
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Builds a superfile from the given readers, merging them into one.
     pub fn build_from_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_to(readers, &mut buf)?;
+        let stats = Self::build_from_readers_to(readers, &HashMap::new(), &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -1739,11 +1759,13 @@ impl SuperfileBuilder {
     /// merged [`SuperfileStats`].
     pub(crate) fn build_from_readers_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
 
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let mut stats_collector = Vec::with_capacity(readers.len());
@@ -1781,10 +1803,12 @@ impl SuperfileBuilder {
     /// anon `Vec`.
     pub(crate) fn build_from_readers_fts_merge_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         // Encode the Parquet body incrementally: each input's surviving rows are
@@ -1869,6 +1893,11 @@ impl SuperfileBuilder {
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Thin `Vec<u8>` wrapper over
     /// [`build_from_readers_fts_merge_to`](Self::build_from_readers_fts_merge_to)
     /// for callers and tests that want the merged superfile in memory. Prefer
@@ -1877,7 +1906,7 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_fts_merge_to(readers, &mut buf)?;
+        let stats = Self::build_from_readers_fts_merge_to(readers, &HashMap::new(), &mut buf)?;
         Ok((buf, stats))
     }
 

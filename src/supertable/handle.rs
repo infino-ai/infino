@@ -250,7 +250,7 @@ impl SupertableInner {
     pub(super) fn builder_options(&self) -> BuilderOptions {
         self.options
             .builder_options()
-            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats())
+            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats(&HashSet::new()))
     }
 
     /// Runtime driving the sync API's async kernels when the caller

@@ -238,27 +238,41 @@ impl SuperfileList {
     /// predates the totals: a partial sum would describe some other
     /// corpus, so the caller falls back rather than mixing.
     pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
-        self.superfiles
-            .iter()
+        Self::fts_length_stats_over(self.superfiles.iter(), column)
+    }
+
+    fn fts_length_stats_over<'a>(
+        superfiles: impl Iterator<Item = &'a Arc<SuperfileEntry>>,
+        column: &str,
+    ) -> Option<ColumnLengthStats> {
+        superfiles
             .filter_map(|sf| sf.fts_summary.get(column))
             .try_fold(ColumnLengthStats::default(), |acc, summary| {
                 ColumnLengthStats::fold(Some(acc), summary.length_stats)
             })
     }
 
-    /// [`Self::fts_length_stats`] for every FTS column any superfile
-    /// summarises, keyed by column; columns without complete totals are
-    /// absent. What a writer hands the next superfile's builder so it
-    /// bakes the table-wide average rather than its own.
-    pub fn fts_corpus_stats(&self) -> HashMap<String, ColumnLengthStats> {
-        let columns: BTreeSet<&str> = self
+    /// [`Self::fts_length_stats`] for every FTS column, over the superfiles
+    /// a new file will sit beside — all of them for an append, all but the
+    /// inputs a compaction `replaces` — keyed by column; columns without
+    /// complete totals are absent. What a writer hands the new file's
+    /// builder so it bakes the table-wide average rather than its own.
+    pub fn fts_corpus_stats(&self, replaces: &HashSet<Uuid>) -> HashMap<String, ColumnLengthStats> {
+        let kept: Vec<&Arc<SuperfileEntry>> = self
             .superfiles
+            .iter()
+            .filter(|sf| !replaces.contains(&sf.superfile_id))
+            .collect();
+        let columns: BTreeSet<&str> = kept
             .iter()
             .flat_map(|sf| sf.fts_summary.keys().map(String::as_str))
             .collect();
         columns
             .into_iter()
-            .filter_map(|c| Some((c.to_owned(), self.fts_length_stats(c)?)))
+            .filter_map(|c| {
+                let stats = Self::fts_length_stats_over(kept.iter().copied(), c)?;
+                Some((c.to_owned(), stats))
+            })
             .collect()
     }
 }

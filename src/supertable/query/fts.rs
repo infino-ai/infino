@@ -2646,6 +2646,8 @@ mod tests {
     /// documents committed so far — and the manifest fold agrees.
     #[test]
     fn each_commit_bakes_the_running_table_wide_average() {
+        use std::collections::HashSet;
+
         use crate::superfile::fts::reader::ColumnLengthStats;
 
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
@@ -2688,8 +2690,21 @@ mod tests {
             })
         );
         assert_eq!(
-            manifest.fts_corpus_stats().get("title").copied(),
+            manifest
+                .fts_corpus_stats(&HashSet::new())
+                .get("title")
+                .copied(),
             manifest.fts_length_stats("title")
+        );
+        // What a compaction replacing the first two commits hands the
+        // merged file: the third commit's totals alone.
+        let replaced: HashSet<_> = superfiles[..2].iter().map(|sf| sf.superfile_id).collect();
+        assert_eq!(
+            manifest.fts_corpus_stats(&replaced).get("title").copied(),
+            Some(ColumnLengthStats {
+                total_tokens: 2,
+                n_scored_docs: 1,
+            })
         );
     }
 
