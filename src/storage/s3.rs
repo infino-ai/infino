@@ -376,6 +376,24 @@ const CODE_CLOSE: &str = "</Code>";
 /// content of its own `Message`, so it never emits a second literal `Code`
 /// after the real one. Reading forwards would let a key holding
 /// `<Code>ExpiredToken</Code>` speak for the response.
+///
+/// Read off the rendered string, and only off it, for two reasons that are
+/// properties of `object_store` rather than choices here:
+///
+/// - The body is already flattened into the top level. A failed request
+///   becomes `Generic { source: RetryError }`, and `RetryError`'s `Display`
+///   ends by writing its inner `RequestError`, whose `Status` variant renders
+///   the status and the whole response body. Walking `Error::source` would
+///   reach the same text one level down.
+/// - The typed form is out of reach. `RetryError` carries `status()` and
+///   `body()` as public methods, which would make this exact, but it lives in
+///   a `pub(crate)` module and cannot be named — let alone downcast to — from
+///   outside the crate.
+///
+/// Anchoring on the status text was considered and is a trap: the rendering
+/// is `Server returned non-2xx status code: 400 Bad Request`, so the obvious
+/// `"status 400"` matches nothing and would turn this function into a
+/// constant `false`.
 fn is_refused_credential(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     let rendered = source.to_string();
     let Some((_, rest)) = rendered.rsplit_once(CODE_OPEN) else {
@@ -763,6 +781,57 @@ mod tests {
             },
         );
         match err {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+    }
+
+    /// The message `object_store` actually renders for a failed S3 request,
+    /// as of 0.13: `RetryError`'s `Display` writes the method, the full URI
+    /// and the elapsed time, then ` - ` and its inner `RequestError`, whose
+    /// `Status` variant is `Server returned non-2xx status code: {status}:
+    /// {body}`.
+    ///
+    /// Written out here because every other case in this test builds a source
+    /// string of its own convenience, and a classifier that only ever sees
+    /// convenient input can pass while doing nothing at all against the real
+    /// thing. Note what it contains: the URI, with the object key, ahead of
+    /// the body — which is why the LAST `Code` element is the one read.
+    fn rendered_s3_failure(key: &str, code: &str) -> String {
+        format!(
+            "Error performing GET https://bucket.s3.us-east-1.amazonaws.com/{key} in 1.204s \
+             - Server returned non-2xx status code: 400 Bad Request: \
+             <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+             <Message>The provided token has expired.</Message>\
+             <RequestId>ABC123</RequestId></Error>"
+        )
+    }
+
+    /// The classifier against the shape `object_store` really produces, not a
+    /// convenient one: a lapsed credential is a refusal, and a throttle on an
+    /// object whose key is spelled like a credential code is not.
+    #[test]
+    fn translate_the_message_object_store_actually_renders() {
+        let refused = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: rendered_s3_failure("data/part-0.parquet", "ExpiredToken").into(),
+            },
+        );
+        match refused {
+            StorageError::PermissionDenied { uri } => assert_eq!(uri, "k"),
+            other => panic!("expected PermissionDenied; got {other:?}"),
+        }
+
+        let throttled_on_a_confusing_key = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: rendered_s3_failure("ExpiredToken/part-0.parquet", "SlowDown").into(),
+            },
+        );
+        match throttled_on_a_confusing_key {
             StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
             other => panic!("expected TransientExhausted; got {other:?}"),
         }
