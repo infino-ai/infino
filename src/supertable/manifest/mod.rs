@@ -478,6 +478,7 @@ impl ManifestSnapshot {
             parts,
             tombstone_seqs,
             superseded_cells,
+            split_checks: BTreeMap::new(),
         }
     }
 
@@ -1541,6 +1542,34 @@ impl ManifestSnapshot {
         }
     }
 
+    /// Overlay `additions` onto the split-check memo, replacing any prior
+    /// verdict for the same cell. In-process-only manifests pass through
+    /// unchanged. See [`list::Manifest::split_checks`].
+    pub fn with_split_checks_added(&self, additions: &BTreeMap<u32, list::CellSplitCheck>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.split_checks
+                .extend(additions.iter().map(|(&c, &v)| (c, v)));
+            list
+        });
+        Self {
+            superfile_list: self.superfile_list.clone(),
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
+    /// The persisted list's split-check memo: per cell, the verdict of the
+    /// last split check and the content fingerprint it ran against. `None`
+    /// for in-process-only manifests (no persisted list).
+    pub fn get_split_checks(&self) -> Option<&BTreeMap<u32, list::CellSplitCheck>> {
+        self.list.as_ref().map(|l| &l.split_checks)
+    }
+
     /// The persisted list's per-superfile tombstone-seq map. `None`
     /// for in-process-only manifests (no persisted list ⇒ no sidecars
     /// can exist).
@@ -1956,6 +1985,14 @@ impl ManifestSnapshot {
             .map(|list| list.superseded_cells.clone())
             .unwrap_or_default();
         superseded_cells.retain(|id, _| !ids_to_remove.contains(id));
+        // Verdicts carry forward unchanged: each is keyed to a content
+        // fingerprint, so a cell that changed no longer matches and re-checks
+        // itself — nothing to prune here.
+        let split_checks = self
+            .list
+            .as_ref()
+            .map(|list| list.split_checks.clone())
+            .unwrap_or_default();
 
         let opts_hash = options_hash::compute_options_hash(opts.as_ref(), &strategy);
         let vector_columns: Vec<list::VectorColumnInfo> = opts
@@ -1975,6 +2012,7 @@ impl ManifestSnapshot {
             drained_ranges: self.get_drained_ranges(),
             tombstone_seqs,
             superseded_cells,
+            split_checks,
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: self.get_next_manifest_id(),
             options_hash: opts_hash,
@@ -4859,6 +4897,7 @@ mod tests {
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -4905,6 +4944,48 @@ mod tests {
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
             }
+        }
+
+        #[test]
+        fn split_checks_added_are_readable_and_replace_per_cell() {
+            let storage = Arc::new(CountingMockStorage::new(HashMap::new()));
+            let snapshot = build_manifest_with_loader(fresh_list(vec![]), storage);
+            assert!(snapshot.get_split_checks().expect("list").is_empty());
+
+            let mut additions = BTreeMap::new();
+            additions.insert(
+                5,
+                list::CellSplitCheck {
+                    fingerprint: 111,
+                    version: 1,
+                },
+            );
+            let with_five = snapshot.with_split_checks_added(&additions);
+            assert_eq!(
+                with_five.get_split_checks().expect("list").get(&5),
+                Some(&list::CellSplitCheck {
+                    fingerprint: 111,
+                    version: 1,
+                })
+            );
+
+            // A later verdict for the same cell replaces the earlier one.
+            let mut replace = BTreeMap::new();
+            replace.insert(
+                5,
+                list::CellSplitCheck {
+                    fingerprint: 222,
+                    version: 2,
+                },
+            );
+            let replaced = with_five.with_split_checks_added(&replace);
+            assert_eq!(
+                replaced.get_split_checks().expect("list").get(&5),
+                Some(&list::CellSplitCheck {
+                    fingerprint: 222,
+                    version: 2,
+                })
+            );
         }
 
         #[tokio::test]
@@ -5167,6 +5248,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -5348,6 +5430,7 @@ mod tests {
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -5487,6 +5570,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -5564,6 +5648,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -5692,6 +5777,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -5904,6 +5990,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -6166,6 +6253,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6321,6 +6409,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6534,6 +6623,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6639,6 +6729,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6771,6 +6862,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6893,6 +6985,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7031,6 +7124,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7179,6 +7273,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7341,6 +7436,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7565,6 +7661,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7667,6 +7764,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7785,6 +7883,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7926,6 +8025,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -8064,6 +8164,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -8156,6 +8257,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -8267,6 +8369,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -8401,6 +8504,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),

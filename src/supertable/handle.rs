@@ -6130,6 +6130,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            split_checks_additions: None,
             graph_ref: None,
         };
         let no_removals = Vec::new();
@@ -6329,6 +6330,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            split_checks_additions: None,
             graph_ref: None,
         };
         let no_removals = Vec::new();
@@ -6405,6 +6407,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            split_checks_additions: None,
             graph_ref: None,
         };
         let zero_manifest = hidden
@@ -6606,6 +6609,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            split_checks_additions: None,
             graph_ref: None,
         };
         let no_removals = Vec::new();
@@ -6971,6 +6975,125 @@ mod tests {
             }
             other => panic!("hidden stays VectorCell after optimize, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn optimize_memoizes_a_whole_cell_and_skips_re_checking_it() {
+        // A single unimodal blob big enough to reach the modality trigger but
+        // NOT multimodal: `optimize` downloads and checks it once, leaves it
+        // whole, and records the verdict. A second `optimize` finds the cell's
+        // contents unchanged and must not re-record it.
+        const DIM: usize = 16;
+        const N: usize = (MODALITY_MIN_CELL_DOCS as usize) + 32;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool)
+        .with_vector_cell_counts(1, 1);
+        let st = Supertable::create(options).expect("create");
+
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        // One tight blob around e_0 with tiny per-row jitter — unimodal, so the
+        // shape check leaves the cell whole.
+        let mut flat = vec![0.0f32; N * DIM];
+        for r in 0..N {
+            flat[r * DIM] = 1.0;
+            flat[r * DIM + 1] = ((r % 7) as f32 - 3.0) * 1e-3;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+
+        // The whole cell stayed whole, and its verdict was recorded.
+        let after_first = hidden.reader().expect("reader");
+        let manifest = after_first.manifest();
+        match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(clusters.n_cent, 1, "unimodal cell must not split");
+            }
+            other => panic!("hidden stays VectorCell, got {other:?}"),
+        }
+        let checks = manifest
+            .get_split_checks()
+            .expect("hidden manifest has a list")
+            .clone();
+        assert!(
+            checks.contains_key(&0),
+            "the checked whole cell records a verdict, got {checks:?}"
+        );
+        assert_eq!(
+            checks[&0].version,
+            crate::supertable::writer::CELL_SPLIT_CHECK_VERSION,
+            "verdict is stamped with the current check version"
+        );
+
+        // A second optimize sees the same contents: the verdict is unchanged
+        // (the memo hit re-checks nothing).
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        let after_second = hidden.reader().expect("reader");
+        assert_eq!(
+            after_second
+                .manifest()
+                .get_split_checks()
+                .expect("list")
+                .get(&0),
+            checks.get(&0),
+            "an unchanged cell keeps its recorded verdict"
+        );
     }
 
     /// The centroid-router graph is cached stamped with the hidden manifest

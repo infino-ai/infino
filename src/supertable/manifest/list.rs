@@ -213,6 +213,21 @@ pub struct Manifest {
     /// blocks and merge drops them; the entry leaves the manifest when
     /// its superfile is merged away (mirrors [`Self::tombstone_seqs`]).
     pub superseded_cells: BTreeMap<Uuid, BTreeSet<u32>>,
+    /// Per cell, the last split-check verdict and a fingerprint of the
+    /// contents it ran against. Lets maintenance skip re-checking a cell whose
+    /// contents are unchanged. Self-invalidating: a cell's fingerprint moves
+    /// when its superfiles change, and an unknown cell is simply re-checked.
+    pub split_checks: BTreeMap<u32, CellSplitCheck>,
+}
+
+/// A cached split-check result for one cell. `fingerprint` identifies the
+/// contents the check ran on; a mismatch — or a `version` bump when the check
+/// logic changes — re-checks the cell. Only "left whole" verdicts are stored;
+/// a split replaces the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellSplitCheck {
+    pub fingerprint: u64,
+    pub version: u32,
 }
 
 /// Content-addressed reference to a sibling object of a manifest
@@ -1330,6 +1345,8 @@ struct ManifestDto {
     parts: Vec<ManifestPartEntryDto>,
     tombstone_seqs: BTreeMap<String, u64>,        // UUID keys
     superseded_cells: BTreeMap<String, Vec<u32>>, // UUID keys
+    #[serde(default)]
+    split_checks: BTreeMap<u32, CellSplitCheck>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1919,6 +1936,7 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .iter()
             .map(|(id, cells)| (id.to_string(), cells.iter().copied().collect()))
             .collect(),
+        split_checks: l.split_checks.clone(),
     })
 }
 
@@ -2060,6 +2078,7 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
                     .map_err(|_| ListParseError::BadFieldValue("superseded_cells", id))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?,
+        split_checks: d.split_checks,
     })
 }
 
@@ -2632,6 +2651,7 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -2835,6 +2855,44 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.superseded_cells, list.superseded_cells);
+    }
+
+    #[test]
+    fn split_checks_roundtrip() {
+        let mut list = empty_list();
+        list.split_checks.insert(
+            3,
+            CellSplitCheck {
+                fingerprint: 0xABCD_1234_5678_9F01,
+                version: 2,
+            },
+        );
+        list.split_checks.insert(
+            7,
+            CellSplitCheck {
+                fingerprint: 1,
+                version: 1,
+            },
+        );
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.split_checks, list.split_checks);
+    }
+
+    #[test]
+    fn split_checks_absent_decodes_empty() {
+        // A manifest written before the field existed carries no `split_checks`
+        // key; `#[serde(default)]` must decode it to an empty memo, not fail.
+        let list = empty_list();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encode(&list).expect("encode")).expect("parse");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("split_checks");
+        let bytes = serde_json::to_vec(&value).expect("reserialize");
+        let decoded = decode(&bytes).expect("decode legacy manifest");
+        assert!(decoded.split_checks.is_empty());
     }
 
     #[test]

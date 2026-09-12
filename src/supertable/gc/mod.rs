@@ -459,6 +459,7 @@ mod tests {
             Some(Manifest {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
@@ -532,6 +533,7 @@ mod tests {
             Some(Manifest {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
@@ -600,6 +602,7 @@ mod tests {
             Some(Manifest {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
