@@ -2281,6 +2281,47 @@ mod tests {
         assert_eq!(r.read_doc_lengths(0).expect("doc lengths"), vec![3, 4]);
     }
 
+    /// The test-only V5 writer must produce exactly what the released 0.8.1
+    /// builder produced — otherwise every legacy test above is testing a
+    /// format of its own invention. The fixture was written by v0.8.1 from
+    /// the same documents.
+    #[test]
+    fn the_legacy_v5_writer_reproduces_a_0_8_1_blob_byte_for_byte() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../../../../tests/fixtures/fts_blob_v0.8.1_ascii_lower.bin");
+        fn fixture_doc(i: u32) -> String {
+            if i % 3 == 2 {
+                return String::new();
+            }
+            match i % 4 {
+                0 => format!("common shared d{i}"),
+                1 => format!("common common beta d{i} pad pad"),
+                2 => format!("common gamma d{i} pad"),
+                _ => format!("common shared delta d{i} pad pad pad pad"),
+            }
+        }
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.era = BlobEra::LegacyV5;
+        b.register_column("body".into(), false)
+            .expect("register body");
+        b.register_column("title".into(), true)
+            .expect("register title");
+        for i in 0..600u32 {
+            let text = fixture_doc(i);
+            b.add_doc(0, i, &text).expect("body");
+            b.add_doc(1, i, &text).expect("title");
+        }
+        let ours = b.finish().expect("finish");
+        assert_eq!(ours.len(), FIXTURE.len(), "blob length");
+        if let Some(at) = ours.iter().zip(FIXTURE).position(|(a, b)| a != b) {
+            panic!(
+                "first difference at byte {at}: ours {:?} vs 0.8.1 {:?}",
+                &ours[at..(at + 16).min(ours.len())],
+                &FIXTURE[at..(at + 16).min(FIXTURE.len())]
+            );
+        }
+    }
+
     #[test]
     fn open_accepts_valid_blob() {
         let (blob, json) = build_blob();

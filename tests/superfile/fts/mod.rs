@@ -5,6 +5,7 @@ pub mod analysis_chain;
 pub mod brute_force_oracle;
 pub mod edge_and_unranked;
 pub mod fuzz_oracle;
+mod legacy_v5_fixture;
 pub mod multi_column;
 pub mod must_should;
 pub mod negation;

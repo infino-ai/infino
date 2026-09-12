@@ -313,11 +313,12 @@ pub(crate) enum BlobEra {
     /// [`format::fts::VERSION_V6`]: coarse table, bounds in the scorer's
     /// scale, the declared average over documents with tokens.
     Current,
-    /// [`format::fts::VERSION_V5`] as 0.8 wrote it: coarse table, bounds
-    /// carrying the `(k1 + 1)` factor, the average over every row.
+    /// [`format::fts::VERSION_V5`] as 0.8 wrote it, byte for byte: coarse
+    /// table, bounds carrying the `(k1 + 1)` factor, idf and the average
+    /// over every row, the average truncated into the directory.
     LegacyV5,
     /// The pre-coarse ladder (`V2`–`V4` by content): fixed-point bounds
-    /// carrying `(k1 + 1)`, the average over every row.
+    /// carrying `(k1 + 1)`, otherwise as [`Self::LegacyV5`].
     NoCoarse,
 }
 
@@ -334,7 +335,7 @@ impl BlobEra {
         }
     }
 
-    /// Whether the declared average divides by every row (the pre-current
+    /// Whether the statistics divide by every row (the pre-current
     /// defect) rather than by the documents that carry tokens.
     fn averages_over_rows(self) -> bool {
         self != Self::Current
@@ -2634,13 +2635,14 @@ impl FtsBuilder {
         let mut n_scored_per_col: Vec<u32> = vec![0; n_columns as usize];
         for (orig_idx, state, _) in &work {
             let own = state.length_stats();
-            avgdl_per_col[*orig_idx] = match era.averages_over_rows() {
-                false => state.stored_average(&own),
-                true => bm25::stored_avgdl(
-                    state.total_tokens as f32 / state.doc_lengths.len().max(1) as f32,
-                ),
+            // The legacy eras reproduce what earlier releases wrote, byte for
+            // byte: the unrounded row average, and idf over rows.
+            let rows = state.doc_lengths.len();
+            (avgdl_per_col[*orig_idx], n_scored_per_col[*orig_idx]) = match era.averages_over_rows()
+            {
+                false => (state.stored_average(&own), own.n_scored_docs as u32),
+                true => (state.total_tokens as f32 / rows.max(1) as f32, rows as u32),
             };
-            n_scored_per_col[*orig_idx] = own.n_scored_docs as u32;
         }
         let scratch_path = scratch_dir.path().to_path_buf();
         // Posting body scratch file. Encoded posting blocks for every
@@ -2810,13 +2812,14 @@ impl FtsBuilder {
         let mut n_scored_per_col: Vec<u32> = vec![0; n_columns as usize];
         for (orig_idx, state, _) in &work {
             let own = state.length_stats();
-            avgdl_per_col[*orig_idx] = match era.averages_over_rows() {
-                false => state.stored_average(&own),
-                true => bm25::stored_avgdl(
-                    state.total_tokens as f32 / state.doc_lengths.len().max(1) as f32,
-                ),
+            // The legacy eras reproduce what earlier releases wrote, byte for
+            // byte: the unrounded row average, and idf over rows.
+            let rows = state.doc_lengths.len();
+            (avgdl_per_col[*orig_idx], n_scored_per_col[*orig_idx]) = match era.averages_over_rows()
+            {
+                false => (state.stored_average(&own), own.n_scored_docs as u32),
+                true => (state.total_tokens as f32 / rows.max(1) as f32, rows as u32),
             };
-            n_scored_per_col[*orig_idx] = own.n_scored_docs as u32;
         }
 
         let scratch_path = scratch_dir.path().to_path_buf();
@@ -3463,7 +3466,12 @@ fn assemble_and_write_blob<W: Write>(
     let mut dir_buf: Vec<u8> = Vec::with_capacity(n_columns as usize * DOC_LENGTHS_ENTRY_SIZE);
     let mut arrays_buf: Vec<u8> = Vec::new();
     for i in 0..n_columns as usize {
-        let avgdl_x1000 = bm25::avgdl_x1000(avgdl_per_col[i]);
+        let avgdl_x1000 = match era.averages_over_rows() {
+            false => bm25::avgdl_x1000(avgdl_per_col[i]),
+            // Earlier releases truncated rather than rounded.
+            true => (avgdl_per_col[i] * format::fts::AVGDL_FIXED_POINT_SCALE)
+                .clamp(0.0, u32::MAX as f32) as u32,
+        };
         dir_buf.extend_from_slice(&(i as u32).to_le_bytes());
         dir_buf.extend_from_slice(&doc_lengths_array_offset.to_le_bytes());
         dir_buf.extend_from_slice(&avgdl_x1000.to_le_bytes());
@@ -3916,15 +3924,14 @@ fn encode_and_emit_term<W: Write>(
                 .zip(block_tfs.iter())
                 .map(|(&d, &t)| {
                     bm25::score(
-                        idf_t,
+                        idf_t * era.bound_scale(params),
                         t,
                         bm25::stored_len(col_doc_lengths[d as usize]),
                         avgdl,
                         params,
                     )
                 })
-                .fold(0.0f32, f32::max)
-                * era.bound_scale(params);
+                .fold(0.0f32, f32::max);
             block_maxes.push(block_max);
             let block = Block {
                 doc_ids: mem::take(&mut block_doc_ids),
