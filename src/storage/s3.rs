@@ -320,6 +320,38 @@ fn tuned_client_options() -> ClientOptions {
         .with_connect_timeout(S3_CONNECT_TIMEOUT)
 }
 
+/// S3's own codes for a credential that is not valid *now*: it expired, or
+/// it was never one of ours.
+///
+/// S3 reports these as a **400 with the code in an XML body**, not as a 401
+/// or 403, so `object_store` classifies them `Generic` rather than
+/// `PermissionDenied` — and `Generic` is the arm that means "transient, keep
+/// retrying". Left there, an expired credential reads to a caller as a
+/// storage fault that will pass on its own, and the one remedy that would
+/// fix it — minting a fresh credential — is never reached. It does not pass
+/// on its own.
+const REFUSED_CREDENTIAL_CODES: [&str; 4] = [
+    "ExpiredToken",
+    "TokenRefreshRequired",
+    "InvalidToken",
+    "InvalidAccessKeyId",
+];
+
+/// Whether a `Generic` error is S3 refusing the credential, read off the
+/// code it puts in the body.
+///
+/// Matched on the rendered message because that is where `object_store`
+/// leaves it: the XML body is formatted into the error's `source` and the
+/// code is not a field this crate can reach any other way. A miss leaves the
+/// error classified as it is today; a false positive costs the caller one
+/// pointless credential refresh and the same error again.
+fn is_refused_credential(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let rendered = source.to_string();
+    REFUSED_CREDENTIAL_CODES
+        .iter()
+        .any(|code| rendered.contains(code))
+}
+
 /// Translate an `object_store::Error` to our `StorageError`.
 /// Same shape as the LocalFS provider's translate; kept here
 /// rather than shared to keep each backend file self-
@@ -334,6 +366,13 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
         // Refused credentials, kept apart from `Permanent`: the URI is
         // fine and the same call with valid credentials can succeed.
         ObjError::PermissionDenied { .. } | ObjError::Unauthenticated { .. } => {
+            StorageError::PermissionDenied { uri: uri.into() }
+        }
+        // A refused credential arrives here rather than in the arm above,
+        // because S3 answers 400 with the code in the body. It is the same
+        // fault and gets the same classification, so a caller that heals a
+        // refusal by re-minting heals this one too.
+        ObjError::Generic { ref source, .. } if is_refused_credential(source.as_ref()) => {
             StorageError::PermissionDenied { uri: uri.into() }
         }
         ObjError::Generic { source, .. } => StorageError::TransientExhausted {
@@ -689,6 +728,49 @@ mod tests {
             },
         );
         match err {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+    }
+
+    /// An expired or unknown credential reaches us as `Generic`, because S3
+    /// answers 400 with the code in an XML body rather than 401 or 403. It is
+    /// the same refusal as the typed variants and is classified the same, so a
+    /// caller that heals a refusal by minting a fresh credential heals this
+    /// one too instead of retrying a fault that will never clear.
+    #[test]
+    fn translate_a_refused_credential_code_to_permission_denied() {
+        let body = |code: &str| {
+            format!(
+                "Error performing GET: status 400 Bad Request: \
+                 <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+                 <Message>The provided token has expired.</Message></Error>"
+            )
+        };
+        for code in REFUSED_CREDENTIAL_CODES {
+            let err = translate(
+                "k",
+                ObjError::Generic {
+                    store: "S3",
+                    source: body(code).into(),
+                },
+            );
+            match err {
+                StorageError::PermissionDenied { uri } => assert_eq!(uri, "k", "{code}"),
+                other => panic!("expected PermissionDenied for {code}; got {other:?}"),
+            }
+        }
+        // A generic fault that names no such code keeps the transient
+        // classification: retrying a throttle or a dropped socket is right,
+        // and only the credential codes are not.
+        let throttled = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "status 503 Slow Down: <Error><Code>SlowDown</Code></Error>".into(),
+            },
+        );
+        match throttled {
             StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
             other => panic!("expected TransientExhausted; got {other:?}"),
         }
