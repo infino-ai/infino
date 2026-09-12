@@ -120,138 +120,6 @@ const LEN_QUANT_EXACT_MAX: u32 = 1 << (LEN_QUANT_MANTISSA_BITS + 1);
 /// instead of an `f32`), which is what keeps it cache-resident at scale.
 const LEN_QUANT_MANTISSA_BITS: u32 = 3;
 
-/// Build a block's competitive frontier from its `(term frequency,
-/// stored length)` pairs and write it into the block's fixed slot.
-///
-/// A document is competitive only if no other in the block has both a
-/// term frequency at least as high and a length at least as short:
-/// score rises with the first and falls with the second, so anything
-/// else is dominated and can never be the block's maximum at *any*
-/// average document length. That last part is the point — the frontier
-/// is average-independent, where a stored score is not.
-///
-/// A frontier larger than the slot keeps its highest-frequency points
-/// plus a synthetic `(max tf, min length)` pair. That pair dominates
-/// every document in the block, so the bound stays sound; it is simply
-/// looser, since no document need have both extremes.
-///
-/// Unused slots are marked with a zero term frequency, which no posting
-/// carries.
-pub(super) fn encode_block_frontier(pairs: &[(u32, u32)], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), format::fts::BLOCK_FRONTIER_BYTES);
-    out.fill(0);
-    if pairs.is_empty() {
-        return;
-    }
-    let mut front: Vec<(u32, u32)> = pairs
-        .iter()
-        .copied()
-        .filter(|&(tf, dl)| {
-            !pairs
-                .iter()
-                .any(|&(t2, d2)| (t2, d2) != (tf, dl) && t2 >= tf && d2 <= dl)
-        })
-        .collect();
-    front.sort_unstable();
-    front.dedup();
-    // Highest frequency first: those are the points most likely to carry
-    // the maximum, so they are the ones to keep when the slot is full.
-    front.sort_unstable_by_key(|&(tf, _)| std::cmp::Reverse(tf));
-
-    let cap = format::fts::BLOCK_FRONTIER_POINTS;
-    if front.len() > cap {
-        let max_tf = pairs.iter().map(|&(tf, _)| tf).max().unwrap_or(0);
-        let min_dl = pairs.iter().map(|&(_, dl)| dl).min().unwrap_or(0);
-        front.truncate(cap - 1);
-        front.push((max_tf, min_dl));
-    }
-    for (i, &(tf, dl)) in front.iter().enumerate() {
-        out[i * 2] = quantize_tf_up(tf);
-        out[i * 2 + 1] = quantize_len(dl);
-    }
-}
-
-/// The block's upper bound at `avgdl` and `params`, recomputed from its
-/// stored frontier.
-///
-/// Exact whenever the frontier fit its slot and every frequency fell in
-/// the codec's exact range, which is the ordinary case; otherwise it is
-/// above the true maximum and never below it.
-#[inline]
-pub(super) fn block_frontier_bound(
-    slot: &[u8],
-    idf_weight: f32,
-    avgdl: f32,
-    params: Bm25Params,
-) -> f32 {
-    let mut best = 0.0f32;
-    for pair in slot.chunks_exact(2) {
-        // A zero frequency marks an unused slot, and the frontier is
-        // packed from the front, so nothing after it is set.
-        if pair[0] == 0 {
-            break;
-        }
-        let tf = dequantize_tf(pair[0]);
-        let dl = dequantize_len(pair[1]);
-        best = best.max(score_with_dl_norm_k1(
-            idf_weight,
-            tf,
-            params.dl_norm_k1(dl, avgdl),
-        ));
-    }
-    best
-}
-
-/// Quantize a term frequency into one byte, **rounding up**.
-///
-/// Frequencies below [`TF_QUANT_EXACT_MAX`] are stored exactly, which
-/// covers the overwhelming majority — a term appearing four or more
-/// times in one document is already unusual. Larger ones keep the top
-/// [`TF_QUANT_MANTISSA_BITS`] bits below the leading 1 plus an exponent,
-/// and any remainder bumps the mantissa so the decoded value is never
-/// below the input.
-///
-/// The rounding direction is the whole point. This is stored so a bound
-/// can be recomputed later, and score rises with frequency, so a value
-/// rounded *down* would produce a bound below a score it is supposed to
-/// cap — which silently drops documents from the top-k. Rounding up can
-/// only make a bound loose, which costs work and never correctness.
-#[inline]
-pub(super) fn quantize_tf_up(tf: u32) -> u8 {
-    if tf < TF_QUANT_EXACT_MAX {
-        return tf as u8;
-    }
-    let bits = u32::BITS - 1 - tf.leading_zeros();
-    let shift = bits - TF_QUANT_MANTISSA_BITS;
-    let mantissa = (tf >> shift) & 0x07;
-    // Anything below the mantissa's last kept bit rounds the mantissa up.
-    let has_remainder = (tf & ((1 << shift) - 1)) != 0;
-    let exponent = shift + 1;
-    let code = ((exponent << TF_QUANT_MANTISSA_BITS) | mantissa) as u16;
-    let code = if has_remainder { code + 1 } else { code };
-    code.min(u8::MAX as u16) as u8
-}
-
-/// Decode a byte produced by [`quantize_tf_up`].
-#[inline]
-pub(super) fn dequantize_tf(b: u8) -> u32 {
-    let i = b as u32;
-    if i < TF_QUANT_EXACT_MAX {
-        i
-    } else {
-        let mantissa = i & 0x07;
-        let exponent = (i >> TF_QUANT_MANTISSA_BITS) - 1;
-        (mantissa | 0x08) << exponent
-    }
-}
-
-/// Term frequencies below this are stored exactly in one byte.
-const TF_QUANT_EXACT_MAX: u32 = 1 << (TF_QUANT_MANTISSA_BITS + 1);
-
-/// Mantissa bits kept when a term frequency is quantized. Matches the
-/// length codec's shape so the two decode with the same arithmetic.
-const TF_QUANT_MANTISSA_BITS: u32 = 3;
-
 /// Quantize a document length into one byte via an 8-bit float:
 /// lengths `< LEN_QUANT_EXACT_MAX` are stored exactly; larger lengths
 /// keep the top `LEN_QUANT_MANTISSA_BITS` bits below the leading 1 plus
@@ -286,6 +154,25 @@ pub(super) fn dequantize_len(b: u8) -> u32 {
         let exponent = (i >> LEN_QUANT_MANTISSA_BITS) - 1;
         (mantissa | 0x08) << exponent
     }
+}
+
+/// An average document length as the doc-lengths directory stores it:
+/// rounded to [`format::fts::AVGDL_FIXED_POINT_SCALE`]. The single source
+/// for that fixed point — the builder writes this value and bakes bounds
+/// at [`stored_avgdl`], the reader recovers the same [`stored_avgdl`], so
+/// the two agree to the bit.
+#[inline]
+pub fn avgdl_x1000(avgdl: f32) -> u32 {
+    (avgdl * format::fts::AVGDL_FIXED_POINT_SCALE)
+        .round()
+        .clamp(0.0, u32::MAX as f32) as u32
+}
+
+/// The average document length scoring actually uses for a column whose
+/// exact average is `avgdl`: what [`avgdl_x1000`] round-trips to.
+#[inline]
+pub fn stored_avgdl(avgdl: f32) -> f32 {
+    avgdl_x1000(avgdl) as f32 / format::fts::AVGDL_FIXED_POINT_SCALE
 }
 
 /// The document length the scorer actually sees for a doc of `len`
@@ -620,137 +507,27 @@ mod tests {
         }
     }
 
-    // --- competitive frontier --------------------------------------------
-
-    /// The true maximum over a block, scored the way the reader scores:
-    /// against the stored length bucket, not the exact token count. The
-    /// bound has to cap what is actually computed at query time, and
-    /// the quantizer truncates downward — a shorter length scores
-    /// higher — so comparing against exact lengths would call a correct
-    /// bound too large.
-    fn block_max(pairs: &[(u32, u32)], idf: f32, avgdl: f32, p: Bm25Params) -> f32 {
-        pairs
-            .iter()
-            .map(|&(tf, dl)| score_with_dl_norm_k1(idf, tf, p.dl_norm_k1(stored_len(dl), avgdl)))
-            .fold(0.0f32, f32::max)
-    }
+    // --- stored average -------------------------------------------------
 
     #[test]
-    fn frontier_bound_is_exact_at_any_average() {
-        // The property the whole design rests on: a bound recomputed
-        // from the stored frontier equals the block's true maximum, and
-        // keeps equalling it as the average document length moves. A
-        // stored *score* cannot do this — it is frozen at the average
-        // the build used.
-        let p = Bm25Params::STANDARD;
-        let idf = 1.7f32;
-        let pairs: Vec<(u32, u32)> = vec![(1, 300), (3, 480), (2, 120), (1, 90), (5, 900)];
-        let mut slot = [0u8; format::fts::BLOCK_FRONTIER_BYTES];
-        encode_block_frontier(&pairs, &mut slot);
-        for avgdl in [50.0, 120.0, 293.4, 480.0, 2000.0] {
-            let got = block_frontier_bound(&slot, idf, avgdl, p);
-            let want = block_max(&pairs, idf, avgdl, p);
-            assert!(
-                (got - want).abs() <= want * 1e-6,
-                "avgdl {avgdl}: bound {got} != true max {want}"
+    fn stored_average_rounds_to_the_directory_fixed_point_and_round_trips() {
+        assert_eq!(avgdl_x1000(1.002), 1002);
+        assert_eq!(avgdl_x1000(1.0024), 1002);
+        assert_eq!(avgdl_x1000(1.0026), 1003);
+        assert_eq!(avgdl_x1000(0.0), 0);
+        assert_eq!(avgdl_x1000(-1.0), 0, "a negative average clamps to zero");
+        for avgdl in [1.002f32, 3.2, 89.0, 292.4, 4_000_000.0] {
+            let stored = stored_avgdl(avgdl);
+            assert_eq!(
+                avgdl_x1000(stored),
+                avgdl_x1000(avgdl),
+                "{avgdl}: stored value must re-encode to the same fixed point"
             );
-        }
-    }
-
-    #[test]
-    fn frontier_bound_never_sits_below_a_score_in_its_block() {
-        // Soundness across shapes, including blocks whose frontier
-        // overflows the slot and falls back to the dominating pair.
-        let p = Bm25Params::STANDARD;
-        let idf = 2.3f32;
-        for n in [1usize, 2, 5, 17, 64] {
-            let pairs: Vec<(u32, u32)> = (0..n)
-                .map(|i| ((i as u32 % 7) + 1, 20 + (i as u32 * 53) % 4000))
-                .collect();
-            let mut slot = [0u8; format::fts::BLOCK_FRONTIER_BYTES];
-            encode_block_frontier(&pairs, &mut slot);
-            for avgdl in [30.0, 293.4, 5000.0] {
-                let got = block_frontier_bound(&slot, idf, avgdl, p);
-                let want = block_max(&pairs, idf, avgdl, p);
-                assert!(
-                    got >= want - want * 1e-6,
-                    "n={n} avgdl={avgdl}: bound {got} below true max {want}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_overflowing_frontier_still_dominates_every_document() {
-        // Constructed so every document is competitive: frequency rises
-        // as length rises, so none dominates another and the frontier is
-        // the whole block. It cannot fit, and the fallback must still
-        // bound it.
-        let p = Bm25Params::STANDARD;
-        let idf = 1.1f32;
-        let pairs: Vec<(u32, u32)> = (0..12).map(|i| (i + 1, 40 + i * 200)).collect();
-        let mut slot = [0u8; format::fts::BLOCK_FRONTIER_BYTES];
-        encode_block_frontier(&pairs, &mut slot);
-        for avgdl in [60.0, 293.4, 1500.0] {
-            let got = block_frontier_bound(&slot, idf, avgdl, p);
-            let want = block_max(&pairs, idf, avgdl, p);
-            assert!(got >= want - want * 1e-6, "avgdl {avgdl}: {got} < {want}");
-        }
-    }
-
-    #[test]
-    fn an_empty_block_bounds_to_zero() {
-        let mut slot = [0u8; format::fts::BLOCK_FRONTIER_BYTES];
-        encode_block_frontier(&[], &mut slot);
-        assert_eq!(slot, [0u8; format::fts::BLOCK_FRONTIER_BYTES]);
-        assert_eq!(
-            block_frontier_bound(&slot, 1.0, 100.0, Bm25Params::STANDARD),
-            0.0
-        );
-    }
-
-    // --- term-frequency quantization -------------------------------------
-
-    #[test]
-    fn tf_quantization_never_rounds_down() {
-        // The property the whole stored-frontier design rests on: a
-        // decoded frequency at or above the input, always. Below it, a
-        // bound built from the decoded value would sit under a real
-        // score and prune a document that belonged in the top-k.
-        for tf in 0..100_000u32 {
-            let got = dequantize_tf(quantize_tf_up(tf));
-            assert!(got >= tf, "tf {tf} decoded to {got}, which is lower");
-        }
-    }
-
-    #[test]
-    fn tf_quantization_is_exact_for_ordinary_frequencies() {
-        // A term appearing a handful of times in one document is the
-        // common case and must cost no slack at all.
-        for tf in 0..TF_QUANT_EXACT_MAX {
-            assert_eq!(dequantize_tf(quantize_tf_up(tf)), tf, "tf {tf}");
-        }
-    }
-
-    #[test]
-    fn tf_quantization_slack_is_bounded() {
-        // Above the exact region the codec keeps three mantissa bits, so
-        // it may overstate by at most one step in the last place.
-        let max_rel = 2f64.powi(-(TF_QUANT_MANTISSA_BITS as i32));
-        for tf in TF_QUANT_EXACT_MAX..200_000u32 {
-            let got = dequantize_tf(quantize_tf_up(tf)) as f64;
-            let rel = (got - tf as f64) / tf as f64;
-            assert!(rel <= max_rel + 1e-9, "tf {tf}: decoded {got}, slack {rel}");
-        }
-    }
-
-    #[test]
-    fn tf_quantization_is_monotonic() {
-        let mut prev = 0u8;
-        for tf in 0..200_000u32 {
-            let b = quantize_tf_up(tf);
-            assert!(b >= prev, "tf {tf}: byte {b} below previous {prev}");
-            prev = b;
+            assert_eq!(stored_avgdl(stored), stored, "{avgdl}: idempotent");
+            assert!(
+                (stored - avgdl).abs()
+                    <= 0.5 / format::fts::AVGDL_FIXED_POINT_SCALE + avgdl * f32::EPSILON
+            );
         }
     }
 

@@ -25,15 +25,16 @@ use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
 use super::{
+    bounds::StoredBound,
     cursor::{TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
-    options::ScoringOverride,
     phrase::{AnyCursor, PhraseCursor},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
 };
+use crate::superfile::fts::bm25;
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -476,15 +477,10 @@ pub struct FtsReader {
     /// bitset-encoded, so the unranked count kernels prefer membership
     /// bit-tests (no decode) over decoding a common term's blocks.
     pub(super) has_bitset_blocks: bool,
-    /// True iff the blob is `VERSION_V5` — each PFOR term's postings region
-    /// ends with a coarse block-max table. `V1`–`V4` blobs lack it, so the
-    /// ranked walk skips the coarse level and the threshold seed there.
-    pub(super) has_coarse_block_max: bool,
-    /// Whether every term carries a competitive-frontier table. Only the
-    /// current blob version writes one; older blobs fall back to scaling
-    /// their baked bound, which is why the version gates this rather
-    /// than it being inferred per term.
-    pub(super) has_block_frontier: bool,
+    /// How the blob's block-max slots encode their maxima and which
+    /// average length they were baked at, decided by its version. Also
+    /// says whether each PFOR term ends with a coarse table.
+    pub(super) bounds: StoredBound,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -499,33 +495,26 @@ impl FtsReader {
     /// [`ColumnMeta::bound_scale`] picks up the factor that keeps the
     /// *stored* bounds — which belong to the declared pair — upper
     /// bounds under the new one. Results stay exact; only pruning power
-    /// is traded.
+    /// is traded, which is why this is an opt-in per query and never the
+    /// default path.
     ///
     /// A column whose declared pair already equals `params` is left
     /// untouched, so a query that "overrides" with what the column
     /// already uses costs nothing.
-    ///
-    /// Cheap enough to do per query: the clone is a `Bytes`/`Arc` bump
-    /// for the blob, one `String` and one 1 KiB table per re-derived
-    /// column, and no pass over any per-doc array.
-    pub(crate) fn with_scoring_override(&self, over: ScoringOverride) -> Self {
+    pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
         let mut view = self.clone();
         for col in &mut view.columns {
-            let params = over.params.unwrap_or(col.params);
-            let avgdl = over.avgdl.unwrap_or(col.avgdl);
-            if params == col.params && avgdl == col.avgdl {
+            if col.params == params {
                 continue;
             }
-            let rescored = col.dl_norm_k1.rescored(avgdl, params);
-            // Compose rather than replace: `bound_scale` already carries
-            // the correction from the average the bounds were baked at
-            // to the one this reader scores with, and that correction is
-            // still owed. Multiplying the two suprema loosens the bound
-            // slightly and cannot under-bound it.
+            let rescored = col.dl_norm_k1.rescored(col.avgdl(), params);
+            // Compose rather than replace: an older file's bounds already
+            // owe the correction applied on open, and this move is owed
+            // on top of it. The product of the two suprema cannot
+            // under-bound.
             col.bound_scale *= col.dl_norm_k1.bound_scale(&rescored, col.params, params);
             col.dl_norm_k1 = rescored;
             col.params = params;
-            col.avgdl = avgdl;
         }
         view
     }
@@ -703,19 +692,7 @@ impl FtsReader {
         let has_bitset_blocks = version == format::fts::VERSION_V4
             || version == format::fts::VERSION_V5
             || version == format::fts::VERSION_V6;
-        // V5 and later append a per-term coarse block-max table; V1–V4
-        // do not.
-        let has_coarse_block_max =
-            version == format::fts::VERSION_V5 || version == format::fts::VERSION_V6;
-        let has_block_frontier = version == format::fts::VERSION_V6;
-        // Blobs before V6 store bounds that include the `(k1 + 1)`
-        // factor the scorer no longer applies, so every stored bound is
-        // that much larger than the score it caps. Left alone it stays a
-        // valid upper bound — just a uniformly loose one, which costs
-        // block-max pruning on every file written before this. Dividing
-        // it out restores exactly the pruning those files had, and the
-        // factor is per column because `k1` is declared per column.
-        let bounds_carry_k1_plus_one = version != format::fts::VERSION_V6;
+        let bounds = StoredBound::for_version(version);
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -903,7 +880,10 @@ impl FtsReader {
             ]);
             let doc_lengths_offset =
                 read_u64_le(&dir_bytes[entry_off + 4..entry_off + 12]) as usize;
-            let avgdl_x1000 = read_u32_le(&dir_bytes[entry_off + 12..entry_off + 16]) as u64;
+            let avgdl_x1000 = read_u32_le(
+                &dir_bytes[entry_off + format::fts::DOC_LENGTHS_ENTRY_AVGDL_OFF
+                    ..entry_off + format::fts::DOC_LENGTHS_ENTRY_AVGDL_OFF + U32_BYTES],
+            ) as u64;
 
             // Verify column_id matches the JSON's positional column_id.
             if column_id != i as u32 {
@@ -940,11 +920,11 @@ impl FtsReader {
                 }
             }
 
-            // What the build divided by: the token total over *rows*,
-            // including the rows this column is null for. It is what the
-            // stored per-block bounds were computed against, so it stays
-            // the reference `bound_scale` corrects from, but it is not
-            // what scoring should use.
+            // The average the file declares and its bounds were baked at.
+            // A current-version file bakes the table-wide average over
+            // documents that carry tokens, and that is what to score it
+            // at. An older file divided by its own *row* count, nulls
+            // included, which is not what scoring should use.
             let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             let n = n_docs as usize;
             // The column's declared parameters — recorded in the KV
@@ -958,23 +938,34 @@ impl FtsReader {
             // it. A column no document contributes to yields an empty
             // table; it'll never be indexed since `search`
             // short-circuits.
+            // A current-version file is scored at the average it
+            // declares, so its bounds are exact as stored. An older file
+            // is scored at the average over the documents that carry
+            // tokens, computed from the array being walked, and its
+            // bounds owe two corrections: that average can only be higher
+            // than the row-count one it was baked at (no more documents
+            // carry tokens than there are rows), which lowers the norm
+            // and raises every score above the bound meant to cap it, so
+            // the bound is inflated by the supremum of that move; and the
+            // `(k1 + 1)` factor those files carry is divided out, which
+            // restores exactly the pruning they had.
+            let declared = bounds.declares_scoring_average();
             let (dl_norm_k1, length_stats) = NormTable::new(
                 (0..n).map(|d| read_u32_le(&array_region[d * 4..d * 4 + 4])),
                 n,
                 params,
+                |stats| match declared {
+                    true => baked_avgdl,
+                    false => bm25::stored_avgdl(stats.avgdl()),
+                },
             );
-            let avgdl = dl_norm_k1.avgdl();
-            // Inflate the stored bounds to cover the gap between the
-            // average they were baked at and the one being scored with.
-            // Correcting the average can only raise it (no more
-            // documents carry tokens than there are rows), which lowers
-            // the norm and raises the score, so the stored bounds would
-            // otherwise sit below scores they are meant to cap.
-            let baked = dl_norm_k1.rescored(baked_avgdl, params);
-            let mut bound_scale = baked.bound_scale(&dl_norm_k1, params, params);
-            if bounds_carry_k1_plus_one {
-                bound_scale /= params.k1 + 1.0;
-            }
+            let bound_scale = match declared {
+                true => 1.0,
+                false => {
+                    let baked = dl_norm_k1.rescored(baked_avgdl, params);
+                    baked.bound_scale(&dl_norm_k1, params, params) / (params.k1 + 1.0)
+                }
+            };
             let base = Base::from_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
@@ -996,7 +987,6 @@ impl FtsReader {
             columns.push(ColumnMeta {
                 name: col_cfg.name.clone(),
                 doc_lengths_range: doc_lengths_offset..array_end,
-                avgdl,
                 length_stats,
                 dl_norm_k1,
                 params,
@@ -1020,8 +1010,7 @@ impl FtsReader {
             positions_range,
             has_position_subindex,
             has_bitset_blocks,
-            has_coarse_block_max,
-            has_block_frontier,
+            bounds,
             columns,
             column_id_by_name,
         })
@@ -1304,8 +1293,7 @@ impl FtsReader {
                             0,
                             true,
                             self.has_position_subindex,
-                            self.has_coarse_block_max,
-                            self.has_block_frontier,
+                            self.bounds.has_coarse(),
                         )?;
                         positional.push((Some(term_meta), None));
                     }
@@ -1379,7 +1367,6 @@ impl FtsReader {
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let positional = col_meta.positions;
-        let n_docs = u64::from(self.n_docs);
         let column_name = col_meta.name.clone();
         let region_base = self.postings_range.start;
         let positions_region = self.positions_range.clone();
@@ -1443,8 +1430,7 @@ impl FtsReader {
                             0,
                             true,
                             false,
-                            self.has_coarse_block_max,
-                            self.has_block_frontier,
+                            self.bounds.has_coarse(),
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
@@ -1463,22 +1449,11 @@ impl FtsReader {
                     };
                     let mut pos_at = 0usize;
 
-                    let mut cursor = TermCursor::new(
-                        term_bytes,
-                        n_docs,
-                        positional,
-                        None,
-                        1,
-                        false,
-                        false,
-                        self.has_coarse_block_max,
-                        self.has_block_frontier,
-                        // This walk carries postings across into a merge; it
-                        // reads doc ids, tfs and positions and never consults
-                        // a score bound, so no correction applies.
-                        1.0,
-                        None,
-                    )?;
+                    // This walk carries postings across into a merge; it
+                    // reads doc ids, tfs and positions and never consults
+                    // a score bound.
+                    let mut cursor =
+                        TermCursor::new(term_bytes, col_meta, self.bounds, None, 1, false, false)?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
@@ -1971,7 +1946,12 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::{
         BytesLazyByteSource,
-        fts::{bm25, builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer},
+        fts::{
+            bm25,
+            builder::{BlobEra, FtsBuilder},
+            reader::BoolMode,
+            tokenize::AsciiLowerTokenizer,
+        },
     };
 
     /// Byte offset of the blob's version field.
@@ -1980,9 +1960,9 @@ mod tests {
     /// A corpus big enough to produce several posting blocks, so the
     /// blob carries a real skip table (and, when coarse is on, a coarse
     /// table) rather than a single degenerate block.
-    fn versioned_blob(write_coarse: bool) -> (Bytes, &'static str) {
+    fn versioned_blob(era: BlobEra) -> (Bytes, &'static str) {
         let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
-        b.write_coarse = write_coarse;
+        b.era = era;
         b.register_column("body".into(), false).expect("register");
         for doc in 0..600u32 {
             let text = match doc % 3 {
@@ -1998,6 +1978,14 @@ mod tests {
         )
     }
 
+    /// `blob` with its FTS version field overwritten — how the read path
+    /// for a version the builder no longer writes is exercised.
+    fn stamped(blob: &Bytes, version: u32) -> Bytes {
+        let mut bytes = blob.to_vec();
+        bytes[VERSION_FIELD].copy_from_slice(&version.to_le_bytes());
+        Bytes::from(bytes)
+    }
+
     /// The `(k1 + 1)` the score no longer carries, which every stored
     /// bound written before the current blob version still does.
     fn legacy_bound_factor() -> f32 {
@@ -2006,7 +1994,7 @@ mod tests {
 
     #[test]
     fn current_version_bounds_need_no_scale_correction() {
-        let (blob, json) = versioned_blob(true);
+        let (blob, json) = versioned_blob(BlobEra::Current);
         assert_eq!(
             read_u32_le(&blob[VERSION_FIELD]),
             format::fts::VERSION_V6,
@@ -2026,7 +2014,7 @@ mod tests {
         // otherwise they sit a uniform 2.2x above the scores they cap
         // and block-max pruning stops doing its job on every file
         // written before this.
-        let (blob, json) = versioned_blob(false);
+        let (blob, json) = versioned_blob(BlobEra::NoCoarse);
         assert!(
             read_u32_le(&blob[VERSION_FIELD]) < format::fts::VERSION_V6,
             "a no-coarse build must stamp a pre-current version"
@@ -2046,18 +2034,17 @@ mod tests {
         // released engine wrote, so every file already on disk is this
         // version and it is the read path that matters most.
         //
-        // The layout is byte-for-byte identical to the current one and
-        // only the bound *scale* differs, so stamping the version is
-        // enough to exercise the classification: what must hold is that
-        // it is treated as legacy and its bounds corrected. Reading it
-        // as current would leave them 2.2x too large — sound but with
-        // pruning disabled — and the opposite mistake, reading a
-        // current blob as legacy, would divide bounds that are already
-        // right and silently prune real hits out of the top-k.
-        let (current, json) = versioned_blob(true);
-        let mut bytes = current.to_vec();
-        bytes[VERSION_FIELD].copy_from_slice(&format::fts::VERSION_V5.to_le_bytes());
-        let previous = Bytes::from(bytes);
+        // The header and region layout are identical to the current
+        // one; only what a block-max slot holds differs, and open never
+        // decodes a slot, so stamping the version is enough to exercise
+        // the classification: what must hold is that it is treated as
+        // legacy and its bounds corrected. Reading it as current would
+        // leave them 2.2x too large — sound but with pruning disabled —
+        // and the opposite mistake, reading a current blob as legacy,
+        // would divide bounds that are already right and silently prune
+        // real hits out of the top-k.
+        let (current, json) = versioned_blob(BlobEra::Current);
+        let previous = stamped(&current, format::fts::VERSION_V5);
 
         let r = FtsReader::open(previous, json).expect("the previous version still opens");
         assert!(
@@ -2072,18 +2059,18 @@ mod tests {
     }
 
     #[test]
-    fn every_accepted_version_still_opens_and_searches() {
-        // A guard on the accept list itself: a version dropped from it
+    fn every_accepted_version_still_opens() {
+        // A guard on the accept list for the versions that share the
+        // current region layout (V1–V3 differ in header and regions and
+        // cannot be stamped onto these bytes): a version dropped from it
         // turns every file written by that release into an open error.
         for v in [
             format::fts::VERSION_V4,
             format::fts::VERSION_V5,
             format::fts::VERSION_V6,
         ] {
-            let (current, json) = versioned_blob(true);
-            let mut bytes = current.to_vec();
-            bytes[VERSION_FIELD].copy_from_slice(&v.to_le_bytes());
-            let r = FtsReader::open(Bytes::from(bytes), json)
+            let (current, json) = versioned_blob(BlobEra::Current);
+            let r = FtsReader::open(stamped(&current, v), json)
                 .unwrap_or_else(|e| panic!("version {v} must open: {e}"));
             assert!(
                 r.columns[0].bound_scale > 0.0,
@@ -2100,18 +2087,15 @@ mod tests {
         // must agree on everything scoring reads — otherwise a query
         // would score differently depending on whether it happened to
         // be the first to ask.
-        let (blob, json) = versioned_blob(true);
+        let (blob, json) = versioned_blob(BlobEra::Current);
         let r = FtsReader::open(blob, json).expect("open");
-        let over = ScoringOverride {
-            params: Some(bm25::Bm25Params::new(1.4, 0.6)),
-            avgdl: Some(r.columns[0].avgdl * 1.5),
-        };
-        let first = r.with_scoring_override(over);
-        let second = r.with_scoring_override(over);
+        let over = bm25::Bm25Params::new(1.4, 0.6);
+        let first = r.with_bm25_override(over);
+        let second = r.with_bm25_override(over);
         let a = &first.columns[0];
         let b = &second.columns[0];
         assert_eq!(a.params, b.params);
-        assert_eq!(a.avgdl, b.avgdl);
+        assert_eq!(a.avgdl(), b.avgdl());
         assert_eq!(a.bound_scale, b.bound_scale);
         assert_eq!(a.length_stats, b.length_stats);
         for doc in 0..r.n_docs() {
@@ -2124,30 +2108,177 @@ mod tests {
     }
 
     #[test]
-    fn an_override_that_only_moves_the_average_still_rescales() {
-        // The parameter pair is unchanged here, so a correction keyed on
-        // the pair alone would return the file's own table untouched and
-        // score against the wrong average while claiming otherwise.
-        let (blob, json) = versioned_blob(true);
+    fn a_current_file_is_scored_at_the_average_it_declares() {
+        // The writer bakes the table-wide average into the file, so the
+        // reader takes it as given: no correction, no inflation. An
+        // older file declared its row-count average and is corrected.
+        let (blob, json) = versioned_blob(BlobEra::Current);
         let r = FtsReader::open(blob, json).expect("open");
-        let baseline = r.columns[0].dl_norm_k1.get(0);
-        let view = r.with_scoring_override(ScoringOverride {
-            params: None,
-            avgdl: Some(r.columns[0].avgdl * 2.0),
-        });
+        let col = &r.columns[0];
+        assert_eq!(col.bound_scale, 1.0);
         assert_eq!(
-            view.columns[0].params, r.columns[0].params,
-            "pair unchanged"
+            col.avgdl(),
+            col.length_stats.avgdl(),
+            "dense: declared == over documents"
         );
-        assert_ne!(
-            view.columns[0].dl_norm_k1.get(0),
-            baseline,
-            "a doubled average must change the per-doc normalizer"
+
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "alpha beta gamma").expect("doc");
+        b.add_doc(0, 1, "").expect("null row");
+        let sparse = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(
+            sparse.columns[0].avgdl(),
+            3.0,
+            "the declared average counts the document that carries tokens, not the null row"
         );
+        assert_eq!(sparse.columns[0].bound_scale, 1.0);
+    }
+
+    /// A corpus whose common term's blocks tie closely, with every other
+    /// row null when `sparse`, so block-max pruning is live at small `k`
+    /// and the corrected collection size and average both matter.
+    fn tied_corpus(era: BlobEra, sparse: bool) -> (Bytes, &'static str) {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.era = era;
+        b.register_column("body".into(), false).expect("register");
+        let mut next = 0u32;
+        for doc in 0..900u32 {
+            let text = match doc % 4 {
+                0 => format!("common shared d{doc}"),
+                1 => format!("common common beta d{doc} pad pad"),
+                2 => format!("common gamma d{doc} pad"),
+                _ => format!("common shared delta d{doc} pad pad pad pad"),
+            };
+            b.add_doc(0, next, &text).expect("add doc");
+            next += 1;
+            if sparse {
+                b.add_doc(0, next, "").expect("null row");
+                next += 1;
+            }
+        }
+        (
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+        )
+    }
+
+    /// Ranked results with pruning live (`k` far below the match count).
+    async fn top(r: &FtsReader, terms: &[&str], k: usize) -> Vec<(u32, f32)> {
+        r.search("body", terms, k, BoolMode::Or)
+            .await
+            .expect("search")
+    }
+
+    #[tokio::test]
+    async fn an_older_sparse_file_ranks_exactly_like_a_fresh_one() {
+        // The legacy path end to end: a V5 file written as 0.8 wrote it —
+        // bounds carrying `(k1 + 1)`, average over rows — on a column
+        // that is null for every other row. The reader corrects the
+        // average, inflates the bounds, and must return the same top-k
+        // with the same scores as a fresh file of the same documents.
+        let json = tied_corpus(BlobEra::Current, true).1;
+        let fresh = FtsReader::open(tied_corpus(BlobEra::Current, true).0, json).expect("open");
+        for era in [BlobEra::LegacyV5, BlobEra::NoCoarse] {
+            let old = FtsReader::open(tied_corpus(era, true).0, json).expect("open");
+            let col = &old.columns[0];
+            assert!(
+                col.bound_scale > 1.0 / (col.params.k1 + 1.0),
+                "{era:?}: inflated"
+            );
+            assert_eq!(
+                col.avgdl(),
+                fresh.columns[0].avgdl(),
+                "{era:?}: corrected average"
+            );
+            for terms in [
+                &["common"][..],
+                &["common", "shared"][..],
+                &["gamma", "beta"][..],
+            ] {
+                for k in [1usize, 3, 10] {
+                    assert_eq!(
+                        top(&old, terms, k).await,
+                        top(&fresh, terms, k).await,
+                        "{era:?} {terms:?} k={k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_override_on_an_older_file_composes_its_corrections() {
+        // The open-time correction and a query-time `k1`/`b` move are
+        // both owed; the product must still cap every score, which the
+        // parity against a fresh file scored under the same override
+        // shows with pruning live.
+        let json = tied_corpus(BlobEra::Current, false).1;
+        let params = bm25::Bm25Params::new(0.9, 0.4);
+        let fresh = FtsReader::open(tied_corpus(BlobEra::Current, false).0, json)
+            .expect("open")
+            .with_bm25_override(params);
+        let old = FtsReader::open(tied_corpus(BlobEra::LegacyV5, false).0, json).expect("open");
+        let overridden = old.with_bm25_override(params);
         assert!(
-            view.columns[0].bound_scale > r.columns[0].bound_scale,
-            "and must inflate the stored bounds to stay above the scores"
+            overridden.columns[0].bound_scale > old.columns[0].bound_scale,
+            "the override owes a factor on top of the open-time one"
         );
+        for k in [1usize, 3, 10] {
+            assert_eq!(
+                top(&overridden, &["common", "shared"], k).await,
+                top(&fresh, &["common", "shared"], k).await,
+                "k={k}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn null_rows_change_neither_idf_nor_the_average() {
+        // The same documents with and without null rows interleaved must
+        // score identically: the collection size idf uses and the
+        // average length both count documents that carry tokens. Doc
+        // ids differ (nulls occupy rows), so compare by score sequence.
+        let json = tied_corpus(BlobEra::Current, false).1;
+        let dense = FtsReader::open(tied_corpus(BlobEra::Current, false).0, json).expect("open");
+        let sparse = FtsReader::open(tied_corpus(BlobEra::Current, true).0, json).expect("open");
+        assert_eq!(
+            sparse.columns[0].scored_doc_count(),
+            dense.columns[0].scored_doc_count()
+        );
+        assert_eq!(sparse.columns[0].avgdl(), dense.columns[0].avgdl());
+        for terms in [
+            &["common"][..],
+            &["common", "shared"][..],
+            &["gamma", "beta"][..],
+        ] {
+            let a: Vec<(u32, f32)> = top(&dense, terms, 20).await;
+            let b: Vec<(u32, f32)> = top(&sparse, terms, 20).await;
+            let a_docs: Vec<u32> = a.iter().map(|(d, _)| *d).collect();
+            let b_docs: Vec<u32> = b.iter().map(|(d, _)| d / 2).collect();
+            assert_eq!(
+                a_docs, b_docs,
+                "{terms:?}: same documents in the same order"
+            );
+            let a_scores: Vec<f32> = a.iter().map(|(_, s)| *s).collect();
+            let b_scores: Vec<f32> = b.iter().map(|(_, s)| *s).collect();
+            assert_eq!(a_scores, b_scores, "{terms:?}: same scores");
+        }
+    }
+
+    #[test]
+    fn a_chopped_run_counts_every_piece_toward_the_document_length() {
+        // A 511-character run is three tokens, not one: the length that
+        // enters normalization is the truthful one, and the run is no
+        // longer the "shortest document in the corpus".
+        let run = "a".repeat(511);
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, &run).expect("doc 0");
+        b.add_doc(0, 1, &format!("{run} b")).expect("doc 1");
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(r.read_doc_lengths(0).expect("doc lengths"), vec![3, 4]);
     }
 
     #[test]
@@ -2439,7 +2570,7 @@ mod tests {
         // And each matches the closed form for its own pair, against the
         // quantized length the scorer actually sees.
         let dl = bm25::stored_len(8);
-        let avgdl = std_reader.columns[0].avgdl;
+        let avgdl = std_reader.columns[0].avgdl();
         assert!((std_norm - bm25::Bm25Params::STANDARD.dl_norm_k1(dl, avgdl)).abs() < 1e-6);
         assert!((alt_norm - bm25::Bm25Params::new(1.4, 0.6).dl_norm_k1(dl, avgdl)).abs() < 1e-6);
     }
@@ -2466,7 +2597,7 @@ mod tests {
 
         for (k1, b_param) in [(1.4_f32, 0.75_f32), (0.9, 0.75), (1.2, 0.4), (1.2, 0.0)] {
             let query = bm25::Bm25Params::new(k1, b_param);
-            let other = col.dl_norm_k1.rescored(col.avgdl, query);
+            let other = col.dl_norm_k1.rescored(col.avgdl(), query);
             let r_factor = col.dl_norm_k1.bound_scale(&other, baked, query);
             assert!(
                 r_factor >= 1.0,
@@ -2492,7 +2623,7 @@ mod tests {
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = &r.columns[0];
         let baked = col.params;
-        let avgdl = col.avgdl;
+        let avgdl = col.avgdl();
 
         for (k1, b_param) in [
             (1.4_f32, 0.75_f32),
@@ -2573,10 +2704,7 @@ mod tests {
             // Same query parameters, reached two ways: an override on a
             // file baked at the standard pair, and a file baked at the
             // pair itself.
-            let overridden = baked_standard.with_scoring_override(ScoringOverride {
-                params: Some(params),
-                avgdl: None,
-            });
+            let overridden = baked_standard.with_bm25_override(params);
 
             for terms in [
                 &["common"][..],
@@ -2623,10 +2751,7 @@ mod tests {
         b.add_doc(0, 0, "a b a").expect("doc 0");
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        let same = r.with_scoring_override(ScoringOverride {
-            params: Some(bm25::Bm25Params::STANDARD),
-            avgdl: None,
-        });
+        let same = r.with_bm25_override(bm25::Bm25Params::STANDARD);
         assert_eq!(same.columns[0].bound_scale, 1.0);
         assert_eq!(same.columns[0].params, r.columns[0].params);
     }

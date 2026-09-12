@@ -675,7 +675,7 @@ async fn oracle_and_scores_match_brute_force_ordering() {
     for ((i_doc, i_score), (o_doc, o_score)) in infino_hits.iter().zip(oracle_hits.iter()) {
         assert_eq!(*i_doc, *o_doc, "doc-id mismatch");
         // f32 BM25 sums diverge by ~1e-4 between the two scorers due
-        // to operand ordering (infino precomputes idf_x_k1p1 and
+        // to operand ordering (infino precomputes idf_weight and
         // dl_norm_k1; the oracle multiplies term-by-term). 1e-3 is
         // tighter than any meaningful BM25 score gap on this corpus.
         let delta = (i_score - o_score).abs();
@@ -1576,7 +1576,7 @@ async fn oracle_and_multi_block_score_matches_brute_force() {
     // may reorder within a single score class). Catches scoring
     // drift introduced by the block-crossing code paths in the
     // flat-merge (e.g. wrong `block_tfs[pos]` index after a block
-    // boundary, or a stale `idf_x_k1p1` if the cursor was
+    // boundary, or a stale `idf_weight` if the cursor was
     // reconstructed mid-walk).
     let corp_owned = build_multi_block_corpus();
     let corp_refs: Vec<(u64, &str)> = corp_owned.iter().map(|(i, s)| (*i, s.as_str())).collect();

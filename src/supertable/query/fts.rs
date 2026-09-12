@@ -127,7 +127,6 @@ use crate::{
             reader::{
                 Bm25SearchOptions, Bm25Stats, ClauseLists, ColumnLengthStats, FetchedTermMemo,
                 GlobalTermIdf, LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
-                ScoringOverride,
             },
             tokenize::Phrase,
         },
@@ -417,7 +416,7 @@ impl SupertableReader {
     /// starts. A declared pair is validated at `create_table`; this is
     /// the same check for the per-search form, so a caller sees the
     /// bounds rather than a silently strange ranking.
-    fn validate_bm25_override(p: Bm25Params) -> Result<(), QueryError> {
+    fn validate_bm25_params(p: Bm25Params) -> Result<(), QueryError> {
         let (k1, b) = (p.k1, p.b);
         match k1.is_finite() && k1 > 0.0 && b.is_finite() && (0.0..=1.0).contains(&b) {
             true => Ok(()),
@@ -426,33 +425,6 @@ impl SupertableReader {
                  got k1={k1}, b={b}"
             ))),
         }
-    }
-
-    /// Table-wide document-length totals for `column`, summed from the
-    /// manifest's per-superfile summaries.
-    ///
-    /// This is the whole point of recording the totals on the manifest:
-    /// the sum is an in-memory fold over the pinned snapshot, so making
-    /// a score independent of which superfile its document lives in
-    /// costs no fetch and no fan-out.
-    ///
-    /// A superfile with no summary entry for `column` does not index it
-    /// and contributes nothing. A superfile that *does* index it but
-    /// recorded no totals was written before they existed, and there is
-    /// no way to recover them without opening it — so the whole fold
-    /// goes unknown rather than silently summing a subset, which would
-    /// be neither the table-wide average nor the local one. The caller
-    /// then keeps each superfile's own average, exactly as before, and
-    /// a rewrite (a fresh commit, or `optimize`) backfills.
-    fn column_corpus_stats(manifest: &ManifestSnapshot, column: &str) -> Option<ColumnLengthStats> {
-        let mut total = ColumnLengthStats::default();
-        for sf in &manifest.superfiles {
-            let Some(summary) = sf.fts_summary.get(column) else {
-                continue;
-            };
-            total.merge_with(&summary.length_stats?);
-        }
-        Some(total)
     }
 
     #[cfg_attr(
@@ -481,22 +453,16 @@ impl SupertableReader {
             bm25: bm25_params,
         } = opts;
         if let Some(p) = bm25_params {
-            Self::validate_bm25_override(p)?;
+            Self::validate_bm25_params(p)?;
         }
         let manifest = self.manifest();
-        // Under global statistics the length normalizer uses the
-        // table-wide average too, not just the table-wide idf. Halving
-        // it — globalizing the term weight but leaving the normalizer
-        // per-superfile — would still let the same document score
-        // differently depending on which commit it landed in, which is
-        // the thing this mode exists to rule out.
+        // The table-wide collection size for idf. The average document
+        // length needs no such fold: every current-version superfile was
+        // baked at the table-wide average as of its commit and is scored
+        // at what it declares.
         let corpus = match stats {
             Bm25Stats::PerSuperfile => None,
-            Bm25Stats::Global => Self::column_corpus_stats(manifest.as_ref(), column),
-        };
-        let bm25_override = ScoringOverride {
-            params: bm25_params,
-            avgdl: corpus.map(|c| c.avgdl()).filter(|a| *a > 0.0),
+            Bm25Stats::Global => manifest.fts_length_stats(column),
         };
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
@@ -793,7 +759,7 @@ impl SupertableReader {
                                             start,
                                             end,
                                             floor,
-                                            bm25_override,
+                                            bm25_params,
                                         )
                                     })
                                 },
@@ -809,7 +775,7 @@ impl SupertableReader {
                                     start,
                                     end,
                                     floor,
-                                    bm25_override,
+                                    bm25_params,
                                 )
                             })
                             .map_err(fts_read_error)?
@@ -836,7 +802,7 @@ impl SupertableReader {
                                 },
                                 k,
                                 floor,
-                                bm25_override,
+                                bm25_params,
                             )
                             .await
                             .map_err(fts_read_error)?;
@@ -868,7 +834,7 @@ impl SupertableReader {
                                     "un-ranged fts kernel: reader pool dropped result",
                                     move || {
                                         op_stats::timed_kernel(&kernel_stats, || {
-                                            kernel_reader.run_prepared(prep, bm25_override)
+                                            kernel_reader.run_prepared(prep, bm25_params)
                                         })
                                     },
                                 )
@@ -877,7 +843,7 @@ impl SupertableReader {
                                 .map_err(fts_read_error)?
                             }
                             prep => op_stats::timed_kernel(&op_stats, || {
-                                r.run_prepared(prep, bm25_override)
+                                r.run_prepared(prep, bm25_params)
                             })
                             .map_err(fts_read_error)?,
                         }
@@ -1214,7 +1180,7 @@ impl SupertableReader {
                                             // override with; columns
                                             // score with what they
                                             // baked in.
-                                            ScoringOverride::default(),
+                                            None,
                                         )
                                     })
                                 },
@@ -1230,7 +1196,7 @@ impl SupertableReader {
                                     start,
                                     end,
                                     f32::NEG_INFINITY,
-                                    ScoringOverride::default(),
+                                    None,
                                 )
                             })
                             .map_err(fts_read_error)
@@ -2478,14 +2444,20 @@ mod tests {
         );
     }
 
-    /// Oracle for `Bm25Stats::Global`: a table split across many
-    /// superfiles, scored with global stats, must rank identically to
-    /// the same docs in a single superfile (where per-superfile stats
-    /// already ARE global). Docs are uniform length so `avgdl` matches
-    /// everywhere and global idf is the only variable the `Global` path
-    /// changes.
+    /// Oracle for table-wide statistics: a table split across many
+    /// commits, scored with `Bm25Stats::Global`, against the same docs
+    /// in a single superfile (where per-superfile stats already ARE
+    /// table-wide). Lengths fall with doc id, so each commit's own
+    /// average differs from the table's.
+    ///
+    /// idf is globalized at query time, so it matches everywhere. The
+    /// average document length is baked at write time as the running
+    /// table-wide value: the last commit's covers the whole table and
+    /// its docs score exactly as in the single superfile; each earlier
+    /// commit sits as close to the table's average as the data committed
+    /// by then allowed, and no further.
     #[test]
-    fn global_stats_multi_superfile_matches_single_superfile() {
+    fn global_stats_multi_superfile_converges_to_single_superfile() {
         // 24 docs of *varying* length. The first three tokens carry the
         // query terms (so df/idf drives ranking); the trailing `dNN` is
         // a per-doc unique tag that keeps every title distinct, and a
@@ -2557,33 +2529,54 @@ mod tests {
             hits.into_iter().collect()
         };
 
+        let chunk_of = |title: &str| -> usize {
+            let i: usize = title
+                .split(' ')
+                .find_map(|w| w.strip_prefix('d'))
+                .and_then(|d| d.parse().ok())
+                .expect("titles carry a d{i:02} tag");
+            i / 6
+        };
+        let rel = |a: f32, b: f32| (a - b).abs() / a.abs().max(1.0);
+
         for q in ["alpha shared", "beta red", "gamma green d05", "shared red"] {
             let single_ref = score_map(all_scored(&single, q, Bm25Stats::PerSuperfile));
             let multi_global = score_map(all_scored(&multi, q, Bm25Stats::Global));
             let multi_local = score_map(all_scored(&multi, q, Bm25Stats::PerSuperfile));
 
-            // Global stats over the fragmented table reproduce the
-            // single-superfile result exactly: same docs (by content),
-            // same per-doc score.
             assert_eq!(
                 single_ref.len(),
                 multi_global.len(),
                 "hit count mismatch for {q:?}"
             );
+            // Per commit: the mean relative gap to the single-superfile
+            // score. The last commit is exact; earlier ones converge.
+            let mut gap = [(0.0f32, 0usize); 4];
             for (title, s_score) in &single_ref {
                 let g_score = multi_global
                     .get(title)
                     .unwrap_or_else(|| panic!("global result missing {title:?} for {q:?}"));
-                assert!(
-                    (s_score - g_score).abs() <= 1e-5 * s_score.abs().max(1.0),
-                    "global score {g_score} != single score {s_score} for {title:?} / {q:?}"
-                );
+                let chunk = chunk_of(title);
+                gap[chunk].0 += rel(*s_score, *g_score);
+                gap[chunk].1 += 1;
+                if chunk == 3 {
+                    assert!(
+                        rel(*s_score, *g_score) <= 1e-5,
+                        "last commit: global score {g_score} != single score {s_score} \
+                         for {title:?} / {q:?}"
+                    );
+                }
             }
-
-            // Sanity: per-superfile stats on the fragmented table do NOT
-            // reproduce the single-superfile scores — otherwise the test
-            // could pass without Global doing anything.
             if q == "alpha shared" {
+                let means: Vec<f32> = gap.iter().map(|&(sum, n)| sum / n as f32).collect();
+                assert!(
+                    means.windows(2).all(|w| w[0] >= w[1]) && means[0] > means[3],
+                    "each commit must sit closer to the table's average than the one \
+                     before it, got per-commit gaps {means:?} for {q:?}"
+                );
+                // Sanity: per-superfile stats on the fragmented table do NOT
+                // reproduce the single-superfile scores — otherwise the test
+                // could pass without Global doing anything.
                 let local_diverges = single_ref.len() != multi_local.len()
                     || single_ref.iter().any(|(title, s)| {
                         multi_local
@@ -2597,6 +2590,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Rows this column is null for are not documents it has: with them
+    /// interleaved, table-wide idf (its collection size) and the average
+    /// length both stay what the documents alone give, so every score is
+    /// identical to the same documents ingested without the nulls.
+    #[test]
+    fn null_rows_leave_table_wide_scores_unchanged() {
+        let titles: Vec<&str> = vec![
+            "alpha shared red d00 filler filler",
+            "beta shared green d01 filler",
+            "gamma shared red d02",
+            "alpha red d03 filler filler filler",
+            "beta green d04",
+            "gamma shared green d05 filler",
+        ];
+        let with_nulls: Vec<&str> = titles.iter().flat_map(|t| [*t, ""]).collect();
+
+        let dense = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let sparse = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        for (st, rows) in [(&dense, &titles), (&sparse, &with_nulls)] {
+            let mut w = st.writer().expect("writer");
+            for chunk in rows.chunks(rows.len().div_ceil(2)) {
+                w.append(&build_batch(0, chunk)).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+        assert_eq!(
+            sparse
+                .reader()
+                .expect("reader")
+                .manifest()
+                .fts_length_stats("title"),
+            dense
+                .reader()
+                .expect("reader")
+                .manifest()
+                .fts_length_stats("title"),
+            "null rows enter neither total"
+        );
+        for q in ["alpha shared", "beta red", "gamma green d05", "shared red"] {
+            assert_eq!(
+                all_scored(&sparse, q, Bm25Stats::Global),
+                all_scored(&dense, q, Bm25Stats::Global),
+                "{q:?}"
+            );
+        }
+    }
+
+    /// The writer hands each new superfile the table's length totals, so
+    /// the file declares the running table-wide average as of its commit
+    /// — the first commit its own, every later one the average over all
+    /// documents committed so far — and the manifest fold agrees.
+    #[test]
+    fn each_commit_bakes_the_running_table_wide_average() {
+        use crate::superfile::fts::reader::ColumnLengthStats;
+
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        // Token totals per commit: 10 over 2 docs, then 4 over 2, then 2
+        // over 1 — the empty title is a row this column has no document
+        // for and must not enter the denominator.
+        let commits: [&[&str]; 3] = [
+            &["one two three four five six seven eight", "nine ten"],
+            &["a b", "c d"],
+            &["x y", ""],
+        ];
+        for titles in commits {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(0, titles)).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let mut superfiles = manifest.get_all_superfiles().to_vec();
+        assert_eq!(superfiles.len(), 3, "one superfile per commit");
+        superfiles.sort_by_key(|sf| sf.id_min);
+        let declared: Vec<f32> = superfiles
+            .iter()
+            .map(|sf| {
+                let reader = manifest.options.store.reader(&sf.uri).expect("reader");
+                let fts = reader.fts().expect("fts index");
+                fts.fts_columns_config()
+                    .next()
+                    .expect("title column")
+                    .avgdl()
+            })
+            .collect();
+        assert_eq!(declared, vec![5.0, 14.0 / 4.0, 16.0 / 5.0]);
+        assert_eq!(
+            manifest.fts_length_stats("title"),
+            Some(ColumnLengthStats {
+                total_tokens: 16,
+                n_scored_docs: 5,
+            })
+        );
+        assert_eq!(
+            manifest.fts_corpus_stats().get("title").copied(),
+            manifest.fts_length_stats("title")
+        );
     }
 
     /// Like [`options_one_superfile_per_commit`] but with the `title`
@@ -3346,7 +3439,7 @@ mod tests {
     /// and the score halves — and it is only observable through scores,
     /// so this asserts on the numbers rather than on plumbing.
     #[test]
-    fn supertable_bm25_search_honors_a_query_time_bm25_override() {
+    fn supertable_bm25_search_honors_a_query_time_bm25_params() {
         let st = seeded_three_doc_supertable();
         let scores = |opts: Bm25SearchOptions| -> Vec<(String, f32)> {
             use arrow_array::{Float32Array, LargeStringArray};

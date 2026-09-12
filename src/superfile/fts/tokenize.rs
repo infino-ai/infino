@@ -130,6 +130,16 @@ fn is_token_segment(segment: &str) -> bool {
         .any(|c| c.is_alphanumeric() || is_emoji_token_char(c))
 }
 
+/// [`emit_capped`] for a positioned callback: the pieces of `tok` take
+/// consecutive positions from `this_position`. Returns the piece count.
+fn emit_capped_positioned<F: FnMut(&str, u64)>(tok: &str, this_position: u64, f: &mut F) -> u64 {
+    let mut at = this_position;
+    emit_capped(tok, &mut |piece| {
+        f(piece, at);
+        at += 1;
+    })
+}
+
 /// Emit `tok`, chopped to [`MAX_TOKEN_CHARS`] characters per piece, and
 /// return how many pieces were emitted — a positional caller advances
 /// its ordinal by that much so each piece occupies its own position.
@@ -508,11 +518,7 @@ impl AsciiLowerTokenizer {
                 // therefore valid UTF-8 and the original `text`
                 // outlives the callback call.
                 let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
-                let mut at = this_position;
-                position += emit_capped(s, &mut |piece| {
-                    f(piece, at);
-                    at += 1;
-                }) - 1;
+                position += emit_capped_positioned(s, this_position, &mut f) - 1;
             } else {
                 // Slow path: copy + lowercase into the reusable buf.
                 buf.clear();
@@ -524,11 +530,7 @@ impl AsciiLowerTokenizer {
                 // ASCII alphanumeric (or its lowercased form, which
                 // is also ASCII).
                 let s = unsafe { from_utf8_unchecked(&buf) };
-                let mut at = this_position;
-                position += emit_capped(s, &mut |piece| {
-                    f(piece, at);
-                    at += 1;
-                }) - 1;
+                position += emit_capped_positioned(s, this_position, &mut f) - 1;
             }
         }
     }

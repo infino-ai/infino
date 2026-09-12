@@ -425,12 +425,11 @@ async fn do_apply(
     // closure as well would count that CPU twice.
     let bytes = if inner.options.vector_columns.is_empty() {
         timed_kernel(&op_stats, || {
-            let mut builder =
-                SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
-                    AppendPhaseError::SuperfileBuild {
-                        message: format!("builder construction: {e}"),
-                    }
-                })?;
+            let mut builder = SuperfileBuilder::new(inner.builder_options()).map_err(|e| {
+                AppendPhaseError::SuperfileBuild {
+                    message: format!("builder construction: {e}"),
+                }
+            })?;
             builder
                 .add_batch(&scalar_with_id, &vector_slices)
                 .map_err(|e| AppendPhaseError::SuperfileBuild {

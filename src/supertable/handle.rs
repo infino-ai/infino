@@ -48,7 +48,7 @@ use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{PrefixedStorageProvider, StorageError},
     superfile::{
-        builder::VectorConfig,
+        builder::{BuilderOptions, VectorConfig},
         vector::{kmeans::kmeans, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -243,6 +243,16 @@ pub(super) struct SupertableInner {
 }
 
 impl SupertableInner {
+    /// Builder options for a superfile this table is about to commit: the
+    /// static configuration plus the table-wide FTS length statistics as
+    /// of the current manifest, so the new file bakes — and is scored at
+    /// — the corpus average rather than its own.
+    pub(super) fn builder_options(&self) -> BuilderOptions {
+        self.options
+            .builder_options()
+            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats())
+    }
+
     /// Runtime driving the sync API's async kernels when the caller
     /// isn't already on a tokio runtime. Process-wide — see
     /// [`shared_query_runtime`].

@@ -94,21 +94,10 @@ pub mod fts {
     /// table), so existing indices read unchanged and need no reindex.
     pub const VERSION_V5: u32 = 5;
 
-    /// The version new code writes. Two changes over [`VERSION_V5`]: the
-    /// **scale** the stored bounds are expressed in, and a per-term
-    /// **competitive-frontier table** at the tail of the postings
-    /// region, after the coarse table — [`BLOCK_FRONTIER_BYTES`] per
-    /// block.
-    ///
-    /// The frontier is what makes a bound survive the average document
-    /// length moving. A stored bound is a *score*, so it is frozen at
-    /// whatever average the build divided by; scoring against a
-    /// table-wide average then needs it inflated, and a common term's
-    /// block maxima sit so close together that even a one-percent
-    /// inflation admits most of the blocks a tight bound would skip.
-    /// Storing the competitive `(term frequency, length)` pairs instead
-    /// lets the bound be recomputed exactly at whatever average the
-    /// query uses, so nothing is inflated and pruning is unchanged.
+    /// The version new code writes. Byte-for-byte the [`VERSION_V5`]
+    /// layout; what changes is the **scale** of the stored bounds and the
+    /// **average document length** they and the file's scoring are
+    /// expressed at.
     ///
     /// `V1`–`V5` bounds are maxima of `idf · tf · (k1 + 1) / (tf + k1 ·
     /// norm)`. `V6` drops the `(k1 + 1)` factor, so a bound is a maximum
@@ -122,6 +111,14 @@ pub mod fts {
     /// fusion against vector distances, a comparison against another
     /// engine.
     ///
+    /// The average a `V6` file declares in its doc-lengths directory is
+    /// the one to score it at: the writer bakes it as the table-wide
+    /// average over the documents that carry tokens, folding in every
+    /// superfile committed before it, so a query needs no other value
+    /// and the stored bounds — exact scores at that average — stay
+    /// exact with nothing to inflate. A `V5` file declares its own
+    /// row-count average, which the reader corrects on open.
+    ///
     /// Readers accept `V1`–`V6`. An older blob's bounds are still exact
     /// upper bounds in their own scale, and the reader brings them into
     /// this one by folding `1 / (k1 + 1)` into the column's bound
@@ -132,34 +129,6 @@ pub mod fts {
     /// of the top-k, which is why the scale is version-stamped rather
     /// than inferred.
     pub const VERSION_V6: u32 = 6;
-
-    /// Bytes per block in a term's competitive-frontier table (V6).
-    ///
-    /// Holds [`BLOCK_FRONTIER_POINTS`] `(term-frequency, length-bucket)`
-    /// pairs, one byte each, so a block's bound can be recomputed at
-    /// whatever average document length a query scores with instead of
-    /// being frozen at the one the build divided by.
-    ///
-    /// Fixed-width rather than the variable-length form the frontier
-    /// would compress to, because the ranked walk reaches a block by
-    /// index — the threshold seed picks blocks out of order and the
-    /// coarse level jumps whole spans — so the table has to be
-    /// randomly addressable. A variable-length region would need an
-    /// offset per block, which costs half the saving and puts a
-    /// dependent load in the skip loop.
-    pub const BLOCK_FRONTIER_BYTES: usize = 8;
-
-    /// Competitive pairs stored per block. A document is competitive
-    /// only if no other in the block has both a higher term frequency
-    /// and a shorter length; score rises with the first and falls with
-    /// the second, so everything else is dominated and can never be the
-    /// block's maximum at any average length.
-    ///
-    /// Four is headroom: a measured common term's frontier runs to
-    /// three. A block with more keeps its most competitive pairs plus a
-    /// synthetic `(max tf, min length)` point, which dominates every
-    /// pair and so stays a sound bound, at the cost of some tightness.
-    pub const BLOCK_FRONTIER_POINTS: usize = 4;
 
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
@@ -198,10 +167,14 @@ pub mod fts {
     /// reader's per-doc scoring) removes that slack.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
+    /// Offset of `avgdl_x1000` within a doc-lengths directory entry
+    /// (`[0..4]` column id, `[4..12]` array offset, `[12..16]` this).
+    pub const DOC_LENGTHS_ENTRY_AVGDL_OFF: usize = 12;
+
     /// Number of consecutive posting blocks summarised by one entry of
-    /// a term's coarse block-max table (V5 only). The table sits at the tail
-    /// of a PFOR term's postings region: `ceil(num_blocks / this)` `f32`s,
-    /// each the max of its span's per-block max BM25.
+    /// a term's coarse block-max table (V5 and later). The table sits at
+    /// the tail of a PFOR term's postings region: `ceil(num_blocks / this)`
+    /// `f32`s, each the max of its span's per-block max BM25.
     ///
     /// It gives the ranked single-term walk a second, coarser skip level:
     /// when the running k-th-best score already dominates a whole span's
@@ -323,8 +296,9 @@ pub mod fts {
         pub const LAST_DOC_ID_OFF: usize = 0;
         /// `[4..8]` byte offset to the encoded PFOR block (`u32` LE).
         pub const BLOCK_OFFSET_OFF: usize = 4;
-        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5,
-        /// fixed-point `u32` (`ceil(max × scale)`) on legacy `V1`-`V4`. LE.
+        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5
+        /// and later, fixed-point `u32` (`ceil(max × scale)`) on legacy
+        /// `V1`-`V4`. LE.
         pub const MAX_BM25_OFF: usize = 8;
         /// `[12..16]` block's position-runs offset, relative to the
         /// term's `positions_offset` (`u32` LE). Zero on positionless

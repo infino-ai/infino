@@ -41,9 +41,6 @@ pub(super) struct PhraseMember {
     /// inline FST value's slot carries it instead of a tf. `None` for
     /// PFOR members.
     pub(super) inline_position: Option<u32>,
-    /// The member's own idf, summed with its siblings' into the
-    /// phrase's scoring constant.
-    pub(super) idf: f32,
     /// Byte offset of each decoded-block pair's run within
     /// `positions`, valid for `run_offsets_block`. Rebuilt on block
     /// crossings by one `skip_run` walk over the block's runs. Used by
@@ -243,15 +240,13 @@ impl PhraseCursor {
             .zip(positions)
             .zip(positional)
             .map(|((cursor, positions), (term_meta, inline_position))| {
-                let idf = cursor.idf_weight;
-                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
-                idf_sum += idf;
+                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / cursor.idf_weight);
+                idf_sum += cursor.idf_weight;
                 PhraseMember {
                     cursor,
                     positions,
                     term_meta,
                     inline_position,
-                    idf,
                     run_offsets: Vec::new(),
                     run_offsets_block: NO_BLOCK_CACHED,
                     cached_pair: NO_BLOCK_CACHED,
@@ -558,7 +553,7 @@ impl PhraseCursor {
         let mut min_scaled = f32::INFINITY;
         for m in self.members.iter_mut() {
             let b = m.cursor.block_max_in_range(range_start, range_end);
-            min_scaled = min_scaled.min(b / m.idf);
+            min_scaled = min_scaled.min(b / m.cursor.idf_weight);
         }
         self.idf_weight * min_scaled
     }
@@ -728,6 +723,50 @@ mod tests {
         // doc lengths in play its score must strictly exceed doc 0's
         // (same length, tf 1... doc 0 len 3, doc 4 len 4; tf=2 wins).
         assert_eq!(hits[0].0, 4, "double occurrence ranks first");
+    }
+
+    /// An emoji is a token under `standard`, so it occupies a position
+    /// and breaks adjacency: `"cat dog"` must not match `cat 🙂 dog`.
+    #[tokio::test]
+    async fn an_emoji_between_two_words_breaks_the_phrase() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer,
+        };
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        b.add_doc(0, 0, "cat 🙂 dog").expect("doc 0");
+        b.add_doc(0, 1, "cat dog").expect("doc 1");
+        b.add_doc(0, 2, "cat, dog").expect("doc 2");
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["cat", "dog"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "punctuation takes no position; an emoji does"
+        );
+        // And the emoji itself is searchable.
+        let emoji = r
+            .search("title", &["🙂"], 10, BoolMode::Or)
+            .await
+            .expect("search");
+        assert_eq!(emoji.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![0]);
     }
 
     #[tokio::test]

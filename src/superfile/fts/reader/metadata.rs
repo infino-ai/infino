@@ -90,24 +90,55 @@ impl ColumnLengthStats {
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         self.n_scored_docs = self.n_scored_docs.saturating_add(other.n_scored_docs);
     }
+
+    /// Count one document of `dl` tokens. A zero-length document — a null
+    /// or empty cell indexed to keep the per-doc arrays row-aligned — is
+    /// not a document this column has and contributes to neither total.
+    #[inline]
+    pub fn add(&mut self, dl: u32) {
+        if dl > 0 {
+            self.total_tokens += u64::from(dl);
+            self.n_scored_docs += 1;
+        }
+    }
+
+    /// The statistics of a column whose per-doc lengths are `lengths`.
+    pub fn from_lengths(lengths: impl IntoIterator<Item = u32>) -> Self {
+        let mut stats = Self::default();
+        for dl in lengths {
+            stats.add(dl);
+        }
+        stats
+    }
+
+    /// Fold two contributions where either may be unknown. Statistics
+    /// exist to be summed — the whole point of rolling them up is that
+    /// the table's average and collection size come out as they would
+    /// for one unfragmented file — and a contributor that predates the
+    /// totals has nothing to add: folding it in as zero would silently
+    /// shrink both. So an unknown side makes the result unknown.
+    pub fn fold(acc: Option<Self>, next: Option<Self>) -> Option<Self> {
+        let (mut acc, next) = (acc?, next?);
+        acc.merge_with(&next);
+        Some(acc)
+    }
 }
 
 impl NormTable {
     /// Build from a column's per-doc lengths, returning the table
     /// alongside the totals the pass produced.
     ///
-    /// The average the table decodes at is derived here rather than
-    /// taken from the caller: it is `total_tokens / n_scored_docs`, and
-    /// only this pass knows how many documents actually carry tokens.
-    /// A column no document contributes to yields an empty table; it is
-    /// never indexed because `search` short-circuits on empty columns.
-    ///
-    /// The lengths are summed exactly, so the average costs nothing
-    /// beyond the pass the per-doc buckets already require.
+    /// The same pass that quantizes each length sums them, so the
+    /// column's statistics cost nothing extra; `decode_avgdl` then picks
+    /// the average the table decodes at, given those statistics — the
+    /// average the file declares, or one corrected from them. A column
+    /// no document contributes to yields an empty table; it is never
+    /// indexed because `search` short-circuits on empty columns.
     pub(super) fn new(
         doc_lengths: impl Iterator<Item = u32>,
         n_docs: usize,
         params: bm25::Bm25Params,
+        decode_avgdl: impl FnOnce(&ColumnLengthStats) -> f32,
     ) -> (Self, ColumnLengthStats) {
         let mut bytes = Vec::with_capacity(n_docs);
         let mut lo = u8::MAX;
@@ -118,20 +149,16 @@ impl NormTable {
             lo = lo.min(bucket);
             hi = hi.max(bucket);
             bytes.push(bucket);
-            if dl > 0 {
-                stats.total_tokens += u64::from(dl);
-                stats.n_scored_docs += 1;
-            }
+            stats.add(dl);
         }
-        let avgdl = stats.avgdl();
-        if avgdl <= 0.0 {
+        if stats.n_scored_docs == 0 {
             return (Self::empty(), stats);
         }
-        let occupied = if bytes.is_empty() { (0, 0) } else { (lo, hi) };
+        let avgdl = decode_avgdl(&stats);
         let table = Self {
             bytes: Arc::from(bytes),
             lut: build_lut(avgdl, params),
-            occupied,
+            occupied: (lo, hi),
             avgdl,
         };
         (table, stats)
@@ -139,9 +166,9 @@ impl NormTable {
 
     /// The same per-doc buckets decoded at a different average length
     /// and/or parameter pair — for a query that overrides what the
-    /// column declared, and for the table-wide average that makes a
-    /// score independent of which superfile the document landed in.
-    /// Shares `bytes`, so the cost is one 256-entry table.
+    /// column declared, and for an older file whose declared average the
+    /// reader corrects. Shares `bytes`, so the cost is one 256-entry
+    /// table.
     pub(super) fn rescored(&self, avgdl: f32, params: bm25::Bm25Params) -> Self {
         if self.bytes.is_empty() {
             return Self::empty();
@@ -212,14 +239,6 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
-    /// The length the scorer normalizes this doc by — the stored
-    /// bucket decoded, not the doc's true token count. Test-only: the
-    /// scoring path reads the norm straight out of the table.
-    #[cfg(test)]
-    pub(super) fn stored_length(&self, doc: u32) -> u32 {
-        bm25::dequantize_len(self.bytes[doc as usize])
-    }
-
     /// Number of docs in the table. Test-only: the query path indexes
     /// by doc id and never needs the count.
     #[cfg(test)]
@@ -261,17 +280,6 @@ pub struct ColumnMeta {
     /// Byte range into [`FtsReader::blob`] holding this column's
     /// `u32` doc-lengths array (4 bytes per doc, length × n_docs).
     pub doc_lengths_range: Range<usize>,
-    /// Average doc length across this column — over the documents that
-    /// carry tokens, so a column that is null for most rows is
-    /// normalized against the documents it actually has. `0.0` if the
-    /// column has none.
-    ///
-    /// Derived at open from the stored lengths rather than read from
-    /// the doc-lengths directory: the directory records the average
-    /// over *rows*, which is the same number only for a column with no
-    /// gaps. The directory value is still what the stored per-block
-    /// bounds were built against, hence `bound_scale`.
-    pub avgdl: f32,
     /// This column's exact token total and the number of documents
     /// carrying tokens, summed at open. Table-wide statistics are these
     /// summed across superfiles.
@@ -292,10 +300,10 @@ pub struct ColumnMeta {
     ///
     /// The stored bounds are exact scores under what the build baked
     /// in: the column's declared parameter pair, and the average length
-    /// over rows that the doc-lengths directory records. Every reason
-    /// the scored value departs from that — the average corrected to
-    /// the documents that carry tokens, a table-wide average, a
-    /// query-time parameter override — is a [`NormTable::bound_scale`]
+    /// the doc-lengths directory declares. Every reason the scored value
+    /// departs from that — an older file's row-count average corrected
+    /// to the documents that carry tokens, a query-time parameter
+    /// override — is a [`NormTable::bound_scale`]
     /// factor, and they compose by multiplication because each is a
     /// supremum of a ratio (a product of suprema is never below the
     /// supremum of the product, so composing loosens and cannot
@@ -328,17 +336,6 @@ pub struct ColumnMeta {
 }
 
 impl ColumnMeta {
-    /// The average length and parameters a block bound should be
-    /// recomputed at, when this column is scored against anything other
-    /// than what its file baked in.
-    ///
-    /// `None` when nothing moved, which is the case a stored bound is
-    /// already exact for — recomputing then would be work for an
-    /// identical answer.
-    pub(crate) fn frontier_rescore(&self) -> Option<(f32, bm25::Bm25Params)> {
-        (self.bound_scale != 1.0).then_some((self.avgdl, self.params))
-    }
-
     /// The collection size this column's inverse document frequency is
     /// computed against: the documents that carry tokens here, not the
     /// superfile's row count.
@@ -352,6 +349,12 @@ impl ColumnMeta {
     /// each column's weighting independent of how often it is filled.
     pub fn scored_doc_count(&self) -> u64 {
         self.length_stats.n_scored_docs
+    }
+
+    /// The average document length this column is scored at — the one
+    /// its norm table decodes with.
+    pub fn avgdl(&self) -> f32 {
+        self.dl_norm_k1.avgdl()
     }
 }
 
@@ -514,7 +517,10 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+        bm25,
+        builder::{BlobEra, FtsBuilder},
+        reader::FtsReader,
+        tokenize::AsciiLowerTokenizer,
     };
 
     // ── Column length totals ──────────────────────────────────────────
@@ -568,14 +574,13 @@ mod tests {
 
     /// Number of rows carrying text in the sparse fixture below.
     const SPARSE_FILLED_ROWS: u32 = 2;
-    /// Rows whose cell is null, which ingest indexes as the empty
-    /// string so the doc-lengths array stays aligned with Parquet.
     const SPARSE_EMPTY_ROWS: u32 = 6;
 
-    /// A column filled for two of eight rows: four tokens across two
-    /// documents, and six empty slots that can never match a term.
-    fn sparse_reader() -> FtsReader {
+    /// Two documents of two tokens each, then rows this column is null
+    /// for: four tokens over two documents, eight rows.
+    fn sparse_builder(era: BlobEra) -> FtsBuilder {
         let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.era = era;
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "alpha beta").expect("doc 0");
         b.add_doc(0, 1, "alpha gamma").expect("doc 1");
@@ -583,8 +588,44 @@ mod tests {
             b.add_doc(0, SPARSE_FILLED_ROWS + row, "")
                 .expect("null row");
         }
+        b
+    }
+
+    fn sparse_reader() -> FtsReader {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
-        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+        FtsReader::open(
+            Bytes::from(sparse_builder(BlobEra::Current).finish().expect("finish")),
+            json,
+        )
+        .expect("open")
+    }
+
+    #[test]
+    fn folding_an_unknown_contributor_makes_the_total_unknown() {
+        let known = Some(ColumnLengthStats {
+            total_tokens: 100,
+            n_scored_docs: 10,
+        });
+        let more = Some(ColumnLengthStats {
+            total_tokens: 50,
+            n_scored_docs: 15,
+        });
+        assert_eq!(
+            ColumnLengthStats::fold(known, more),
+            Some(ColumnLengthStats {
+                total_tokens: 150,
+                n_scored_docs: 25,
+            })
+        );
+        assert_eq!(ColumnLengthStats::fold(known, None), None);
+        assert_eq!(ColumnLengthStats::fold(None, more), None);
+        assert_eq!(
+            ColumnLengthStats::from_lengths([3, 0, 1, 0]),
+            ColumnLengthStats {
+                total_tokens: 4,
+                n_scored_docs: 2,
+            }
+        );
     }
 
     #[test]
@@ -601,7 +642,7 @@ mod tests {
         assert_eq!(col.scored_doc_count(), u64::from(SPARSE_FILLED_ROWS));
         // 4 / 2, not 4 / 8 — dividing by the row count would deflate the
         // average by the fill rate and over-reward short documents.
-        assert_eq!(col.avgdl, 2.0);
+        assert_eq!(col.avgdl(), 2.0);
         // The doc-lengths array still has one slot per row: the array is
         // indexed by local doc id and cannot skip rows.
         assert_eq!(
@@ -611,34 +652,56 @@ mod tests {
     }
 
     #[test]
-    fn sparse_column_bounds_stay_above_the_scores_they_cap() {
-        // Correcting the average raises it, which lowers the norm and
-        // raises every score, so the bounds baked at the row-count
-        // average would sit below the scores they exist to cap. If this
-        // regresses, block-max pruning silently drops documents from the
-        // top-k rather than failing.
+    fn a_sparse_column_declares_the_average_over_its_documents() {
+        // The builder divides by the documents that carry tokens, so the
+        // file declares the corrected average and its bounds — exact
+        // scores at that average — need no inflation.
         let r = sparse_reader();
         let col = &r.columns[0];
-        assert!(
-            col.bound_scale > 1.0,
-            "a corrected average owes an inflation factor, got {}",
-            col.bound_scale
-        );
-        // The factor is the supremum of the per-document ratio, so it
-        // must cover the worst occupied length at any term frequency.
-        // What the build recorded: the same token total over every row.
-        let rows = (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as f32;
-        let baked_avgdl = col.length_stats.total_tokens as f32 / rows;
-        let baked = col.dl_norm_k1.rescored(baked_avgdl, col.params);
-        for doc in 0..SPARSE_FILLED_ROWS {
-            for tf in 1..8u32 {
-                let at_baked = bm25::score_with_dl_norm_k1(1.0, tf, baked.get(doc));
-                let at_scored = bm25::score_with_dl_norm_k1(1.0, tf, col.dl_norm_k1.get(doc));
-                assert!(
-                    at_baked * col.bound_scale >= at_scored - f32::EPSILON,
-                    "doc {doc} tf {tf}: {at_baked} * {} < {at_scored}",
-                    col.bound_scale
-                );
+        assert_eq!(col.avgdl(), 2.0);
+        assert_eq!(col.bound_scale, 1.0);
+    }
+
+    #[test]
+    fn an_older_sparse_file_is_corrected_and_its_bounds_inflated() {
+        // A pre-current file divided by its row count. Correcting the
+        // average raises it, which lowers the norm and raises every
+        // score, so the bounds baked at the row-count average sit below
+        // the scores they exist to cap and owe the supremum factor —
+        // on top of the `(k1 + 1)` those files carry. If this regresses,
+        // block-max pruning silently drops documents from the top-k.
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        for era in [BlobEra::LegacyV5, BlobEra::NoCoarse] {
+            let blob = Bytes::from(sparse_builder(era).finish().expect("finish"));
+            let r = FtsReader::open(blob, json).expect("open");
+            let col = &r.columns[0];
+            assert_eq!(
+                col.avgdl(),
+                2.0,
+                "{era:?}: scored at the average over documents"
+            );
+            let legacy_scale = 1.0 / (col.params.k1 + 1.0);
+            assert!(
+                col.bound_scale > legacy_scale,
+                "{era:?}: a corrected average owes an inflation factor beyond the scale change, got {}",
+                col.bound_scale
+            );
+            // What that build recorded: the same token total over every row.
+            let rows = (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as f32;
+            let baked = col
+                .dl_norm_k1
+                .rescored(col.length_stats.total_tokens as f32 / rows, col.params);
+            for doc in 0..SPARSE_FILLED_ROWS {
+                for tf in 1..8u32 {
+                    let at_baked =
+                        bm25::score_with_dl_norm_k1(col.params.k1 + 1.0, tf, baked.get(doc));
+                    let at_scored = bm25::score_with_dl_norm_k1(1.0, tf, col.dl_norm_k1.get(doc));
+                    assert!(
+                        at_baked * col.bound_scale >= at_scored - f32::EPSILON,
+                        "{era:?} doc {doc} tf {tf}: {at_baked} * {} < {at_scored}",
+                        col.bound_scale
+                    );
+                }
             }
         }
     }
@@ -651,14 +714,14 @@ mod tests {
         // under-bounded every score.
         let r = sparse_reader();
         let col = &r.columns[0];
-        let wider = col.dl_norm_k1.rescored(col.avgdl * 2.0, col.params);
+        let wider = col.dl_norm_k1.rescored(col.avgdl() * 2.0, col.params);
         let factor = col.dl_norm_k1.bound_scale(&wider, col.params, col.params);
         assert!(
             factor > 1.0,
             "same parameters, larger average: expected an inflation factor, got {factor}"
         );
         // And it is still exactly 1.0 when nothing moves at all.
-        let same = col.dl_norm_k1.rescored(col.avgdl, col.params);
+        let same = col.dl_norm_k1.rescored(col.avgdl(), col.params);
         assert_eq!(
             col.dl_norm_k1.bound_scale(&same, col.params, col.params),
             1.0
@@ -679,7 +742,7 @@ mod tests {
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = &r.columns[0];
         assert_eq!(col.length_stats.n_scored_docs, 0);
-        assert_eq!(col.avgdl, 0.0);
+        assert_eq!(col.avgdl(), 0.0);
         assert_eq!(col.dl_norm_k1.len(), 0);
     }
 
@@ -735,7 +798,7 @@ mod tests {
         assert_eq!(cols[0].name, "body");
         // Three non-empty docs ⇒ a positive average doc length and a
         // populated per-doc normalization table.
-        assert!(cols[0].avgdl > 0.0);
+        assert!(cols[0].avgdl() > 0.0);
         assert_eq!(cols[0].dl_norm_k1.len(), 3);
     }
 

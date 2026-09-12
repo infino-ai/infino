@@ -62,6 +62,7 @@ use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::options::SupertableOptions;
+use crate::superfile::fts::reader::ColumnLengthStats;
 use crate::{
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
@@ -217,6 +218,36 @@ impl SuperfileList {
     /// Total documents across all superfiles.
     pub fn n_docs_total(&self) -> u64 {
         self.superfiles.iter().map(|s| s.n_docs).sum()
+    }
+
+    /// One FTS column's length statistics over the whole table — the
+    /// documents that carry tokens and their token total — folded from
+    /// every superfile's summary. `None` while any superfile's summary
+    /// predates the totals: a partial sum would describe some other
+    /// corpus, so the caller falls back rather than mixing.
+    pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
+        self.superfiles
+            .iter()
+            .filter_map(|sf| sf.fts_summary.get(column))
+            .try_fold(ColumnLengthStats::default(), |acc, summary| {
+                ColumnLengthStats::fold(Some(acc), summary.length_stats)
+            })
+    }
+
+    /// [`Self::fts_length_stats`] for every FTS column any superfile
+    /// summarises, keyed by column; columns without complete totals are
+    /// absent. What a writer hands the next superfile's builder so it
+    /// bakes the table-wide average rather than its own.
+    pub fn fts_corpus_stats(&self) -> HashMap<String, ColumnLengthStats> {
+        let columns: BTreeSet<&str> = self
+            .superfiles
+            .iter()
+            .flat_map(|sf| sf.fts_summary.keys().map(String::as_str))
+            .collect();
+        columns
+            .into_iter()
+            .filter_map(|c| Some((c.to_owned(), self.fts_length_stats(c)?)))
+            .collect()
     }
 }
 

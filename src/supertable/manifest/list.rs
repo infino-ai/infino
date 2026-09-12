@@ -1091,14 +1091,15 @@ pub struct FtsSummaryAgg {
     /// This column's token total and count of documents carrying
     /// tokens. Unlike the rest of this struct these drive *scoring*,
     /// not skip-pruning: summed over the manifest they give the
-    /// table-wide average document length and collection size, so a
-    /// term is weighted the same way regardless of which superfile the
-    /// document it matched happens to live in.
+    /// table-wide collection size a query weights terms with and the
+    /// table-wide average document length the next superfile is written
+    /// at, so a document scores the same way regardless of which
+    /// superfile it happens to live in.
     ///
-    /// `None` on a summary written before the totals were recorded. A
-    /// reader falls back to that superfile's row count, which is what
-    /// it would have used anyway, so a partially backfilled manifest
-    /// degrades toward the old numbers rather than to anything new.
+    /// `None` on a summary written before the totals were recorded. The
+    /// table-wide fold is then unknown: a query weights terms with the
+    /// row count instead, and the next superfile averages over itself —
+    /// the old numbers, until a rewrite backfills the totals.
     pub length_stats: Option<ColumnLengthStats>,
 }
 
@@ -1160,19 +1161,8 @@ impl FtsSummaryAgg {
             (None, None) => None,
         };
         self.n_terms_distinct = self.n_terms_distinct.max(other.n_terms_distinct);
-        // Plain sums, not a union or a max: these are corpus totals, and
-        // the whole point of rolling them up is that the average and the
-        // collection size come out the same as they would for one
-        // unfragmented file. A contributor that predates the totals has
-        // nothing to add, and folding it in as zero would silently
-        // shrink both — so an unknown side makes the result unknown.
-        self.length_stats = match (self.length_stats, other.length_stats) {
-            (Some(mut a), Some(b)) => {
-                a.merge_with(&b);
-                Some(a)
-            }
-            _ => None,
-        };
+        // See `ColumnLengthStats::fold` for why an unknown side wins.
+        self.length_stats = ColumnLengthStats::fold(self.length_stats, other.length_stats);
     }
 
     /// Merge two per-FTS-column summary tables
@@ -2738,7 +2728,10 @@ mod tests {
                 term_bloom: Some(title_bloom.finish()),
                 n_terms_distinct: 1_048_576,
                 term_range: Some((b"alpha".to_vec(), b"zulu".to_vec())),
-                length_stats: None,
+                length_stats: Some(ColumnLengthStats {
+                    total_tokens: 1_234_567,
+                    n_scored_docs: 9_800,
+                }),
             },
         );
         // "body": no bloom info, no range (the all-None / always-keep shape).
@@ -3590,7 +3583,7 @@ mod tests {
         // average and the collection size — producing a number that is
         // neither the table-wide statistic nor the per-superfile one,
         // with no error to notice. Unknown on either side means unknown,
-        // and the reader then keeps each superfile's own average.
+        // and the next superfile then averages over itself.
         let mut a = fts_agg(&[b"alpha"], 16, Some((b"alpha", b"mango")));
         a.length_stats = Some(ColumnLengthStats {
             total_tokens: 100,

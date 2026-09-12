@@ -53,6 +53,7 @@ use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
+use crate::superfile::fts::bm25::Bm25Params;
 use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
@@ -61,7 +62,7 @@ use crate::{
         fts::{
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
-                PreparedClauses, ScoringOverride, TermPattern,
+                PreparedClauses, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -180,7 +181,7 @@ pub struct SuperfileReader {
     /// query on a column asks for the same override, so a single entry
     /// hits on all but the first. A table alternating between two FTS
     /// columns thrashes it and simply pays what it paid before.
-    scored_fts: RwLock<Option<(ScoringOverride, Arc<FtsReader>)>>,
+    scored_fts: RwLock<Option<(Bm25Params, Arc<FtsReader>)>>,
     vec: Option<VectorReader>,
     /// Byte range of the stable-id sidecar within `bytes` (a packed
     /// little-endian `i128` per local doc id), when the superfile carries
@@ -1458,25 +1459,26 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
-        scoring: ScoringOverride,
+        bm25: Option<Bm25Params>,
     ) -> Result<PreparedClauses, ReadError> {
-        let fts = self.fts_scored(scoring)?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.prepare_clauses(column, lists, k, floor).await?)
     }
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched.
     ///
-    /// `scoring` must be the same override the paired `prepare_clauses`
-    /// was given: the cursors carry the idf they were built with, and
-    /// scoring divides by a norm table derived from that same override. `with_scoring_override` is deterministic, so
-    /// two separately-derived views of one pair agree bit for bit.
+    /// `bm25` must be the same override the paired `prepare_clauses`
+    /// was given: the cursors carry the bounds they were built with, and
+    /// scoring divides by a norm table derived from that same override.
+    /// `with_bm25_override` is deterministic, so two separately-derived
+    /// views of one pair agree bit for bit.
     pub(crate) fn run_prepared(
         &self,
         prep: PreparedClauses,
-        scoring: ScoringOverride,
+        bm25: Option<Bm25Params>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self.fts_scored(scoring)?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.run_prepared(prep)?)
     }
 
@@ -1489,23 +1491,23 @@ impl SuperfileReader {
     /// for the blob plus one 1 KiB decode table per column that
     /// actually moves — and records the factor that keeps each column's
     /// stored bounds upper bounds under what is being scored.
-    fn fts_scored(&self, scoring: ScoringOverride) -> Result<ScoredFts<'_>, ReadError> {
+    fn fts_scored(&self, bm25: Option<Bm25Params>) -> Result<ScoredFts<'_>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        if scoring.is_empty() {
+        let Some(params) = bm25 else {
             return Ok(ScoredFts::Baked(fts));
-        }
+        };
         if let Some((cached, view)) = self.scored_fts.read().expect("scored fts memo").as_ref()
-            && *cached == scoring
+            && *cached == params
         {
             return Ok(ScoredFts::Derived(Arc::clone(view)));
         }
-        let view = Arc::new(fts.with_scoring_override(scoring));
+        let view = Arc::new(fts.with_bm25_override(params));
         // Last writer wins. Two queries racing here derive the same view
-        // from the same inputs — `with_scoring_override` is
-        // deterministic — so which one lands is immaterial.
-        *self.scored_fts.write().expect("scored fts memo") = Some((scoring, Arc::clone(&view)));
+        // from the same inputs — `with_bm25_override` is deterministic —
+        // so which one lands is immaterial.
+        *self.scored_fts.write().expect("scored fts memo") = Some((params, Arc::clone(&view)));
         Ok(ScoredFts::Derived(view))
     }
 
@@ -1677,9 +1679,9 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-        scoring: ScoringOverride,
+        bm25: Option<Bm25Params>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self.fts_scored(scoring)?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
     }
 
@@ -1712,7 +1714,7 @@ impl SuperfileReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
-            ScoringOverride::default(),
+            None,
         )
     }
 
@@ -2710,6 +2712,46 @@ mod tests {
     }
 
     // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn a_scored_view_is_memoized_per_parameter_pair() {
+        // No override borrows the baked reader; an override derives a view
+        // once and hands the same one back while the pair is unchanged,
+        // and a different pair replaces it — the memo is last-writer-wins
+        // and never keeps a stale pair.
+        let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
+        assert!(matches!(
+            r.fts_scored(None).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+        let a = Bm25Params::new(1.4, 0.6);
+        let b = Bm25Params::new(0.9, 0.4);
+        let first = match r.fts_scored(Some(a)).expect("derive") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        let again = match r.fts_scored(Some(a)).expect("reuse") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "same pair: the memoized view is reused"
+        );
+        let other = match r.fts_scored(Some(b)).expect("derive another") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a different pair derives a different view"
+        );
+        assert_eq!(other.fts_columns_config().next().expect("column").params, b);
+        assert!(matches!(
+            r.fts_scored(None).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+    }
 
     #[test]
     fn open_with_verify_crc_off_succeeds() {

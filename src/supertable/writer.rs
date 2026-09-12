@@ -2183,7 +2183,7 @@ impl SupertableWriter {
         let outputs = fanout_shards_metered(&writer_pool, &self.op_stats, &shards, |slice| {
             build_one_shard_with_layout(
                 slice.as_slice(),
-                &user_options,
+                &user_inner,
                 user_options.vector_layout,
                 user_global_centroids.clone(),
             )
@@ -2305,12 +2305,13 @@ fn reserve_build_scratch(
 /// optional global centroids.
 fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
-    options: &SupertableOptions,
+    inner: &SupertableInner,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
     provided_centroids: Option<std::sync::Arc<[f32]>>,
 ) -> Result<ShardOutput, BuildError> {
+    let options = &inner.options;
     let mut builder = SuperfileBuilder::new(
-        options
+        inner
             .builder_options()
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
@@ -5662,11 +5663,12 @@ fn drain_pack_assigned_cell(
 /// Parquet object, `partition_hint = shard_id`.
 fn build_one_shard_from_packed_cells(
     cells: Vec<(u32, MergedIvfSubsection, Vec<i128>)>,
-    options: &SupertableOptions,
+    inner: &SupertableInner,
 ) -> Result<ShardOutput, BuildError> {
     if cells.is_empty() {
         return Err(BuildError::NoDocsToBuild);
     }
+    let options = &inner.options;
     // Sort by cell_id up front so the concatenated `_id` column order matches
     // the subsection order the builder re-sorts into — a caller passing cells
     // out of cell_id order would otherwise diverge parquet `_id` from the
@@ -5699,7 +5701,7 @@ fn build_one_shard_from_packed_cells(
     .map_err(|_| BuildError::BatchSchemaMismatch)?;
 
     let mut builder = SuperfileBuilder::new(
-        options
+        inner
             .builder_options()
             .with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
@@ -5741,7 +5743,7 @@ fn build_prepared_from_packed_cells(
     shard_id: u32,
     cells: Vec<(u32, MergedIvfSubsection, Vec<i128>)>,
 ) -> Result<PreparedSuperfile, BuildError> {
-    let shard = build_one_shard_from_packed_cells(cells, &inner.options)?;
+    let shard = build_one_shard_from_packed_cells(cells, inner)?;
     let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
     let entry = finish_superfile_entry(prepared.entry, Some(shard_id))?;
     Ok(PreparedSuperfile {
@@ -5778,7 +5780,6 @@ fn build_prepared_from_spilled_cells(
     let mut scalar_stats = HashMap::new();
     let mut builder = SuperfileBuilder::new(
         inner
-            .options
             .builder_options()
             .with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
@@ -6059,7 +6060,6 @@ fn commit_shards_via_drain(
         .collect();
     let packed_shards = group_cells_by_packed_shard(assigned_cells, n_packed_shards);
 
-    let options = &inner.options;
     let shard_outputs = fanout_shards_metered(
         &inner.options.writer_pool,
         op_stats,
@@ -6071,7 +6071,7 @@ fn commit_shards_via_drain(
                 &source_scalar,
                 &vector_views,
                 &local_by_id,
-                options,
+                inner,
                 &vc,
             )?;
             let Some(tx) = pipeline else {
@@ -6208,7 +6208,7 @@ fn build_one_packed_shard_via_drain(
     source_scalar: &RecordBatch,
     vector_views: &[VectorColumnView<'_>],
     local_by_id: &HashMap<i128, u32>,
-    options: &SupertableOptions,
+    inner: &SupertableInner,
     vc: &VectorConfig,
 ) -> Result<Option<ShardOutput>, BuildError> {
     let mut ordered_locals: Vec<u32> = Vec::new();
@@ -6243,7 +6243,7 @@ fn build_one_packed_shard_via_drain(
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         },
-        || build_shard_parquet_and_fts(source_scalar, vector_views, &ordered_locals, options),
+        || build_shard_parquet_and_fts(source_scalar, vector_views, &ordered_locals, inner),
     );
     let packed_groups = packed_groups?;
     let (mut builder, id_min, id_max, n_docs, scalar_stats) = body_and_fts?;
@@ -6287,7 +6287,7 @@ fn build_shard_parquet_and_fts(
     source_scalar: &RecordBatch,
     vector_views: &[VectorColumnView<'_>],
     ordered_locals: &[u32],
-    options: &SupertableOptions,
+    inner: &SupertableInner,
 ) -> Result<
     (
         SuperfileBuilder,
@@ -6298,6 +6298,7 @@ fn build_shard_parquet_and_fts(
     ),
     BuildError,
 > {
+    let options = &inner.options;
     let take_indices = UInt32Array::from(ordered_locals.to_vec());
     let columns: Vec<ArrayRef> = source_scalar
         .columns()
@@ -6322,7 +6323,7 @@ fn build_shard_parquet_and_fts(
     let vector_slices: Vec<&[f32]> = ordered_vectors.iter().map(Vec::as_slice).collect();
 
     let mut builder = SuperfileBuilder::new(
-        options
+        inner
             .builder_options()
             .with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
@@ -12442,6 +12443,53 @@ supertable:
             .expect("update");
         assert_eq!(stats.matched(), 1);
         assert_eq!(stats.n_tombstoned(), 1);
+    }
+
+    #[test]
+    fn an_update_rewrites_the_row_at_the_running_table_wide_average() {
+        // The update pipeline builds its superfile through the same door
+        // as an append: the table's length totals go in, so the rewritten
+        // row's file declares the running table-wide average — here the
+        // seven tokens already committed plus its own three over three
+        // documents — and carries its own totals for the next fold.
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::fts::{bm25, reader::ColumnLengthStats};
+        let dir = TempDir::new().expect("tempdir");
+        let st = storage_backed_st(&dir);
+        st.append(&row("a b c d e f")).expect("append");
+        st.append(&row("g")).expect("append");
+        st.update(col("title").eq(lit("g")), &row("x y z"))
+            .expect("update");
+
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let rewritten = manifest
+            .get_all_superfiles()
+            .iter()
+            .find(|sf| sf.fts_summary["title"].length_stats.map(|s| s.total_tokens) == Some(3))
+            .cloned()
+            .expect("the update's superfile carries its own totals");
+        assert_eq!(
+            rewritten.fts_summary["title"].length_stats,
+            Some(ColumnLengthStats {
+                total_tokens: 3,
+                n_scored_docs: 1,
+            })
+        );
+        let fts = manifest
+            .options
+            .store
+            .reader(&rewritten.uri)
+            .expect("reader");
+        let declared = fts
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("title column")
+            .avgdl();
+        assert_eq!(declared, bm25::stored_avgdl((7.0 + 3.0) / 3.0));
     }
 
     #[test]

@@ -39,9 +39,11 @@ pub enum Bm25Stats {
     /// superfiles in the query's manifest snapshot. A term then has one
     /// idf for the whole table, so a fragmented table ranks like a
     /// single unified corpus, at the cost of a document-frequency
-    /// gather before scoring. (Length normalization still uses each
-    /// superfile's own average document length.) The default: ranking
-    /// should not depend on how commits happened to shard the corpus.
+    /// gather before scoring. Length normalization needs no gather:
+    /// every superfile is written at the table-wide average document
+    /// length as of its commit and scored at the average it declares.
+    /// The default: ranking should not depend on how commits happened
+    /// to shard the corpus.
     #[default]
     Global,
 }
@@ -56,32 +58,6 @@ impl From<&str> for Bm25Stats {
             // drift apart.
             _ => Bm25Stats::default(),
         }
-    }
-}
-
-/// What one superfile is asked to score with when the query cannot
-/// simply use what that superfile baked in.
-///
-/// Both fields exist for the same reason and are corrected the same
-/// way: each moves the per-doc length normalizer away from the one the
-/// stored per-block bounds were computed against, so each contributes a
-/// factor that inflates those bounds back into upper bounds. The
-/// factors compose, and an empty override costs nothing — the query
-/// reads the superfile's own reader by reference.
-#[derive(Debug, Copy, Clone, PartialEq, Default)]
-pub struct ScoringOverride {
-    /// Similarity parameters replacing what each column declared.
-    pub params: Option<Bm25Params>,
-    /// Average document length replacing this superfile's own — the
-    /// table-wide average, so that a document's score does not depend on
-    /// which superfile it happens to live in.
-    pub avgdl: Option<f32>,
-}
-
-impl ScoringOverride {
-    /// Nothing to override: score each column exactly as it was built.
-    pub fn is_empty(&self) -> bool {
-        self.params.is_none() && self.avgdl.is_none()
     }
 }
 
