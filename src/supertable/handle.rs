@@ -1319,6 +1319,7 @@ impl Supertable {
             .expect("open_all_superfiles: user table needs storage");
         let mut targets: Vec<(
             crate::supertable::manifest::SuperfileUri,
+            String,
             Option<crate::supertable::manifest::SubsectionOffsets>,
             std::sync::Arc<dyn crate::storage::StorageProvider>,
         )> = manifest
@@ -1327,6 +1328,7 @@ impl Supertable {
             .map(|e| {
                 (
                     e.uri,
+                    e.storage_path(),
                     e.subsection_offsets.clone(),
                     std::sync::Arc::clone(&user_storage),
                 )
@@ -1342,6 +1344,7 @@ impl Supertable {
             for entry in hidden_manifest.superfiles.iter() {
                 targets.push((
                     entry.uri,
+                    entry.storage_path(),
                     entry.subsection_offsets.clone(),
                     std::sync::Arc::clone(&hidden_storage),
                 ));
@@ -1350,7 +1353,7 @@ impl Supertable {
         self.block_on_query(async move {
             let handles: Vec<_> = targets
                 .into_iter()
-                .map(|(uri, offsets, storage)| {
+                .map(|(uri, storage_key, offsets, storage)| {
                     let store = store.clone();
                     let disk_cache = disk_cache.clone();
                     tokio::spawn(async move {
@@ -1359,6 +1362,7 @@ impl Supertable {
                             disk_cache.as_ref(),
                             Some(&storage),
                             &uri,
+                            &storage_key,
                             offsets.as_ref(),
                             true,
                         )
@@ -1392,17 +1396,18 @@ impl Supertable {
         let targets: Vec<_> = hidden_manifest
             .superfiles
             .iter()
-            .map(|e| (e.uri, e.subsection_offsets.clone()))
+            .map(|e| (e.uri, e.storage_path(), e.subsection_offsets.clone()))
             .collect();
         let merged = self
             .block_on_query(async move {
                 let mut by_cell: HashMap<u32, Vec<i128>> = HashMap::new();
-                for (uri, offsets) in targets {
+                for (uri, storage_key, offsets) in targets {
                     let reader = crate::supertable::query::superfile_reader::superfile_reader(
                         &store,
                         disk_cache.as_ref(),
                         Some(&storage),
                         &uri,
+                        &storage_key,
                         offsets.as_ref(),
                         true,
                     )
@@ -2415,6 +2420,7 @@ mod tests {
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),

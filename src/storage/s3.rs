@@ -320,6 +320,98 @@ fn tuned_client_options() -> ClientOptions {
         .with_connect_timeout(S3_CONNECT_TIMEOUT)
 }
 
+/// S3's own codes for a credential that is not valid *now*: it expired, or
+/// it was never one of ours.
+///
+/// S3 reports these as a **400 with the code in an XML body**, not as a 401
+/// or 403, so `object_store` classifies them `Generic` rather than
+/// `PermissionDenied` — and `Generic` is the arm that means "transient, keep
+/// retrying". Left there, an expired credential reads to a caller as a
+/// storage fault that will pass on its own, and the one remedy that would
+/// fix it — minting a fresh credential — is never reached. It does not pass
+/// on its own.
+///
+/// The test for membership here is not "does this code concern credentials"
+/// but "does a fresh credential fix it". All four mean the token or key
+/// identity is dead, and a mint replaces it.
+///
+/// `SignatureDoesNotMatch` is deliberately NOT one of them, though it reads
+/// like it belongs: it means the key exists and the request's signature did
+/// not verify, which is usually clock skew, a region or endpoint mismatch, or
+/// a signing fault — none of them cured by a new credential. On a minted
+/// credential it cannot mean expiry at all, because expiry says
+/// `ExpiredToken`. Classifying it here would turn a configuration fault into
+/// a mint loop: mint, fail, mint, fail, spending STS calls and hiding the
+/// real cause behind credential churn. Retrying is the better failure there.
+const REFUSED_CREDENTIAL_CODES: [&str; 4] = [
+    "ExpiredToken",
+    "TokenRefreshRequired",
+    "InvalidToken",
+    "InvalidAccessKeyId",
+];
+
+/// Opening and closing tags of the `Code` element in S3's XML error body.
+const CODE_OPEN: &str = "<Code>";
+const CODE_CLOSE: &str = "</Code>";
+
+/// Whether a `Generic` error is S3 refusing the credential, read off the
+/// `Code` element of the XML body it answered with.
+///
+/// Read from the rendered message because that is where `object_store`
+/// leaves it: the body is formatted into the error's `source` and the code is
+/// not a field this crate can reach any other way. The element is parsed out
+/// and compared whole rather than searched for as a substring — a request
+/// against an object whose KEY contains `ExpiredToken` renders that name into
+/// the same message, and a substring test would read a throttle on that
+/// object as a dead credential.
+///
+/// A body this cannot parse — no `Code` element, or a credential fault S3
+/// words some other way — is left classified as it is today. That is the safe
+/// direction: a miss costs the retry the caller already gets, while a false
+/// positive would send it to mint a credential it does not need.
+///
+/// The LAST `Code` element is the one read, not the first. `object_store`
+/// renders the failing path ahead of the response body, so anything a caller
+/// controls appears before S3's XML, and S3 escapes the content of its own
+/// `Message`, so it never emits a second literal `Code` after the real one.
+///
+/// That ordering is belt-and-braces rather than the load-bearing guard, and
+/// it is worth being exact about which risk is which. A key cannot forge a
+/// whole `Code` element: the URI is percent-encoded with a set that keeps
+/// only alphanumerics and `-._~/`, so `<` and `>` arrive as `%3C` and `%3E`.
+/// What a key CAN carry is the bare word — `data/ExpiredToken/part-0.parquet`
+/// survives verbatim — which is why the element is parsed at all instead of
+/// searching the message for the code. Reading from the end costs nothing and
+/// keeps the parse correct if that encoding ever loosens.
+///
+/// Read off the rendered string, and only off it, for two reasons that are
+/// properties of `object_store` rather than choices here:
+///
+/// - The body is already flattened into the top level. A failed request
+///   becomes `Generic { source: RetryError }`, and `RetryError`'s `Display`
+///   ends by writing its inner `RequestError`, whose `Status` variant renders
+///   the status and the whole response body. Walking `Error::source` would
+///   reach the same text one level down.
+/// - The typed form is out of reach. `RetryError` carries `status()` and
+///   `body()` as public methods, which would make this exact, but it lives in
+///   a `pub(crate)` module and cannot be named — let alone downcast to — from
+///   outside the crate.
+///
+/// Anchoring on the status text was considered and is a trap: the rendering
+/// is `Server returned non-2xx status code: 400 Bad Request`, so the obvious
+/// `"status 400"` matches nothing and would turn this function into a
+/// constant `false`.
+fn is_refused_credential(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let rendered = source.to_string();
+    let Some((_, rest)) = rendered.rsplit_once(CODE_OPEN) else {
+        return false;
+    };
+    let Some((code, _)) = rest.split_once(CODE_CLOSE) else {
+        return false;
+    };
+    REFUSED_CREDENTIAL_CODES.contains(&code.trim())
+}
+
 /// Translate an `object_store::Error` to our `StorageError`.
 /// Same shape as the LocalFS provider's translate; kept here
 /// rather than shared to keep each backend file self-
@@ -334,6 +426,13 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
         // Refused credentials, kept apart from `Permanent`: the URI is
         // fine and the same call with valid credentials can succeed.
         ObjError::PermissionDenied { .. } | ObjError::Unauthenticated { .. } => {
+            StorageError::PermissionDenied { uri: uri.into() }
+        }
+        // A refused credential arrives here rather than in the arm above,
+        // because S3 answers 400 with the code in the body. It is the same
+        // fault and gets the same classification, so a caller that heals a
+        // refusal by re-minting heals this one too.
+        ObjError::Generic { ref source, .. } if is_refused_credential(source.as_ref()) => {
             StorageError::PermissionDenied { uri: uri.into() }
         }
         ObjError::Generic { source, .. } => StorageError::TransientExhausted {
@@ -689,6 +788,169 @@ mod tests {
             },
         );
         match err {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+    }
+
+    /// The message `object_store` actually renders for a failed S3 request,
+    /// as of 0.13: `RetryError`'s `Display` writes the method, the full URI
+    /// and the elapsed time, then ` - ` and its inner `RequestError`, whose
+    /// `Status` variant is `Server returned non-2xx status code: {status}:
+    /// {body}`.
+    ///
+    /// Written out here because every other case in this test builds a source
+    /// string of its own convenience, and a classifier that only ever sees
+    /// convenient input can pass while doing nothing at all against the real
+    /// thing. Note what it contains: the URI, with the object key, ahead of
+    /// the body — which is why the LAST `Code` element is the one read.
+    fn rendered_s3_failure(key: &str, code: &str) -> String {
+        format!(
+            "Error performing GET https://bucket.s3.us-east-1.amazonaws.com/{key} in 1.204s \
+             - Server returned non-2xx status code: 400 Bad Request: \
+             <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+             <Message>The provided token has expired.</Message>\
+             <RequestId>ABC123</RequestId></Error>"
+        )
+    }
+
+    /// The classifier against the shape `object_store` really produces, not a
+    /// convenient one: a lapsed credential is a refusal, and a throttle on an
+    /// object whose key is spelled like a credential code is not.
+    #[test]
+    fn translate_the_message_object_store_actually_renders() {
+        let refused = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: rendered_s3_failure("data/part-0.parquet", "ExpiredToken").into(),
+            },
+        );
+        match refused {
+            StorageError::PermissionDenied { uri } => assert_eq!(uri, "k"),
+            other => panic!("expected PermissionDenied; got {other:?}"),
+        }
+
+        let throttled_on_a_confusing_key = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: rendered_s3_failure("ExpiredToken/part-0.parquet", "SlowDown").into(),
+            },
+        );
+        match throttled_on_a_confusing_key {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+    }
+
+    /// An expired or unknown credential reaches us as `Generic`, because S3
+    /// answers 400 with the code in an XML body rather than 401 or 403. It is
+    /// the same refusal as the typed variants and is classified the same, so a
+    /// caller that heals a refusal by minting a fresh credential heals this
+    /// one too instead of retrying a fault that will never clear.
+    #[test]
+    fn translate_a_refused_credential_code_to_permission_denied() {
+        let body = |code: &str| {
+            format!(
+                "Error performing GET: status 400 Bad Request: \
+                 <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+                 <Message>The provided token has expired.</Message></Error>"
+            )
+        };
+        for code in REFUSED_CREDENTIAL_CODES {
+            let err = translate(
+                "k",
+                ObjError::Generic {
+                    store: "S3",
+                    source: body(code).into(),
+                },
+            );
+            match err {
+                StorageError::PermissionDenied { uri } => assert_eq!(uri, "k", "{code}"),
+                other => panic!("expected PermissionDenied for {code}; got {other:?}"),
+            }
+        }
+        // A generic fault that names no such code keeps the transient
+        // classification: retrying a throttle or a dropped socket is right,
+        // and only the credential codes are not.
+        let throttled = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "status 503 Slow Down: <Error><Code>SlowDown</Code></Error>".into(),
+            },
+        );
+        match throttled {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+
+        // The code is read out of the `Code` element, not searched for in the
+        // message, so an object whose KEY carries one of these names does not
+        // turn its own throttle into a dead credential. A caller may name a
+        // table anything.
+        let named_like_a_code = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "status 503 Slow Down for /bucket/ExpiredToken/part-0.parquet: \
+                         <Error><Code>SlowDown</Code></Error>"
+                    .into(),
+            },
+        );
+        match named_like_a_code {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => {
+                panic!("expected TransientExhausted for a key named like a code; got {other:?}")
+            }
+        }
+
+        // A key carrying a whole `Code` element of its own does not speak for
+        // the response. This one the encoder already prevents — the URI keeps
+        // only alphanumerics and `-._~/`, so `<` and `>` arrive percent-
+        // encoded — so it is defence in depth against that loosening, not a
+        // shape reachable today. The reachable one is the bare word above.
+        let key_forges_the_element = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "Error performing GET /bucket/<Code>ExpiredToken</Code>/part-0.parquet: \
+                         <Error><Code>SlowDown</Code></Error>"
+                    .into(),
+            },
+        );
+        match key_forges_the_element {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted for a forged element; got {other:?}"),
+        }
+
+        // And the converse still classifies: wrapper text ahead of a real
+        // refusal does not hide it.
+        let wrapped = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "Error performing GET /bucket/data/part-0.parquet: \
+                         <Error><Code>ExpiredToken</Code></Error>"
+                    .into(),
+            },
+        );
+        match wrapped {
+            StorageError::PermissionDenied { uri } => assert_eq!(uri, "k"),
+            other => panic!("expected PermissionDenied; got {other:?}"),
+        }
+
+        // A body with no `Code` element at all is left as it was: a miss
+        // costs the retry the caller already gets.
+        let unparseable = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "error sending request".into(),
+            },
+        );
+        match unparseable {
             StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
             other => panic!("expected TransientExhausted; got {other:?}"),
         }

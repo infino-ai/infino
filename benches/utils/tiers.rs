@@ -785,7 +785,7 @@ pub fn open_superfile_cold_reader(
     let offsets = superfile_cold_size_hint(known_size);
     let reader = block_on(async move {
         cache
-            .reader_with_hints(uri, Some(&offsets), None, true)
+            .reader_with_hints(uri, &uri.storage_path(), Some(&offsets), None, true)
             .await
             .expect("cold reader")
     });
