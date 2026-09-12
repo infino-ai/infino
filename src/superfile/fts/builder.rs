@@ -90,7 +90,6 @@ use memmap2::Mmap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::debug;
 
-use crate::superfile::fts::reader::ColumnLengthStats;
 use crate::superfile::{
     BuildError,
     format::{
@@ -104,6 +103,7 @@ use crate::superfile::{
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
+        reader::ColumnLengthStats,
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
 };

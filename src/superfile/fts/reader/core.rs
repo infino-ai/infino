@@ -34,7 +34,6 @@ use super::{
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
 };
-use crate::superfile::fts::bm25;
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -48,6 +47,7 @@ use crate::superfile::{
     },
     fts::{
         analysis::{Base, chain_tokenizer},
+        bm25,
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::FstValue,

@@ -62,12 +62,12 @@ use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::options::SupertableOptions;
-use crate::superfile::fts::reader::ColumnLengthStats;
 use crate::{
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::VectorConfig,
+        fts::reader::ColumnLengthStats,
         vector::{
             distance::{
                 COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,

@@ -53,13 +53,13 @@ use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
-use crate::superfile::fts::bm25::Bm25Params;
 use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
+            bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
                 PreparedClauses, TermPattern,
