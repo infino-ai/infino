@@ -337,19 +337,34 @@ const REFUSED_CREDENTIAL_CODES: [&str; 4] = [
     "InvalidAccessKeyId",
 ];
 
+/// Opening and closing tags of the `Code` element in S3's XML error body.
+const CODE_OPEN: &str = "<Code>";
+const CODE_CLOSE: &str = "</Code>";
+
 /// Whether a `Generic` error is S3 refusing the credential, read off the
-/// code it puts in the body.
+/// `Code` element of the XML body it answered with.
 ///
-/// Matched on the rendered message because that is where `object_store`
-/// leaves it: the XML body is formatted into the error's `source` and the
-/// code is not a field this crate can reach any other way. A miss leaves the
-/// error classified as it is today; a false positive costs the caller one
-/// pointless credential refresh and the same error again.
+/// Read from the rendered message because that is where `object_store`
+/// leaves it: the body is formatted into the error's `source` and the code is
+/// not a field this crate can reach any other way. The element is parsed out
+/// and compared whole rather than searched for as a substring — a request
+/// against an object whose KEY contains `ExpiredToken` renders that name into
+/// the same message, and a substring test would read a throttle on that
+/// object as a dead credential.
+///
+/// A body this cannot parse — no `Code` element, or a credential fault S3
+/// words some other way — is left classified as it is today. That is the safe
+/// direction: a miss costs the retry the caller already gets, while a false
+/// positive would send it to mint a credential it does not need.
 fn is_refused_credential(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     let rendered = source.to_string();
-    REFUSED_CREDENTIAL_CODES
-        .iter()
-        .any(|code| rendered.contains(code))
+    let Some((_, rest)) = rendered.split_once(CODE_OPEN) else {
+        return false;
+    };
+    let Some((code, _)) = rest.split_once(CODE_CLOSE) else {
+        return false;
+    };
+    REFUSED_CREDENTIAL_CODES.contains(&code.trim())
 }
 
 /// Translate an `object_store::Error` to our `StorageError`.
@@ -771,6 +786,40 @@ mod tests {
             },
         );
         match throttled {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => panic!("expected TransientExhausted; got {other:?}"),
+        }
+
+        // The code is read out of the `Code` element, not searched for in the
+        // message, so an object whose KEY carries one of these names does not
+        // turn its own throttle into a dead credential. A caller may name a
+        // table anything.
+        let named_like_a_code = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "status 503 Slow Down for /bucket/ExpiredToken/part-0.parquet: \
+                         <Error><Code>SlowDown</Code></Error>"
+                    .into(),
+            },
+        );
+        match named_like_a_code {
+            StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
+            other => {
+                panic!("expected TransientExhausted for a key named like a code; got {other:?}")
+            }
+        }
+
+        // A body with no `Code` element at all is left as it was: a miss
+        // costs the retry the caller already gets.
+        let unparseable = translate(
+            "k",
+            ObjError::Generic {
+                store: "S3",
+                source: "error sending request".into(),
+            },
+        );
+        match unparseable {
             StorageError::TransientExhausted { uri, .. } => assert_eq!(uri, "k"),
             other => panic!("expected TransientExhausted; got {other:?}"),
         }
