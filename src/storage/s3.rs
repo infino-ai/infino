@@ -372,10 +372,17 @@ const CODE_CLOSE: &str = "</Code>";
 ///
 /// The LAST `Code` element is the one read, not the first. `object_store`
 /// renders the failing path ahead of the response body, so anything a caller
-/// controls — an object key — appears before S3's XML, and S3 escapes the
-/// content of its own `Message`, so it never emits a second literal `Code`
-/// after the real one. Reading forwards would let a key holding
-/// `<Code>ExpiredToken</Code>` speak for the response.
+/// controls appears before S3's XML, and S3 escapes the content of its own
+/// `Message`, so it never emits a second literal `Code` after the real one.
+///
+/// That ordering is belt-and-braces rather than the load-bearing guard, and
+/// it is worth being exact about which risk is which. A key cannot forge a
+/// whole `Code` element: the URI is percent-encoded with a set that keeps
+/// only alphanumerics and `-._~/`, so `<` and `>` arrive as `%3C` and `%3E`.
+/// What a key CAN carry is the bare word — `data/ExpiredToken/part-0.parquet`
+/// survives verbatim — which is why the element is parsed at all instead of
+/// searching the message for the code. Reading from the end costs nothing and
+/// keeps the parse correct if that encoding ever loosens.
 ///
 /// Read off the rendered string, and only off it, for two reasons that are
 /// properties of `object_store` rather than choices here:
@@ -899,9 +906,11 @@ mod tests {
             }
         }
 
-        // The path is rendered ahead of the response body, so a key carrying
-        // a whole `Code` element of its own does not get to speak for the
-        // response: the LAST element is the one S3 sent.
+        // A key carrying a whole `Code` element of its own does not speak for
+        // the response. This one the encoder already prevents — the URI keeps
+        // only alphanumerics and `-._~/`, so `<` and `>` arrive percent-
+        // encoded — so it is defence in depth against that loosening, not a
+        // shape reachable today. The reachable one is the bare word above.
         let key_forges_the_element = translate(
             "k",
             ObjError::Generic {
