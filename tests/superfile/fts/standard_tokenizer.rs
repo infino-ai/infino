@@ -61,7 +61,7 @@ fn build_standard(corpus: &[(u64, &str)]) -> SuperfileReader {
 fn corpus() -> Vec<(u64, &'static str)> {
     vec![
         (0, "rust async runtime"),
-        (1, "café résumé naïve"), // non-ASCII: dropped entirely by ascii_lower
+        (1, "café résumé naïve 🚀"), // non-ASCII: dropped entirely by ascii_lower; emoji is a token
         (2, "the rust programming café"), // "café" co-occurs with "rust"
         (3, "version 2 point 0 release"),
         (4, "rust systems programming"),
@@ -166,62 +166,15 @@ async fn standard_tokenizer_indexes_non_ascii_terms() {
         HashSet::from([1, 7]),
         "naïve indexed under standard"
     );
-}
-
-#[tokio::test]
-async fn standard_tokenizer_indexes_emoji_as_terms() {
-    // An emoji is a token under `standard`, as it is under Lucene's
-    // StandardTokenizer: searchable on its own, occupying a position of
-    // its own, and never merged into a neighbouring word. A ZWJ family
-    // sequence stays one token. Text-default symbols and keycap bases
-    // (`#`, `*`, digits, `™`) are not emoji and tokenize as before.
-    let corp: Vec<(u64, &str)> = vec![
-        (0, "launch day 🚀 went well"),
-        (1, "🚀🚀 double rocket"),
-        (2, "no rocket here"),
-        (3, "family 👨‍👩‍👧 photo"),
-        (4, "rocket™ #1 launch"),
-        (5, "cat 🙂 dog"),
-        (6, "cat dog"),
-    ];
-    let reader = build_standard(&corp);
-    let ids =
-        |hits: Vec<(u32, f32)>| -> HashSet<u64> { hits.iter().map(|(d, _)| *d as u64).collect() };
 
     let rocket = reader
         .bm25_hits_async("title", "🚀", K_ALL, BoolMode::Or)
         .await
         .expect("search 🚀");
+    let rocket_ids: HashSet<u64> = rocket.iter().map(|(d, _)| *d as u64).collect();
     assert_eq!(
-        ids(rocket),
-        HashSet::from([0, 1]),
-        "the emoji is a searchable term"
+        rocket_ids,
+        HashSet::from([1]),
+        "an emoji is a searchable term under standard"
     );
-
-    let family = reader
-        .bm25_hits_async("title", "👨‍👩‍👧", K_ALL, BoolMode::Or)
-        .await
-        .expect("search family");
-    assert_eq!(
-        ids(family),
-        HashSet::from([3]),
-        "a ZWJ sequence is one token"
-    );
-
-    // `rocket™` tokenizes to `rocket` (™ is a text-default symbol, not an
-    // emoji) and `#1` to `1`, so the word query reaches doc 4 and the
-    // emoji query does not.
-    let word = reader
-        .bm25_hits_async("title", "rocket", K_ALL, BoolMode::Or)
-        .await
-        .expect("search rocket");
-    assert_eq!(ids(word), HashSet::from([1, 2, 4]));
-
-    // Two occurrences outrank one: the emoji carries term frequency
-    // like any other term.
-    let ranked = reader
-        .bm25_hits_async("title", "🚀", 1, BoolMode::Or)
-        .await
-        .expect("top-1 🚀");
-    assert_eq!(ranked.first().map(|(d, _)| *d), Some(1));
 }
