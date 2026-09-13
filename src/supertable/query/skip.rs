@@ -401,6 +401,7 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::reader::ColumnLengthStats,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -483,7 +484,12 @@ mod tests {
             (Some(min), Some(max)) => (min.as_bytes().to_vec(), max.as_bytes().to_vec()),
             _ => (Vec::new(), Vec::new()),
         };
-        let summary = FtsSummaryAgg::new_with_params(bb.finish(), terms.len() as u32, term_range);
+        let summary = FtsSummaryAgg::new_with_params(
+            bb.finish(),
+            terms.len() as u32,
+            term_range,
+            ColumnLengthStats::default(),
+        );
         (column.to_string(), summary)
     }
 

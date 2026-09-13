@@ -39,9 +39,11 @@ pub enum Bm25Stats {
     /// superfiles in the query's manifest snapshot. A term then has one
     /// idf for the whole table, so a fragmented table ranks like a
     /// single unified corpus, at the cost of a document-frequency
-    /// gather before scoring. (Length normalization still uses each
-    /// superfile's own average document length.) The default: ranking
-    /// should not depend on how commits happened to shard the corpus.
+    /// gather before scoring. Length normalization needs no gather:
+    /// every superfile is written at the table-wide average document
+    /// length as of its commit and scored at the average it declares.
+    /// The default: ranking should not depend on how commits happened
+    /// to shard the corpus.
     #[default]
     Global,
 }

@@ -559,6 +559,12 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
+        // The merged file replaces its inputs, so it bakes the table-wide
+        // average document length over everything else in the table plus
+        // its own documents — the same statistic a fresh append bakes, and
+        // what lets a compacted table score like an unfragmented one.
+        let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
+        let fts_corpus = manifest.fts_corpus_stats(&replaced);
         let (merged_bytes, superfile_stats): (Bytes, _) = {
             let first_vec = readers_with_tombstones
                 .first()
@@ -583,11 +589,13 @@ impl Supertable {
                     SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
                         &readers_with_tombstones,
                         &superseded_per_reader,
+                        &fts_corpus,
                         &mut writer,
                     )?
                 } else if sq8_merge == Some(true) {
                     SuperfileBuilder::build_from_sq8_ivf_readers_to(
                         &readers_with_tombstones,
+                        &fts_corpus,
                         &mut writer,
                     )?
                 } else if first_vec.is_none() {
@@ -596,13 +604,18 @@ impl Supertable {
                     // re-tokenizing the whole corpus.
                     SuperfileBuilder::build_from_readers_fts_merge_to(
                         &readers_with_tombstones,
+                        &fts_corpus,
                         &mut writer,
                     )?
                 } else {
                     // A vector index is present but not IVF-mergeable (e.g. an
                     // fp32 rerank codec); the re-index path re-encodes both the
                     // FTS and the vectors from the decoded rows.
-                    SuperfileBuilder::build_from_readers_to(&readers_with_tombstones, &mut writer)?
+                    SuperfileBuilder::build_from_readers_to(
+                        &readers_with_tombstones,
+                        &fts_corpus,
+                        &mut writer,
+                    )?
                 };
                 writer
                     .flush()
@@ -1792,6 +1805,72 @@ mod tests {
     /// `token_match` (unranked) can't see this — it only checks presence — so
     /// this exercises the ranked path through the actual `merge_superfiles`
     /// dispatch + streamed temp-file output, complementing the builder oracle.
+    /// A merged superfile replaces its inputs, so it bakes the table-wide
+    /// average over everything that remains beside it plus itself — not
+    /// its inputs' own average — and carries its own totals for the next
+    /// fold. Here commit A (5 + 1 tokens), B (2 tokens), C (10 tokens) are
+    /// four documents; merging A and B must declare (6 + 2 + 10) / 4.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_bakes_the_table_wide_average() {
+        use crate::superfile::fts::{bm25, reader::ColumnLengthStats};
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+        for titles in [
+            &["cat bird elephant giraffe hippo", "dog"][..],
+            &["cat dog"][..],
+            &["one two three four five six seven eight nine ten"][..],
+        ] {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(titles)).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader().expect("reader");
+        let mut superfiles: Vec<Arc<SuperfileEntry>> =
+            reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(superfiles.len(), 3, "three ingest superfiles");
+        superfiles.sort_by_key(|sf| sf.id_min);
+        let inputs = &superfiles[..2];
+
+        let merged = st
+            .merge_superfiles(inputs)
+            .await
+            .expect("merge_superfiles should succeed");
+        let merged_reader = merged
+            .open_reader()
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
+        let fts = merged_reader.fts().expect("fts index");
+        assert_eq!(
+            fts.column_length_stats("title"),
+            Some(ColumnLengthStats {
+                total_tokens: 8,
+                n_scored_docs: 3,
+            }),
+            "the merged file's own totals"
+        );
+        let declared = fts
+            .fts_columns_config()
+            .next()
+            .expect("title column")
+            .avgdl();
+        assert_eq!(
+            declared,
+            bm25::stored_avgdl((6.0 + 2.0 + 10.0) / 4.0),
+            "declared average spans the remaining superfile too, not just the inputs"
+        );
+        assert_ne!(
+            declared,
+            bm25::stored_avgdl(8.0 / 3.0),
+            "not the inputs' own average"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn merge_superfiles_preserves_bm25_length_normalization() {
         let dir = TempDir::new().expect("tempdir");

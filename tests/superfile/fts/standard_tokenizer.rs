@@ -61,7 +61,7 @@ fn build_standard(corpus: &[(u64, &str)]) -> SuperfileReader {
 fn corpus() -> Vec<(u64, &'static str)> {
     vec![
         (0, "rust async runtime"),
-        (1, "café résumé naïve"), // non-ASCII: dropped entirely by ascii_lower
+        (1, "café résumé naïve 🚀"), // non-ASCII: dropped entirely by ascii_lower; emoji is a token
         (2, "the rust programming café"), // "café" co-occurs with "rust"
         (3, "version 2 point 0 release"),
         (4, "rust systems programming"),
@@ -165,5 +165,16 @@ async fn standard_tokenizer_indexes_non_ascii_terms() {
         naive_ids,
         HashSet::from([1, 7]),
         "naïve indexed under standard"
+    );
+
+    let rocket = reader
+        .bm25_hits_async("title", "🚀", K_ALL, BoolMode::Or)
+        .await
+        .expect("search 🚀");
+    let rocket_ids: HashSet<u64> = rocket.iter().map(|(d, _)| *d as u64).collect();
+    assert_eq!(
+        rocket_ids,
+        HashSet::from([1]),
+        "an emoji is a searchable term under standard"
     );
 }

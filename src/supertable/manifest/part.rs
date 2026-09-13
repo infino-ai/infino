@@ -853,6 +853,8 @@ mod tests {
     //! surfaces a typed error.
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::superfile::fts::reader::ColumnLengthStats;
+
     /// `from_hex` is the exact inverse of `to_hex` — the recovery path a
     /// content-addressed cache file name round-trips through — and
     /// rejects wrong lengths and non-hex input. Debug elides to the
@@ -930,7 +932,12 @@ mod tests {
             let key = format!("term_{}_{i}", seed);
             builder.insert(key.as_bytes());
         }
-        FtsSummaryAgg::new_with_params(builder.finish(), n_terms, range)
+        FtsSummaryAgg::new_with_params(
+            builder.finish(),
+            n_terms,
+            range,
+            ColumnLengthStats::default(),
+        )
     }
 
     fn make_vector_summary(dim: usize, seed: f32) -> VectorSummary {

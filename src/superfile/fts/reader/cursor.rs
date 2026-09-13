@@ -10,7 +10,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::core::{read_u32_le, read_u64_le};
+use super::{
+    bounds::{BoundDecoder, StoredBound},
+    core::{read_u32_le, read_u64_le},
+    metadata::ColumnMeta,
+};
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -62,14 +66,15 @@ pub(super) struct TermMeta {
     pub(super) subindex_start: Option<usize>,
     /// Absolute offset (within the postings region) of the coarse
     /// block-max table — `ceil(num_blocks / COARSE_BLOCK_MAX_SPAN)`
-    /// fixed-point `u32`s at the tail of the term region.
+    /// 4-byte slots at the tail of the term region.
     pub(super) coarse_start: usize,
     /// Term-relative end of the last posting block: `postings_length`
     /// minus the coarse table's bytes. The blocks end here; the coarse
     /// table follows.
     pub(super) blocks_end_in_term: usize,
-    /// Whether this term carries a coarse block-max table (V5 blobs).
-    /// `false` for V1–V4 — the ranked walk then skips the coarse level.
+    /// Whether this term carries a coarse block-max table (V5 and
+    /// later). `false` for V1–V4 — the ranked walk then skips the coarse
+    /// level.
     pub(super) has_coarse: bool,
 }
 
@@ -158,10 +163,10 @@ impl TermMeta {
             }
             false => None,
         };
-        // Coarse block-max table (V5 only): `ceil(num_blocks / span)` u32s at
-        // the tail of the term region, so the blocks end where it begins.
-        // V1–V4 blobs have no such table — the blocks run to `postings_length`
-        // and the ranked walk skips the coarse level.
+        // Coarse block-max table (V5 and later): `ceil(num_blocks / span)`
+        // slots at the tail of the term region, so the blocks end where it
+        // begins. V1–V4 blobs have no such table — the blocks run to
+        // `postings_length` and the ranked walk skips the coarse level.
         let coarse_size = match has_coarse {
             true => num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * U32_BYTES,
             false => 0,
@@ -186,35 +191,13 @@ impl TermMeta {
         })
     }
 
-    /// Decode a 4-byte block-max slot (a per-block skip entry's field or a
-    /// coarse-table entry) into a guaranteed upper bound on the BM25 score.
-    /// V5 stores the exact `f32` bits; legacy `V1`-`V4` store
-    /// `ceil(max × scale)` as fixed-point. Both return a value at or above
-    /// the true max:
-    /// - V5 nudges the exact stored max up one `f32` ULP. The stored value
-    ///   equals the reader's per-doc score for the block's max doc, so for
-    ///   local scoring it is already an exact bound; the ULP guards the
-    ///   cross-superfile idf-rescale multiply, whose f32 rounding could
-    ///   otherwise dip a hair below a score-tied doc and drop tied hits.
-    /// - Legacy adds one fixed-point step, covering both the `x1000 / scale`
-    ///   division rounding and files written before the encode-side `ceil`.
+    /// Raw coarse slot `g`, bounding every block in span `g` (blocks
+    /// `[g*SPAN .. (g+1)*SPAN)`) once a [`super::bounds::BoundDecoder`]
+    /// has interpreted it. Coarse entries exist only where `has_coarse`.
     #[inline]
-    fn decode_block_max(&self, raw: u32) -> f32 {
-        if self.has_coarse {
-            f32::from_bits(raw).next_up()
-        } else {
-            raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
-        }
-    }
-
-    /// Decode coarse block-max entry `g` into a guaranteed upper bound
-    /// on the BM25 score of every block in span `g` (blocks
-    /// `[g*SPAN .. (g+1)*SPAN)`). Coarse entries exist only on V5, where
-    /// they are `f32` bits.
-    #[inline]
-    pub(super) fn coarse_entry(&self, postings: &[u8], g: usize) -> f32 {
+    pub(super) fn coarse_slot(&self, postings: &[u8], g: usize) -> u32 {
         let at = self.coarse_start + g * U32_BYTES;
-        self.decode_block_max(read_u32_le(&postings[at..at + U32_BYTES]))
+        read_u32_le(&postings[at..at + U32_BYTES])
     }
 
     /// For a `VERSION_V3` positional term, the run offset of the nearest
@@ -240,15 +223,15 @@ impl TermMeta {
         Some((checkpoint, runs_to_skip))
     }
 
-    /// Decode skip-table entry `i` into `(last_doc_id,
-    /// block_offset_in_term, block_max_bm25)`. `block_offset_in_term`
-    /// is relative to the term's `metadata_offset`; `block_max_bm25`
-    /// is recovered from the fixed-point `max_bm25_x1000` field. The
-    /// reserved field (entry bytes 12..16) is ignored. Per-entry on
-    /// purpose — the single-term BMW walk streams entries without
-    /// materializing a `Vec`.
+    /// Skip-table entry `i` as `(last_doc_id, block_offset_in_term,
+    /// raw bound slot)`. `block_offset_in_term` is relative to the
+    /// term's `metadata_offset`; the slot is what a
+    /// [`super::bounds::BoundDecoder`] turns into the block's upper
+    /// bound. The positions field (entry bytes 12..16) is read
+    /// separately. Per-entry on purpose — the single-term BMW walk
+    /// streams entries without materializing a `Vec`.
     #[inline]
-    pub(super) fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, f32) {
+    pub(super) fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, u32) {
         debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
         let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
         let last_doc_id = read_u32_le(
@@ -259,21 +242,11 @@ impl TermMeta {
             &postings[entry_off + skip_entry::BLOCK_OFFSET_OFF
                 ..entry_off + skip_entry::BLOCK_OFFSET_OFF + U32_BYTES],
         ) as usize;
-        let block_max_raw = read_u32_le(
+        let bound_slot = read_u32_le(
             &postings[entry_off + skip_entry::MAX_BM25_OFF
                 ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
         );
-        // Decode to a guaranteed upper bound on the block's BM25 (V5 exact
-        // f32 + one ULP; legacy fixed-point + one step). The upper-bound
-        // guarantee matters for the cross-superfile floor: block-skip
-        // compares `block_max <= floor`, and a bound that dips below a
-        // score-tied block's true max would let a rising floor skip it,
-        // dropping tied hits by completion order (nondeterministic top-k).
-        (
-            last_doc_id,
-            block_offset,
-            self.decode_block_max(block_max_raw),
-        )
+        (last_doc_id, block_offset, bound_slot)
     }
 
     /// This block's position-run byte offset within the term's
@@ -338,17 +311,15 @@ pub(super) struct BlockMeta {
 /// iteration.
 #[derive(Clone)]
 pub(crate) struct TermCursor {
-    /// Precomputed `idf * (k1 + 1)` — the score numerator's
-    /// per-cursor constant, built from the parameters this query is
-    /// scoring with. Computed once at cursor build so the hot inner
-    /// loop fits one multiply + add + divide per call.
-    pub(super) idf_x_k1p1: f32,
-    /// The bare effective idf (global override and repeated-term
-    /// `weight` already folded in). Kept alongside `idf_x_k1p1` because
-    /// a phrase cursor composes its members' idfs, and recovering one
-    /// by dividing by `(k1 + 1)` would silently use the wrong `k1` the
-    /// moment a column declares a non-standard pair.
-    pub(super) idf: f32,
+    /// The effective inverse document frequency this cursor scores
+    /// with: the table-wide value when the query uses table-wide
+    /// statistics, otherwise this superfile's own, with a repeated
+    /// term's query-side frequency already folded in.
+    ///
+    /// It is the whole per-cursor constant of the score numerator —
+    /// there is no separate `(k1 + 1)` factor to carry — so the hot
+    /// inner loop is one multiply, one add and one divide.
+    pub(super) idf_weight: f32,
     /// Maximum block-max-BM25 across all blocks. Used by the WAND
     /// pivot test (term-level upper bound).
     pub(super) term_max_bm25: f32,
@@ -428,56 +399,34 @@ impl TermCursor {
     /// [`FtsReader::fetch_term_postings`] fetched for this term.
     pub(super) fn new(
         term_bytes: Bytes,
-        n_docs: u64,
-        positional: bool,
+        col: &ColumnMeta,
+        stored: StoredBound,
         global_idf: Option<f32>,
         weight: u32,
         header_probed: bool,
         count_only: bool,
-        has_coarse: bool,
-        params: bm25::Bm25Params,
-        bound_scale: f32,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
         // The plain-term cursor never decodes positions, so it needs no
         // sub-index (it reads block offsets straight from the skip table).
-        // `has_coarse` (V5) tells it the last block ends before the coarse
+        // `has_coarse` tells it the last block ends before the coarse
         // table, not at `postings_length`.
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false, has_coarse)?;
-        let local_idf = bm25::idf(n_docs, term_meta.df);
-        // Effective idf folds in the query-term-frequency `weight` (> 1 only for a
-        // deduplicated repeated term) on top of any global-idf override.
+        let term_meta = TermMeta::parse(
+            postings,
+            metadata_offset,
+            col.positions,
+            false,
+            stored.has_coarse(),
+        )?;
+        let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);
+        // Effective idf folds in the query-term-frequency `weight` (> 1
+        // only for a deduplicated repeated term) on top of any global-idf
+        // override. Every stored bound is decoded at this idf too, so the
+        // bounds stay consistent with the scores computed from it.
         let idf = global_idf.unwrap_or(local_idf) * weight as f32;
-        // Stored per-block BMW upper bounds bake in the LOCAL idf, so any factor
-        // that scales the score away from it — a global-idf override and/or a qtf
-        // `weight` — must rescale them by the same ratio: block_max =
-        // local_idf_x_k1p1 × (an idf-independent tf-factor), so the linear rescale
-        // is exact and keeps the BMW skip UBs consistent with the scores computed
-        // from `idf_x_k1p1` below. When `idf == local_idf` (the default
-        // per-superfile path with weight 1) the ratio is 1 and the block loop does
-        // no extra work, matching the per-superfile scorer exactly.
-        // Two independent reasons a stored bound needs scaling, and both
-        // are linear multipliers on it, so they compose into one:
-        //
-        //   idf / local_idf — the bounds bake in this superfile's own
-        //     idf; a global-statistics override or a repeated-term
-        //     `weight` scales the score away from it. Exact, since the
-        //     score is linear in idf.
-        //   bound_scale — the bounds were baked at the column's declared
-        //     BM25 pair; a query scoring at another needs them inflated
-        //     by the supremum of the ratio between the two. Loosening
-        //     rather than exact, because k1/b do not enter linearly.
-        //
-        // Both are 1.0 on the default path (per-superfile stats, weight
-        // 1, no parameter override), and the block loop then does no
-        // extra work at all.
-        let idf_ratio = (local_idf > 0.0 && idf != local_idf).then(|| idf / local_idf);
-        let idf_rescale = match (idf_ratio, bound_scale != 1.0) {
-            (None, false) => None,
-            (ratio, _) => Some(ratio.unwrap_or(1.0) * bound_scale),
-        };
+        let bounds = BoundDecoder::new(stored, col, idf, local_idf);
 
         // Collect straight into the `Arc` allocation: `0..num_blocks` is
         // an exact-size iterator, so this writes each entry in place —
@@ -488,12 +437,8 @@ impl TermCursor {
         let mut term_max_bm25: f32 = 0.0;
         let blocks: Arc<[BlockMeta]> = (0..term_meta.num_blocks)
             .map(|i| {
-                let (last_doc_id, block_offset_in_term, raw_block_max) =
-                    term_meta.skip_entry(postings, i);
-                let block_max_bm25 = match idf_rescale {
-                    Some(ratio) => raw_block_max * ratio,
-                    None => raw_block_max,
-                };
+                let (last_doc_id, block_offset_in_term, raw) = term_meta.skip_entry(postings, i);
+                let block_max_bm25 = bounds.bound(raw);
                 term_max_bm25 = term_max_bm25.max(block_max_bm25);
 
                 BlockMeta {
@@ -506,8 +451,7 @@ impl TermCursor {
             .collect();
 
         let mut cursor = Self {
-            idf_x_k1p1: params.idf_x_k1p1(idf),
-            idf,
+            idf_weight: idf,
             term_max_bm25,
             df: term_meta.df,
             blocks,
@@ -539,17 +483,15 @@ impl TermCursor {
     pub(super) fn new_inline(
         doc_id: u32,
         tf: u32,
-        n_docs: u64,
+        n_scored_docs: u64,
         dl_norm_k1: f32,
         global_idf: Option<f32>,
         weight: u32,
-        params: bm25::Bm25Params,
     ) -> Self {
         // Fold the qtf `weight` into the effective idf so the single-doc block-max
-        // (computed below from `idf_x_k1p1`) scales together with the score.
-        let idf = global_idf.unwrap_or_else(|| bm25::idf(n_docs, 1)) * weight as f32;
-        let idf_x_k1p1 = params.idf_x_k1p1(idf);
-        let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+        // (computed below from `idf_weight`) scales together with the score.
+        let idf_weight = global_idf.unwrap_or_else(|| bm25::idf(n_scored_docs, 1)) * weight as f32;
+        let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
 
         let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
             last_doc_id: doc_id,
@@ -567,8 +509,7 @@ impl TermCursor {
         block_tfs[0] = tf;
 
         Self {
-            idf_x_k1p1,
-            idf,
+            idf_weight,
             term_max_bm25: block_max_bm25,
             df: 1,
             blocks,
@@ -1086,6 +1027,8 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rand_distr::{Distribution, LogNormal};
 
     use crate::superfile::fts::{
         bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
@@ -1106,6 +1049,129 @@ mod tests {
     /// Without the length-consistent block bound the assertion fires on the
     /// highest-tf doc in each block; a small-doc corpus (every length in the
     /// exact-quantization region) never exercises it.
+    /// A corpus shaped like real text: log-normal lengths (median 89
+    /// tokens, a long tail) and one common term drawn per token with the
+    /// probability of a Zipf rank-1 word, so its frequency grows with the
+    /// document and every block holds documents scoring within a hair of
+    /// each other — the shape block-max pruning is most sensitive to.
+    fn realistic_reader(n_docs: u32) -> FtsReader {
+        let mut rng = StdRng::seed_from_u64(114);
+        let lengths = LogNormal::new(4.4886, 1.55).expect("log-normal params");
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        let mut text = String::new();
+        for doc_id in 0..n_docs {
+            let len = (lengths.sample(&mut rng) as usize).clamp(1, 3000);
+            text.clear();
+            for _ in 0..len {
+                if rng.random_bool(0.069) {
+                    text.push_str("common ");
+                } else {
+                    text.push_str(&format!("f{} ", rng.random_range(0..5000u32)));
+                }
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// Per block of `common`: the bound its cursor decoded and the exact
+    /// maximum score under `view`'s statistics, in block order.
+    async fn block_bounds_and_maxima(view: &FtsReader) -> Vec<(f32, f32)> {
+        let col = &view.columns[0];
+        let mut cursors = view
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let cursor = cursors.first_mut().expect("term present");
+        let idf = cursor.idf_weight;
+        let blocks: Vec<(u32, f32)> = cursor
+            .blocks
+            .iter()
+            .map(|b| (b.last_doc_id, b.block_max_bm25))
+            .collect();
+        let mut exact = vec![0.0f32; blocks.len()];
+        let mut blk = 0usize;
+        while !cursor.is_exhausted() {
+            let doc = cursor.current_doc_id();
+            while blk + 1 < blocks.len() && doc > blocks[blk].0 {
+                blk += 1;
+            }
+            let score =
+                bm25::score_with_dl_norm_k1(idf, cursor.current_tf(), col.dl_norm_k1.get(doc));
+            exact[blk] = exact[blk].max(score);
+            cursor.next();
+        }
+        blocks.iter().map(|b| b.1).zip(exact).collect()
+    }
+
+    /// At the statistics the file declares, every stored bound is the
+    /// block's maximum to the last bit (plus the one-ULP guard), and a
+    /// `k1`/`b` override — the only remaining reason a bound is scored
+    /// away from what it was baked at — leaves it sound. Exactness on the
+    /// default path is what keeps pruning intact: a common term's block
+    /// maxima sit so close together that even a percent of looseness
+    /// admits most of the blocks a tight bound would skip.
+    #[tokio::test]
+    async fn bounds_are_exact_at_the_declared_statistics_and_sound_under_an_override() {
+        let reader = realistic_reader(6_000);
+        assert_eq!(reader.columns[0].bound_scale, 1.0);
+        let baked = block_bounds_and_maxima(&reader).await;
+        assert!(baked.len() > 30, "need a long posting list to say anything");
+        for (i, &(bound, max)) in baked.iter().enumerate() {
+            assert!(
+                bound == max.next_up(),
+                "block {i}: bound {bound} is not the exact maximum {max} plus one ULP"
+            );
+        }
+
+        let view = reader.with_bm25_override(bm25::Bm25Params::new(0.9, 0.4));
+        assert!(
+            view.columns[0].bound_scale > 1.0,
+            "an override owes an inflation factor"
+        );
+        let overridden = block_bounds_and_maxima(&view).await;
+        for (i, &(bound, max)) in overridden.iter().enumerate() {
+            assert!(
+                bound >= max,
+                "override block {i}: bound {bound} below max {max}"
+            );
+        }
+    }
+
+    /// The declared average is a rounded fixed-point value. Bounds are
+    /// baked at exactly that value and the norm table is built from it,
+    /// so an average the fixed point cannot represent exactly still
+    /// leaves every bound one ULP above its block's maximum.
+    #[tokio::test]
+    async fn bounds_stay_exact_when_the_average_is_not_exactly_representable() {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        // 501 tokens over 500 documents: an average of 1.002.
+        for doc in 0..500u32 {
+            let text = if doc == 250 {
+                "common common"
+            } else {
+                "common"
+            };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(reader.columns[0].avgdl(), bm25::stored_avgdl(1.002));
+        for (i, (bound, max)) in block_bounds_and_maxima(&reader)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                bound == max.next_up(),
+                "block {i}: bound {bound} vs max {max}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn block_max_bounds_query_time_score() {
         // A length that truncates under the one-byte length quantizer:
@@ -1171,7 +1237,7 @@ mod tests {
             let doc = cursor.current_doc_id();
             let tf = cursor.current_tf();
             let query_score =
-                bm25::score_with_dl_norm_k1(cursor.idf_x_k1p1, tf, col_meta.dl_norm_k1.get(doc));
+                bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, col_meta.dl_norm_k1.get(doc));
             let block_max = cursor.current_block_max_bm25();
             assert!(
                 block_max >= query_score,

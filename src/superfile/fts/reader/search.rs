@@ -13,6 +13,7 @@ use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
 use super::{
+    bounds::BoundDecoder,
     core::*,
     cursor::{TermCursor, TermMeta},
     filter::{AtomExcludeFilter, ExcludeFilter},
@@ -592,7 +593,7 @@ impl FtsReader {
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
         // repeat count becomes a query-term-frequency multiplier on the term's
-        // idf. BM25 is linear in `idf_x_k1p1`, so this scores identically to N
+        // idf. BM25 is linear in `idf_weight`, so this scores identically to N
         // duplicate cursors at 1/N the cursor + scan cost — e.g. `+to +be +or
         // +not +to +be` builds 4 cursors, not 6. A no-op for distinct-term
         // queries. The single-term fast path below gates on the pre-dedup count,
@@ -1030,8 +1031,8 @@ impl FtsReader {
                     true => 1,
                     false => tf,
                 };
-                let idf_t = global_idf.unwrap_or_else(|| bm25::idf(self.n_docs as u64, 1));
-                let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
+                let idf_t = global_idf.unwrap_or_else(|| bm25::idf(col_meta.scored_doc_count(), 1));
+                let idf_weight = idf_t;
                 // Drop the lone match if a negated term excludes it.
                 // The inline slot read no postings-region bytes; the
                 // work-stats byte count for this path is genuinely zero.
@@ -1041,7 +1042,7 @@ impl FtsReader {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
                 let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+                let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
@@ -1065,30 +1066,16 @@ impl FtsReader {
             metadata_offset,
             col_meta.positions,
             false,
-            self.has_coarse_block_max,
+            self.bounds.has_coarse(),
         )?;
 
-        let local_idf = bm25::idf(self.n_docs as u64, term_meta.df);
+        let local_idf = bm25::idf(col_meta.scored_doc_count(), term_meta.df);
         let idf_t = global_idf.unwrap_or(local_idf);
-        let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
-        // Stored block-max and coarse entries bake in the LOCAL idf. Scores
-        // below use the (possibly overridden) effective idf, and the score
-        // is linear in idf, so rescaling every stored bound by the ratio
-        // keeps bounds exactly as tight as the per-superfile path — the
-        // same exact rescale `TermCursor::new` applies (see cursor.rs).
-        let bound_rescale = match local_idf > 0.0 && idf_t != local_idf {
-            true => idf_t / local_idf,
-            false => 1.0,
-        }
-        // And the same again for a parameter override: the stored bounds
-        // were baked at the column's declared pair, so scoring at
-        // another needs them inflated by the supremum of the ratio
-        // between the two. Both factors are linear multipliers on a
-        // stored bound, so they compose; both are 1.0 on the default
-        // path. See `ColumnMeta::bound_scale` and `TermCursor::new`,
-        // which does the identical composition for the multi-term
-        // kernels.
-        * col_meta.bound_scale;
+        let idf_weight = idf_t;
+        // Every stored bound — per block and per span — is decoded at the
+        // same idf and statistics the scores below use, so the skip tests
+        // compare like with like. See `BoundDecoder`.
+        let bounds = BoundDecoder::new(self.bounds, col_meta, idf_t, local_idf);
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
@@ -1103,7 +1090,7 @@ impl FtsReader {
         let mut buf_t = [0u32; BLOCK_LEN];
 
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
-        // The coarse block-max table exists only on V5 blobs; on V1–V4 the
+        // The coarse block-max table exists from V5 on; on V1–V4 the
         // walk falls back to the flat per-block skip (and no seed).
         let coarse_enabled = term_meta.has_coarse;
 
@@ -1136,7 +1123,7 @@ impl FtsReader {
             // Gather enough top spans to contain the top `m_want` blocks
             // (over-cover: worst case each is in its own span).
             let mut spans: Vec<(f32, usize)> = (0..num_coarse)
-                .map(|g| (term_meta.coarse_entry(postings, g) * bound_rescale, g))
+                .map(|g| (bounds.bound(term_meta.coarse_slot(postings, g)), g))
                 .collect();
             let s = m_want.max(seed::TOP_SPANS).min(spans.len());
             spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
@@ -1147,8 +1134,8 @@ impl FtsReader {
                 let start = g * coarse_span;
                 let end = (start + coarse_span).min(term_meta.num_blocks);
                 for bi in start..end {
-                    let (_, _, bm) = term_meta.skip_entry(postings, bi);
-                    cand.push((bm * bound_rescale, bi));
+                    let (_, _, raw) = term_meta.skip_entry(postings, bi);
+                    cand.push((bounds.bound(raw), bi));
                 }
             }
             let m = m_want.min(cand.len());
@@ -1167,7 +1154,7 @@ impl FtsReader {
                 let n = decode_block(bytes, &mut buf_d, &mut buf_t);
                 for j in 0..n {
                     let score =
-                        bm25::score_with_dl_norm_k1(idf_x_k1p1, buf_t[j], dl_norm_k1.get(buf_d[j]));
+                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(buf_d[j]));
                     if score <= floor_eff {
                         continue;
                     }
@@ -1204,7 +1191,7 @@ impl FtsReader {
         let mut i = 0usize;
         while i < term_meta.num_blocks {
             if coarse_enabled && i.is_multiple_of(coarse_span) {
-                let coarse_max = term_meta.coarse_entry(postings, i / coarse_span) * bound_rescale;
+                let coarse_max = bounds.bound(term_meta.coarse_slot(postings, i / coarse_span));
                 let span_end = (i + coarse_span).min(term_meta.num_blocks);
                 // Seed skip, span-wide (strict): no block in the span can
                 // reach the seeded lower bound on the k-th, so none can be
@@ -1233,8 +1220,8 @@ impl FtsReader {
 
             // last_doc_id (first tuple slot) is unused here — it serves
             // AND-merge seeks, which single-term never does.
-            let (_, block_offset_in_term, raw_block_max) = term_meta.skip_entry(postings, i);
-            let block_max_bm25 = raw_block_max * bound_rescale;
+            let (_, block_offset_in_term, raw) = term_meta.skip_entry(postings, i);
+            let block_max_bm25 = bounds.bound(raw);
 
             // Seed skip (strict): block can't reach the seeded lower bound
             // on the k-th, so it holds no top-k doc.
@@ -1274,7 +1261,7 @@ impl FtsReader {
                     continue;
                 }
                 let tf = buf_t[j];
-                let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1.get(doc_id));
+                let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1.get(doc_id));
                 // Floor gate: strictly-below-floor docs are dead to the
                 // caller; keeping them out also keeps the heap's min
                 // (the BMW skip bar) honest.
@@ -1405,7 +1392,7 @@ impl FtsReader {
                         0,
                         col_meta.positions,
                         false,
-                        self.has_coarse_block_max,
+                        self.bounds.has_coarse(),
                     )?;
                     Some(FetchedTermSlot::Pfor {
                         bytes,
@@ -1540,11 +1527,10 @@ impl FtsReader {
                     cursors.push(Some(TermCursor::new_inline(
                         doc_id,
                         tf,
-                        self.n_docs as u64,
+                        col_meta.scored_doc_count(),
                         dl_norm_k1,
                         gidf,
                         weight,
-                        col_meta.params,
                     )));
                 }
                 Some(Resolved::Memo {
@@ -1558,15 +1544,12 @@ impl FtsReader {
                 }) => {
                     let cursor = TermCursor::new(
                         bytes,
-                        self.n_docs as u64,
-                        col_meta.positions,
+                        col_meta,
+                        self.bounds,
                         gidf,
                         weight,
                         header_probed,
                         count_only,
-                        self.has_coarse_block_max,
-                        col_meta.params,
-                        col_meta.bound_scale,
                     )?;
                     cursors.push(Some(cursor));
                 }
@@ -1585,11 +1568,10 @@ impl FtsReader {
                     let cursor = TermCursor::new_inline(
                         doc_id,
                         tf,
-                        self.n_docs as u64,
+                        col_meta.scored_doc_count(),
                         dl_norm_k1,
                         gidf,
                         weight,
-                        col_meta.params,
                     );
                     cursors.push(Some(cursor));
                 }
@@ -1600,15 +1582,12 @@ impl FtsReader {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
                     let cursor = TermCursor::new(
                         term_bytes,
-                        self.n_docs as u64,
-                        col_meta.positions,
+                        col_meta,
+                        self.bounds,
                         gidf,
                         weight,
                         header_probed,
                         count_only,
-                        self.has_coarse_block_max,
-                        col_meta.params,
-                        col_meta.bound_scale,
                     )?;
                     cursors.push(Some(cursor));
                 }

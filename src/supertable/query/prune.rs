@@ -268,7 +268,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
+        superfile::{
+            builder::FtsConfig, fts::reader::ColumnLengthStats, vector::layout::VectorLayout,
+        },
         supertable::{
             SupertableOptions,
             manifest::{
@@ -498,6 +500,7 @@ mod tests {
                 bb.finish(),
                 titles.len() as u32,
                 (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
+                ColumnLengthStats::default(),
             ),
         );
 
@@ -608,7 +611,12 @@ mod tests {
         let mut fts = HashMap::new();
         fts.insert(
             "title".to_string(),
-            FtsSummaryAgg::new_with_params(bb.finish(), bloom_tokens.len() as u32, term_range),
+            FtsSummaryAgg::new_with_params(
+                bb.finish(),
+                bloom_tokens.len() as u32,
+                term_range,
+                ColumnLengthStats::default(),
+            ),
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {

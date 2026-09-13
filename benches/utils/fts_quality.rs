@@ -456,7 +456,7 @@ impl Oracle {
     fn tf_factor(&self, tf: u32, dl: u32) -> f64 {
         let tf = f64::from(tf);
         let norm = 1.0 - B + B * f64::from(dl) / self.avgdl.max(f64::MIN_POSITIVE);
-        tf * (K1 + 1.0) / (tf + K1 * norm)
+        tf / (tf + K1 * norm)
     }
 
     /// A battery query's clauses as atom indices. Every term and phrase was
