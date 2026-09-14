@@ -130,16 +130,6 @@ fn is_token_segment(segment: &str) -> bool {
         .any(|c| c.is_alphanumeric() || is_emoji_token_char(c))
 }
 
-/// [`emit_capped`] for a positioned callback: the pieces of `tok` take
-/// consecutive positions from `this_position`. Returns the piece count.
-fn emit_capped_positioned<F: FnMut(&str, u64)>(tok: &str, this_position: u64, f: &mut F) -> u64 {
-    let mut at = this_position;
-    emit_capped(tok, &mut |piece| {
-        f(piece, at);
-        at += 1;
-    })
-}
-
 /// Emit `tok`, chopped to [`MAX_TOKEN_CHARS`] characters per piece, and
 /// return how many pieces were emitted — a positional caller advances
 /// its ordinal by that much so each piece occupies its own position.
@@ -151,7 +141,7 @@ fn emit_capped_positioned<F: FnMut(&str, u64)>(tok: &str, this_position: u64, f:
 /// compare and no character walk. Only a run past the byte bound pays
 /// for `char_indices`, and only then can it split.
 #[inline]
-fn emit_capped<F: FnMut(&str)>(tok: &str, f: &mut F) -> u64 {
+fn emit_capped<'a, F: FnMut(&'a str)>(tok: &'a str, f: &mut F) -> u64 {
     if tok.len() <= MAX_TOKEN_CHARS {
         f(tok);
         return 1;
@@ -173,6 +163,67 @@ fn emit_capped<F: FnMut(&str)>(tok: &str, f: &mut F) -> u64 {
         pieces += 1;
     }
     pieces
+}
+
+/// Where the pieces of one ASCII segment go. Implemented by the index
+/// side (hand the piece to the builder) and the query side (wrap it as
+/// a borrowed or owned query term); [`emit_ascii_segment`] is the only
+/// producer, so the two sides cannot disagree on what a segment becomes.
+trait AsciiPieces<'a> {
+    /// A piece of the input itself — the segment needed no case fold.
+    fn borrowed(&mut self, piece: &'a str);
+    /// A piece of the lowercase copy; valid for this call only.
+    fn folded(&mut self, piece: &str);
+}
+
+/// One ASCII word segment, case-folded and chopped at
+/// [`MAX_TOKEN_CHARS`], for every index-side and query-side ASCII fast
+/// path of both tokenizers. A segment that is already lowercase is cut
+/// in place and borrowed; one carrying an upper-case byte is folded into
+/// `scratch` first, which the caller reuses across segments so the
+/// index build allocates nothing per token. Returns the piece count,
+/// which the positional paths turn into consecutive ordinals.
+///
+/// This is the one place a run past the cap is split. A path that cut
+/// or folded a segment on its own would index a token under one form
+/// and look it up under another, and that is silent recall loss.
+fn emit_ascii_segment<'a>(
+    seg: &'a str,
+    has_upper: bool,
+    scratch: &mut String,
+    sink: &mut impl AsciiPieces<'a>,
+) -> u64 {
+    if !has_upper {
+        return emit_capped(seg, &mut |piece| sink.borrowed(piece));
+    }
+    scratch.clear();
+    scratch.extend(seg.bytes().map(|b| b.to_ascii_lowercase() as char));
+    emit_capped(scratch.as_str(), &mut |piece| sink.folded(piece))
+}
+
+/// The index side: every piece goes to the builder's callback as-is.
+struct IndexPieces<'f, F: FnMut(&str)>(&'f mut F);
+
+impl<'a, F: FnMut(&str)> AsciiPieces<'a> for IndexPieces<'_, F> {
+    fn borrowed(&mut self, piece: &'a str) {
+        (self.0)(piece)
+    }
+    fn folded(&mut self, piece: &str) {
+        (self.0)(piece)
+    }
+}
+
+/// The query side: a piece of the query string is handed on without a
+/// copy; a piece of the folded copy has to be owned.
+struct QueryPieces<'f, F>(&'f mut F);
+
+impl<'q, F: FnMut(Cow<'q, str>)> AsciiPieces<'q> for QueryPieces<'_, F> {
+    fn borrowed(&mut self, piece: &'q str) {
+        (self.0)(Cow::Borrowed(piece))
+    }
+    fn folded(&mut self, piece: &str) {
+        (self.0)(Cow::Owned(piece.to_owned()))
+    }
 }
 
 /// Trait every tokenizer impl must satisfy.
@@ -484,7 +535,7 @@ impl AsciiLowerTokenizer {
     #[inline]
     pub fn tokenize_each_inline_positioned<F: FnMut(&str, u64)>(&self, text: &str, mut f: F) {
         let bytes = text.as_bytes();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut scratch = String::new();
         let mut pos = 0;
         let mut position: u64 = 0;
         while pos < bytes.len() {
@@ -509,29 +560,18 @@ impl AsciiLowerTokenizer {
                 // just consumed is the phrase gap it leaves behind.
                 continue;
             }
-            if !had_upper {
-                // Fast path: borrow directly from `text`.
-                //
-                // SAFETY: `is_token_byte` only accepts ASCII
-                // alphanumerics, so every byte in `bytes[start..end]`
-                // is a single-byte ASCII codepoint. The slice is
-                // therefore valid UTF-8 and the original `text`
-                // outlives the callback call.
-                let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
-                position += emit_capped_positioned(s, this_position, &mut f) - 1;
-            } else {
-                // Slow path: copy + lowercase into the reusable buf.
-                buf.clear();
-                buf.reserve(end - start);
-                for &b in &bytes[start..end] {
-                    buf.push(b.to_ascii_lowercase());
-                }
-                // SAFETY: same reasoning — every byte pushed is an
-                // ASCII alphanumeric (or its lowercased form, which
-                // is also ASCII).
-                let s = unsafe { from_utf8_unchecked(&buf) };
-                position += emit_capped_positioned(s, this_position, &mut f) - 1;
-            }
+            // SAFETY: `is_token_byte` only accepts ASCII alphanumerics,
+            // so every byte in `bytes[start..end]` is a single-byte
+            // ASCII codepoint: the slice is valid UTF-8, and `text`
+            // outlives the callback call.
+            let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
+            let mut at = this_position;
+            let mut emit = |piece: &str| {
+                f(piece, at);
+                at += 1;
+            };
+            position +=
+                emit_ascii_segment(s, had_upper, &mut scratch, &mut IndexPieces(&mut emit)) - 1;
         }
     }
 }
@@ -897,6 +937,7 @@ impl Tokenizer for AsciiLowerTokenizer {
         f: &mut dyn FnMut(Cow<'q, str>, u64),
     ) {
         let bytes = text.as_bytes();
+        let mut scratch = String::new();
         let mut pos = 0;
         let mut position: u64 = 0;
         while pos < bytes.len() {
@@ -910,20 +951,23 @@ impl Tokenizer for AsciiLowerTokenizer {
             if start == pos {
                 continue;
             }
-            // Every scanned run occupies one ordinal, dropped or not —
-            // the same rule `tokenize_each_inline_positioned` follows,
-            // so query and index agree on the spacing.
+            // Every scanned run occupies one ordinal, dropped or not,
+            // and a chopped run one per piece — the same rule
+            // `tokenize_each_inline_positioned` follows, so query and
+            // index agree on the spacing.
             let this_position = position;
             position += 1;
             if had_non_ascii {
                 continue;
             }
-            let s = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
-            if had_upper {
-                f(Cow::Owned(s.to_ascii_lowercase()), this_position);
-            } else {
-                f(Cow::Borrowed(s), this_position);
-            }
+            let s: &'q str = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
+            let mut at = this_position;
+            let mut emit = |piece: Cow<'q, str>| {
+                f(piece, at);
+                at += 1;
+            };
+            position +=
+                emit_ascii_segment(s, had_upper, &mut scratch, &mut QueryPieces(&mut emit)) - 1;
         }
     }
 }
@@ -1290,20 +1334,20 @@ impl StandardTokenizer {
     /// word), so a chunk boundary could not be placed soundly.
     #[inline]
     pub fn tokenize_each_inline<F: FnMut(&str)>(&self, text: &str, mut f: F) {
+        let mut buf = String::new();
         if text.is_ascii() {
+            // Cased ASCII only, so the ASCII fold agrees with the
+            // Unicode fold the non-ASCII path applies.
             ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
-                let seg = &text[start..end];
-                if has_upper {
-                    // Cased ASCII only, so `to_ascii_lowercase` agrees
-                    // with the Unicode fold the non-ASCII path applies.
-                    emit_capped(&seg.to_ascii_lowercase(), &mut f);
-                } else {
-                    emit_capped(seg, &mut f);
-                }
+                emit_ascii_segment(
+                    &text[start..end],
+                    has_upper,
+                    &mut buf,
+                    &mut IndexPieces(&mut f),
+                );
             });
             return;
         }
-        let mut buf = String::new();
         // `split_word_bounds` rather than `unicode_words` because the
         // latter's filter drops emoji; the segmentation itself is the
         // same, and UAX #29 already holds a ZWJ emoji sequence together
@@ -1367,15 +1411,13 @@ impl Tokenizer for StandardTokenizer {
     /// its owned folds.
     fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
         if text.is_ascii() {
+            let mut scratch = String::new();
+            let mut emit = |piece: Cow<'q, str>| f(piece);
             ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
                 // `text` outlives the callback, so the reslice carries
                 // the caller's `'q` with no lifetime gymnastics.
                 let seg: &'q str = &text[start..end];
-                if has_upper {
-                    f(Cow::Owned(seg.to_ascii_lowercase()));
-                } else {
-                    f(Cow::Borrowed(seg));
-                }
+                emit_ascii_segment(seg, has_upper, &mut scratch, &mut QueryPieces(&mut emit));
             });
             return;
         }
@@ -1932,6 +1974,45 @@ mod tests {
                 assert_eq!(got.concat(), text, "chopping must not lose text");
             }
         }
+    }
+
+    #[test]
+    fn query_paths_chop_like_the_index_paths() {
+        // A query is tokenized by its own fast paths, and a run past the
+        // cap must come out as the same pieces the index wrote — for
+        // both analyzers, lowercase and mixed case, with the pieces at
+        // consecutive positions. A query path that emitted the run
+        // whole would look up a term the index never wrote.
+        let text = format!(
+            "{}z {} tail",
+            "a".repeat(OVER_CAP),
+            "B".repeat(NEARLY_TWO_CAPS)
+        );
+        let want: Vec<String> = std_tokens(&text);
+        assert_eq!(want.len(), 5, "index side: 2 + 2 pieces + tail");
+        assert_eq!(want[3], "b".repeat(NEARLY_TWO_CAPS - MAX_TOKEN_CHARS));
+        assert_eq!(tokens(&text), want, "both analyzers index ASCII alike");
+
+        let mut ascii_query = Vec::new();
+        AsciiLowerTokenizer.tokenize_each_query(&text, &mut |t| ascii_query.push(t.into_owned()));
+        assert_eq!(ascii_query, want, "ascii_lower query path");
+        let mut std_query = Vec::new();
+        StandardTokenizer.tokenize_each_query(&text, &mut |t| std_query.push(t.into_owned()));
+        assert_eq!(std_query, want, "standard query path");
+
+        let expect: Vec<(String, u64)> = want.iter().cloned().zip(0u64..).collect();
+        let mut queried = Vec::new();
+        AsciiLowerTokenizer
+            .tokenize_each_query_positioned(&text, &mut |t, p| queried.push((t.into_owned(), p)));
+        assert_eq!(
+            queried, expect,
+            "pieces take consecutive positions on the query side"
+        );
+        assert_eq!(
+            positioned(&text),
+            expect,
+            "and the same positions the index recorded"
+        );
     }
 
     #[test]
