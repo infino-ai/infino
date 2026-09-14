@@ -606,8 +606,16 @@ pub mod kv {
     pub const IDS_OFFSET: &str = "inf.ids.offset";
 
     /// Present iff the stable-id sidecar is present: its byte length
-    /// (`16 * n_docs`).
+    /// (`16 * n_docs` for the raw layout; whatever the packed layout
+    /// came to otherwise).
     pub const IDS_LENGTH: &str = "inf.ids.length";
+    /// Optional, alongside the sidecar keys: names the sidecar's layout.
+    /// Absent means the raw `i128` array; [`IDS_LAYOUT_PACKED`] means the
+    /// frame-of-reference blocks of `superfile::ids`, which a reader
+    /// decodes per doc at the same fixed cost for a fraction of the bytes.
+    pub const IDS_LAYOUT: &str = "inf.ids.layout";
+    /// The [`IDS_LAYOUT`] value for the packed sidecar.
+    pub const IDS_LAYOUT_PACKED: &str = "packed";
 
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";

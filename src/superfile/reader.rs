@@ -67,6 +67,7 @@ use crate::{
             },
             tokenize::{Phrase, Tokenizer},
         },
+        ids,
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
@@ -192,6 +193,9 @@ pub struct SuperfileReader {
     /// resident bytes to slice (lazy path) — both fall back to the Parquet
     /// id column.
     id_sidecar: Option<Range<usize>>,
+    /// Whether `id_sidecar` holds the packed layout (`superfile::ids`)
+    /// rather than the raw `i128` array.
+    id_sidecar_packed: bool,
 }
 
 struct LazyMetadataFetch {
@@ -409,6 +413,7 @@ impl SuperfileReader {
             // No resident bytes to slice on the lazy path; `_id` resolution
             // there goes through the Parquet id column.
             id_sidecar: None,
+            id_sidecar_packed: false,
         })
     }
 
@@ -514,21 +519,31 @@ impl SuperfileReader {
         //    local doc id. Record its byte range so `take_by_local_doc_ids`
         //    resolves `_id` from a fixed-width slice instead of the Parquet
         //    id pages. Absent on pre-sidecar superfiles → Parquet fallback.
+        let id_sidecar_packed =
+            kv_map.get(kv::IDS_LAYOUT).map(String::as_str) == Some(kv::IDS_LAYOUT_PACKED);
         let id_sidecar = if all_present(&kv_map, kv::IDS_KEYS) {
             let off = parse_u64(&kv_map, kv::IDS_OFFSET)? as usize;
             let len = parse_u64(&kv_map, kv::IDS_LENGTH)? as usize;
-            let expected = (n_docs as usize) * format::ID_SIDECAR_ENTRY_BYTES;
-            if len != expected {
-                return Err(ReadError::MalformedKv(format!(
-                    "stable-id sidecar length {len} != {expected} (16 x n_docs)"
-                )));
-            }
             let end = off
                 .checked_add(len)
                 .filter(|&end| end <= bytes.len())
                 .ok_or_else(|| {
                     ReadError::MalformedKv("stable-id sidecar range out of bounds".into())
                 })?;
+            match id_sidecar_packed {
+                true => {
+                    ids::PackedIds::parse(&bytes[off..end], n_docs as usize)
+                        .map_err(ReadError::MalformedKv)?;
+                }
+                false => {
+                    let expected = (n_docs as usize) * format::ID_SIDECAR_ENTRY_BYTES;
+                    if len != expected {
+                        return Err(ReadError::MalformedKv(format!(
+                            "stable-id sidecar length {len} != {expected} (16 x n_docs)"
+                        )));
+                    }
+                }
+            }
             Some(off..end)
         } else if any_present(&kv_map, kv::IDS_KEYS) {
             return Err(ReadError::MalformedKv(
@@ -551,6 +566,7 @@ impl SuperfileReader {
             scored_fts: RwLock::new(None),
             vec,
             id_sidecar,
+            id_sidecar_packed,
         })
     }
 
@@ -1035,12 +1051,22 @@ impl SuperfileReader {
         /// fixed-size `from_le_bytes` decode.
         const ENTRY: usize = format::ID_SIDECAR_ENTRY_BYTES;
         let region = &bytes[range];
-        let ids = local_doc_ids.iter().map(|&doc_id| {
-            let start = doc_id as usize * ENTRY;
-            let raw: [u8; ENTRY] = region[start..start + ENTRY]
-                .try_into()
-                .expect("sidecar entry within bounds");
-            i128::from_le_bytes(raw)
+        let packed = match self.id_sidecar_packed {
+            true => Some(
+                ids::PackedIds::parse(region, self.n_docs as usize)
+                    .map_err(ReadError::MalformedKv)?,
+            ),
+            false => None,
+        };
+        let ids = local_doc_ids.iter().map(|&doc_id| match &packed {
+            Some(p) => p.get(doc_id).expect("doc id within n_docs"),
+            None => {
+                let start = doc_id as usize * ENTRY;
+                let raw: [u8; ENTRY] = region[start..start + ENTRY]
+                    .try_into()
+                    .expect("sidecar entry within bounds");
+                i128::from_le_bytes(raw)
+            }
         });
         let id_idx = self
             .schema
@@ -2530,14 +2556,19 @@ mod tests {
     fn stable_id_sidecar_serves_id_and_matches_parquet_fallback() {
         let (bytes, ids) = build_shuffled_id_superfile();
 
-        // The sidecar KV is present, sized to one packed i128 per row.
+        // The sidecar KVs are present and name the packed layout, which
+        // never costs more than one raw i128 per row plus its headers.
         let kvs = footer::read_kv_metadata(&bytes).expect("kv metadata");
         let len: usize = kvs
             .get(kv::IDS_LENGTH)
             .expect("sidecar length present")
             .parse()
             .expect("length is a usize");
-        assert_eq!(len, ids.len() * format::ID_SIDECAR_ENTRY_BYTES);
+        assert_eq!(
+            kvs.get(kv::IDS_LAYOUT).map(String::as_str),
+            Some(kv::IDS_LAYOUT_PACKED)
+        );
+        assert!(len <= ids.len() * format::ID_SIDECAR_ENTRY_BYTES + 4096);
 
         let locals: Vec<u32> = vec![0, 4999, 1, 4999, 37, 100, 2500];
         let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();

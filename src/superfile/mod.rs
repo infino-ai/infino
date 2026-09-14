@@ -22,6 +22,7 @@ pub mod builder;
 pub mod error;
 pub mod format;
 pub mod fts;
+pub(crate) mod ids;
 pub mod lazy_source;
 pub mod reader;
 pub mod stats;
