@@ -61,6 +61,7 @@ use crate::{
             SuperfileHit, exec::metered_exec::MeteredExec, superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
+        reader_cache::ReadIntent,
     },
 };
 
@@ -558,7 +559,7 @@ async fn resolve_columns(
             storage,
             &entry.uri,
             entry.subsection_offsets.as_ref(),
-            true,
+            ReadIntent::Warm,
         )
         .await
         .map(|reader| (index, reader))

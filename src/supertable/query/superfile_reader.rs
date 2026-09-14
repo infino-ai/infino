@@ -14,10 +14,13 @@
 //!      path; no syscalls.
 //!   2. **Disk cache fallback.** Miss in the in-memory tier
 //!      AND a `DiskCacheStore` is attached →
-//!      `DiskCacheStore::reader(uri)` (`await`ed directly).
+//!      `DiskCacheStore::open_for_query(uri, ...)` (`await`ed directly).
 //!      The cache itself handles cold-fetch from object
 //!      storage, pwrite to the local cache directory, and
-//!      mmap.
+//!      mmap, and degrades to an uncached range-only reader
+//!      when the superfile cannot be admitted (larger than
+//!      the whole budget), so a budget miss never fails the
+//!      query.
 //!   3. **No cache.** Miss in the in-memory tier and no
 //!      cache attached → surface the in-memory tier's
 //!      `ReaderCacheError::NotFound`. The in-process-only
@@ -39,7 +42,8 @@ use crate::{
     supertable::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
-            DiskCacheStore, ReaderCacheError, SuperfileReaderCache, disk::DiskCacheError,
+            DiskCacheStore, ReadIntent, ReaderCacheError, SuperfileReaderCache,
+            disk::DiskCacheError,
         },
     },
 };
@@ -56,13 +60,18 @@ use crate::{
 /// (1 RTT cold open) instead of doing the parquet footer first
 /// and the subsection fetches second (2 RTTs). `None` falls back
 /// to the 2-RTT path — same shape, slower.
+///
+/// `intent` is the read policy: `ReadIntent::Warm` for FTS/SQL
+/// (serve now, warm a full local mmap in the background),
+/// `ReadIntent::Stream` for vector search (block cache only,
+/// never promote).
 pub async fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,
     uri: &SuperfileUri,
     offsets: Option<&SubsectionOffsets>,
-    allow_background_fill: bool,
+    intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
     // 1. In-memory tier.
     match store.reader(uri) {
@@ -73,24 +82,14 @@ pub async fn superfile_reader(
         Err(other) => return Err(other),
     }
 
-    // 2. Disk cache fallback (when attached).
+    // 2. Disk cache fallback (when attached). The cache itself degrades to
+    //    an uncached streaming reader when it cannot admit the superfile
+    //    (larger than the whole budget), so a budget miss never fails here.
     if let Some(cache) = disk_cache {
-        match cache
-            .reader_with_hints(uri, offsets, storage, allow_background_fill)
+        return cache
+            .open_for_query(uri, offsets, storage, intent)
             .await
-        {
-            Ok(reader) => return Ok(reader),
-            // Cache can't admit this superfile (e.g. it's larger than the
-            // whole budget). Stream it directly via range GETs instead
-            // of failing the query.
-            Err(DiskCacheError::BudgetExceeded) => {
-                return cache
-                    .open_range_only(uri, offsets, storage)
-                    .await
-                    .map_err(cache_open_failed);
-            }
-            Err(e) => return Err(cache_open_failed(e)),
-        }
+            .map_err(cache_open_failed);
     }
 
     // 3. Storage-only fallback. This covers reopened LocalFs/S3
@@ -142,8 +141,8 @@ mod tests {
     const N_DOCS: u64 = 3;
 
     /// A `disk_budget_bytes` smaller than any real superfile, so the
-    /// disk cache rejects admission with `BudgetExceeded` and the
-    /// caller is forced down the `open_range_only` fallback.
+    /// disk cache rejects admission with `BudgetExceeded` and
+    /// `open_for_query` degrades to its range-only fallback.
     const TINY_BUDGET_BYTES: u64 = 4;
 
     /// Build minimal valid superfile bytes (parquet body + KV metadata
@@ -210,7 +209,7 @@ mod tests {
 
         // No disk cache, no storage attached: if the in-memory tier is
         // consulted first (it is), neither fallback is needed.
-        let reader = superfile_reader(&store, None, None, &uri, None, true)
+        let reader = superfile_reader(&store, None, None, &uri, None, ReadIntent::Warm)
             .await
             .expect("in-memory hit");
         assert_eq!(reader.n_docs(), N_DOCS);
@@ -247,7 +246,7 @@ mod tests {
         // A working fallback is attached; the in-memory error must win.
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
 
-        let err = superfile_reader(&store, None, Some(&storage), &uri, None, true)
+        let err = superfile_reader(&store, None, Some(&storage), &uri, None, ReadIntent::Warm)
             .await
             .expect_err("in-memory error must propagate");
         assert!(
@@ -266,9 +265,16 @@ mod tests {
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
         let cache = disk_cache(&dir, &storage, |_| {});
 
-        let reader = superfile_reader(&empty_store(), Some(&cache), None, &uri, None, true)
-            .await
-            .expect("disk cache cold fetch");
+        let reader = superfile_reader(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("disk cache cold fetch");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -284,9 +290,16 @@ mod tests {
             cfg.disk_budget_bytes = TINY_BUDGET_BYTES;
         });
 
-        let reader = superfile_reader(&empty_store(), Some(&cache), None, &uri, None, true)
-            .await
-            .expect("range-only fallback on budget exceeded");
+        let reader = superfile_reader(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("range-only fallback on budget exceeded");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -298,9 +311,16 @@ mod tests {
         // Nothing put at storage: the cold fetch can't find the bytes.
         let uri = SuperfileUri::new_v4();
 
-        let err = superfile_reader(&empty_store(), Some(&cache), None, &uri, None, true)
-            .await
-            .expect_err("missing storage object must error");
+        let err = superfile_reader(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect_err("missing storage object must error");
         assert!(
             matches!(err, ReaderCacheError::OpenFailed { .. }),
             "expected OpenFailed, got {err:?}",
@@ -317,9 +337,16 @@ mod tests {
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
 
         // No disk cache, but durable storage attached: whole-object open.
-        let reader = superfile_reader(&empty_store(), None, Some(&storage), &uri, None, true)
-            .await
-            .expect("storage-only fallback");
+        let reader = superfile_reader(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &uri,
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("storage-only fallback");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -330,9 +357,16 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         // Nothing put at storage → the GET fails.
 
-        let err = superfile_reader(&empty_store(), None, Some(&storage), &uri, None, true)
-            .await
-            .expect_err("missing object must error");
+        let err = superfile_reader(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &uri,
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect_err("missing object must error");
         assert!(
             matches!(err, ReaderCacheError::OpenFailed { .. }),
             "expected OpenFailed, got {err:?}",
@@ -344,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn no_cache_no_storage_returns_not_found() {
         let uri = SuperfileUri::new_v4();
-        let err = superfile_reader(&empty_store(), None, None, &uri, None, true)
+        let err = superfile_reader(&empty_store(), None, None, &uri, None, ReadIntent::Warm)
             .await
             .expect_err("in-process-only miss must be NotFound");
         match err {

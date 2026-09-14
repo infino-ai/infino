@@ -118,7 +118,7 @@ use crate::{
             skip::{ScalarOp, ScalarPredicate},
             superfile_reader::superfile_reader,
         },
-        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
 };
@@ -510,7 +510,7 @@ impl SupertableProvider {
                     storage.as_ref(),
                     &entry.uri,
                     entry.subsection_offsets.as_ref(),
-                    true,
+                    ReadIntent::Warm,
                 )
                 .await
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;

@@ -60,7 +60,10 @@ use crate::{
             scalar_cache::DecodedScalarCache,
             sql::{SqlSchemas, build_sql_schemas},
         },
-        reader_cache::disk::{DiskCacheError, skip_background_fill},
+        reader_cache::{
+            ReadIntent,
+            disk::{DiskCacheError, skip_background_fill},
+        },
         stats::process_rss_bytes,
         tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
         utils::idgen::IdGenerator,
@@ -1350,7 +1353,7 @@ impl Supertable {
                             Some(&storage),
                             &uri,
                             offsets.as_ref(),
-                            true,
+                            ReadIntent::Warm,
                         )
                         .await
                     }.in_current_span())
@@ -1394,7 +1397,7 @@ impl Supertable {
                         Some(&storage),
                         &uri,
                         offsets.as_ref(),
-                        true,
+                        ReadIntent::Warm,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -2370,7 +2373,7 @@ mod tests {
                 manifest.options.disk_cache.as_ref(),
                 manifest.options.storage.as_ref(),
                 &entry,
-                true,
+                ReadIntent::Warm,
             ))
             .expect("open superfile");
             let vector = reader.vec().expect("vector reader");

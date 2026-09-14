@@ -138,7 +138,7 @@ use crate::{
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
         },
-        reader_cache::disk::ForegroundQueryGuard,
+        reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
         tombstones::SidecarCache,
     },
 };
@@ -915,7 +915,7 @@ impl SupertableReader {
             self,
             units,
             false,
-            true,
+            ReadIntent::Warm,
             move |r, _entry, _sidecars, _now, (suid, full): (Uuid, bool)| {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
@@ -1438,7 +1438,7 @@ impl SupertableReader {
             self,
             units,
             true,
-            true,
+            ReadIntent::Warm,
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
                 let column_arc = Arc::clone(&column_arc);
@@ -1701,7 +1701,7 @@ impl SupertableReader {
                 Ok(hits)
             }
         };
-        let per_unit = dispatch::fanout_with(self, units, true, true, body).await?;
+        let per_unit = dispatch::fanout_with(self, units, true, ReadIntent::Warm, body).await?;
         let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
         dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
         Ok(hits)

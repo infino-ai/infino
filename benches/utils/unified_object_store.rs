@@ -109,7 +109,7 @@ use infino::{
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
         query::VectorSearchOptions,
-        reader_cache::DiskCacheStore,
+        reader_cache::{DiskCacheStore, ReadIntent},
         storage::{S3StorageProvider, StorageProvider},
     },
 };
@@ -1301,16 +1301,14 @@ pub(crate) mod diag {
         }
 
         // ── Phase 2b: cold-open HINTED (1 RTT parallel) ─────────────
-        eprintln!(
-            "[diag] === cold-open HINTED via cache.reader_with_hints (3 fresh-cache iters) ==="
-        );
+        eprintln!("[diag] === cold-open HINTED via cache.open_for_query (3 fresh-cache iters) ===");
         for i in 0..3 {
             let before = storage.snapshot();
             let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
             let off_ref = offsets.clone();
             let t0 = Instant::now();
             let _reader = rt
-                .block_on(cache.reader_with_hints(&uri, Some(&off_ref), None, true))
+                .block_on(cache.open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm))
                 .expect("cold reader");
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
@@ -1357,7 +1355,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, Some(&off_ref), None, true)
+                    .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
                     .await
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
@@ -1413,7 +1411,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, Some(&off_ref), None, true)
+                    .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
                     .await
                     .expect("cold reader");
                 reader
@@ -1440,7 +1438,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, Some(&off_ref), None, true)
+                    .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
                     .await
                     .expect("cold reader");
                 reader
@@ -1560,7 +1558,7 @@ pub(crate) mod diag {
                 let off_ref = offsets.clone();
                 let t0 = Instant::now();
                 let _reader = rt
-                    .block_on(cache.reader_with_hints(&uri, Some(&off_ref), None, true))
+                    .block_on(cache.open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm))
                     .expect("real S3 cold reader");
                 let wall = t0.elapsed();
                 let snap = storage.snapshot().diff(&before);
@@ -1581,7 +1579,7 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, Some(&off_ref), None, true)
+                        .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
                         .await
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
@@ -1612,7 +1610,7 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, Some(&off_ref), None, true)
+                        .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
                         .await
                         .expect("real S3 cold reader");
                     reader

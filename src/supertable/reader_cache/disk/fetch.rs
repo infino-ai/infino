@@ -26,7 +26,7 @@ use futures::{
 use memmap2::Mmap;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{OnceCell, oneshot},
+    sync::oneshot,
     task::{JoinHandle, spawn_blocking},
 };
 use tracing::{Instrument, debug_span};
@@ -46,6 +46,7 @@ use crate::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
             block_source::BlockCachedSource,
+            config::ColdFetchMode,
             disk::{sources::mmap_readonly_with_handle, *},
         },
     },
@@ -95,7 +96,9 @@ impl DiskCacheStore {
     /// Install a promoted entry, honoring the reinstate-only-if-present gate that keeps the budget
     /// balanced under a racing eviction.
     ///
-    /// `Fresh` inserts unconditionally: the foreground cold-fetch owns the slot it just reserved.
+    /// `Fresh` admits through [`Self::admit_entry`]: the foreground cold-fetch owns the slot it just
+    /// reserved, and anything a lost race left there (a lazy admission of the same URI) has its
+    /// budget released.
     /// `ReplaceIfPresent` is for a background finalizer that may have been evicted while it ran: it
     /// replaces an occupied slot, but on a vacant slot it drops the just-renamed file and returns
     /// `None` (eviction already released the reservation, so reinstating the entry would leak it).
@@ -107,10 +110,7 @@ impl DiskCacheStore {
         mode: InstallMode,
     ) -> Option<Arc<CachedEntry>> {
         match mode {
-            InstallMode::Fresh => {
-                self.cached.insert(uri, Arc::clone(&entry));
-                Some(entry)
-            }
+            InstallMode::Fresh => Some(self.admit_entry(uri, entry)),
             InstallMode::ReplaceIfPresent => match self.cached.entry(uri) {
                 Entry::Occupied(mut occ) => {
                     *occ.get_mut() = Arc::clone(&entry);
@@ -137,13 +137,8 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-
-        // A finished cache file may already be on disk; use it before fetching.
-        if let Some(entry) = self.try_reuse_cached_file(uri, None).await? {
-            return Ok(entry);
-        }
-
         let head = fetch_storage.head(&storage_uri).await?;
+
         let size = head.size;
         // Don't use the borrow-lifetimed Reservation guard
         // because it would tie the future to `&self` and block
@@ -151,6 +146,7 @@ impl DiskCacheStore {
         // reserve manually here; the background task either
         // commits (cache filled) or rolls back via fetch_sub.
         self.reserve_manual(size).await?;
+
         let reserved_bytes = size;
         let tmp = self.tmp_path(uri);
         let final_path = self.cache_path(uri);
@@ -265,10 +261,8 @@ impl DiskCacheStore {
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
-        // Register entry in the cache so subsequent reader()
-        // calls hit cache rather than re-entering the
-        // coordinator.
-        self.cached.insert(*uri, Arc::clone(&entry));
+        // Admit the entry so later readers hit tier 1 instead of re-entering the coordinator.
+        let entry = self.admit_entry(*uri, entry);
 
         // 5. Spawn the background finalizer: wait for pwrites,
         //    fsync, rename, mmap, and atomically replace the
@@ -309,67 +303,33 @@ impl DiskCacheStore {
         Ok(entry)
     }
 
-    /// lazy-foreground cold-fetch coordinator.
-    /// Returns immediately with a
-    /// [`SuperfileReader::open_lazy`]-built reader over a
-    /// [`crate::supertable::StorageRangeSource`]; spawns a
-    /// background task that waits for foreground lazy readers
-    /// to release before fetching the full superfile, mmap'ing
-    /// it, and replacing the cached entry. Subsequent
-    /// `reader(uri)` calls return the mmap-backed reader (zero
-    /// S3 GETs for any subsequent search).
-    /// lazy cold-fetch coordinator. When `offsets` is `Some`,
-    /// the cold open uses manifest-provided size/open-batch hints;
-    /// when `None`, it falls back to unknown-size suffix-tail
-    /// discovery.
-    pub(crate) async fn reader_lazy_with_bg_fill_hinted(
+    /// Tier 4: the file is not local anywhere, so fetch it from the object store. The one place a
+    /// fetch shape is chosen. [`ReadIntent::Load`] always downloads the whole file and mmaps it;
+    /// `Warm` and `Stream` follow the configured cold-fetch mode, differing only in whether a lazy
+    /// open keeps warming toward a full mmap in the background.
+    pub(crate) async fn fetch_from_source(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        intent: ReadIntent,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
-        allow_background_fill: bool,
-    ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
-        if let Some(entry) = self.cached.get(uri) {
-            entry.last_access_us.store(self.now_us(), Ordering::Release);
-            if allow_background_fill {
-                self.maybe_spawn_background_fill(uri, &entry, storage);
-            }
-            return Ok(Arc::clone(&entry.reader));
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        let fetch_storage = self.resolve_storage(storage);
+
+        if intent == ReadIntent::Load {
+            return self.cold_fetch(uri, fetch_storage).await;
         }
-        let cell = self
-            .coordinators
-            .entry(*uri)
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
-        let result = cell
-            .get_or_init(|| async {
-                let fetch_storage = self.resolve_storage(storage);
+        match self.config.cold_fetch_mode {
+            ColdFetchMode::HybridWithPrefetch => self.cold_fetch_hybrid(uri, fetch_storage).await,
+            ColdFetchMode::RangeOnly => Err(DiskCacheError::SuperfileOpen(
+                "ColdFetchMode::RangeOnly bypasses the disk cache; \
+                 construct StorageRangeSource + open_lazy directly"
+                    .into(),
+            )),
+            ColdFetchMode::LazyForegroundWithBackgroundFill => {
+                let allow_background_fill = intent == ReadIntent::Warm;
                 self.cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
                     .await
-            })
-            .await;
-        let fetch_storage = self.resolve_storage(storage);
-        match result {
-            Ok(entry) => {
-                if allow_background_fill {
-                    self.maybe_spawn_background_fill(uri, entry, storage);
-                }
-                Ok(Arc::clone(&entry.reader))
-            }
-            Err(_e) => {
-                self.coordinators.remove(uri);
-                match self
-                    .cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
-                    .await
-                {
-                    Ok(entry) => {
-                        if allow_background_fill {
-                            self.maybe_spawn_background_fill(uri, &entry, storage);
-                        }
-                        Ok(Arc::clone(&entry.reader))
-                    }
-                    Err(e) => Err(e),
-                }
             }
         }
     }
@@ -471,15 +431,6 @@ impl DiskCacheStore {
         allow_background_fill: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-
-        // A finished cache file may already be on disk; use it before fetching.
-        if let Some(entry) = self
-            .try_reuse_cached_file(uri, offsets.map(|o| o.total_size))
-            .await?
-        {
-            return Ok(entry);
-        }
-
         let block_source_arc: Arc<BlockCachedSource>;
         let (lazy_reader, size) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
@@ -656,9 +607,9 @@ impl DiskCacheStore {
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
-        self.cached.insert(*uri, Arc::clone(&entry));
-
-        Ok(entry)
+        // Admission may hand back an existing whole-file copy instead of this lazy entry; serve
+        // whatever it returns.
+        Ok(self.admit_entry(*uri, entry))
     }
 
     /// Run the cold-fetch coordinator for `uri`. Reserves
@@ -669,12 +620,6 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-
-        // A finished cache file may already be on disk; use it before fetching.
-        if let Some(entry) = self.try_reuse_cached_file(uri, None).await? {
-            return Ok(entry);
-        }
-
         let head = fetch_storage.head(&storage_uri).await?;
         let size = head.size;
 
@@ -697,9 +642,12 @@ impl DiskCacheStore {
             },
         )?;
         let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None);
+
         self.install_promoted_entry(*uri, Arc::clone(&entry), &final_path, InstallMode::Fresh);
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
+
         reservation.commit();
+
         Ok(entry)
     }
 
@@ -1551,7 +1499,7 @@ mod tests {
             .expect("put at hidden prefix");
 
         let reader = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .open_for_query(&uri, None, Some(&hidden_storage), ReadIntent::Warm)
             .await
             .expect("cold fetch via caller storage");
         assert_eq!(reader.n_docs(), 1);
@@ -1594,7 +1542,7 @@ mod tests {
             .expect("put at hidden prefix");
 
         let reader = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .open_for_query(&uri, None, Some(&hidden_storage), ReadIntent::Warm)
             .await
             .expect("lazy cold fetch via caller storage");
         assert_eq!(reader.n_docs(), 1);
@@ -1609,7 +1557,7 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
 
-        // reader_with_hints(None) → unknown-size lazy cold fetch.
+        // open_for_query(None) → unknown-size lazy cold fetch.
         let r = store.reader(&uri).await.expect("lazy cold");
         assert_eq!(r.n_docs(), 1);
         assert_eq!(store.stats().n_cold_fetches, 1);
@@ -1649,7 +1597,7 @@ mod tests {
             open_blob: Vec::new(),
         };
         let r = store
-            .reader_with_hints(&uri, Some(&offsets), None, true)
+            .open_for_query(&uri, Some(&offsets), None, ReadIntent::Warm)
             .await
             .expect("lazy hinted cold");
         assert_eq!(r.n_docs(), 1);
@@ -1660,7 +1608,7 @@ mod tests {
             .await
             .expect("background promotion");
         let r2 = store
-            .reader_with_hints(&uri, Some(&offsets), None, true)
+            .open_for_query(&uri, Some(&offsets), None, ReadIntent::Warm)
             .await
             .expect("warm hinted mmap");
         assert_eq!(store.stats().n_cold_fetches, 1);
@@ -1678,7 +1626,7 @@ mod tests {
 
         // Vector modality: block-cache only — no background fill.
         let vector_reader = store
-            .reader_with_hints(&uri, None, None, false)
+            .open_for_query(&uri, None, None, ReadIntent::Stream)
             .await
             .expect("vector lazy open");
         drop(vector_reader);
@@ -1690,7 +1638,7 @@ mod tests {
 
         // FTS/SQL modality on the same URI starts fill after the fact.
         let fts_reader = store
-            .reader_with_hints(&uri, None, None, true)
+            .open_for_query(&uri, None, None, ReadIntent::Warm)
             .await
             .expect("fts lazy open");
         drop(fts_reader);
@@ -1715,14 +1663,14 @@ mod tests {
 
         // Vector modality: lazy, block-cache only, no fill.
         let vector_reader = store
-            .reader_with_hints(&uri, None, None, false)
+            .open_for_query(&uri, None, None, ReadIntent::Stream)
             .await
             .expect("vector open");
         drop(vector_reader);
 
         // FTS modality starts the fill, which promotes while leaving the vector blob sparse.
         let fts_reader = store
-            .reader_with_hints(&uri, None, None, true)
+            .open_for_query(&uri, None, None, ReadIntent::Warm)
             .await
             .expect("fts open");
         drop(fts_reader);
