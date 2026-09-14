@@ -51,7 +51,7 @@ use crate::superfile::{
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
         dict::{DictReader, make_key},
         fst_value::{FstValue, ValueLayout},
-        positions::decode_run,
+        positions::{decode_group, decode_run, positions_from_run_values},
         posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
         short::decode_short,
         tokenize::{Phrase, Tokenizer},
@@ -1486,22 +1486,34 @@ impl FtsReader {
                             }
                             None => None,
                         };
-                        let mut pos_at = 0usize;
+                        // A short body's positions are one group.
+                        let mut group_vals: Vec<u32> = Vec::new();
+                        if let Some(bytes) = &position_bytes {
+                            let n: usize = t[..decoded.n].iter().map(|&x| x as usize).sum();
+                            decode_group(bytes.as_ref(), &mut 0, n, &mut group_vals).ok_or_else(
+                                || {
+                                    FtsError::Read(ReadError::MalformedVersion(
+                                        "malformed position group in merge read".into(),
+                                    ))
+                                },
+                            )?;
+                        }
+                        let mut vi = 0usize;
                         for i in 0..decoded.n {
                             let positions: &[u32] = match &position_bytes {
-                                Some(bytes) => {
+                                Some(_) => {
                                     positions_buf.clear();
-                                    decode_run(
-                                        bytes.as_ref(),
-                                        &mut pos_at,
-                                        t[i],
+                                    let tf = t[i] as usize;
+                                    positions_from_run_values(
+                                        &group_vals[vi..vi + tf],
                                         &mut positions_buf,
                                     )
                                     .ok_or_else(|| {
                                         FtsError::Read(ReadError::MalformedVersion(
-                                            "truncated position run in merge read".into(),
+                                            "position run overflowing in merge read".into(),
                                         ))
                                     })?;
+                                    vi += tf;
                                     &positions_buf
                                 }
                                 None => &[],
@@ -1545,11 +1557,46 @@ impl FtsReader {
                     // a score bound.
                     let mut cursor =
                         TermCursor::new(term_bytes, col_meta, self.bounds, None, 1, false, false)?;
+                    // Grouped positions (V7): each block's runs are one
+                    // group, decoded whole at the block's start and sliced
+                    // per pair; older blobs are one run after another.
+                    let grouped = self.subindex == SubindexKind::Compact;
+                    let mut group_vals: Vec<u32> = Vec::new();
+                    let mut vi = 0usize;
                     while !cursor.is_exhausted() {
+                        if grouped && let Some(bytes) = &position_bytes {
+                            group_vals.clear();
+                            vi = 0;
+                            let n: usize = cursor.block_tfs[..cursor.block_n]
+                                .iter()
+                                .map(|&x| x as usize)
+                                .sum();
+                            decode_group(bytes.as_ref(), &mut pos_at, n, &mut group_vals)
+                                .ok_or_else(|| {
+                                    FtsError::Read(ReadError::MalformedVersion(
+                                        "malformed position group in merge read".into(),
+                                    ))
+                                })?;
+                        }
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
                             let tf = cursor.block_tfs[cursor.pos];
                             let positions: &[u32] = match &position_bytes {
+                                Some(_) if grouped => {
+                                    positions_buf.clear();
+                                    let n = tf as usize;
+                                    positions_from_run_values(
+                                        &group_vals[vi..vi + n],
+                                        &mut positions_buf,
+                                    )
+                                    .ok_or_else(|| {
+                                        FtsError::Read(ReadError::MalformedVersion(
+                                            "position run overflowing in merge read".into(),
+                                        ))
+                                    })?;
+                                    vi += n;
+                                    &positions_buf
+                                }
                                 Some(bytes) => {
                                     positions_buf.clear();
                                     decode_run(bytes.as_ref(), &mut pos_at, tf, &mut positions_buf)

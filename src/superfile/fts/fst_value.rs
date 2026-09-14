@@ -28,9 +28,9 @@
 //! ```text
 //!   Legacy (V1–V6):  bits  1..43 : metadata_offset (42 bits)
 //!                    bits 43..64 : postings_length (21 bits)
-//!   Flagged (V7+):   bit   1     : 1 = short form, 0 = long (PFOR) form
-//!                    bits  2..43 : metadata_offset (41 bits, 2 TiB)
-//!                    bits 43..64 : postings_length (21 bits)
+//!   Flagged (V7+):   bits  1..22 : postings_length (21 bits)
+//!                    bit  22     : 1 = short form, 0 = long (PFOR) form
+//!                    bits 23..64 : metadata_offset (41 bits, 2 TiB)
 //! ```
 //!
 //! The flag tells the reader how to interpret the fetched range before
@@ -38,6 +38,14 @@
 //! header, skip table and blocks; a short-form range is a
 //! `fts::short` body with none of those. A legacy value spends bit 1 on
 //! its offset, so the layout is selected by version, never inferred.
+//!
+//! Why the flagged layout puts the offset in the **high** bits: terms are
+//! emitted in dictionary order, so consecutive keys have ascending,
+//! nearby offsets. The FST shares each transition's common output
+//! prefix along the path, so two neighbouring values that differ only in
+//! their low bits leave a small residual at the leaf — a length field in
+//! the high bits (the legacy layout) scrambled exactly the bits that
+//! would otherwise be shared, and cost every term a full-width value.
 //!
 //! Why low-bit flag (not high-bit): the `fst` crate VLQ-encodes
 //! values, so encoded length grows with magnitude. Putting the flag
@@ -50,11 +58,12 @@ const DOC_ID_SHIFT: u32 = 1;
 const TF_SHIFT: u32 = 33;
 const LEGACY_OFFSET_SHIFT: u32 = 1;
 const LEGACY_OFFSET_BITS: u32 = 42;
-const SHORT_FLAG_SHIFT: u32 = 1;
-const FLAGGED_OFFSET_SHIFT: u32 = 2;
-const FLAGGED_OFFSET_BITS: u32 = 41;
-const PFOR_LENGTH_SHIFT: u32 = LEGACY_OFFSET_SHIFT + LEGACY_OFFSET_BITS;
 const PFOR_LENGTH_BITS: u32 = 21;
+const LEGACY_LENGTH_SHIFT: u32 = LEGACY_OFFSET_SHIFT + LEGACY_OFFSET_BITS;
+const FLAGGED_LENGTH_SHIFT: u32 = 1;
+const SHORT_FLAG_SHIFT: u32 = FLAGGED_LENGTH_SHIFT + PFOR_LENGTH_BITS;
+const FLAGGED_OFFSET_SHIFT: u32 = SHORT_FLAG_SHIFT + 1;
+const FLAGGED_OFFSET_BITS: u32 = 64 - FLAGGED_OFFSET_SHIFT;
 const LEGACY_OFFSET_MAX: u64 = (1u64 << LEGACY_OFFSET_BITS) - 1;
 const FLAGGED_OFFSET_MAX: u64 = (1u64 << FLAGGED_OFFSET_BITS) - 1;
 pub(crate) const PFOR_LENGTH_MAX: u32 = (1u32 << PFOR_LENGTH_BITS) - 1;
@@ -105,11 +114,15 @@ impl FstValue {
     #[inline]
     pub(crate) fn unpack(packed: u64, layout: ValueLayout) -> Self {
         if packed & 1 == 0 {
-            let slot = ((packed >> PFOR_LENGTH_SHIFT) as u32) & PFOR_LENGTH_MAX;
-            let (metadata_offset, short) = match layout {
-                ValueLayout::Legacy => ((packed >> LEGACY_OFFSET_SHIFT) & LEGACY_OFFSET_MAX, false),
+            let (metadata_offset, slot, short) = match layout {
+                ValueLayout::Legacy => (
+                    (packed >> LEGACY_OFFSET_SHIFT) & LEGACY_OFFSET_MAX,
+                    ((packed >> LEGACY_LENGTH_SHIFT) as u32) & PFOR_LENGTH_MAX,
+                    false,
+                ),
                 ValueLayout::Flagged => (
                     (packed >> FLAGGED_OFFSET_SHIFT) & FLAGGED_OFFSET_MAX,
+                    ((packed >> FLAGGED_LENGTH_SHIFT) as u32) & PFOR_LENGTH_MAX,
                     (packed >> SHORT_FLAG_SHIFT) & 1 == 1,
                 ),
             };
@@ -143,15 +156,15 @@ impl FstValue {
         layout: ValueLayout,
         short: bool,
     ) -> u64 {
-        let slot = postings_length.min(PFOR_LENGTH_UNKNOWN);
-        let offset_bits = match layout {
+        let slot = u64::from(postings_length.min(PFOR_LENGTH_UNKNOWN));
+        match layout {
             ValueLayout::Legacy => {
                 assert!(!short, "the legacy value layout has no short-form flag");
                 assert!(
                     metadata_offset <= LEGACY_OFFSET_MAX,
                     "metadata_offset {metadata_offset} overflows the {LEGACY_OFFSET_BITS}-bit slot"
                 );
-                metadata_offset << LEGACY_OFFSET_SHIFT
+                (metadata_offset << LEGACY_OFFSET_SHIFT) | (slot << LEGACY_LENGTH_SHIFT)
             }
             ValueLayout::Flagged => {
                 assert!(
@@ -162,10 +175,11 @@ impl FstValue {
                     !short || postings_length < PFOR_LENGTH_UNKNOWN,
                     "a short-form body must fit the length slot"
                 );
-                (metadata_offset << FLAGGED_OFFSET_SHIFT) | ((short as u64) << SHORT_FLAG_SHIFT)
+                (metadata_offset << FLAGGED_OFFSET_SHIFT)
+                    | ((short as u64) << SHORT_FLAG_SHIFT)
+                    | (slot << FLAGGED_LENGTH_SHIFT)
             }
-        };
-        offset_bits | ((slot as u64) << PFOR_LENGTH_SHIFT)
+        }
     }
 
     /// Pack a `(doc_id, tf)` pair into the inline-form FST value. The
@@ -322,5 +336,16 @@ mod tests {
         let pfor = FstValue::pack_pfor(42, 128, ValueLayout::Flagged, false);
         let inline = FstValue::pack_inline(42, 7);
         assert_ne!(pfor & 1, inline & 1);
+    }
+
+    #[test]
+    fn flagged_neighbours_differ_only_in_their_low_bits() {
+        // Two terms 40 bytes apart in the postings region: the values
+        // share every bit above the length field's, which is what lets
+        // the FST fold the common part into the shared prefix.
+        let a = FstValue::pack_pfor(1 << 30, 40, ValueLayout::Flagged, false);
+        let b = FstValue::pack_pfor((1 << 30) + 40, 24, ValueLayout::Flagged, true);
+        assert!(b > a, "ascending offsets pack to ascending values");
+        assert!(b - a < 1u64 << FLAGGED_OFFSET_SHIFT << 6, "residual stays small");
     }
 }

@@ -101,7 +101,7 @@ use crate::superfile::{
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX, ValueLayout},
-        positions::{encode_run, read_varint, skip_run},
+        positions::{GROUP_LEB128, encode_group, encode_run, read_varint, skip_run, varint_len},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         reader::ColumnLengthStats,
         short::{SHORT_MAX_DF, ShortPositions, encode_short},
@@ -345,6 +345,14 @@ impl BlobEra {
     /// Whether the position sub-index stores `u16` block-relative
     /// offsets (`V7`) or `u32` absolute ones.
     fn compact_subindex(self) -> bool {
+        self == Self::V7
+    }
+
+    /// Whether position runs are written as per-block **groups** — a
+    /// one-byte header naming the bit width the run values are packed
+    /// at, or the LEB128 form when that is smaller — rather than as bare
+    /// LEB128 runs (`V7`).
+    fn grouped_positions(self) -> bool {
         self == Self::V7
     }
 
@@ -3705,6 +3713,12 @@ struct TermScratch {
     /// so entry `(block, slot)` sits at a flat `block * ENTRIES_PER_BLOCK
     /// + slot`. Reused like the other buffers.
     pos_subindex_offsets: Vec<u32>,
+    /// A term's position region as emitted under grouped positions:
+    /// every block's group back to back. Reused across terms.
+    pos_out: Vec<u8>,
+    /// One block's run values (first position absolute per doc, then
+    /// gaps) decoded from the accumulator's LEB128 runs for regrouping.
+    pos_vals: Vec<u32>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -3941,11 +3955,25 @@ fn encode_and_emit_term<W: Write>(
         let metadata_offset = *postings_len;
         let positions = match term_positions.as_mut() {
             Some((sink, runs)) => {
+                // The whole term is one position group: its run values,
+                // packed or LEB128, whichever is smaller.
+                let vals = &mut scratch.pos_vals;
+                let out = &mut scratch.pos_out;
+                vals.clear();
+                out.clear();
+                let mut at = 0usize;
+                for &(_, tf) in pairs {
+                    for _ in 0..tf {
+                        vals.push(read_varint(runs, &mut at).expect("builder-encoded run"));
+                    }
+                }
+                debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+                encode_group(out, vals);
                 let p = ShortPositions {
                     offset: sink.len,
-                    length: runs.len() as u32,
+                    length: out.len() as u32,
                 };
-                sink.write(runs)?;
+                sink.write(out)?;
                 Some(p)
             }
             None => None,
@@ -4087,21 +4115,63 @@ fn encode_and_emit_term<W: Write>(
         let pos_subindex_offsets = &mut scratch.pos_subindex_offsets;
         pos_block_offsets.clear();
         pos_subindex_offsets.clear();
+        // The bytes the positions region receives for this term: the
+        // accumulator's LEB128 runs verbatim, or — under grouped positions
+        // — those runs regrouped per block into `scratch.pos_out`.
+        let pos_out = &mut scratch.pos_out;
+        pos_out.clear();
         if let Some((_, runs)) = &term_positions {
             debug_assert!(
                 runs.len() <= u32::MAX as usize,
                 "single-term positions > 4 GiB"
             );
             let mut at: usize = 0;
-            for (i, &(_, tf)) in pairs.iter().enumerate() {
-                let in_block = i % BLOCK_LEN;
-                if in_block == 0 {
-                    pos_block_offsets.push(at as u32);
+            if era.grouped_positions() {
+                // Regroup block by block. A packed group is indexed by the
+                // block's tf prefix sums, so its sub-index slots are
+                // unused and get the marker the compact writer turns into
+                // the sentinel; a LEB128 group keeps real checkpoints,
+                // absolute within the term's region, past its header byte.
+                let vals = &mut scratch.pos_vals;
+                for chunk in pairs.chunks(BLOCK_LEN) {
+                    pos_block_offsets.push(pos_out.len() as u32);
+                    vals.clear();
+                    for &(_, tf) in chunk {
+                        for _ in 0..tf {
+                            vals.push(read_varint(runs, &mut at).expect("builder-encoded run"));
+                        }
+                    }
+                    let group_start = pos_out.len();
+                    encode_group(pos_out, vals);
+                    let packed = pos_out[group_start] != GROUP_LEB128;
+                    let mut run_at = group_start + 1;
+                    let mut vi = 0usize;
+                    for (j, &(_, tf)) in chunk.iter().enumerate() {
+                        if j.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
+                            pos_subindex_offsets.push(match packed {
+                                true => u32::MAX,
+                                false => run_at as u32,
+                            });
+                        }
+                        if !packed {
+                            for _ in 0..tf {
+                                run_at += varint_len(vals[vi]);
+                                vi += 1;
+                            }
+                        }
+                    }
                 }
-                if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
-                    pos_subindex_offsets.push(at as u32);
+            } else {
+                for (i, &(_, tf)) in pairs.iter().enumerate() {
+                    let in_block = i % BLOCK_LEN;
+                    if in_block == 0 {
+                        pos_block_offsets.push(at as u32);
+                    }
+                    if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
+                        pos_subindex_offsets.push(at as u32);
+                    }
+                    skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
                 }
-                skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
             }
             debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
             // Pad the final (partial) block's sub-index up to a whole
@@ -4146,8 +4216,12 @@ fn encode_and_emit_term<W: Write>(
         term_buf.extend_from_slice(&(postings_length as u32).to_le_bytes());
         term_buf.extend_from_slice(&num_blocks.to_le_bytes());
         if let Some((sink, runs)) = &term_positions {
+            let region_len = match era.grouped_positions() {
+                true => pos_out.len(),
+                false => runs.len(),
+            };
             term_buf.extend_from_slice(&sink.len.to_le_bytes());
-            term_buf.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+            term_buf.extend_from_slice(&(region_len as u32).to_le_bytes());
         }
         debug_assert_eq!(term_buf.len(), term_meta_size);
         if let Some(start) = meta_write_start {
@@ -4216,8 +4290,9 @@ fn encode_and_emit_term<W: Write>(
                 let block_start = pos_block_offsets[block];
                 let fits = chunk.iter().enumerate().all(|(slot, &off)| {
                     block * entries_per_block + slot >= n_real
-                        || (off - block_start)
-                            < u32::from(format::fts::POSITION_SUBINDEX_COMPACT_NONE)
+                        || (off != u32::MAX
+                            && (off - block_start)
+                                < u32::from(format::fts::POSITION_SUBINDEX_COMPACT_NONE))
                 });
                 for (slot, &off) in chunk.iter().enumerate() {
                     let entry: u16 = match (fits, block * entries_per_block + slot < n_real) {
@@ -4249,7 +4324,10 @@ fn encode_and_emit_term<W: Write>(
         }
 
         if let Some((sink, runs)) = term_positions.as_mut() {
-            sink.write(runs)?;
+            match era.grouped_positions() {
+                true => sink.write(pos_out)?,
+                false => sink.write(runs)?,
+            }
         }
 
         FstValue::pack_pfor(

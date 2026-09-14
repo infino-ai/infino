@@ -18,6 +18,7 @@
 //! builder is consume-on-`finish()`; a session that wants N
 //! superfiles instantiates N builders.
 
+pub(crate) mod bits;
 pub mod builder;
 pub mod error;
 pub mod format;

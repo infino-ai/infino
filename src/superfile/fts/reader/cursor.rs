@@ -114,6 +114,9 @@ pub(super) struct TermMeta {
     /// Its one block's position runs start at offset 0 of the term's
     /// positions bytes.
     pub(super) short: bool,
+    /// Whether the term's positions are per-block **groups** behind a
+    /// one-byte width header (`V7`) rather than bare LEB128 runs.
+    pub(super) positions_grouped: bool,
 }
 
 impl TermMeta {
@@ -228,6 +231,7 @@ impl TermMeta {
             blocks_end_in_term,
             has_coarse,
             short: false,
+            positions_grouped: subindex == SubindexKind::Compact,
         })
     }
 
@@ -248,6 +252,7 @@ impl TermMeta {
             blocks_end_in_term: 0,
             has_coarse: false,
             short: true,
+            positions_grouped: true,
         }
     }
 

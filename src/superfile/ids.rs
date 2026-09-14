@@ -34,7 +34,10 @@
 //! The layout is named by the `inf.ids.layout` footer key; a sidecar
 //! without that key is the older raw `i128` array.
 
-use crate::superfile::format::ID_SIDECAR_ENTRY_BYTES;
+use crate::superfile::{
+    bits::{MAX_WIDTH, get_bits, payload_bytes, put_bits, width_of},
+    format::ID_SIDECAR_ENTRY_BYTES,
+};
 
 /// Docs per frame-of-reference block. Large enough that the 24-byte
 /// block header and 8-byte directory entry are noise per doc, small
@@ -48,62 +51,6 @@ const HEADER_BYTES: usize = 16;
 const BLOCK_HEADER_BYTES: usize = 24;
 /// Directory entry size: one `u64` block offset.
 const DIR_ENTRY_BYTES: usize = 8;
-/// Widest half: a full `u64`.
-const MAX_WIDTH: u8 = 64;
-
-/// Bits needed to hold `v` (zero for zero).
-#[inline]
-fn width_of(v: u64) -> u8 {
-    (u64::BITS - v.leading_zeros()) as u8
-}
-
-/// Bytes a bit-packed payload of `n` values at `width` bits occupies.
-#[inline]
-fn payload_bytes(n: usize, width: u8) -> usize {
-    (n * width as usize).div_ceil(8)
-}
-
-/// OR `v` (`width` bits) into `buf` at bit position `bit`.
-#[inline]
-fn put_bits(buf: &mut [u8], bit: usize, v: u64, width: u8) {
-    if width == 0 {
-        return;
-    }
-    let mut byte = bit / 8;
-    let shift = (bit % 8) as u32;
-    // Up to 71 bits land across at most 9 bytes.
-    let acc: u128 = (v as u128) << shift;
-    let total_bits = shift as usize + width as usize;
-    let n_bytes = total_bits.div_ceil(8);
-    for i in 0..n_bytes {
-        buf[byte] |= (acc >> (8 * i)) as u8;
-        byte += 1;
-    }
-}
-
-/// Value `i` of a `width`-bit stream in `payload`; `None` past its end.
-#[inline]
-fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
-    if width == 0 {
-        return Some(0);
-    }
-    let bit = i * width as usize;
-    let byte = bit / 8;
-    let shift = (bit % 8) as u32;
-    let n_bytes = (shift as usize + width as usize).div_ceil(8);
-    let slice = payload.get(byte..byte + n_bytes)?;
-    let mut acc: u128 = 0;
-    for (k, &b) in slice.iter().enumerate() {
-        acc |= (b as u128) << (8 * k);
-    }
-    let mask: u128 = if width == MAX_WIDTH {
-        u64::MAX as u128
-    } else {
-        (1u128 << width) - 1
-    };
-    Some(((acc >> shift) & mask) as u64)
-}
-
 /// Encode a raw sidecar (`n_docs` little-endian `i128`s, local doc order)
 /// into the packed layout. An empty input yields an empty output, the
 /// "no sidecar" shape both ends already understand.
