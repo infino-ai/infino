@@ -130,6 +130,37 @@ pub mod fts {
     /// than inferred.
     pub const VERSION_V6: u32 = 6;
 
+    /// The version new code writes. Same header, regions, bound scale
+    /// and declared average as [`VERSION_V6`]; what changes is how a
+    /// **rare term** is laid out, and one bit of every dictionary value.
+    ///
+    /// A term whose whole posting list fits one block (`df <=
+    /// BLOCK_LEN`) no longer pays the long-form fixed cost — the 20/32
+    /// byte metadata header, a skip entry, a position sub-index row, a
+    /// coarse slot and a block header, 92 bytes before the first posting
+    /// on a positional column — nor the block codec's padding of a
+    /// partial block to `BLOCK_LEN` lanes, which on a term with two docs
+    /// far apart is hundreds of bytes for two doc ids. It is written in
+    /// the **short form** instead (`fts::short`): a varint `df`, a
+    /// tf-equals-one bitmap, the doc-id deltas as group-varint, the
+    /// remaining tfs as varints and, on a positional column, the term's
+    /// position offset and length. A few bytes per posting, no lane
+    /// padding, nothing per block. On a Zipfian corpus the single-block
+    /// terms are ~97% of the dictionary and were more than half of the
+    /// postings region; they are read once and whole, so the reader
+    /// decodes a short body into the same pre-filled single-block cursor
+    /// the df=1 inline form already uses.
+    ///
+    /// The dictionary value's PFOR form spends bit 1 on the short/long
+    /// flag (see `fst_value`), narrowing the offset field from 42 to 41
+    /// bits (2 TiB). Readers select the value layout by this version:
+    /// `V1`–`V6` values keep their 42-bit offsets, so a legacy value
+    /// whose offset happens to be odd is never mistaken for a short term.
+    /// Multi-block terms are byte-identical to `V6`.
+    ///
+    /// Readers accept `V1`–`V7`.
+    pub const VERSION_V7: u32 = 7;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.

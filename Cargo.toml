@@ -462,6 +462,12 @@ required-features = ["test-helpers"]
 name = "profile_fts_build"
 required-features = ["test-helpers"]
 
+# `index_size_report` reads superfiles through the format-layer reader
+# and builds one from a corpus through the supertable layer.
+[[example]]
+name = "index_size_report"
+required-features = ["test-helpers"]
+
 # `locomo-recall` uses only the public `infino::*` surface (connect, create_table,
 # the search methods, query_sql), so no `test-helpers`. Multi-file example:
 # examples/locomo-recall/{main.rs, embed.mjs, fixture.json, README.md}.

@@ -29,6 +29,7 @@ use crate::superfile::{
         bm25,
         builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{self, BLOCK_LEN, decode_block, decode_block_doc_ids},
+        short::{ShortPositions, decode_short},
     },
 };
 
@@ -76,6 +77,13 @@ pub(super) struct TermMeta {
     /// later). `false` for V1–V4 — the ranked walk then skips the coarse
     /// level.
     pub(super) has_coarse: bool,
+    /// A short-form term (`fts::short`, V7): one block, no header, skip
+    /// table, sub-index or coarse table in its bytes. Only `df`,
+    /// `num_blocks == 1` and the positions fields are meaningful; the
+    /// per-block accessors that read the skip table must not be called.
+    /// Its one block's position runs start at offset 0 of the term's
+    /// positions bytes.
+    pub(super) short: bool,
 }
 
 impl TermMeta {
@@ -188,7 +196,27 @@ impl TermMeta {
             coarse_start,
             blocks_end_in_term,
             has_coarse,
+            short: false,
         })
+    }
+
+    /// The metadata a short-form term implies: it has no header to
+    /// parse, so the phrase path builds this from the decoded body's
+    /// `df` and positional trailer instead.
+    pub(super) fn for_short(df: u64, positions: Option<ShortPositions>) -> Self {
+        let p = positions.unwrap_or_default();
+        Self {
+            df,
+            num_blocks: 1,
+            skip_start: 0,
+            positions_offset: p.offset,
+            positions_length: p.length,
+            subindex_start: None,
+            coarse_start: 0,
+            blocks_end_in_term: 0,
+            has_coarse: false,
+            short: true,
+        }
     }
 
     /// Raw coarse slot `g`, bounding every block in span `g` (blocks
@@ -232,6 +260,7 @@ impl TermMeta {
     /// streams entries without materializing a `Vec`.
     #[inline]
     pub(super) fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, u32) {
+        debug_assert!(!self.short, "a short-form term has no skip table");
         debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
         let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
         let last_doc_id = read_u32_le(
@@ -255,6 +284,10 @@ impl TermMeta {
     #[inline]
     pub(super) fn positions_block_offset(&self, postings: &[u8], i: usize) -> u32 {
         debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
+        if self.short {
+            // One block whose runs are the whole of the term's positions.
+            return 0;
+        }
         let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
         read_u32_le(
             &postings[entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF
@@ -389,6 +422,12 @@ pub(crate) struct TermCursor {
     /// without expanding the block's doc ids. Lets the probe reuse the
     /// decoded tfs across a run of candidates landing in the same block.
     pub(super) tf_decoded_block: usize,
+    /// The whole posting list is already in `block_doc_ids[..block_n]` /
+    /// `block_tfs[..block_n]` and `blocks` has exactly one entry with no
+    /// bytes behind it: the df=1 inline form and the short form
+    /// (`fts::short`). Such a cursor never decodes; the membership probes
+    /// binary-search the buffer instead of reading a block encoding.
+    pub(super) predecoded: bool,
 }
 
 impl TermCursor {
@@ -466,11 +505,73 @@ impl TermCursor {
             count_only,
             decoded_block: usize::MAX,
             tf_decoded_block: usize::MAX,
+            predecoded: false,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
         }
         Ok(cursor)
+    }
+
+    /// Build a cursor from a short-form body (`fts::short`): decode the
+    /// whole list — at most one block — into the cursor's buffers and
+    /// synthesize its single block's metadata. The block's upper bound
+    /// is computed here, at the query's own statistics, as the maximum
+    /// per-doc score over the decoded postings: exact, and no stored
+    /// slot to decode. `body` is kept as `bytes` so the work tallies
+    /// count the range that was fetched.
+    pub(super) fn new_short(
+        body: Bytes,
+        col: &ColumnMeta,
+        global_idf: Option<f32>,
+        weight: u32,
+        header_probed: bool,
+    ) -> Result<Self, FtsError> {
+        let mut block_doc_ids = vec![0u32; BLOCK_LEN];
+        let mut block_tfs = vec![0u32; BLOCK_LEN];
+        let decoded = decode_short(
+            body.as_ref(),
+            col.positions,
+            &mut block_doc_ids,
+            &mut block_tfs,
+        )
+        .ok_or_else(|| {
+            FtsError::Read(ReadError::MalformedVersion(
+                "malformed short-form term body".into(),
+            ))
+        })?;
+        let n = decoded.n;
+        let local_idf = bm25::idf(col.scored_doc_count(), n as u64);
+        let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
+        let block_max_bm25 = block_doc_ids[..n]
+            .iter()
+            .zip(&block_tfs[..n])
+            .map(|(&d, &t)| bm25::score_with_dl_norm_k1(idf_weight, t, col.dl_norm_k1.get(d)))
+            .fold(0.0f32, f32::max);
+        let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
+            last_doc_id: block_doc_ids[n - 1],
+            block_byte_offset: 0,
+            block_byte_end: 0,
+            block_max_bm25,
+        }]);
+        Ok(Self {
+            idf_weight,
+            term_max_bm25: block_max_bm25,
+            df: n as u64,
+            blocks,
+            block_doc_ids,
+            block_tfs,
+            block_n: n,
+            current_block: 0,
+            pos: 0,
+            inspect_block: 0,
+            bytes: body,
+            header_probed,
+            count_only: false,
+            decoded_block: 0,
+            tf_decoded_block: 0,
+            predecoded: true,
+        })
     }
 
     /// Synthesize a cursor for a df=1 inline-encoded term. Skips the
@@ -526,10 +627,12 @@ impl TermCursor {
             count_only: false,
             decoded_block: 0,
             tf_decoded_block: 0,
+            predecoded: true,
         }
     }
 
     pub(super) fn decode_current_block(&mut self) {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
         let block = self.blocks[self.current_block];
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
@@ -565,9 +668,12 @@ impl TermCursor {
         if self.current_block >= self.blocks.len() {
             return false;
         }
-        // Inline (df=1) cursor: single pre-decoded doc, no postings bytes.
-        if self.bytes.is_empty() {
-            return self.block_n > 0 && self.block_doc_ids[0] == doc;
+        // Pre-decoded (inline or short-form) cursor: the whole list is in
+        // the buffer, no block bytes to read.
+        if self.predecoded {
+            return self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .is_ok();
         }
         let block = self.blocks[self.current_block];
         // Borrow the block's bytes in place — `self.bytes` is held for the
@@ -660,12 +766,12 @@ impl TermCursor {
         if self.current_block >= self.blocks.len() {
             return None;
         }
-        // Inline (df=1) cursor: single pre-decoded posting, no postings bytes.
-        if self.bytes.is_empty() {
-            if self.block_n > 0 && self.block_doc_ids[0] == doc {
-                return Some(self.block_tfs[0]);
-            }
-            return None;
+        // Pre-decoded (inline or short-form) cursor: locate in the buffer.
+        if self.predecoded {
+            return self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .ok()
+                .map(|i| self.block_tfs[i]);
         }
         let block = self.blocks[self.current_block];
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
@@ -968,9 +1074,12 @@ impl TermCursor {
     /// it doesn't shift their code offsets — those methods drive the flat-merge
     /// AND path, which is measurably sensitive to its own instruction layout.
     pub(super) fn tf_at_contained(&mut self, doc: u32) -> u32 {
-        // Inline (df=1) cursor: single pre-decoded posting.
-        if self.bytes.is_empty() {
-            return self.block_tfs[0];
+        // Pre-decoded (inline or short-form) cursor: locate in the buffer.
+        if self.predecoded {
+            let pos = self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .expect("contains(doc) confirmed presence");
+            return self.block_tfs[pos];
         }
         let block = self.blocks[self.current_block];
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
@@ -1008,8 +1117,8 @@ impl TermCursor {
     /// out-of-line so it stays clear of the hot doc-cursor methods' layout.
     #[cold]
     pub(super) fn is_bitset_dense(&self) -> bool {
-        if self.bytes.is_empty() {
-            return false; // inline df=1 cursor: no postings bytes
+        if self.predecoded {
+            return false; // inline / short-form cursor: no block bytes
         }
         match self.blocks.first() {
             Some(block) => {

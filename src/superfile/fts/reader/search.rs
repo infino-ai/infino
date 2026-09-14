@@ -30,6 +30,7 @@ use crate::{
         op_stats::{metering_active, timed_section},
     },
     superfile::{
+        ReadError,
         error::FtsError,
         format,
         fts::{
@@ -37,6 +38,7 @@ use crate::{
             dict::make_key,
             fst_value::FstValue,
             posting::{BLOCK_LEN, decode_block},
+            short::{decode_short, short_df},
         },
     },
 };
@@ -48,7 +50,9 @@ use crate::{
 pub(crate) enum FetchedTermSlot {
     /// df=1 inline dictionary slot (no postings-region bytes exist).
     Inline { doc_id: u32, tf: u32 },
-    /// PFOR term: the fetched metadata+skip+blocks range and its df.
+    /// Postings-form term: the fetched range and its df. `short` says
+    /// whether the range is a short-form body or the long form's
+    /// metadata + skip table + blocks.
     Pfor {
         bytes: Bytes,
         /// The dictionary slot carried no length hint, so the fetch paid
@@ -56,6 +60,7 @@ pub(crate) enum FetchedTermSlot {
         /// the cursor built from these bytes must keep reporting.
         header_probed: bool,
         df: u64,
+        short: bool,
     },
 }
 
@@ -970,8 +975,15 @@ impl FtsReader {
         // wave fetched), else via the dictionary.
         enum SingleSource {
             Absent,
-            Inline { doc_id: u32, tf: u32 },
-            Bytes { bytes: Bytes, header_probed: bool },
+            Inline {
+                doc_id: u32,
+                tf: u32,
+            },
+            Bytes {
+                bytes: Bytes,
+                header_probed: bool,
+                short: bool,
+            },
         }
         let source = if let Some(entry) = prefetched.and_then(|m| m.lookup(term)) {
             match entry {
@@ -980,10 +992,12 @@ impl FtsReader {
                 Some(FetchedTermSlot::Pfor {
                     bytes,
                     header_probed,
+                    short,
                     ..
                 }) => SingleSource::Bytes {
                     bytes,
                     header_probed,
+                    short,
                 },
             }
         } else {
@@ -992,11 +1006,12 @@ impl FtsReader {
             let key = make_key(&col_meta.name, term);
             match dict.lookup(&key) {
                 None => SingleSource::Absent,
-                Some(packed) => match FstValue::unpack(packed) {
+                Some(packed) => match FstValue::unpack(packed, self.value_layout) {
                     FstValue::Inline { doc_id, tf } => SingleSource::Inline { doc_id, tf },
                     FstValue::Pfor {
                         metadata_offset,
                         postings_length_hint,
+                        short,
                     } => {
                         // Fetch only this term's byte range (metadata header
                         // + skip table + blocks). The returned buffer starts
@@ -1011,6 +1026,7 @@ impl FtsReader {
                         SingleSource::Bytes {
                             bytes: fetched.pop().expect("one fetched range for one PFOR term"),
                             header_probed: postings_length_hint.is_none(),
+                            short,
                         }
                     }
                 },
@@ -1051,6 +1067,60 @@ impl FtsReader {
             SingleSource::Bytes {
                 bytes,
                 header_probed,
+                short: true,
+            } => {
+                // Short-form term: one block already, so there is nothing
+                // to skip — decode the body and score every posting.
+                let kernel_start = metering_active().then(thread_cpu_ns).flatten();
+                let mut buf_d = [0u32; BLOCK_LEN];
+                let mut buf_t = [0u32; BLOCK_LEN];
+                let decoded =
+                    decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t)
+                        .ok_or_else(|| {
+                            FtsError::Read(ReadError::MalformedVersion(
+                                "malformed short-form term body".into(),
+                            ))
+                        })?;
+                let idf_weight = global_idf
+                    .unwrap_or_else(|| bm25::idf(col_meta.scored_doc_count(), decoded.n as u64));
+                let dl_norm_k1 = &col_meta.dl_norm_k1;
+                let mut heap: BinaryHeap<TopKEntry> =
+                    BinaryHeap::with_capacity(k.min(decoded.n).max(1));
+                for j in 0..decoded.n {
+                    let doc_id = buf_d[j];
+                    if let Some(f) = filter.as_deref_mut()
+                        && !f.admits(doc_id)
+                    {
+                        continue;
+                    }
+                    let score =
+                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(doc_id));
+                    if score <= floor_eff {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push(TopKEntry(score, doc_id));
+                    } else if let Some(TopKEntry(min_score, _)) = heap.peek()
+                        && score > *min_score
+                    {
+                        heap.pop();
+                        heap.push(TopKEntry(score, doc_id));
+                    }
+                }
+                return Ok((
+                    drain_top_k_desc(heap),
+                    MatchWork {
+                        postings_bytes: bytes.len() as u64,
+                        planned_ranges: 1 + u64::from(header_probed),
+                        kernel_cpu_ns: 0,
+                    },
+                    thread_cpu_delta_ns(kernel_start),
+                ));
+            }
+            SingleSource::Bytes {
+                bytes,
+                header_probed,
+                short: false,
             } => (bytes, header_probed),
         };
         let postings = term_bytes.as_ref();
@@ -1348,29 +1418,31 @@ impl FtsReader {
         // coalesced fetch (mirrors `build_term_cursors_opt`).
         enum Pre {
             Inline { doc_id: u32, tf: u32 },
-            Pfor { header_probed: bool },
+            Pfor { header_probed: bool, short: bool },
         }
         let mut resolved: Vec<(Box<str>, Option<Pre>)> = Vec::with_capacity(terms.len());
         let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();
         for term in terms {
             let key = make_key(&col_meta.name, term);
-            let pre = dict
-                .lookup(&key)
-                .map(|packed| match FstValue::unpack(packed) {
-                    FstValue::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
-                    FstValue::Pfor {
-                        metadata_offset,
-                        postings_length_hint,
-                    } => {
-                        pfor_offsets.push((
-                            metadata_offset as usize,
-                            postings_length_hint.map(|len| len as usize),
-                        ));
-                        Pre::Pfor {
-                            header_probed: postings_length_hint.is_none(),
+            let pre =
+                dict.lookup(&key)
+                    .map(|packed| match FstValue::unpack(packed, self.value_layout) {
+                        FstValue::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
+                        FstValue::Pfor {
+                            metadata_offset,
+                            postings_length_hint,
+                            short,
+                        } => {
+                            pfor_offsets.push((
+                                metadata_offset as usize,
+                                postings_length_hint.map(|len| len as usize),
+                            ));
+                            Pre::Pfor {
+                                header_probed: postings_length_hint.is_none(),
+                                short,
+                            }
                         }
-                    }
-                });
+                    });
             resolved.push((Box::from(*term), pre));
         }
         let pfor_bytes = self.fetch_term_postings(&pfor_offsets).await?;
@@ -1382,22 +1454,36 @@ impl FtsReader {
             let slot = match pre {
                 None => None,
                 Some(Pre::Inline { doc_id, tf }) => Some(FetchedTermSlot::Inline { doc_id, tf }),
-                Some(Pre::Pfor { header_probed }) => {
+                Some(Pre::Pfor {
+                    header_probed,
+                    short,
+                }) => {
                     let bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    // df sits in the term's metadata header at the head of
-                    // the fetched range — the same parse the cursor build
-                    // repeats (CPU-only, no extra read).
-                    let term_meta = TermMeta::parse(
-                        bytes.as_ref(),
-                        0,
-                        col_meta.positions,
-                        false,
-                        self.bounds.has_coarse(),
-                    )?;
+                    // df heads the fetched range in either form — the long
+                    // form's metadata header, the short body's leading
+                    // varint (CPU-only, no extra read).
+                    let df = match short {
+                        true => u64::from(short_df(bytes.as_ref()).ok_or_else(|| {
+                            FtsError::Read(ReadError::MalformedVersion(
+                                "malformed short-form term body".into(),
+                            ))
+                        })?),
+                        false => {
+                            TermMeta::parse(
+                                bytes.as_ref(),
+                                0,
+                                col_meta.positions,
+                                false,
+                                self.bounds.has_coarse(),
+                            )?
+                            .df
+                        }
+                    };
                     Some(FetchedTermSlot::Pfor {
                         bytes,
                         header_probed,
-                        df: term_meta.df,
+                        df,
+                        short,
                     })
                 }
             };
@@ -1451,6 +1537,7 @@ impl FtsReader {
             Pfor {
                 gidf: Option<f32>,
                 header_probed: bool,
+                short: bool,
             },
         }
         let all_prefetched = prefetched.is_some_and(|m| terms.iter().all(|t| m.contains(t)));
@@ -1478,13 +1565,14 @@ impl FtsReader {
                 resolved.push(None);
                 continue;
             };
-            match FstValue::unpack(packed) {
+            match FstValue::unpack(packed, self.value_layout) {
                 FstValue::Inline { doc_id, tf } => {
                     resolved.push(Some(Resolved::Inline { doc_id, tf, gidf }));
                 }
                 FstValue::Pfor {
                     metadata_offset,
                     postings_length_hint,
+                    short,
                 } => {
                     pfor_offsets.push((
                         metadata_offset as usize,
@@ -1496,6 +1584,7 @@ impl FtsReader {
                     resolved.push(Some(Resolved::Pfor {
                         gidf,
                         header_probed: postings_length_hint.is_none(),
+                        short,
                     }));
                 }
             }
@@ -1538,19 +1627,25 @@ impl FtsReader {
                         FetchedTermSlot::Pfor {
                             bytes,
                             header_probed,
+                            short,
                             ..
                         },
                     gidf,
                 }) => {
-                    let cursor = TermCursor::new(
-                        bytes,
-                        col_meta,
-                        self.bounds,
-                        gidf,
-                        weight,
-                        header_probed,
-                        count_only,
-                    )?;
+                    let cursor = match short {
+                        true => {
+                            TermCursor::new_short(bytes, col_meta, gidf, weight, header_probed)?
+                        }
+                        false => TermCursor::new(
+                            bytes,
+                            col_meta,
+                            self.bounds,
+                            gidf,
+                            weight,
+                            header_probed,
+                            count_only,
+                        )?,
+                    };
                     cursors.push(Some(cursor));
                 }
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
@@ -1578,17 +1673,27 @@ impl FtsReader {
                 Some(Resolved::Pfor {
                     gidf,
                     header_probed,
+                    short,
                 }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    let cursor = TermCursor::new(
-                        term_bytes,
-                        col_meta,
-                        self.bounds,
-                        gidf,
-                        weight,
-                        header_probed,
-                        count_only,
-                    )?;
+                    let cursor = match short {
+                        true => TermCursor::new_short(
+                            term_bytes,
+                            col_meta,
+                            gidf,
+                            weight,
+                            header_probed,
+                        )?,
+                        false => TermCursor::new(
+                            term_bytes,
+                            col_meta,
+                            self.bounds,
+                            gidf,
+                            weight,
+                            header_probed,
+                            count_only,
+                        )?,
+                    };
                     cursors.push(Some(cursor));
                 }
             }

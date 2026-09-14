@@ -57,6 +57,7 @@ use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
+        error::FtsError,
         format::{self, footer, kv},
         fts::{
             bm25::Bm25Params,
@@ -633,6 +634,58 @@ impl SuperfileReader {
     /// Underlying FTS reader. `None` if this superfile has no FTS index.
     pub fn fts(&self) -> Option<&FtsReader> {
         self.fts.as_ref()
+    }
+
+    /// Attribute every byte of a resident superfile to a region — the
+    /// Parquet row groups (per column), the `_id` sidecar, the vector
+    /// index, the FTS blob (itself broken down per term band by
+    /// [`FtsReader::size_breakdown`]) and the footer. A report over the
+    /// whole file, never a query path; `None` when the reader is not
+    /// fully resident (a lazy object-store open), since the total is the
+    /// resident length.
+    pub fn size_breakdown(&self) -> Result<Option<SuperfileSizeBreakdown>, ReadError> {
+        let Some(bytes) = self.bytes.as_ref() else {
+            return Ok(None);
+        };
+        let kv_map = footer::extract_kv_map(&self.parquet_meta).map_err(ReadError::Footer)?;
+        let kv_len = |key: &str| -> u64 {
+            kv_map
+                .get(key)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mut columns: Vec<(String, u64)> = Vec::new();
+        let mut row_group_bytes = 0u64;
+        for rg in self.parquet_meta.row_groups() {
+            for c in rg.columns() {
+                let size = c.compressed_size().max(0) as u64;
+                row_group_bytes += size;
+                let name = c.column_path().string();
+                match columns.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, b)) => *b += size,
+                    None => columns.push((name, size)),
+                }
+            }
+        }
+        let fts = match &self.fts {
+            Some(r) => Some(r.size_breakdown().map_err(fts_reader_error_to_read)?),
+            None => None,
+        };
+        Ok(Some(SuperfileSizeBreakdown {
+            total_bytes: bytes.len() as u64,
+            n_docs: self.n_docs,
+            row_groups: self.parquet_meta.row_groups().len() as u64,
+            row_group_bytes,
+            columns,
+            id_sidecar_bytes: self
+                .id_sidecar
+                .as_ref()
+                .map(|r| r.len() as u64)
+                .unwrap_or(0),
+            vec_bytes: kv_len(kv::VEC_LENGTH),
+            fts_bytes: kv_len(kv::FTS_LENGTH),
+            fts,
+        }))
     }
 
     /// Vector column names in declaration order, or empty.
@@ -2081,6 +2134,100 @@ pub(crate) fn rank_back_indices(ids: &[u32], sorted: &[u32]) -> UInt32Array {
         builder.append_value(row as u32);
     }
     builder.finish()
+}
+
+/// Whole-file byte attribution; see [`SuperfileReader::size_breakdown`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuperfileSizeBreakdown {
+    pub total_bytes: u64,
+    pub n_docs: u64,
+    pub row_groups: u64,
+    /// Compressed bytes of every Parquet column chunk, and per column.
+    pub row_group_bytes: u64,
+    pub columns: Vec<(String, u64)>,
+    pub id_sidecar_bytes: u64,
+    pub vec_bytes: u64,
+    pub fts_bytes: u64,
+    pub fts: Option<fts_reader::FtsSizeBreakdown>,
+}
+
+impl SuperfileSizeBreakdown {
+    /// Bytes not covered by any region above: the Parquet footer, page
+    /// indexes and region trailers.
+    pub fn other_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(
+            self.row_group_bytes + self.id_sidecar_bytes + self.vec_bytes + self.fts_bytes,
+        )
+    }
+}
+
+/// Bytes per mebibyte, for the report.
+const SIZE_REPORT_BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+impl fmt::Display for SuperfileSizeBreakdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mib = |b: u64| b as f64 / SIZE_REPORT_BYTES_PER_MIB;
+        writeln!(
+            f,
+            "superfile: {} docs, {} B ({:.2} MiB)",
+            self.n_docs,
+            self.total_bytes,
+            mib(self.total_bytes)
+        )?;
+        writeln!(
+            f,
+            "  parquet row groups ({})  {:>12} B  {:>9.2} MiB",
+            self.row_groups,
+            self.row_group_bytes,
+            mib(self.row_group_bytes)
+        )?;
+        for (name, b) in &self.columns {
+            writeln!(
+                f,
+                "    column {:<18} {:>12} B  {:>9.2} MiB",
+                name,
+                b,
+                mib(*b)
+            )?;
+        }
+        writeln!(
+            f,
+            "  id sidecar              {:>12} B  {:>9.2} MiB",
+            self.id_sidecar_bytes,
+            mib(self.id_sidecar_bytes)
+        )?;
+        writeln!(
+            f,
+            "  vector index            {:>12} B  {:>9.2} MiB",
+            self.vec_bytes,
+            mib(self.vec_bytes)
+        )?;
+        writeln!(
+            f,
+            "  fts blob                {:>12} B  {:>9.2} MiB",
+            self.fts_bytes,
+            mib(self.fts_bytes)
+        )?;
+        writeln!(
+            f,
+            "  footer + trailers       {:>12} B  {:>9.2} MiB",
+            self.other_bytes(),
+            mib(self.other_bytes())
+        )?;
+        if let Some(fts) = &self.fts {
+            write!(f, "{fts}")?;
+        }
+        Ok(())
+    }
+}
+
+/// An FTS read error surfaced by the size report is a read error of the
+/// file it was read from.
+fn fts_reader_error_to_read(e: FtsError) -> ReadError {
+    match e {
+        FtsError::Read(r) => r,
+        other => ReadError::MalformedVersion(other.to_string()),
+    }
 }
 
 #[cfg(test)]

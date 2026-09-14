@@ -12,4 +12,5 @@ pub(crate) mod fst_value;
 pub(crate) mod positions;
 pub mod posting;
 pub mod reader;
+pub(crate) mod short;
 pub mod tokenize;

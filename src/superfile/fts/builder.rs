@@ -100,10 +100,11 @@ use crate::superfile::{
         analysis::ChainTokenizer,
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
-        fst_value::{FstValue, INLINE_TF_MAX},
+        fst_value::{FstValue, INLINE_TF_MAX, ValueLayout},
         positions::{encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         reader::ColumnLengthStats,
+        short::{SHORT_MAX_DF, ShortPositions, encode_short},
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
 };
@@ -173,6 +174,7 @@ struct FinishProfile {
     saw_bitset_block: bool,
     encode_calls: u64,
     encode_df1: u64,
+    encode_short: u64,
     encode_pfor: u64,
     encode_total: Duration,
     encode_block_build: Duration,
@@ -312,6 +314,10 @@ const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))] // the older versions are written only by tests
 pub(crate) enum BlobEra {
+    /// [`format::fts::VERSION_V7`]: as [`Self::V6`], plus single-block
+    /// terms in the short form and the short/long flag in every
+    /// dictionary value.
+    V7,
     /// [`format::fts::VERSION_V6`]: coarse table, bounds in the scorer's
     /// scale, the declared average over documents with tokens.
     V6,
@@ -330,10 +336,24 @@ impl BlobEra {
         self != Self::V2ToV4
     }
 
+    /// Whether a single-block term is written in the short form
+    /// (`fts::short`) rather than as header + skip table + PFOR block.
+    fn has_short_form(self) -> bool {
+        self == Self::V7
+    }
+
+    /// How this era packs a postings-form dictionary value.
+    fn value_layout(self) -> ValueLayout {
+        match self {
+            Self::V7 => ValueLayout::Flagged,
+            Self::V6 | Self::V5 | Self::V2ToV4 => ValueLayout::Legacy,
+        }
+    }
+
     /// The factor a stored bound of this era carries over the score.
     fn bound_scale(self, params: bm25::Bm25Params) -> f32 {
         match self {
-            Self::V6 => 1.0,
+            Self::V7 | Self::V6 => 1.0,
             Self::V5 | Self::V2ToV4 => params.k1 + 1.0,
         }
     }
@@ -341,7 +361,7 @@ impl BlobEra {
     /// Whether the statistics divide by every row (the pre-current
     /// defect) rather than by the documents that carry tokens.
     fn averages_over_rows(self) -> bool {
-        self != Self::V6
+        !matches!(self, Self::V7 | Self::V6)
     }
 }
 
@@ -1334,7 +1354,7 @@ pub struct FtsBuilder {
     /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
     /// ::Spilled`) keyed by `term_id` instead.
     bump: Bump,
-    /// Which blob era to emit. Always [`BlobEra::V6`] in production;
+    /// Which blob era to emit. Always [`BlobEra::V7`] in production;
     /// the backwards-compatibility tests pick an older one so the reader's
     /// legacy paths are exercised against faithfully written files.
     pub(crate) era: BlobEra,
@@ -1392,7 +1412,7 @@ impl FtsBuilder {
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
             bump: Bump::new(),
-            era: BlobEra::V6,
+            era: BlobEra::V7,
         }
     }
 
@@ -3531,6 +3551,7 @@ fn assemble_and_write_blob<W: Write>(
     // so the stored per-block bound is interpreted against the pair that
     // entry names. Nothing about the layout differs either way.
     let fts_version = match era {
+        BlobEra::V7 => format::fts::VERSION_V7,
         BlobEra::V6 => format::fts::VERSION_V6,
         BlobEra::V5 => format::fts::VERSION_V5,
         BlobEra::V2ToV4 if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
@@ -3873,6 +3894,34 @@ fn encode_and_emit_term<W: Write>(
     let fst_value: u64 = if let Some(v) = inline_value {
         profile.encode_df1 += 1;
         v
+    } else if era.has_short_form() && pairs.len() <= SHORT_MAX_DF {
+        // Single-block term: the short form (`fts::short`) — no header,
+        // skip entry, sub-index row, coarse slot or block header, and no
+        // lane padding. Its position runs go to the positions region
+        // exactly as a long term's do; the body's trailer says where.
+        profile.encode_short += 1;
+        let metadata_offset = *postings_len;
+        let positions = match term_positions.as_mut() {
+            Some((sink, runs)) => {
+                let p = ShortPositions {
+                    offset: sink.len,
+                    length: runs.len() as u32,
+                };
+                sink.write(runs)?;
+                Some(p)
+            }
+            None => None,
+        };
+        let term_buf = &mut scratch.term_buf;
+        term_buf.clear();
+        encode_short(term_buf, pairs, positions);
+        write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
+        FstValue::pack_pfor(
+            metadata_offset,
+            term_buf.len() as u32,
+            era.value_layout(),
+            true,
+        )
     } else {
         profile.encode_pfor += 1;
         let idf_t = bm25::idf(n_scored_docs as u64, df);
@@ -4135,7 +4184,12 @@ fn encode_and_emit_term<W: Write>(
             sink.write(runs)?;
         }
 
-        FstValue::pack_pfor(metadata_offset, postings_length as u32)
+        FstValue::pack_pfor(
+            metadata_offset,
+            postings_length as u32,
+            era.value_layout(),
+            false,
+        )
     };
 
     let fst_insert_start = profile.enabled.then(Instant::now);
@@ -4482,9 +4536,9 @@ mod tests {
 
         // Magic.
         assert_eq!(&blob[0..8], format::fts::MAGIC);
-        // Version — new code always writes the current version (coarse block-max table).
+        // Version — new code always writes the current version.
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_V6);
+        assert_eq!(version, format::fts::VERSION_V7);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -5279,7 +5333,7 @@ mod tests {
             ver(&legacy) < format::fts::VERSION_V5,
             "legacy must predate the coarse table"
         );
-        assert_eq!(ver(&current), format::fts::VERSION_V6);
+        assert_eq!(ver(&current), format::fts::VERSION_V7);
 
         let r_legacy = FtsReader::open(legacy, title_json(false)).expect("legacy opens");
         let r_current = FtsReader::open(current, title_json(false)).expect("current opens");
@@ -5455,7 +5509,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V6
+            format::fts::VERSION_V7
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");
