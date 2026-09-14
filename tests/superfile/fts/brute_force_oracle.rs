@@ -315,6 +315,72 @@ async fn oracle_three_term_query_top5_set_matches() {
 /// short high-tf anchor docs whose scores strictly decrease, giving a
 /// tie-free top-5 head. Large enough (`n`) that a k=1000 search exercises
 /// a genuinely deep top-k, not "return everything".
+/// Every third row is null for the column, on a corpus whose scores are
+/// otherwise exact (all lengths below the length quantizer's exact
+/// range). BM25 is defined over the documents that carry the field, so
+/// the empty rows must enter neither the average length nor the
+/// collection size — dividing by rows instead deflates the average and
+/// inflates idf for every term, and this asserts the engine's scores
+/// against the oracle's by value, not just by rank, so either mistake
+/// fails here rather than only shifting an order.
+#[tokio::test]
+async fn oracle_sparse_column_scores_match_by_value() {
+    let dense = [
+        "rust async runtime tokio",
+        "rust embedded systems",
+        "python data pipeline pandas numpy",
+        "python machine learning",
+        "javascript web frontend react vue svelte",
+        "rust python interop",
+        "go concurrency channels",
+        "rust rust rust systems",
+    ];
+    // Interleave a null row after every second document.
+    let corp: Vec<(u64, &str)> = dense
+        .iter()
+        .flat_map(|d| [*d, ""])
+        .chain(["", ""])
+        .enumerate()
+        .map(|(i, d)| (i as u64, d))
+        .collect();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+    for (query, mode) in [
+        ("rust", BoolMode::Or),
+        ("python data", BoolMode::Or),
+        ("rust systems", BoolMode::And),
+        ("javascript svelte", BoolMode::And),
+    ] {
+        let got: HashMap<u64, f32> = infino
+            .bm25_hits_async("title", query, corp.len(), mode)
+            .await
+            .expect("BM25 search")
+            .into_iter()
+            .map(|(d, s)| (d as u64, s))
+            .collect();
+        let terms: Vec<String> = tok.tokenize(query).collect();
+        let want: HashMap<u64, f32> = match mode {
+            BoolMode::Or => oracle.top_k_terms(&terms, corp.len()),
+            BoolMode::And => oracle.top_k_terms_and(&terms, corp.len()),
+        }
+        .into_iter()
+        .collect();
+        assert_eq!(
+            got.keys().collect::<HashSet<_>>(),
+            want.keys().collect::<HashSet<_>>(),
+            "{query:?} {mode:?}: match sets"
+        );
+        for (doc, score) in &got {
+            let expected = want[doc];
+            assert!(
+                (score - expected).abs() < BM25_SCORE_ABS_TOLERANCE,
+                "{query:?} {mode:?} doc {doc}: engine {score} vs oracle {expected}"
+            );
+        }
+    }
+}
+
 fn common_heavy_corpus(n: u64) -> Vec<(u64, String)> {
     let terms = ["alpha", "beta", "gamma", "delta"];
     let mut docs = Vec::with_capacity(n as usize);
