@@ -594,7 +594,7 @@ mod tests {
     fn sparse_reader() -> FtsReader {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         FtsReader::open(
-            Bytes::from(sparse_builder(BlobEra::Current).finish().expect("finish")),
+            Bytes::from(sparse_builder(BlobEra::V6).finish().expect("finish")),
             json,
         )
         .expect("open")
@@ -671,7 +671,7 @@ mod tests {
         // on top of the `(k1 + 1)` those files carry. If this regresses,
         // block-max pruning silently drops documents from the top-k.
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
-        for era in [BlobEra::LegacyV5, BlobEra::NoCoarse] {
+        for era in [BlobEra::V5, BlobEra::V2ToV4] {
             let blob = Bytes::from(sparse_builder(era).finish().expect("finish"));
             let r = FtsReader::open(blob, json).expect("open");
             let col = &r.columns[0];

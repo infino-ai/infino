@@ -566,17 +566,14 @@ impl FtsReader {
             }));
         }
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION_V1_LEGACY
-            && version != format::fts::VERSION_V2
-            && version != format::fts::VERSION_V3
-            && version != format::fts::VERSION_V4
-            && version != format::fts::VERSION_V5
-            && version != format::fts::VERSION_V6
-        {
-            return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
+        // The slot mapping is the accept list: a version it has no arm
+        // for is refused here rather than read under another version's
+        // rules.
+        StoredBound::for_version(version).ok_or_else(|| {
+            FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
-            ))));
-        }
+            )))
+        })?;
         // The FST directory starts right after whichever header
         // applies; a v2/v3/v4 header's extension bytes are already in the
         // fetched span (and in the overlay below), so
@@ -692,7 +689,11 @@ impl FtsReader {
         let has_bitset_blocks = version == format::fts::VERSION_V4
             || version == format::fts::VERSION_V5
             || version == format::fts::VERSION_V6;
-        let bounds = StoredBound::for_version(version);
+        let bounds = StoredBound::for_version(version).ok_or_else(|| {
+            FtsError::Read(ReadError::UnsupportedVersion(format!(
+                "fts section version {version}"
+            )))
+        })?;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -1994,7 +1995,7 @@ mod tests {
 
     #[test]
     fn current_version_bounds_need_no_scale_correction() {
-        let (blob, json) = versioned_blob(BlobEra::Current);
+        let (blob, json) = versioned_blob(BlobEra::V6);
         assert_eq!(
             read_u32_le(&blob[VERSION_FIELD]),
             format::fts::VERSION_V6,
@@ -2014,7 +2015,7 @@ mod tests {
         // otherwise they sit a uniform 2.2x above the scores they cap
         // and block-max pruning stops doing its job on every file
         // written before this.
-        let (blob, json) = versioned_blob(BlobEra::NoCoarse);
+        let (blob, json) = versioned_blob(BlobEra::V2ToV4);
         assert!(
             read_u32_le(&blob[VERSION_FIELD]) < format::fts::VERSION_V6,
             "a no-coarse build must stamp a pre-current version"
@@ -2043,7 +2044,7 @@ mod tests {
         // and the opposite mistake, reading a current blob as legacy,
         // would divide bounds that are already right and silently prune
         // real hits out of the top-k.
-        let (current, json) = versioned_blob(BlobEra::Current);
+        let (current, json) = versioned_blob(BlobEra::V6);
         let previous = stamped(&current, format::fts::VERSION_V5);
 
         let r = FtsReader::open(previous, json).expect("the previous version still opens");
@@ -2069,7 +2070,7 @@ mod tests {
             format::fts::VERSION_V5,
             format::fts::VERSION_V6,
         ] {
-            let (current, json) = versioned_blob(BlobEra::Current);
+            let (current, json) = versioned_blob(BlobEra::V6);
             let r = FtsReader::open(stamped(&current, v), json)
                 .unwrap_or_else(|e| panic!("version {v} must open: {e}"));
             assert!(
@@ -2087,7 +2088,7 @@ mod tests {
         // must agree on everything scoring reads — otherwise a query
         // would score differently depending on whether it happened to
         // be the first to ask.
-        let (blob, json) = versioned_blob(BlobEra::Current);
+        let (blob, json) = versioned_blob(BlobEra::V6);
         let r = FtsReader::open(blob, json).expect("open");
         let over = bm25::Bm25Params::new(1.4, 0.6);
         let first = r.with_bm25_override(over);
@@ -2112,7 +2113,7 @@ mod tests {
         // The writer bakes the table-wide average into the file, so the
         // reader takes it as given: no correction, no inflation. An
         // older file declared its row-count average and is corrected.
-        let (blob, json) = versioned_blob(BlobEra::Current);
+        let (blob, json) = versioned_blob(BlobEra::V6);
         let r = FtsReader::open(blob, json).expect("open");
         let col = &r.columns[0];
         assert_eq!(col.bound_scale, 1.0);
@@ -2177,9 +2178,9 @@ mod tests {
         // that is null for every other row. The reader corrects the
         // average, inflates the bounds, and must return the same top-k
         // with the same scores as a fresh file of the same documents.
-        let json = tied_corpus(BlobEra::Current, true).1;
-        let fresh = FtsReader::open(tied_corpus(BlobEra::Current, true).0, json).expect("open");
-        for era in [BlobEra::LegacyV5, BlobEra::NoCoarse] {
+        let json = tied_corpus(BlobEra::V6, true).1;
+        let fresh = FtsReader::open(tied_corpus(BlobEra::V6, true).0, json).expect("open");
+        for era in [BlobEra::V5, BlobEra::V2ToV4] {
             let old = FtsReader::open(tied_corpus(era, true).0, json).expect("open");
             let col = &old.columns[0];
             assert!(
@@ -2213,12 +2214,12 @@ mod tests {
         // both owed; the product must still cap every score, which the
         // parity against a fresh file scored under the same override
         // shows with pruning live.
-        let json = tied_corpus(BlobEra::Current, false).1;
+        let json = tied_corpus(BlobEra::V6, false).1;
         let params = bm25::Bm25Params::new(0.9, 0.4);
-        let fresh = FtsReader::open(tied_corpus(BlobEra::Current, false).0, json)
+        let fresh = FtsReader::open(tied_corpus(BlobEra::V6, false).0, json)
             .expect("open")
             .with_bm25_override(params);
-        let old = FtsReader::open(tied_corpus(BlobEra::LegacyV5, false).0, json).expect("open");
+        let old = FtsReader::open(tied_corpus(BlobEra::V5, false).0, json).expect("open");
         let overridden = old.with_bm25_override(params);
         assert!(
             overridden.columns[0].bound_scale > old.columns[0].bound_scale,
@@ -2239,9 +2240,9 @@ mod tests {
         // score identically: the collection size idf uses and the
         // average length both count documents that carry tokens. Doc
         // ids differ (nulls occupy rows), so compare by score sequence.
-        let json = tied_corpus(BlobEra::Current, false).1;
-        let dense = FtsReader::open(tied_corpus(BlobEra::Current, false).0, json).expect("open");
-        let sparse = FtsReader::open(tied_corpus(BlobEra::Current, true).0, json).expect("open");
+        let json = tied_corpus(BlobEra::V6, false).1;
+        let dense = FtsReader::open(tied_corpus(BlobEra::V6, false).0, json).expect("open");
+        let sparse = FtsReader::open(tied_corpus(BlobEra::V6, true).0, json).expect("open");
         assert_eq!(
             sparse.columns[0].scored_doc_count(),
             dense.columns[0].scored_doc_count()
@@ -2301,7 +2302,7 @@ mod tests {
             }
         }
         let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
-        b.era = BlobEra::LegacyV5;
+        b.era = BlobEra::V5;
         b.register_column("body".into(), false)
             .expect("register body");
         b.register_column("title".into(), true)

@@ -13,42 +13,60 @@
 
 use crate::superfile::{format, fts::reader::metadata::ColumnMeta};
 
-/// How a blob's 4-byte block-max slot (skip entry and coarse entry
-/// alike) encodes the block's maximum score. Decided once per blob from
-/// its version.
+/// The FTS blob version, as far as reading a block-max slot is
+/// concerned: what the 4-byte slot (skip entry and coarse entry alike)
+/// encodes and which average document length it was baked at. Named by
+/// version rather than by property so a reader of the match arms sees
+/// the same numbers the file header carries.
+///
+/// [`Self::for_version`] is also the reader's accept list: a version
+/// with no arm here cannot be opened. So a new blob version has to be
+/// added here deliberately, and can never fall through to an older
+/// arm's decode by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StoredBound {
-    /// `V6`: exact `f32` bits of the maximum, in the scorer's own scale,
-    /// at the average document length the file declares — which is what
-    /// the reader scores the file at, so nothing needs correcting.
-    Exact,
-    /// `V5`: exact `f32` bits carrying the `(k1 + 1)` factor the scorer
-    /// has since dropped, at the file's row-count average.
-    Legacy,
-    /// `V1`–`V4`: `ceil(max × scale)` fixed point, otherwise as
-    /// [`Self::Legacy`]. These blobs also predate the coarse table.
-    LegacyFixedPoint,
+    /// [`format::fts::VERSION_V6`]: exact `f32` bits of the maximum, in
+    /// the scorer's own scale, at the table-wide average the file
+    /// declares — which is what the reader scores the file at, so
+    /// nothing needs correcting.
+    V6,
+    /// [`format::fts::VERSION_V5`]: exact `f32` bits carrying the
+    /// `(k1 + 1)` factor the scorer has since dropped, at the file's
+    /// row-count average.
+    V5,
+    /// [`format::fts::VERSION_V1_LEGACY`] through
+    /// [`format::fts::VERSION_V4`]: `ceil(max × scale)` fixed point,
+    /// otherwise as [`Self::V5`]. These blobs also predate the coarse
+    /// table.
+    V1ToV4,
 }
 
 impl StoredBound {
-    pub(super) fn for_version(version: u32) -> Self {
+    /// The variant for a blob version, or `None` for a version this
+    /// reader does not know — which the open path turns into an
+    /// unsupported-version error.
+    pub(super) fn for_version(version: u32) -> Option<Self> {
         match version {
-            format::fts::VERSION_V6 => Self::Exact,
-            format::fts::VERSION_V5 => Self::Legacy,
-            _ => Self::LegacyFixedPoint,
+            format::fts::VERSION_V6 => Some(Self::V6),
+            format::fts::VERSION_V5 => Some(Self::V5),
+            format::fts::VERSION_V1_LEGACY
+            | format::fts::VERSION_V2
+            | format::fts::VERSION_V3
+            | format::fts::VERSION_V4 => Some(Self::V1ToV4),
+            _ => None,
         }
     }
 
     /// Whether each PFOR term's region ends with a coarse block-max table
     /// (one slot per [`format::fts::COARSE_BLOCK_MAX_SPAN`] blocks).
     pub(super) fn has_coarse(self) -> bool {
-        self != Self::LegacyFixedPoint
+        self != Self::V1ToV4
     }
 
     /// Whether the file's declared average document length is the one to
     /// score it at, or a row-count average the reader must correct.
     pub(super) fn declares_scoring_average(self) -> bool {
-        self == Self::Exact
+        self == Self::V6
     }
 }
 
@@ -95,8 +113,8 @@ impl BoundDecoder {
     #[inline]
     pub(super) fn bound(&self, raw: u32) -> f32 {
         let stored = match self.stored {
-            StoredBound::Exact | StoredBound::Legacy => f32::from_bits(raw).next_up(),
-            StoredBound::LegacyFixedPoint => {
+            StoredBound::V6 | StoredBound::V5 => f32::from_bits(raw).next_up(),
+            StoredBound::V1ToV4 => {
                 raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
             }
         };
@@ -116,26 +134,35 @@ mod tests {
     };
 
     #[test]
-    fn versions_map_to_their_slot_meaning() {
-        assert_eq!(
-            StoredBound::for_version(format::fts::VERSION_V6),
-            StoredBound::Exact
-        );
-        assert_eq!(
-            StoredBound::for_version(format::fts::VERSION_V5),
-            StoredBound::Legacy
-        );
-        for v in [
-            format::fts::VERSION_V4,
-            format::fts::VERSION_V3,
-            format::fts::VERSION_V2,
-        ] {
-            assert_eq!(StoredBound::for_version(v), StoredBound::LegacyFixedPoint);
+    fn every_accepted_version_has_an_arm_and_the_next_one_is_refused() {
+        // The mapping doubles as the accept list, so a version added to
+        // the format without an arm here fails to open rather than
+        // decoding under an older version's rules. The builder's
+        // current version must map to the variant scored at the
+        // declared average.
+        let accepted = [
+            (format::fts::VERSION_V1_LEGACY, StoredBound::V1ToV4),
+            (format::fts::VERSION_V2, StoredBound::V1ToV4),
+            (format::fts::VERSION_V3, StoredBound::V1ToV4),
+            (format::fts::VERSION_V4, StoredBound::V1ToV4),
+            (format::fts::VERSION_V5, StoredBound::V5),
+            (format::fts::VERSION_V6, StoredBound::V6),
+        ];
+        for (version, want) in accepted {
+            assert_eq!(
+                StoredBound::for_version(version),
+                Some(want),
+                "version {version}"
+            );
         }
-        assert!(StoredBound::Exact.has_coarse() && StoredBound::Legacy.has_coarse());
-        assert!(!StoredBound::LegacyFixedPoint.has_coarse());
-        assert!(StoredBound::Exact.declares_scoring_average());
-        assert!(!StoredBound::Legacy.declares_scoring_average());
+        assert_eq!(StoredBound::for_version(format::fts::VERSION_V6 + 1), None);
+        assert_eq!(StoredBound::for_version(0), None);
+
+        assert!(StoredBound::V6.has_coarse() && StoredBound::V5.has_coarse());
+        assert!(!StoredBound::V1ToV4.has_coarse());
+        assert!(StoredBound::V6.declares_scoring_average());
+        assert!(!StoredBound::V5.declares_scoring_average());
+        assert!(!StoredBound::V1ToV4.declares_scoring_average());
     }
 
     #[test]
@@ -149,20 +176,20 @@ mod tests {
         col.bound_scale = 0.5;
 
         // idf 2.0 against a local 1.0 doubles; the column halves: net 1.0.
-        let unit = BoundDecoder::new(StoredBound::Exact, &col, 2.0, 1.0);
+        let unit = BoundDecoder::new(StoredBound::V6, &col, 2.0, 1.0);
         assert_eq!(unit.bound(0.25f32.to_bits()), 0.25f32.next_up());
-        // Legacy scores decode identically to exact ones; only the column
-        // scale (set on open) tells them apart.
-        let legacy = BoundDecoder::new(StoredBound::Legacy, &col, 1.0, 1.0);
+        // V5 scores decode as V6 ones do; only the column scale (set on
+        // open) tells them apart.
+        let legacy = BoundDecoder::new(StoredBound::V5, &col, 1.0, 1.0);
         assert_eq!(legacy.bound(0.25f32.to_bits()), 0.25f32.next_up() * 0.5);
         // Fixed point: one step of slack, then the same multiplier.
-        let fixed = BoundDecoder::new(StoredBound::LegacyFixedPoint, &col, 3.0, 1.0);
+        let fixed = BoundDecoder::new(StoredBound::V1ToV4, &col, 3.0, 1.0);
         assert_eq!(
             fixed.bound(250),
             251.0 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE * 3.0 * 0.5
         );
         // A zero local idf (a term in every document) leaves the ratio at 1.
-        let none = BoundDecoder::new(StoredBound::Exact, &col, 2.0, 0.0);
+        let none = BoundDecoder::new(StoredBound::V6, &col, 2.0, 0.0);
         assert_eq!(none.bound(1.0f32.to_bits()), 1.0f32.next_up() * 0.5);
     }
 }

@@ -304,41 +304,44 @@ const EXTERNAL_MERGE_CHUNK_CAP_TRIPLES: usize = 1024 * 1024;
 const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 
 /// Per-column build-time state (scalar accounting only).
-/// The on-disk era an [`FtsBuilder`] writes. Production always writes
-/// [`Self::Current`]; the others exist so tests can produce the files
-/// earlier releases wrote and hold the reader to reading them exactly.
+/// The blob version an [`FtsBuilder`] writes. Production always writes
+/// the current one; the older variants exist so tests can produce the
+/// files earlier releases wrote and hold the reader to reading them
+/// exactly. Named by version so the arms read the same numbers the
+/// file header carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // the legacy eras are written only by tests
+#[cfg_attr(not(test), allow(dead_code))] // the older versions are written only by tests
 pub(crate) enum BlobEra {
     /// [`format::fts::VERSION_V6`]: coarse table, bounds in the scorer's
     /// scale, the declared average over documents with tokens.
-    Current,
+    V6,
     /// [`format::fts::VERSION_V5`] as 0.8 wrote it, byte for byte: coarse
     /// table, bounds carrying the `(k1 + 1)` factor, idf and the average
     /// over every row, the average truncated into the directory.
-    LegacyV5,
-    /// The pre-coarse ladder (`V2`–`V4` by content): fixed-point bounds
-    /// carrying `(k1 + 1)`, otherwise as [`Self::LegacyV5`].
-    NoCoarse,
+    V5,
+    /// The pre-coarse ladder, [`format::fts::VERSION_V2`] through
+    /// [`format::fts::VERSION_V4`] by content: fixed-point bounds
+    /// carrying `(k1 + 1)`, otherwise as [`Self::V5`].
+    V2ToV4,
 }
 
 impl BlobEra {
     fn has_coarse(self) -> bool {
-        self != Self::NoCoarse
+        self != Self::V2ToV4
     }
 
     /// The factor a stored bound of this era carries over the score.
     fn bound_scale(self, params: bm25::Bm25Params) -> f32 {
         match self {
-            Self::Current => 1.0,
-            Self::LegacyV5 | Self::NoCoarse => params.k1 + 1.0,
+            Self::V6 => 1.0,
+            Self::V5 | Self::V2ToV4 => params.k1 + 1.0,
         }
     }
 
     /// Whether the statistics divide by every row (the pre-current
     /// defect) rather than by the documents that carry tokens.
     fn averages_over_rows(self) -> bool {
-        self != Self::Current
+        self != Self::V6
     }
 }
 
@@ -1331,7 +1334,7 @@ pub struct FtsBuilder {
     /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
     /// ::Spilled`) keyed by `term_id` instead.
     bump: Bump,
-    /// Which blob era to emit. Always [`BlobEra::Current`] in production;
+    /// Which blob era to emit. Always [`BlobEra::V6`] in production;
     /// the backwards-compatibility tests pick an older one so the reader's
     /// legacy paths are exercised against faithfully written files.
     pub(crate) era: BlobEra,
@@ -1389,7 +1392,7 @@ impl FtsBuilder {
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
             bump: Bump::new(),
-            era: BlobEra::Current,
+            era: BlobEra::V6,
         }
     }
 
@@ -3528,13 +3531,11 @@ fn assemble_and_write_blob<W: Write>(
     // so the stored per-block bound is interpreted against the pair that
     // entry names. Nothing about the layout differs either way.
     let fts_version = match era {
-        BlobEra::Current => format::fts::VERSION_V6,
-        BlobEra::LegacyV5 => format::fts::VERSION_V5,
-        BlobEra::NoCoarse if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
-        BlobEra::NoCoarse if positions_region.1 > format::CRC_BYTES as u64 => {
-            format::fts::VERSION_V3
-        }
-        BlobEra::NoCoarse => format::fts::VERSION_V2,
+        BlobEra::V6 => format::fts::VERSION_V6,
+        BlobEra::V5 => format::fts::VERSION_V5,
+        BlobEra::V2ToV4 if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
+        BlobEra::V2ToV4 if positions_region.1 > format::CRC_BYTES as u64 => format::fts::VERSION_V3,
+        BlobEra::V2ToV4 => format::fts::VERSION_V2,
     };
     header.extend_from_slice(&fts_version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
@@ -5075,7 +5076,7 @@ mod tests {
             b.set_max_partition_bytes(m);
         }
         // Legacy (no-coarse) blob — see `build_title_blob`.
-        b.era = BlobEra::NoCoarse;
+        b.era = BlobEra::V2ToV4;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
@@ -5312,7 +5313,7 @@ mod tests {
         // These tests cover the legacy (V1–V4, no coarse table) format and
         // the reader's backwards-compatibility with it; the current-version
         // path is covered by the FTS integration suite.
-        b.era = BlobEra::NoCoarse;
+        b.era = BlobEra::V2ToV4;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
