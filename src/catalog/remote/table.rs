@@ -117,6 +117,17 @@ impl Table for RemoteTable {
         Ok(())
     }
 
+    /// The wire carries `?table=` and nothing else per append, so a source
+    /// name has nowhere to travel. Refused rather than silently dropped: a
+    /// caller asking for named superfiles and getting unnamed ones would have
+    /// no way to tell.
+    fn append_named(&self, _batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
+        Err(InfinoError::Backend(format!(
+            "append_named({source_name:?}) is not available on a hosted table: the append wire \
+             carries no source name; use append"
+        )))
+    }
+
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         let predicate = predicate_to_sql(&predicate)?;
         let body = wire::batches_to_ipc(std::slice::from_ref(batch))?;

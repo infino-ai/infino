@@ -6,60 +6,119 @@ on:
   pull_request:
     branches: [main]
 
+# A force-push to a PR branch supersedes the in-flight run; don't keep
+# paying for it. Pushes to main are never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
-    name: Format, Build & Test
+  # The three legs below split what used to be one serial job, so the
+  # wall time is the longest leg (the coverage build) instead of the
+  # sum. Branch protection requires the aggregate `check` job below,
+  # which keeps the historical check name.
+  lint:
+    name: Format & Clippy
     runs-on: ubuntu-latest
+    env:
+      # The suite links dozens of binaries; lld cuts the link phase.
+      # Full DWARF is never read in CI — line tables are enough for
+      # backtraces (llvm-cov uses its own instrumentation, not DWARF).
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lld
+        run: sudo apt-get install -y --no-install-recommends lld
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The bench merge gate's classification, ahead of the Rust build so
+      # a broken gate fails in seconds. `make check` runs the same
+      # target; this is the early tripwire, not a second suite.
+      - run: make bench-gate
+      - run: make check
+
+  coverage:
+    name: Tests & coverage
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       # The default github-hosted ubuntu runner has ~14 GB free at job
-      # start; infino's dep graph (datafusion + lance + tantivy)
-      # plus `cargo llvm-cov`'s separate `target/llvm-cov-target/`
-      # directory (it instruments a second full build of everything)
-      # overflows that, so the coverage step fails with ENOSPC. Free
-      # ~30 GB by removing toolchains the build doesn't need (Android
-      # SDK, .NET, Haskell, ...) before any compile work starts.
-      - uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
+      # start; infino's dep graph (datafusion + lance + tantivy) plus
+      # `cargo llvm-cov`'s separate `target/llvm-cov-target/` directory
+      # (it instruments a second full build of everything) overflows
+      # that, so the coverage step fails with ENOSPC. Removing the
+      # unused toolchains directly takes seconds where the marketplace
+      # action's apt-remove loop took over two minutes.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force > /dev/null
+          sudo swapoff -a && sudo rm -f /mnt/swapfile
+          df -h /
+      - name: Install lld
+        run: sudo apt-get install -y --no-install-recommends lld
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Prebuilt binaries in seconds, instead of `cargo install` (minutes
+      # on a cache miss) — and nothing to carry in a ~/.cargo/bin cache.
+      # Versions pinned: the coverage gate's margin is thin (functions
+      # 89.1% against an 89 floor), and a tool release that changes how
+      # regions are counted must not flip CI by itself — bump deliberately.
+      - uses: taiki-e/install-action@v2
         with:
-          components: rustfmt
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.143
+      - run: make coverage-ci
+
+  tests-aux:
+    name: Doctest, remote & storage
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lld
+        run: sudo apt-get install -y --no-install-recommends lld
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-directories: |
-            ~/.cargo/bin
             target/infino-bench/rustfs
-      - name: Install cargo-llvm-cov
-        run: |
-          if ! command -v cargo-llvm-cov &> /dev/null; then
-            cargo install cargo-llvm-cov --locked
-          fi
-      # The bench merge gate's classification, ahead of `make ci` so a broken
-      # gate fails in seconds instead of after the Rust build. `make check`
-      # runs the same target; this is the early tripwire, not a second suite.
-      - run: make bench-gate
-      - run: make ci
-      # libtest's positional filters are plain substring matches ORed
-      # together, not a regex: a single 'a|b' argument matches nothing and
-      # the step passes vacuously with 0 tests run. `cargo test` accepts
-      # only one filter before `--`, so both go after it. Folded scalar:
-      # a plain `run:` value would read the `:: ` before the second
-      # filter as a YAML mapping.
+      - run: make doctest
+      - run: make test-remote
       - name: RustFS storage wire + smoke tests
-        run: >-
-          cargo test --features test-helpers --test supertable --
-          storage::rustfs_s3_wire:: storage::smoke_rustfs:: --test-threads=1
+        run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1
+
+  # Aggregate gate carrying the check name branch protection requires.
+  # `if: always()` so it reports a real failure — a skipped required
+  # check satisfies branch protection, which is exactly the hole this
+  # job exists to close.
+  check:
+    name: Format, Build & Test
+    needs: [lint, coverage, tests-aux]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every leg green
+        run: |
+          results="${{ needs.lint.result }} ${{ needs.coverage.result }} ${{ needs.tests-aux.result }}"
+          echo "lint / coverage / tests-aux: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || exit 1
+          done
 
   public-api:
     name: Public API surface
@@ -99,15 +158,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force > /dev/null
+          sudo swapoff -a && sudo rm -f /mnt/swapfile
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -190,15 +245,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force > /dev/null
+          sudo swapoff -a && sudo rm -f /mnt/swapfile
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:

@@ -183,7 +183,11 @@ pub use error::InfinoError;
 pub use superfile::VectorSearchOptions;
 /// Value types named by the public method signatures.
 pub use superfile::{
-    fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+    fts::{
+        analysis::{Stemmer, Stopwords},
+        bm25::Bm25Params,
+        reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+    },
     vector::distance::Metric,
 };
 pub use supertable::{

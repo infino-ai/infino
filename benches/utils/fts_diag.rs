@@ -28,7 +28,7 @@
 
 use std::time::Instant;
 
-use infino::superfile::fts::reader::{Bm25Stats, BoolMode};
+use infino::{Bm25SearchOptions, superfile::fts::reader::BoolMode};
 
 use crate::{diag_common, markdown::fmt_count};
 
@@ -94,7 +94,13 @@ pub fn run() {
     // Warm both paths for every shape (cache-hot before timing).
     for s in SHAPES {
         let _ = reader
-            .bm25_search(COLUMN, s.query, K, s.mode, Bm25Stats::default(), None)
+            .bm25_search(
+                COLUMN,
+                s.query,
+                K,
+                Bm25SearchOptions::new().with_mode(s.mode),
+                None,
+            )
             .expect("warm-up bm25_search");
     }
 
@@ -119,7 +125,12 @@ pub fn run() {
     );
     for s in SHAPES {
         let hits = reader
-            .bm25_hits(COLUMN, s.query, K, s.mode)
+            .bm25_hits(
+                COLUMN,
+                s.query,
+                K,
+                Bm25SearchOptions::new().with_mode(s.mode),
+            )
             .expect("bm25_hits")
             .len();
 
@@ -135,7 +146,12 @@ pub fn run() {
         for _ in 0..cfg.iters {
             let t = Instant::now();
             let out = reader
-                .bm25_hits(COLUMN, s.query, K, s.mode)
+                .bm25_hits(
+                    COLUMN,
+                    s.query,
+                    K,
+                    Bm25SearchOptions::new().with_mode(s.mode),
+                )
                 .expect("kernel bm25_hits");
             kernel.push(t.elapsed());
             std::hint::black_box(out);
@@ -145,7 +161,13 @@ pub fn run() {
         for _ in 0..cfg.iters {
             let t = Instant::now();
             let out = reader
-                .bm25_search(COLUMN, s.query, K, s.mode, Bm25Stats::default(), None)
+                .bm25_search(
+                    COLUMN,
+                    s.query,
+                    K,
+                    Bm25SearchOptions::new().with_mode(s.mode),
+                    None,
+                )
                 .expect("full bm25_search");
             full.push(t.elapsed());
             std::hint::black_box(out);

@@ -48,7 +48,7 @@ use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{PrefixedStorageProvider, StorageError},
     superfile::{
-        builder::VectorConfig,
+        builder::{BuilderOptions, VectorConfig},
         vector::{kmeans::kmeans, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -246,6 +246,16 @@ pub(super) struct SupertableInner {
 }
 
 impl SupertableInner {
+    /// Builder options for a superfile this table is about to commit: the
+    /// static configuration plus the table-wide FTS length statistics as
+    /// of the current manifest, so the new file bakes — and is scored at
+    /// — the corpus average rather than its own.
+    pub(super) fn builder_options(&self) -> BuilderOptions {
+        self.options
+            .builder_options()
+            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats(&HashSet::new()))
+    }
+
     /// Runtime driving the sync API's async kernels when the caller
     /// isn't already on a tokio runtime. Process-wide — see
     /// [`shared_query_runtime`].
@@ -1312,6 +1322,7 @@ impl Supertable {
             .expect("open_all_superfiles: user table needs storage");
         let mut targets: Vec<(
             crate::supertable::manifest::SuperfileUri,
+            String,
             Option<crate::supertable::manifest::SubsectionOffsets>,
             std::sync::Arc<dyn crate::storage::StorageProvider>,
         )> = manifest
@@ -1320,6 +1331,7 @@ impl Supertable {
             .map(|e| {
                 (
                     e.uri,
+                    e.storage_path(),
                     e.subsection_offsets.clone(),
                     std::sync::Arc::clone(&user_storage),
                 )
@@ -1335,6 +1347,7 @@ impl Supertable {
             for entry in hidden_manifest.superfiles.iter() {
                 targets.push((
                     entry.uri,
+                    entry.storage_path(),
                     entry.subsection_offsets.clone(),
                     std::sync::Arc::clone(&hidden_storage),
                 ));
@@ -1343,7 +1356,7 @@ impl Supertable {
         self.block_on_query(async move {
             let handles: Vec<_> = targets
                 .into_iter()
-                .map(|(uri, offsets, storage)| {
+                .map(|(uri, storage_key, offsets, storage)| {
                     let store = store.clone();
                     let disk_cache = disk_cache.clone();
                     tokio::spawn(async move {
@@ -1352,6 +1365,7 @@ impl Supertable {
                             disk_cache.as_ref(),
                             Some(&storage),
                             &uri,
+                            &storage_key,
                             offsets.as_ref(),
                             ReadIntent::Warm,
                         )
@@ -1385,17 +1399,18 @@ impl Supertable {
         let targets: Vec<_> = hidden_manifest
             .superfiles
             .iter()
-            .map(|e| (e.uri, e.subsection_offsets.clone()))
+            .map(|e| (e.uri, e.storage_path(), e.subsection_offsets.clone()))
             .collect();
         let merged = self
             .block_on_query(async move {
                 let mut by_cell: HashMap<u32, Vec<i128>> = HashMap::new();
-                for (uri, offsets) in targets {
+                for (uri, storage_key, offsets) in targets {
                     let reader = crate::supertable::query::superfile_reader::superfile_reader(
                         &store,
                         disk_cache.as_ref(),
                         Some(&storage),
                         &uri,
+                        &storage_key,
                         offsets.as_ref(),
                         ReadIntent::Warm,
                     )
@@ -2346,6 +2361,7 @@ mod tests {
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::reader::Bm25SearchOptions,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -2407,6 +2423,7 @@ mod tests {
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -4429,7 +4446,15 @@ mod tests {
         // pre-compact warm/cold queries against a disk-cache consumer).
         use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         let hits = consumer
-            .bm25_search("title", "doc", 5, BoolMode::Or, Bm25Stats::Global, None)
+            .bm25_search(
+                "title",
+                "doc",
+                5,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
+                None,
+            )
             .expect("bm25 pre-optimize");
         assert!(!hits.is_empty(), "pre-optimize FTS should return hits");
 
@@ -4438,7 +4463,15 @@ mod tests {
             .expect("sql-shaped optimize after lazy reads");
 
         let hits_after = consumer
-            .bm25_search("title", "doc", 5, BoolMode::Or, Bm25Stats::Global, None)
+            .bm25_search(
+                "title",
+                "doc",
+                5,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
+                None,
+            )
             .expect("bm25 post-optimize");
         assert!(
             !hits_after.is_empty(),
@@ -8433,7 +8466,15 @@ mod tests {
     fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
         use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         table
-            .bm25_search("title", query, 10, BoolMode::Or, Bm25Stats::Global, None)
+            .bm25_search(
+                "title",
+                query,
+                10,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::Or)
+                    .with_stats(Bm25Stats::Global),
+                None,
+            )
             .expect("bm25 search")
             .iter()
             .map(|b| b.num_rows())

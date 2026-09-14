@@ -198,7 +198,12 @@ fn demo_supertable() {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits("title", "fox", SEARCH_TOP_K, BoolMode::Or)
+        .bm25_hits(
+            "title",
+            "fox",
+            SEARCH_TOP_K,
+            infino::Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across superfiles -> {} hit(s)", hits.len());
     for h in &hits {

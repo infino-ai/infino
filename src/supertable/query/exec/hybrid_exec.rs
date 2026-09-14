@@ -70,7 +70,7 @@ use crate::{
     InfinoError,
     runtime_metrics::op_stats,
     superfile::{
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::reader::{Bm25SearchOptions, BoolMode},
         reader::VectorSearchOptions,
     },
     supertable::{
@@ -152,7 +152,12 @@ impl SupertableReader {
         // Both retrievers run concurrently on the query runtime; each
         // inherits its own manifest skip and returns hits best-first.
         let (bm25_res, vector_res) = future::join(
-            self.bm25_search_async(text_col, q_text, k, mode, Bm25Stats::default()),
+            self.bm25_search_async(
+                text_col,
+                q_text,
+                k,
+                Bm25SearchOptions::new().with_mode(mode),
+            ),
             self.vector_search_user_table_async(vec_col, &q_vec, k, options),
         )
         .await;

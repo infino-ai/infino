@@ -94,6 +94,42 @@ pub mod fts {
     /// table), so existing indices read unchanged and need no reindex.
     pub const VERSION_V5: u32 = 5;
 
+    /// The version new code writes. Byte-for-byte the [`VERSION_V5`]
+    /// layout; what changes is the **scale** of the stored bounds and the
+    /// **average document length** they and the file's scoring are
+    /// expressed at.
+    ///
+    /// `V1`–`V5` bounds are maxima of `idf · tf · (k1 + 1) / (tf + k1 ·
+    /// norm)`. `V6` drops the `(k1 + 1)` factor, so a bound is a maximum
+    /// of `idf · tf / (tf + k1 · norm)` — the same quantity the scorer
+    /// now produces, and the one a BM25 implementation is conventionally
+    /// expected to report. The factor was a constant multiplier on every
+    /// score in a query, so it never changed a ranking; it did make
+    /// every published score a fixed multiple of what the same `k1` and
+    /// `b` produce elsewhere, which matters to anything reading the
+    /// number rather than the order — a score threshold, a weighted
+    /// fusion against vector distances, a comparison against another
+    /// engine.
+    ///
+    /// The average a `V6` file declares in its doc-lengths directory is
+    /// the one to score it at: the writer bakes it as the table-wide
+    /// average over the documents that carry tokens, folding in every
+    /// superfile committed before it, so a query needs no other value
+    /// and the stored bounds — exact scores at that average — stay
+    /// exact with nothing to inflate. A `V5` file declares its own
+    /// row-count average, which the reader corrects on open.
+    ///
+    /// Readers accept `V1`–`V6`. An older blob's bounds are still exact
+    /// upper bounds in their own scale, and the reader brings them into
+    /// this one by folding `1 / (k1 + 1)` into the column's bound
+    /// correction — so existing indices read unchanged, keep their
+    /// pruning power, and need no reindex. Getting that gate wrong in
+    /// the other direction (treating a `V6` blob as older) would divide
+    /// a bound that is already correct and silently prune documents out
+    /// of the top-k, which is why the scale is version-stamped rather
+    /// than inferred.
+    pub const VERSION_V6: u32 = 6;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
@@ -131,10 +167,14 @@ pub mod fts {
     /// reader's per-doc scoring) removes that slack.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
+    /// Offset of `avgdl_x1000` within a doc-lengths directory entry
+    /// (`[0..4]` column id, `[4..12]` array offset, `[12..16]` this).
+    pub const DOC_LENGTHS_ENTRY_AVGDL_OFF: usize = 12;
+
     /// Number of consecutive posting blocks summarised by one entry of
-    /// a term's coarse block-max table (V5 only). The table sits at the tail
-    /// of a PFOR term's postings region: `ceil(num_blocks / this)` `f32`s,
-    /// each the max of its span's per-block max BM25.
+    /// a term's coarse block-max table (V5 and later). The table sits at
+    /// the tail of a PFOR term's postings region: `ceil(num_blocks / this)`
+    /// `f32`s, each the max of its span's per-block max BM25.
     ///
     /// It gives the ranked single-term walk a second, coarser skip level:
     /// when the running k-th-best score already dominates a whole span's
@@ -256,8 +296,9 @@ pub mod fts {
         pub const LAST_DOC_ID_OFF: usize = 0;
         /// `[4..8]` byte offset to the encoded PFOR block (`u32` LE).
         pub const BLOCK_OFFSET_OFF: usize = 4;
-        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5,
-        /// fixed-point `u32` (`ceil(max × scale)`) on legacy `V1`-`V4`. LE.
+        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5
+        /// and later, fixed-point `u32` (`ceil(max × scale)`) on legacy
+        /// `V1`-`V4`. LE.
         pub const MAX_BM25_OFF: usize = 8;
         /// `[12..16]` block's position-runs offset, relative to the
         /// term's `positions_offset` (`u32` LE). Zero on positionless

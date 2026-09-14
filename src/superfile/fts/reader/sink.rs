@@ -234,7 +234,7 @@ impl AndSink for MustShouldSink<'_> {
         for c in &mut self.shoulds {
             c.skip_to(doc);
             if !c.is_exhausted() && c.current_doc_id() == doc {
-                score += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), norm);
+                score += bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), norm);
             }
         }
         // Floor gate on the FULL score — a must-only score below the

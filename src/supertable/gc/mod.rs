@@ -72,7 +72,7 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     // it cannot see as orphans. That is what the flag carries.
     let superfiles_complete = if let Some(superfiles) = manifest.complete_flat_superfiles() {
         for sf in superfiles {
-            live.insert(sf.uri.storage_path());
+            live.insert(sf.storage_path());
         }
         true
     } else {
@@ -103,7 +103,7 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     // so these have to be named here or a sidecar past the gap is deleted and its deleted rows
     // come back. The superfile paths repeat what the complete view above already inserted.
     for sf in manifest.get_all_superfiles() {
-        live.insert(sf.uri.storage_path());
+        live.insert(sf.storage_path());
         live.insert(WalStore::tombstones_path(sf.superfile_id));
     }
 
@@ -183,7 +183,7 @@ async fn live_set(
                 })
             })?;
         if let Some(pending) = state.pending_drain {
-            uris.extend(pending.entries.iter().map(|entry| entry.uri.storage_path()));
+            uris.extend(pending.entries.iter().map(|entry| entry.storage_path()));
         }
     }
 
@@ -382,6 +382,7 @@ mod tests {
 
     fn sf_entry(uri: SuperfileUri) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
             uri,
@@ -414,6 +415,34 @@ mod tests {
         let (live, superfiles_complete) = build_live_set(&manifest);
         assert!(superfiles_complete);
         assert!(live.contains(&uri.storage_path()));
+    }
+
+    /// The keep-set names a source-named superfile by the key it actually
+    /// lives at, not the unnamed key its uuid alone would give — the one
+    /// mismatch that would make the sweep delete live data. And the cache
+    /// drop-through parses that key back to the uri, so the local copy goes
+    /// with the object.
+    #[test]
+    fn build_live_set_names_a_source_named_superfile_by_its_stem_key() {
+        let uri = SuperfileUri::new_v4();
+        let mut entry = (*sf_entry(uri)).clone();
+        entry.stem = Some("customers".into());
+        let named_key = entry.storage_path();
+        assert_eq!(named_key, format!("data/customers-{}.sf.parquet", uri.0));
+
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![Arc::new(entry)]);
+        let (live, superfiles_complete) = build_live_set(&manifest);
+        assert!(superfiles_complete);
+        assert!(live.contains(&named_key), "the named key is what is kept");
+        assert!(
+            !live.contains(&uri.storage_path()),
+            "the unnamed key is not where the bytes are, so it must not be what is kept"
+        );
+        assert_eq!(
+            SuperfileUri::from_storage_path(&named_key),
+            Some(uri),
+            "eviction parses the named key back to the cache's uri"
+        );
     }
 
     #[test]

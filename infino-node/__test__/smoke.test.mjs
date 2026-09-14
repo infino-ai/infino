@@ -366,3 +366,46 @@ test("connectionMemoryBudgetBytes: 0 measures without enforcing", () => {
   docs.append([{ title: "the quick brown fox" }]);
   assert.equal(docs.bm25Search("title", "fox", 10).length, 1);
 });
+
+// The analysis filters resolve at `createTable`, not at `fts()` — `fts`
+// only records the strings. So this is where an unknown name surfaces,
+// and it had no coverage in either binding.
+//
+// The names are matched exactly, matching the engine's own resolver and
+// the python binding: an earlier version of this binding case-folded the
+// argument, so `stopwords: "English"` worked here and threw there for
+// the same call.
+test("analysis filter names resolve at createTable, exactly", () => {
+  const db = connect("memory://");
+
+  // The accepted spelling works end to end: stemming folds the
+  // inflection and the stopword never reaches the index.
+  const t = db.createTable(
+    "chained",
+    titleSchema(),
+    new IndexSpec().fts("title", { stopwords: "english", stemmer: "english", positions: true }),
+  );
+  t.append([{ title: "the quick brown foxes are running" }]);
+  assert.equal(t.bm25Search("title", "run", 10).length, 1);
+  assert.equal(t.bm25Search("title", "the", 10).length, 0);
+  assert.equal(t.bm25Search("title", '"brown foxes"', 10).length, 1);
+
+  // Wrong case is not accepted, and the error names what was passed.
+  for (const [opts, needle] of [
+    [{ stopwords: "English" }, "English"],
+    [{ stemmer: "ENGLISH" }, "ENGLISH"],
+    [{ stopwords: "german" }, "german"],
+  ]) {
+    let err;
+    try {
+      db.createTable(`bad-${needle}`, titleSchema(), new IndexSpec().fts("title", opts));
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, `expected ${JSON.stringify(opts)} to throw`);
+    assert.ok(
+      String(err.message).includes(needle),
+      `error must name the value passed, got: ${err.message}`,
+    );
+  }
+});

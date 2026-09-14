@@ -193,13 +193,16 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::supertable::{
-        FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
-        manifest::{
-            aggregates,
-            bloom::BloomBuilder,
-            list::{FORMAT_VERSION, PartitionStrategy},
-            part::ContentHash,
+    use crate::{
+        superfile::fts::reader::ColumnLengthStats,
+        supertable::{
+            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
+            manifest::{
+                aggregates,
+                bloom::BloomBuilder,
+                list::{FORMAT_VERSION, PartitionStrategy},
+                part::ContentHash,
+            },
         },
     };
 
@@ -244,6 +247,7 @@ mod tests {
                     bloom.finish(),
                     title_terms.len() as u32,
                     term_range,
+                    ColumnLengthStats::default(),
                 ),
             );
         }
@@ -258,6 +262,7 @@ mod tests {
             );
         }
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -352,9 +357,11 @@ mod tests {
                 BloomBuilder::with_n_blocks(16).finish(),
                 0,
                 (Vec::new(), Vec::new()),
+                ColumnLengthStats::default(),
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -387,9 +394,11 @@ mod tests {
                 BloomBuilder::with_n_blocks(16).finish(),
                 0,
                 (Vec::new(), Vec::new()),
+                ColumnLengthStats::default(),
             ),
         );
         let s = Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -429,6 +438,7 @@ mod tests {
             let mx: ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
             cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                stem: None,
                 birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
@@ -476,6 +486,7 @@ mod tests {
             );
             cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                stem: None,
                 birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),

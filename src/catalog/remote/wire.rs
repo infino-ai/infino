@@ -46,10 +46,35 @@ pub(crate) fn metric_str(metric: Metric) -> &'static str {
 /// `{fts: [entry, …], vector: [{column, dim, metric}, …]}`. Absent index kinds
 /// are omitted (the server treats a missing key as "none").
 ///
-/// Each FTS entry is a `{column, analyzer}` object — plus `stored: false`
-/// for an index-only column. The analyzer is always named rather than left
-/// to the server's own idea of a default, so a table is created with the
-/// analyzer this client resolved and the two can never drift apart.
+/// Each FTS entry is a `{column, analyzer, k1, b}` object — plus
+/// `stored: false` for an index-only column and `positions: true` for a
+/// phrase-capable one. The analyzer and the BM25
+/// pair are always named rather than left to the server's own idea of a
+/// default, so a table is created with what this client resolved and the
+/// two can never drift apart. That matters most for the pair: it is the
+/// provenance of the stored score bounds, and a server that filled in
+/// its own default would build bounds the client never asked for.
+///
+/// `analyzer` names the **base** tokenizer; a stopword set and a
+/// stemmer ride as their own `stopwords` / `stemmer` keys, each emitted
+/// only when set. A server that does not implement a named filter must
+/// reject the request rather than build a table analyzed differently
+/// than the client asked for — which is the request schema's job
+/// (`additionalProperties: false`), not something an encoding trick in
+/// this client can guarantee.
+/// One BM25 parameter widened for JSON without picking up the noise of a
+/// naive `f32 as f64`: that cast is exact, so `1.2_f32` widens to
+/// `1.2000000476837158` and crosses the wire as those seventeen digits.
+/// Round-tripping through the `f32`'s shortest `Debug` form instead
+/// yields the `f64` a reader would write by hand, so the request body
+/// says `1.2` and a server comparing against its own `1.2` matches.
+/// Same reasoning as the superfile writer's parameter serializer.
+fn param_as_f64(v: f32) -> f64 {
+    format!("{v:?}")
+        .parse()
+        .expect("an f32's Debug form is always a valid f64 literal")
+}
+
 pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
     let mut indexes = serde_json::Map::new();
     let columns = spec.fts_columns();
@@ -58,15 +83,32 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
             .iter()
             .zip(spec.fts_analyzers())
             .zip(spec.fts_stored())
-            .map(|((column, analyzer), stored)| {
-                let mut entry = serde_json::Map::new();
-                entry.insert("column".to_string(), json!(column));
-                entry.insert("analyzer".to_string(), json!(analyzer));
-                if !stored {
-                    entry.insert("stored".to_string(), json!(false));
-                }
-                Value::Object(entry)
-            })
+            .zip(spec.fts_bm25())
+            .zip(spec.fts_positions())
+            .zip(spec.fts_stopwords())
+            .zip(spec.fts_stemmers())
+            .map(
+                |((((((column, analyzer), stored), bm25), positions), stopwords), stemmer)| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("column".to_string(), json!(column));
+                    entry.insert("analyzer".to_string(), json!(analyzer));
+                    entry.insert("k1".to_string(), json!(param_as_f64(bm25.k1)));
+                    entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
+                    if !stored {
+                        entry.insert("stored".to_string(), json!(false));
+                    }
+                    if positions {
+                        entry.insert("positions".to_string(), json!(true));
+                    }
+                    if let Some(name) = stopwords.as_str() {
+                        entry.insert("stopwords".to_string(), json!(name));
+                    }
+                    if let Some(name) = stemmer.as_str() {
+                        entry.insert("stemmer".to_string(), json!(name));
+                    }
+                    Value::Object(entry)
+                },
+            )
             .collect();
         indexes.insert("fts".to_string(), Value::Array(fts));
     }
@@ -168,7 +210,7 @@ mod tests {
     use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 
     use super::*;
-    use crate::FtsField;
+    use crate::{FtsField, Stemmer, Stopwords};
 
     #[test]
     fn index_spec_json_shape() {
@@ -178,11 +220,56 @@ mod tests {
         let json = index_spec_to_json(&spec);
         assert_eq!(
             json["fts"],
-            json!([{"column": "body", "analyzer": "standard"}])
+            json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
         assert_eq!(
             json["vector"][0],
             json!({"column": "embedding", "dim": 384, "metric": "cosine"})
+        );
+    }
+
+    /// The analysis filters cross as their own keys, only when set, so
+    /// the server builds the index the client declared. A column with
+    /// no filter sends neither key, which is what keeps a default
+    /// request byte-identical to one from before the filters existed.
+    ///
+    /// A server that does not implement a named filter has to reject
+    /// the request — that is the request schema's job
+    /// (`additionalProperties: false`), which is why this client does
+    /// not smuggle the filters into the `analyzer` string to force a
+    /// rejection.
+    #[test]
+    fn index_spec_json_carries_the_analysis_filters_only_when_set() {
+        let spec = IndexSpec::new().fts(
+            FtsField::new("body")
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
+        );
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{
+                "column": "body",
+                "analyzer": "standard",
+                "k1": 1.2,
+                "b": 0.75,
+                "stopwords": "english",
+                "stemmer": "english",
+            }])
+        );
+        // One filter, not both.
+        let spec = IndexSpec::new().fts(FtsField::new("body").stemmer(Stemmer::English));
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{
+                "column": "body", "analyzer": "standard",
+                "k1": 1.2, "b": 0.75, "stemmer": "english",
+            }])
+        );
+        // And neither: no keys at all, not empty strings.
+        let spec = IndexSpec::new().fts("body");
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
     }
 
@@ -200,8 +287,8 @@ mod tests {
         assert_eq!(
             json["fts"],
             json!([
-                {"column": "title", "analyzer": "ascii_lower"},
-                {"column": "body", "analyzer": "standard"}
+                {"column": "title", "analyzer": "ascii_lower", "k1": 1.2, "b": 0.75},
+                {"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}
             ])
         );
 
@@ -211,7 +298,7 @@ mod tests {
         let defaulted = index_spec_to_json(&IndexSpec::new().fts("title"));
         assert_eq!(
             defaulted["fts"],
-            json!([{"column": "title", "analyzer": "standard"}])
+            json!([{"column": "title", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
     }
 
@@ -222,7 +309,30 @@ mod tests {
         let spec = IndexSpec::new().fts(FtsField::new("body").stored(false));
         assert_eq!(
             index_spec_to_json(&spec)["fts"],
-            json!([{"column": "body", "analyzer": "standard", "stored": false}])
+            json!([
+                {"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75, "stored": false}
+            ])
+        );
+    }
+
+    #[test]
+    fn index_spec_json_carries_the_declared_bm25_pair() {
+        // The pair crosses on every column, defaults included, for the
+        // same reason the analyzer does: it is the provenance of the
+        // stored score bounds, so a server filling in its own default
+        // would build bounds the client never asked for. A declared pair
+        // that failed to cross would be worse than an error — the table
+        // would come back scoring something else, silently.
+        let spec = IndexSpec::new()
+            .fts(FtsField::new("title").bm25(1.6, 0.4))
+            .fts("body");
+        assert_eq!(
+            index_spec_to_json(&spec)["fts"],
+            json!([
+                {"column": "title", "analyzer": "standard", "k1": 1.6, "b": 0.4},
+                {"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}
+            ]),
+            "the declared pair crosses per column, and a default column names the standard pair"
         );
     }
 

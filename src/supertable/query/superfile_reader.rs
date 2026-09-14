@@ -53,6 +53,12 @@ use crate::{
 /// configured. See the module-level docs for the precise
 /// policy.
 ///
+/// `storage_key` is the object key the superfile's bytes live at, the
+/// manifest entry's `storage_path()`, which carries a source stem when the
+/// superfile was ingested with one. It is passed alongside `uri` rather
+/// than re-derived from it because a named superfile's key is not a
+/// function of its uuid; `uri` still keys every cache tier.
+///
 /// `offsets` is an optional pre-known layout hint
 /// pulled from the manifest's [`SubsectionOffsets`]. When `Some`
 /// the disk-cache cold-fetch path fires the parquet-footer,
@@ -70,6 +76,7 @@ pub async fn superfile_reader(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,
     uri: &SuperfileUri,
+    storage_key: &str,
     offsets: Option<&SubsectionOffsets>,
     intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
@@ -87,7 +94,7 @@ pub async fn superfile_reader(
     //    (larger than the whole budget), so a budget miss never fails here.
     if let Some(cache) = disk_cache {
         return cache
-            .open_for_query(uri, offsets, storage, intent)
+            .open_for_query(uri, storage_key, offsets, storage, intent)
             .await
             .map_err(cache_open_failed);
     }
@@ -97,13 +104,15 @@ pub async fn superfile_reader(
     // It is intentionally whole-object: callers who need bounded
     // memory attach `DiskCacheStore`, which uses lazy/range opens.
     if let Some(storage) = storage {
-        let path = uri.storage_path();
-        let (bytes, _) = storage
-            .get(&path)
-            .await
-            .map_err(|e| ReaderCacheError::OpenFailed {
-                source: ReadError::Io(io::Error::other(format!("storage fetch {path}: {e}"))),
-            })?;
+        let (bytes, _) =
+            storage
+                .get(storage_key)
+                .await
+                .map_err(|e| ReaderCacheError::OpenFailed {
+                    source: ReadError::Io(io::Error::other(format!(
+                        "storage fetch {storage_key}: {e}"
+                    ))),
+                })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
         return Ok(Arc::new(reader));
@@ -209,9 +218,17 @@ mod tests {
 
         // No disk cache, no storage attached: if the in-memory tier is
         // consulted first (it is), neither fallback is needed.
-        let reader = superfile_reader(&store, None, None, &uri, None, ReadIntent::Warm)
-            .await
-            .expect("in-memory hit");
+        let reader = superfile_reader(
+            &store,
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("in-memory hit");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -246,9 +263,17 @@ mod tests {
         // A working fallback is attached; the in-memory error must win.
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
 
-        let err = superfile_reader(&store, None, Some(&storage), &uri, None, ReadIntent::Warm)
-            .await
-            .expect_err("in-memory error must propagate");
+        let err = superfile_reader(
+            &store,
+            None,
+            Some(&storage),
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect_err("in-memory error must propagate");
         assert!(
             matches!(err, ReaderCacheError::OpenFailed { .. }),
             "expected the in-memory OpenFailed to surface, got {err:?}",
@@ -270,6 +295,7 @@ mod tests {
             Some(&cache),
             None,
             &uri,
+            &uri.storage_path(),
             None,
             ReadIntent::Warm,
         )
@@ -295,6 +321,7 @@ mod tests {
             Some(&cache),
             None,
             &uri,
+            &uri.storage_path(),
             None,
             ReadIntent::Warm,
         )
@@ -316,6 +343,7 @@ mod tests {
             Some(&cache),
             None,
             &uri,
+            &uri.storage_path(),
             None,
             ReadIntent::Warm,
         )
@@ -342,6 +370,7 @@ mod tests {
             None,
             Some(&storage),
             &uri,
+            &uri.storage_path(),
             None,
             ReadIntent::Warm,
         )
@@ -362,6 +391,7 @@ mod tests {
             None,
             Some(&storage),
             &uri,
+            &uri.storage_path(),
             None,
             ReadIntent::Warm,
         )
@@ -378,9 +408,17 @@ mod tests {
     #[tokio::test]
     async fn no_cache_no_storage_returns_not_found() {
         let uri = SuperfileUri::new_v4();
-        let err = superfile_reader(&empty_store(), None, None, &uri, None, ReadIntent::Warm)
-            .await
-            .expect_err("in-process-only miss must be NotFound");
+        let err = superfile_reader(
+            &empty_store(),
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect_err("in-process-only miss must be NotFound");
         match err {
             ReaderCacheError::NotFound { uri: got } => assert_eq!(got, uri),
             other => panic!("expected NotFound, got {other:?}"),

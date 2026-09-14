@@ -41,8 +41,6 @@ pub(super) struct PhraseMember {
     /// inline FST value's slot carries it instead of a tf. `None` for
     /// PFOR members.
     pub(super) inline_position: Option<u32>,
-    /// The member's bare idf (the cursor stores only `idf × (K1+1)`).
-    pub(super) idf: f32,
     /// Byte offset of each decoded-block pair's run within
     /// `positions`, valid for `run_offsets_block`. Rebuilt on block
     /// crossings by one `skip_run` walk over the block's runs. Used by
@@ -165,8 +163,8 @@ impl PhraseMember {
 
 /// Doc-at-a-time cursor over an exact phrase: the members'
 /// intersection drives doc alignment, and a doc matches only when the
-/// members' positions verify adjacency (member `i` at `p + i` for
-/// some anchor `p`). Scores as one BM25 atom with `tf` = the number
+/// members' positions verify the phrase's spacing (member `i` at
+/// `p + position_offsets[i]` for some anchor `p`). Scores as one BM25 atom with `tf` = the number
 /// of verified anchors and `idf` = Σ member idf. Exposes the same
 /// notion of term- and block-level upper bounds as [`TermCursor`], so
 /// the atom walks can prune with it:
@@ -175,6 +173,22 @@ impl PhraseMember {
 /// the BM25 tf-factor is monotone in tf.
 pub(super) struct PhraseCursor {
     pub(super) members: Vec<PhraseMember>,
+    /// Each member's **token-position** offset from the phrase's first
+    /// member, in `members` (query) order — strictly ascending, first
+    /// entry `0`.
+    ///
+    /// Named for the unit on purpose: [`PhraseMember`] also carries
+    /// `run_offsets` and `cached_run_offset`, which are **byte** offsets
+    /// into a term's positions blob. Confusing the two would be a
+    /// correctness bug, not a type error.
+    ///
+    /// Plain `0..n` for a phrase whose words were adjacent in the
+    /// query, which is every phrase on a column with no analysis
+    /// chain. A column whose stopword set removed a word from the
+    /// middle of the phrase gets a gap here, so the verification asks
+    /// for the members exactly as far apart as the same chain put them
+    /// at index time — see `Phrase` in `fts::tokenize`.
+    pub(super) position_offsets: Vec<u32>,
     /// Member indices in ascending posting-list length (rarest first).
     /// The doc-alignment in [`Self::seek_match`] is a set intersection —
     /// order-independent — so it probes members rarest-first: the short
@@ -184,8 +198,9 @@ pub(super) struct PhraseCursor {
     /// Positional verification still runs in query order (`members`
     /// order), which the phrase adjacency check requires.
     pub(super) align_order: Vec<usize>,
-    /// Σ member idf × (K1 + 1) — the phrase's scoring constant.
-    pub(super) idf_x_k1p1: f32,
+    /// Σ member idf — the phrase's scoring constant, and the factor a
+    /// bound in the "scaled" form is multiplied back up by.
+    pub(super) idf_weight: f32,
     /// Phrase-scaled term-level upper bound (see type docs).
     pub(super) term_max_bm25: f32,
     /// Aligned-and-verified doc, or `u32::MAX` when exhausted.
@@ -207,10 +222,17 @@ impl PhraseCursor {
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
+        offsets: Vec<u32>,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
         debug_assert_eq!(cursors.len(), positional.len());
+        debug_assert_eq!(cursors.len(), offsets.len());
+        debug_assert_eq!(offsets.first(), Some(&0), "offsets are normalized");
+        debug_assert!(
+            offsets.windows(2).all(|w| w[0] < w[1]),
+            "offsets are strictly ascending"
+        );
         let mut idf_sum = 0.0f32;
         let mut min_scaled_bound = f32::INFINITY;
         let members: Vec<PhraseMember> = cursors
@@ -218,15 +240,13 @@ impl PhraseCursor {
             .zip(positions)
             .zip(positional)
             .map(|((cursor, positions), (term_meta, inline_position))| {
-                let idf = cursor.idf_x_k1p1 / (bm25::K1 + 1.0);
-                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
-                idf_sum += idf;
+                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / cursor.idf_weight);
+                idf_sum += cursor.idf_weight;
                 PhraseMember {
                     cursor,
                     positions,
                     term_meta,
                     inline_position,
-                    idf,
                     run_offsets: Vec::new(),
                     run_offsets_block: NO_BLOCK_CACHED,
                     cached_pair: NO_BLOCK_CACHED,
@@ -240,9 +260,10 @@ impl PhraseCursor {
         let mut align_order: Vec<usize> = (0..members.len()).collect();
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
-            idf_x_k1p1: idf_sum * (bm25::K1 + 1.0),
+            idf_weight: idf_sum,
             term_max_bm25: idf_sum * min_scaled_bound,
             members,
+            position_offsets: offsets,
             align_order,
             current_doc: 0,
             current_tf: 0,
@@ -418,7 +439,7 @@ impl PhraseCursor {
                     .min()
                     .expect("members >= 2");
                 let ub =
-                    bm25::score_with_dl_norm_k1(self.idf_x_k1p1, min_tf, dl_norm_k1.get(aligned));
+                    bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, dl_norm_k1.get(aligned));
                 if ub < bar {
                     from = match aligned.checked_add(1) {
                         Some(next) => next,
@@ -457,7 +478,9 @@ impl PhraseCursor {
     /// probe is a binary search over a per-doc-tf-sized slice.
     pub(super) fn verify_at_aligned(&mut self, aligned: u32) -> Result<u32, FtsError> {
         // Staged, rarest-first, lazy-decode verification. A phrase match
-        // starting at position `s` has member `j` at `s + j`, so any
+        // starting at position `s` has member `j` at
+        // `s + position_offsets[j]`,
+        // so any
         // member can seed the candidate starts: the rarest member (by
         // posting length — `align_order[0]`) seeds them, then each
         // remaining member filters the survivors *in rarest-first order*.
@@ -477,7 +500,7 @@ impl PhraseCursor {
         // bit-test and its block is not yet decoded; on the ranked path it
         // was already decoded by `skip_to`, so this is a no-op there.
         let anchor = self.align_order[0];
-        let anchor_off = anchor as u32;
+        let anchor_off = self.position_offsets[anchor];
         self.members[anchor].cursor.materialize_at(aligned);
         self.members[anchor].decode_current_positions()?;
         self.verify_scratch.clear();
@@ -494,9 +517,9 @@ impl PhraseCursor {
             self.members[j].cursor.materialize_at(aligned);
             self.members[j].decode_current_positions()?;
             let plist = &self.members[j].pos_scratch;
-            let off = j as u32;
+            let off = self.position_offsets[j];
             // Compact the survivors in place: keep a start iff member `j`
-            // holds `start + j`.
+            // holds `start + position_offsets[j]`.
             let mut w = 0usize;
             for r in 0..self.verify_scratch.len() {
                 let start = self.verify_scratch[r];
@@ -521,7 +544,7 @@ impl PhraseCursor {
     /// per-doc BM25 normalization.
     #[inline]
     pub(super) fn score_current(&self, dl_norm_k1: f32) -> f32 {
-        bm25::score_with_dl_norm_k1(self.idf_x_k1p1, self.current_tf, dl_norm_k1)
+        bm25::score_with_dl_norm_k1(self.idf_weight, self.current_tf, dl_norm_k1)
     }
 
     /// Phrase-scaled block-level upper bound over `[range_start,
@@ -530,10 +553,9 @@ impl PhraseCursor {
         let mut min_scaled = f32::INFINITY;
         for m in self.members.iter_mut() {
             let b = m.cursor.block_max_in_range(range_start, range_end);
-            min_scaled = min_scaled.min(b / m.idf);
+            min_scaled = min_scaled.min(b / m.cursor.idf_weight);
         }
-        let idf_sum = self.idf_x_k1p1 / (bm25::K1 + 1.0);
-        idf_sum * min_scaled
+        self.idf_weight * min_scaled
     }
 }
 
@@ -637,7 +659,7 @@ impl AnyCursor {
     pub(super) fn score_current(&self, dl_norm_k1: f32) -> f32 {
         match self {
             AnyCursor::Term(c) => {
-                bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), dl_norm_k1)
+                bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), dl_norm_k1)
             }
             AnyCursor::Phrase(c) => c.score_current(dl_norm_k1),
         }
@@ -665,10 +687,15 @@ impl AnyCursor {
 #[cfg(test)]
 mod tests {
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::reader::{FtsReader, core::ClauseLists};
+    use crate::superfile::fts::{
+        reader::{FtsReader, core::ClauseLists},
+        tokenize::Phrase,
+    };
 
-    fn phrase(terms: &[&str]) -> Vec<Vec<String>> {
-        vec![terms.iter().map(|t| t.to_string()).collect()]
+    fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
+        vec![Phrase::adjacent(
+            terms.iter().map(|t| t.to_string()).collect(),
+        )]
     }
 
     #[tokio::test]
@@ -696,6 +723,50 @@ mod tests {
         // doc lengths in play its score must strictly exceed doc 0's
         // (same length, tf 1... doc 0 len 3, doc 4 len 4; tf=2 wins).
         assert_eq!(hits[0].0, 4, "double occurrence ranks first");
+    }
+
+    /// An emoji is a token under `standard`, so it occupies a position
+    /// and breaks adjacency: `"cat dog"` must not match `cat 🙂 dog`.
+    #[tokio::test]
+    async fn an_emoji_between_two_words_breaks_the_phrase() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer,
+        };
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        b.add_doc(0, 0, "cat 🙂 dog").expect("doc 0");
+        b.add_doc(0, 1, "cat dog").expect("doc 1");
+        b.add_doc(0, 2, "cat, dog").expect("doc 2");
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["cat", "dog"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "punctuation takes no position; an emoji does"
+        );
+        // And the emoji itself is searchable.
+        let emoji = r
+            .search("title", &["🙂"], 10, BoolMode::Or)
+            .await
+            .expect("search");
+        assert_eq!(emoji.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![0]);
     }
 
     #[tokio::test]

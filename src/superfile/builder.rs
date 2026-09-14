@@ -96,9 +96,11 @@ use crate::superfile::{
         kv,
     },
     fts::{
+        analysis::{Base, Stemmer, Stopwords, chain_name, chain_tokenizer},
+        bm25,
         builder::FtsBuilder,
-        reader::ColumnMeta,
-        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, tokenizer_for_name},
+        reader::{ColumnLengthStats, ColumnMeta},
+        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
     },
     stats::SuperfileStats,
     vector::{
@@ -129,12 +131,24 @@ use crate::superfile::{
 #[derive(Debug, Clone)]
 pub struct FtsConfig {
     pub column: String,
-    /// Analyzer (tokenizer) name applied to this column —
+    /// **Base** analyzer (tokenizer) name applied to this column —
     /// `"standard"` (the default) or `"ascii_lower"`. Resolved to a
-    /// tokenizer instance once, at builder construction; an unknown
+    /// tokenizer instance once, at builder construction, together with
+    /// [`FtsConfig::stopwords`] and [`FtsConfig::stemmer`]; an unknown
     /// name is a build error. Per column: each FTS column is tokenized
     /// with its own analyzer, so columns in one table may differ.
     pub analyzer: String,
+    /// Stopword set removed after the base tokenizer and before the
+    /// stemmer. Persisted in the column's `inf.fts.columns` entry as
+    /// `"stopwords"`, emitted only when set — so a column with no
+    /// stopwords keeps an entry byte-identical to one written before
+    /// the filter existed, and a reader of such an entry correctly
+    /// infers that no set was applied.
+    pub stopwords: Stopwords,
+    /// Stemmer applied to what survives the stopword set. Persisted as
+    /// `"stemmer"` under the same only-when-set rule as
+    /// [`FtsConfig::stopwords`].
+    pub stemmer: Stemmer,
     /// Record token positions for this column, enabling exact phrase
     /// queries against it. Off by default: positions roughly double
     /// the column's FTS index footprint, so the cost is a per-column
@@ -154,6 +168,16 @@ pub struct FtsConfig {
     /// existing superfile the column is legitimately absent from the
     /// stored schema and its postings are carried across instead.
     pub stored: bool,
+    /// BM25 similarity parameters for this column. The build bakes the
+    /// stored per-block score bounds at this pair and records it in the
+    /// column's `inf.fts.columns` entry, so a reader never infers which
+    /// parameters a bound belongs to. A query may score at a different
+    /// pair; the reader corrects the bounds for the difference.
+    ///
+    /// Defaults to the standard pair (`k1 = 1.2`, `b = 0.75`), which
+    /// keeps the built bytes identical to a file written before the
+    /// parameters were declarable.
+    pub bm25: bm25::Bm25Params,
 }
 
 impl FtsConfig {
@@ -163,8 +187,11 @@ impl FtsConfig {
         Self {
             column: column.into(),
             analyzer: STANDARD_TOKENIZER.to_string(),
+            stopwords: Stopwords::None,
+            stemmer: Stemmer::None,
             positions: false,
             stored: true,
+            bm25: bm25::Bm25Params::STANDARD,
         }
     }
 
@@ -172,6 +199,25 @@ impl FtsConfig {
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         self.analyzer = name.into();
         self
+    }
+
+    /// Set the stopword set (see the field docs).
+    pub fn stopwords(mut self, stopwords: Stopwords) -> Self {
+        self.stopwords = stopwords;
+        self
+    }
+
+    /// Set the stemmer (see the field docs).
+    pub fn stemmer(mut self, stemmer: Stemmer) -> Self {
+        self.stemmer = stemmer;
+        self
+    }
+
+    /// This column's analysis as one derived identity string — the
+    /// value [`Tokenizer::name`] reports for its tokenizer. Never
+    /// persisted; see [`crate::superfile::fts::analysis`].
+    pub(crate) fn chain_name(&self) -> Option<&'static str> {
+        Base::from_name(&self.analyzer).map(|b| chain_name(b, self.stopwords, self.stemmer))
     }
 
     /// Record token positions (see the field docs).
@@ -183,6 +229,14 @@ impl FtsConfig {
     /// Keep the raw text in the Parquet body (see the field docs).
     pub fn stored(mut self, stored: bool) -> Self {
         self.stored = stored;
+        self
+    }
+
+    /// Set the BM25 similarity parameters (see the field docs).
+    /// Validated at `SupertableOptions::new`, which names the column
+    /// in the error.
+    pub fn bm25(mut self, k1: f32, b: f32) -> Self {
+        self.bm25 = bm25::Bm25Params::new(k1, b);
         self
     }
 }
@@ -230,6 +284,13 @@ pub struct BuilderOptions {
     ///
     /// May be empty.
     pub fts_columns: Vec<FtsConfig>,
+    /// Table-wide FTS length statistics — token total and documents with
+    /// tokens per column — over every superfile the new file will sit
+    /// beside. Each column bakes and declares the average over those
+    /// plus its own documents, so every superfile of a table scores at
+    /// one average as of its commit rather than its own. Empty for a
+    /// standalone build or a table's first superfile.
+    pub fts_corpus_stats: HashMap<String, ColumnLengthStats>,
     /// Vector columns. `column` must NOT collide with a
     /// column in `schema`, and must be unique across both
     /// `fts_columns` and `vector_columns`. May be empty.
@@ -355,11 +416,21 @@ impl BuilderOptions {
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
             vector_layout: VectorLayout::Ivf,
+            fts_corpus_stats: HashMap::new(),
         }
     }
 
     pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
         self.vector_layout = layout;
+        self
+    }
+
+    /// See [`Self::fts_corpus_stats`].
+    pub(crate) fn with_fts_corpus_stats(
+        mut self,
+        stats: HashMap<String, ColumnLengthStats>,
+    ) -> Self {
+        self.fts_corpus_stats = stats;
         self
     }
 
@@ -378,17 +449,30 @@ impl BuilderOptions {
     }
 
     pub fn new_from_reader(reader: &SuperfileReader) -> Self {
-        // Recover each FTS column's analyzer from the source reader so a
-        // rebuild carries the analyzer the postings were built with. This
-        // is why an existing table keeps its recorded analyzer through
-        // compaction and optimize no matter what the engine's default is.
+        // Recover each FTS column's whole analysis chain from the source
+        // reader — base tokenizer *and* both filters — so a rebuild
+        // carries the analysis the postings were built with. This is why
+        // an existing table keeps its recorded analyzer through
+        // compaction and optimize no matter what the engine's default
+        // is; dropping a filter here would re-tokenize the merged file's
+        // postings unfiltered.
+        //
+        // The BM25 pair rides along for the same reason and with a sharper
+        // consequence: dropping it here would rebake the merged file's
+        // block-max bounds at the standard pair while the source files
+        // kept theirs, so one column would score two ways depending on
+        // which superfile a document landed in — and a compaction, not
+        // any user action, would be what changed the ranking.
         let fts_columns: Vec<FtsConfig> = if let Some(fts) = &reader.fts() {
             fts.fts_columns_config()
                 .map(|c| {
                     FtsConfig::new(c.name.clone())
-                        .analyzer(c.tokenizer.name())
+                        .analyzer(c.base.name())
+                        .stopwords(c.stopwords)
+                        .stemmer(c.stemmer)
                         .positions(c.positions)
                         .stored(c.stored)
+                        .bm25(c.params.k1, c.params.b)
                 })
                 .collect()
         } else {
@@ -470,11 +554,16 @@ impl BuilderOptions {
                     own.column, other.name
                 )));
             }
-            let other_analyzer = other.tokenizer.name();
-            if own.analyzer != other_analyzer {
+            // Compare the whole analysis, not the base name: two columns
+            // sharing a base but differing in a filter hold different
+            // terms, so carrying one's postings into the other silently
+            // mixes two tokenizations.
+            let own_analysis = own.chain_name().unwrap_or(own.analyzer.as_str());
+            let other_analysis = other.tokenizer.name();
+            if own_analysis != other_analysis {
                 return Err(BuildError::FTSSchemaMismatch(format!(
                     "column {}: mismatched analyzer. self {} vs other {}",
-                    own.column, own.analyzer, other_analyzer
+                    own.column, own_analysis, other_analysis
                 )));
             }
             if own.positions != other.positions {
@@ -700,13 +789,25 @@ impl SuperfileBuilder {
             // column below registers its own analyzer explicitly.
             let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
             for fc in &opts.fts_columns {
-                let tok = tokenizer_for_name(&fc.analyzer).ok_or_else(|| {
-                    BuildError::UnknownAnalyzer {
+                // The whole chain, not just the base: a column that
+                // declares a stopword set or a stemmer must be indexed
+                // through them, or the postings would hold unfiltered
+                // terms while every query filtered.
+                let base =
+                    Base::from_name(&fc.analyzer).ok_or_else(|| BuildError::UnknownAnalyzer {
                         column: fc.column.clone(),
                         analyzer: fc.analyzer.clone(),
-                    }
-                })?;
-                fb.register_column_with_tokenizer(fc.column.clone(), fc.positions, tok)?;
+                    })?;
+                let tok = chain_tokenizer(base, fc.stopwords, fc.stemmer);
+                let id = fb.register_column_with_tokenizer(
+                    fc.column.clone(),
+                    fc.positions,
+                    tok,
+                    fc.bm25,
+                )?;
+                if let Some(corpus) = opts.fts_corpus_stats.get(&fc.column) {
+                    fb.set_corpus_length_stats(id, *corpus);
+                }
             }
             Some(fb)
         };
@@ -1095,13 +1196,18 @@ impl SuperfileBuilder {
         Ok(())
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Merge Sq8 IVF superfiles without fp32 corpus decode — byte-splices
     /// per-cluster IVF blocks and remaps doc ids.
     pub fn build_from_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_sq8_ivf_readers_to(readers, &mut buf)?;
+        let stats = Self::build_from_sq8_ivf_readers_to(readers, &HashMap::new(), &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -1111,10 +1217,12 @@ impl SuperfileBuilder {
     /// the compaction caller can stream to a temp file.
     pub(crate) fn build_from_sq8_ivf_readers_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let vec_col = first
@@ -1168,6 +1276,11 @@ impl SuperfileBuilder {
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Merge multi-cell (v2) Sq8 IVF superfiles **per global cell id**, then
     /// repack into one multi-cell output. Never flattens different cells into
     /// one IVF. Parquet `_id` rows follow cell-directory order (same as drain).
@@ -1182,6 +1295,7 @@ impl SuperfileBuilder {
         let stats = Self::build_from_multi_cell_sq8_ivf_readers_to(
             readers,
             superseded_per_reader,
+            &HashMap::new(),
             &mut buf,
         )?;
         Ok((buf, stats))
@@ -1193,10 +1307,12 @@ impl SuperfileBuilder {
     pub(crate) fn build_from_multi_cell_sq8_ivf_readers_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         superseded_per_reader: &[BTreeSet<u32>],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
             return Err(BuildError::VectorSchemaMismatch(
                 "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
@@ -1622,12 +1738,17 @@ impl SuperfileBuilder {
         Ok(superfile_stats)
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Builds a superfile from the given readers, merging them into one.
     pub fn build_from_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_to(readers, &mut buf)?;
+        let stats = Self::build_from_readers_to(readers, &HashMap::new(), &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -1638,11 +1759,13 @@ impl SuperfileBuilder {
     /// merged [`SuperfileStats`].
     pub(crate) fn build_from_readers_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
 
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let mut stats_collector = Vec::with_capacity(readers.len());
@@ -1680,10 +1803,12 @@ impl SuperfileBuilder {
     /// anon `Vec`.
     pub(crate) fn build_from_readers_fts_merge_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let builder_opts =
+            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         // Encode the Parquet body incrementally: each input's surviving rows are
@@ -1768,6 +1893,11 @@ impl SuperfileBuilder {
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
+    /// A standalone merge: the output averages document length over its
+    /// own documents. A table's compaction uses the `_to` variant with the
+    /// table's length totals, so the merged file bakes the table-wide
+    /// average over everything that remains beside it.
+    ///
     /// Thin `Vec<u8>` wrapper over
     /// [`build_from_readers_fts_merge_to`](Self::build_from_readers_fts_merge_to)
     /// for callers and tests that want the merged superfile in memory. Prefer
@@ -1776,7 +1906,7 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_fts_merge_to(readers, &mut buf)?;
+        let stats = Self::build_from_readers_fts_merge_to(readers, &HashMap::new(), &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -2286,11 +2416,37 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 /// JSON per column.
 ///
 /// Output shape per column:
-/// `{"name":"<escaped>","tokenizer":"<name>"}`.
-/// `tokenizer` is that column's analyzer name (`"ascii_lower"` or
-/// `"standard"`), straight from `FtsConfig.analyzer` — the reader
-/// reconstructs the matching tokenizer from it for query-time
-/// tokenization.
+/// `{"name":"<escaped>","tokenizer":"<name>","k1":<f>,"b":<f>}`.
+/// `tokenizer` holds the column's base tokenizer name (`"ascii_lower"`
+/// or `"standard"`), straight from `FtsConfig.analyzer` — whose field
+/// name says `analyzer` only because that is what the public option is
+/// called. A stopword set
+/// and a stemmer ride as `"stopwords"` / `"stemmer"`, each emitted only
+/// when set; the reader reconstructs the column's tokenizer from all
+/// three for query-time tokenization, and a missing filter field means
+/// the filter is off — the one thing a file written before it existed
+/// can mean.
+///
+/// `k1` / `b` are written **unconditionally, defaults included**,
+/// unlike `positions` and `stored`. Those two are booleans whose
+/// absence has exactly one possible meaning, so omitting them keeps a
+/// default column's JSON byte-identical to older files. A scoring
+/// parameter is different: it is the provenance of the stored
+/// block-max bounds, and a reader that has to infer it is a reader
+/// that will infer wrong the day the recommended default moves. The
+/// same lesson is recorded on `rerank_codec` in
+/// `supertable::manifest::options_hash` — a data-determined value
+/// belongs on disk, read back rather than re-derived.
+/// One BM25 parameter as JSON. `{:?}` on an `f32` is the shortest
+/// decimal that round-trips back to the same bits, and always carries a
+/// `.`, so the value the reader deserializes is bit-for-bit the value
+/// the bounds were baked with — which is what makes the
+/// `params == query` comparison in the reader exact rather than
+/// approximate.
+fn fts_param_json(v: f32) -> String {
+    format!("{v:?}")
+}
+
 fn fts_columns_json(cols: &[FtsConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
@@ -2302,6 +2458,26 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         s.push_str(r#"","tokenizer":""#);
         s.push_str(&escape_json(&c.analyzer));
         s.push('"');
+        // Always emitted — see the function docs.
+        s.push_str(r#","k1":"#);
+        s.push_str(&fts_param_json(c.bm25.k1));
+        s.push_str(r#","b":"#);
+        s.push_str(&fts_param_json(c.bm25.b));
+        // Analysis filters, each emitted only when set, so a column
+        // with neither keeps JSON byte-identical to a file written
+        // before they existed. A reader that does not know the field
+        // treats the filter as off, which degrades that column's
+        // results rather than making the file unreadable.
+        if let Some(name) = c.stopwords.as_str() {
+            s.push_str(r#","stopwords":""#);
+            s.push_str(name);
+            s.push('"');
+        }
+        if let Some(name) = c.stemmer.as_str() {
+            s.push_str(r#","stemmer":""#);
+            s.push_str(name);
+            s.push('"');
+        }
         // Emitted only when set: a positionless column's JSON stays
         // byte-identical to files written before positions existed
         // (the reader defaults a missing field to false).
@@ -2716,11 +2892,13 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard","positions":true}"#),
+            s.contains(
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}"#
+            ),
             "positional column carries the flag: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"standard"}"#),
+            s.contains(r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}"#),
             "positionless column carries no positions key at all: {s}"
         );
     }
@@ -2736,11 +2914,11 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard"}"#),
+            s.contains(r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}"#),
             "title uses the standard analyzer: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"ascii_lower"}"#),
+            s.contains(r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75}"#),
             "body uses ascii_lower: {s}"
         );
     }
@@ -2755,11 +2933,13 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard"}"#),
+            s.contains(r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}"#),
             "stored column carries no stored key at all: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"standard","stored":false}"#),
+            s.contains(
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false}"#
+            ),
             "index-only column carries the flag: {s}"
         );
     }
@@ -4838,6 +5018,125 @@ mod tests {
             .await
             .expect("bm25 on carried stored column");
         assert_eq!(hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn build_from_readers_bm25_params_preserved_by_new_from_reader() {
+        // Same failure shape as the codec case below: dropping the pair in
+        // `new_from_reader` would rebake the merged file's block-max bounds
+        // at the standard values while the source kept its own, so one
+        // column would score two ways depending on which superfile a
+        // document landed in — and a compaction, not any user action,
+        // would be what changed the ranking.
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").bm25(1.4, 0.6)],
+            vec![],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let source_bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(source_bytes)).expect("open reader");
+        let source_pair = reader
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column")
+            .params;
+        assert_eq!(source_pair, bm25::Bm25Params::new(1.4, 0.6));
+
+        let (merged_bytes, _stats) =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let merged_pair = merged
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column")
+            .params;
+        assert_eq!(
+            merged_pair, source_pair,
+            "the declared pair must survive a rebuild, or compaction silently rescores the column"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_from_readers_analysis_chain_preserved_by_new_from_reader() {
+        // Same failure shape as the pair above, one layer nastier.
+        // `new_from_reader` rebuilds a column's analyzer from
+        // `tokenizer.name()`, and for a chained column that name is the
+        // whole chain. Drop a filter there and the merged file's
+        // postings are re-tokenized *unfiltered* while the source's
+        // were filtered — so a compaction, not any user action, would
+        // change which terms exist. (In practice the merge's own
+        // carry-compatibility check would reject the mismatch first,
+        // which turns the bug into a permanently failing background
+        // compaction rather than wrong answers — still a bug, and one
+        // nothing else here would catch.)
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![
+                FtsConfig::new("title")
+                    .stopwords(Stopwords::English)
+                    .stemmer(Stemmer::English)
+                    .positions(true),
+            ],
+            vec![],
+        );
+        // The derived identity the reader will report for that column.
+        let chain = chain_name(Base::Standard, Stopwords::English, Stemmer::English);
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let source_bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(source_bytes)).expect("open reader");
+        let source_cfg = reader
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(source_cfg.tokenizer.name(), chain);
+        assert_eq!(source_cfg.stopwords, Stopwords::English);
+        assert_eq!(source_cfg.stemmer, Stemmer::English);
+        assert!(source_cfg.positions, "positions must reach the built file");
+
+        let (merged_bytes, _stats) =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let merged_cfg = merged
+            .fts()
+            .expect("fts index")
+            .fts_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            merged_cfg.tokenizer.name(),
+            chain,
+            "the analysis chain must survive a rebuild, or compaction \
+             silently re-tokenizes the column"
+        );
+        assert_eq!(
+            (merged_cfg.stopwords, merged_cfg.stemmer),
+            (Stopwords::English, Stemmer::English),
+            "the filter components must survive too — the derived name is \
+             not something a rebuild can parse back"
+        );
+        assert!(
+            merged_cfg.positions,
+            "the positions flag must survive a rebuild too"
+        );
     }
 
     #[tokio::test]

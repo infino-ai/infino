@@ -785,7 +785,13 @@ pub fn open_superfile_cold_reader(
     let offsets = superfile_cold_size_hint(known_size);
     let reader = block_on(async move {
         cache
-            .open_for_query(uri, Some(&offsets), None, ReadIntent::Warm)
+            .open_for_query(
+                uri,
+                &uri.storage_path(),
+                Some(&offsets),
+                None,
+                ReadIntent::Warm,
+            )
             .await
             .expect("cold reader")
     });

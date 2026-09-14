@@ -28,6 +28,7 @@
 //! "ordered equality".
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -39,7 +40,10 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::reader::BoolMode,
+        fts::{
+            reader::BoolMode,
+            tokenize::{Phrase, Tokenizer},
+        },
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids, default_tokenizer},
 };
@@ -123,16 +127,18 @@ pub fn build_infino_superfile_positional(corpus: &[(u64, &str)]) -> SuperfileRea
 }
 
 fn build_infino_superfile_with(corpus: &[(u64, &str)], positions: bool) -> SuperfileReader {
+    build_infino_superfile_with_fts(corpus, FtsConfig::new("title").positions(positions))
+}
+
+/// Build the same single-superfile fixture under an arbitrary
+/// [`FtsConfig`], for tests that need a non-default analysis (a stopword
+/// set, a stemmer) rather than just positions on or off.
+pub fn build_infino_superfile_with_fts(corpus: &[(u64, &str)], fts: FtsConfig) -> SuperfileReader {
     let schema = Arc::new(Schema::new(vec![
         Field::new("doc_id", DataType::Decimal128(38, 0), false),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
-    let opts = BuilderOptions::new(
-        schema.clone(),
-        "doc_id",
-        vec![FtsConfig::new("title").positions(positions)],
-        vec![],
-    );
+    let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![fts], vec![]);
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
     let ids = decimal128_ids(corpus.iter().map(|(i, _)| *i));
     let titles = LargeStringArray::from(corpus.iter().map(|(_, t)| *t).collect::<Vec<_>>());
@@ -141,6 +147,38 @@ fn build_infino_superfile_with(corpus: &[(u64, &str)], positions: bool) -> Super
     b.add_batch(&batch, &[]).expect("add_batch");
     let bytes = Bytes::from(b.finish().expect("finish builder"));
     SuperfileReader::open(bytes).expect("open superfile")
+}
+
+/// Oracle top-k for `query` under `mode`, parsed with `tok`.
+///
+/// Parsing here with the *same* tokenizer the reader uses is the point:
+/// it means a difference in how the query was split into clauses can
+/// never masquerade as a difference in scoring. `Phrase::map` carries
+/// each term's offset across, so a phrase is graded at the spacing the
+/// parser derived rather than at adjacency — which is what a stopworded
+/// column needs, and a no-op for every other column.
+pub fn oracle_top_k_atoms(
+    oracle: &BruteForceBm25,
+    tok: &dyn Tokenizer,
+    query: &str,
+    mode: BoolMode,
+    k: usize,
+) -> Vec<(u64, f32)> {
+    let clauses = tok.parse(query).into_clauses(mode);
+    let own =
+        |v: Vec<Cow<'_, str>>| -> Vec<String> { v.into_iter().map(Cow::into_owned).collect() };
+    let own_ph = |v: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+        v.iter().map(|p| p.map(|t| t.to_string())).collect()
+    };
+    oracle.top_k_atoms(
+        &own(clauses.musts),
+        &own_ph(clauses.must_phrases),
+        &own(clauses.shoulds),
+        &own_ph(clauses.should_phrases),
+        &own(clauses.negatives),
+        &own_ph(clauses.negative_phrases),
+        k,
+    )
 }
 
 /// Run infino's BM25 search and return doc_ids in score-descending
@@ -277,6 +315,72 @@ async fn oracle_three_term_query_top5_set_matches() {
 /// short high-tf anchor docs whose scores strictly decrease, giving a
 /// tie-free top-5 head. Large enough (`n`) that a k=1000 search exercises
 /// a genuinely deep top-k, not "return everything".
+/// Every third row is null for the column, on a corpus whose scores are
+/// otherwise exact (all lengths below the length quantizer's exact
+/// range). BM25 is defined over the documents that carry the field, so
+/// the empty rows must enter neither the average length nor the
+/// collection size — dividing by rows instead deflates the average and
+/// inflates idf for every term, and this asserts the engine's scores
+/// against the oracle's by value, not just by rank, so either mistake
+/// fails here rather than only shifting an order.
+#[tokio::test]
+async fn oracle_sparse_column_scores_match_by_value() {
+    let dense = [
+        "rust async runtime tokio",
+        "rust embedded systems",
+        "python data pipeline pandas numpy",
+        "python machine learning",
+        "javascript web frontend react vue svelte",
+        "rust python interop",
+        "go concurrency channels",
+        "rust rust rust systems",
+    ];
+    // Interleave a null row after every second document.
+    let corp: Vec<(u64, &str)> = dense
+        .iter()
+        .flat_map(|d| [*d, ""])
+        .chain(["", ""])
+        .enumerate()
+        .map(|(i, d)| (i as u64, d))
+        .collect();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+    for (query, mode) in [
+        ("rust", BoolMode::Or),
+        ("python data", BoolMode::Or),
+        ("rust systems", BoolMode::And),
+        ("javascript svelte", BoolMode::And),
+    ] {
+        let got: HashMap<u64, f32> = infino
+            .bm25_hits_async("title", query, corp.len(), mode)
+            .await
+            .expect("BM25 search")
+            .into_iter()
+            .map(|(d, s)| (d as u64, s))
+            .collect();
+        let terms: Vec<String> = tok.tokenize(query).collect();
+        let want: HashMap<u64, f32> = match mode {
+            BoolMode::Or => oracle.top_k_terms(&terms, corp.len()),
+            BoolMode::And => oracle.top_k_terms_and(&terms, corp.len()),
+        }
+        .into_iter()
+        .collect();
+        assert_eq!(
+            got.keys().collect::<HashSet<_>>(),
+            want.keys().collect::<HashSet<_>>(),
+            "{query:?} {mode:?}: match sets"
+        );
+        for (doc, score) in &got {
+            let expected = want[doc];
+            assert!(
+                (score - expected).abs() < BM25_SCORE_ABS_TOLERANCE,
+                "{query:?} {mode:?} doc {doc}: engine {score} vs oracle {expected}"
+            );
+        }
+    }
+}
+
 fn common_heavy_corpus(n: u64) -> Vec<(u64, String)> {
     let terms = ["alpha", "beta", "gamma", "delta"];
     let mut docs = Vec::with_capacity(n as usize);
@@ -637,7 +741,7 @@ async fn oracle_and_scores_match_brute_force_ordering() {
     for ((i_doc, i_score), (o_doc, o_score)) in infino_hits.iter().zip(oracle_hits.iter()) {
         assert_eq!(*i_doc, *o_doc, "doc-id mismatch");
         // f32 BM25 sums diverge by ~1e-4 between the two scorers due
-        // to operand ordering (infino precomputes idf_x_k1p1 and
+        // to operand ordering (infino precomputes idf_weight and
         // dl_norm_k1; the oracle multiplies term-by-term). 1e-3 is
         // tighter than any meaningful BM25 score gap on this corpus.
         let delta = (i_score - o_score).abs();
@@ -1538,7 +1642,7 @@ async fn oracle_and_multi_block_score_matches_brute_force() {
     // may reorder within a single score class). Catches scoring
     // drift introduced by the block-crossing code paths in the
     // flat-merge (e.g. wrong `block_tfs[pos]` index after a block
-    // boundary, or a stale `idf_x_k1p1` if the cursor was
+    // boundary, or a stale `idf_weight` if the cursor was
     // reconstructed mid-walk).
     let corp_owned = build_multi_block_corpus();
     let corp_refs: Vec<(u64, &str)> = corp_owned.iter().map(|(i, s)| (*i, s.as_str())).collect();

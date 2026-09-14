@@ -141,7 +141,7 @@ fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl
             bnorm[n] = dl_norm.get(doc);
             n += 1;
             if n == L {
-                let contrib = bm25::score_one_term_x4(c.idf_x_k1p1, btf, bnorm);
+                let contrib = bm25::score_one_term_x4(c.idf_weight, btf, bnorm);
                 for l in 0..L {
                     scores[bidx[l]] += contrib[l];
                 }
@@ -150,7 +150,7 @@ fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl
         }
     }
     for l in 0..n {
-        scores[bidx[l]] += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, btf[l], bnorm[l]);
+        scores[bidx[l]] += bm25::score_with_dl_norm_k1(c.idf_weight, btf[l], bnorm[l]);
     }
 }
 
@@ -485,7 +485,7 @@ impl FtsReader {
             let mut packed = 0;
             for cursor in &cursors {
                 if cursor.current_doc_id() == pivot_doc {
-                    idfs[packed] = cursor.idf_x_k1p1;
+                    idfs[packed] = cursor.idf_weight;
                     tfs[packed] = cursor.current_tf() as f32;
                     packed += 1;
                     if packed == 4 {
@@ -723,7 +723,7 @@ impl FtsReader {
                     let score = if need_score {
                         let norm = dl_norm_k1.get(d);
                         let mut s = bm25::score_with_dl_norm_k1(
-                            driver.idf_x_k1p1,
+                            driver.idf_weight,
                             driver.current_tf(),
                             norm,
                         );
@@ -732,7 +732,7 @@ impl FtsReader {
                         // cursor on `d`'s block, so this doesn't re-seek.
                         for o in others.iter_mut() {
                             let tf = o.tf_at_contained(d);
-                            s += bm25::score_with_dl_norm_k1(o.idf_x_k1p1, tf, norm);
+                            s += bm25::score_with_dl_norm_k1(o.idf_weight, tf, norm);
                         }
                         s
                     } else {
@@ -989,10 +989,10 @@ impl FtsReader {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1.get(a);
                         let mut score =
-                            bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.block_tfs[i], norm);
+                            bm25::score_with_dl_norm_k1(c0.idf_weight, c0.block_tfs[i], norm);
                         for o in others.iter() {
                             score +=
-                                bm25::score_with_dl_norm_k1(o.idf_x_k1p1, o.block_tfs[o.pos], norm);
+                                bm25::score_with_dl_norm_k1(o.idf_weight, o.block_tfs[o.pos], norm);
                         }
                         score
                     } else {
@@ -1098,8 +1098,8 @@ impl FtsReader {
             let rb_n = c1.block_n;
             let mut i = c0.pos;
             let mut j = c1.pos;
-            let c0_idf = c0.idf_x_k1p1;
-            let c1_idf = c1.idf_x_k1p1;
+            let c0_idf = c0.idf_weight;
+            let c1_idf = c1.idf_weight;
             while i < lb_n && j < rb_n {
                 let a = c0.block_doc_ids[i];
                 let b = c1.block_doc_ids[j];
@@ -1273,7 +1273,7 @@ impl FtsReader {
                     }
                     let norm = dl_norm_k1.get(candidate);
                     let essential_score = bm25::score_with_dl_norm_k1(
-                        cursors[0].idf_x_k1p1,
+                        cursors[0].idf_weight,
                         cursors[0].current_tf(),
                         norm,
                     );
@@ -1294,13 +1294,13 @@ impl FtsReader {
                         continue;
                     }
                     // SIMD-pack non-essentials at `candidate`.
-                    let mut idfs = [cursors[0].idf_x_k1p1, 0.0, 0.0, 0.0];
+                    let mut idfs = [cursors[0].idf_weight, 0.0, 0.0, 0.0];
                     let mut tfs = [cursors[0].current_tf() as f32, 0.0, 0.0, 0.0];
                     let mut packed = 1;
                     let mut score: f32 = 0.0;
                     for cursor in cursors.iter_mut().skip(1) {
                         if let Some(tf) = cursor.bitset_probe_tf(candidate) {
-                            idfs[packed] = cursor.idf_x_k1p1;
+                            idfs[packed] = cursor.idf_weight;
                             tfs[packed] = tf as f32;
                             packed += 1;
                             if packed == 4 {
@@ -1434,7 +1434,7 @@ impl FtsReader {
                 let mut packed = 0;
                 for cursor in cursors.iter().take(f_essential) {
                     if cursor.current_doc_id() == candidate {
-                        idfs[packed] = cursor.idf_x_k1p1;
+                        idfs[packed] = cursor.idf_weight;
                         tfs[packed] = cursor.current_tf() as f32;
                         packed += 1;
                         if packed == 4 {
@@ -1481,7 +1481,7 @@ impl FtsReader {
                             // tf read on a bitset block, decode-and-locate on a
                             // PACKED one.
                             if let Some(tf) = cursor.bitset_probe_tf(candidate) {
-                                score += bm25::score_with_dl_norm_k1(cursor.idf_x_k1p1, tf, norm);
+                                score += bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, norm);
                             }
                             remaining_block_ub -= block_ub;
                         }
@@ -1635,7 +1635,7 @@ impl FtsReader {
                         if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
                             let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
                             let contributions = bm25::score_one_term_x4(
-                                c.idf_x_k1p1,
+                                c.idf_weight,
                                 [tfs[0], tfs[1], tfs[2], tfs[3]],
                                 [
                                     dl_norm_k1.get(doc_ids[0]),
@@ -1655,7 +1655,7 @@ impl FtsReader {
                     }
                     let local = (d - base) as usize;
                     scores[local] += bm25::score_with_dl_norm_k1(
-                        c.idf_x_k1p1,
+                        c.idf_weight,
                         c.current_tf(),
                         dl_norm_k1.get(d),
                     );
@@ -1813,7 +1813,7 @@ impl FtsReader {
                     }
                     let norm = dl_norm_k1.get(candidate);
                     let essential_score =
-                        bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.current_tf(), norm);
+                        bm25::score_with_dl_norm_k1(c0.idf_weight, c0.current_tf(), norm);
                     // Bound the non-essentials at `candidate` by each one's
                     // block-max for the block that *contains* it (monotonic
                     // `shallow_advance` hint — amortized O(1), no decode), not by
@@ -1833,13 +1833,13 @@ impl FtsReader {
                     // Complete: probe each non-essential and SIMD-pack the
                     // matches (leader seeded as lane 0, so `score` is the full
                     // BM25 sum).
-                    let mut idfs = [c0.idf_x_k1p1, 0.0, 0.0, 0.0];
+                    let mut idfs = [c0.idf_weight, 0.0, 0.0, 0.0];
                     let mut tfs = [c0.current_tf() as f32, 0.0, 0.0, 0.0];
                     let mut packed = 1;
                     let mut score = 0.0f32;
                     for c in non_ess.iter_mut() {
                         if let Some(tf) = c.bitset_probe_tf(candidate) {
-                            idfs[packed] = c.idf_x_k1p1;
+                            idfs[packed] = c.idf_weight;
                             tfs[packed] = tf as f32;
                             packed += 1;
                             if packed == 4 {
@@ -1949,7 +1949,7 @@ impl FtsReader {
                         if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
                             let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
                             let contributions = bm25::score_one_term_x4(
-                                c.idf_x_k1p1,
+                                c.idf_weight,
                                 [tfs[0], tfs[1], tfs[2], tfs[3]],
                                 [
                                     dl_norm_k1.get(doc_ids[0]),
@@ -1969,7 +1969,7 @@ impl FtsReader {
                     }
                     let local = (d - base) as usize;
                     scores[local] += bm25::score_with_dl_norm_k1(
-                        c.idf_x_k1p1,
+                        c.idf_weight,
                         c.current_tf(),
                         dl_norm_k1.get(d),
                     );
@@ -2147,7 +2147,7 @@ impl FtsReader {
             let mut packed = 0;
             for cursor in cursors.iter_mut() {
                 if cursor.current_doc_id() == candidate {
-                    idfs[packed] = cursor.idf_x_k1p1;
+                    idfs[packed] = cursor.idf_weight;
                     tfs[packed] = cursor.current_tf() as f32;
                     packed += 1;
                     if packed == 4 {

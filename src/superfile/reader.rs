@@ -20,7 +20,14 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::{borrow::Cow, collections::HashMap, fmt, io, ops::Range, str, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt, io,
+    ops::{Deref, Range},
+    str,
+    sync::{Arc, RwLock},
+};
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
@@ -52,11 +59,12 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
+            bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
                 PreparedClauses, TermPattern,
             },
-            tokenize::Tokenizer,
+            tokenize::{Phrase, Tokenizer},
         },
         vector::{
             layout::VectorLayout,
@@ -102,6 +110,25 @@ impl Default for OpenOptions {
     }
 }
 
+/// The FTS reader a scored query reads through: the one the file baked,
+/// or a shared view of it scoring against something else. Derefs to
+/// [`FtsReader`] so call sites do not care which they hold.
+enum ScoredFts<'a> {
+    Baked(&'a FtsReader),
+    Derived(Arc<FtsReader>),
+}
+
+impl Deref for ScoredFts<'_> {
+    type Target = FtsReader;
+
+    fn deref(&self) -> &FtsReader {
+        match self {
+            ScoredFts::Baked(r) => r,
+            ScoredFts::Derived(r) => r,
+        }
+    }
+}
+
 pub struct SuperfileReader {
     /// Full Parquet bytes, `Some` only for the eager [`open`]
     /// path. The lazy [`open_lazy`] path drops the
@@ -139,6 +166,22 @@ pub struct SuperfileReader {
     id_column: String,
     n_docs: u64,
     fts: Option<FtsReader>,
+    /// The most recently derived scored FTS view, kept so a query that
+    /// scores against anything other than what the file baked in does
+    /// not rebuild one per call.
+    ///
+    /// Rebuilding is not free: it clones the column metadata and builds
+    /// a fresh 256-entry decode table per column, and the scored path
+    /// asks for a view more than once per superfile per query. Since
+    /// table-wide statistics became the default that happens on every
+    /// query rather than only on an explicit override, so a common term
+    /// touching every superfile paid it once per superfile per call.
+    ///
+    /// One slot rather than a map: within a manifest generation every
+    /// query on a column asks for the same override, so a single entry
+    /// hits on all but the first. A table alternating between two FTS
+    /// columns thrashes it and simply pays what it paid before.
+    scored_fts: RwLock<Option<(Bm25Params, Arc<FtsReader>)>>,
     vec: Option<VectorReader>,
     /// Byte range of the stable-id sidecar within `bytes` (a packed
     /// little-endian `i128` per local doc id), when the superfile carries
@@ -360,6 +403,7 @@ impl SuperfileReader {
             id_column,
             n_docs,
             fts,
+            scored_fts: RwLock::new(None),
             vec,
             // No resident bytes to slice on the lazy path; `_id` resolution
             // there goes through the Parquet id column.
@@ -503,6 +547,7 @@ impl SuperfileReader {
             id_column,
             n_docs,
             fts,
+            scored_fts: RwLock::new(None),
             vec,
             id_sidecar,
         })
@@ -1112,11 +1157,11 @@ impl SuperfileReader {
         let musts: Vec<&str> = clauses.musts.iter().map(|t| &**t).collect();
         let shoulds: Vec<&str> = clauses.shoulds.iter().map(|t| &**t).collect();
         let negatives: Vec<&str> = clauses.negatives.iter().map(|t| &**t).collect();
-        let own = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
-            phrases
-                .into_iter()
-                .map(|p| p.into_iter().map(Cow::into_owned).collect())
-                .collect()
+        // `Phrase::map` keeps each term's offset, which is what a
+        // phrase on a stopworded column needs: its terms were not
+        // adjacent in the query and must not be required adjacent here.
+        let own = |phrases: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
+            phrases.iter().map(|p| p.map(|t| t.to_string())).collect()
         };
         let must_phrases = own(clauses.must_phrases);
         let should_phrases = own(clauses.should_phrases);
@@ -1249,7 +1294,7 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
@@ -1267,10 +1312,10 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        phrases: &[Vec<String>],
+        phrases: &[Phrase<String>],
         mode: BoolMode,
         neg_terms: &[&str],
-        neg_phrases: &[Vec<String>],
+        neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
@@ -1414,20 +1459,56 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
+        bm25: Option<Bm25Params>,
     ) -> Result<PreparedClauses, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.prepare_clauses(column, lists, k, floor).await?)
     }
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched.
-    pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, ReadError> {
+    ///
+    /// `bm25` must be the same override the paired `prepare_clauses`
+    /// was given: the cursors carry the bounds they were built with, and
+    /// scoring divides by a norm table derived from that same override.
+    /// `with_bm25_override` is deterministic, so two separately-derived
+    /// views of one pair agree bit for bit.
+    pub(crate) fn run_prepared(
+        &self,
+        prep: PreparedClauses,
+        bm25: Option<Bm25Params>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self.fts_scored(bm25)?;
+        Ok(fts.run_prepared(prep)?)
+    }
+
+    /// The FTS reader a scored query should read through: this
+    /// superfile's own, or a view of it that scores with `scoring`
+    /// instead of what each column baked in.
+    ///
+    /// Borrowed when there is no override, which is the default path
+    /// and costs nothing. An override clones the reader — an `Arc` bump
+    /// for the blob plus one 1 KiB decode table per column that
+    /// actually moves — and records the factor that keeps each column's
+    /// stored bounds upper bounds under what is being scored.
+    fn fts_scored(&self, bm25: Option<Bm25Params>) -> Result<ScoredFts<'_>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.run_prepared(prep)?)
+        let Some(params) = bm25 else {
+            return Ok(ScoredFts::Baked(fts));
+        };
+        if let Some((cached, view)) = self.scored_fts.read().expect("scored fts memo").as_ref()
+            && *cached == params
+        {
+            return Ok(ScoredFts::Derived(Arc::clone(view)));
+        }
+        let view = Arc::new(fts.with_bm25_override(params));
+        // Last writer wins. Two queries racing here derive the same view
+        // from the same inputs — `with_bm25_override` is deterministic —
+        // so which one lands is immaterial.
+        *self.scored_fts.write().expect("scored fts memo") = Some((params, Arc::clone(&view)));
+        Ok(ScoredFts::Derived(view))
     }
 
     /// Prefix-expanded BM25 search.
@@ -1598,10 +1679,9 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        bm25: Option<Bm25Params>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        let fts = self.fts_scored(bm25)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
     }
 
@@ -1626,7 +1706,16 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let set = self.bm25_prefix_cursor_set(column, prefix, pool).await?;
-        self.bm25_search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, f32::NEG_INFINITY)
+        // Prefix search has no search-options surface, so columns score
+        // with the pair they declared.
+        self.bm25_search_or_range_prebuilt(
+            &set,
+            k,
+            doc_id_start,
+            doc_id_end,
+            f32::NEG_INFINITY,
+            None,
+        )
     }
 
     /// Multi-column BM25 search with per-column weights ("most
@@ -1850,6 +1939,12 @@ pub struct VectorSearchOptions {
     /// IVF probe override. `None` → engine default for the query path.
     pub nprobe: Option<usize>,
     rerank_mult: Option<usize>,
+    /// `hnsw_ivf` serve-time beam override. `None` → the stamped k→ef curve
+    /// (or the `vector.hnsw_ef_search` config), exactly as today; `Some(ef)`
+    /// with `ef > 0` walks this query at that fixed beam. A test-and-bench
+    /// instrument (recall/latency sweeps of an already-built graph); ignored
+    /// under any non-graph serving path.
+    ef: Option<usize>,
 }
 
 impl VectorSearchOptions {
@@ -1884,6 +1979,19 @@ impl VectorSearchOptions {
     /// The configured rerank multiplier, if one was set.
     pub fn rerank_mult(&self) -> Option<usize> {
         self.rerank_mult
+    }
+
+    /// Set the `hnsw_ivf` serve-time beam (`ef`) for this query. Higher improves
+    /// recall at the cost of more work; overrides the stamped k→ef curve for an
+    /// already-built graph without a rebuild.
+    pub fn with_ef(mut self, ef: usize) -> Self {
+        self.ef = Some(ef);
+        self
+    }
+
+    /// The configured serve-time `ef` beam, if one was set.
+    pub(crate) fn ef(&self) -> Option<usize> {
+        self.ef
     }
 
     /// Resolve `(nprobe, rerank_mult)` for this query path.
@@ -2604,6 +2712,46 @@ mod tests {
     }
 
     // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn a_scored_view_is_memoized_per_parameter_pair() {
+        // No override borrows the baked reader; an override derives a view
+        // once and hands the same one back while the pair is unchanged,
+        // and a different pair replaces it — the memo is last-writer-wins
+        // and never keeps a stale pair.
+        let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
+        assert!(matches!(
+            r.fts_scored(None).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+        let a = Bm25Params::new(1.4, 0.6);
+        let b = Bm25Params::new(0.9, 0.4);
+        let first = match r.fts_scored(Some(a)).expect("derive") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        let again = match r.fts_scored(Some(a)).expect("reuse") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "same pair: the memoized view is reused"
+        );
+        let other = match r.fts_scored(Some(b)).expect("derive another") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a different pair derives a different view"
+        );
+        assert_eq!(other.fts_columns_config().next().expect("column").params, b);
+        assert!(matches!(
+            r.fts_scored(None).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+    }
 
     #[test]
     fn open_with_verify_crc_off_succeeds() {

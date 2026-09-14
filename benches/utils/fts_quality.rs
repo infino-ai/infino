@@ -65,6 +65,7 @@ use std::{borrow::Cow, cmp::Ordering, collections::HashMap, time::Instant};
 
 use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch, StringArray};
 use infino::{
+    Bm25SearchOptions,
     superfile::fts::{
         bm25::stored_len,
         reader::{Bm25Stats, BoolMode},
@@ -455,7 +456,7 @@ impl Oracle {
     fn tf_factor(&self, tf: u32, dl: u32) -> f64 {
         let tf = f64::from(tf);
         let norm = 1.0 - B + B * f64::from(dl) / self.avgdl.max(f64::MIN_POSITIVE);
-        tf * (K1 + 1.0) / (tf + K1 * norm)
+        tf / (tf + K1 * norm)
     }
 
     /// A battery query's clauses as atom indices. Every term and phrase was
@@ -647,7 +648,13 @@ fn engine_hits(
     stats: Bm25Stats,
 ) -> Vec<EngineHit> {
     let batches = reader
-        .bm25_search(column, q.query, k, q.mode, stats, Some(&[column, "score"]))
+        .bm25_search(
+            column,
+            q.query,
+            k,
+            Bm25SearchOptions::new().with_mode(q.mode).with_stats(stats),
+            Some(&[column, "score"]),
+        )
         .expect("quality bm25_search");
     let mut hits = Vec::with_capacity(k);
     for batch in &batches {

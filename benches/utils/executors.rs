@@ -18,6 +18,7 @@ use std::{
 };
 
 use arrow_array::{Array, RecordBatch};
+use infino::Bm25SearchOptions;
 
 use crate::{
     cpu,
@@ -287,7 +288,7 @@ pub mod fts {
             SuperfileReader,
             fts::{
                 reader::BoolMode as InfinoBoolMode,
-                tokenize::{AsciiLowerTokenizer, Tokenizer},
+                tokenize::{AsciiLowerTokenizer, Phrase, Tokenizer},
             },
         },
         supertable::SupertableReader,
@@ -748,10 +749,11 @@ pub mod fts {
                 };
                 if !phrases.is_empty() {
                     let refs: Vec<&str> = terms.iter().map(|t| &**t).collect();
-                    let owned: Vec<Vec<String>> = phrases
-                        .into_iter()
-                        .map(|p| p.into_iter().map(|t| t.into_owned()).collect())
-                        .collect();
+                    // `Phrase::map` carries each term's offset across, so
+                    // a bench query on a stopworded column asks for the
+                    // spacing the parser derived rather than adjacency.
+                    let owned: Vec<Phrase<String>> =
+                        phrases.iter().map(|p| p.map(|t| t.to_string())).collect();
                     return self
                         .atoms_match_count(column, &refs, &owned, eff_mode, &[], &[])
                         .await
@@ -782,11 +784,17 @@ pub mod fts {
 
     impl FtsRead for SupertableReader {
         fn bm25_rows(&self, column: &str, query: &str, k: usize, mode: InfinoBoolMode) -> usize {
-            self.bm25_search(column, query, k, mode, infino::Bm25Stats::default(), None)
-                .expect("supertable bm25_search")
-                .iter()
-                .map(|b| b.num_rows())
-                .sum()
+            self.bm25_search(
+                column,
+                query,
+                k,
+                Bm25SearchOptions::new().with_mode(mode),
+                None,
+            )
+            .expect("supertable bm25_search")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
         }
 
         fn bm25_rows_fetched(
@@ -800,8 +808,7 @@ pub mod fts {
                 column,
                 query,
                 k,
-                mode,
-                infino::Bm25Stats::default(),
+                Bm25SearchOptions::new().with_mode(mode),
                 Some(&["_id", column, "score"]),
             )
             .expect("supertable bm25_search fetched")
@@ -818,15 +825,20 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> ((u64, u64), (u64, u64)) {
             let search = self
-                .bm25_search(column, query, k, mode, infino::Bm25Stats::default(), None)
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    Bm25SearchOptions::new().with_mode(mode),
+                    None,
+                )
                 .expect("supertable bm25_search payload");
             let fetched = self
                 .bm25_search(
                     column,
                     query,
                     k,
-                    mode,
-                    infino::Bm25Stats::default(),
+                    Bm25SearchOptions::new().with_mode(mode),
                     Some(&["_id", column, "score"]),
                 )
                 .expect("supertable bm25_search fetched payload");

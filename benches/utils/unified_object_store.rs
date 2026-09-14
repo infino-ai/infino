@@ -96,6 +96,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    Bm25SearchOptions,
     config::{
         CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
         SupertableSettings,
@@ -1308,7 +1309,13 @@ pub(crate) mod diag {
             let off_ref = offsets.clone();
             let t0 = Instant::now();
             let _reader = rt
-                .block_on(cache.open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm))
+                .block_on(cache.open_for_query(
+                    &uri,
+                    &uri.storage_path(),
+                    Some(&off_ref),
+                    None,
+                    ReadIntent::Warm,
+                ))
                 .expect("cold reader");
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
@@ -1355,7 +1362,13 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
+                    .open_for_query(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&off_ref),
+                        None,
+                        ReadIntent::Warm,
+                    )
                     .await
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
@@ -1411,7 +1424,13 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
+                    .open_for_query(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&off_ref),
+                        None,
+                        ReadIntent::Warm,
+                    )
                     .await
                     .expect("cold reader");
                 reader
@@ -1438,7 +1457,13 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
+                    .open_for_query(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&off_ref),
+                        None,
+                        ReadIntent::Warm,
+                    )
                     .await
                     .expect("cold reader");
                 reader
@@ -1558,7 +1583,13 @@ pub(crate) mod diag {
                 let off_ref = offsets.clone();
                 let t0 = Instant::now();
                 let _reader = rt
-                    .block_on(cache.open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm))
+                    .block_on(cache.open_for_query(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&off_ref),
+                        None,
+                        ReadIntent::Warm,
+                    ))
                     .expect("real S3 cold reader");
                 let wall = t0.elapsed();
                 let snap = storage.snapshot().diff(&before);
@@ -1579,7 +1610,13 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
+                        .open_for_query(
+                            &uri,
+                            &uri.storage_path(),
+                            Some(&off_ref),
+                            None,
+                            ReadIntent::Warm,
+                        )
                         .await
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
@@ -1610,7 +1647,13 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .open_for_query(&uri, Some(&off_ref), None, ReadIntent::Warm)
+                        .open_for_query(
+                            &uri,
+                            &uri.storage_path(),
+                            Some(&off_ref),
+                            None,
+                            ReadIntent::Warm,
+                        )
                         .await
                         .expect("real S3 cold reader");
                     reader
@@ -1753,7 +1796,7 @@ pub(crate) mod diag {
             let bm25_t0 = Instant::now();
             let bm25_hits = consumer
                 .reader().expect("reader")
-                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, Bm25SearchOptions::new().with_mode(BoolMode::Or))
                 .expect("cold BM25 over real S3 supertable");
             let cold_bm25 = bm25_t0.elapsed();
             eprintln!(
@@ -1780,7 +1823,7 @@ pub(crate) mod diag {
             let warm_bm25_t0 = Instant::now();
             let warm_bm25_hits = consumer
                 .reader().expect("reader")
-                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, Bm25SearchOptions::new().with_mode(BoolMode::Or))
                 .expect("warm BM25 over real S3 supertable");
             let warm_bm25 = warm_bm25_t0.elapsed();
             let cache_stats = consumer
@@ -2178,7 +2221,12 @@ pub(crate) mod diag {
         let _ = consumer
             .reader()
             .expect("reader")
-            .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+            .bm25_hits(
+                FTS_COLUMN,
+                FTS_QUERY_TERM,
+                TOP_K,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
             .expect("warm-up bm25");
         let _ = consumer
             .reader()
@@ -2233,7 +2281,12 @@ pub(crate) mod diag {
             let _ = consumer
                 .reader()
                 .expect("reader")
-                .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
+                .bm25_hits(
+                    FTS_COLUMN,
+                    FTS_QUERY_TERM,
+                    TOP_K,
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                )
                 .expect("kernel bm25");
             kernel_bm25.push(t.elapsed());
         }

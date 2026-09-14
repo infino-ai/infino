@@ -29,7 +29,9 @@ use arrow_array::{
     Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use infino::{ConnectOptions, Connection, IndexSpec, Metric, Supertable, connect_with};
+use infino::{
+    ConnectOptions, Connection, IndexSpec, Metric, Supertable, VectorSearchOptions, connect_with,
+};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -205,7 +207,8 @@ pub fn bench_serve_tcp(
 //   CREATE  (1): u32 dim, u32 metric_len, metric_len bytes  -> u8 status
 //   APPEND  (2): u32 nrows, u32 dim, nrows*(i64 id + dim*f32) -> u8 status, u64 count
 //   OPTIMIZE(3): (none)                                       -> u8 status
-//   SEARCH  (4): u32 k, u32 dim, dim*f32                      -> u32 n, n*i64 dataset ids
+//   SEARCH  (4): u32 k, u32 ef, u32 dim, dim*f32              -> u32 n, n*i64 dataset ids
+//     (ef=0 serves the stamped k->ef curve; ef>0 walks this query at that beam)
 //   DROP    (5): (none)                                       -> u8 status
 // status: 0 = ok, 1 = error (followed by u32 msg_len, msg bytes).
 //
@@ -418,6 +421,10 @@ fn do_optimize(stream: &mut TcpStream, srv: &ServeState) -> std::io::Result<()> 
 
 fn do_search(stream: &mut TcpStream, srv: &ServeState) -> std::io::Result<()> {
     let k = read_u32(stream)? as usize;
+    // Per-query hnsw beam. 0 = serve at the graph's stamped k->ef curve; a
+    // positive value walks this query at that fixed beam, so a client can sweep
+    // ef against one resident graph without a rebuild or restart.
+    let ef = read_u32(stream)? as usize;
     let dim = read_u32(stream)? as usize;
     // Bound dim before allocating the query buffer; a garbage header is a
     // protocol error and the stream is already desynced, so close.
@@ -449,7 +456,10 @@ fn do_search(stream: &mut TcpStream, srv: &ServeState) -> std::io::Result<()> {
             );
             return Err(std::io::Error::other("dim mismatch"));
         }
-        let batches = match table.vector_search(&srv.col, &query, k, None, None) {
+        // Pass the per-query beam via the test-and-bench options path (off the
+        // public API); ef=0 leaves the engine's stamped curve in charge.
+        let opts = VectorSearchOptions::new().with_ef(ef);
+        let batches = match table.vector_search_with_options(&srv.col, &query, k, opts, None, None) {
             Ok(b) => b,
             Err(e) => {
                 // A transient engine error fails this one query rather than

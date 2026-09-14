@@ -608,12 +608,6 @@ impl DiskCacheStore {
         self.config.cache_root.join(uri.cache_tmp_filename())
     }
 
-    /// The storage-side URI for a superfile, mirroring the
-    /// writer's persist layout.
-    pub(crate) fn storage_path(uri: &SuperfileUri) -> String {
-        uri.storage_path()
-    }
-
     // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
     // the shipped library.
 

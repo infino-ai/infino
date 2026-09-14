@@ -35,7 +35,8 @@ pub enum BuildError {
 
     #[error(
         "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
-         \"ascii_lower\", \"standard\")"
+         \"standard\", \"ascii_lower\"; stopwords and stemming are \
+         separate options, not part of this name)"
     )]
     UnknownAnalyzer { column: String, analyzer: String },
 

@@ -97,11 +97,13 @@ use crate::superfile::{
         checksum::{crc32c, crc32c_append},
     },
     fts::{
+        analysis::ChainTokenizer,
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
+        reader::ColumnLengthStats,
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
 };
@@ -302,19 +304,92 @@ const EXTERNAL_MERGE_CHUNK_CAP_TRIPLES: usize = 1024 * 1024;
 const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 
 /// Per-column build-time state (scalar accounting only).
+/// The blob version an [`FtsBuilder`] writes. Production always writes
+/// the current one; the older variants exist so tests can produce the
+/// files earlier releases wrote and hold the reader to reading them
+/// exactly. Named by version so the arms read the same numbers the
+/// file header carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // the older versions are written only by tests
+pub(crate) enum BlobEra {
+    /// [`format::fts::VERSION_V6`]: coarse table, bounds in the scorer's
+    /// scale, the declared average over documents with tokens.
+    V6,
+    /// [`format::fts::VERSION_V5`] as 0.8 wrote it, byte for byte: coarse
+    /// table, bounds carrying the `(k1 + 1)` factor, idf and the average
+    /// over every row, the average truncated into the directory.
+    V5,
+    /// The pre-coarse ladder, [`format::fts::VERSION_V2`] through
+    /// [`format::fts::VERSION_V4`] by content: fixed-point bounds
+    /// carrying `(k1 + 1)`, otherwise as [`Self::V5`].
+    V2ToV4,
+}
+
+impl BlobEra {
+    fn has_coarse(self) -> bool {
+        self != Self::V2ToV4
+    }
+
+    /// The factor a stored bound of this era carries over the score.
+    fn bound_scale(self, params: bm25::Bm25Params) -> f32 {
+        match self {
+            Self::V6 => 1.0,
+            Self::V5 | Self::V2ToV4 => params.k1 + 1.0,
+        }
+    }
+
+    /// Whether the statistics divide by every row (the pre-current
+    /// defect) rather than by the documents that carry tokens.
+    fn averages_over_rows(self) -> bool {
+        self != Self::V6
+    }
+}
+
 struct ColumnState {
     name: String,
     /// One u32 per doc (token count for this column), push order
     /// matches local_doc_id order.
     doc_lengths: Vec<u32>,
     /// Total token count across every doc in this column. Used for
-    /// `avgdl = total_tokens / n_docs`.
+    /// `avgdl = total_tokens / documents with tokens`.
     total_tokens: u64,
     /// Record token positions for this column (phrase support). Set
     /// at registration from `FtsConfig::positions`; selects the
     /// positional capture path in `add_doc` and the extended
     /// per-term layout at emit.
     positions: bool,
+    /// BM25 parameters for this column, from `FtsConfig::bm25`. The
+    /// per-block score bounds in the skip table are the block's true
+    /// max under this pair, and the pair itself is recorded in the
+    /// column's KV entry so the reader knows what the bounds mean.
+    params: bm25::Bm25Params,
+    /// Length statistics of the table this column's superfile joins —
+    /// every superfile already committed — so the average it bakes and
+    /// scores at is the table-wide one as of this commit, not its own.
+    /// Zero for a standalone build, which then averages over itself.
+    corpus: ColumnLengthStats,
+}
+
+impl ColumnState {
+    /// The average document length this column is written at: the
+    /// table's token total over the documents that carry tokens, this
+    /// superfile's `own` included, rounded to the fixed point the file
+    /// stores so the bounds baked from it are exact at the value a
+    /// reader recovers. A null or empty cell is indexed as a zero-length
+    /// document so the per-doc arrays stay aligned with the row, but it
+    /// is not a document this column has, and dividing by it would
+    /// deflate the average by the column's fill rate.
+    fn stored_average(&self, own: &ColumnLengthStats) -> f32 {
+        let mut table = self.corpus;
+        table.merge_with(own);
+        bm25::stored_avgdl(table.avgdl())
+    }
+
+    /// This column's own statistics: token total over, and count of,
+    /// the documents that carry tokens.
+    fn length_stats(&self) -> ColumnLengthStats {
+        ColumnLengthStats::from_lengths(self.doc_lengths.iter().copied())
+    }
 }
 
 /// Per-column posting accumulator. Starts in `InRam` mode; transitions
@@ -1259,11 +1334,10 @@ pub struct FtsBuilder {
     /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
     /// ::Spilled`) keyed by `term_id` instead.
     bump: Bump,
-    /// Whether to write the V5 per-term coarse block-max table (and stamp
-    /// the blob V5). Always `true` in production; test-only builds set it
-    /// `false` to emit a legacy (V2–V4, no coarse) blob for the
-    /// backwards-compatibility tests.
-    write_coarse: bool,
+    /// Which blob era to emit. Always [`BlobEra::V6`] in production;
+    /// the backwards-compatibility tests pick an older one so the reader's
+    /// legacy paths are exercised against faithfully written files.
+    pub(crate) era: BlobEra,
 }
 
 impl FtsBuilder {
@@ -1318,7 +1392,7 @@ impl FtsBuilder {
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
             bump: Bump::new(),
-            write_coarse: true,
+            era: BlobEra::V6,
         }
     }
 
@@ -1386,9 +1460,12 @@ impl FtsBuilder {
     /// Register an FTS column up-front, tokenized with the builder's
     /// default tokenizer. Returns its `column_id` (its index in
     /// declaration order).
+    /// Scores with the standard BM25 pair; use
+    /// [`FtsBuilder::register_column_with_tokenizer`] to declare
+    /// another.
     pub fn register_column(&mut self, name: String, positions: bool) -> Result<u32, BuildError> {
         let tokenizer = Arc::clone(&self.default_tokenizer);
-        self.register_column_with_tokenizer(name, positions, tokenizer)
+        self.register_column_with_tokenizer(name, positions, tokenizer, bm25::Bm25Params::STANDARD)
     }
 
     /// Register an FTS column tokenized with an explicit `tokenizer`,
@@ -1399,6 +1476,7 @@ impl FtsBuilder {
         name: String,
         positions: bool,
         tokenizer: Arc<dyn Tokenizer>,
+        params: bm25::Bm25Params,
     ) -> Result<u32, BuildError> {
         if name.as_bytes().contains(&FST_SEPARATOR) {
             return Err(BuildError::ReservedSeparatorInColumnName(name));
@@ -1415,6 +1493,8 @@ impl FtsBuilder {
             doc_lengths: Vec::new(),
             total_tokens: 0,
             positions,
+            params,
+            corpus: ColumnLengthStats::default(),
         });
         self.postings.push(ColumnPostings::new());
         self.column_tokenizers.push(tokenizer);
@@ -1559,6 +1639,15 @@ impl FtsBuilder {
     /// with monotonically increasing `local_doc_id` per column. Multiple
     /// occurrences of the same term in `text` increment the term-frequency
     /// for that doc.
+    /// Give a column the length statistics of the table its superfile
+    /// joins, so `finish` bakes — and the file declares — the table-wide
+    /// average document length rather than this superfile's own. Without
+    /// it the column averages over itself, which is right for the first
+    /// superfile of a table and for a standalone file.
+    pub fn set_corpus_length_stats(&mut self, column_id: u32, corpus: ColumnLengthStats) {
+        self.columns[column_id as usize].corpus = corpus;
+    }
+
     pub fn add_doc(
         &mut self,
         column_id: u32,
@@ -1836,7 +1925,7 @@ impl FtsBuilder {
     /// column's ascending local-doc-id axis either way.
     ///
     /// Also accumulates `total_tokens` as the sum of the lengths. `finish`
-    /// derives `avgdl = total_tokens / n_docs` from it, and a doc length *is*
+    /// derives the stored average from it, and a doc length *is*
     /// its token count (`add_doc` clamps only at `u32::MAX`, never reached in
     /// practice), so this sum equals what re-indexing the same corpus would
     /// accumulate — keeping merged BM25 scores identical to a fresh build.
@@ -1877,6 +1966,12 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
         let positional = self.columns[col_idx].positions;
@@ -1945,6 +2040,8 @@ impl FtsBuilder {
                 ascii.tokenize_each_inline(text, &mut on_token);
             } else if let Some(standard) = standard_tok {
                 standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -2007,13 +2104,22 @@ impl FtsBuilder {
                     record(tok, tokens_in_doc);
                     tokens_in_doc += 1;
                 });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
             } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals; a tokenizer that silently drops tokens will
-                // not leave phrase gaps (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
-                    record(tok, tokens_in_doc);
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait; the default numbering is
+                // consecutive, which is correct for one that drops
+                // nothing (see the `Tokenizer` trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2130,6 +2236,12 @@ impl FtsBuilder {
             .as_ref()
             .as_any()
             .downcast_ref::<StandardTokenizer>();
+        // A column with a stopword set or a stemmer tokenizes through
+        // the chain, which wraps one of the two above. It gets its own
+        // monomorphized arm for the same reason they do, and it must be
+        // reached through the *chain's* scan — the base's would index
+        // the unfiltered tokens.
+        let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
         let positional = self.columns[col_idx].positions;
 
@@ -2176,6 +2288,8 @@ impl FtsBuilder {
                 ascii.tokenize_each_inline(text, &mut on_token);
             } else if let Some(standard) = standard_tok {
                 standard.tokenize_each_inline(text, &mut on_token);
+            } else if let Some(chain) = chain_tok {
+                chain.tokenize_each_inline(text, &mut on_token);
             } else {
                 tokenizer.tokenize_each(text, &mut on_token);
             }
@@ -2245,12 +2359,21 @@ impl FtsBuilder {
                     record(tok, tokens_in_doc);
                     tokens_in_doc += 1;
                 });
+            } else if let Some(chain) = chain_tok {
+                // Gap-aware: a token the chain's stopword filter removes
+                // advances the position ordinal but emits nothing, and
+                // the doc length counts only what is emitted — the token
+                // count Lucene's norms are built from too.
+                chain.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
             } else {
-                // A custom tokenizer can't report dropped tokens through
-                // the current trait, so positions are plain emission
-                // ordinals (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each(text, &mut |tok| {
-                    record(tok, tokens_in_doc);
+                // A custom tokenizer reports its own gap-inclusive
+                // positions through the trait (see the `Tokenizer`
+                // trait docs).
+                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                    record(tok, position);
                     tokens_in_doc += 1;
                 });
             }
@@ -2490,7 +2613,7 @@ impl FtsBuilder {
             pos_scratch: _,
             run_scratch: _,
             bump,
-            write_coarse,
+            era,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2512,12 +2635,16 @@ impl FtsBuilder {
         work.sort_unstable_by(|a, b| a.1.name.cmp(&b.1.name));
 
         let mut avgdl_per_col: Vec<f32> = vec![0.0; n_columns as usize];
+        let mut n_scored_per_col: Vec<u32> = vec![0; n_columns as usize];
         for (orig_idx, state, _) in &work {
-            let n = state.doc_lengths.len() as u64;
-            avgdl_per_col[*orig_idx] = if n == 0 {
-                0.0
-            } else {
-                (state.total_tokens as f32) / (n as f32)
+            let own = state.length_stats();
+            // The legacy eras reproduce what earlier releases wrote, byte for
+            // byte: the unrounded row average, and idf over rows.
+            let rows = state.doc_lengths.len();
+            (avgdl_per_col[*orig_idx], n_scored_per_col[*orig_idx]) = match era.averages_over_rows()
+            {
+                false => (state.stored_average(&own), own.n_scored_docs as u32),
+                true => (state.total_tokens as f32 / rows.max(1) as f32, rows as u32),
             };
         }
         let scratch_path = scratch_dir.path().to_path_buf();
@@ -2549,10 +2676,15 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
+                corpus: _,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
             let col_doc_lengths: &[u32] = &col_doc_lengths_owned;
+            // The collection size idf is baked with: the documents that
+            // carry tokens, matching what the reader divides by.
+            let n_scored = n_scored_per_col[orig_col_idx];
 
             // In-RAM path invariant: dispatcher checked
             // `!any_spilled`, so every column is `InRam`.
@@ -2597,7 +2729,8 @@ impl FtsBuilder {
                     col_name_bytes,
                     col_doc_lengths,
                     avgdl,
-                    n_docs,
+                    params,
+                    n_scored,
                     &mut key_buf,
                     &mut postings_writer,
                     &mut postings_crc_acc,
@@ -2607,7 +2740,7 @@ impl FtsBuilder {
                     term_positions,
                     &mut finish_profile,
                     &mut term_scratch,
-                    write_coarse,
+                    era,
                 )?;
                 n_terms_total_usize += 1;
             }
@@ -2630,7 +2763,7 @@ impl FtsBuilder {
                 doc_lengths_by_orig_col,
                 scratch_dir,
                 finish_profile,
-                write_coarse,
+                era,
             },
             &mut w,
         )
@@ -2661,7 +2794,7 @@ impl FtsBuilder {
             pos_scratch: _,
             run_scratch: _,
             bump,
-            write_coarse,
+            era,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2679,12 +2812,16 @@ impl FtsBuilder {
         work.sort_unstable_by(|a, b| a.1.name.cmp(&b.1.name));
 
         let mut avgdl_per_col: Vec<f32> = vec![0.0; n_columns as usize];
+        let mut n_scored_per_col: Vec<u32> = vec![0; n_columns as usize];
         for (orig_idx, state, _) in &work {
-            let n = state.doc_lengths.len() as u64;
-            avgdl_per_col[*orig_idx] = if n == 0 {
-                0.0
-            } else {
-                (state.total_tokens as f32) / (n as f32)
+            let own = state.length_stats();
+            // The legacy eras reproduce what earlier releases wrote, byte for
+            // byte: the unrounded row average, and idf over rows.
+            let rows = state.doc_lengths.len();
+            (avgdl_per_col[*orig_idx], n_scored_per_col[*orig_idx]) = match era.averages_over_rows()
+            {
+                false => (state.stored_average(&own), own.n_scored_docs as u32),
+                true => (state.total_tokens as f32 / rows.max(1) as f32, rows as u32),
             };
         }
 
@@ -2759,10 +2896,15 @@ impl FtsBuilder {
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
                 positions: col_positions,
+                params,
+                corpus: _,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
             let col_doc_lengths: &[u32] = &col_doc_lengths_owned;
+            // The collection size idf is baked with: the documents that
+            // carry tokens, matching what the reader divides by.
+            let n_scored = n_scored_per_col[orig_col_idx];
 
             match posting_state {
                 ColumnPostings::InRam {
@@ -2802,7 +2944,8 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
-                            n_docs,
+                            params,
+                            n_scored,
                             &mut key_buf,
                             &mut postings_writer,
                             &mut postings_crc_acc,
@@ -2812,7 +2955,7 @@ impl FtsBuilder {
                             term_positions,
                             &mut finish_profile,
                             &mut term_scratch,
-                            write_coarse,
+                            era,
                         )?;
                         n_terms_total_usize += 1;
                     }
@@ -2949,7 +3092,8 @@ impl FtsBuilder {
                             col_name_bytes,
                             col_doc_lengths,
                             avgdl,
-                            n_docs,
+                            params,
+                            n_scored,
                             &mut key_buf,
                             &mut postings_writer,
                             &mut postings_crc_acc,
@@ -2958,7 +3102,7 @@ impl FtsBuilder {
                             &mut positions_sink,
                             &mut finish_profile,
                             &mut term_scratch,
-                            write_coarse,
+                            era,
                         )?,
                         SpillStore::Positional { blobs, .. } => {
                             // mmap each partition's positions blob so
@@ -2986,7 +3130,8 @@ impl FtsBuilder {
                                 col_name_bytes,
                                 col_doc_lengths,
                                 avgdl,
-                                n_docs,
+                                params,
+                                n_scored,
                                 &mut key_buf,
                                 &mut postings_writer,
                                 &mut postings_crc_acc,
@@ -2995,7 +3140,7 @@ impl FtsBuilder {
                                 &mut positions_sink,
                                 &mut finish_profile,
                                 &mut term_scratch,
-                                write_coarse,
+                                era,
                             )?
                         }
                     };
@@ -3090,7 +3235,7 @@ impl FtsBuilder {
                 doc_lengths_by_orig_col,
                 scratch_dir,
                 finish_profile,
-                write_coarse,
+                era,
             },
             &mut w,
         )
@@ -3167,9 +3312,9 @@ struct BlobAssemblyInputs {
     /// Profile accumulator — final block of `[fts-finish]` timings
     /// is emitted at the bottom of assembly.
     finish_profile: FinishProfile,
-    /// Whether the per-term coarse block-max table was written (V5). When
+    /// Whether the per-term coarse block-max table was written (V5 and later). When
     /// false the blob is a legacy V2–V4 (no coarse) — test-only.
-    write_coarse: bool,
+    era: BlobEra,
 }
 
 /// FST emission sink picked by the active finish path.
@@ -3211,7 +3356,7 @@ fn assemble_and_write_blob<W: Write>(
         mut doc_lengths_by_orig_col,
         scratch_dir,
         mut finish_profile,
-        write_coarse,
+        era,
     } = inputs;
 
     debug_assert!(
@@ -3324,9 +3469,12 @@ fn assemble_and_write_blob<W: Write>(
     let mut dir_buf: Vec<u8> = Vec::with_capacity(n_columns as usize * DOC_LENGTHS_ENTRY_SIZE);
     let mut arrays_buf: Vec<u8> = Vec::new();
     for i in 0..n_columns as usize {
-        let avgdl_x1000 = (avgdl_per_col[i] * format::fts::AVGDL_FIXED_POINT_SCALE)
-            .max(0.0)
-            .min(u32::MAX as f32) as u32;
+        let avgdl_x1000 = match era.averages_over_rows() {
+            false => bm25::avgdl_x1000(avgdl_per_col[i]),
+            // Earlier releases truncated rather than rounded.
+            true => (avgdl_per_col[i] * format::fts::AVGDL_FIXED_POINT_SCALE)
+                .clamp(0.0, u32::MAX as f32) as u32,
+        };
         dir_buf.extend_from_slice(&(i as u32).to_le_bytes());
         dir_buf.extend_from_slice(&doc_lengths_array_offset.to_le_bytes());
         dir_buf.extend_from_slice(&avgdl_x1000.to_le_bytes());
@@ -3372,20 +3520,22 @@ fn assemble_and_write_blob<W: Write>(
     // and therefore a run-offset sub-index — else V2 (positionless, or a
     // positional blob whose terms all inlined), byte-identical to before.
     // Readers accept all of these.
-    // New code always writes V5: every PFOR term carries a coarse block-max
-    // table, and V5 subsumes the earlier eras (positions region iff positional
+    // New code always writes the current version: every PFOR term carries a
+    // coarse block-max table, and it subsumes the earlier eras (positions region iff positional
     // with the V3 sub-index; bitset blocks self-describing per block as in V4).
     // The legacy ladder (V2/V3/V4) is written only when the coarse table is
     // suppressed (test-only), so the backwards-compat tests can produce a
     // genuine pre-086 blob.
-    let fts_version = if write_coarse {
-        format::fts::VERSION_V5
-    } else if finish_profile.saw_bitset_block {
-        format::fts::VERSION_V4
-    } else if positions_region.1 > format::CRC_BYTES as u64 {
-        format::fts::VERSION_V3
-    } else {
-        format::fts::VERSION_V2
+    // A column's BM25 parameters do not move the version: they are
+    // recorded in its `inf.fts.columns` entry and read back from there,
+    // so the stored per-block bound is interpreted against the pair that
+    // entry names. Nothing about the layout differs either way.
+    let fts_version = match era {
+        BlobEra::V6 => format::fts::VERSION_V6,
+        BlobEra::V5 => format::fts::VERSION_V5,
+        BlobEra::V2ToV4 if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
+        BlobEra::V2ToV4 if positions_region.1 > format::CRC_BYTES as u64 => format::fts::VERSION_V3,
+        BlobEra::V2ToV4 => format::fts::VERSION_V2,
     };
     header.extend_from_slice(&fts_version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
@@ -3477,7 +3627,7 @@ struct TermScratch {
     /// one doc). Scoring against the quantized length keeps the bound a
     /// true upper bound over query-time scores; a tighter bound lets the
     /// reader's block-skip fire more often.
-    block_ub_per_block: Vec<f32>,
+    block_maxes: Vec<f32>,
     /// Per-term list of encoded blocks held across the meta + skip-
     /// table + block-bytes emit stages.
     encoded_blocks: Vec<EncodedBlock>,
@@ -3515,7 +3665,8 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
-    n_docs: u32,
+    params: bm25::Bm25Params,
+    n_scored_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
@@ -3524,7 +3675,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
-    write_coarse: bool,
+    era: BlobEra,
 ) -> Result<usize, BuildError> {
     let mmap_start = finish_profile.enabled.then(Instant::now);
     let mut mmaps: Vec<Mmap> = Vec::with_capacity(sorted_files.len());
@@ -3626,7 +3777,8 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             col_name_bytes,
             col_doc_lengths,
             avgdl,
-            n_docs,
+            params,
+            n_scored_docs,
             key_buf,
             postings_writer,
             postings_crc_acc,
@@ -3636,7 +3788,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             term_positions,
             finish_profile,
             term_scratch,
-            write_coarse,
+            era,
         )?;
         n_emitted += 1;
     }
@@ -3667,7 +3819,8 @@ fn encode_and_emit_term<W: Write>(
     col_name_bytes: &[u8],
     col_doc_lengths: &[u32],
     avgdl: f32,
-    n_docs: u32,
+    params: bm25::Bm25Params,
+    n_scored_docs: u32,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
@@ -3677,7 +3830,7 @@ fn encode_and_emit_term<W: Write>(
     mut term_positions: Option<(&mut PositionsSink, &[u8])>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
-    write_coarse: bool,
+    era: BlobEra,
 ) -> Result<(), BuildError> {
     let encode_start = profile.enabled.then(Instant::now);
     profile.encode_calls += 1;
@@ -3722,14 +3875,14 @@ fn encode_and_emit_term<W: Write>(
         v
     } else {
         profile.encode_pfor += 1;
-        let idf_t = bm25::idf(n_docs as u64, df);
+        let idf_t = bm25::idf(n_scored_docs as u64, df);
         // Reuse `scratch.encoded_blocks` / `scratch.min_dl_per_block`
         // across every dense term in the column (one allocation amortised
         // over ~5K terms / ~1M blocks at 1M docs, vs `Vec::new` per term).
         let encoded_blocks = &mut scratch.encoded_blocks;
-        let block_ub_per_block = &mut scratch.block_ub_per_block;
+        let block_maxes = &mut scratch.block_maxes;
         encoded_blocks.clear();
-        block_ub_per_block.clear();
+        block_maxes.clear();
         let block_build_start = profile.enabled.then(Instant::now);
         // Build each block by moving the reusable `doc_ids` / `tfs`
         // buffers into a `Block` (Vec move = pointer swap, no copy),
@@ -3767,16 +3920,20 @@ fn encode_and_emit_term<W: Write>(
             // against the exact length would leave the stored max below the
             // query-time score of that same doc and let the block-max skip
             // drop a qualifying document.
-            let block_ub = block_doc_ids
+            let block_max = block_doc_ids
                 .iter()
                 .zip(block_tfs.iter())
                 .map(|(&d, &t)| {
-                    let reader_dl =
-                        bm25::dequantize_len(bm25::quantize_len(col_doc_lengths[d as usize]));
-                    bm25::score(idf_t, t, reader_dl, avgdl)
+                    bm25::score(
+                        idf_t * era.bound_scale(params),
+                        t,
+                        bm25::stored_len(col_doc_lengths[d as usize]),
+                        avgdl,
+                        params,
+                    )
                 })
                 .fold(0.0f32, f32::max);
-            block_ub_per_block.push(block_ub);
+            block_maxes.push(block_max);
             let block = Block {
                 doc_ids: mem::take(&mut block_doc_ids),
                 tfs: mem::take(&mut block_tfs),
@@ -3813,11 +3970,11 @@ fn encode_and_emit_term<W: Write>(
             Some(_) => num_blocks as usize * entries_per_block * format::fts::U32_BYTES,
             None => 0,
         };
-        // Coarse block-max table at the tail of the term region: one
-        // `f32` per `COARSE_BLOCK_MAX_SPAN` blocks (the span's max block-max),
-        // giving the ranked walk a second skip level. Appended last so no
-        // existing block offset moves.
-        let num_coarse = match write_coarse {
+        // Coarse block-max table at the tail of the term region: one slot
+        // per `COARSE_BLOCK_MAX_SPAN` blocks bounding the whole span, giving
+        // the ranked walk a second skip level. Appended last so no existing
+        // block offset moves.
+        let num_coarse = match era.has_coarse() {
             true => (num_blocks as usize).div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN),
             false => 0,
         };
@@ -3907,23 +4064,24 @@ fn encode_and_emit_term<W: Write>(
         // Blocks follow the meta, the skip table, and the (V3-only)
         // position sub-index, so their offsets start past all three.
         let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
-        // Coarse span-maxes (V5 only), filled alongside the per-block skip
-        // entries and appended after the blocks below. Each entry is the
-        // span's max of the per-block `f32` maxes, stored as `f32` bits — a
-        // true upper bound over the span.
+        // Coarse span-maxes, filled alongside the per-block skip entries
+        // and appended after the blocks below. Each entry is the span's
+        // max of the per-block `f32` maxes, stored as `f32` bits — a true
+        // upper bound over the span.
         let mut coarse_maxes: Vec<u32> = Vec::with_capacity(num_coarse);
         let mut span_max: f32 = 0.0;
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
-            let max_bm25 = block_ub_per_block[i];
-            // The 4-byte block-max slot. V5 stores the exact `f32` bits: it
-            // equals the reader's per-doc score for the block's max doc (same
-            // quantized-length scoring), so it is an exact upper bound with no
-            // fixed-point slack. Legacy V1-V4 store `ceil(max_bm25 × scale)`
-            // as a `u32`; `ceil` keeps it a true upper bound after truncation
-            // (the reader adds one more step on decode).
-            let block_max_encoded: u32 = if write_coarse {
+            let max_bm25 = block_maxes[i];
+            // The 4-byte block-max slot. The current version stores the exact
+            // `f32` bits: it equals the reader's per-doc score for the block's
+            // max doc (same quantized-length scoring), so it is an exact upper
+            // bound with no fixed-point slack. Legacy V1-V4 store
+            // `ceil(max_bm25 × scale)` as a `u32`; `ceil` keeps it a true
+            // upper bound after truncation (the reader adds one more step on
+            // decode).
+            let block_max_encoded: u32 = if era.has_coarse() {
                 max_bm25.to_bits()
             } else {
                 (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
@@ -3940,8 +4098,7 @@ fn encode_and_emit_term<W: Write>(
             term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
             block_offset += blk.bytes.len() as u32;
 
-            if write_coarse {
-                // Coarse (V5) tracks the float max, stored as f32 bits.
+            if era.has_coarse() {
                 span_max = span_max.max(max_bm25);
                 if (i + 1).is_multiple_of(coarse_span) || i + 1 == encoded_blocks.len() {
                     coarse_maxes.push(span_max.to_bits());
@@ -4070,7 +4227,7 @@ fn sort_partition_to_file<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::default_tokenizer as tokenizer;
+    use crate::{superfile::fts::tokenize::Phrase, test_helpers::default_tokenizer as tokenizer};
 
     /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
     /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
@@ -4325,9 +4482,9 @@ mod tests {
 
         // Magic.
         assert_eq!(&blob[0..8], format::fts::MAGIC);
-        // Version — new code always writes V5 (coarse block-max table).
+        // Version — new code always writes the current version (coarse block-max table).
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_V5);
+        assert_eq!(version, format::fts::VERSION_V6);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -4919,7 +5076,7 @@ mod tests {
             b.set_max_partition_bytes(m);
         }
         // Legacy (no-coarse) blob — see `build_title_blob`.
-        b.write_coarse = false;
+        b.era = BlobEra::V2ToV4;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
@@ -5079,7 +5236,9 @@ mod tests {
             (&["filler", "medium"], 79),
         ];
         for (terms, want) in phrases {
-            let phrase = vec![terms.iter().map(|t| t.to_string()).collect()];
+            let phrase = vec![Phrase::adjacent(
+                terms.iter().map(|t| t.to_string()).collect(),
+            )];
             let a = v3
                 .atoms_match_count("title", &[], &phrase, BoolMode::And, &[], &[])
                 .await
@@ -5095,18 +5254,19 @@ mod tests {
         }
     }
 
-    /// The V5 reader reads a legacy V4 blob (no coarse table) and returns the
-    /// identical ranked top-k as it does for the V5 blob of the same corpus —
-    /// the backwards-compatibility contract for the coarse-table format bump.
+    /// The current reader reads a legacy V4 blob (no coarse table) and returns
+    /// the identical ranked top-k as it does for the current blob of the same
+    /// corpus — the backwards-compatibility contract for the coarse-table
+    /// format bump.
     #[tokio::test]
-    async fn v5_reader_reads_legacy_v4_blob_identically() {
+    async fn current_reader_reads_legacy_v4_blob_identically() {
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
         let docs = positional_corpus();
 
-        // Legacy V4 (no coarse) via the helper; V5 (coarse) via the default.
+        // Legacy V4 (no coarse) via the helper; current (coarse) via the default.
         let legacy = build_title_blob(&docs, false);
-        let v5 = {
+        let current = {
             let mut b = FtsBuilder::new(tokenizer());
             b.register_column("title".into(), false).expect("register");
             for (i, t) in docs.iter().enumerate() {
@@ -5117,12 +5277,12 @@ mod tests {
         let ver = |b: &bytes::Bytes| u32::from_le_bytes(b[8..12].try_into().expect("version"));
         assert!(
             ver(&legacy) < format::fts::VERSION_V5,
-            "legacy must be < V5"
+            "legacy must predate the coarse table"
         );
-        assert_eq!(ver(&v5), format::fts::VERSION_V5);
+        assert_eq!(ver(&current), format::fts::VERSION_V6);
 
         let r_legacy = FtsReader::open(legacy, title_json(false)).expect("legacy opens");
-        let r_v5 = FtsReader::open(v5, title_json(false)).expect("v5 opens");
+        let r_current = FtsReader::open(current, title_json(false)).expect("current opens");
         // Single-term (the coarse/seed path) and a union — both must agree.
         let queries: &[&[&str]] = &[&["common"], &["common", "medium"], &["uniqueonce"]];
         for terms in queries {
@@ -5130,11 +5290,11 @@ mod tests {
                 .search("title", terms, docs.len(), BoolMode::Or)
                 .await
                 .expect("legacy search");
-            let b = r_v5
+            let b = r_current
                 .search("title", terms, docs.len(), BoolMode::Or)
                 .await
-                .expect("v5 search");
-            assert_eq!(a, b, "legacy vs V5 results diverged for {terms:?}");
+                .expect("current search");
+            assert_eq!(a, b, "legacy vs current results diverged for {terms:?}");
         }
     }
 
@@ -5151,9 +5311,9 @@ mod tests {
     fn build_title_blob(docs: &[String], positional: bool) -> bytes::Bytes {
         let mut b = FtsBuilder::new(tokenizer());
         // These tests cover the legacy (V1–V4, no coarse table) format and
-        // the reader's backwards-compatibility with it; the production V5
+        // the reader's backwards-compatibility with it; the current-version
         // path is covered by the FTS integration suite.
-        b.write_coarse = false;
+        b.era = BlobEra::V2ToV4;
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
@@ -5295,7 +5455,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V5
+            format::fts::VERSION_V6
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

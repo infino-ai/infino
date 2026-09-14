@@ -31,6 +31,7 @@ use crate::{
 pub(crate) trait Table: Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError>;
+    fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError>;
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError>;
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError>;
     fn bm25_search(
@@ -97,6 +98,9 @@ impl Table for SupertableHandle {
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         SupertableHandle::append(self, batch)
     }
+    fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
+        SupertableHandle::append_named(self, batch, source_name)
+    }
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         SupertableHandle::update(self, predicate, batch)
     }
@@ -111,7 +115,7 @@ impl Table for SupertableHandle {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        SupertableHandle::bm25_search(self, column, query, k, opts.mode, opts.stats, projection)
+        SupertableHandle::bm25_search(self, column, query, k, opts, projection)
     }
     fn token_match(
         &self,
@@ -213,6 +217,29 @@ impl Supertable {
     /// Append a batch of rows.
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         self.inner.append(batch)
+    }
+
+    /// Append a batch of rows, naming the source they came from.
+    ///
+    /// The superfiles this commit writes are keyed
+    /// `data/<stem>-<uuid>.sf.parquet` instead of `data/seg-<uuid>.sf.parquet`,
+    /// where the stem is `source_name` lowercased and reduced to `[a-z0-9_]`
+    /// — so rows ingested from `customers.parquet` land in objects a bucket
+    /// listing shows as `customers-….sf.parquet`. The uuid keeps every key
+    /// unique; the name is a label, and the table behaves exactly as with
+    /// [`Self::append`]. A merge of superfiles from different sources drops
+    /// the label; a name that reduces to nothing falls back to the unnamed
+    /// key.
+    ///
+    /// Readers of a table that has ever been appended to this way must be
+    /// at least this engine version: the manifest part carrying a named
+    /// superfile is written at a format version an older reader refuses,
+    /// so that its garbage collector cannot mistake the named objects for
+    /// orphans.
+    ///
+    /// Hosted tables do not accept a source name yet and return an error.
+    pub fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
+        self.inner.append_named(batch, source_name)
     }
 
     /// Update rows matching `predicate` with values from `batch`.

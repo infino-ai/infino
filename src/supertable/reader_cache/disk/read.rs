@@ -33,6 +33,10 @@ impl DiskCacheStore {
     /// `offsets` is the manifest's record of where the parquet footer and the vector and FTS blobs
     /// sit inside the file. With it, a cold miss fetches all three open ranges in one parallel round
     /// trip instead of two; without it (`None`) the open still works, just one round trip slower.
+    /// `storage_key` is the object key the bytes live at, the manifest entry's `storage_path()`,
+    /// which carries a source stem when the superfile was ingested with one. It travels beside
+    /// `uri` because a source-named superfile's key is not a function of its uuid; every cache
+    /// slot, coordinator and on-disk filename stays keyed by `uri`.
     /// `intent` is the read policy: [`ReadIntent::Warm`] for FTS/SQL (serve now, warm a full mmap
     /// in the background), [`ReadIntent::Stream`] for vector search (block cache only, never
     /// promote).
@@ -45,6 +49,7 @@ impl DiskCacheStore {
     pub async fn open_for_query(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
         intent: ReadIntent,
@@ -55,10 +60,13 @@ impl DiskCacheStore {
             "Load reads go through reader_synchronous_with_storage; they must never degrade"
         );
 
-        match self.reader_tiered(uri, intent, offsets, storage).await {
+        match self
+            .reader_tiered(uri, storage_key, intent, offsets, storage)
+            .await
+        {
             // Nothing local and the file cannot be admitted: stream it uncached rather than fail.
             Err(DiskCacheError::BudgetExceeded) => {
-                self.open_range_only(uri, offsets, storage).await
+                self.open_range_only(storage_key, offsets, storage).await
             }
             served => served,
         }
@@ -75,14 +83,16 @@ impl DiskCacheStore {
     /// neither local nor admittable. Nor can it be a tier of its own: the tiers find or admit a
     /// [`CachedEntry`], and this path has nothing to cache and so nothing to evict. It is the escape
     /// hatch for when caching is impossible, not a fifth place to look.
+    ///
+    /// Takes the object key alone: nothing here is keyed by uri, since no cache entry is created.
     async fn open_range_only(
         self: &Arc<Self>,
-        uri: &SuperfileUri,
+        storage_key: &str,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         let fetch_storage = self.resolve_storage(storage);
-        let storage_uri = Self::storage_path(uri);
+        let storage_uri = storage_key.to_owned();
 
         let range_src: Arc<dyn LazyByteSource> = match offsets {
             Some(o) if o.total_size > 0 => Arc::new(StorageRangeSource::with_known_size(
@@ -113,10 +123,17 @@ impl DiskCacheStore {
     pub async fn reader_synchronous_with_storage(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
-        self.reader_tiered(uri, ReadIntent::Load, None, Some(&fetch_storage))
-            .await
+        self.reader_tiered(
+            uri,
+            storage_key,
+            ReadIntent::Load,
+            None,
+            Some(&fetch_storage),
+        )
+        .await
     }
 
     /// The reader lookup, read top to bottom as four tiers, cheapest first: whole file in memory,
@@ -124,6 +141,8 @@ impl DiskCacheStore {
     /// exactly what it is trying to find. `intent` is the only policy: it decides which local copies
     /// count (a lazy reader is a hit for a query but not for [`ReadIntent::Load`], which rewrites the
     /// whole file) and which fetch shape a miss uses. Nothing else branches on the caller.
+    /// `storage_key` is the object key the bytes live at; only tier 4 and the background fill use
+    /// it, every local tier is keyed by `uri`.
     ///
     /// # Tier cascade
     ///
@@ -156,13 +175,14 @@ impl DiskCacheStore {
     async fn reader_tiered(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         intent: ReadIntent,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         // Tier 1, memory: the whole file is already mmapped or buffered in this process. No I/O.
         if let Some(entry) = self.whole_file_in_memory(uri) {
-            return Ok(self.serve(uri, &entry, intent, storage));
+            return Ok(self.serve(uri, storage_key, &entry, intent, storage));
         }
 
         // A Load rewrites the whole file, so a lazy handle is no use to it: drop it here so it can
@@ -177,7 +197,7 @@ impl DiskCacheStore {
             .fetch_from_disk_cache(uri, offsets.map(|o| o.total_size))
             .await?
         {
-            return Ok(self.serve(uri, &entry, intent, storage));
+            return Ok(self.serve(uri, storage_key, &entry, intent, storage));
         }
 
         // Tier 3, open lazy reader: a Paged handle is already streaming this file. No full copy is
@@ -185,16 +205,16 @@ impl DiskCacheStore {
         if intent != ReadIntent::Load
             && let Some(entry) = self.open_lazy_reader(uri)
         {
-            return Ok(self.serve(uri, &entry, intent, storage));
+            return Ok(self.serve(uri, storage_key, &entry, intent, storage));
         }
 
         // Tier 4, source: nothing local. Fetch it from the object store, coalescing concurrent
         // callers so only one does the work.
         let entry = self
-            .fetch_from_source_coalesced(uri, intent, offsets, storage)
+            .fetch_from_source_coalesced(uri, storage_key, intent, offsets, storage)
             .await?;
 
-        Ok(self.serve(uri, &entry, intent, storage))
+        Ok(self.serve(uri, storage_key, &entry, intent, storage))
     }
 
     /// Tier 1: a cached entry that holds the whole file locally (mmapped or buffered), so it serves
@@ -231,13 +251,14 @@ impl DiskCacheStore {
     fn serve(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         entry: &Arc<CachedEntry>,
         intent: ReadIntent,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Arc<SuperfileReader> {
         entry.last_access_us.store(self.now_us(), Ordering::Release);
         if intent == ReadIntent::Warm {
-            self.maybe_spawn_background_fill(uri, entry, storage);
+            self.maybe_spawn_background_fill(uri, storage_key, entry, storage);
         }
 
         Arc::clone(&entry.reader)
@@ -256,6 +277,7 @@ impl DiskCacheStore {
     async fn fetch_from_source_coalesced(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         intent: ReadIntent,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
@@ -267,7 +289,7 @@ impl DiskCacheStore {
             .clone();
 
         match cell
-            .get_or_init(|| self.fetch_from_source(uri, intent, offsets, storage))
+            .get_or_init(|| self.fetch_from_source(uri, storage_key, intent, offsets, storage))
             .await
         {
             Ok(entry) => {
@@ -280,7 +302,8 @@ impl DiskCacheStore {
             }
             Err(_) => {
                 self.coordinators.remove(uri);
-                self.fetch_from_source(uri, intent, offsets, storage).await
+                self.fetch_from_source(uri, storage_key, intent, offsets, storage)
+                    .await
             }
         }
     }
@@ -291,13 +314,16 @@ impl DiskCacheStore {
     /// Test and bench shorthand: a [`ReadIntent::Warm`] walk of [`Self::reader_tiered`] with no
     /// manifest offsets and the cache's own storage. Unlike [`Self::open_for_query`] it does not
     /// degrade to a range-only reader on [`DiskCacheError::BudgetExceeded`], so tests can assert on
-    /// that error surfacing.
+    /// that error surfacing. Takes only the uri, so it is for a superfile with the unnamed key shape
+    /// (tests and benches that mint their own); a query path holds the manifest entry and passes
+    /// `entry.storage_path()`, the key a source-named superfile actually lives at.
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn reader(
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
-        self.reader_tiered(uri, ReadIntent::Warm, None, None).await
+        self.reader_tiered(uri, &uri.storage_path(), ReadIntent::Warm, None, None)
+            .await
     }
 
     /// Test shorthand for [`Self::reader_synchronous_with_storage`] using the cache's own storage:
@@ -308,7 +334,8 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         let storage = Arc::clone(&self.storage);
-        self.reader_synchronous_with_storage(uri, storage).await
+        self.reader_synchronous_with_storage(uri, &uri.storage_path(), storage)
+            .await
     }
 
     /// Block until the background fill has swapped in the mmap-backed reader, or fail after
@@ -399,7 +426,9 @@ mod tests {
         let before = store.stats();
         match intent {
             ReadIntent::Stream | ReadIntent::Warm => {
-                store.open_for_query(uri, None, None, intent).await
+                store
+                    .open_for_query(uri, &uri.storage_path(), None, None, intent)
+                    .await
             }
             ReadIntent::Load => store.reader_synchronous(uri).await,
         }
@@ -428,7 +457,13 @@ mod tests {
             let uri_l = SuperfileUri::new_v4();
             put_superfile(&store_l, &uri_l, tiny_superfile_bytes()).await;
             store_l
-                .open_for_query(&uri_l, None, None, ReadIntent::Stream)
+                .open_for_query(
+                    &uri_l,
+                    &uri_l.storage_path(),
+                    None,
+                    None,
+                    ReadIntent::Stream,
+                )
                 .await
                 .expect("lazy open");
             let writer = reopen_store(&store_l, |_| {});
@@ -555,7 +590,13 @@ mod tests {
 
         // Query path admission: lazy reader with no resident parquet bytes.
         let lazy = cache
-            .open_for_query(&uri, None, Some(&hidden_storage), ReadIntent::Warm)
+            .open_for_query(
+                &uri,
+                &uri.storage_path(),
+                None,
+                Some(&hidden_storage),
+                ReadIntent::Warm,
+            )
             .await
             .expect("lazy cold fetch via caller storage");
         assert!(
@@ -565,7 +606,7 @@ mod tests {
 
         // Compaction path must force an eager reopen via caller storage.
         let eager = cache
-            .reader_synchronous_with_storage(&uri, Arc::clone(&hidden_storage))
+            .reader_synchronous_with_storage(&uri, &uri.storage_path(), Arc::clone(&hidden_storage))
             .await
             .expect("synchronous compaction open");
         assert!(
@@ -602,7 +643,7 @@ mod tests {
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
         // offsets = None → unknown-size StorageRangeSource.
         let r = store
-            .open_range_only(&uri, None, None)
+            .open_range_only(&uri.storage_path(), None, None)
             .await
             .expect("range open");
         assert_eq!(r.n_docs(), 1);
@@ -627,7 +668,7 @@ mod tests {
             open_blob: Vec::new(),
         };
         let r = store
-            .open_range_only(&uri, Some(&offsets), None)
+            .open_range_only(&uri.storage_path(), Some(&offsets), None)
             .await
             .expect("known-size range open");
         assert_eq!(r.n_docs(), 1);
@@ -660,11 +701,11 @@ mod tests {
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
 
         let first = store
-            .open_for_query(&uri, None, None, ReadIntent::Stream)
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
             .await
             .expect("first lazy open");
         let second = store
-            .open_for_query(&uri, None, None, ReadIntent::Stream)
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
             .await
             .expect("second open rides the first");
 
@@ -693,7 +734,13 @@ mod tests {
         assert_eq!(store.stats().current_bytes, size);
 
         let served = store
-            .cold_fetch_lazy(&uri, None, store.resolve_storage(None), false)
+            .cold_fetch_lazy(
+                &uri,
+                &uri.storage_path(),
+                None,
+                store.resolve_storage(None),
+                false,
+            )
             .await
             .expect("late lazy admission");
 
@@ -723,7 +770,7 @@ mod tests {
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
 
         let reader = store
-            .open_for_query(&uri, None, None, ReadIntent::Stream)
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
             .await
             .expect("lazy open");
         // Fill one block through the entry's block source so SourceOwned bytes are charged. (A
@@ -762,7 +809,7 @@ mod tests {
         );
 
         let _again = store
-            .open_for_query(&uri, None, None, ReadIntent::Stream)
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
             .await
             .expect("reopen after eviction");
         assert_eq!(

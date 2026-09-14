@@ -4068,6 +4068,7 @@ impl SupertableReader {
         column: &str,
         query: &[f32],
         k: usize,
+        ef_opt: Option<usize>,
     ) -> Result<IndexOutcome<Vec<SuperfileHit>>, QueryError> {
         if k == 0 {
             return Ok(IndexOutcome::Ready(Vec::new()));
@@ -4125,8 +4126,12 @@ impl SupertableReader {
         // pre-curve bundle returns its single stamped `ef` for every `k`. A
         // non-zero `hnsw_ef_search` config overrides the curve with a fixed
         // serve-time beam — a rebuild-free knob for sweeping an already-built
-        // graph's recall/latency curve.
-        let ef_override = config::global().vector.hnsw_ef_search;
+        // graph's recall/latency curve. A per-query `ef_opt` (from the
+        // test-and-bench `VectorSearchOptions::with_ef`) takes precedence over
+        // the config so a sweep can vary the beam per request without a restart.
+        let ef_override = ef_opt
+            .filter(|&e| e > 0)
+            .unwrap_or_else(|| config::global().vector.hnsw_ef_search);
         let ef = if ef_override > 0 {
             ef_override
         } else {
@@ -4837,7 +4842,7 @@ impl SupertableReader {
             && hidden_vector_index
             && vcfg.search_mode == config::VectorSearchMode::HnswIvf
             && let Some(hits) = self
-                .hnsw_search(column, query, k)
+                .hnsw_search(column, query, k, options.ef())
                 .await?
                 .or_warn("hnsw search")
         {
@@ -7563,6 +7568,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::IndexOutcome;
+    use crate::superfile::fts::reader::Bm25SearchOptions;
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
@@ -8869,6 +8875,7 @@ mod tests {
             .insert(uri, superfile_bytes_with_ids(ids, dim))
             .expect("insert superfile bytes");
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri,
@@ -8891,6 +8898,7 @@ mod tests {
     fn contiguous_entry(id_min: i128, n_docs: u64, seed: u128) -> Arc<SuperfileEntry> {
         let id = Uuid::from_u128(seed);
         Arc::new(SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
@@ -9254,6 +9262,7 @@ mod tests {
 
     fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
         SuperfileEntry {
+            stem: None,
             birth_version: 0,
             superfile_id,
             uri: SuperfileUri(superfile_id),
@@ -10711,7 +10720,15 @@ mod tests {
         let (_dir, st, _q, _k) = drained_three_direction_fixture();
         let reader = st.reader().expect("reader");
         let batches = reader
-            .bm25_search("title", "5", 8, BoolMode::And, Bm25Stats::Global, None)
+            .bm25_search(
+                "title",
+                "5",
+                8,
+                Bm25SearchOptions::new()
+                    .with_mode(BoolMode::And)
+                    .with_stats(Bm25Stats::Global),
+                None,
+            )
             .expect("global-stats bm25");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
@@ -11831,7 +11848,7 @@ mod tests {
         );
         assert!(
             matches!(
-                block_on(bare.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+                block_on(bare.hnsw_search("emb", &query, 5, None)).expect("hnsw search"),
                 IndexOutcome::Unavailable(IndexUnavailable::NotHydrated)
             ),
             "the graph arm must decline an unpublished generation the same way"
@@ -11893,7 +11910,7 @@ mod tests {
         }
         // The mirror of `flat_search_declines_a_generation_that_published_a
         // _graph`: neither arm may answer from the other's index.
-        match block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search") {
+        match block_on(served.hnsw_search("emb", &query, 5, None)).expect("hnsw search") {
             IndexOutcome::Unavailable(IndexUnavailable::WrongKind { wanted }) => {
                 assert_eq!(wanted, "hnsw");
             }
@@ -11999,7 +12016,7 @@ mod tests {
         let served = hidden.reader().expect("hidden reader after publish");
 
         let hits = expect_ready(
-            block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+            block_on(served.hnsw_search("emb", &query, 5, None)).expect("hnsw search"),
             "the published graph",
         );
         assert!(!hits.is_empty(), "the graph must answer its own generation");
@@ -12016,19 +12033,19 @@ mod tests {
 
         assert!(
             matches!(
-                block_on(served.hnsw_search("emb", &query, 0)).expect("k=0"),
+                block_on(served.hnsw_search("emb", &query, 0, None)).expect("k=0"),
                 IndexOutcome::Ready(ref hits) if hits.is_empty()
             ),
             "k=0 is an empty answer, not a decline"
         );
-        match block_on(served.hnsw_search("sibling", &query, 5)).expect("column mismatch") {
+        match block_on(served.hnsw_search("sibling", &query, 5, None)).expect("column mismatch") {
             IndexOutcome::Unavailable(IndexUnavailable::ColumnMismatch { queried, index }) => {
                 assert_eq!(queried, "sibling");
                 assert_eq!(index, "emb");
             }
             other => panic!("expected ColumnMismatch, got {}", describe(other)),
         }
-        match block_on(served.hnsw_search("emb", &query[..GRAPH_FIXTURE_DIM - 1], 5))
+        match block_on(served.hnsw_search("emb", &query[..GRAPH_FIXTURE_DIM - 1], 5, None))
             .expect("dim mismatch")
         {
             IndexOutcome::Unavailable(IndexUnavailable::DimMismatch { queried, index }) => {
