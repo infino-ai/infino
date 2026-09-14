@@ -21,6 +21,7 @@ use crate::superfile::{
     format::{
         self,
         fts::{
+            POSITION_SUBINDEX_COMPACT_ENTRY_BYTES, POSITION_SUBINDEX_COMPACT_NONE,
             POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, U32_BYTES, U64_BYTES,
             skip_entry, term_meta,
         },
@@ -32,6 +33,33 @@ use crate::superfile::{
         short::{ShortPositions, decode_short},
     },
 };
+
+/// How a blob lays out the position run-offset sub-index each
+/// positional long-form term carries between its skip table and its
+/// blocks — decided by the blob version at open.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) enum SubindexKind {
+    /// `V1`/`V2`: no sub-index; the phrase decode walks a block's runs
+    /// from the block start.
+    None,
+    /// `V3`–`V6`: `u32` offsets absolute within the term's positions.
+    Wide,
+    /// `V7`+: `u16` offsets relative to the block's first run, or
+    /// [`POSITION_SUBINDEX_COMPACT_NONE`] in every slot of a block whose
+    /// runs outgrew the range.
+    Compact,
+}
+
+impl SubindexKind {
+    /// Bytes one sub-index entry occupies (zero when there is none).
+    pub(super) fn entry_bytes(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Wide => U32_BYTES,
+            Self::Compact => POSITION_SUBINDEX_COMPACT_ENTRY_BYTES,
+        }
+    }
+}
 
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —
@@ -65,6 +93,8 @@ pub(super) struct TermMeta {
     /// skip table on a `VERSION_V3` positional term. `None` on
     /// `V1`/`V2` (no sub-index) and on positionless terms.
     pub(super) subindex_start: Option<usize>,
+    /// The sub-index entry layout `subindex_start` points at.
+    pub(super) subindex: SubindexKind,
     /// Absolute offset (within the postings region) of the coarse
     /// block-max table — `ceil(num_blocks / COARSE_BLOCK_MAX_SPAN)`
     /// 4-byte slots at the tail of the term region.
@@ -95,7 +125,7 @@ impl TermMeta {
         postings: &[u8],
         metadata_offset: usize,
         positional: bool,
-        has_subindex: bool,
+        subindex: SubindexKind,
         has_coarse: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
@@ -158,10 +188,10 @@ impl TermMeta {
         // skip table: `num_blocks × ENTRIES_PER_BLOCK` u32s. Bound it now;
         // the blocks follow it (their offsets are read from the skip
         // table, which the writer already shifted past the sub-index).
-        let subindex_start = match has_subindex {
-            true => {
-                let subindex_end =
-                    skip_end + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * U32_BYTES;
+        let subindex_start = match subindex {
+            SubindexKind::Wide | SubindexKind::Compact => {
+                let subindex_end = skip_end
+                    + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes();
                 if subindex_end > postings.len() {
                     return Err(FtsError::Read(ReadError::MalformedVersion(
                         "position sub-index runs past postings region".into(),
@@ -169,7 +199,7 @@ impl TermMeta {
                 }
                 Some(skip_end)
             }
-            false => None,
+            SubindexKind::None => None,
         };
         // Coarse block-max table (V5 and later): `ceil(num_blocks / span)`
         // slots at the tail of the term region, so the blocks end where it
@@ -193,6 +223,7 @@ impl TermMeta {
             positions_offset,
             positions_length,
             subindex_start,
+            subindex,
             coarse_start,
             blocks_end_in_term,
             has_coarse,
@@ -212,6 +243,7 @@ impl TermMeta {
             positions_offset: p.offset,
             positions_length: p.length,
             subindex_start: None,
+            subindex: SubindexKind::None,
             coarse_start: 0,
             blocks_end_in_term: 0,
             has_coarse: false,
@@ -245,9 +277,24 @@ impl TermMeta {
         let start = self.subindex_start?;
         let slot = pair_in_block / POSITION_SUBINDEX_STRIDE;
         let idx = block * POSITION_SUBINDEX_ENTRIES_PER_BLOCK + slot;
-        let at = start + idx * U32_BYTES;
-        let checkpoint = read_u32_le(&postings[at..at + U32_BYTES]);
         let runs_to_skip = pair_in_block % POSITION_SUBINDEX_STRIDE;
+        let checkpoint = match self.subindex {
+            SubindexKind::Wide => {
+                let at = start + idx * U32_BYTES;
+                read_u32_le(&postings[at..at + U32_BYTES])
+            }
+            SubindexKind::Compact => {
+                let at = start + idx * POSITION_SUBINDEX_COMPACT_ENTRY_BYTES;
+                let rel = u16::from_le_bytes([postings[at], postings[at + 1]]);
+                if rel == POSITION_SUBINDEX_COMPACT_NONE {
+                    // This block's runs outgrew the entry width; the
+                    // caller walks them from the block start.
+                    return None;
+                }
+                self.positions_block_offset(postings, block) + u32::from(rel)
+            }
+            SubindexKind::None => return None,
+        };
         Some((checkpoint, runs_to_skip))
     }
 
@@ -456,7 +503,7 @@ impl TermCursor {
             postings,
             metadata_offset,
             col.positions,
-            false,
+            SubindexKind::None,
             stored.has_coarse(),
         )?;
         let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);

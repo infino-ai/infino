@@ -176,6 +176,29 @@ pub mod fts {
     /// they stay in lockstep.
     pub const POSITION_SUBINDEX_ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
 
+    /// Width of one sub-index entry from [`VERSION_V7`]: a `u16` byte
+    /// offset relative to the block's own first run (the skip entry's
+    /// positions field), instead of the `u32` absolute offset `V3`–`V6`
+    /// stored. A block's 128 runs are short — a few bytes per position —
+    /// so the relative offset fits two bytes for any realistic block; a
+    /// block whose runs exceed the range stores
+    /// [`POSITION_SUBINDEX_COMPACT_NONE`] in every slot and the reader
+    /// takes the block-start walk for it.
+    pub const POSITION_SUBINDEX_COMPACT_ENTRY_BYTES: usize = 2;
+    /// Compact sub-index sentinel: this block has no usable sub-index.
+    pub const POSITION_SUBINDEX_COMPACT_NONE: u16 = u16::MAX;
+
+    /// Bytes per stored document length from [`VERSION_V7`]: a `u16`,
+    /// saturating at [`DOC_LENGTH_STORED_MAX`], instead of the `u32`
+    /// `V1`–`V6` stored. The scorer reads a one-byte bucket of the length
+    /// and the directory carries the exact average, so nothing about
+    /// scoring changes; a document past 65,535 tokens has its stored
+    /// length (and so its stored bucket and bound) computed from the
+    /// saturated value, consistently on the writer and the reader.
+    pub const DOC_LENGTH_BYTES_V7: usize = 2;
+    /// Largest per-document length a `V7` blob stores.
+    pub const DOC_LENGTH_STORED_MAX: u32 = u16::MAX as u32;
+
     /// Fixed-point scale for the per-column average document length.
     /// The builder stores `round(avgdl × 1000)` in the doc-lengths
     /// directory as a `u32` (`avgdl_x1000`); the reader recovers the

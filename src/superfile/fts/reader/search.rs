@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap;
 use super::{
     bounds::BoundDecoder,
     core::*,
-    cursor::{TermCursor, TermMeta},
+    cursor::{SubindexKind, TermCursor, TermMeta},
     filter::{AtomExcludeFilter, ExcludeFilter},
     options::BoolMode,
     phrase::AnyCursor,
@@ -1135,7 +1135,7 @@ impl FtsReader {
             postings,
             metadata_offset,
             col_meta.positions,
-            false,
+            SubindexKind::None,
             self.bounds.has_coarse(),
         )?;
 
@@ -1473,7 +1473,7 @@ impl FtsReader {
                                 bytes.as_ref(),
                                 0,
                                 col_meta.positions,
-                                false,
+                                SubindexKind::None,
                                 self.bounds.has_coarse(),
                             )?
                             .df

@@ -13,7 +13,7 @@ use std::fmt;
 
 use super::{
     core::{FtsReader, fetch_source_range, header_postings_length},
-    cursor::TermMeta,
+    cursor::{SubindexKind, TermMeta},
 };
 use crate::superfile::{
     ReadError,
@@ -170,7 +170,10 @@ impl FtsReader {
         let mut columns = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
             let positional = col.positions;
-            let has_sub = self.has_position_subindex && positional;
+            let subindex = match positional {
+                true => self.subindex,
+                false => SubindexKind::None,
+            };
             let has_coarse = self.bounds.has_coarse();
             let mut prefix = col.name.as_bytes().to_vec();
             prefix.push(FST_SEPARATOR);
@@ -235,7 +238,7 @@ impl FtsReader {
                                 u64::from(decoded.positions.map(|p| p.length).unwrap_or(0));
                             continue;
                         }
-                        let meta = TermMeta::parse(tb, 0, positional, has_sub, has_coarse)?;
+                        let meta = TermMeta::parse(tb, 0, positional, subindex, has_coarse)?;
                         let nb = meta.num_blocks as u64;
                         let b = &mut buckets[band_of(meta.df)];
                         b.terms += 1;
@@ -248,10 +251,8 @@ impl FtsReader {
                             false => TERM_META_SIZE,
                         } as u64;
                         b.skip_bytes += nb * SKIP_ENTRY_SIZE as u64;
-                        if has_sub {
-                            b.subindex_bytes +=
-                                nb * (POSITION_SUBINDEX_ENTRIES_PER_BLOCK * U32_BYTES) as u64;
-                        }
+                        b.subindex_bytes += nb
+                            * (POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes()) as u64;
                         if has_coarse {
                             b.coarse_bytes += nb
                                 .div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN as u64)

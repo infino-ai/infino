@@ -698,6 +698,161 @@ mod tests {
         )]
     }
 
+    /// A multi-block positional term's sub-index stores `u16` offsets
+    /// relative to each block's first run. Plant a phrase in every one of
+    /// 300 docs at varying in-block pair slots (three blocks, tf varying so
+    /// the runs differ in length) and verify every doc through the phrase
+    /// path — the decode reaches each pair's run through the compact
+    /// checkpoints.
+    #[tokio::test]
+    async fn compact_subindex_reaches_every_pair_across_blocks() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, reader::cursor::SubindexKind, tokenize::AsciiLowerTokenizer,
+        };
+        let n_docs = 300u32;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for i in 0..n_docs {
+            let text = format!(
+                "{}{}alpha beta",
+                "alpha ".repeat((i % 7) as usize),
+                "filler ".repeat((i % 50) as usize)
+            );
+            b.add_doc(0, i, &text).expect("doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(r.subindex, SubindexKind::Compact);
+        let phrases = phrase(&["alpha", "beta"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                n_docs as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..n_docs).collect::<Vec<_>>(),
+            "every doc holds the phrase"
+        );
+        // No doc holds "beta alpha".
+        let reversed = phrase(&["beta", "alpha"]);
+        let none = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &reversed,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        assert!(none.is_empty());
+    }
+
+    /// A block whose position runs outgrow the `u16` sub-index range gets
+    /// the sentinel in every slot and is decoded by the block-start walk.
+    /// Postings are planted directly (300 occurrences per doc, 200 apart,
+    /// so a block's runs run to ~77 KB) so the fixture costs no
+    /// tokenization; the phrase must still verify in every doc.
+    #[tokio::test]
+    async fn compact_subindex_falls_back_when_a_block_outgrows_the_entry_width() {
+        use std::sync::Arc;
+
+        use crate::superfile::{
+            format::fts::POSITION_SUBINDEX_COMPACT_NONE,
+            fts::{
+                builder::FtsBuilder,
+                dict::make_key,
+                fst_value::FstValue,
+                reader::{
+                    core::fetch_source_range,
+                    cursor::{SubindexKind, TermMeta},
+                },
+                tokenize::AsciiLowerTokenizer,
+            },
+        };
+        const N_DOCS: u32 = 129;
+        const TF: u32 = 300;
+        const GAP: u32 = 200;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        let alpha: Vec<u32> = (0..TF).map(|j| j * GAP).collect();
+        let filler: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
+        for d in 0..N_DOCS {
+            b.add_prebuilt_term_posting(0, "alpha", d, TF, &alpha)
+                .expect("alpha");
+            b.add_prebuilt_term_posting(0, "filler", d, TF, &filler)
+                .expect("filler");
+        }
+        b.append_prebuilt_doc_lengths(0, &vec![TF * GAP; N_DOCS as usize]);
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+
+        // The first (full) block's slots all carry the sentinel.
+        let fst = r.dict_bytes().expect("dict");
+        let dict = FtsReader::open_dict(&fst).expect("dict");
+        let FstValue::Pfor {
+            metadata_offset,
+            postings_length_hint: Some(len),
+            short: false,
+        } = FstValue::unpack(
+            dict.lookup(&make_key("title", "alpha"))
+                .expect("alpha in dict"),
+            r.value_layout,
+        )
+        else {
+            panic!("alpha spans two blocks: long form with a length hint");
+        };
+        let start = r.postings_range.start + metadata_offset as usize;
+        let bytes =
+            fetch_source_range(&r.source, start..start + len as usize, "test").expect("term");
+        let meta =
+            TermMeta::parse(bytes.as_ref(), 0, true, SubindexKind::Compact, true).expect("meta");
+        assert_eq!(meta.num_blocks, 2);
+        let sub = meta.subindex_start.expect("compact sub-index");
+        let slot0 = u16::from_le_bytes([bytes[sub], bytes[sub + 1]]);
+        assert_eq!(
+            slot0, POSITION_SUBINDEX_COMPACT_NONE,
+            "block 0 outgrew the range"
+        );
+        assert_eq!(meta.positions_subindex_offset(bytes.as_ref(), 0, 5), None);
+        // Block 1 (one doc) fits: its checkpoint is block-relative.
+        assert!(
+            meta.positions_subindex_offset(bytes.as_ref(), 1, 0)
+                .is_some()
+        );
+
+        let phrases = phrase(&["alpha", "filler"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                N_DOCS as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..N_DOCS).collect::<Vec<_>>());
+    }
+
     #[tokio::test]
     async fn phrase_matches_adjacent_in_order_only() {
         let (blob, json) = build_phrase_blob();

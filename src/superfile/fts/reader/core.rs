@@ -26,7 +26,7 @@ use rustc_hash::FxHashMap;
 
 use super::{
     bounds::StoredBound,
-    cursor::{TermCursor, TermMeta},
+    cursor::{SubindexKind, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, NormTable, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
@@ -468,12 +468,14 @@ pub struct FtsReader {
     /// iff the blob is v2. Phrase queries fetch per-term run ranges
     /// out of it via [`Self::fetch_term_positions`].
     pub(super) positions_range: Option<Range<usize>>,
-    /// True iff the blob is `VERSION_V3` — its positional terms carry a
-    /// position run-offset sub-index between skip table and blocks, which
-    /// the phrase decode uses to reach a pair's runs by skipping
-    /// `< POSITION_SUBINDEX_STRIDE` runs. `V1`/`V2` blobs lack it and take
-    /// the block-start skip-walk fallback.
-    pub(super) has_position_subindex: bool,
+    /// How this blob's positional long-form terms lay out the position
+    /// run-offset sub-index between skip table and blocks, which the
+    /// phrase decode uses to reach a pair's runs by skipping
+    /// `< POSITION_SUBINDEX_STRIDE` runs. `V1`/`V2` blobs have none and
+    /// take the block-start skip-walk fallback.
+    pub(super) subindex: SubindexKind,
+    /// Bytes per stored document length (`u16` from `V7`, `u32` before).
+    pub(super) doc_length_bytes: usize,
     /// True iff the blob is `VERSION_V4` — some posting blocks may be
     /// bitset-encoded, so the unranked count kernels prefer membership
     /// bit-tests (no decode) over decoding a common term's blocks.
@@ -688,11 +690,15 @@ impl FtsReader {
                 ))));
             }
         };
-        let has_position_subindex = version == format::fts::VERSION_V3
-            || version == format::fts::VERSION_V4
-            || version == format::fts::VERSION_V5
-            || version == format::fts::VERSION_V6
-            || version == format::fts::VERSION_V7;
+        let subindex = match version {
+            v if v >= format::fts::VERSION_V7 => SubindexKind::Compact,
+            v if v >= format::fts::VERSION_V3 => SubindexKind::Wide,
+            _ => SubindexKind::None,
+        };
+        let doc_length_bytes = match version >= format::fts::VERSION_V7 {
+            true => format::fts::DOC_LENGTH_BYTES_V7,
+            false => U32_BYTES,
+        };
         let has_bitset_blocks = version == format::fts::VERSION_V4
             || version == format::fts::VERSION_V5
             || version == format::fts::VERSION_V6
@@ -909,7 +915,7 @@ impl FtsReader {
             // `doc_lengths_offset` lies within the prefetched doc-lengths
             // tail, so on the lazy path this resolves from the overlay
             // (see the directory comment above) — no per-column GET.
-            let array_byte_len = 4 * n_docs as usize;
+            let array_byte_len = doc_length_bytes * n_docs as usize;
             let array_end = doc_lengths_offset + array_byte_len;
             if array_end + 4 > source_len {
                 return Err(FtsError::Read(ReadError::MalformedVersion(format!(
@@ -964,7 +970,7 @@ impl FtsReader {
             // restores exactly the pruning they had.
             let declared = bounds.declares_scoring_average();
             let (dl_norm_k1, length_stats) = NormTable::new(
-                (0..n).map(|d| read_u32_le(&array_region[d * 4..d * 4 + 4])),
+                (0..n).map(|d| read_doc_length(&array_region, d, doc_length_bytes)),
                 n,
                 params,
                 |stats| match declared {
@@ -1021,7 +1027,8 @@ impl FtsReader {
             fst_range,
             postings_range,
             positions_range,
-            has_position_subindex,
+            subindex,
+            doc_length_bytes,
             has_bitset_blocks,
             bounds,
             value_layout,
@@ -1306,7 +1313,7 @@ impl FtsReader {
                             cursor.bytes.as_ref(),
                             0,
                             true,
-                            self.has_position_subindex,
+                            self.subindex,
                             self.bounds.has_coarse(),
                         )?;
                         positional.push((Some(term_meta), None));
@@ -1513,7 +1520,7 @@ impl FtsReader {
                             term_bytes.as_ref(),
                             0,
                             true,
-                            false,
+                            SubindexKind::None,
                             self.bounds.has_coarse(),
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
@@ -1575,14 +1582,13 @@ impl FtsReader {
         let range = self.columns[column_id as usize].doc_lengths_range.clone();
         let bytes = fetch_source_range(&self.source, range, "fts/merge doc_lengths")?;
         let region = bytes.as_ref();
-        if region.len() < n * U32_BYTES {
+        let width = self.doc_length_bytes;
+        if region.len() < n * width {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "doc-lengths region shorter than n_docs entries".into(),
             )));
         }
-        Ok((0..n)
-            .map(|d| read_u32_le(&region[d * U32_BYTES..d * U32_BYTES + U32_BYTES]))
-            .collect())
+        Ok((0..n).map(|d| read_doc_length(region, d, width)).collect())
     }
 
     /// Walk the FST and collect every term registered under
@@ -1987,6 +1993,19 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
 
 /// Read `postings_length` out of a term metadata header, given only
 /// enough bytes to cover that field.
+/// Document `d`'s stored length from a doc-lengths array of `width`-byte
+/// little-endian entries (`u16` from `V7`, `u32` before).
+#[inline]
+fn read_doc_length(region: &[u8], d: usize, width: usize) -> u32 {
+    let at = d * width;
+    match width {
+        format::fts::DOC_LENGTH_BYTES_V7 => {
+            u32::from(u16::from_le_bytes([region[at], region[at + 1]]))
+        }
+        _ => read_u32_le(&region[at..at + U32_BYTES]),
+    }
+}
+
 pub(super) fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
     let field_end = term_meta::POSTINGS_LENGTH_OFF + U32_BYTES;
     if header.len() < field_end {
@@ -2607,6 +2626,38 @@ mod tests {
         );
         assert_eq!(rb.n_docs(), 3);
         assert_eq!(rb.n_terms(), ra.n_terms());
+    }
+
+    /// A `V7` blob stores each length in two bytes, saturating: a document
+    /// past 65,535 tokens reads back at the cap, the exact total still
+    /// feeds the average, and the doc is scored and found like any other
+    /// (its stored bound and its bucket both come from the saturated
+    /// length, so the block skip cannot drop it).
+    #[tokio::test]
+    async fn doc_lengths_store_in_two_bytes_and_saturate() {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        let long = "tok ".repeat(70_000);
+        b.add_doc(0, 0, &long).expect("long doc");
+        b.add_doc(0, 1, "tok tok tok").expect("short doc");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(r.doc_length_bytes, format::fts::DOC_LENGTH_BYTES_V7);
+        assert_eq!(
+            r.read_doc_lengths(0).expect("doc lengths"),
+            vec![format::fts::DOC_LENGTH_STORED_MAX, 3]
+        );
+        assert_eq!(
+            r.columns[0].doc_lengths_range.len(),
+            2 * format::fts::DOC_LENGTH_BYTES_V7
+        );
+        let hits = r
+            .search("body", &["tok"], 10, BoolMode::Or)
+            .await
+            .expect("search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1]);
     }
 
     #[test]

@@ -342,6 +342,29 @@ impl BlobEra {
         self == Self::V7
     }
 
+    /// Whether the position sub-index stores `u16` block-relative
+    /// offsets (`V7`) or `u32` absolute ones.
+    fn compact_subindex(self) -> bool {
+        self == Self::V7
+    }
+
+    /// Bytes per stored document length.
+    fn doc_length_bytes(self) -> usize {
+        match self {
+            Self::V7 => format::fts::DOC_LENGTH_BYTES_V7,
+            Self::V6 | Self::V5 | Self::V2ToV4 => format::fts::U32_BYTES,
+        }
+    }
+
+    /// The per-document length as this era stores it — what both the
+    /// block-max bound and the reader's bucket are computed from.
+    fn stored_doc_length(self, len: u32) -> u32 {
+        match self {
+            Self::V7 => len.min(format::fts::DOC_LENGTH_STORED_MAX),
+            Self::V6 | Self::V5 | Self::V2ToV4 => len,
+        }
+    }
+
     /// How this era packs a postings-form dictionary value.
     fn value_layout(self) -> ValueLayout {
         match self {
@@ -1951,9 +1974,11 @@ impl FtsBuilder {
     /// accumulate — keeping merged BM25 scores identical to a fresh build.
     pub(crate) fn append_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: &[u32]) {
         let total_tokens: u64 = doc_lengths.iter().map(|&dl| u64::from(dl)).sum();
+        let era = self.era;
         let col = &mut self.columns[column_id as usize];
         col.total_tokens += total_tokens;
-        col.doc_lengths.extend_from_slice(doc_lengths);
+        col.doc_lengths
+            .extend(doc_lengths.iter().map(|&dl| era.stored_doc_length(dl)));
         self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
     }
 
@@ -2153,7 +2178,9 @@ impl FtsBuilder {
         // `self.columns[col_idx]` is a disjoint field from
         // `self.postings[col_idx]`, so split-borrow legal.
         let col = &mut self.columns[col_idx];
-        let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
+        let dl_clamped: u32 = self
+            .era
+            .stored_doc_length(tokens_in_doc.min(u32::MAX as u64) as u32);
         col.doc_lengths.push(dl_clamped);
         col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
         let docs_now = local_doc_id.saturating_add(1);
@@ -2405,7 +2432,9 @@ impl FtsBuilder {
         }
 
         let col = &mut self.columns[col_idx];
-        let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
+        let dl_clamped: u32 = self
+            .era
+            .stored_doc_length(tokens_in_doc.min(u32::MAX as u64) as u32);
         col.doc_lengths.push(dl_clamped);
         col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
         let docs_now = local_doc_id.saturating_add(1);
@@ -3512,16 +3541,25 @@ fn assemble_and_write_blob<W: Write>(
         // is materially faster than the per-u32 `to_le_bytes`
         // + push loop, especially at the 10M-doc / column
         // scale where this writes 40 MB per column.
-        #[cfg(target_endian = "little")]
-        arrays_buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(&col_dls));
-        #[cfg(not(target_endian = "little"))]
-        for &dl in &col_dls {
-            arrays_buf.extend_from_slice(&dl.to_le_bytes());
+        let dl_bytes = era.doc_length_bytes();
+        if dl_bytes == format::fts::DOC_LENGTH_BYTES_V7 {
+            // `add_doc` / the prebuilt carry already saturated every
+            // length to the stored width.
+            for &dl in &col_dls {
+                arrays_buf.extend_from_slice(&(dl as u16).to_le_bytes());
+            }
+        } else {
+            #[cfg(target_endian = "little")]
+            arrays_buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(&col_dls));
+            #[cfg(not(target_endian = "little"))]
+            for &dl in &col_dls {
+                arrays_buf.extend_from_slice(&dl.to_le_bytes());
+            }
         }
         let array_bytes = &arrays_buf[array_start..];
         let array_crc = crc32c(array_bytes);
         arrays_buf.extend_from_slice(&array_crc.to_le_bytes());
-        doc_lengths_array_offset += (col_dls.len() as u64) * 4 + 4;
+        doc_lengths_array_offset += (col_dls.len() as u64) * dl_bytes as u64 + 4;
     }
     let dir_crc = crc32c(&dir_buf);
     dir_buf.extend_from_slice(&dir_crc.to_le_bytes());
@@ -4015,8 +4053,14 @@ fn encode_and_emit_term<W: Write>(
         // the posting blocks. Zero-sized on positionless terms, which keep
         // the V2 layout byte-for-byte.
         let entries_per_block = format::fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK;
+        // From V7 an entry is a `u16` offset relative to its block's first
+        // run; earlier eras store `u32` absolute offsets.
+        let subindex_entry_bytes = match era.compact_subindex() {
+            true => format::fts::POSITION_SUBINDEX_COMPACT_ENTRY_BYTES,
+            false => format::fts::U32_BYTES,
+        };
         let subindex_size = match term_positions {
-            Some(_) => num_blocks as usize * entries_per_block * format::fts::U32_BYTES,
+            Some(_) => num_blocks as usize * entries_per_block * subindex_entry_bytes,
             None => 0,
         };
         // Coarse block-max table at the tail of the term region: one slot
@@ -4068,7 +4112,7 @@ fn encode_and_emit_term<W: Write>(
                 pos_subindex_offsets.push(at as u32);
             }
             debug_assert_eq!(
-                pos_subindex_offsets.len() * format::fts::U32_BYTES,
+                pos_subindex_offsets.len() * subindex_entry_bytes,
                 subindex_size,
                 "sub-index must hold entries_per_block offsets per block"
             );
@@ -4160,10 +4204,34 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_skip_write += start.elapsed();
         }
 
-        // Position sub-index (VERSION_V3, positional terms): sits between
-        // the skip table and the blocks. Empty on positionless terms.
-        for &off in pos_subindex_offsets.iter() {
-            term_buf.extend_from_slice(&off.to_le_bytes());
+        // Position sub-index (positional terms): sits between the skip
+        // table and the blocks. Empty on positionless terms.
+        if era.compact_subindex() {
+            // `u16` offsets relative to the block's first run. A block
+            // whose runs outgrow the range gets the sentinel in every
+            // slot (the reader walks it from the block start); the pad
+            // slots past the last real pair are never read and hold 0.
+            let n_real = pairs.len().div_ceil(format::fts::POSITION_SUBINDEX_STRIDE);
+            for (block, chunk) in pos_subindex_offsets.chunks(entries_per_block).enumerate() {
+                let block_start = pos_block_offsets[block];
+                let fits = chunk.iter().enumerate().all(|(slot, &off)| {
+                    block * entries_per_block + slot >= n_real
+                        || (off - block_start)
+                            < u32::from(format::fts::POSITION_SUBINDEX_COMPACT_NONE)
+                });
+                for (slot, &off) in chunk.iter().enumerate() {
+                    let entry: u16 = match (fits, block * entries_per_block + slot < n_real) {
+                        (false, _) => format::fts::POSITION_SUBINDEX_COMPACT_NONE,
+                        (true, false) => 0,
+                        (true, true) => (off - block_start) as u16,
+                    };
+                    term_buf.extend_from_slice(&entry.to_le_bytes());
+                }
+            }
+        } else {
+            for &off in pos_subindex_offsets.iter() {
+                term_buf.extend_from_slice(&off.to_le_bytes());
+            }
         }
 
         let block_write_start = profile.enabled.then(Instant::now);
