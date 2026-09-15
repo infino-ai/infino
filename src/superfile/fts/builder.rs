@@ -95,18 +95,15 @@ use crate::superfile::{
     format::{
         self, FST_SEPARATOR,
         checksum::{crc32c, crc32c_append},
-        fts::SkipLayout,
+        fts::{BlobLayout, SkipLayout},
     },
     fts::{
         analysis::ChainTokenizer,
         bm25,
-        dict::{DictLayout, StreamingTermDictBuilder, TermDictBuilder},
+        dict::{StreamingTermDictBuilder, TermDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_group, encode_run, skip_run},
-        posting::{
-            BLOCK_LEN, Block, BlockLayout, ENCODING_BITSET, EncodedBlock, block_encoding,
-            encode_block,
-        },
+        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, block_encoding, encode_block},
         reader::ColumnLengthStats,
         short::{SHORT_MAX_DF, encode_short},
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
@@ -334,66 +331,25 @@ pub(crate) enum BlobEra {
 }
 
 impl BlobEra {
-    fn has_coarse(self) -> bool {
-        self != Self::V2ToV4
-    }
-
-    /// Whether a single-block term is written in the short form
-    /// (`fts::short`) rather than as header + skip table + PFOR block.
-    fn has_short_form(self) -> bool {
-        self == Self::V7
-    }
-
-    /// Whether position runs are written as per-block **groups** (two
-    /// patched bit-packed streams, decoded whole and indexed by tf prefix
-    /// sums) rather than as bare LEB128 runs with a run-offset sub-index
-    /// (`V7`). A grouped blob carries no sub-index.
-    fn grouped_positions(self) -> bool {
-        self == Self::V7
-    }
-
-    /// Which header a posting block carries: the 4-byte word with the
-    /// base derived from the previous block (`V7`), or the 8-byte header
-    /// storing it.
-    fn block_layout(self) -> BlockLayout {
-        match self {
-            Self::V7 => BlockLayout::Compact,
-            _ => BlockLayout::Wide,
-        }
-    }
-
-    /// How skip entries locate their blocks: by byte length with span
-    /// starts in the coarse slots (`V7`), or by absolute offset.
-    fn skip_layout(self) -> SkipLayout {
-        match self {
-            Self::V7 => SkipLayout::Length,
-            _ => SkipLayout::Absolute,
-        }
-    }
-
-    /// Bytes per stored document length.
-    fn doc_length_bytes(self) -> usize {
-        match self {
-            Self::V7 => format::fts::DOC_LENGTH_BYTES_V7,
-            Self::V6 | Self::V5 | Self::V2ToV4 => format::fts::U32_BYTES,
-        }
+    /// The version this era stamps, for the layout table. `V2ToV4` reads
+    /// as `V4` — the sub-index and the bitset encoding are written; the
+    /// header's version is then set by what the blob actually contains.
+    fn layout(self) -> BlobLayout {
+        let version = match self {
+            Self::V7 => format::fts::VERSION_V7,
+            Self::V6 => format::fts::VERSION_V6,
+            Self::V5 => format::fts::VERSION_V5,
+            Self::V2ToV4 => format::fts::VERSION_V4,
+        };
+        BlobLayout::for_version(version).expect("every era names a known version")
     }
 
     /// The per-document length as this era stores it — what both the
     /// block-max bound and the reader's bucket are computed from.
     fn stored_doc_length(self, len: u32) -> u32 {
-        match self {
-            Self::V7 => len.min(format::fts::DOC_LENGTH_STORED_MAX),
-            Self::V6 | Self::V5 | Self::V2ToV4 => len,
-        }
-    }
-
-    /// How this era lays out the term dictionary: front-coded term
-    /// blocks from `V7`, an FST of packed values before.
-    fn dict_layout(self) -> DictLayout {
-        match self {
-            Self::V7 => DictLayout::Blocks,
-            Self::V6 | Self::V5 | Self::V2ToV4 => DictLayout::Fst,
+        match self.layout().doc_length_bytes {
+            format::fts::DOC_LENGTH_BYTES_V7 => len.min(format::fts::DOC_LENGTH_STORED_MAX),
+            _ => len,
         }
     }
 
@@ -2738,7 +2694,7 @@ impl FtsBuilder {
         // The in-RAM path's FST sink: collect (key, value) into a
         // `DictBuilder` and serialise once at assembly time. No
         // scratch file, no streaming.
-        let mut fst_inram = TermDictBuilder::new(era.dict_layout());
+        let mut fst_inram = TermDictBuilder::new(era.layout().dict);
 
         let mut doc_lengths_by_orig_col: Vec<Option<Vec<u32>>> =
             (0..n_columns as usize).map(|_| None).collect();
@@ -2918,7 +2874,7 @@ impl FtsBuilder {
         let mut fst_streaming = {
             let fst_file = File::create(&fst_streaming_path)?;
             let bw = BufWriter::new(fst_file);
-            StreamingTermDictBuilder::new(era.dict_layout(), bw).map_err(map_fst_err)?
+            StreamingTermDictBuilder::new(era.layout().dict, bw).map_err(map_fst_err)?
         };
 
         // Drain every spilled column's per-partition batch buffer
@@ -3565,7 +3521,7 @@ fn assemble_and_write_blob<W: Write>(
         // is materially faster than the per-u32 `to_le_bytes`
         // + push loop, especially at the 10M-doc / column
         // scale where this writes 40 MB per column.
-        let dl_bytes = era.doc_length_bytes();
+        let dl_bytes = era.layout().doc_length_bytes;
         if dl_bytes == format::fts::DOC_LENGTH_BYTES_V7 {
             // `add_doc` / the prebuilt carry already saturated every
             // length to the stored width.
@@ -3962,7 +3918,7 @@ fn encode_and_emit_term<W: Write>(
     let fst_value: FstValue = if let Some(v) = inline_value {
         profile.encode_df1 += 1;
         v
-    } else if era.has_short_form() && pairs.len() <= SHORT_MAX_DF {
+    } else if era.layout().short_form && pairs.len() <= SHORT_MAX_DF {
         // Single-block term: the short form (`fts::short`) — no header,
         // skip entry, sub-index row, coarse slot or block header, and no
         // lane padding. Its position runs go to the positions region
@@ -4067,7 +4023,7 @@ fn encode_and_emit_term<W: Write>(
                 tfs: mem::take(&mut block_tfs),
             };
             let prev_last_doc_id = encoded_blocks.last().map(|b: &EncodedBlock| b.last_doc_id);
-            encoded_blocks.push(encode_block(&block, era.block_layout(), prev_last_doc_id));
+            encoded_blocks.push(encode_block(&block, era.layout().block, prev_last_doc_id));
             // Reclaim the underlying allocations for the next chunk.
             block_doc_ids = block.doc_ids;
             block_tfs = block.tfs;
@@ -4086,7 +4042,7 @@ fn encode_and_emit_term<W: Write>(
         }
         let num_blocks = encoded_blocks.len() as u32;
         let metadata_offset = *postings_len;
-        let skip_layout = era.skip_layout();
+        let skip_layout = era.layout().skip;
         let skip_table_size =
             encoded_blocks.len() * skip_layout.entry_bytes(term_positions.is_some());
         let blocks_total_size: usize = encoded_blocks.iter().map(|b| b.bytes.len()).sum();
@@ -4104,7 +4060,7 @@ fn encode_and_emit_term<W: Write>(
         // no run offsets; earlier eras store a `u32` sub-index entry every
         // `POSITION_SUBINDEX_STRIDE` pairs.
         let subindex_entry_bytes = format::fts::U32_BYTES;
-        let subindex_size = match (&term_positions, era.grouped_positions()) {
+        let subindex_size = match (&term_positions, era.layout().grouped_positions) {
             (Some(_), false) => num_blocks as usize * entries_per_block * subindex_entry_bytes,
             _ => 0,
         };
@@ -4112,7 +4068,7 @@ fn encode_and_emit_term<W: Write>(
         // per `COARSE_BLOCK_MAX_SPAN` blocks bounding the whole span, giving
         // the ranked walk a second skip level. Appended last so no existing
         // block offset moves.
-        let num_coarse = match era.has_coarse() {
+        let num_coarse = match era.layout().coarse {
             true => (num_blocks as usize).div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN),
             false => 0,
         };
@@ -4143,7 +4099,7 @@ fn encode_and_emit_term<W: Write>(
                 "single-term positions > 4 GiB"
             );
             let mut at: usize = 0;
-            if era.grouped_positions() {
+            if era.layout().grouped_positions {
                 // Regroup block by block: every long-form group is packed,
                 // so the phrase decode reads it whole and indexes it by the
                 // block's tf prefix sums — no run offsets to record.
@@ -4178,7 +4134,7 @@ fn encode_and_emit_term<W: Write>(
             // `entries_per_block`, so entry `(block, slot)` is a flat
             // `block * entries_per_block + slot`. The pad offsets point at
             // the run end and are never read (no pair maps to them).
-            while !era.grouped_positions()
+            while !era.layout().grouped_positions
                 && !pos_subindex_offsets.len().is_multiple_of(entries_per_block)
             {
                 pos_subindex_offsets.push(at as u32);
@@ -4218,7 +4174,7 @@ fn encode_and_emit_term<W: Write>(
         term_buf.extend_from_slice(&(postings_length as u32).to_le_bytes());
         term_buf.extend_from_slice(&num_blocks.to_le_bytes());
         if let Some((sink, runs)) = &term_positions {
-            let region_len = match era.grouped_positions() {
+            let region_len = match era.layout().grouped_positions {
                 true => pos_out.len(),
                 false => runs.len(),
             };
@@ -4252,7 +4208,7 @@ fn encode_and_emit_term<W: Write>(
             // `ceil(max_bm25 × scale)` as a `u32`; `ceil` keeps it a true
             // upper bound after truncation (the reader adds one more step on
             // decode).
-            let block_max_encoded: u32 = if era.has_coarse() {
+            let block_max_encoded: u32 = if era.layout().coarse {
                 max_bm25.to_bits()
             } else {
                 (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
@@ -4284,7 +4240,7 @@ fn encode_and_emit_term<W: Write>(
             }
             block_offset += blk.bytes.len() as u32;
 
-            if era.has_coarse() {
+            if era.layout().coarse {
                 span_max = span_max.max(max_bm25);
                 if (i + 1).is_multiple_of(coarse_span) || i + 1 == encoded_blocks.len() {
                     coarse_slots.extend_from_slice(&span_max.to_bits().to_le_bytes());
@@ -4319,7 +4275,7 @@ fn encode_and_emit_term<W: Write>(
         }
 
         if let Some((sink, runs)) = term_positions.as_mut() {
-            match era.grouped_positions() {
+            match era.layout().grouped_positions {
                 true => sink.write(pos_out)?,
                 false => sink.write(runs)?,
             }

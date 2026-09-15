@@ -17,7 +17,7 @@
 //! ## On-disk block layout
 //!
 //! Two header layouts exist, chosen by the blob version
-//! ([`BlockLayout`]). The **compact** header (current) is one 32-bit
+//! (`format::fts::BlockLayout`). The **compact** header (current) is one 32-bit
 //! little-endian word:
 //!
 //! ```text
@@ -87,6 +87,7 @@ use bitpacking::{BitPacker, BitPacker4x};
 
 use crate::superfile::{
     bits::{ExceptionPlan, plan_exceptions},
+    format::fts::BlockLayout,
     varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
 };
 
@@ -143,17 +144,6 @@ pub const ENCODING_BITSET: u8 = 1;
 #[inline]
 pub fn bitset_block_base(doc_id: u32) -> u32 {
     doc_id & !63
-}
-
-/// Which header a block carries — by blob version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockLayout {
-    /// `V1`–`V6`: the 8-byte header with the base doc id stored.
-    Wide,
-    /// `V7`+: the 4-byte header word; a packed or patched block's base
-    /// doc id is the previous block's last doc id (zero for the first
-    /// block), a bitset block's origin follows the word.
-    Compact,
 }
 
 impl BlockLayout {

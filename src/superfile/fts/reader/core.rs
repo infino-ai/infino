@@ -41,15 +41,15 @@ use crate::superfile::{
         self, FST_SEPARATOR,
         checksum::crc32c,
         fts::{
-            HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr,
-            term_meta,
+            BlobLayout, DictLayout, HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES,
+            U32_BYTES, U64_BYTES, hdr, term_meta,
         },
     },
     fts::{
         analysis::{Base, chain_tokenizer},
         bm25,
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
-        dict::{DictLayout, TermDict, make_key},
+        dict::{TermDict, make_key},
         fst_value::FstValue,
         positions::{GroupIndex, decode_run},
         posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
@@ -679,38 +679,20 @@ impl FtsReader {
         // carries a per-term position sub-index (handled in the phrase
         // decode), and v4 may store dense blocks in the bitset encoding
         // (self-describing per block, handled in the codec).
-        let positional_blob = match version {
-            v if v == format::fts::VERSION_V1_LEGACY => false,
-            v if v == format::fts::VERSION_V2 => true,
-            v if v == format::fts::VERSION_V3 => true,
-            v if v == format::fts::VERSION_V4 => true,
-            v if v == format::fts::VERSION_V5 => true,
-            v if v == format::fts::VERSION_V6 => true,
-            v if v == format::fts::VERSION_V7 => true,
-            _ => {
-                return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
-                    "fts section version {version}"
-                ))));
-            }
+        let layout = BlobLayout::for_version(version).ok_or_else(|| {
+            FtsError::Read(ReadError::UnsupportedVersion(format!(
+                "fts section version {version}"
+            )))
+        })?;
+        let positional_blob = version != format::fts::VERSION_V1_LEGACY;
+        let positions_grouped = layout.grouped_positions;
+        let subindex = match layout.position_subindex {
+            true => SubindexKind::Wide,
+            false => SubindexKind::None,
         };
-        let positions_grouped = version >= format::fts::VERSION_V7;
-        let subindex = match version {
-            v if v >= format::fts::VERSION_V7 => SubindexKind::None,
-            v if v >= format::fts::VERSION_V3 => SubindexKind::Wide,
-            _ => SubindexKind::None,
-        };
-        let doc_length_bytes = match version >= format::fts::VERSION_V7 {
-            true => format::fts::DOC_LENGTH_BYTES_V7,
-            false => U32_BYTES,
-        };
-        let has_bitset_blocks = version == format::fts::VERSION_V4
-            || version == format::fts::VERSION_V5
-            || version == format::fts::VERSION_V6
-            || version == format::fts::VERSION_V7;
-        let dict_layout = match version >= format::fts::VERSION_V7 {
-            true => DictLayout::Blocks,
-            false => DictLayout::Fst,
-        };
+        let doc_length_bytes = layout.doc_length_bytes;
+        let has_bitset_blocks = layout.bitset_blocks;
+        let dict_layout = layout.dict;
         let bounds = StoredBound::for_version(version).ok_or_else(|| {
             FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"

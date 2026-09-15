@@ -14,10 +14,7 @@ use rayon::ThreadPool;
 use super::{core::*, work::MatchWork};
 use crate::{
     runtime_bridge::run_on_pool,
-    superfile::{
-        error::FtsError,
-        fts::dict::{DictLayout, make_key},
-    },
+    superfile::{error::FtsError, format::fts::DictLayout, fts::dict::make_key},
 };
 
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;

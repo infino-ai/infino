@@ -324,6 +324,102 @@ pub mod fts {
         pub const POSITIONS_LENGTH_OFF: usize = 28;
     }
 
+    /// Which header a posting block carries — by blob version.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BlockLayout {
+        /// `V1`–`V6`: the 8-byte header with the base doc id stored.
+        Wide,
+        /// `V7`+: the 4-byte header word; a packed or patched block's base
+        /// doc id is the previous block's last doc id (zero for the first
+        /// block), a bitset block's origin follows the word.
+        Compact,
+    }
+
+    /// How the term dictionary lays its terms out — by blob version.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DictLayout {
+        /// `V1`–`V6`: one FST keyed `column <SEP> term`, values packed as
+        /// `fts::fst_value` describes.
+        Fst,
+        /// `V7`+: front-coded term blocks behind a fixed-width first-key
+        /// table (see `fts::dict`).
+        Blocks,
+    }
+
+    /// Everything a blob version decides about how its regions are laid
+    /// out — the one table the writer (by the era it writes) and the
+    /// reader (by the version it opened) both consult, so the version
+    /// ladder is spelled out once.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BlobLayout {
+        /// Each long-form term ends with a coarse block-max table, one
+        /// slot per [`COARSE_BLOCK_MAX_SPAN`] blocks (`V5`+).
+        pub coarse: bool,
+        /// A single-block term is written in the short form (`V7`+).
+        pub short_form: bool,
+        /// Positions are per-block groups (`V7`+); a grouped blob carries
+        /// no run-offset sub-index.
+        pub grouped_positions: bool,
+        /// A positional long-form term carries a run-offset sub-index
+        /// between its skip table and its blocks (`V3`–`V6`).
+        pub position_subindex: bool,
+        /// Dense blocks may take the presence-bitset encoding (`V4`+).
+        pub bitset_blocks: bool,
+        pub block: BlockLayout,
+        pub skip: SkipLayout,
+        pub dict: DictLayout,
+        /// Bytes per stored document length.
+        pub doc_length_bytes: usize,
+    }
+
+    impl BlobLayout {
+        /// The layout of blob `version`, or `None` for a version this
+        /// crate does not know.
+        pub fn for_version(version: u32) -> Option<Self> {
+            let legacy = Self {
+                coarse: false,
+                short_form: false,
+                grouped_positions: false,
+                position_subindex: false,
+                bitset_blocks: false,
+                block: BlockLayout::Wide,
+                skip: SkipLayout::Absolute,
+                dict: DictLayout::Fst,
+                doc_length_bytes: U32_BYTES,
+            };
+            Some(match version {
+                VERSION_V1_LEGACY | VERSION_V2 => legacy,
+                VERSION_V3 => Self {
+                    position_subindex: true,
+                    ..legacy
+                },
+                VERSION_V4 => Self {
+                    position_subindex: true,
+                    bitset_blocks: true,
+                    ..legacy
+                },
+                VERSION_V5 | VERSION_V6 => Self {
+                    coarse: true,
+                    position_subindex: true,
+                    bitset_blocks: true,
+                    ..legacy
+                },
+                VERSION_V7 => Self {
+                    coarse: true,
+                    short_form: true,
+                    grouped_positions: true,
+                    position_subindex: false,
+                    bitset_blocks: true,
+                    block: BlockLayout::Compact,
+                    skip: SkipLayout::Length,
+                    dict: DictLayout::Blocks,
+                    doc_length_bytes: DOC_LENGTH_BYTES_V7,
+                },
+                _ => return None,
+            })
+        }
+    }
+
     /// How a term's skip table locates its blocks — by blob version.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SkipLayout {

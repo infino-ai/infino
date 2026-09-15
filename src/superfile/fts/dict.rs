@@ -41,7 +41,7 @@ use std::{cmp::Ordering, collections::BTreeMap, io::Write, mem::take, ops::Range
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
 use crate::superfile::{
-    format::{FST_SEPARATOR, u32_le_at, u64_le_at},
+    format::{FST_SEPARATOR, fts::DictLayout, u32_le_at, u64_le_at},
     fts::fst_value::{FstValue, PFOR_LENGTH_UNKNOWN},
     varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
 };
@@ -215,17 +215,6 @@ const INDEX_ENTRY_BYTES: usize = 8 + 4;
 const FORM_INLINE: u8 = 0;
 const FORM_SHORT: u8 = 1;
 const FORM_LONG: u8 = 2;
-
-/// How a dictionary lays its terms out — chosen by the blob version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DictLayout {
-    /// `V1`–`V6`: one FST keyed `column <SEP> term`, values packed as
-    /// `fst_value` describes.
-    Fst,
-    /// `V7`+: front-coded term blocks with a first-key index and a
-    /// trailing footer (see the module docs).
-    Blocks,
-}
 
 /// Streams sorted `(key, entry)` pairs into the term-block layout:
 /// blocks as they fill, then the index, then the footer — so the

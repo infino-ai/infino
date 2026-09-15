@@ -12,8 +12,11 @@
 //! walk and the multi-term cursors cannot drift apart.
 
 use crate::superfile::{
-    format::{self, fts::SkipLayout},
-    fts::{posting::BlockLayout, reader::metadata::ColumnMeta},
+    format::{
+        self,
+        fts::{BlobLayout, BlockLayout, SkipLayout},
+    },
+    fts::reader::metadata::ColumnMeta,
 };
 
 /// The FTS blob version, as far as reading a block-max slot is
@@ -49,20 +52,28 @@ pub(super) enum StoredBound {
 }
 
 impl StoredBound {
+    /// The layout table of a version this variant stands for. `V1ToV4`
+    /// reads as `V4`: the three fields the bound decoder's callers take
+    /// from it (coarse table, block header, skip entries) are the same
+    /// across `V1`–`V4`.
+    fn layout(self) -> BlobLayout {
+        let version = match self {
+            Self::V7 => format::fts::VERSION_V7,
+            Self::V6 => format::fts::VERSION_V6,
+            Self::V5 => format::fts::VERSION_V5,
+            Self::V1ToV4 => format::fts::VERSION_V4,
+        };
+        BlobLayout::for_version(version).expect("every variant names a known version")
+    }
+
     /// Which block header the version's posting blocks carry.
     pub(super) fn block_layout(self) -> BlockLayout {
-        match self {
-            Self::V7 => BlockLayout::Compact,
-            _ => BlockLayout::Wide,
-        }
+        self.layout().block
     }
 
     /// How the version's skip tables locate their blocks.
     pub(super) fn skip_layout(self) -> SkipLayout {
-        match self {
-            Self::V7 => SkipLayout::Length,
-            _ => SkipLayout::Absolute,
-        }
+        self.layout().skip
     }
 
     /// The variant for a blob version, or `None` for a version this
@@ -84,7 +95,7 @@ impl StoredBound {
     /// Whether each PFOR term's region ends with a coarse block-max table
     /// (one slot per [`format::fts::COARSE_BLOCK_MAX_SPAN`] blocks).
     pub(super) fn has_coarse(self) -> bool {
-        self != Self::V1ToV4
+        self.layout().coarse
     }
 
     /// Whether the file's declared average document length is the one to

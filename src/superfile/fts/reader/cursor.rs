@@ -21,15 +21,15 @@ use crate::superfile::{
     format::{
         self,
         fts::{
-            POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, SkipLayout, U32_BYTES,
-            U64_BYTES, coarse_slot, skip_entry, term_meta,
+            BlockLayout, POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, SkipLayout,
+            U32_BYTES, U64_BYTES, coarse_slot, skip_entry, term_meta,
         },
     },
     fts::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, BlockLayout, ENCODING_BITSET, block_encoding, decode_block,
+            BLOCK_LEN, BlockHeader, ENCODING_BITSET, block_encoding, decode_block,
             decode_block_doc_ids, decode_block_tfs,
         },
         short::decode_short,
