@@ -113,89 +113,174 @@ pub(crate) fn skip_run(bytes: &[u8], at: &mut usize, tf: u32) -> Option<()> {
 }
 
 /// Group header value for a group stored as LEB128 runs (the layout
-/// every blob before `VERSION_V7` used for all of its runs).
+/// every blob before `VERSION_V7` used for all of its runs; from `V7`
+/// only a short-form term's group may still take it).
 pub(crate) const GROUP_LEB128: u8 = 0;
+/// Group header value for a group stored as two patched streams.
+pub(crate) const GROUP_PACKED: u8 = 1;
 /// Widest packed position value: a `u32`.
 const GROUP_MAX_WIDTH: u8 = 32;
-/// A packed group's first header byte is the first-position stream's
-/// width plus this, so that a zero width (every doc's first position is
-/// 0) is told apart from [`GROUP_LEB128`].
-const GROUP_FIRST_WIDTH_BIAS: u8 = 1;
+/// Most exception lanes a packed stream may carry; bounds the patch loop.
+const GROUP_MAX_EXCEPTIONS: usize = 64;
 
 /// Append one **position group** — the run values (first position
 /// absolute per doc, then gaps, in posting order) of one posting block,
-/// or of a whole short-form term — behind a short header. `tfs` are the
-/// group's per-doc term frequencies, so `values.len() == Σ tfs`.
+/// or of a whole short-form term — behind a one-byte header. `tfs` are
+/// the group's per-doc term frequencies, so `values.len() == Σ tfs`.
 ///
-/// A packed group splits the values into two streams, each bit-packed
-/// at its own width: every doc's **first** position (bounded by the
-/// document length — tens of thousands at most, so ten to fifteen bits)
-/// and every **gap** between a doc's positions (a few bits for a term
-/// that recurs within a document). Packing them together would let the
-/// first positions set the width for every gap and lose most of the
-/// saving. Header: `first_width + 1`, `gap_width`, then the two
-/// payloads; the reader knows both counts from the tfs. When the LEB128
-/// runs come out smaller (an outlier in either stream), the header is
-/// the single byte [`GROUP_LEB128`] and the runs follow as before, so no
-/// group grows past what it cost before grouping.
+/// A [`GROUP_PACKED`] group splits the values into two **streams**,
+/// every doc's **first** position and every **gap** between a doc's
+/// positions, because the two have very different ranges (a first
+/// position is bounded by the document length, a gap for a recurring
+/// term is a few bits). Each stream is bit-packed at the width most of
+/// its lanes fit, and the lanes that do not — one long document, one
+/// long gap — store their high bits as **exceptions** `(lane, high
+/// bits)` so a single outlier never widens the whole stream. Stream
+/// layout: `width (u8) | n_exceptions (varint) | packed low bits |
+/// exceptions (varint lane, varint high bits)`.
 ///
-/// From `VERSION_V7` every group takes this shape; a phrase decode reads
-/// a packed group whole and indexes it by the block's tf prefix sums,
-/// where a LEB128 group is walked run by run as before.
-pub(crate) fn encode_group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32]) {
+/// A packed group can be decoded whole and indexed by the block's tf
+/// prefix sums, so a positional term needs no run offsets past its
+/// block starts: `V7` carries no position sub-index. That only holds if
+/// every long-form group is packed, so `allow_leb128` is `false` for
+/// them; a short-form term's group is decoded whole in any case and may
+/// take the LEB128 form when that is smaller.
+pub(crate) fn encode_group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32], allow_leb128: bool) {
     debug_assert_eq!(
         tfs.iter().map(|&t| t as usize).sum::<usize>(),
         values.len(),
         "values are the runs of tfs"
     );
-    let n_first = tfs.len();
-    let n_gap = values.len() - n_first;
-    let (mut max_first, mut max_gap) = (0u32, 0u32);
+    let mut firsts: Vec<u32> = Vec::with_capacity(tfs.len());
+    let mut gaps: Vec<u32> = Vec::with_capacity(values.len() - tfs.len());
     let mut vi = 0usize;
     for &tf in tfs {
-        max_first = max_first.max(values[vi]);
-        for &g in &values[vi + 1..vi + tf as usize] {
-            max_gap = max_gap.max(g);
-        }
+        firsts.push(values[vi]);
+        gaps.extend_from_slice(&values[vi + 1..vi + tf as usize]);
         vi += tf as usize;
     }
-    let first_width = width_of(max_first.into());
-    let gap_width = width_of(max_gap.into());
-    let packed_len = 2 + payload_bytes(n_first, first_width) + payload_bytes(n_gap, gap_width);
-    let leb_len: usize = 1 + values.iter().map(|&v| varint_len(v)).sum::<usize>();
-    if leb_len <= packed_len {
-        out.push(GROUP_LEB128);
-        for &v in values {
-            push_varint(out, v);
+    let first_plan = plan_stream(&firsts);
+    let gap_plan = plan_stream(&gaps);
+    let packed_len = 1 + first_plan.bytes + gap_plan.bytes;
+    if allow_leb128 {
+        let leb_len: usize = 1 + values.iter().map(|&v| varint_len(v)).sum::<usize>();
+        if leb_len <= packed_len {
+            out.push(GROUP_LEB128);
+            for &v in values {
+                push_varint(out, v);
+            }
+            return;
         }
-        return;
     }
-    debug_assert!(first_width <= GROUP_MAX_WIDTH && gap_width <= GROUP_MAX_WIDTH);
-    out.push(first_width + GROUP_FIRST_WIDTH_BIAS);
-    out.push(gap_width);
-    let first_start = out.len();
-    let gap_start = first_start + payload_bytes(n_first, first_width);
-    out.resize(gap_start + payload_bytes(n_gap, gap_width), 0);
-    let (mut fi, mut gi, mut vi) = (0usize, 0usize, 0usize);
-    for &tf in tfs {
-        put_bits(
-            &mut out[first_start..gap_start],
-            fi * first_width as usize,
-            u64::from(values[vi]),
-            first_width,
-        );
-        fi += 1;
-        for &g in &values[vi + 1..vi + tf as usize] {
+    out.push(GROUP_PACKED);
+    write_stream(out, &firsts, &first_plan);
+    write_stream(out, &gaps, &gap_plan);
+}
+
+/// A stream's packing: the width most lanes fit and the lanes that do
+/// not, with their high bits, plus the bytes the whole stream takes.
+struct StreamPlan {
+    width: u8,
+    exceptions: Vec<(u32, u32)>,
+    bytes: usize,
+}
+
+/// The cheapest `(width, exceptions)` for `lanes`: every width below the
+/// plain one is tried and the smallest total kept, subject to
+/// [`GROUP_MAX_EXCEPTIONS`].
+fn plan_stream(lanes: &[u32]) -> StreamPlan {
+    let plain = width_of(lanes.iter().copied().max().unwrap_or(0).into());
+    let cost = |width: u8, exceptions: &[(u32, u32)]| -> usize {
+        1 + varint_len(exceptions.len() as u32)
+            + payload_bytes(lanes.len(), width)
+            + exceptions
+                .iter()
+                .map(|&(lane, hi)| varint_len(lane) + varint_len(hi))
+                .sum::<usize>()
+    };
+    let mut best = StreamPlan {
+        width: plain,
+        exceptions: Vec::new(),
+        bytes: cost(plain, &[]),
+    };
+    for width in 0..plain {
+        let mut exceptions = Vec::new();
+        for (i, &v) in lanes.iter().enumerate() {
+            let hi = if width == 0 { v } else { v >> width };
+            if hi != 0 {
+                exceptions.push((i as u32, hi));
+                if exceptions.len() > GROUP_MAX_EXCEPTIONS {
+                    break;
+                }
+            }
+        }
+        if exceptions.len() > GROUP_MAX_EXCEPTIONS {
+            continue;
+        }
+        let bytes = cost(width, &exceptions);
+        if bytes < best.bytes {
+            best = StreamPlan {
+                width,
+                exceptions,
+                bytes,
+            };
+        }
+    }
+    best
+}
+
+/// Emit one stream per its plan.
+fn write_stream(out: &mut Vec<u8>, lanes: &[u32], plan: &StreamPlan) {
+    debug_assert!(plan.width <= GROUP_MAX_WIDTH);
+    out.push(plan.width);
+    push_varint(out, plan.exceptions.len() as u32);
+    let start = out.len();
+    out.resize(start + payload_bytes(lanes.len(), plan.width), 0);
+    if plan.width > 0 {
+        let mask: u64 = (1u64 << plan.width) - 1;
+        for (i, &v) in lanes.iter().enumerate() {
             put_bits(
-                &mut out[gap_start..],
-                gi * gap_width as usize,
-                u64::from(g),
-                gap_width,
+                &mut out[start..],
+                i * plan.width as usize,
+                u64::from(v) & mask,
+                plan.width,
             );
-            gi += 1;
         }
-        vi += tf as usize;
     }
+    for &(lane, hi) in &plan.exceptions {
+        push_varint(out, lane);
+        push_varint(out, hi);
+    }
+}
+
+/// Decode one stream of `n` lanes at `*at`, appending to `out`.
+fn read_stream(bytes: &[u8], at: &mut usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
+    let width = *bytes.get(*at)?;
+    *at += 1;
+    if width > GROUP_MAX_WIDTH {
+        return None;
+    }
+    let n_exc = read_varint(bytes, at)? as usize;
+    if n_exc > GROUP_MAX_EXCEPTIONS.max(n) {
+        return None;
+    }
+    let len = payload_bytes(n, width);
+    let payload = bytes.get(*at..*at + len)?;
+    let base = out.len();
+    out.reserve(n);
+    for i in 0..n {
+        out.push(get_bits(payload, i, width)? as u32);
+    }
+    *at += len;
+    for _ in 0..n_exc {
+        let lane = read_varint(bytes, at)? as usize;
+        let hi = read_varint(bytes, at)?;
+        if lane >= n {
+            return None;
+        }
+        out[base + lane] |= hi.checked_shl(u32::from(width)).unwrap_or(0);
+    }
+    Some(())
 }
 
 /// Encoded LEB128 length of `v`.
@@ -222,35 +307,31 @@ pub(crate) fn decode_group(
     let n: usize = tfs.iter().map(|&t| t as usize).sum();
     let header = *bytes.get(*at)?;
     *at += 1;
-    if header == GROUP_LEB128 {
-        for _ in 0..n {
-            out.push(read_varint(bytes, at)?);
+    match header {
+        GROUP_LEB128 => {
+            for _ in 0..n {
+                out.push(read_varint(bytes, at)?);
+            }
+            Some(())
         }
-        return Some(());
-    }
-    let first_width = header - GROUP_FIRST_WIDTH_BIAS;
-    let gap_width = *bytes.get(*at)?;
-    *at += 1;
-    if first_width > GROUP_MAX_WIDTH || gap_width > GROUP_MAX_WIDTH {
-        return None;
-    }
-    let n_first = tfs.len();
-    let n_gap = n - n_first;
-    let first_len = payload_bytes(n_first, first_width);
-    let gap_len = payload_bytes(n_gap, gap_width);
-    let firsts = bytes.get(*at..*at + first_len)?;
-    let gaps = bytes.get(*at + first_len..*at + first_len + gap_len)?;
-    out.reserve(n);
-    let mut gi = 0usize;
-    for (fi, &tf) in tfs.iter().enumerate() {
-        out.push(get_bits(firsts, fi, first_width)? as u32);
-        for _ in 1..tf {
-            out.push(get_bits(gaps, gi, gap_width)? as u32);
-            gi += 1;
+        GROUP_PACKED => {
+            let n_first = tfs.len();
+            let mut firsts = Vec::with_capacity(n_first);
+            let mut gaps = Vec::with_capacity(n - n_first);
+            read_stream(bytes, at, n_first, &mut firsts)?;
+            read_stream(bytes, at, n - n_first, &mut gaps)?;
+            out.reserve(n);
+            let mut gi = 0usize;
+            for (fi, &tf) in tfs.iter().enumerate() {
+                out.push(firsts[fi]);
+                let take = tf as usize - 1;
+                out.extend_from_slice(&gaps[gi..gi + take]);
+                gi += take;
+            }
+            Some(())
         }
+        _ => None,
     }
-    *at += first_len + gap_len;
-    Some(())
 }
 
 /// Turn a run's `tf` values (first absolute, then gaps) into absolute
@@ -274,72 +355,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_group_picks_the_smaller_form_and_round_trips() {
+    fn a_group_packs_two_streams_with_exceptions_and_round_trips() {
         // 100 docs, tf 3 each: first positions up to ~2000 (11 bits), gaps
-        // of 1..=20 (5 bits). Packed: 2 + 138 + 125 = 265 B; LEB128 would
-        // be 1 + 100 × 2 + 200 × 1 = 401 B. Packed wins, and splitting the
-        // streams is what makes it win: at one shared width the gaps would
-        // cost 11 bits each.
+        // of 1..=20 (5 bits), plus one doc far out (an exception in the
+        // first stream) and one huge gap (an exception in the gap
+        // stream). Neither outlier widens its stream.
         let tfs = vec![3u32; 100];
         let mut vals = Vec::new();
         for d in 0..100u32 {
             vals.extend_from_slice(&[20 * d + 7, 1 + d % 20, 3 + d % 17]);
         }
+        vals[3 * 41] = 1 << 24;
+        vals[3 * 77 + 2] = 1 << 30;
         let mut out = Vec::new();
-        encode_group(&mut out, &tfs, &vals);
-        assert_ne!(out[0], GROUP_LEB128);
-        assert_eq!(
-            out.len(),
-            2 + payload_bytes(100, 11) + payload_bytes(200, 5)
-        );
+        encode_group(&mut out, &tfs, &vals, true);
+        assert_eq!(out[0], GROUP_PACKED);
+        // firsts: 1 + 1 + 138 (11 bits) + one exception; gaps: 1 + 1 + 125 (5 bits) + one exception.
+        assert!(out.len() < 1 + 145 + 133, "got {} bytes", out.len());
         let mut at = 0;
         let mut back = Vec::new();
         decode_group(&out, &mut at, &tfs, &mut back).expect("decodes");
         assert_eq!(back, vals);
         assert_eq!(at, out.len());
 
-        // One huge gap widens every gap: LEB128 wins and is chosen.
-        let mut outlier = vals.clone();
-        outlier[7] = 1 << 30;
+        // A short term with a lone value: LEB128 is smaller and allowed.
         let mut out = Vec::new();
-        encode_group(&mut out, &tfs, &outlier);
+        encode_group(&mut out, &[1], &[5], true);
         assert_eq!(out[0], GROUP_LEB128);
-        let mut at = 0;
+        // The same values with LEB128 disallowed pack anyway.
+        let mut out = Vec::new();
+        encode_group(&mut out, &[1], &[5], false);
+        assert_eq!(out[0], GROUP_PACKED);
         let mut back = Vec::new();
-        decode_group(&out, &mut at, &tfs, &mut back).expect("decodes");
-        assert_eq!(back, outlier);
-        assert_eq!(at, out.len());
+        decode_group(&out, &mut 0, &[1], &mut back).expect("decodes");
+        assert_eq!(back, vec![5]);
 
-        // Single posting, tf 1 (no gaps), zero first positions, wide values.
+        // Edge shapes: tf 1 everywhere (no gaps), zero first positions, the
+        // top of the range, a stream that is all exceptions but one.
         for (tfs, v) in [
             (vec![1u32], vec![0u32]),
             (vec![1], vec![u32::MAX]),
             (vec![2, 2], vec![0, 5, 0, 7]),
             (vec![4], vec![5, 0, 0, 7]),
             (vec![1; 64], vec![0; 64]),
+            (vec![1; 5], vec![1, 1 << 20, 1, 1 << 31, 1]),
         ] {
-            let mut out = Vec::new();
-            encode_group(&mut out, &tfs, &v);
-            let mut at = 0;
-            let mut back = Vec::new();
-            decode_group(&out, &mut at, &tfs, &mut back).expect("decodes");
-            assert_eq!(back, v, "tfs {tfs:?}");
-            assert_eq!(at, out.len());
+            for allow in [true, false] {
+                let mut out = Vec::new();
+                encode_group(&mut out, &tfs, &v, allow);
+                let mut at = 0;
+                let mut back = Vec::new();
+                decode_group(&out, &mut at, &tfs, &mut back).expect("decodes");
+                assert_eq!(back, v, "tfs {tfs:?} allow {allow}");
+                assert_eq!(at, out.len());
+            }
         }
-        // Truncation is refused, not a panic.
+        // Truncation and bad headers are refused, not a panic.
         let mut out = Vec::new();
-        encode_group(&mut out, &tfs, &vals);
+        encode_group(&mut out, &tfs, &vals, false);
         for cut in 0..out.len() {
             let mut at = 0;
             assert!(decode_group(&out[..cut], &mut at, &tfs, &mut Vec::new()).is_none());
         }
         assert!(
-            decode_group(&[34, 0], &mut 0, &[1], &mut Vec::new()).is_none(),
-            "first width past 32"
+            decode_group(&[2], &mut 0, &[1], &mut Vec::new()).is_none(),
+            "unknown header"
         );
         assert!(
-            decode_group(&[1, 33], &mut 0, &[2], &mut Vec::new()).is_none(),
-            "gap width past 32"
+            decode_group(&[GROUP_PACKED, 33, 0], &mut 0, &[1], &mut Vec::new()).is_none(),
+            "width past 32"
         );
     }
 

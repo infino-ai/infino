@@ -18,7 +18,7 @@ use crate::superfile::{
     error::FtsError,
     fts::{
         bm25,
-        positions::{GROUP_LEB128, decode_group, decode_run, positions_from_run_values, skip_run},
+        positions::{decode_group, decode_run, positions_from_run_values, skip_run},
     },
 };
 
@@ -83,20 +83,13 @@ impl PhraseMember {
         let pair = self.cursor.pos;
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
 
-        // Grouped positions (V7): the block's runs sit behind a one-byte
-        // header. A packed group is decoded whole once per block and
-        // indexed by the block's tf prefix sums — no run walk at all; a
-        // LEB128 group is walked exactly as before, past its header.
-        let mut block_first_extra = 0usize;
+        // Grouped positions (V7): the block's runs are one group, decoded
+        // whole once per block and indexed by the block's tf prefix sums —
+        // no run walk and no sub-index.
         if term_meta.positions_grouped {
             let group_start =
                 term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
-            let header = *self.positions.get(group_start).ok_or_else(|| {
-                FtsError::Read(ReadError::MalformedVersion(
-                    "position group header past the term's positions".into(),
-                ))
-            })?;
-            if header != GROUP_LEB128 {
+            {
                 if self.group_block != block {
                     self.group_vals.clear();
                     let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
@@ -126,7 +119,6 @@ impl PhraseMember {
                 })?;
                 return Ok(());
             }
-            block_first_extra = 1;
         }
 
         // Fast path (VERSION_V3): the run-offset sub-index gives the
@@ -176,9 +168,8 @@ impl PhraseMember {
         // walking every run from the block's recorded first-run offset.
         if self.run_offsets_block != block {
             self.run_offsets.clear();
-            let block_first = term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block)
-                as usize
-                + block_first_extra;
+            let block_first =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             let mut at = block_first;
             for i in 0..self.cursor.block_n {
                 self.run_offsets.push(at as u32);
@@ -745,14 +736,13 @@ mod tests {
         )]
     }
 
-    /// A multi-block positional term's sub-index stores `u16` offsets
-    /// relative to each block's first run. Plant a phrase in every one of
-    /// 300 docs at varying in-block pair slots (three blocks, tf varying so
-    /// the runs differ in length) and verify every doc through the phrase
-    /// path — the decode reaches each pair's run through the compact
-    /// checkpoints.
+    /// A multi-block positional term's groups are decoded whole and
+    /// indexed by tf prefix sums. Plant a phrase in every one of 300 docs
+    /// at varying in-block pair slots (three blocks, tf varying so the
+    /// runs differ in length) and verify every doc through the phrase
+    /// path.
     #[tokio::test]
-    async fn compact_subindex_reaches_every_pair_across_blocks() {
+    async fn grouped_positions_reach_every_pair_across_blocks() {
         use std::sync::Arc;
 
         use crate::superfile::fts::{
@@ -771,7 +761,8 @@ mod tests {
         }
         let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        assert_eq!(r.subindex, SubindexKind::Compact);
+        assert!(r.positions_grouped);
+        assert_eq!(r.subindex, SubindexKind::None);
         let phrases = phrase(&["alpha", "beta"]);
         let hits = r
             .search_excluding(
@@ -815,12 +806,11 @@ mod tests {
     /// member with tf > 1 (one packed group), and verify the phrase in
     /// every doc through both decode paths.
     #[tokio::test]
-    async fn packed_and_leb128_position_groups_both_verify_phrases() {
+    async fn position_groups_verify_phrases_in_long_and_short_terms() {
         use std::sync::Arc;
 
         use crate::superfile::fts::{
-            builder::FtsBuilder, positions::GROUP_LEB128, posting::BLOCK_LEN,
-            tokenize::AsciiLowerTokenizer,
+            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
         };
         const N_DOCS: u32 = 200;
         let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
@@ -845,19 +835,6 @@ mod tests {
         b.append_prebuilt_doc_lengths(0, &vec![(1 << 20) + 8; N_DOCS as usize]);
         let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-
-        // The region holds both group kinds: alpha's block 0 packed, block 1 LEB128.
-        let region = r
-            .positions_range
-            .clone()
-            .expect("positional blob has a positions region");
-        let bytes =
-            super::super::core::fetch_source_range(&r.source, region, "test").expect("positions");
-        assert!(bytes.contains(&GROUP_LEB128), "some LEB128 group");
-        assert!(
-            bytes.iter().any(|&h| h != GROUP_LEB128),
-            "some packed group"
-        );
 
         let hits = r
             .search_excluding(
@@ -892,29 +869,15 @@ mod tests {
         assert_eq!(ids, vec![0, 1, 2], "short-form member's packed group");
     }
 
-    /// A block whose LEB128 position runs outgrow the `u16` sub-index
-    /// range gets the sentinel in every slot and is decoded by the
-    /// block-start walk. Postings are planted directly — 600 occurrences
-    /// per doc, 599 unit gaps then one huge one so the LEB128 form wins
-    /// over packing and a block's runs run to ~77 KB — so the fixture costs
-    /// no tokenization; the phrase must still verify in every doc.
+    /// A block whose position runs are very long (600 occurrences per doc,
+    /// 599 unit gaps then one huge one that becomes a stream exception)
+    /// still packs as one group and verifies. Postings are planted
+    /// directly so the fixture costs no tokenization.
     #[tokio::test]
-    async fn compact_subindex_falls_back_when_a_block_outgrows_the_entry_width() {
+    async fn a_block_with_very_long_runs_verifies_phrases() {
         use std::sync::Arc;
 
-        use crate::superfile::{
-            format::fts::POSITION_SUBINDEX_COMPACT_NONE,
-            fts::{
-                builder::FtsBuilder,
-                dict::make_key,
-                fst_value::FstValue,
-                reader::{
-                    core::fetch_source_range,
-                    cursor::{SubindexKind, TermMeta},
-                },
-                tokenize::AsciiLowerTokenizer,
-            },
-        };
+        use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
         const N_DOCS: u32 = 129;
         const TF: u32 = 600;
         const OUTLIER_GAP: u32 = 1 << 25;
@@ -936,40 +899,6 @@ mod tests {
         b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
         let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-
-        // The first (full) block's slots all carry the sentinel.
-        let fst = r.dict_bytes().expect("dict");
-        let dict = FtsReader::open_dict(&fst).expect("dict");
-        let FstValue::Pfor {
-            metadata_offset,
-            postings_length_hint: Some(len),
-            short: false,
-        } = FstValue::unpack(
-            dict.lookup(&make_key("title", "alpha"))
-                .expect("alpha in dict"),
-            r.value_layout,
-        )
-        else {
-            panic!("alpha spans two blocks: long form with a length hint");
-        };
-        let start = r.postings_range.start + metadata_offset as usize;
-        let bytes =
-            fetch_source_range(&r.source, start..start + len as usize, "test").expect("term");
-        let meta =
-            TermMeta::parse(bytes.as_ref(), 0, true, SubindexKind::Compact, true).expect("meta");
-        assert_eq!(meta.num_blocks, 2);
-        let sub = meta.subindex_start.expect("compact sub-index");
-        let slot0 = u16::from_le_bytes([bytes[sub], bytes[sub + 1]]);
-        assert_eq!(
-            slot0, POSITION_SUBINDEX_COMPACT_NONE,
-            "block 0 outgrew the range"
-        );
-        assert_eq!(meta.positions_subindex_offset(bytes.as_ref(), 0, 5), None);
-        // Block 1 (one doc) fits: its checkpoint is block-relative.
-        assert!(
-            meta.positions_subindex_offset(bytes.as_ref(), 1, 0)
-                .is_some()
-        );
 
         let phrases = phrase(&["alpha", "filler"]);
         let hits = r

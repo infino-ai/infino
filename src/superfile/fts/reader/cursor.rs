@@ -21,7 +21,6 @@ use crate::superfile::{
     format::{
         self,
         fts::{
-            POSITION_SUBINDEX_COMPACT_ENTRY_BYTES, POSITION_SUBINDEX_COMPACT_NONE,
             POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, U32_BYTES, U64_BYTES,
             skip_entry, term_meta,
         },
@@ -30,7 +29,7 @@ use crate::superfile::{
         bm25,
         builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{self, BLOCK_LEN, decode_block, decode_block_doc_ids},
-        short::{ShortPositions, decode_short},
+        short::decode_short,
     },
 };
 
@@ -40,14 +39,11 @@ use crate::superfile::{
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(super) enum SubindexKind {
     /// `V1`/`V2`: no sub-index; the phrase decode walks a block's runs
-    /// from the block start.
+    /// from the block start. Also `V7`+, whose grouped positions are
+    /// decoded whole per block and indexed by tf prefix sums.
     None,
     /// `V3`–`V6`: `u32` offsets absolute within the term's positions.
     Wide,
-    /// `V7`+: `u16` offsets relative to the block's first run, or
-    /// [`POSITION_SUBINDEX_COMPACT_NONE`] in every slot of a block whose
-    /// runs outgrew the range.
-    Compact,
 }
 
 impl SubindexKind {
@@ -56,7 +52,6 @@ impl SubindexKind {
         match self {
             Self::None => 0,
             Self::Wide => U32_BYTES,
-            Self::Compact => POSITION_SUBINDEX_COMPACT_ENTRY_BYTES,
         }
     }
 }
@@ -130,6 +125,7 @@ impl TermMeta {
         positional: bool,
         subindex: SubindexKind,
         has_coarse: bool,
+        positions_grouped: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -192,7 +188,7 @@ impl TermMeta {
         // the blocks follow it (their offsets are read from the skip
         // table, which the writer already shifted past the sub-index).
         let subindex_start = match subindex {
-            SubindexKind::Wide | SubindexKind::Compact => {
+            SubindexKind::Wide => {
                 let subindex_end = skip_end
                     + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes();
                 if subindex_end > postings.len() {
@@ -231,21 +227,21 @@ impl TermMeta {
             blocks_end_in_term,
             has_coarse,
             short: false,
-            positions_grouped: subindex == SubindexKind::Compact,
+            positions_grouped,
         })
     }
 
     /// The metadata a short-form term implies: it has no header to
     /// parse, so the phrase path builds this from the decoded body's
-    /// `df` and positional trailer instead.
-    pub(super) fn for_short(df: u64, positions: Option<ShortPositions>) -> Self {
-        let p = positions.unwrap_or_default();
+    /// `df`. Its position group is inline in the body (the member's
+    /// `positions` bytes are that slice), so the region fields are zero.
+    pub(super) fn for_short(df: u64) -> Self {
         Self {
             df,
             num_blocks: 1,
             skip_start: 0,
-            positions_offset: p.offset,
-            positions_length: p.length,
+            positions_offset: 0,
+            positions_length: 0,
             subindex_start: None,
             subindex: SubindexKind::None,
             coarse_start: 0,
@@ -287,16 +283,6 @@ impl TermMeta {
             SubindexKind::Wide => {
                 let at = start + idx * U32_BYTES;
                 read_u32_le(&postings[at..at + U32_BYTES])
-            }
-            SubindexKind::Compact => {
-                let at = start + idx * POSITION_SUBINDEX_COMPACT_ENTRY_BYTES;
-                let rel = u16::from_le_bytes([postings[at], postings[at + 1]]);
-                if rel == POSITION_SUBINDEX_COMPACT_NONE {
-                    // This block's runs outgrew the entry width; the
-                    // caller walks them from the block start.
-                    return None;
-                }
-                self.positions_block_offset(postings, block) + u32::from(rel)
             }
             SubindexKind::None => return None,
         };
@@ -510,6 +496,7 @@ impl TermCursor {
             col.positions,
             SubindexKind::None,
             stored.has_coarse(),
+            false,
         )?;
         let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);
         // Effective idf folds in the query-term-frequency `weight` (> 1

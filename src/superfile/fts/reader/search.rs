@@ -1137,6 +1137,7 @@ impl FtsReader {
             col_meta.positions,
             SubindexKind::None,
             self.bounds.has_coarse(),
+            self.positions_grouped,
         )?;
 
         let local_idf = bm25::idf(col_meta.scored_doc_count(), term_meta.df);
@@ -1475,6 +1476,7 @@ impl FtsReader {
                                 col_meta.positions,
                                 SubindexKind::None,
                                 self.bounds.has_coarse(),
+                                self.positions_grouped,
                             )?
                             .df
                         }

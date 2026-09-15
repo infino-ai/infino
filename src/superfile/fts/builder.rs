@@ -101,10 +101,10 @@ use crate::superfile::{
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX, ValueLayout},
-        positions::{GROUP_LEB128, encode_group, encode_run, read_varint, skip_run, varint_len},
+        positions::{encode_group, encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         reader::ColumnLengthStats,
-        short::{SHORT_MAX_DF, ShortPositions, encode_short},
+        short::{SHORT_MAX_DF, encode_short},
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
 };
@@ -342,16 +342,10 @@ impl BlobEra {
         self == Self::V7
     }
 
-    /// Whether the position sub-index stores `u16` block-relative
-    /// offsets (`V7`) or `u32` absolute ones.
-    fn compact_subindex(self) -> bool {
-        self == Self::V7
-    }
-
-    /// Whether position runs are written as per-block **groups** — a
-    /// one-byte header naming the bit width the run values are packed
-    /// at, or the LEB128 form when that is smaller — rather than as bare
-    /// LEB128 runs (`V7`).
+    /// Whether position runs are written as per-block **groups** (two
+    /// patched bit-packed streams, decoded whole and indexed by tf prefix
+    /// sums) rather than as bare LEB128 runs with a run-offset sub-index
+    /// (`V7`). A grouped blob carries no sub-index.
     fn grouped_positions(self) -> bool {
         self == Self::V7
     }
@@ -3953,10 +3947,10 @@ fn encode_and_emit_term<W: Write>(
         // exactly as a long term's do; the body's trailer says where.
         profile.encode_short += 1;
         let metadata_offset = *postings_len;
-        let positions = match term_positions.as_mut() {
-            Some((sink, runs)) => {
-                // The whole term is one position group: its run values,
-                // packed or LEB128, whichever is smaller.
+        let positions = match term_positions.as_ref() {
+            Some((_, runs)) => {
+                // The whole term is one position group, inline in the body:
+                // its run values, packed or LEB128, whichever is smaller.
                 let vals = &mut scratch.pos_vals;
                 let out = &mut scratch.pos_out;
                 vals.clear();
@@ -3971,13 +3965,8 @@ fn encode_and_emit_term<W: Write>(
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
                 tfs.extend(pairs.iter().map(|&(_, tf)| tf));
-                encode_group(out, tfs, vals);
-                let p = ShortPositions {
-                    offset: sink.len,
-                    length: out.len() as u32,
-                };
-                sink.write(out)?;
-                Some(p)
+                encode_group(out, tfs, vals, true);
+                Some(out.as_slice())
             }
             None => None,
         };
@@ -4084,15 +4073,13 @@ fn encode_and_emit_term<W: Write>(
         // the posting blocks. Zero-sized on positionless terms, which keep
         // the V2 layout byte-for-byte.
         let entries_per_block = format::fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK;
-        // From V7 an entry is a `u16` offset relative to its block's first
-        // run; earlier eras store `u32` absolute offsets.
-        let subindex_entry_bytes = match era.compact_subindex() {
-            true => format::fts::POSITION_SUBINDEX_COMPACT_ENTRY_BYTES,
-            false => format::fts::U32_BYTES,
-        };
-        let subindex_size = match term_positions {
-            Some(_) => num_blocks as usize * entries_per_block * subindex_entry_bytes,
-            None => 0,
+        // A grouped blob (V7) decodes a block's positions whole and needs
+        // no run offsets; earlier eras store a `u32` sub-index entry every
+        // `POSITION_SUBINDEX_STRIDE` pairs.
+        let subindex_entry_bytes = format::fts::U32_BYTES;
+        let subindex_size = match (&term_positions, era.grouped_positions()) {
+            (Some(_), false) => num_blocks as usize * entries_per_block * subindex_entry_bytes,
+            _ => 0,
         };
         // Coarse block-max table at the tail of the term region: one slot
         // per `COARSE_BLOCK_MAX_SPAN` blocks bounding the whole span, giving
@@ -4130,11 +4117,9 @@ fn encode_and_emit_term<W: Write>(
             );
             let mut at: usize = 0;
             if era.grouped_positions() {
-                // Regroup block by block. A packed group is indexed by the
-                // block's tf prefix sums, so its sub-index slots are
-                // unused and get the marker the compact writer turns into
-                // the sentinel; a LEB128 group keeps real checkpoints,
-                // absolute within the term's region, past its header byte.
+                // Regroup block by block: every long-form group is packed,
+                // so the phrase decode reads it whole and indexes it by the
+                // block's tf prefix sums — no run offsets to record.
                 let vals = &mut scratch.pos_vals;
                 for chunk in pairs.chunks(BLOCK_LEN) {
                     pos_block_offsets.push(pos_out.len() as u32);
@@ -4144,28 +4129,10 @@ fn encode_and_emit_term<W: Write>(
                             vals.push(read_varint(runs, &mut at).expect("builder-encoded run"));
                         }
                     }
-                    let group_start = pos_out.len();
                     let tfs = &mut scratch.tfs;
                     tfs.clear();
                     tfs.extend(chunk.iter().map(|&(_, tf)| tf));
-                    encode_group(pos_out, tfs, vals);
-                    let packed = pos_out[group_start] != GROUP_LEB128;
-                    let mut run_at = group_start + 1;
-                    let mut vi = 0usize;
-                    for (j, &(_, tf)) in chunk.iter().enumerate() {
-                        if j.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
-                            pos_subindex_offsets.push(match packed {
-                                true => u32::MAX,
-                                false => run_at as u32,
-                            });
-                        }
-                        if !packed {
-                            for _ in 0..tf {
-                                run_at += varint_len(vals[vi]);
-                                vi += 1;
-                            }
-                        }
-                    }
+                    encode_group(pos_out, tfs, vals, false);
                 }
             } else {
                 for (i, &(_, tf)) in pairs.iter().enumerate() {
@@ -4184,7 +4151,9 @@ fn encode_and_emit_term<W: Write>(
             // `entries_per_block`, so entry `(block, slot)` is a flat
             // `block * entries_per_block + slot`. The pad offsets point at
             // the run end and are never read (no pair maps to them).
-            while !pos_subindex_offsets.len().is_multiple_of(entries_per_block) {
+            while !era.grouped_positions()
+                && !pos_subindex_offsets.len().is_multiple_of(entries_per_block)
+            {
                 pos_subindex_offsets.push(at as u32);
             }
             debug_assert_eq!(
@@ -4286,33 +4255,8 @@ fn encode_and_emit_term<W: Write>(
 
         // Position sub-index (positional terms): sits between the skip
         // table and the blocks. Empty on positionless terms.
-        if era.compact_subindex() {
-            // `u16` offsets relative to the block's first run. A block
-            // whose runs outgrow the range gets the sentinel in every
-            // slot (the reader walks it from the block start); the pad
-            // slots past the last real pair are never read and hold 0.
-            let n_real = pairs.len().div_ceil(format::fts::POSITION_SUBINDEX_STRIDE);
-            for (block, chunk) in pos_subindex_offsets.chunks(entries_per_block).enumerate() {
-                let block_start = pos_block_offsets[block];
-                let fits = chunk.iter().enumerate().all(|(slot, &off)| {
-                    block * entries_per_block + slot >= n_real
-                        || (off != u32::MAX
-                            && (off - block_start)
-                                < u32::from(format::fts::POSITION_SUBINDEX_COMPACT_NONE))
-                });
-                for (slot, &off) in chunk.iter().enumerate() {
-                    let entry: u16 = match (fits, block * entries_per_block + slot < n_real) {
-                        (false, _) => format::fts::POSITION_SUBINDEX_COMPACT_NONE,
-                        (true, false) => 0,
-                        (true, true) => (off - block_start) as u16,
-                    };
-                    term_buf.extend_from_slice(&entry.to_le_bytes());
-                }
-            }
-        } else {
-            for &off in pos_subindex_offsets.iter() {
-                term_buf.extend_from_slice(&off.to_le_bytes());
-            }
+        for &off in pos_subindex_offsets.iter() {
+            term_buf.extend_from_slice(&off.to_le_bytes());
         }
 
         let block_write_start = profile.enabled.then(Instant::now);

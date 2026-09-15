@@ -240,11 +240,22 @@ impl FtsReader {
                             b.key_bytes += key_bytes;
                             b.short_terms += 1;
                             b.short_bytes += len as u64;
-                            b.positions_bytes +=
-                                u64::from(decoded.positions.map(|p| p.length).unwrap_or(0));
+                            // The group is inline in the body: part of
+                            // `short_bytes`, reported under positions too.
+                            b.positions_bytes += decoded
+                                .positions_at
+                                .map(|at| (len - at) as u64)
+                                .unwrap_or(0);
                             continue;
                         }
-                        let meta = TermMeta::parse(tb, 0, positional, subindex, has_coarse)?;
+                        let meta = TermMeta::parse(
+                            tb,
+                            0,
+                            positional,
+                            subindex,
+                            has_coarse,
+                            self.positions_grouped,
+                        )?;
                         let nb = meta.num_blocks as u64;
                         let b = &mut buckets[band_of(meta.df)];
                         b.terms += 1;

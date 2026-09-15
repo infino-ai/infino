@@ -176,18 +176,6 @@ pub mod fts {
     /// they stay in lockstep.
     pub const POSITION_SUBINDEX_ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
 
-    /// Width of one sub-index entry from [`VERSION_V7`]: a `u16` byte
-    /// offset relative to the block's own first run (the skip entry's
-    /// positions field), instead of the `u32` absolute offset `V3`–`V6`
-    /// stored. A block's 128 runs are short — a few bytes per position —
-    /// so the relative offset fits two bytes for any realistic block; a
-    /// block whose runs exceed the range stores
-    /// [`POSITION_SUBINDEX_COMPACT_NONE`] in every slot and the reader
-    /// takes the block-start walk for it.
-    pub const POSITION_SUBINDEX_COMPACT_ENTRY_BYTES: usize = 2;
-    /// Compact sub-index sentinel: this block has no usable sub-index.
-    pub const POSITION_SUBINDEX_COMPACT_NONE: u16 = u16::MAX;
-
     /// Bytes per stored document length from [`VERSION_V7`]: a `u16`,
     /// saturating at [`DOC_LENGTH_STORED_MAX`], instead of the `u32`
     /// `V1`–`V6` stored. The scorer reads a one-byte bucket of the length

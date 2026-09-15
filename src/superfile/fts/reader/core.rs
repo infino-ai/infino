@@ -474,6 +474,9 @@ pub struct FtsReader {
     /// `< POSITION_SUBINDEX_STRIDE` runs. `V1`/`V2` blobs have none and
     /// take the block-start skip-walk fallback.
     pub(super) subindex: SubindexKind,
+    /// Whether positions are per-block groups decoded whole (`V7`+)
+    /// rather than LEB128 runs walked with the sub-index.
+    pub(super) positions_grouped: bool,
     /// Bytes per stored document length (`u16` from `V7`, `u32` before).
     pub(super) doc_length_bytes: usize,
     /// True iff the blob is `VERSION_V4` — some posting blocks may be
@@ -690,8 +693,9 @@ impl FtsReader {
                 ))));
             }
         };
+        let positions_grouped = version >= format::fts::VERSION_V7;
         let subindex = match version {
-            v if v >= format::fts::VERSION_V7 => SubindexKind::Compact,
+            v if v >= format::fts::VERSION_V7 => SubindexKind::None,
             v if v >= format::fts::VERSION_V3 => SubindexKind::Wide,
             _ => SubindexKind::None,
         };
@@ -1028,6 +1032,7 @@ impl FtsReader {
             postings_range,
             positions_range,
             subindex,
+            positions_grouped,
             doc_length_bytes,
             has_bitset_blocks,
             bounds,
@@ -1303,6 +1308,8 @@ impl FtsReader {
             // dropped during cursor build.
             let mut positional: Vec<(Option<TermMeta>, Option<u32>)> =
                 Vec::with_capacity(cursors.len());
+            // Short-form members' inline groups, by member index.
+            let mut inline_groups: Vec<(usize, Bytes)> = Vec::new();
             for (cursor, term) in cursors.iter().zip(&member_refs) {
                 match (cursor.predecoded, cursor.bytes.is_empty()) {
                     (false, _) => {
@@ -1315,13 +1322,15 @@ impl FtsReader {
                             true,
                             self.subindex,
                             self.bounds.has_coarse(),
+                            self.positions_grouped,
                         )?;
                         positional.push((Some(term_meta), None));
                     }
                     (true, false) => {
-                        // Short-form member: its positions live in the
-                        // region like a long term's; the body's trailer
-                        // says where. Re-decode for the trailer only.
+                        // Short-form member: its position group is inline
+                        // in the body, after the postings. Re-decode for
+                        // where it starts; the slice becomes the member's
+                        // positions bytes.
                         let mut d = [0u32; BLOCK_LEN];
                         let mut t = [0u32; BLOCK_LEN];
                         let decoded = decode_short(cursor.bytes.as_ref(), true, &mut d, &mut t)
@@ -1330,10 +1339,13 @@ impl FtsReader {
                                     "malformed short-form term body".into(),
                                 ))
                             })?;
-                        positional.push((
-                            Some(TermMeta::for_short(decoded.n as u64, decoded.positions)),
-                            None,
+                        inline_groups.push((
+                            positional.len(),
+                            cursor
+                                .bytes
+                                .slice(decoded.positions_at.expect("positional short body")..),
                         ));
+                        positional.push((Some(TermMeta::for_short(decoded.n as u64)), None));
                     }
                     (true, true) => {
                         dict_ranges += 1;
@@ -1361,7 +1373,10 @@ impl FtsReader {
                         .unwrap_or((0, 0))
                 })
                 .collect();
-            let positions = self.fetch_term_positions(&pos_ranges).await?;
+            let mut positions = self.fetch_term_positions(&pos_ranges).await?;
+            for (member, group) in inline_groups {
+                positions[member] = group;
+            }
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
                 cursors,
                 positions,
@@ -1470,23 +1485,9 @@ impl FtsReader {
                                     "malformed short-form term body".into(),
                                 ))
                             })?;
-                        let position_bytes = match decoded.positions {
-                            Some(p) => {
-                                let region = positions_region.as_ref().ok_or_else(|| {
-                                    FtsError::Read(ReadError::MalformedVersion(
-                                        "positional column missing a positions region".into(),
-                                    ))
-                                })?;
-                                let pstart = region.start + p.offset as usize;
-                                Some(fetch_source_range(
-                                    &self.source,
-                                    pstart..pstart + p.length as usize,
-                                    "fts/merge positions",
-                                )?)
-                            }
-                            None => None,
-                        };
-                        // A short body's positions are one group.
+                        // A short body's positions are one group, inline
+                        // after its postings.
+                        let position_bytes = decoded.positions_at.map(|at| term_bytes.slice(at..));
                         let mut group_vals: Vec<u32> = Vec::new();
                         if let Some(bytes) = &position_bytes {
                             decode_group(bytes.as_ref(), &mut 0, &t[..decoded.n], &mut group_vals)
@@ -1532,6 +1533,7 @@ impl FtsReader {
                             true,
                             SubindexKind::None,
                             self.bounds.has_coarse(),
+                            self.positions_grouped,
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
                             FtsError::Read(ReadError::MalformedVersion(
@@ -1558,7 +1560,7 @@ impl FtsReader {
                     // Grouped positions (V7): each block's runs are one
                     // group, decoded whole at the block's start and sliced
                     // per pair; older blobs are one run after another.
-                    let grouped = self.subindex == SubindexKind::Compact;
+                    let grouped = self.positions_grouped;
                     let mut group_vals: Vec<u32> = Vec::new();
                     let mut vi = 0usize;
                     while !cursor.is_exhausted() {

@@ -17,8 +17,9 @@
 //!   bitmap   ceil(df / 8) bytes; bit i set ⇔ tf_i == 1
 //!   groupvar df doc-id deltas (first absolute, then doc − prev)
 //!   varint   tf_i for every i with tf_i != 1, in posting order
-//!   varint   positions_length  (positional column only)
-//!   varint   positions_offset  (positional column only, u64)
+//!   group    the term's position group (positional column only; see
+//!            `positions::encode_group`) — inline, since a short term's
+//!            body is fetched whole and read once
 //! ```
 //!
 //! Group-varint packs four values behind one control byte (two bits per
@@ -39,51 +40,13 @@ use crate::superfile::fts::posting::BLOCK_LEN;
 /// Largest posting count the short form is used for — one block.
 pub(crate) const SHORT_MAX_DF: usize = BLOCK_LEN;
 
-/// Positional trailer of a short body: where the term's position runs
-/// sit in the positions region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct ShortPositions {
-    pub(crate) offset: u64,
-    pub(crate) length: u32,
-}
-
 /// Decoded short body: `n` postings in `doc_ids[..n]` / `tfs[..n]`, plus
-/// the positional trailer when the column has one.
+/// where the inline position group starts when the column has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShortDecoded {
     pub(crate) n: usize,
-    pub(crate) positions: Option<ShortPositions>,
-}
-
-#[inline]
-fn push_varint_u64(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        let byte = (v as u8) & 0x7f;
-        v >>= 7;
-        if v == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-#[inline]
-fn read_varint_u64(bytes: &[u8], at: &mut usize) -> Option<u64> {
-    let mut v: u64 = 0;
-    let mut shift: u32 = 0;
-    loop {
-        let &b = bytes.get(*at)?;
-        *at += 1;
-        if shift >= 64 {
-            return None;
-        }
-        v |= u64::from(b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            return Some(v);
-        }
-        shift += 7;
-    }
+    /// Byte offset within the body of the term's position group.
+    pub(crate) positions_at: Option<usize>,
 }
 
 /// Byte length (1..=4) of `v` in group-varint, minus one.
@@ -135,12 +98,9 @@ fn read_group_varint(bytes: &[u8], at: &mut usize, n: usize, out: &mut [u32]) ->
 
 /// Encode one term's postings (`pairs` = `(doc_id, tf)`, doc ids
 /// strictly ascending, `1..=SHORT_MAX_DF` of them) into `out`.
-/// `positions` is `Some` on a positional column.
-pub(crate) fn encode_short(
-    out: &mut Vec<u8>,
-    pairs: &[(u32, u32)],
-    positions: Option<ShortPositions>,
-) {
+/// `positions` is the term's encoded position group on a positional
+/// column, appended inline.
+pub(crate) fn encode_short(out: &mut Vec<u8>, pairs: &[(u32, u32)], positions: Option<&[u8]>) {
     let n = pairs.len();
     assert!(
         (1..=SHORT_MAX_DF).contains(&n),
@@ -168,9 +128,8 @@ pub(crate) fn encode_short(
             push_varint(out, tf);
         }
     }
-    if let Some(p) = positions {
-        push_varint(out, p.length);
-        push_varint_u64(out, p.offset);
+    if let Some(group) = positions {
+        out.extend_from_slice(group);
     }
 }
 
@@ -184,9 +143,10 @@ pub(crate) fn short_df(body: &[u8]) -> Option<u32> {
 }
 
 /// Decode a short body into `doc_ids[..n]` / `tfs[..n]` (both at least
-/// [`SHORT_MAX_DF`] long). `positional` selects whether the trailer is
-/// present. `None` on any malformed input — truncation, a `df` outside
-/// `1..=SHORT_MAX_DF`, a non-ascending doc id, trailing garbage.
+/// [`SHORT_MAX_DF`] long). `positional` selects whether a position group
+/// follows the postings (its bytes are left to the phrase decode). `None`
+/// on any malformed input — truncation, a `df` outside `1..=SHORT_MAX_DF`,
+/// a non-ascending doc id, trailing garbage on a positionless body.
 pub(crate) fn decode_short(
     body: &[u8],
     positional: bool,
@@ -222,29 +182,33 @@ pub(crate) fn decode_short(
             tf
         };
     }
-    let positions = match positional {
-        true => {
-            let length = read_varint(body, &mut at)?;
-            let offset = read_varint_u64(body, &mut at)?;
-            Some(ShortPositions { offset, length })
-        }
-        false => None,
-    };
-    (at == body.len()).then_some(ShortDecoded { n, positions })
+    match positional {
+        true => (at < body.len()).then_some(ShortDecoded {
+            n,
+            positions_at: Some(at),
+        }),
+        false => (at == body.len()).then_some(ShortDecoded {
+            n,
+            positions_at: None,
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn round_trip(pairs: &[(u32, u32)], positions: Option<ShortPositions>) -> Vec<u8> {
+    fn round_trip(pairs: &[(u32, u32)], positions: Option<&[u8]>) -> Vec<u8> {
         let mut body = Vec::new();
         encode_short(&mut body, pairs, positions);
         let mut d = [0u32; SHORT_MAX_DF];
         let mut t = [0u32; SHORT_MAX_DF];
         let got = decode_short(&body, positions.is_some(), &mut d, &mut t).expect("decodes");
         assert_eq!(got.n, pairs.len());
-        assert_eq!(got.positions, positions);
+        match positions {
+            Some(group) => assert_eq!(&body[got.positions_at.expect("group")..], group),
+            None => assert_eq!(got.positions_at, None),
+        }
         for (i, &(doc, tf)) in pairs.iter().enumerate() {
             assert_eq!((d[i], t[i]), (doc, tf), "posting {i}");
         }
@@ -262,13 +226,10 @@ mod tests {
     }
 
     #[test]
-    fn positional_trailer_round_trips() {
+    fn inline_position_group_round_trips() {
         round_trip(
             &[(0, 3), (1, 1), (2, 1), (1_000_000, 7)],
-            Some(ShortPositions {
-                offset: 1 << 40,
-                length: 123_456,
-            }),
+            Some(&[1, 2, 3, 4, 5, 6, 7]),
         );
     }
 
@@ -279,13 +240,7 @@ mod tests {
             .collect();
         round_trip(&full, None);
         round_trip(&[(u32::MAX, 2)], None);
-        round_trip(
-            &[(u32::MAX, 1)],
-            Some(ShortPositions {
-                offset: 0,
-                length: 1,
-            }),
-        );
+        round_trip(&[(u32::MAX, 1)], Some(&[0u8, 9]));
     }
 
     #[test]
@@ -305,29 +260,22 @@ mod tests {
         let mut d = [0u32; SHORT_MAX_DF];
         let mut t = [0u32; SHORT_MAX_DF];
         let mut body = Vec::new();
-        encode_short(
-            &mut body,
-            &[(5, 1), (9, 4)],
-            Some(ShortPositions {
-                offset: 3,
-                length: 9,
-            }),
-        );
+        encode_short(&mut body, &[(5, 1), (9, 4)], None);
         for cut in 0..body.len() {
             assert!(
-                decode_short(&body[..cut], true, &mut d, &mut t).is_none(),
+                decode_short(&body[..cut], false, &mut d, &mut t).is_none(),
                 "cut {cut}"
             );
         }
         let mut extra = body.clone();
         extra.push(0);
         assert!(
-            decode_short(&extra, true, &mut d, &mut t).is_none(),
+            decode_short(&extra, false, &mut d, &mut t).is_none(),
             "trailing byte"
         );
         assert!(
-            decode_short(&body, false, &mut d, &mut t).is_none(),
-            "wrong positional flag"
+            decode_short(&body, true, &mut d, &mut t).is_none(),
+            "a positional body needs its group"
         );
         assert!(short_df(&[0]).is_none(), "df 0");
         assert!(short_df(&[129]).is_none(), "df past a block");
