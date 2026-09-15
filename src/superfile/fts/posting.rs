@@ -122,13 +122,25 @@ pub const ENCODING_PACKED: u8 = 0;
 /// Deltas here are explicit (`doc[0] - base`, then `doc[i] -
 /// doc[i-1]`, padding lanes 0), prefix-summed by the reader after the
 /// exceptions are patched in — the sorted bit-packer's fused prefix sum
-/// cannot see a patch. Chosen only when it is the smallest of the three
-/// encodings for the block, so a block with uniform widths stays
-/// [`ENCODING_PACKED`] and decodes exactly as before.
+/// cannot see a patch. Chosen only when it beats plain packing by at
+/// least [`PATCHED_MIN_SAVING`] bytes and the bitset did not claim the
+/// block, so a block with uniform widths stays [`ENCODING_PACKED`] and
+/// decodes exactly as before.
 pub const ENCODING_PATCHED: u8 = 2;
 /// Most exception lanes a patched stream may carry: the header's count
 /// field is five bits, and past this the stream is better off wider.
 const PATCHED_MAX_EXCEPTIONS: usize = 31;
+/// Fewest bytes the patched form must save over plain packing to be
+/// taken. A patched block decodes through an unpack, an exception
+/// scatter and a prefix sum where a plain block has one fused kernel —
+/// about 40 ns against 27 per block on the reference machine — and the
+/// count and membership walks pay that on every block they expand. On
+/// the 1M reference corpus the saving is spread thin: the median
+/// patched block saves ~30 B, and the blocks under this bar are the
+/// dense ones common-term queries walk most. Above it stay the partial
+/// and sparse blocks, where the form saves tens to hundreds of bytes
+/// each and rare terms are walked rarely.
+const PATCHED_MIN_SAVING: usize = 33;
 
 /// Block `encoding`: doc ids stored as a **presence bitset** over
 /// `[origin, last_doc_id]`, `origin` aligned down to a 64-bit word so
@@ -451,7 +463,7 @@ pub fn encode_block(b: &Block, layout: BlockLayout, prev_last_doc_id: Option<u32
         let tf_plan = plan_patched(&padded_tfs);
         let patched_size = header_size + delta_plan.bytes + tf_plan.bytes;
         let plain_size = header_size + deltas_size + tfs_size;
-        if patched_size < plain_size {
+        if patched_size + PATCHED_MIN_SAVING <= plain_size {
             let mut bytes = Vec::with_capacity(patched_size);
             bytes.extend_from_slice(&compact_header(
                 count,
