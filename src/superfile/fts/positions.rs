@@ -15,10 +15,10 @@
 //! table records each 128-doc block's starting byte so a block's runs
 //! are randomly addressable without decoding its predecessors.
 
-use std::ops::Range;
+use std::{iter::repeat_n, ops::Range};
 
 use crate::superfile::{
-    bits::{ExceptionPlan, get_bits, payload_bytes, plan_exceptions, put_bits},
+    bits::{ExceptionPlan, payload_bytes, plan_exceptions, put_bits},
     varint::{push_varint, read_varint, varint_len},
 };
 
@@ -209,12 +209,41 @@ impl StreamIndex {
     }
 
     /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
+    /// One bounds check for the whole run, then one unaligned 64-bit
+    /// load per lane — a phrase reads a few lanes per candidate, so the
+    /// per-lane bookkeeping is what shows.
     fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
         let payload = &bytes[self.payload.clone()];
+        let width = self.width as usize;
         let base = out.len();
         out.reserve(n);
-        for i in from..from + n {
-            out.push(get_bits(payload, i, self.width)? as u32);
+        if width == 0 {
+            out.extend(repeat_n(0u32, n));
+        } else {
+            let end_bit = (from + n) * width;
+            if end_bit.div_ceil(8) > payload.len() {
+                return None;
+            }
+            let mask = (1u64 << width) - 1;
+            let mut bit = from * width;
+            for _ in 0..n {
+                let byte = bit / 8;
+                let word = match payload.get(byte..byte + 8) {
+                    Some(chunk) => u64::from_le_bytes(chunk.try_into().expect("8 bytes")),
+                    None => {
+                        // The stream's last bytes: pad the load.
+                        let mut tail = [0u8; 8];
+                        let rest = &payload[byte..];
+                        tail[..rest.len()].copy_from_slice(rest);
+                        u64::from_le_bytes(tail)
+                    }
+                };
+                out.push(((word >> (bit % 8)) & mask) as u32);
+                bit += width;
+            }
+        }
+        if self.exceptions.is_empty() {
+            return Some(());
         }
         let first = self
             .exceptions
