@@ -809,6 +809,14 @@ pub(crate) fn fanout_prior_for_k(
     out
 }
 
+/// How far under a `k`'s own measured recall ceiling the parity-relaxed
+/// acceptance bar sits, so the knee lands on the SMALLEST near-plateau fanout
+/// rather than the widest rung (grading against the exact ceiling would only be
+/// cleared by the fanout that produced it). Small: the router's recall curve is
+/// near-flat at the plateau, so a 1pt margin distinguishes the knee from the
+/// tail without demanding the ceiling exactly.
+const PARITY_KNEE_SLACK: f64 = 0.01;
+
 /// Pick the per-`k` router fanout from a MEASURED-recall ladder — the third
 /// calibration stage's core policy, mirroring the HNSW `ef` calibrator's knee
 /// rule (`hnsw::calibrate_ef_curve`). `ladder` is a set of `(fanout, recall@k
@@ -827,20 +835,31 @@ pub(crate) fn fanout_prior_for_k(
 /// noise near the floor can otherwise invert two adjacent anchors). The ladder
 /// is expected ASCENDING in fanout; it is sorted defensively.
 ///
-/// The bar is `register_floor` (default 0.98) by design, NOT the full
+/// The starting bar is `register_floor` (default 0.98), NOT the full
 /// `target_recall`: the global-fine path's recall ceiling sits around 0.99, so
 /// grading each rung against the full target would leave every fanout short of
-/// the bar, stamp the sentinel `0` everywhere, and keep `auto` from ever
-/// engaging the graph. Whether 0.98 leaves the graph at recall parity with the
-/// stamped grid is a tracked follow-up (infino#714); this policy deliberately
-/// keeps the 0.98 acceptance bar until then.
+/// the bar and stamp the sentinel everywhere. But an absolute bar over-rejects
+/// on its own: the router reads the SAME Sq16 codes as the stamped grid, so it
+/// shares the grid's within-cell recall ceiling, and on hard/high-dim data that
+/// ceiling sits below 0.98 (measured laion-100M: the router plateaus ~0.973,
+/// the grid it replaces serves ~0.975). Grading the router against a bar its
+/// shared codec cannot reach would reject it AT PARITY with the grid. So the
+/// per-`k` bar relaxes toward that `k`'s OWN measured ceiling (its widest-rung
+/// recall, minus [`PARITY_KNEE_SLACK`] so the smallest near-plateau fanout is
+/// taken, not the widest), bounded to at most `parity_gap` below
+/// `register_floor` — a genuinely collapsed router (ceiling far under the floor)
+/// still fails to clear the bounded bar and stays the sentinel. `parity_gap = 0`
+/// restores the pre-parity absolute-floor behaviour. This is the same
+/// codec-set-ceiling reasoning that gives the flat plane its own lower floor.
 ///
 /// [`CellRoutingParams::fanout_for_k_at`]: crate::supertable::manifest::list::CellRoutingParams::fanout_for_k_at
 pub(crate) fn fanout_knee_from_recalls(
     ladder: &[(u32, [f64; WIDTH_LAW_KS.len()])],
     register_floor: f64,
+    parity_gap: f64,
 ) -> [u32; WIDTH_LAW_KS.len()] {
     let floor = register_floor.max(0.0);
+    let gap = parity_gap.max(0.0);
     let mut rungs: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder.to_vec();
     rungs.sort_by_key(|(f, _)| *f);
     let mut out = [0u32; WIDTH_LAW_KS.len()];
@@ -858,15 +877,19 @@ pub(crate) fn fanout_knee_from_recalls(
             *slot = 0;
             continue;
         }
-        // Smallest fanout whose measured recall@k clears the graceful floor.
         // A finite floor of 0 is cleared by the first rung.
         if floor <= 0.0 {
             *slot = rungs.first().map(|(f, _)| *f).unwrap_or(0);
             continue;
         }
+        // Parity-relaxed bar: drop toward this `k`'s own ceiling (`best`), a
+        // knee-slack under it, but never more than `gap` below the absolute
+        // floor. With `gap == 0` this is exactly `floor` (the old behaviour).
+        let eff_floor = floor.min(best - PARITY_KNEE_SLACK).max(floor - gap);
+        // Smallest fanout whose measured recall@k clears the (relaxed) bar.
         *slot = rungs
             .iter()
-            .find(|(_, recall_by_k)| recall_by_k[ki] >= floor)
+            .find(|(_, recall_by_k)| recall_by_k[ki] >= eff_floor)
             .map(|(f, _)| *f)
             .unwrap_or(0);
     }
@@ -1092,7 +1115,10 @@ mod pool_hint_tests {
         // (0.985); k=1000 never clears (max 0.97 < 0.98) → sentinel 0. The
         // monotone floor then lifts nothing (0 stays 0; the sequence is
         // already non-decreasing 64,256,1024).
-        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [64, 256, 1024, 0]);
+        assert_eq!(
+            fanout_knee_from_recalls(&ladder, 0.98, 0.0),
+            [64, 256, 1024, 0]
+        );
     }
 
     /// A ladder whose recall plateaus below the floor at every anchor — even at
@@ -1107,7 +1133,7 @@ mod pool_hint_tests {
             // Widest rung still short of floor 0.98 at every anchor.
             (512, [0.94, 0.92, 0.88, 0.70]),
         ];
-        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [0, 0, 0, 0]);
+        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98, 0.0), [0, 0, 0, 0]);
     }
 
     /// The stamped knee may EXCEED the old `width × fine` prior — reading more
@@ -1123,7 +1149,7 @@ mod pool_hint_tests {
             (32u32, [0.99, 0.90, 0.80, 0.70]),
             (512, [0.999, 0.99, 0.95, 0.90]),
         ];
-        let knee = fanout_knee_from_recalls(&ladder, 0.98);
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.0);
         assert_eq!(knee[1], 512, "measured recall pushes k=10 well past W×F=32");
         assert!(
             knee[1] > prior[1],
@@ -1141,7 +1167,7 @@ mod pool_hint_tests {
             (64u32, [0.99, 0.97, 0.99, 0.60]),
             (256, [0.999, 0.99, 0.995, 0.75]),
         ];
-        let knee = fanout_knee_from_recalls(&ladder, 0.98);
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.0);
         // k=1→64, k=10→256, k=100 measured 64 but floored up to 256, k=1000→0.
         assert_eq!(knee, [64, 256, 256, 0]);
     }
@@ -1158,10 +1184,69 @@ mod pool_hint_tests {
             (64, [0.999, 0.99, 0.0, 0.0]),
         ];
         // Degenerate floor: a register floor of 0 clears the first supported rung.
-        let knee = fanout_knee_from_recalls(&ladder, 0.0);
+        let knee = fanout_knee_from_recalls(&ladder, 0.0, 0.0);
         // Supported anchors clear at the first rung (floor 0); unsupported ones
         // (all-zero recall) stay 0 despite the collapsed floor.
         assert_eq!(knee, [16, 16, 0, 0]);
+    }
+
+    /// The measured laion-100M ladder: the router's recall@10 plateaus at
+    /// ~0.973, BELOW the absolute 0.98 floor, because it shares the stamped
+    /// grid's within-cell Sq16 ceiling (the grid it replaces serves ~0.975).
+    /// The parity relaxation drops the k=10 bar toward that ceiling, so the
+    /// knee stamps a real fanout (~1024) instead of the sentinel — the graph
+    /// engages at parity with the grid.
+    #[test]
+    fn fanout_knee_parity_engages_at_codec_ceiling() {
+        // recall@10 column = the measured laion-100M sweep: 512→0.9521,
+        // 1024→0.9655, 2048→0.9713, 4096→0.9732 (all < 0.98).
+        let ladder = [
+            (512u32, [0.970, 0.9521, 0.930, 0.0]),
+            (1024, [0.980, 0.9655, 0.945, 0.0]),
+            (2048, [0.985, 0.9713, 0.955, 0.0]),
+            (4096, [0.988, 0.9732, 0.960, 0.0]),
+        ];
+        // Absolute floor 0.98, parity gap 0.03 (the shipped default).
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.03);
+        // k=10 relaxes to ~0.9632 (ceiling 0.9732 − 0.01 slack) and stamps the
+        // smallest fanout clearing it, 1024 (0.9655). k=100 relaxes to 0.95 and
+        // stamps 2048; k=1 clears near the absolute floor at 1024; k=1000 stays
+        // the sentinel.
+        assert_eq!(knee, [1024, 1024, 2048, 0]);
+    }
+
+    /// `parity_gap = 0` is the pre-parity behaviour: the same below-floor laion
+    /// ladder stamps the sentinel at k=10 (recall never reaches the absolute
+    /// 0.98), so `auto` would decline the graph — the exact gap the parity
+    /// relaxation closes.
+    #[test]
+    fn fanout_knee_parity_gap_zero_keeps_absolute_floor() {
+        let ladder = [
+            (512u32, [0.970, 0.9521, 0.930, 0.0]),
+            (1024, [0.980, 0.9655, 0.945, 0.0]),
+            (2048, [0.985, 0.9713, 0.955, 0.0]),
+            (4096, [0.988, 0.9732, 0.960, 0.0]),
+        ];
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.0);
+        // Only k=1 (0.980 at 1024) clears the absolute floor; k=10/k=100 plateau
+        // below it and stay the sentinel.
+        assert_eq!(knee, [1024, 0, 0, 0]);
+    }
+
+    /// The parity relaxation is bounded: a router whose recall COLLAPSES far
+    /// below the floor (a broken graph, not a codec ceiling) still fails to
+    /// clear `floor − parity_gap` at every rung and stays the sentinel, so
+    /// `auto` declines it.
+    #[test]
+    fn fanout_knee_parity_still_rejects_collapsed_router() {
+        let ladder = [
+            (64u32, [0.70, 0.60, 0.50, 0.0]),
+            (512, [0.85, 0.80, 0.70, 0.0]),
+        ];
+        // Even with the parity gap, the ceiling (~0.85) is far under
+        // `floor − gap` (0.95), so nothing clears and every anchor is sentinel.
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.03);
+        assert_eq!(knee, [0, 0, 0, 0]);
     }
 }
 
