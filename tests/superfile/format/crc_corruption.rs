@@ -406,32 +406,33 @@ fn corrupt_fts_bitset_block_rejected() {
             .expect("postings offset"),
     ) as usize;
     let term0 = fts_off + postings_offset_rel;
-    // A term is `[meta][skip table][blocks]`; the first block's offset *within
-    // the term* is recorded in skip entry 0's block-offset field, so read it
-    // directly instead of re-deriving the skip-table size. Non-positional term
-    // meta is 20 B (`TERM_META_SIZE`); a skip entry's block-offset u32 sits at
-    // its offset 4 (`BLOCK_OFFSET_OFF`).
+    // A term is `[meta][skip table][blocks]`. Skip entries carry block
+    // lengths, not offsets, so the first block starts right after the skip
+    // table: non-positional term meta is 20 B (`TERM_META_SIZE`), the block
+    // count sits at meta offset 16, and a positionless skip entry is 10 B.
     const TERM_META: usize = 20;
-    const SKIP_BLOCK_OFFSET_FIELD: usize = 4;
-    let block0_off_in_term = u32::from_le_bytes(
-        bytes[term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD
-            ..term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD + 4]
+    const NUM_BLOCKS_OFF: usize = 16;
+    const SKIP_ENTRY: usize = 10;
+    let num_blocks = u32::from_le_bytes(
+        bytes[term0 + NUM_BLOCKS_OFF..term0 + NUM_BLOCKS_OFF + 4]
             .try_into()
-            .expect("block offset"),
+            .expect("block count"),
     ) as usize;
-    let block0 = term0 + block0_off_in_term;
-    // Block header byte 3 is the encoding (`ENCODING_BITSET == 1`). Assert the
-    // first postings term's block really is a bitset — both a fixture sanity
-    // check and proof the flip below lands in a presence bitmap, not a PFOR block.
+    let block0 = term0 + TERM_META + num_blocks * SKIP_ENTRY;
+    // Header byte 3's low two bits are the encoding (`ENCODING_BITSET == 1`).
+    // Assert the first postings term's block really is a bitset — both a
+    // fixture sanity check and proof the flip below lands in a presence
+    // bitmap, not a PFOR block.
     const ENCODING_OFF: usize = 3;
+    const ENCODING_MASK: u8 = 0b11;
     const ENCODING_BITSET: u8 = 1;
-    const BLOCK_HEADER: usize = 8;
+    const BLOCK_HEADER: usize = 4;
     assert_eq!(
-        bytes[block0 + ENCODING_OFF],
+        bytes[block0 + ENCODING_OFF] & ENCODING_MASK,
         ENCODING_BITSET,
         "first postings term's block must be bitset-encoded on this dense corpus"
     );
-    // Flip a byte in the presence bitmap, just past the 8-byte block header.
+    // Flip a byte in the presence bitmap, just past the 4-byte block header.
     assert_corruption_rejected(bytes, block0 + BLOCK_HEADER, "fts/bitset block presence");
 }
 

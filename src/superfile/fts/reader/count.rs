@@ -694,7 +694,9 @@ mod tests {
         let mix = &cursors[0];
         let (mut saw_bitset, mut saw_packed) = (false, false);
         for blk in mix.blocks.iter() {
-            match mix.bytes.as_ref()[blk.block_byte_offset + posting::ENCODING_OFF] {
+            match posting::block_encoding(
+                &mix.bytes.as_ref()[blk.block_byte_offset..blk.block_byte_end],
+            ) {
                 ENCODING_BITSET => saw_bitset = true,
                 ENCODING_PACKED | ENCODING_PATCHED => saw_packed = true,
                 other => panic!("unexpected encoding byte {other}"),

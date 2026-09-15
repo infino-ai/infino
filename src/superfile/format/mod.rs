@@ -157,7 +157,14 @@ pub mod fts {
     /// metadata offset as a delta — a third smaller than the FST for
     /// the same terms. Readers select the layout by this version;
     /// `V1`–`V6` blobs keep their FST and its packed values.
-    /// Multi-block terms are byte-identical to `V6`.
+    /// Multi-block terms change in two fixed costs. A block's header is
+    /// one 4-byte word (`posting::BlockLayout::Compact`): the base doc
+    /// id is the previous block's last doc id, which the skip table
+    /// already holds, and a patched block's exception counts ride in the
+    /// word. A skip entry carries the block's byte length instead of its
+    /// offset ([`SkipLayout::Length`]) and drops the positions field on
+    /// a positionless column; each coarse slot gains its span's start
+    /// offset so a random block is still reached in constant work.
     ///
     /// Readers accept `V1`–`V7`.
     pub const VERSION_V7: u32 = 7;
@@ -317,36 +324,106 @@ pub mod fts {
         pub const POSITIONS_LENGTH_OFF: usize = 28;
     }
 
-    /// Skip-table entry field offsets (relative to the entry start;
-    /// each entry is `SKIP_ENTRY_SIZE` bytes):
+    /// How a term's skip table locates its blocks — by blob version.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SkipLayout {
+        /// `V1`–`V6`: 16-byte entries carrying each block's absolute byte
+        /// offset within the term; 4-byte coarse slots.
+        Absolute,
+        /// `V7`+: an entry carries the block's byte **length** (`u16`) in
+        /// place of its offset — 10 bytes, 14 on a positional column —
+        /// and each 8-byte coarse slot adds the offset of its span's
+        /// first block. A sequential walk accumulates lengths; a random
+        /// block is one slot read plus at most `COARSE_BLOCK_MAX_SPAN - 1`
+        /// lengths summed.
+        Length,
+    }
+
+    impl SkipLayout {
+        /// Bytes one skip entry takes on a column with or without
+        /// positions.
+        pub fn entry_bytes(self, positional: bool) -> usize {
+            match (self, positional) {
+                (Self::Absolute, _) => 16,
+                (Self::Length, true) => 14,
+                (Self::Length, false) => 10,
+            }
+        }
+
+        /// Bytes one coarse block-max slot takes.
+        pub fn coarse_slot_bytes(self) -> usize {
+            match self {
+                Self::Absolute => U32_BYTES,
+                Self::Length => 2 * U32_BYTES,
+            }
+        }
+
+        /// Entry offset of the block-max bound (`u32` LE).
+        pub fn bound_off(self) -> usize {
+            match self {
+                Self::Absolute => 8,
+                Self::Length => 6,
+            }
+        }
+
+        /// Entry offset of the block's position-group offset (`u32` LE,
+        /// positional columns).
+        pub fn positions_off(self) -> usize {
+            match self {
+                Self::Absolute => 12,
+                Self::Length => 10,
+            }
+        }
+    }
+
+    /// Skip-table entry field offsets (relative to the entry start).
+    ///
+    /// [`SkipLayout::Absolute`]:
     ///
     /// ```text
     /// [ 0.. 4] last_doc_id (u32 LE)
     /// [ 4.. 8] block_offset (u32 LE, relative to term metadata start)
-    /// [ 8..12] max_bm25_x1000 (u32 LE)
+    /// [ 8..12] block-max bound (u32 LE)
     /// [12..16] positions_block_offset (u32 LE; positional columns)
     /// ```
     ///
-    /// The final field was reserved (always written zero) before
-    /// positions existed; for a positional column it now records the
-    /// byte offset of this block's position runs, relative to the
-    /// term's `positions_offset` — per-block random access into the
-    /// term's position bytes, aligned with the PFOR doc blocks.
-    /// Positionless columns keep writing zero, byte-identical to the
-    /// reserved era.
+    /// [`SkipLayout::Length`]:
+    ///
+    /// ```text
+    /// [ 0.. 4] last_doc_id (u32 LE)
+    /// [ 4.. 6] block_len (u16 LE, the block's encoded bytes)
+    /// [ 6..10] block-max bound (u32 LE)
+    /// [10..14] positions_block_offset (u32 LE; positional columns only)
+    /// ```
+    ///
+    /// A block's offset under the length layout is the coarse slot's
+    /// span start plus the lengths of the span's earlier blocks. The
+    /// positions field records the byte offset of this block's position
+    /// group, relative to the term's `positions_offset` — per-block
+    /// random access into the term's position bytes, aligned with the
+    /// doc blocks. An absolute-layout positionless column writes zero
+    /// there (the field's reserved era); a length-layout one omits it.
     pub mod skip_entry {
-        /// `[0..4]` largest doc-id in the block (`u32` LE).
+        /// `[0..4]` largest doc-id in the block (`u32` LE), both layouts.
         pub const LAST_DOC_ID_OFF: usize = 0;
-        /// `[4..8]` byte offset to the encoded PFOR block (`u32` LE).
+        /// `[4..8]` byte offset to the encoded block (`u32` LE), absolute
+        /// layout.
         pub const BLOCK_OFFSET_OFF: usize = 4;
-        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5
-        /// and later, fixed-point `u32` (`ceil(max × scale)`) on legacy
-        /// `V1`-`V4`. LE.
-        pub const MAX_BM25_OFF: usize = 8;
-        /// `[12..16]` block's position-runs offset, relative to the
-        /// term's `positions_offset` (`u32` LE). Zero on positionless
-        /// columns (formerly the reserved field).
-        pub const POSITIONS_BLOCK_OFFSET_OFF: usize = 12;
+        /// `[4..6]` byte length of the encoded block (`u16` LE), length
+        /// layout.
+        pub const BLOCK_LEN_OFF: usize = 4;
+    }
+
+    /// Coarse slot field offsets (relative to the slot start): the
+    /// span's block-max bound, and under [`SkipLayout::Length`] the byte
+    /// offset (relative to term metadata start) of the span's first
+    /// block.
+    pub mod coarse_slot {
+        /// `[0..4]` span bound (`u32` LE: `f32` bits from V5, fixed point
+        /// before).
+        pub const BOUND_OFF: usize = 0;
+        /// `[4..8]` span start offset (`u32` LE), length layout only.
+        pub const SPAN_START_OFF: usize = 4;
     }
 }
 

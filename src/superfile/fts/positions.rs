@@ -26,7 +26,7 @@ use crate::superfile::bits::{get_bits, payload_bytes, put_bits, width_of};
 pub(crate) const MAX_VARINT_BYTES: usize = 5;
 
 /// LEB128 continuation flag: high bit set ⇒ another byte follows.
-const CONTINUATION_BIT: u8 = 0x80;
+pub(crate) const CONTINUATION_BIT: u8 = 0x80;
 /// Payload bits per LEB128 byte.
 const PAYLOAD_BITS: u32 = 7;
 /// Payload mask per LEB128 byte.

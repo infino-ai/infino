@@ -18,16 +18,12 @@ use super::{
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    format::{
-        self, FST_SEPARATOR,
-        fts::{POSITION_SUBINDEX_ENTRIES_PER_BLOCK, U32_BYTES},
-    },
+    format::{self, FST_SEPARATOR, fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK},
     fts::{
-        builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
+        builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         fst_value::FstValue,
         posting::{
-            BLOCK_LEN, ENCODING_OFF, ENCODING_PACKED, ENCODING_PATCHED, HEADER_SIZE,
-            PATCHED_COUNTS_SIZE, patched_exception_ranges,
+            BLOCK_LEN, BlockHeader, ENCODING_PACKED, ENCODING_PATCHED, patched_exception_ranges,
         },
         short::{decode_short, short_df},
     },
@@ -180,7 +176,6 @@ impl FtsReader {
                 true => self.subindex,
                 false => SubindexKind::None,
             };
-            let has_coarse = self.bounds.has_coarse();
             let mut prefix = col.name.as_bytes().to_vec();
             prefix.push(FST_SEPARATOR);
             let mut buckets: Vec<DfBucket> = DF_BAND_LABELS
@@ -253,7 +248,7 @@ impl FtsReader {
                             0,
                             positional,
                             subindex,
-                            has_coarse,
+                            self.bounds,
                             self.positions_grouped,
                         )?;
                         let nb = meta.num_blocks as u64;
@@ -267,26 +262,33 @@ impl FtsReader {
                             true => TERM_META_POSITIONAL_SIZE,
                             false => TERM_META_SIZE,
                         } as u64;
-                        b.skip_bytes += nb * SKIP_ENTRY_SIZE as u64;
+                        b.skip_bytes += nb * meta.skip.entry_bytes(positional) as u64;
                         b.subindex_bytes += nb
                             * (POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes()) as u64;
-                        if has_coarse {
+                        if meta.has_coarse {
                             b.coarse_bytes += nb
                                 .div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN as u64)
-                                * U32_BYTES as u64;
+                                * meta.skip.coarse_slot_bytes() as u64;
                         }
                         b.positions_bytes += u64::from(meta.positions_length);
+                        let mut prev_end: Option<usize> = None;
                         for i in 0..meta.num_blocks {
-                            let (_, off, _) = meta.skip_entry(tb, i);
-                            let end = meta.block_end_in_term(tb, i);
-                            let doc_count = u64::from(tb[off]);
-                            b.block_header_bytes += HEADER_SIZE as u64;
+                            let range = meta.block_range_in_term(tb, i, prev_end);
+                            prev_end = Some(range.end);
+                            let block = &tb[range];
+                            let hdr = BlockHeader::parse(
+                                block,
+                                meta.block_layout,
+                                meta.prev_last_doc_id(tb, i),
+                            );
+                            let doc_count = hdr.count as u64;
+                            b.block_header_bytes += hdr.payload as u64;
                             if doc_count < LANES {
                                 b.partial_blocks += 1;
                             }
-                            let delta_bits = u64::from(tb[off + 1]);
-                            let tf_bits = u64::from(tb[off + 2]);
-                            match tb[off + ENCODING_OFF] {
+                            let delta_bits = u64::from(hdr.delta_bits);
+                            let tf_bits = u64::from(hdr.tf_bits);
+                            match hdr.encoding {
                                 ENCODING_PACKED => {
                                     b.docid_bytes += LANES * delta_bits / 8;
                                     b.tf_bytes += LANES * tf_bits / 8;
@@ -295,9 +297,7 @@ impl FtsReader {
                                 }
                                 ENCODING_PATCHED => {
                                     // Exceptions count with the stream they patch.
-                                    let (delta_exc, tf_exc) =
-                                        patched_exception_ranges(&tb[off..end]);
-                                    b.block_header_bytes += PATCHED_COUNTS_SIZE as u64;
+                                    let (delta_exc, tf_exc) = patched_exception_ranges(block, &hdr);
                                     b.patched_blocks += 1;
                                     b.docid_bytes +=
                                         LANES * delta_bits / 8 + delta_exc.len() as u64;
@@ -306,7 +306,9 @@ impl FtsReader {
                                         (LANES - doc_count) * (delta_bits + tf_bits) / 8;
                                 }
                                 _ => {
-                                    b.bitset_bytes += (end - off) as u64 - HEADER_SIZE as u64;
+                                    b.bitset_bytes +=
+                                        (block.len() - hdr.payload) as u64 - LANES * tf_bits / 8;
+                                    b.tf_bytes += LANES * tf_bits / 8;
                                 }
                             }
                         }

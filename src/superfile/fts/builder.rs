@@ -95,6 +95,7 @@ use crate::superfile::{
     format::{
         self, FST_SEPARATOR,
         checksum::{crc32c, crc32c_append},
+        fts::SkipLayout,
     },
     fts::{
         analysis::ChainTokenizer,
@@ -102,7 +103,10 @@ use crate::superfile::{
         dict::{DictLayout, StreamingTermDictBuilder, TermDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_group, encode_run, read_varint, skip_run},
-        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
+        posting::{
+            BLOCK_LEN, Block, BlockLayout, ENCODING_BITSET, EncodedBlock, block_encoding,
+            encode_block,
+        },
         reader::ColumnLengthStats,
         short::{SHORT_MAX_DF, encode_short},
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
@@ -231,9 +235,6 @@ pub(crate) const TERM_META_SIZE: usize = 20;
 /// mix within one column.
 pub(crate) const TERM_META_POSITIONAL_SIZE: usize = 32;
 
-/// Skip-table entry size in bytes.
-pub(crate) const SKIP_ENTRY_SIZE: usize = 16;
-
 /// Doc-lengths directory entry size in bytes (per column).
 ///
 /// Layout:
@@ -348,6 +349,25 @@ impl BlobEra {
     /// (`V7`). A grouped blob carries no sub-index.
     fn grouped_positions(self) -> bool {
         self == Self::V7
+    }
+
+    /// Which header a posting block carries: the 4-byte word with the
+    /// base derived from the previous block (`V7`), or the 8-byte header
+    /// storing it.
+    fn block_layout(self) -> BlockLayout {
+        match self {
+            Self::V7 => BlockLayout::Compact,
+            _ => BlockLayout::Wide,
+        }
+    }
+
+    /// How skip entries locate their blocks: by byte length with span
+    /// starts in the coarse slots (`V7`), or by absolute offset.
+    fn skip_layout(self) -> SkipLayout {
+        match self {
+            Self::V7 => SkipLayout::Length,
+            _ => SkipLayout::Absolute,
+        }
     }
 
     /// Bytes per stored document length.
@@ -4045,7 +4065,8 @@ fn encode_and_emit_term<W: Write>(
                 doc_ids: mem::take(&mut block_doc_ids),
                 tfs: mem::take(&mut block_tfs),
             };
-            encoded_blocks.push(encode_block(&block));
+            let prev_last_doc_id = encoded_blocks.last().map(|b: &EncodedBlock| b.last_doc_id);
+            encoded_blocks.push(encode_block(&block, era.block_layout(), prev_last_doc_id));
             // Reclaim the underlying allocations for the next chunk.
             block_doc_ids = block.doc_ids;
             block_tfs = block.tfs;
@@ -4056,12 +4077,17 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_block_build += start.elapsed();
         }
         // A block emitted in the bitset encoding bumps the blob to v4.
-        if encoded_blocks.iter().any(|b| b.bytes[3] == ENCODING_BITSET) {
+        if encoded_blocks
+            .iter()
+            .any(|b| block_encoding(&b.bytes) == ENCODING_BITSET)
+        {
             profile.saw_bitset_block = true;
         }
         let num_blocks = encoded_blocks.len() as u32;
         let metadata_offset = *postings_len;
-        let skip_table_size = encoded_blocks.len() * SKIP_ENTRY_SIZE;
+        let skip_layout = era.skip_layout();
+        let skip_table_size =
+            encoded_blocks.len() * skip_layout.entry_bytes(term_positions.is_some());
         let blocks_total_size: usize = encoded_blocks.iter().map(|b| b.bytes.len()).sum();
         let term_meta_size = match term_positions {
             Some(_) => TERM_META_POSITIONAL_SIZE,
@@ -4089,7 +4115,7 @@ fn encode_and_emit_term<W: Write>(
             true => (num_blocks as usize).div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN),
             false => 0,
         };
-        let coarse_table_size = num_coarse * format::fts::U32_BYTES;
+        let coarse_table_size = num_coarse * skip_layout.coarse_slot_bytes();
         let postings_length = (term_meta_size
             + skip_table_size
             + subindex_size
@@ -4206,12 +4232,14 @@ fn encode_and_emit_term<W: Write>(
         // Blocks follow the meta, the skip table, and the (V3-only)
         // position sub-index, so their offsets start past all three.
         let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
-        // Coarse span-maxes, filled alongside the per-block skip entries
-        // and appended after the blocks below. Each entry is the span's
-        // max of the per-block `f32` maxes, stored as `f32` bits — a true
-        // upper bound over the span.
-        let mut coarse_maxes: Vec<u32> = Vec::with_capacity(num_coarse);
+        // Coarse slots, filled alongside the per-block skip entries and
+        // appended after the blocks below. Each holds the span's max of
+        // the per-block `f32` maxes, stored as `f32` bits — a true upper
+        // bound over the span — and, under the length skip layout, the
+        // byte offset of the span's first block.
+        let mut coarse_slots: Vec<u8> = Vec::with_capacity(coarse_table_size);
         let mut span_max: f32 = 0.0;
+        let mut span_start: u32 = block_offset;
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
@@ -4231,24 +4259,42 @@ fn encode_and_emit_term<W: Write>(
                     .max(0.0)
                     .min(u32::MAX as f32) as u32
             };
+            if i.is_multiple_of(coarse_span) {
+                span_start = block_offset;
+            }
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
-            term_buf.extend_from_slice(&block_offset.to_le_bytes());
-            term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
-            // Positionless columns keep writing zero here —
-            // byte-identical to the field's reserved era.
-            let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
-            term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
+            match skip_layout {
+                SkipLayout::Absolute => {
+                    term_buf.extend_from_slice(&block_offset.to_le_bytes());
+                    term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
+                    // Positionless columns keep writing zero here —
+                    // byte-identical to the field's reserved era.
+                    let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
+                    term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
+                }
+                SkipLayout::Length => {
+                    let len = u16::try_from(blk.bytes.len()).expect("a block is under 64 KiB");
+                    term_buf.extend_from_slice(&len.to_le_bytes());
+                    term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
+                    if term_positions.is_some() {
+                        term_buf.extend_from_slice(&pos_block_offsets[i].to_le_bytes());
+                    }
+                }
+            }
             block_offset += blk.bytes.len() as u32;
 
             if era.has_coarse() {
                 span_max = span_max.max(max_bm25);
                 if (i + 1).is_multiple_of(coarse_span) || i + 1 == encoded_blocks.len() {
-                    coarse_maxes.push(span_max.to_bits());
+                    coarse_slots.extend_from_slice(&span_max.to_bits().to_le_bytes());
+                    if skip_layout == SkipLayout::Length {
+                        coarse_slots.extend_from_slice(&span_start.to_le_bytes());
+                    }
                     span_max = 0.0;
                 }
             }
         }
-        debug_assert_eq!(coarse_maxes.len(), num_coarse);
+        debug_assert_eq!(coarse_slots.len(), coarse_table_size);
         if let Some(start) = skip_write_start {
             profile.encode_skip_write += start.elapsed();
         }
@@ -4264,9 +4310,7 @@ fn encode_and_emit_term<W: Write>(
             term_buf.extend_from_slice(&blk.bytes);
         }
         // Coarse block-max table: the term region's tail.
-        for &cm in &coarse_maxes {
-            term_buf.extend_from_slice(&cm.to_le_bytes());
-        }
+        term_buf.extend_from_slice(&coarse_slots);
         debug_assert_eq!(term_buf.len(), postings_length as usize);
         write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
         if let Some(start) = block_write_start {

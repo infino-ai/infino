@@ -52,7 +52,7 @@ use crate::superfile::{
         dict::{DictLayout, TermDict, make_key},
         fst_value::FstValue,
         positions::{decode_group, decode_run, positions_from_run_values},
-        posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
+        posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
         short::decode_short,
         tokenize::{Phrase, Tokenizer},
     },
@@ -1330,7 +1330,7 @@ impl FtsReader {
                             0,
                             true,
                             self.subindex,
-                            self.bounds.has_coarse(),
+                            self.bounds,
                             self.positions_grouped,
                         )?;
                         positional.push((Some(term_meta), None));
@@ -1541,7 +1541,7 @@ impl FtsReader {
                             0,
                             true,
                             SubindexKind::None,
-                            self.bounds.has_coarse(),
+                            self.bounds,
                             self.positions_grouped,
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
@@ -1944,24 +1944,23 @@ pub(super) fn or_cursor_into_bitset(
         }
         return;
     }
-    for block in c.blocks.iter() {
+    for (b, block) in c.blocks.iter().enumerate() {
         // Borrow the block bytes in place rather than `.slice()` them: a
         // per-block `.slice()` bumps and drops an atomic refcount on `c.bytes`
         // for every block of the union, while a borrowed subslice needs none —
         // the same fix already applied to the membership `contains` path.
         let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
-        if bytes[posting::ENCODING_OFF] == ENCODING_BITSET {
+        let hdr = c.block_header(b);
+        if hdr.encoding == ENCODING_BITSET {
             // Word-OR the presence bitset in at its aligned base word.
             // Tfs trail; the bitset is everything between them.
-            let base_word = read_u32_le(&bytes[4..8]) as usize / 64;
-            let tf_bits = bytes[2] as usize;
-            let tfs_size = BLOCK_LEN * tf_bits / 8;
-            let presence = &bytes[posting::HEADER_SIZE..bytes.len() - tfs_size];
+            let base_word = hdr.base as usize / 64;
+            let presence = &bytes[hdr.payload..bytes.len() - hdr.tfs_size()];
             for (i, chunk) in presence.chunks_exact(8).enumerate() {
                 dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
             }
         } else {
-            let n = decode_block_doc_ids(bytes, scratch);
+            let n = decode_block_doc_ids(bytes, &hdr, scratch);
             for &d in &scratch[..n] {
                 dest[(d >> 6) as usize] |= 1u64 << (d & 63);
             }

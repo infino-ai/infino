@@ -11,7 +11,10 @@
 //! the single place that difference is interpreted, so the single-term
 //! walk and the multi-term cursors cannot drift apart.
 
-use crate::superfile::{format, fts::reader::metadata::ColumnMeta};
+use crate::superfile::{
+    format::{self, fts::SkipLayout},
+    fts::{posting::BlockLayout, reader::metadata::ColumnMeta},
+};
 
 /// The FTS blob version, as far as reading a block-max slot is
 /// concerned: what the 4-byte slot (skip entry and coarse entry alike)
@@ -46,6 +49,22 @@ pub(super) enum StoredBound {
 }
 
 impl StoredBound {
+    /// Which block header the version's posting blocks carry.
+    pub(super) fn block_layout(self) -> BlockLayout {
+        match self {
+            Self::V7 => BlockLayout::Compact,
+            _ => BlockLayout::Wide,
+        }
+    }
+
+    /// How the version's skip tables locate their blocks.
+    pub(super) fn skip_layout(self) -> SkipLayout {
+        match self {
+            Self::V7 => SkipLayout::Length,
+            _ => SkipLayout::Absolute,
+        }
+    }
+
     /// The variant for a blob version, or `None` for a version this
     /// reader does not know — which the open path turns into an
     /// unsupported-version error.

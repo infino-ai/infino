@@ -2288,7 +2288,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        posting::{ENCODING_BITSET, ENCODING_OFF},
+        posting::{ENCODING_BITSET, block_encoding},
         reader::BoolMode,
         tokenize::AsciiLowerTokenizer,
     };
@@ -2423,7 +2423,7 @@ mod tests {
         // probe takes the PACKED fallback and the rank path under test is skipped.
         let blk = cursor.blocks[0];
         assert_eq!(
-            cursor.bytes[blk.block_byte_offset + ENCODING_OFF],
+            block_encoding(&cursor.bytes[blk.block_byte_offset..blk.block_byte_end]),
             ENCODING_BITSET,
             "corpus must produce a bitset block for this test to be meaningful"
         );

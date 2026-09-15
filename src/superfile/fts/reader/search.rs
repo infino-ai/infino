@@ -37,7 +37,7 @@ use crate::{
             bm25,
             dict::make_key,
             fst_value::FstValue,
-            posting::{BLOCK_LEN, decode_block},
+            posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
     },
@@ -1136,7 +1136,7 @@ impl FtsReader {
             metadata_offset,
             col_meta.positions,
             SubindexKind::None,
-            self.bounds.has_coarse(),
+            self.bounds,
             self.positions_grouped,
         )?;
 
@@ -1205,7 +1205,7 @@ impl FtsReader {
                 let start = g * coarse_span;
                 let end = (start + coarse_span).min(term_meta.num_blocks);
                 for bi in start..end {
-                    let (_, _, raw) = term_meta.skip_entry(postings, bi);
+                    let (_, raw) = term_meta.skip_entry(postings, bi);
                     cand.push((bounds.bound(raw), bi));
                 }
             }
@@ -1219,10 +1219,14 @@ impl FtsReader {
             let mut seed_heap: BinaryHeap<TopKEntry> =
                 BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
             for &(_, bi) in &cand[..m] {
-                let (_, off, _) = term_meta.skip_entry(postings, bi);
-                let end = term_meta.block_end_in_term(postings, bi);
-                let bytes = &postings[metadata_offset + off..metadata_offset + end];
-                let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+                let range = term_meta.block_range_in_term(postings, bi, None);
+                let bytes = &postings[metadata_offset + range.start..metadata_offset + range.end];
+                let hdr = BlockHeader::parse(
+                    bytes,
+                    term_meta.block_layout,
+                    term_meta.prev_last_doc_id(postings, bi),
+                );
+                let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
                 for j in 0..n {
                     let score =
                         bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(buf_d[j]));
@@ -1260,6 +1264,9 @@ impl FtsReader {
         // it. Inside a span that might qualify, the walk falls back to
         // the per-block bar — identical decisions, identical top-k.
         let mut i = 0usize;
+        // Where the previous block ended, so the length-coded skip table
+        // yields this block's range in one read; `None` after a span jump.
+        let mut prev_end: Option<usize> = None;
         while i < term_meta.num_blocks {
             if coarse_enabled && i.is_multiple_of(coarse_span) {
                 let coarse_max = bounds.bound(term_meta.coarse_slot(postings, i / coarse_span));
@@ -1270,12 +1277,14 @@ impl FtsReader {
                 // play, preserving the tie-break.
                 if coarse_max < seed_threshold {
                     i = span_end;
+                    prev_end = None;
                     continue;
                 }
                 // Floor skip, span-wide: nothing in the span reaches the
                 // caller's floor.
                 if coarse_max <= floor_eff {
                     i = span_end;
+                    prev_end = None;
                     continue;
                 }
                 // BMW skip, span-wide: heap full AND no block in the span
@@ -1285,14 +1294,17 @@ impl FtsReader {
                     && coarse_max <= *min_score
                 {
                     i = span_end;
+                    prev_end = None;
                     continue;
                 }
             }
 
             // last_doc_id (first tuple slot) is unused here — it serves
             // AND-merge seeks, which single-term never does.
-            let (_, block_offset_in_term, raw) = term_meta.skip_entry(postings, i);
+            let (_, raw) = term_meta.skip_entry(postings, i);
             let block_max_bm25 = bounds.bound(raw);
+            let range = term_meta.block_range_in_term(postings, i, prev_end);
+            prev_end = Some(range.end);
 
             // Seed skip (strict): block can't reach the seeded lower bound
             // on the k-th, so it holds no top-k doc.
@@ -1316,12 +1328,15 @@ impl FtsReader {
             }
 
             // Locate the block's bytes.
-            let block_end_in_term = term_meta.block_end_in_term(postings, i);
-            let block_bytes = &postings
-                [metadata_offset + block_offset_in_term..metadata_offset + block_end_in_term];
+            let block_bytes = &postings[metadata_offset + range.start..metadata_offset + range.end];
+            let hdr = BlockHeader::parse(
+                block_bytes,
+                term_meta.block_layout,
+                term_meta.prev_last_doc_id(postings, i),
+            );
 
             //  Actual number of real docs in that block.
-            let n = decode_block(block_bytes, &mut buf_d, &mut buf_t);
+            let n = decode_block(block_bytes, &hdr, &mut buf_d, &mut buf_t);
 
             for j in 0..n {
                 let doc_id = buf_d[j];
@@ -1473,7 +1488,7 @@ impl FtsReader {
                                 0,
                                 col_meta.positions,
                                 SubindexKind::None,
-                                self.bounds.has_coarse(),
+                                self.bounds,
                                 self.positions_grouped,
                             )?
                             .df
