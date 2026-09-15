@@ -1036,11 +1036,13 @@ impl SuperfileReader {
     }
 
     /// Build the `_id` column for `local_doc_ids` (in caller order) from the
-    /// stable-id sidecar `range` within `bytes`: each id is a little-endian
-    /// `i128` at `local_doc_id * ENTRY`. Direct indexing, so duplicates and
-    /// ordering need no rank-back. Bounds are guaranteed by the doc-id
-    /// bounds-check in [`take_by_local_doc_ids`] and the sidecar-length check
-    /// at open, so the fixed-width reads cannot overrun the region.
+    /// stable-id sidecar `range` within `bytes`: a packed sidecar is opened
+    /// by its header (its blocks were validated at superfile open) and
+    /// indexed per doc; a raw one holds a little-endian `i128` at
+    /// `local_doc_id * ENTRY`. Direct indexing, so duplicates and ordering
+    /// need no rank-back. Raw bounds are guaranteed by the doc-id
+    /// bounds-check in [`take_by_local_doc_ids`] and the sidecar-length
+    /// check at open, so the fixed-width reads cannot overrun the region.
     fn id_array_from_sidecar(
         &self,
         bytes: &Bytes,
@@ -1053,21 +1055,28 @@ impl SuperfileReader {
         let region = &bytes[range];
         let packed = match self.id_sidecar_packed {
             true => Some(
-                ids::PackedIds::parse(region, self.n_docs as usize)
+                ids::PackedIds::open(region, self.n_docs as usize)
                     .map_err(ReadError::MalformedKv)?,
             ),
             false => None,
         };
-        let ids = local_doc_ids.iter().map(|&doc_id| match &packed {
-            Some(p) => p.get(doc_id).expect("doc id within n_docs"),
-            None => {
-                let start = doc_id as usize * ENTRY;
-                let raw: [u8; ENTRY] = region[start..start + ENTRY]
-                    .try_into()
-                    .expect("sidecar entry within bounds");
-                i128::from_le_bytes(raw)
-            }
-        });
+        let mut ids: Vec<i128> = Vec::with_capacity(local_doc_ids.len());
+        for &doc_id in local_doc_ids {
+            ids.push(match &packed {
+                Some(p) => p.get(doc_id).ok_or_else(|| {
+                    ReadError::MalformedKv(format!(
+                        "stable-id sidecar has no entry for doc {doc_id}"
+                    ))
+                })?,
+                None => {
+                    let start = doc_id as usize * ENTRY;
+                    let raw: [u8; ENTRY] = region[start..start + ENTRY]
+                        .try_into()
+                        .expect("sidecar entry within bounds");
+                    i128::from_le_bytes(raw)
+                }
+            });
+        }
         let id_idx = self
             .schema
             .index_of(&self.id_column)

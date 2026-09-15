@@ -128,50 +128,24 @@ pub(crate) struct PackedIds<'a> {
 
 impl<'a> PackedIds<'a> {
     /// Parse and validate every header, directory entry and block bound
-    /// against `bytes` and the expected `n_docs`, so [`Self::get`] can
-    /// index without further checks. A mismatch is an `Err` with the
-    /// reason; nothing panics on a malformed sidecar.
+    /// against `bytes` and the expected `n_docs`. A mismatch is an `Err`
+    /// with the reason; nothing panics on a malformed sidecar. This is
+    /// the superfile-open check; the per-query path takes [`Self::open`].
     pub(crate) fn parse(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
-        let u32_at = |at: usize| -> Option<u32> {
-            bytes
-                .get(at..at + 4)
-                .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
-        };
-        let u64_at = |at: usize| -> Option<u64> {
-            bytes
-                .get(at..at + 8)
-                .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
-        };
-        let declared = u32_at(0).ok_or("packed id sidecar shorter than its header")? as usize;
-        if declared != n_docs {
-            return Err(format!(
-                "packed id sidecar declares {declared} docs, superfile has {n_docs}"
-            ));
-        }
-        if u32_at(4) != Some(BLOCK_DOCS as u32) {
-            return Err("packed id sidecar block size is not the reader's".into());
-        }
-        let n_blocks = u32_at(8).ok_or("packed id sidecar truncated")? as usize;
-        if n_blocks != n_docs.div_ceil(BLOCK_DOCS) {
-            return Err("packed id sidecar block count does not match n_docs".into());
-        }
-        for b in 0..n_blocks {
-            let off = u64_at(HEADER_BYTES + b * DIR_ENTRY_BYTES)
+        let ids = Self::open(bytes, n_docs)?;
+        for b in 0..ids.n_blocks {
+            let off = u64_at(bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)
                 .ok_or("packed id sidecar directory truncated")? as usize;
-            let n_in_block = match b + 1 == n_blocks {
+            let n_in_block = match b + 1 == ids.n_blocks {
                 true => n_docs - b * BLOCK_DOCS,
                 false => BLOCK_DOCS,
             };
-            let hi_width = *bytes
-                .get(off + 16)
+            let header = bytes
+                .get(off..off + BLOCK_HEADER_BYTES)
                 .ok_or("packed id sidecar block header truncated")?;
-            let lo_width = *bytes
-                .get(off + 17)
-                .ok_or("packed id sidecar block header truncated")?;
-            let n_declared = bytes
-                .get(off + 18..off + 20)
-                .map(|s| u16::from_le_bytes([s[0], s[1]]) as usize)
-                .ok_or("packed id sidecar block header truncated")?;
+            let hi_width = header[16];
+            let lo_width = header[17];
+            let n_declared = u16::from_le_bytes([header[18], header[19]]) as usize;
             if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH || n_declared != n_in_block {
                 return Err(format!("packed id sidecar block {b} header is malformed"));
             }
@@ -183,6 +157,33 @@ impl<'a> PackedIds<'a> {
                 return Err(format!("packed id sidecar block {b} runs past the sidecar"));
             }
         }
+        Ok(ids)
+    }
+
+    /// Open a sidecar by its header alone — no walk of the block
+    /// directory — for the per-query id resolve of a superfile whose
+    /// sidecar [`Self::parse`] validated at open. The walk is a few
+    /// thousand blocks on a large superfile, and it was being repeated
+    /// on every query. [`Self::get`] bounds-checks each read it makes,
+    /// so bytes this is misapplied to answer `None` rather than panic.
+    pub(crate) fn open(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
+        let declared =
+            u32_at(bytes, 0).ok_or("packed id sidecar shorter than its header")? as usize;
+        if declared != n_docs {
+            return Err(format!(
+                "packed id sidecar declares {declared} docs, superfile has {n_docs}"
+            ));
+        }
+        if u32_at(bytes, 4) != Some(BLOCK_DOCS as u32) {
+            return Err("packed id sidecar block size is not the reader's".into());
+        }
+        let n_blocks = u32_at(bytes, 8).ok_or("packed id sidecar truncated")? as usize;
+        if n_blocks != n_docs.div_ceil(BLOCK_DOCS) {
+            return Err("packed id sidecar block count does not match n_docs".into());
+        }
+        if bytes.len() < HEADER_BYTES + n_blocks * DIR_ENTRY_BYTES {
+            return Err("packed id sidecar directory truncated".into());
+        }
         Ok(Self {
             bytes,
             n_docs,
@@ -190,7 +191,8 @@ impl<'a> PackedIds<'a> {
         })
     }
 
-    /// The `_id` of local doc `doc`; `None` past `n_docs`.
+    /// The `_id` of local doc `doc`; `None` past `n_docs` or on a block
+    /// the sidecar's bytes cannot hold.
     #[inline]
     pub(crate) fn get(&self, doc: u32) -> Option<i128> {
         let doc = doc as usize;
@@ -200,22 +202,39 @@ impl<'a> PackedIds<'a> {
         let b = doc / BLOCK_DOCS;
         let i = doc % BLOCK_DOCS;
         debug_assert!(b < self.n_blocks);
-        let dir = HEADER_BYTES + b * DIR_ENTRY_BYTES;
-        let off =
-            u64::from_le_bytes(self.bytes[dir..dir + 8].try_into().expect("8 bytes")) as usize;
-        let hi_base = u64::from_le_bytes(self.bytes[off..off + 8].try_into().expect("8 bytes"));
-        let lo_base =
-            u64::from_le_bytes(self.bytes[off + 8..off + 16].try_into().expect("8 bytes"));
-        let hi_width = self.bytes[off + 16];
-        let lo_width = self.bytes[off + 17];
-        let n_in_block = u16::from_le_bytes([self.bytes[off + 18], self.bytes[off + 19]]) as usize;
+        let off = u64_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
+        let header = self.bytes.get(off..off + BLOCK_HEADER_BYTES)?;
+        let hi_base = u64::from_le_bytes(header[..8].try_into().expect("8 bytes"));
+        let lo_base = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
+        let hi_width = header[16];
+        let lo_width = header[17];
+        let n_in_block = u16::from_le_bytes([header[18], header[19]]) as usize;
+        if i >= n_in_block || hi_width > MAX_WIDTH || lo_width > MAX_WIDTH {
+            return None;
+        }
         let hi_start = off + BLOCK_HEADER_BYTES;
         let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
         let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
-        let hi = hi_base.wrapping_add(get_bits(&self.bytes[hi_start..lo_start], i, hi_width)?);
-        let lo = lo_base.wrapping_add(get_bits(&self.bytes[lo_start..lo_end], i, lo_width)?);
+        let hi = hi_base.wrapping_add(get_bits(self.bytes.get(hi_start..lo_start)?, i, hi_width)?);
+        let lo = lo_base.wrapping_add(get_bits(self.bytes.get(lo_start..lo_end)?, i, lo_width)?);
         Some((((hi as u128) << 64) | lo as u128) as i128)
     }
+}
+
+/// Little-endian `u32` at `at`, `None` past the end.
+#[inline]
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes
+        .get(at..at + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
+}
+
+/// Little-endian `u64` at `at`, `None` past the end.
+#[inline]
+fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
+    bytes
+        .get(at..at + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
 }
 
 #[cfg(test)]
@@ -275,6 +294,31 @@ mod tests {
         round_trip(&ids);
         round_trip(&[42]);
         assert!(encode_packed(&[]).is_empty());
+    }
+
+    #[test]
+    fn header_only_open_answers_none_on_a_block_it_cannot_hold() {
+        let ids: Vec<i128> = (0..BLOCK_DOCS as i128 * 2 + 5)
+            .map(|i| i * 11 + 3)
+            .collect();
+        let mut packed = round_trip(&ids);
+        // Point the last block's directory entry past the sidecar.
+        let dir = HEADER_BYTES + 2 * DIR_ENTRY_BYTES;
+        let past_end = packed.len() as u64;
+        packed[dir..dir + 8].copy_from_slice(&past_end.to_le_bytes());
+        assert!(
+            PackedIds::parse(&packed, ids.len()).is_err(),
+            "open-time parse refuses it"
+        );
+        let p = PackedIds::open(&packed, ids.len()).expect("header is intact");
+        assert_eq!(p.get(0), Some(ids[0]));
+        assert_eq!(
+            p.get(2 * BLOCK_DOCS as u32 - 1),
+            Some(ids[2 * BLOCK_DOCS - 1])
+        );
+        assert_eq!(p.get(2 * BLOCK_DOCS as u32), None, "corrupt block");
+        assert_eq!(p.get(ids.len() as u32), None, "past n_docs");
+        assert!(PackedIds::open(&packed[..HEADER_BYTES + 8], ids.len()).is_err());
     }
 
     #[test]
