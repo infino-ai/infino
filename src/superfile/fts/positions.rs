@@ -339,6 +339,7 @@ pub(crate) fn decode_group(
 /// One stream of a packed group located for random access: its lane
 /// width, where its payload lies in the positions bytes, and its
 /// exceptions in ascending lane order.
+#[derive(Default)]
 struct StreamIndex {
     width: u8,
     payload: Range<usize>,
@@ -346,10 +347,11 @@ struct StreamIndex {
 }
 
 impl StreamIndex {
-    /// Parse the stream of `n` lanes at `*at`, advancing past it. The
-    /// exception lanes must ascend (the writer emits them in lane order),
-    /// so a run's exceptions are one binary search away.
-    fn parse(bytes: &[u8], at: &mut usize, n: usize) -> Option<Self> {
+    /// Parse the stream of `n` lanes at `*at` into `self`, reusing its
+    /// exception buffer, advancing past it. The exception lanes must
+    /// ascend (the writer emits them in lane order), so a run's
+    /// exceptions are one binary search away.
+    fn parse_into(&mut self, bytes: &[u8], at: &mut usize, n: usize) -> Option<()> {
         let width = *bytes.get(*at)?;
         *at += 1;
         if width > GROUP_MAX_WIDTH {
@@ -362,7 +364,7 @@ impl StreamIndex {
         let payload = *at..*at + payload_bytes(n, width);
         bytes.get(payload.clone())?;
         *at = payload.end;
-        let mut exceptions = Vec::with_capacity(n_exc);
+        self.exceptions.clear();
         let mut prev_lane: Option<u32> = None;
         for _ in 0..n_exc {
             let lane = read_varint(bytes, at)?;
@@ -370,14 +372,12 @@ impl StreamIndex {
             if lane as usize >= n || prev_lane.is_some_and(|p| lane <= p) {
                 return None;
             }
-            exceptions.push((lane, hi));
+            self.exceptions.push((lane, hi));
             prev_lane = Some(lane);
         }
-        Some(Self {
-            width,
-            payload,
-            exceptions,
-        })
+        self.width = width;
+        self.payload = payload;
+        Some(())
     }
 
     /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
@@ -402,15 +402,15 @@ impl StreamIndex {
     }
 }
 
-/// The two streams of a packed group, or a LEB128 group's values.
-enum GroupStreams {
-    /// Decoded whole: LEB128 runs allow no random access, and only a
-    /// short-form term (read once, whole) still writes them.
-    Leb128(Vec<u32>),
-    Packed {
-        first: StreamIndex,
-        gap: StreamIndex,
-    },
+/// Which layout the located group has.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum GroupKind {
+    /// Decoded whole into `values`: LEB128 runs allow no random access,
+    /// and only a short-form term (read once, whole) still writes them.
+    #[default]
+    Leb128,
+    /// Two packed streams read lane by lane.
+    Packed,
 }
 
 /// A position group located for **per-run** access: one pair's run is
@@ -419,8 +419,15 @@ enum GroupStreams {
 /// so decoding a whole group — every position of 128 docs — per
 /// candidate was the cost that dominated; here a candidate costs its
 /// own `tf` lanes plus one binary search over the stream's exceptions.
+/// One instance is reused across blocks so relocating allocates nothing.
+#[derive(Default)]
 pub(crate) struct GroupIndex {
-    streams: GroupStreams,
+    kind: GroupKind,
+    /// A LEB128 group's values, whole.
+    values: Vec<u32>,
+    /// A packed group's first-position and gap streams.
+    first: StreamIndex,
+    gap: StreamIndex,
     /// Where pair `p`'s lanes begin: in the gap stream (`Σ (tf - 1)` over
     /// the pairs before it) for a packed group, in the values (`Σ tf`)
     /// for a LEB128 one. `tfs.len() + 1` entries.
@@ -432,40 +439,39 @@ pub(crate) struct GroupIndex {
 impl GroupIndex {
     /// Locate the group at `*at` (its header) for the block whose per-doc
     /// term frequencies are `tfs`, advancing `*at` past it. `None` on a
-    /// truncated or malformed group.
-    pub(crate) fn parse(bytes: &[u8], at: &mut usize, tfs: &[u32]) -> Option<Self> {
+    /// truncated or malformed group, after which the index must be
+    /// relocated before use.
+    pub(crate) fn locate(&mut self, bytes: &[u8], at: &mut usize, tfs: &[u32]) -> Option<()> {
         let n: usize = tfs.iter().map(|&t| t as usize).sum();
         let header = *bytes.get(*at)?;
         *at += 1;
-        let (streams, lanes_per_pair): (GroupStreams, fn(u32) -> u32) = match header {
+        let lanes_per_pair: fn(u32) -> u32 = match header {
             GROUP_LEB128 => {
-                let mut values = Vec::with_capacity(n);
+                self.kind = GroupKind::Leb128;
+                self.values.clear();
+                self.values.reserve(n);
                 for _ in 0..n {
-                    values.push(read_varint(bytes, at)?);
+                    self.values.push(read_varint(bytes, at)?);
                 }
-                (GroupStreams::Leb128(values), |tf| tf)
+                |tf| tf
             }
             GROUP_PACKED => {
-                let first = StreamIndex::parse(bytes, at, tfs.len())?;
-                let gap = StreamIndex::parse(bytes, at, n - tfs.len())?;
-                (GroupStreams::Packed { first, gap }, |tf| {
-                    tf.saturating_sub(1)
-                })
+                self.kind = GroupKind::Packed;
+                self.first.parse_into(bytes, at, tfs.len())?;
+                self.gap.parse_into(bytes, at, n - tfs.len())?;
+                |tf| tf.saturating_sub(1)
             }
             _ => return None,
         };
-        let mut starts = Vec::with_capacity(tfs.len() + 1);
+        self.starts.clear();
+        self.starts.reserve(tfs.len() + 1);
         let mut acc = 0u32;
-        starts.push(acc);
+        self.starts.push(acc);
         for &tf in tfs {
             acc = acc.checked_add(lanes_per_pair(tf))?;
-            starts.push(acc);
+            self.starts.push(acc);
         }
-        Some(Self {
-            streams,
-            starts,
-            run: Vec::new(),
-        })
+        Some(())
     }
 
     /// The absolute positions of pair `pair` (whose term frequency is
@@ -479,14 +485,15 @@ impl GroupIndex {
     ) -> Option<()> {
         let start = *self.starts.get(pair)? as usize;
         self.run.clear();
-        match &self.streams {
-            GroupStreams::Leb128(values) => {
+        match self.kind {
+            GroupKind::Leb128 => {
                 self.run
-                    .extend_from_slice(values.get(start..start + tf as usize)?);
+                    .extend_from_slice(self.values.get(start..start + tf as usize)?);
             }
-            GroupStreams::Packed { first, gap } => {
-                first.read_lanes(bytes, pair, 1, &mut self.run)?;
-                gap.read_lanes(bytes, start, tf as usize - 1, &mut self.run)?;
+            GroupKind::Packed => {
+                self.first.read_lanes(bytes, pair, 1, &mut self.run)?;
+                self.gap
+                    .read_lanes(bytes, start, tf as usize - 1, &mut self.run)?;
             }
         }
         positions_from_run_values(&self.run, out)
@@ -615,7 +622,8 @@ mod tests {
             let start = out.len();
             encode_group(&mut out, &tfs, &vals, allow);
             let mut at = start;
-            let mut index = GroupIndex::parse(&out, &mut at, &tfs).expect("parses");
+            let mut index = GroupIndex::default();
+            index.locate(&out, &mut at, &tfs).expect("parses");
             assert_eq!(at, out.len());
             let mut whole = Vec::new();
             decode_group(&out, &mut start.clone(), &tfs, &mut whole).expect("decodes");
@@ -636,13 +644,18 @@ mod tests {
                     .is_none()
             );
             for cut in start..out.len() {
-                assert!(GroupIndex::parse(&out[..cut], &mut start.clone(), &tfs).is_none());
+                assert!(
+                    GroupIndex::default()
+                        .locate(&out[..cut], &mut start.clone(), &tfs)
+                        .is_none()
+                );
             }
         }
         // A LEB128 group must still be allowed to have a run overflow refused.
         let mut out = Vec::new();
         encode_group(&mut out, &[2], &[u32::MAX, 1], true);
-        let mut index = GroupIndex::parse(&out, &mut 0, &[2]).expect("parses");
+        let mut index = GroupIndex::default();
+        index.locate(&out, &mut 0, &[2]).expect("parses");
         assert!(index.run_positions(&out, 0, 2, &mut Vec::new()).is_none());
     }
 

@@ -60,8 +60,9 @@ pub(super) struct PhraseMember {
     /// Scratch for the member's decoded positions at the aligned doc.
     pub(super) pos_scratch: Vec<u32>,
     /// The current block's position group located for per-run access,
-    /// and which block it belongs to (`usize::MAX` = none).
-    pub(super) group_index: Option<GroupIndex>,
+    /// and which block it belongs to (`usize::MAX` = none). Reused
+    /// across blocks, so a block crossing allocates nothing.
+    pub(super) group_index: GroupIndex,
     pub(super) group_block: usize,
 }
 
@@ -91,19 +92,16 @@ impl PhraseMember {
                 let mut at =
                     term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
                 let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
-                let index = GroupIndex::parse(&self.positions, &mut at, tfs).ok_or_else(|| {
-                    FtsError::Read(ReadError::MalformedVersion(
-                        "position group truncated or malformed".into(),
-                    ))
-                })?;
-                self.group_index = Some(index);
+                self.group_index
+                    .locate(&self.positions, &mut at, tfs)
+                    .ok_or_else(|| {
+                        FtsError::Read(ReadError::MalformedVersion(
+                            "position group truncated or malformed".into(),
+                        ))
+                    })?;
                 self.group_block = block;
             }
-            let index = self
-                .group_index
-                .as_mut()
-                .expect("group index located for this block");
-            index
+            self.group_index
                 .run_positions(
                     &self.positions,
                     pair,
@@ -285,7 +283,7 @@ impl PhraseCursor {
                     cached_pair: NO_BLOCK_CACHED,
                     cached_run_offset: 0,
                     pos_scratch: Vec::new(),
-                    group_index: None,
+                    group_index: GroupIndex::default(),
                     group_block: NO_BLOCK_CACHED,
                 }
             })
