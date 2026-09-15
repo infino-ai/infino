@@ -61,7 +61,7 @@ use crate::{
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
-        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
 };
@@ -79,7 +79,7 @@ pub(crate) async fn open_reader(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
-    allow_background_fill: bool,
+    intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     superfile_reader(
         store,
@@ -88,7 +88,7 @@ pub(crate) async fn open_reader(
         &entry.uri,
         &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
-        allow_background_fill,
+        intent,
     )
     .await
     .map_err(|e| QueryError::build(e.to_string(), &e))
@@ -205,7 +205,7 @@ pub(crate) async fn open_compaction_input(
         return Ok(Arc::new(reader));
     }
     // Compaction is not a query modality; allow fill so inputs can promote.
-    open_reader(store, disk_cache, storage, entry, true).await
+    open_reader(store, disk_cache, storage, entry, ReadIntent::Warm).await
 }
 
 /// Tag a kernel's results with their source and stamp stable ids immediately
@@ -503,7 +503,7 @@ where
         reader,
         units,
         true,
-        true, // FTS/local-hit path — background fill allowed
+        ReadIntent::Warm, // FTS/local-hit path: warm toward a full mmap
         move |r, entry, tombstone_cache, now, params| {
             let kernel = kernel.clone();
             async move {
@@ -539,7 +539,7 @@ pub(crate) async fn fanout_with<P, R, B, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     prefetch_tombstones: bool,
-    allow_background_fill: bool,
+    intent: ReadIntent,
     body: B,
 ) -> Result<Vec<R>, QueryError>
 where
@@ -588,7 +588,7 @@ where
             disk_cache.as_ref(),
             storage.as_ref(),
             &entry,
-            allow_background_fill,
+            intent,
         )
         .await?;
         verify_superfile_vector_codecs(&r, &vector_columns)?;
@@ -610,7 +610,7 @@ where
                     disk_cache.as_ref(),
                     storage.as_ref(),
                     &entry,
-                    allow_background_fill,
+                    intent,
                 )
                 .await?;
                 verify_superfile_vector_codecs(&r, &vector_columns)?;

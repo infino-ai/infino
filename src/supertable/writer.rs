@@ -183,7 +183,7 @@ use crate::{
             dispatch::{open_compaction_input, open_reader},
             vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
-        reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
+        reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
         wal::{
             Lease,
@@ -3086,7 +3086,7 @@ pub(super) fn prepare_superfile_named(
 
     // capture `(total_size, vec_off/len, fts_off/len)`
     // from the freshly-written bytes' parquet KV metadata. Caching
-    // these on the manifest lets `DiskCacheStore::reader_with_hints`
+    // these on the manifest lets `DiskCacheStore::open_for_query`
     // fire the parquet-footer, vector, and FTS subsection GETs in
     // parallel on cold open (1 RTT instead of 2 sequential).
     let subsection_offsets = build_subsection_offsets(&shard.bytes);
@@ -5208,9 +5208,15 @@ async fn open_ivf_reader_with_tombstones(
         .map(|t| t.bitmap_for(entry.superfile_id, now))
         .transpose()
         .map_err(|e| BuildError::Store(e.to_string()))?;
-    let reader = open_reader(&inner.options.store, disk_cache, Some(storage), entry, true)
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+    let reader = open_reader(
+        &inner.options.store,
+        disk_cache,
+        Some(storage),
+        entry,
+        ReadIntent::Warm,
+    )
+    .await
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     Ok((reader, bitmap))
 }
 
@@ -5329,7 +5335,7 @@ async fn cell_doc_counts_via_reader(
         inner.options.disk_cache.as_ref(),
         Some(storage),
         entry,
-        true,
+        ReadIntent::Warm,
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -9247,7 +9253,7 @@ pub(in crate::supertable) async fn stamp_term_stats(
                 disk_cache.as_ref(),
                 opt_storage.as_ref(),
                 entry,
-                false,
+                ReadIntent::Stream,
             )
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;

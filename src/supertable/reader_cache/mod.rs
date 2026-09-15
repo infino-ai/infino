@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 pub use config::{CacheEvictionPolicy, ColdFetchMode, DiskCacheConfig, LruPolicy};
-pub use disk::{CacheStats, DiskCacheError, DiskCacheStore};
+pub use disk::{CacheStats, DiskCacheError, DiskCacheStore, ReadIntent};
 pub use in_memory::InMemoryReaderCache;
 use thiserror::Error;
 

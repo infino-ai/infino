@@ -125,7 +125,7 @@ fn reader_blocks_background_fill(reader: &Weak<SuperfileReader>) -> bool {
     reader.strong_count() > 1
 }
 
-/// Errors surfaced by [`DiskCacheStore::reader`].
+/// Errors surfaced by [`DiskCacheStore::open_for_query`] and its sibling reader entry points.
 #[derive(Debug, Error)]
 pub enum DiskCacheError {
     #[error("storage error during cold fetch")]
@@ -171,8 +171,23 @@ pub(crate) struct CachedEntry {
     last_access_us: AtomicU64,
 }
 
-/// Where a cached entry's bytes currently live. Lines up with the three tiers
-/// [`DiskCacheStore::reader`] checks in order: memory, disk, then object store.
+/// What a caller needs locally, chosen per read. Decides which cached entries count as a hit
+/// (a whole-file [`CachedEntry::has_whole_file`] serves any intent; a lazy [`Residency::Paged`]
+/// entry serves `Stream`/`Warm` but not `Load`) and which fetch shape a real miss uses; nothing
+/// else branches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIntent {
+    /// Serve byte ranges on demand, stay remote-backed, never promote. Vector search.
+    Stream,
+    /// Serve now, and download the rest in the background toward a local mmap. FTS and SQL queries.
+    Warm,
+    /// Download the whole file and mmap it before serving. Compaction, which rewrites its input.
+    Load,
+}
+
+/// Where a cached entry's bytes currently live. Lines up with the four tiers
+/// [`DiskCacheStore::open_for_query`] checks in order: whole file in memory, whole file on disk, a
+/// lazy reader already open, then the object store.
 enum Residency {
     /// Whole superfile in an anonymous heap buffer, and the only copy. A background task writes it
     /// to disk and promotes it to [`Residency::Mapped`].
@@ -205,6 +220,16 @@ impl CachedEntry {
     /// Whether the whole file is mmapped locally, so the hot path never reads object storage.
     fn is_mapped(&self) -> bool {
         matches!(self.residency, Residency::Mapped { .. })
+    }
+
+    /// Whether this entry holds the complete file locally, ready to read with no object-store GETs:
+    /// [`Residency::Mapped`] (mmapped from disk) or [`Residency::Buffered`] (in a RAM buffer). A
+    /// [`Residency::Paged`] entry does not, it only has the ranges touched so far.
+    fn has_whole_file(&self) -> bool {
+        matches!(
+            self.residency,
+            Residency::Mapped { .. } | Residency::Buffered
+        )
     }
 
     /// The live block source: a [`Residency::Paged`] entry's source, or the retained vector hole of
@@ -464,21 +489,6 @@ impl DiskCacheStore {
             .unwrap_or_else(|| Arc::clone(&self.storage))
     }
 
-    /// Whether `uri` has any cache entry — including a still-lazy
-    /// `LazyForegroundWithBackgroundFill` reader whose `mmap` is `None`.
-    /// Use [`Self::is_mmap_promoted`] to test for residency.
-    pub fn is_cached(&self, uri: &SuperfileUri) -> bool {
-        self.cached.contains_key(uri)
-    }
-
-    /// Whether `uri` is cached with a finished mmap promotion
-    /// (`CachedEntry::mmap == Some`). False while
-    /// `LazyForegroundWithBackgroundFill` still holds the lazy
-    /// in-memory reader or the background download is in flight.
-    pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
-        self.cached.get(uri).map(|e| e.is_mapped()).unwrap_or(false)
-    }
-
     /// Snapshot of the cache's load. Cheap; reads atomics +
     /// a `DashMap::len` (which itself is `O(shards)`).
     pub fn stats(&self) -> CacheStats {
@@ -568,26 +578,6 @@ impl DiskCacheStore {
         *g = pinned_fn;
     }
 
-    /// Observability accessor: invoke the currently-installed
-    /// `pinned_fn` and return its result. Useful for tests
-    /// that want to assert which URIs are protected from
-    /// eviction at the moment of the call; also for
-    /// debug-time inspection of long-running caches.
-    ///
-    /// Cheap: clones the `Arc<dyn Fn>` out of the mutex,
-    /// drops the lock, then invokes the closure. The closure
-    /// itself is whatever the caller installed — most
-    /// commonly the `Weak<SupertableInner>`-based snapshot
-    /// installed by [`crate::supertable::Supertable::create`]
-    /// / [`crate::supertable::Supertable::open`].
-    pub fn current_pinned_uris(&self) -> HashSet<SuperfileUri> {
-        let f = {
-            let g = self.pinned_fn.lock().expect("pinned_fn mutex poisoned");
-            Arc::clone(&g)
-        };
-        f()
-    }
-
     pub(crate) fn now_us(&self) -> u64 {
         self.started_at.elapsed().as_micros() as u64
     }
@@ -616,6 +606,44 @@ impl DiskCacheStore {
     /// during cold fetch; renamed to `cache_path` on success).
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config.cache_root.join(uri.cache_tmp_filename())
+    }
+
+    // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
+    // the shipped library.
+
+    /// Whether `uri` has any cache entry at all, including a lazy [`Residency::Paged`] one. Use
+    /// [`Self::is_mmap_promoted`] to test for a finished whole-file mmap.
+    #[cfg(test)]
+    pub(crate) fn is_cached(&self, uri: &SuperfileUri) -> bool {
+        self.cached.contains_key(uri)
+    }
+
+    /// Whether `uri` is cached with a finished mmap promotion
+    /// (`CachedEntry::mmap == Some`). False while
+    /// `LazyForegroundWithBackgroundFill` still holds the lazy
+    /// in-memory reader or the background download is in flight.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
+        self.cached.get(uri).map(|e| e.is_mapped()).unwrap_or(false)
+    }
+
+    /// Observability accessor: invoke the currently-installed
+    /// `pinned_fn` and return its result. Lets tests assert which
+    /// URIs are protected from eviction at the moment of the call.
+    ///
+    /// Cheap: clones the `Arc<dyn Fn>` out of the mutex,
+    /// drops the lock, then invokes the closure. The closure
+    /// itself is whatever the caller installed, most
+    /// commonly the `Weak<SupertableInner>`-based snapshot
+    /// installed by [`crate::supertable::Supertable::create`]
+    /// / [`crate::supertable::Supertable::open`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn current_pinned_uris(&self) -> HashSet<SuperfileUri> {
+        let f = {
+            let g = self.pinned_fn.lock().expect("pinned_fn mutex poisoned");
+            Arc::clone(&g)
+        };
+        f()
     }
 }
 
