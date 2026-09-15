@@ -10822,6 +10822,7 @@ mod tests {
             birth_version: 0,
             superfile_id: Uuid::from_u128(id),
             uri: SuperfileUri(Uuid::from_u128(id)),
+            stem: None,
             n_docs: 1,
             id_min: 0,
             id_max: 0,
