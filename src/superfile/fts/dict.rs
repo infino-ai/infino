@@ -17,11 +17,15 @@
 //! its doc id and tf as varints; a short- or long-form term carries its
 //! metadata offset as a varint delta from the previous such offset and
 //! its postings length as a varint. After the blocks comes an **index**:
-//! each block's byte offset and first full key. A trailing footer holds
-//! the term and block counts, the block size and the index offset. A
-//! lookup binary-searches the index for the last first-key `<=` the
-//! probe and decodes that one block sequentially; a prefix scan starts
-//! the same way and walks blocks until the prefix stops matching. This
+//! every block's first full key, concatenated, then a fixed-width table
+//! with each block's byte offset and where its first key begins. A
+//! trailing footer holds the term and block counts, the block size and
+//! the offset of the key area. Fixed-width entries mean the index is
+//! binary-searched in place — opening a dictionary reads only the
+//! footer, however many terms it holds — for the last first-key `<=`
+//! the probe, and that one block is decoded sequentially; a prefix scan
+//! starts the same way and walks blocks until the prefix stops matching.
+//! This
 //! is a third smaller than the FST for the same keys: an FST spends
 //! bytes on transitions and on the value at every leaf, front-coding
 //! spends them only on each key's unshared tail.
@@ -32,7 +36,7 @@
 //! describes. Still written for the term-stats sidecar ([`DictBuilder`])
 //! and read for legacy blobs; [`TermDict`] hides which layout a blob uses.
 
-use std::{collections::BTreeMap, io::Write};
+use std::{cmp::Ordering, collections::BTreeMap, io::Write, mem::take, ops::Range};
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
@@ -203,8 +207,12 @@ impl<'a> DictReader<'a> {
 /// full key per block) is a rounding error.
 pub(crate) const TERM_BLOCK_SIZE: usize = 32;
 /// Trailing footer of a term-block region: `n_terms`, `n_blocks`,
-/// `block_size` (`u32` each) and the index offset (`u64`).
+/// `block_size` (`u32` each) and the offset of the key area (`u64`),
+/// which is also where the blocks end.
 const TERM_BLOCKS_FOOTER_BYTES: usize = 3 * 4 + 8;
+/// One index-table entry: the block's byte offset (`u64`) and the start
+/// of its first key within the key area (`u32`).
+const INDEX_ENTRY_BYTES: usize = 8 + 4;
 /// Term forms in a block entry.
 const FORM_INLINE: u8 = 0;
 const FORM_SHORT: u8 = 1;
@@ -349,7 +357,7 @@ impl<W: Write> TermBlockWriter<W> {
             return Ok(());
         }
         self.index
-            .push((std::mem::take(&mut self.block_first_key), self.written));
+            .push((take(&mut self.block_first_key), self.written));
         self.out.write_all(&self.block)?;
         self.written += self.block.len() as u64;
         self.block.clear();
@@ -360,29 +368,37 @@ impl<W: Write> TermBlockWriter<W> {
     /// Write the last block, the index and the footer; return the sink.
     pub(crate) fn finish(mut self) -> std::io::Result<W> {
         self.flush_block()?;
-        let index_offset = self.written;
+        let keys_offset = self.written;
         let mut tail = Vec::new();
-        for (key, offset) in &self.index {
-            push_varint(&mut tail, key.len() as u32);
+        for (key, _) in &self.index {
             tail.extend_from_slice(key);
-            push_u64_varint(&mut tail, *offset);
+        }
+        let mut key_start = 0u32;
+        for (key, offset) in &self.index {
+            tail.extend_from_slice(&offset.to_le_bytes());
+            tail.extend_from_slice(&key_start.to_le_bytes());
+            key_start += key.len() as u32;
         }
         tail.extend_from_slice(&(self.n_terms as u32).to_le_bytes());
         tail.extend_from_slice(&(self.index.len() as u32).to_le_bytes());
         tail.extend_from_slice(&(TERM_BLOCK_SIZE as u32).to_le_bytes());
-        tail.extend_from_slice(&index_offset.to_le_bytes());
+        tail.extend_from_slice(&keys_offset.to_le_bytes());
         self.out.write_all(&tail)?;
         Ok(self.out)
     }
 }
 
-/// A term-block dictionary over borrowed bytes.
+/// A term-block dictionary over borrowed bytes. Opening reads the
+/// footer only; the index table is consulted in place per lookup, and a
+/// malformed entry answers as an absent key rather than a panic (the
+/// region is CRC-checked at open, so this is defensive).
 pub(crate) struct TermBlocks<'a> {
     bytes: &'a [u8],
-    /// `(first key, block start)` per block, in order.
-    index: Vec<(&'a [u8], usize)>,
-    /// End of the block area (start of the index).
+    n_blocks: usize,
+    /// End of the block area (start of the key area).
     blocks_end: usize,
+    /// End of the key area (start of the index table).
+    keys_end: usize,
 }
 
 impl<'a> TermBlocks<'a> {
@@ -395,64 +411,99 @@ impl<'a> TermBlocks<'a> {
         let n_terms = u32_at(f) as usize;
         let n_blocks = u32_at(f + 4) as usize;
         let block_size = u32_at(f + 8) as usize;
-        let index_offset =
+        let keys_offset =
             u64::from_le_bytes(bytes[f + 12..f + 20].try_into().expect("8 bytes")) as usize;
-        if block_size != TERM_BLOCK_SIZE || index_offset > f {
+        let table_bytes = n_blocks
+            .checked_mul(INDEX_ENTRY_BYTES)
+            .ok_or("term-block dictionary footer is malformed")?;
+        let keys_end = f
+            .checked_sub(table_bytes)
+            .ok_or("term-block index does not fit before the footer")?;
+        if block_size != TERM_BLOCK_SIZE || keys_offset > keys_end || n_terms < n_blocks {
             return Err("term-block dictionary footer is malformed".into());
         }
-        let mut index = Vec::with_capacity(n_blocks);
-        let mut at = index_offset;
-        for _ in 0..n_blocks {
-            let key_len = read_varint(bytes, &mut at).ok_or("term-block index truncated")? as usize;
-            let key = bytes
-                .get(at..at + key_len)
-                .ok_or("term-block index key truncated")?;
-            at += key_len;
-            let offset =
-                read_u64_varint(bytes, &mut at).ok_or("term-block index truncated")? as usize;
-            if offset > index_offset {
-                return Err("term-block index offset past the blocks".into());
-            }
-            index.push((key, offset));
-        }
-        if at != f {
-            return Err("term-block index does not end at the footer".into());
-        }
-        if n_terms < n_blocks {
-            return Err("term-block dictionary footer is malformed".into());
-        }
-        Ok(Self {
+        let dict = Self {
             bytes,
-            index,
-            blocks_end: index_offset,
-        })
+            n_blocks,
+            blocks_end: keys_offset,
+            keys_end,
+        };
+        // The first block starts the region and its first entry is the
+        // first indexed key; the table and footer sit at the end, so a
+        // region whose bytes shifted still parses them yet misreads the
+        // blocks — this one decode catches that.
+        let anchored = match n_blocks {
+            0 => keys_offset == keys_end,
+            _ => {
+                dict.entry(0) == Some((0, 0))
+                    && dict.block_range(0).is_some_and(|range| {
+                        let mut cur = BlockCursor::new(&bytes[range]);
+                        cur.next().is_some() && Some(cur.key.as_slice()) == dict.first_key(0)
+                    })
+            }
+        };
+        if !anchored {
+            return Err("term-block index is misaligned".into());
+        }
+        Ok(dict)
     }
 
-    /// Index of the last block whose first key is `<= key`, if any.
+    /// Block `b`'s byte offset and the start of its first key within the
+    /// key area, straight from the table; `None` past the last block.
+    fn entry(&self, b: usize) -> Option<(usize, usize)> {
+        if b >= self.n_blocks {
+            return None;
+        }
+        let at = self.keys_end + b * INDEX_ENTRY_BYTES;
+        let e = &self.bytes[at..at + INDEX_ENTRY_BYTES];
+        let block_start = u64::from_le_bytes(e[..8].try_into().expect("8 bytes")) as usize;
+        let key_start = u32::from_le_bytes(e[8..].try_into().expect("4 bytes")) as usize;
+        Some((block_start, key_start))
+    }
+
+    /// Block `b`'s first key.
+    fn first_key(&self, b: usize) -> Option<&'a [u8]> {
+        let (_, start) = self.entry(b)?;
+        let end = match self.entry(b + 1) {
+            Some((_, next)) => next,
+            None => self.keys_end - self.blocks_end,
+        };
+        self.bytes
+            .get(self.blocks_end + start..self.blocks_end + end)
+    }
+
+    /// Index of the last block whose first key is `<= key`, if any. A
+    /// malformed entry sorts as greater, so it is never chosen.
     fn block_for(&self, key: &[u8]) -> Option<usize> {
-        let n = self.index.partition_point(|(first, _)| *first <= key);
-        n.checked_sub(1)
+        let (mut lo, mut hi) = (0usize, self.n_blocks);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.first_key(mid) {
+                Some(first) if first <= key => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        lo.checked_sub(1)
     }
 
-    fn block_range(&self, b: usize) -> std::ops::Range<usize> {
-        let start = self.index[b].1;
-        let end = self
-            .index
-            .get(b + 1)
-            .map(|e| e.1)
-            .unwrap_or(self.blocks_end);
-        start..end
+    fn block_range(&self, b: usize) -> Option<Range<usize>> {
+        let (start, _) = self.entry(b)?;
+        let end = match self.entry(b + 1) {
+            Some((next, _)) => next,
+            None => self.blocks_end,
+        };
+        (start <= end && end <= self.blocks_end).then_some(start..end)
     }
 
     /// Exact lookup.
     pub(crate) fn lookup(&self, key: &[u8]) -> Option<FstValue> {
         let b = self.block_for(key)?;
-        let mut cur = BlockCursor::new(&self.bytes[self.block_range(b)]);
+        let mut cur = BlockCursor::new(&self.bytes[self.block_range(b)?]);
         while let Some(entry) = cur.next() {
             match cur.key.as_slice().cmp(key) {
-                std::cmp::Ordering::Less => continue,
-                std::cmp::Ordering::Equal => return Some(entry),
-                std::cmp::Ordering::Greater => return None,
+                Ordering::Less => continue,
+                Ordering::Equal => return Some(entry),
+                Ordering::Greater => return None,
             }
         }
         None
@@ -465,12 +516,12 @@ impl<'a> TermBlocks<'a> {
         prefix: &[u8],
         mut visit: impl FnMut(&[u8], FstValue) -> bool,
     ) {
-        if self.index.is_empty() {
-            return;
-        }
         let mut b = self.block_for(prefix).unwrap_or(0);
-        while b < self.index.len() {
-            let mut cur = BlockCursor::new(&self.bytes[self.block_range(b)]);
+        while b < self.n_blocks {
+            let Some(range) = self.block_range(b) else {
+                return;
+            };
+            let mut cur = BlockCursor::new(&self.bytes[range]);
             while let Some(entry) = cur.next() {
                 let key = cur.key.as_slice();
                 if key < prefix {
@@ -830,6 +881,20 @@ mod tests {
         );
         assert!(TermBlocks::open(&bytes[1..]).is_err(), "shifted bytes");
         assert!(TermBlocks::open(&[]).is_err(), "empty");
+        // A table entry pointing past the blocks answers as absent, not
+        // a panic: corrupt the last entry's block offset.
+        let mut bad = bytes.clone();
+        let f = bad.len() - TERM_BLOCKS_FOOTER_BYTES;
+        let last = f - INDEX_ENTRY_BYTES;
+        bad[last..last + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let d = TermBlocks::open(&bad).expect("footer intact");
+        let (k, _) = items.last().expect("items");
+        assert_eq!(d.lookup(k), None);
+        assert!(
+            TermDict::Blocks(TermBlocks::open(&bad).expect("footer intact"))
+                .iter_prefix(k)
+                .is_empty()
+        );
     }
 
     // --- make_key -------------------------------------------------------
