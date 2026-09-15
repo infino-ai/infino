@@ -414,6 +414,11 @@ const DEFAULT_VECTOR_FINE_NPROBE_PCT: f64 = 0.0;
 /// (0.287–0.294 across the BioASQ diag configs; decisive-geometry
 /// controls cliff shut below it, so they are unaffected by the value).
 const DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK: f32 = 0.30;
+/// Cap on the #515 admit extension as a multiple of the stamped
+/// `width_for_k`: served cells are bounded to `mult * width` so the serve
+/// stays anchored to the target-aware width instead of the unbounded
+/// near-tie window. `1` = width-only (no extension). Default 3.
+const DEFAULT_VECTOR_ADMIT_EXTENSION_MULT: usize = 3;
 /// Default user superfiles the hidden-index drain materializes per batch.
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// Default boundary-replication budget (commit + drain). `<= 1.0` disables
@@ -622,6 +627,10 @@ pub struct VectorSettings {
     /// measure real-query slack, the same distribution mismatch that
     /// under-stamped the width law on such corpora.
     pub serve_near_tie_slack: f32,
+    /// Cap on the #515 admit extension as a multiple of the stamped
+    /// `width_for_k` (see [`DEFAULT_VECTOR_ADMIT_EXTENSION_MULT`]). Anchors
+    /// admission to the target-aware width; `1` disables the extension.
+    pub admit_extension_mult: usize,
     /// K-means training points per centroid for the drain's per-cell
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
@@ -831,6 +840,7 @@ impl Default for VectorSettings {
             target_recall: DEFAULT_VECTOR_TARGET_RECALL,
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
+            admit_extension_mult: DEFAULT_VECTOR_ADMIT_EXTENSION_MULT,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             search_mode: VectorSearchMode::Ivf,
             hnsw_plane: VectorHnswPlane::default(),
@@ -1277,6 +1287,12 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "vector.target_recall must be in (0.0, 1.0], got {}",
                 v.target_recall
+            )));
+        }
+        if v.admit_extension_mult < 1 {
+            return Err(ConfigError::Invalid(format!(
+                "vector.admit_extension_mult ({}) must be >= 1 (1 = width-only)",
+                v.admit_extension_mult
             )));
         }
         for (name, floor) in [

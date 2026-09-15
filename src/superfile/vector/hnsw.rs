@@ -49,9 +49,11 @@ use rayon::prelude::*;
 use crate::superfile::vector::{
     distance::{
         Metric, SQ4_CODE_MAX, SQ4_LOADING_SIGMAS, SQ4_RESIDUAL_CENTER, SQ4_RESIDUAL_DIVISOR,
-        SQ4_ROW_BLOCK, Sq4Kernel, Sq16Kernel, dequantize_sq16_into, distance, encode_sq16_row,
-        quantize_query_i8, sq8_walk_dot,
+        SQ4_ROW_BLOCK, Sq4Kernel, Sq16Kernel, dequantize_sq16_adaptive_into, dequantize_sq16_into,
+        distance, encode_sq16_adaptive_row, encode_sq16_row, quantize_query_i8, sq8_walk_dot,
+        sq16_adaptive_norm_sq,
     },
+    rerank_codec::SQ16_CODE_MAX,
     rotation::RandomRotation,
 };
 
@@ -124,18 +126,56 @@ impl Plane {
     }
 }
 
-/// Sq16 node scorer: one `u16` code per dimension on the fixed cosine
-/// grid, scored with the existing fused-dequant [`Sq16Kernel`] under the
-/// [`Metric::NegDot`] convention (`score = −dot`, so smaller is nearer).
+/// Single-`u16`-plane node scorer: one `u16` code per dimension, scored with
+/// the existing fused-dequant [`Sq16Kernel`]. It carries the column's [`Metric`]
+/// and one of two rulers, so [`Hnsw::build`] / [`Hnsw::search`] grade against
+/// the geometry the column was created with:
 ///
-/// The codes are stored row-major (`dim × 2` bytes per node) and scored
-/// straight from the code bytes — no per-candidate decode buffer.
+/// - **Fixed cosine grid** (`ruler == None`, `metric == NegDot`). The codes are
+///   the flat `[-1, 1]` Sq16 plane; scoring is `−dot`, smaller is nearer. This
+///   is the cosine data graph and the only ruler that existed before the
+///   metric-aware path — every existing constructor produces it, so cosine
+///   behaviour is byte-for-byte unchanged.
+/// - **Fitted global ruler** (`ruler == Some((scale, offset))`). The codes are a
+///   single `u16` plane quantized against ONE per-dim ruler fitted over the
+///   whole graph — the graph-wide counterpart of the IVF rerank path's
+///   per-cluster [`RerankCodec::Sq16Adaptive`](crate::superfile::vector::rerank_codec::RerankCodec::Sq16Adaptive).
+///   (A single ruler, not per-cluster: the plane is node-ordered across every
+///   cell with no cluster to key a ruler on — the same reason [`Sq4Scorer`] fits
+///   a global ruler. 16 bits keeps the intra-cluster resolution a global ruler
+///   spends elsewhere.) Scoring is the column's real `metric` (`L2Sq`/`NegDot`)
+///   via [`Sq16Kernel::new_adaptive`]; `norms` carries per-node `‖x̂‖²` for the
+///   `L2Sq` cross-term (empty for `NegDot`, where the norm cancels).
+///
+/// The codes are stored row-major (`dim × 2` bytes per node) and scored straight
+/// from the code bytes — no per-candidate decode buffer either way.
 pub(crate) struct Sq16Scorer {
     /// `len × dim × 2` little-endian `u16` codes, row-major — owned heap, or a
     /// zero-copy slice of the mapped graph bundle.
     codes: Plane,
     dim: usize,
     len: usize,
+    /// Distance the kernel ranks by. `NegDot` for the fixed cosine grid (its
+    /// `−dot` orders unit vectors the same as cosine); the column's own metric
+    /// for a fitted ruler.
+    metric: Metric,
+    /// `None` = the fixed `[-1, 1]` cosine grid; `Some` = a fitted global ruler.
+    /// Boxed so the cosine scorer — the overwhelming common case, and the one
+    /// embedded in the resident [`HnswIndex`] / `ResidentIndexKind` enum — pays
+    /// only a pointer, not the two ruler vectors plus the norm table inline.
+    adaptive: Option<Box<AdaptiveRuler>>,
+}
+
+/// The fitted-ruler data a metric-aware [`Sq16Scorer`] carries — absent for the
+/// fixed cosine grid.
+struct AdaptiveRuler {
+    /// Per-dim ruler: reconstruction is `x[d] = code[d]·scale[d] + offset[d]`
+    /// (vs the fixed grid's constants). Each `dim` long.
+    scale: Vec<f32>,
+    offset: Vec<f32>,
+    /// Per-node dequantized `‖x̂‖²`, present only for `L2Sq` (the kernel's L2
+    /// cross-term needs it); empty for `NegDot`.
+    norms: Vec<f32>,
 }
 
 impl Sq16Scorer {
@@ -149,11 +189,7 @@ impl Sq16Scorer {
             debug_assert_eq!(v.len(), dim);
             encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
         }
-        Self {
-            codes: Plane::Owned(codes),
-            dim,
-            len: vectors.len(),
-        }
+        Self::cosine(Plane::Owned(codes), dim, vectors.len())
     }
 
     /// Adopt already-encoded Sq16 code bytes verbatim: `codes` is
@@ -161,11 +197,7 @@ impl Sq16Scorer {
     /// on-disk `full[]` Sq16 plane. No decode/re-encode round trip.
     pub(crate) fn from_codes(codes: Vec<u8>, dim: usize, len: usize) -> Self {
         debug_assert_eq!(codes.len(), len * dim * 2);
-        Self {
-            codes: Plane::Owned(codes),
-            dim,
-            len,
-        }
+        Self::cosine(Plane::Owned(codes), dim, len)
     }
 
     /// Adopt an already-backed Sq16 code plane verbatim: the plane holds
@@ -174,7 +206,114 @@ impl Sq16Scorer {
     /// decode/re-encode round trip and, for the shared variant, no heap copy.
     pub(crate) fn from_plane(codes: Plane, dim: usize, len: usize) -> Self {
         debug_assert_eq!(codes.len(), len * dim * 2);
-        Self { codes, dim, len }
+        Self::cosine(codes, dim, len)
+    }
+
+    /// The fixed `[-1, 1]` cosine-grid scorer (`metric == NegDot`, no ruler,
+    /// no norms) — the one shape every legacy constructor produces.
+    fn cosine(codes: Plane, dim: usize, len: usize) -> Self {
+        Self {
+            codes,
+            dim,
+            len,
+            metric: Metric::NegDot,
+            adaptive: None,
+        }
+    }
+
+    /// Adopt a single-`u16` plane quantized against a fitted GLOBAL `(scale,
+    /// offset)` ruler (each `dim` long), scored under `metric`. `norms` are the
+    /// per-node dequantized `‖x̂‖²` and are required for `L2Sq` (the kernel's
+    /// cross-term reads them) and empty for `NegDot`. Cosine never takes this
+    /// path — it keeps the fixed grid.
+    pub(crate) fn from_adaptive_plane(
+        codes: Plane,
+        dim: usize,
+        len: usize,
+        metric: Metric,
+        scale: Vec<f32>,
+        offset: Vec<f32>,
+        norms: Vec<f32>,
+    ) -> Self {
+        debug_assert_eq!(codes.len(), len * dim * 2);
+        debug_assert_eq!(scale.len(), dim);
+        debug_assert_eq!(offset.len(), dim);
+        debug_assert!(metric != Metric::Cosine, "cosine keeps the fixed grid");
+        debug_assert_eq!(
+            norms.len(),
+            if metric == Metric::L2Sq { len } else { 0 },
+            "L2Sq needs one per-node norm; NegDot needs none"
+        );
+        Self {
+            codes,
+            dim,
+            len,
+            metric,
+            adaptive: Some(Box::new(AdaptiveRuler {
+                scale,
+                offset,
+                norms,
+            })),
+        }
+    }
+
+    /// Fit ONE global `(scale, offset)` ruler over `flat` (`len × dim` fp32,
+    /// row-major) and encode it to a single-`u16` adaptive plane scored under
+    /// `metric` — the non-cosine counterpart of [`Self::from_unit_vectors`]. The
+    /// ruler is per-dim `[min, max] → (scale = span/65535, offset = min)`, the
+    /// same fit the IVF per-cluster `Sq16Adaptive` uses, but taken once over the
+    /// whole graph (the plane is node-ordered across cells, with no cluster to
+    /// key a ruler on). A degenerate (constant) dim keeps `scale = 1` so decode
+    /// returns the offset exactly. Per-node `‖x̂‖²` is computed for `L2Sq`.
+    ///
+    /// The ruler is always fit fresh over `flat`. (A ruler-INHERITING variant —
+    /// delta rows landing on a prior plane's ruler, the first-input-ruler rule
+    /// the adaptive codecs follow on merge — belongs with the incremental extend
+    /// path, which does not yet support fitted-ruler graphs.)
+    pub(crate) fn from_fp32_metric(flat: &[f32], dim: usize, len: usize, metric: Metric) -> Self {
+        debug_assert_eq!(flat.len(), len * dim);
+        debug_assert_ne!(metric, Metric::Cosine, "cosine keeps the fixed grid");
+        let (scale, offset) = {
+            let mut lo = vec![f32::INFINITY; dim];
+            let mut hi = vec![f32::NEG_INFINITY; dim];
+            for i in 0..len {
+                let row = &flat[i * dim..(i + 1) * dim];
+                for (d, &x) in row.iter().enumerate() {
+                    lo[d] = lo[d].min(x);
+                    hi[d] = hi[d].max(x);
+                }
+            }
+            let mut scale = vec![1.0f32; dim];
+            let mut offset = vec![0.0f32; dim];
+            for d in 0..dim {
+                // A constant (or empty-plane) coordinate keeps unit scale so the
+                // stored ruler stays finite and round-trips; encode maps it to
+                // code 0 and decode returns `offset` exactly.
+                if lo[d].is_finite() && hi[d] > lo[d] {
+                    offset[d] = lo[d];
+                    scale[d] = (hi[d] - lo[d]) / SQ16_CODE_MAX;
+                } else if lo[d].is_finite() {
+                    offset[d] = lo[d];
+                }
+            }
+            (scale, offset)
+        };
+        let stride = dim * 2;
+        let mut codes = vec![0u8; len * stride];
+        let mut norms = if metric == Metric::L2Sq {
+            vec![0.0f32; len]
+        } else {
+            Vec::new()
+        };
+        for i in 0..len {
+            let src = &flat[i * dim..(i + 1) * dim];
+            let row = &mut codes[i * stride..(i + 1) * stride];
+            encode_sq16_adaptive_row(src, &scale, &offset, row);
+            if metric == Metric::L2Sq {
+                norms[i] = sq16_adaptive_norm_sq(row, dim, &scale, &offset);
+            }
+        }
+        Self::from_adaptive_plane(Plane::Owned(codes), dim, len, metric, scale, offset, norms)
     }
 
     /// The raw node-ordered Sq16 code plane — so an incremental build can
@@ -184,11 +323,70 @@ impl Sq16Scorer {
         self.codes.bytes()
     }
 
+    /// The distance the kernel ranks by (`NegDot` for the fixed cosine grid).
+    pub(crate) fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// The COLUMN metric this scorer serves: the fixed grid serves `Cosine` (its
+    /// `−dot` orders unit vectors the same way), a fitted ruler serves its own
+    /// `metric`. Distinct from [`Self::metric`] — the serving path compares this
+    /// to the column's declared metric to reject a graph built for another.
+    pub(crate) fn served_metric(&self) -> Metric {
+        if self.adaptive.is_none() {
+            Metric::Cosine
+        } else {
+            self.metric
+        }
+    }
+
+    /// The fitted global ruler `(scale, offset)`, or `None` for the fixed
+    /// cosine grid — so [`encode_hnsw`] can persist it.
+    pub(crate) fn ruler(&self) -> Option<(&[f32], &[f32])> {
+        self.adaptive
+            .as_ref()
+            .map(|a| (a.scale.as_slice(), a.offset.as_slice()))
+    }
+
+    /// Per-node dequantized `‖x̂‖²` (non-empty only for a fitted-ruler `L2Sq`
+    /// scorer) — so [`encode_hnsw`] can persist the norm table.
+    pub(crate) fn node_norms(&self) -> &[f32] {
+        self.adaptive.as_ref().map_or(&[], |a| a.norms.as_slice())
+    }
+
+    /// Whether calibration queries drawn from this plane should be
+    /// unit-normalized: yes for the fixed cosine grid (its geometry is
+    /// unit vectors), no for a fitted ruler (magnitude carries signal under
+    /// `L2Sq`/`NegDot`).
+    pub(crate) fn normalizes_queries(&self) -> bool {
+        self.adaptive.is_none()
+    }
+
+    /// Decode one node to fp32 through whichever ruler this scorer holds — the
+    /// fixed grid or the fitted `(scale, offset)`. Used to synthesize
+    /// calibration queries in the plane's own geometry.
+    pub(crate) fn decode_node_into(&self, node: u32, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), self.dim);
+        match &self.adaptive {
+            None => dequantize_sq16_into(self.row(node), out),
+            Some(a) => dequantize_sq16_adaptive_into(self.row(node), &a.scale, &a.offset, out),
+        }
+    }
+
     #[inline]
     fn row(&self, node: u32) -> &[u8] {
         let stride = self.dim * 2;
         let start = node as usize * stride;
         &self.codes.bytes()[start..start + stride]
+    }
+
+    /// Fold a query into the fused kernel through this scorer's ruler + metric.
+    #[inline]
+    fn kernel_for(&self, query: &[f32]) -> Sq16Kernel {
+        match &self.adaptive {
+            None => Sq16Kernel::new(self.metric, query),
+            Some(a) => Sq16Kernel::new_adaptive(self.metric, query, &a.scale, &a.offset),
+        }
     }
 }
 
@@ -206,7 +404,7 @@ impl NodeScorer for Sq16Scorer {
     }
 
     fn prepare(&self, query: &[f32]) -> Sq16Kernel {
-        Sq16Kernel::new(Metric::NegDot, query)
+        self.kernel_for(query)
     }
 
     fn prepare_node(&self, node: u32) -> Sq16Kernel {
@@ -214,16 +412,20 @@ impl NodeScorer for Sq16Scorer {
         // at build time) so it can act as the query for node-to-node
         // distance; candidate scoring below stays fused-from-codes.
         let mut decoded = vec![0.0f32; self.dim];
-        dequantize_sq16_into(self.row(node), &mut decoded);
-        Sq16Kernel::new(Metric::NegDot, &decoded)
+        self.decode_node_into(node, &mut decoded);
+        self.kernel_for(&decoded)
     }
 
     #[inline]
     fn score(&self, q: &Sq16Kernel, node: u32) -> f32 {
-        // NegDot: `distance_with_norm` returns `−dot`, computed by the
-        // fused `u16 → f32` dequant cross kernel straight off the code
-        // bytes — no per-candidate decode.
-        q.distance_with_norm(self.row(node), None)
+        // Fixed cosine grid / NegDot: `distance_with_norm` returns `−dot` with
+        // no norm term. A fitted-ruler L2Sq scorer feeds the node's stored
+        // `‖x̂‖²`; every case is the fused `u16 → f32` dequant cross kernel
+        // straight off the code bytes — no per-candidate decode.
+        let norm = (self.metric == Metric::L2Sq)
+            .then(|| self.adaptive.as_ref().map(|a| a.norms[node as usize]))
+            .flatten();
+        q.distance_with_norm(self.row(node), norm)
     }
 }
 
@@ -1266,23 +1468,37 @@ pub(crate) fn calibration_queries(
 ) -> Vec<Vec<f32>> {
     let n = scorer.len();
     let dim = scorer.dim();
-    let stride = dim * 2;
     let mut rng = seed ^ SPLITMIX64_INCREMENT;
     let nq = n_queries.min(n);
+    // The fixed cosine grid's geometry is unit vectors: jitter by an absolute
+    // amount and renormalize. A fitted ruler (L2Sq/NegDot) is in the column's
+    // own un-normalized space — an absolute 0.05 nudge is negligible next to a
+    // raw vector's components, so recall would read falsely optimistic; scale
+    // the nudge to the vector's magnitude instead, and DON'T renormalize
+    // (magnitude carries signal).
+    let normalize = scorer.normalizes_queries();
     (0..nq)
         .map(|i| {
-            let node = i.wrapping_mul(CALIB_QUERY_STRIDE_MULT) % n;
+            let node = (i.wrapping_mul(CALIB_QUERY_STRIDE_MULT) % n) as u32;
             let mut v = vec![0.0f32; dim];
-            // Straight from the Sq16 codes: a query derived through a
+            // Decoded through the scorer's own ruler: a query derived through a
             // coarse plane would carry that plane's error into the probe.
-            dequantize_sq16_into(&scorer.codes()[node * stride..(node + 1) * stride], &mut v);
+            scorer.decode_node_into(node, &mut v);
+            let jitter = if normalize {
+                CALIB_QUERY_JITTER
+            } else {
+                let rms = (v.iter().map(|a| a * a).sum::<f32>() / dim as f32).sqrt();
+                CALIB_QUERY_JITTER * rms.max(1e-12)
+            };
             for x in &mut v {
                 let u = (splitmix64(&mut rng) >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
-                *x += (u * 2.0 - 1.0) * CALIB_QUERY_JITTER;
+                *x += (u * 2.0 - 1.0) * jitter;
             }
-            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
-            for x in &mut v {
-                *x /= norm;
+            if normalize {
+                let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
+                for x in &mut v {
+                    *x /= norm;
+                }
             }
             v
         })
@@ -1815,7 +2031,7 @@ const HNSW_DATA_MAGIC_V3: &[u8; 8] = b"INFDDG03";
 /// `k`) on `v03`/`v02` — today's exact behavior, no forced rebuild.
 const HNSW_DATA_MAGIC_V4: &[u8; 8] = b"INFDDG04";
 /// All magics are 8 bytes; the shared byte width of the leading tag.
-const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V4.len();
+pub(crate) const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V4.len();
 /// Byte size of the fixed frame of a data bundle: magic(8) + n(u64) + dim(u32)
 /// + ef(u32) + col_len(u32) + graph_len(u64). The variable-length column name,
 /// doc-id map, Sq16/SQ8 planes, and graph bytes are added on top; naming it
@@ -1836,6 +2052,42 @@ const HNSW_DATA_FIXED_BYTES: usize = HNSW_DATA_MAGIC_LEN + 8 + 4 + 4 + 4 + 8;
 /// would take the column-name length out of the middle of the header and
 /// mis-slice every section after it.
 const HNSW_DATA_MAGIC_V5: &[u8; 8] = b"INFDDG05";
+
+/// `v06` makes the Sq16 refine plane metric-aware. It appends, after `v05`'s
+/// trailing k→ef curve, a metric byte and — for a non-cosine column — the
+/// single fitted global ruler (`scale[dim]`, `offset[dim]`) the plane was
+/// quantized against plus, for `L2Sq`, the per-node `‖x̂‖²` table. Cosine
+/// columns keep writing `v05` (fixed `[-1, 1]` grid, `−dot`), so every existing
+/// cosine bundle and reader is untouched; only L2Sq/NegDot columns — which
+/// `v05` and earlier declined to build a graph for at all — reach `v06`.
+///
+/// The ruler + norms ride at the END rather than the header so the entire
+/// `v05` sequential read (doc-ids, Sq16/walk planes, graph, curve) is byte-for
+/// -byte unchanged; `v06` reads three extra trailing sections and rebuilds a
+/// metric-aware scorer from them instead of the fixed-grid one.
+pub(crate) const HNSW_DATA_MAGIC_V6: &[u8; 8] = b"INFDDG06";
+
+/// Wire tag for the column metric stamped in a `v06` bundle. Local to the
+/// bundle format so the on-disk mapping cannot drift with an unrelated enum
+/// reorder elsewhere.
+fn metric_tag(metric: Metric) -> u8 {
+    match metric {
+        Metric::Cosine => 0,
+        Metric::L2Sq => 1,
+        Metric::NegDot => 2,
+    }
+}
+
+/// Inverse of [`metric_tag`]; `None` for an unknown tag (a newer build) so the
+/// bundle decodes to `None` and the query serves ivf rather than misreading it.
+fn metric_from_tag(tag: u8) -> Option<Metric> {
+    match tag {
+        0 => Some(Metric::Cosine),
+        1 => Some(Metric::L2Sq),
+        2 => Some(Metric::NegDot),
+        _ => None,
+    }
+}
 
 /// Which resident plane the graph walk scores candidates on.
 ///
@@ -1977,6 +2229,12 @@ pub(crate) struct HnswIndex {
 /// `sq4` must be `Some` exactly when `walk` names a 4-bit codec; the caller
 /// builds it from the same `sq16_codes` written here, so the two cannot
 /// describe different rows.
+///
+/// `ruler` makes the Sq16 refine plane metric-aware: `None` writes a `v05`
+/// bundle (the fixed `[-1, 1]` cosine grid, scored `−dot`); `Some((scale,
+/// offset))` writes a `v06` bundle stamping `metric` plus that single fitted
+/// global ruler and, for `L2Sq`, the per-node `‖x̂‖²` in `norms`. Cosine passes
+/// `None`, so its bytes are unchanged.
 pub(crate) fn encode_hnsw(
     sq16_codes: &[u8],
     doc_ids: &[i128],
@@ -1987,6 +2245,9 @@ pub(crate) fn encode_hnsw(
     column: &str,
     walk: WalkCodec,
     sq4: Option<&Sq4Scorer>,
+    metric: Metric,
+    ruler: Option<(&[f32], &[f32])>,
+    norms: &[f32],
 ) -> Vec<u8> {
     let n = doc_ids.len();
     debug_assert_eq!(sq16_codes.len(), n * dim * 2);
@@ -1994,6 +2255,19 @@ pub(crate) fn encode_hnsw(
         walk.is_sq4(),
         sq4.is_some(),
         "the 4-bit plane must be supplied exactly when the codec names it"
+    );
+    // A fitted ruler makes this a v06 (metric-aware) bundle; its absence is the
+    // fixed-grid cosine v05. Guard the shapes the two trailing sections assume.
+    let v6 = ruler.is_some();
+    if let Some((scale, offset)) = ruler {
+        debug_assert_ne!(metric, Metric::Cosine, "cosine keeps the fixed grid (v05)");
+        debug_assert_eq!(scale.len(), dim, "ruler scale length vs dim");
+        debug_assert_eq!(offset.len(), dim, "ruler offset length vs dim");
+    }
+    debug_assert_eq!(
+        norms.len(),
+        if v6 && metric == Metric::L2Sq { n } else { 0 },
+        "L2Sq stamps one norm per node; every other case stamps none"
     );
     let graph_bytes = graph.to_bytes();
     let col = column.as_bytes();
@@ -2010,6 +2284,13 @@ pub(crate) fn encode_hnsw(
     };
     // The trailing k→ef curve: a u16 count then `(u32 k, u32 ef)` per pair.
     let curve_len = 2 + ef_curve.len() * 8;
+    // v06 metric-aware trailer: metric byte, and for a fitted ruler the two
+    // f32 ruler vectors plus the per-node norm table (L2Sq only).
+    let meta_len = if v6 {
+        1 + dim * 2 * 4 + norms.len() * 4
+    } else {
+        0
+    };
     let mut out = Vec::with_capacity(
         HNSW_DATA_FIXED_BYTES
             + 1
@@ -2018,9 +2299,14 @@ pub(crate) fn encode_hnsw(
             + sq16_codes.len()
             + walk_len
             + graph_bytes.len()
-            + curve_len,
+            + curve_len
+            + meta_len,
     );
-    out.extend_from_slice(HNSW_DATA_MAGIC_V5);
+    out.extend_from_slice(if v6 {
+        HNSW_DATA_MAGIC_V6
+    } else {
+        HNSW_DATA_MAGIC_V5
+    });
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     // Was reserved / alignment; now the stamped recall@10 query beam (u32).
@@ -2081,6 +2367,21 @@ pub(crate) fn encode_hnsw(
         out.extend_from_slice(&k.to_le_bytes());
         out.extend_from_slice(&ef.to_le_bytes());
     }
+    // v06 metric-aware trailer, after the curve so the whole v05 layout above is
+    // untouched: metric byte, then (fitted ruler only) `scale`, `offset`, and
+    // the per-node norm table. Cosine wrote v05 and skips all of this.
+    if let Some((scale, offset)) = ruler {
+        out.push(metric_tag(metric));
+        for &s in scale {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for &o in offset {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        for &nsq in norms {
+            out.extend_from_slice(&nsq.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -2124,24 +2425,28 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
     let bytes: &[u8] = bundle.as_ref();
     let mut c = Cursor::new(bytes);
     let magic = c.take(HNSW_DATA_MAGIC_LEN)?;
-    // Two independent format axes, so three facts per magic:
-    //   - `walk_tag`: does the header carry the walk-codec byte? `v05` only.
+    // Independent format axes, so four facts per magic:
+    //   - `walk_tag`: does the header carry the walk-codec byte? `v05`/`v06`.
     //   - `implied_walk`: for the versions that predate that byte, the codec
     //     their layout implies — `v03`/`v04` always wrote the SQ8 section,
     //     `v02` wrote none, so SQ8 is derived on read.
-    //   - `has_curve`: is the trailing k→ef curve present? `v04`/`v05`. Older
-    //     bundles synthesize a degenerate 1-point curve from the single stamped
-    //     `ef` below.
+    //   - `has_curve`: is the trailing k→ef curve present? `v04`/`v05`/`v06`.
+    //     Older bundles synthesize a degenerate 1-point curve from the single
+    //     stamped `ef` below.
+    //   - `metric_aware`: does a metric + fitted-ruler trailer follow the curve?
+    //     `v06` only; every older bundle is the fixed `[-1, 1]` cosine grid.
     // Any other tag (e.g. a legacy `01`) is unsupported → `None`, and the query
     // serves ivf until the next drain rebuilds.
-    let (walk_tag, implied_walk, has_curve) = if magic == HNSW_DATA_MAGIC_V5 {
-        (true, WalkCodec::Sq16, true)
+    let (walk_tag, implied_walk, has_curve, metric_aware) = if magic == HNSW_DATA_MAGIC_V6 {
+        (true, WalkCodec::Sq16, true, true)
+    } else if magic == HNSW_DATA_MAGIC_V5 {
+        (true, WalkCodec::Sq16, true, false)
     } else if magic == HNSW_DATA_MAGIC_V4 {
-        (false, WalkCodec::Sq8, true)
+        (false, WalkCodec::Sq8, true, false)
     } else if magic == HNSW_DATA_MAGIC_V3 {
-        (false, WalkCodec::Sq8, false)
+        (false, WalkCodec::Sq8, false, false)
     } else if magic == HNSW_DATA_MAGIC_V2 {
-        (false, WalkCodec::Sq16, false)
+        (false, WalkCodec::Sq16, false, false)
     } else {
         return None;
     };
@@ -2198,7 +2503,11 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
     let mut sq8_plane = Plane::Owned(Vec::new());
     match stored {
         WalkCodec::Sq16 => {
-            if want != WalkCodec::Sq16 {
+            // A metric-aware (fitted-ruler) bundle never serves a derived SQ8
+            // walk: the high byte of a per-dim adaptive code is not a valid
+            // proximity proxy, so the serve path walks the Sq16 plane directly.
+            // Deriving one anyway would just waste `n × dim` bytes.
+            if want != WalkCodec::Sq16 && !metric_aware {
                 sq8_plane = Plane::Owned(derive_sq8_plane(sq16_slice));
             }
         }
@@ -2292,7 +2601,46 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
     } else {
         ef_curve
     };
-    let scorer = Sq16Scorer::from_plane(Plane::Shared(sq16_plane), dim, n);
+    // The refine scorer: the fixed cosine grid for every pre-`v06` bundle, or
+    // the fitted-ruler metric-aware plane read from the `v06` trailer. The Sq16
+    // plane bytes are identical either way — only the ruler/metric/norms the
+    // scorer scores them through differ.
+    let scorer = if metric_aware {
+        let metric = metric_from_tag(c.u8()?)?;
+        // A cosine tag in a v06 trailer is malformed (cosine writes v05); reject
+        // rather than build a fitted-ruler scorer that will not be exercised.
+        if metric == Metric::Cosine {
+            return None;
+        }
+        // Bound the ruler read (two f32 vectors) before taking it.
+        if dim.checked_mul(2)?.checked_mul(4)? > c.remaining() {
+            return None;
+        }
+        let scale = read_f32_le(c.take(dim.checked_mul(4)?)?);
+        let offset = read_f32_le(c.take(dim.checked_mul(4)?)?);
+        // Per-node norms follow for L2Sq only (the kernel's cross-term needs
+        // them); NegDot stamps none. Bound the read before taking it.
+        let norms = if metric == Metric::L2Sq {
+            let norm_bytes = n.checked_mul(4)?;
+            if norm_bytes > c.remaining() {
+                return None;
+            }
+            read_f32_le(c.take(norm_bytes)?)
+        } else {
+            Vec::new()
+        };
+        Sq16Scorer::from_adaptive_plane(
+            Plane::Shared(sq16_plane),
+            dim,
+            n,
+            metric,
+            scale,
+            offset,
+            norms,
+        )
+    } else {
+        Sq16Scorer::from_plane(Plane::Shared(sq16_plane), dim, n)
+    };
     Some(HnswIndex {
         scorer,
         graph,
@@ -3605,6 +3953,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         assert_eq!(
             &bytes[..HNSW_DATA_MAGIC_LEN],
@@ -3695,6 +4046,9 @@ mod tests {
                 "emb",
                 walk,
                 Some(&sq4),
+                Metric::Cosine,
+                None,
+                &[],
             );
             assert_eq!(
                 &bytes[..HNSW_DATA_MAGIC_LEN],
@@ -3722,6 +4076,78 @@ mod tests {
                     graph.search(original, q, 10, 64),
                     idx.graph.search(restored, q, 10, 64),
                     "restored Sq4 bundle search diverged"
+                );
+            }
+        }
+    }
+
+    /// The metric-aware `v06` bundle round-trips a fitted-ruler plane: the
+    /// metric, the single global `(scale, offset)` ruler, and — for L2Sq — the
+    /// per-node norm table, all recovered so a decoded graph scores exactly the
+    /// distances it was built on. Covers both non-cosine metrics: L2Sq (carries
+    /// norms) and NegDot (no norms).
+    #[test]
+    fn hnsw_bundle_roundtrip_v06_metric_aware() {
+        let dim = 20;
+        let n = 800;
+        for metric in [Metric::L2Sq, Metric::NegDot] {
+            // Non-unit vectors so the ruler spans a real range and, under L2Sq,
+            // the per-node norms actually vary.
+            let flat: Vec<f32> = random_unit_vectors(n, dim, 0xA11CE)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, x)| x * (1.0 + (i % 5) as f32))
+                .collect();
+            let scorer = Sq16Scorer::from_fp32_metric(&flat, dim, n, metric);
+            assert_eq!(scorer.served_metric(), metric);
+            assert!(scorer.ruler().is_some(), "a fitted ruler must be present");
+            assert_eq!(
+                scorer.node_norms().len(),
+                if metric == Metric::L2Sq { n } else { 0 },
+                "L2Sq stamps one norm per node; NegDot stamps none"
+            );
+            let graph = Hnsw::build(&scorer, HnswParams::default());
+            let doc_ids: Vec<i128> = (0..n as i128).map(|i| 500 + i * 3).collect();
+            let curve: Vec<(u32, u32)> = vec![(10, 128)];
+            let (rscale, roffset) = scorer.ruler().expect("ruler");
+            let bytes = encode_hnsw(
+                scorer.codes(),
+                &doc_ids,
+                &graph,
+                dim,
+                128,
+                &curve,
+                "emb",
+                WalkCodec::Sq16,
+                None,
+                metric,
+                Some((rscale, roffset)),
+                scorer.node_norms(),
+            );
+            assert_eq!(
+                &bytes[..HNSW_DATA_MAGIC_LEN],
+                HNSW_DATA_MAGIC_V6,
+                "a fitted-ruler bundle stamps the v06 magic"
+            );
+            let idx = decode_hnsw(&Bytes::from(bytes), Some(WalkCodec::Sq16)).expect("decode v06");
+            assert_eq!(idx.scorer.served_metric(), metric, "metric round-trips");
+            let (dscale, doffset) = idx.scorer.ruler().expect("ruler round-trips");
+            assert_eq!(dscale, rscale, "ruler scale round-trips");
+            assert_eq!(doffset, roffset, "ruler offset round-trips");
+            assert_eq!(
+                idx.scorer.node_norms(),
+                scorer.node_norms(),
+                "norm table round-trips"
+            );
+            // The decoded graph scores exactly what the built one does — the
+            // whole point of persisting the ruler + norms rather than a plane on
+            // the wrong grid.
+            for q in random_unit_vectors(15, dim, 0xF00D) {
+                assert_eq!(
+                    graph.search(&scorer, &q, 10, 64),
+                    idx.graph.search(&idx.scorer, &q, 10, 64),
+                    "{metric:?}: metric-aware bundle search diverged"
                 );
             }
         }
@@ -3770,6 +4196,9 @@ mod tests {
                 "emb",
                 walk,
                 sq4.as_ref(),
+                Metric::Cosine,
+                None,
+                &[],
             );
             let bundle = Bytes::from(bytes);
 
@@ -3856,6 +4285,9 @@ mod tests {
                 "emb",
                 walk,
                 sq4.as_ref(),
+                Metric::Cosine,
+                None,
+                &[],
             ));
 
             // What maintenance does: hydrate as stored, re-encode on the
@@ -3871,6 +4303,9 @@ mod tests {
                 &prior.column,
                 prior.stored_walk,
                 prior.sq4.as_ref(),
+                Metric::Cosine,
+                None,
+                &[],
             ));
             assert_eq!(
                 first, again,
@@ -3916,6 +4351,9 @@ mod tests {
             column,
             WalkCodec::Sq4,
             Some(&sq4),
+            Metric::Cosine,
+            None,
+            &[],
         );
 
         // Walk the header to the ruler's `step` vector and zero its first
@@ -4142,6 +4580,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         assert_eq!(&v5[..HNSW_DATA_MAGIC_LEN], HNSW_DATA_MAGIC_V5);
 
@@ -4259,6 +4700,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         let idx_off =
             decode_hnsw(&Bytes::from(v5_again), Some(WalkCodec::Sq16)).expect("decode v05 sq8-off");
@@ -4364,6 +4808,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         let idx = decode_hnsw(&Bytes::from(bytes), Some(WalkCodec::Sq8)).expect("decode bundle");
         assert!(
