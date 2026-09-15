@@ -213,7 +213,6 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
             let code_max = codec.code_max();
             let mut lo = vec![0f32; dim];
             let mut hi = vec![0f32; dim];
-            let mut min_scale = vec![0f32; dim];
             for c in 0..n_cent {
                 let base = c * dim;
                 let mut any = false;
@@ -228,14 +227,12 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                         for d in 0..dim {
                             lo[d] = o[d];
                             hi[d] = o[d] + s[d] * code_max;
-                            min_scale[d] = s[d];
                         }
                         any = true;
                     } else {
                         for d in 0..dim {
                             lo[d] = lo[d].min(o[d]);
                             hi[d] = hi[d].max(o[d] + s[d] * code_max);
-                            min_scale[d] = min_scale[d].min(s[d]);
                         }
                     }
                 }
@@ -246,16 +243,16 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                 }
                 for d in 0..dim {
                     dst_offset[base + d] = lo[d];
-                    // Guard a zero-span union (every contributing input pinned
-                    // the same constant offset with `scale == 0`): fall back to
-                    // the smallest input scale when it is positive, else a tiny
-                    // epsilon, so decode never divides by zero / yields a
-                    // zero-width grid. A positive scale in any input forces
-                    // `hi > lo`, so this branch is defensive.
+                    // Guard a zero-span union (a dimension every contributing
+                    // input pinned to the same constant with `scale == 0`): fall
+                    // back to a tiny epsilon so decode never divides by zero /
+                    // yields a zero-width grid. A zero span forces every input's
+                    // scale to 0 at this dimension, so no positive input scale
+                    // survives to fall back to — a positive scale in any input
+                    // forces `hi > lo` and takes the first branch. This branch is
+                    // defensive.
                     dst_scale[base + d] = if hi[d] > lo[d] {
                         (hi[d] - lo[d]) / code_max
-                    } else if min_scale[d] > 0.0 {
-                        min_scale[d]
                     } else {
                         f32::EPSILON
                     };
