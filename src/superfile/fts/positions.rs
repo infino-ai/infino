@@ -260,15 +260,26 @@ impl StreamIndex {
 }
 
 /// Which layout the located group has.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum GroupKind {
     /// Decoded whole into `values`: LEB128 runs allow no random access,
     /// and only a short-form term (read once, whole) still writes them.
     #[default]
     Leb128,
-    /// Two packed streams read lane by lane.
+    /// Two packed streams read lane by lane, one run at a time.
     Packed,
+    /// The packed streams read whole into `firsts` and `gaps` — the block
+    /// is being visited densely, and one sequential pass over each stream
+    /// is cheaper than a random read per run.
+    Bulk,
 }
+
+/// Runs read one at a time from a packed group before the rest of the
+/// block is decoded in bulk. A phrase driven by a rare member asks for
+/// one or two runs per block of a common member and never reaches this;
+/// a phrase of common members asks for most of them, and paid two to
+/// three times the sequential decode's cost per run before this switch.
+const BULK_AFTER_RUNS: u32 = 2;
 
 /// A position group located for **per-run** access: one pair's run is
 /// decoded without touching the block's other runs. A phrase visits few
@@ -285,6 +296,11 @@ pub(crate) struct GroupIndex {
     /// A packed group's first-position and gap streams.
     first: StreamIndex,
     gap: StreamIndex,
+    /// The streams decoded whole once the block proves dense.
+    firsts: Vec<u32>,
+    gaps: Vec<u32>,
+    /// Runs served from this block so far.
+    served: u32,
     /// Where pair `p`'s lanes begin: in the gap stream (`Σ (tf - 1)` over
     /// the pairs before it) for a packed group, in the values (`Σ tf`)
     /// for a LEB128 one. `tfs.len() + 1` entries.
@@ -300,6 +316,7 @@ impl GroupIndex {
     /// relocated before use.
     pub(crate) fn locate(&mut self, bytes: &[u8], at: &mut usize, tfs: &[u32]) -> Option<()> {
         let n: usize = tfs.iter().map(|&t| t as usize).sum();
+        self.served = 0;
         let header = *bytes.get(*at)?;
         *at += 1;
         let lanes_per_pair: fn(u32) -> u32 = match header {
@@ -341,6 +358,16 @@ impl GroupIndex {
         out: &mut Vec<u32>,
     ) -> Option<()> {
         let start = *self.starts.get(pair)? as usize;
+        if self.kind == GroupKind::Packed && self.served >= BULK_AFTER_RUNS {
+            self.firsts.clear();
+            self.gaps.clear();
+            let n_pairs = self.starts.len() - 1;
+            let n_gaps = *self.starts.last()? as usize;
+            self.first.read_lanes(bytes, 0, n_pairs, &mut self.firsts)?;
+            self.gap.read_lanes(bytes, 0, n_gaps, &mut self.gaps)?;
+            self.kind = GroupKind::Bulk;
+        }
+        self.served += 1;
         self.run.clear();
         match self.kind {
             GroupKind::Leb128 => {
@@ -351,6 +378,11 @@ impl GroupIndex {
                 self.first.read_lanes(bytes, pair, 1, &mut self.run)?;
                 self.gap
                     .read_lanes(bytes, start, tf as usize - 1, &mut self.run)?;
+            }
+            GroupKind::Bulk => {
+                self.run.push(*self.firsts.get(pair)?);
+                self.run
+                    .extend_from_slice(self.gaps.get(start..start + tf as usize - 1)?);
             }
         }
         positions_from_run_values(&self.run, out)
@@ -469,6 +501,58 @@ mod tests {
                 .is_none(),
             "width past 32"
         );
+    }
+
+    #[test]
+    fn a_dense_walk_switches_to_the_bulk_decode_and_agrees() {
+        // Reading every pair of a packed group in order crosses the bulk
+        // threshold after a few runs; the answers before and after the
+        // switch are the same positions, and a fresh index reading pairs
+        // out of order (never dense) agrees too.
+        let tfs: Vec<u32> = (0..128u32).map(|d| 1 + d % 4).collect();
+        let mut vals = Vec::new();
+        for (d, &tf) in tfs.iter().enumerate() {
+            vals.push(11 * d as u32 + 2);
+            vals.extend((1..tf).map(|g| 2 + (g * 7 + d as u32) % 13));
+        }
+        vals[4] = 1 << 22;
+        let want = positions_of(&tfs, &vals);
+        let mut out = Vec::new();
+        encode_group(&mut out, &tfs, &vals, false);
+        let mut dense = GroupIndex::default();
+        dense.locate(&out, &mut 0, &tfs).expect("locates");
+        assert_eq!(dense.kind, GroupKind::Packed);
+        let mut got = Vec::new();
+        for (pair, &tf) in tfs.iter().enumerate() {
+            dense.run_positions(&out, pair, tf, &mut got).expect("run");
+            if pair as u32 > BULK_AFTER_RUNS {
+                assert_eq!(dense.kind, GroupKind::Bulk, "pair {pair}");
+            }
+        }
+        assert_eq!(got, want);
+        let mut sparse = GroupIndex::default();
+        sparse.locate(&out, &mut 0, &tfs).expect("locates");
+        let mut wi: Vec<usize> = std::iter::once(0)
+            .chain(tfs.iter().scan(0usize, |a, &t| {
+                *a += t as usize;
+                Some(*a)
+            }))
+            .collect();
+        wi.pop();
+        for pair in [127usize, 0, 64] {
+            let mut one = Vec::new();
+            sparse
+                .run_positions(&out, pair, tfs[pair], &mut one)
+                .expect("run");
+            assert_eq!(
+                one,
+                want[wi[pair]..wi[pair] + tfs[pair] as usize],
+                "pair {pair}"
+            );
+        }
+        // Relocating resets the count: the next block starts per-run.
+        dense.locate(&out, &mut 0, &tfs).expect("relocates");
+        assert_eq!(dense.kind, GroupKind::Packed);
     }
 
     #[test]
