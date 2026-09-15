@@ -115,11 +115,13 @@ pub const ENCODING_PACKED: u8 = 0;
 /// ```
 ///
 /// Deltas here are explicit (`doc[0] - base`, then `doc[i] -
-/// doc[i-1]`, padding lanes 0), prefix-summed by the reader after the
-/// exceptions are patched in — the sorted bit-packer's fused prefix sum
-/// cannot see a patch. Chosen only when it is the smallest of the three
-/// encodings for the block, so a block with uniform widths stays
-/// [`ENCODING_PACKED`] and decodes exactly as before.
+/// doc[i-1]`, padding lanes 0). The reader prefix-sums the low bits
+/// with the same fused kernel a plain block uses and then adds each
+/// exception's high bits to every lane from its own on — exceptions are
+/// listed in ascending lane order so that is one cumulative pass.
+/// Chosen only when it is the smallest of the three encodings for the
+/// block, so a block with uniform widths stays [`ENCODING_PACKED`] and
+/// decodes exactly as before.
 pub const ENCODING_PATCHED: u8 = 2;
 /// Most exception lanes a patched stream may carry: the header's count
 /// field is five bits, and past this the stream is better off wider.
@@ -214,6 +216,7 @@ impl BlockHeader {
     /// `bytes` is shorter than the header, or a field is out of range.
     /// The postings region is CRC-validated at open, so this is the
     /// caller's guarantee.
+    #[inline]
     pub fn parse(bytes: &[u8], layout: BlockLayout, prev_last_doc_id: Option<u32>) -> Self {
         assert!(
             bytes.len() >= COMPACT_HEADER_SIZE,
@@ -642,9 +645,15 @@ pub fn decode_block(
     count
 }
 
-/// Unpack a patched block's low delta bits, patch the exceptions in and
-/// prefix-sum from the base. Returns the offset where the tf exceptions
-/// begin — the delta list's end, found in the same pass that applied it.
+/// Decode a patched block's doc ids: the low delta bits through the
+/// same fused unpack-and-prefix-sum the plain layout uses, then the
+/// exceptions. An exception adds `hi << width` to one *delta*, which
+/// adds it to every doc id from that lane on — so the exceptions, which
+/// the writer lists in ascending lane order, are applied as one
+/// cumulative pass over the lanes past the first: each lane gets the
+/// sum of the exceptions at or before it, about a hundred adds the
+/// compiler vectorizes, however many exceptions there are. Returns the
+/// offset where the tf exceptions begin.
 fn decode_patched_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u32]) -> usize {
     assert!(
         dest_doc_ids.len() >= BLOCK_LEN,
@@ -657,20 +666,48 @@ fn decode_patched_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u
         bytes.len(),
         hdr.payload + deltas_size
     );
-    BitPacker4x::new().decompress(
+    BitPacker4x::new().decompress_sorted(
+        hdr.base,
         &bytes[hdr.payload..hdr.payload + deltas_size],
         &mut dest_doc_ids[..BLOCK_LEN],
         hdr.delta_bits,
     );
-    let tf_exc_start = patch_lanes(
-        bytes,
-        hdr.payload + deltas_size,
-        hdr.n_delta_exc,
-        hdr.delta_bits,
-        dest_doc_ids,
-    );
-    prefix_sum_block(&mut dest_doc_ids[..BLOCK_LEN], hdr.base);
-    tf_exc_start
+    let dest = &mut dest_doc_ids[..BLOCK_LEN];
+    let mut at = hdr.payload + deltas_size;
+    let mut acc: u32 = 0;
+    let mut from = 0usize;
+    for _ in 0..hdr.n_delta_exc {
+        let (lane, hi, next) = read_exception(bytes, at);
+        at = next;
+        if lane > from {
+            for v in &mut dest[from..lane] {
+                *v = v.wrapping_add(acc);
+            }
+            from = lane;
+        }
+        acc = acc.wrapping_add(hi << hdr.delta_bits);
+    }
+    if acc != 0 {
+        for v in &mut dest[from..] {
+            *v = v.wrapping_add(acc);
+        }
+    }
+    at
+}
+
+/// One exception at `at`: its lane, its high bits, and the offset past
+/// it. The one-byte high value most exceptions carry skips the general
+/// varint decode.
+#[inline]
+fn read_exception(bytes: &[u8], at: usize) -> (usize, u32, usize) {
+    let lane = bytes[at] as usize;
+    let first = bytes[at + 1];
+    if first < CONTINUATION_BIT {
+        return (lane, u32::from(first), at + 2);
+    }
+    let mut next = at + 1;
+    let hi = read_varint(bytes, &mut next).expect("patched block exception within block");
+    (lane, hi, next)
 }
 
 /// OR `n` exceptions starting at `at` — each a lane byte and its high
@@ -681,18 +718,8 @@ fn decode_patched_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u
 #[inline]
 fn patch_lanes(bytes: &[u8], mut at: usize, n: usize, width: u8, dest: &mut [u32]) -> usize {
     for _ in 0..n {
-        let lane = bytes[at] as usize;
-        let first = bytes[at + 1];
-        let hi = match first < CONTINUATION_BIT {
-            true => {
-                at += 2;
-                u32::from(first)
-            }
-            false => {
-                at += 1;
-                read_varint(bytes, &mut at).expect("patched block exception within block")
-            }
-        };
+        let (lane, hi, next) = read_exception(bytes, at);
+        at = next;
         dest[lane] |= hi << width;
     }
     at
@@ -742,41 +769,6 @@ pub(crate) fn patched_exception_ranges(
     let tf_exc_start = skip_lanes(bytes, delta_exc_start, hdr.n_delta_exc);
     let end = skip_lanes(bytes, tf_exc_start, hdr.n_tf_exc);
     (delta_exc_start..tf_exc_start, tf_exc_start..end)
-}
-
-/// Turn a block's deltas into doc ids in place: `dest[i] = base + Σ
-/// dest[..=i]`. Four independent quarter-block chains, each quarter then
-/// offset by the totals before it, so the adds pipeline four abreast
-/// where one chain over the whole block would wait on every add.
-fn prefix_sum_block(dest: &mut [u32], base: u32) {
-    const QUARTER: usize = BLOCK_LEN / 4;
-    let (q0, rest) = dest.split_at_mut(QUARTER);
-    let (q1, rest) = rest.split_at_mut(QUARTER);
-    let (q2, q3) = rest.split_at_mut(QUARTER);
-    let (mut s0, mut s1, mut s2, mut s3) = (base, 0u32, 0u32, 0u32);
-    for (((a, b), c), d) in q0
-        .iter_mut()
-        .zip(q1.iter_mut())
-        .zip(q2.iter_mut())
-        .zip(q3.iter_mut())
-    {
-        s0 = s0.wrapping_add(*a);
-        *a = s0;
-        s1 = s1.wrapping_add(*b);
-        *b = s1;
-        s2 = s2.wrapping_add(*c);
-        *c = s2;
-        s3 = s3.wrapping_add(*d);
-        *d = s3;
-    }
-    let o1 = s0;
-    let o2 = o1.wrapping_add(s1);
-    let o3 = o2.wrapping_add(s2);
-    for (q, o) in [(q1, o1), (q2, o2), (q3, o3)] {
-        for v in q.iter_mut() {
-            *v = v.wrapping_add(o);
-        }
-    }
 }
 
 /// Decode only the tf array of a block (the trailing tf-packed bytes) into

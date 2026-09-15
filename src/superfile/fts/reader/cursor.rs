@@ -552,6 +552,9 @@ pub(crate) struct TermCursor {
     pub(super) predecoded: bool,
     /// Which header the blocks carry (from the blob version).
     pub(super) layout: BlockLayout,
+    /// The parsed header of the block it names — the membership probes
+    /// visit one block many times and must not re-parse it per probe.
+    header_cache: Option<(usize, BlockHeader)>,
 }
 
 impl TermCursor {
@@ -635,6 +638,7 @@ impl TermCursor {
             tf_decoded_block: usize::MAX,
             predecoded: false,
             layout: term_meta.block_layout,
+            header_cache: None,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -701,6 +705,7 @@ impl TermCursor {
             tf_decoded_block: 0,
             predecoded: true,
             layout: BlockLayout::Compact,
+            header_cache: None,
         })
     }
 
@@ -759,6 +764,7 @@ impl TermCursor {
             tf_decoded_block: 0,
             predecoded: true,
             layout: BlockLayout::Compact,
+            header_cache: None,
         }
     }
 
@@ -779,12 +785,27 @@ impl TermCursor {
         )
     }
 
+    /// The current block's parsed header, cached across probes of the
+    /// same block.
+    #[inline]
+    fn current_header(&mut self) -> BlockHeader {
+        let b = self.current_block;
+        if let Some((cached, hdr)) = self.header_cache
+            && cached == b
+        {
+            return hdr;
+        }
+        let hdr = self.block_header(b);
+        self.header_cache = Some((b, hdr));
+        hdr
+    }
+
     pub(super) fn decode_current_block(&mut self) {
         debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
         let block = self.blocks[self.current_block];
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
-        let hdr = self.block_header(self.current_block);
+        let hdr = self.current_header();
         let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
         // Count-only cursors skip the tf half of the block; the count
         // kernels never read `block_tfs`, so it is left stale.
@@ -831,9 +852,9 @@ impl TermCursor {
         // every membership probe; over a long driver it was ~11% of the
         // intersection-count time (and wasted on the PACKED path, which
         // only reads the encoding byte before falling to the decode cache).
+        let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if block_encoding(raw) == ENCODING_BITSET {
-            let hdr = self.block_header(self.current_block);
+        if hdr.encoding == ENCODING_BITSET {
             let base = hdr.base;
             if doc < base {
                 return false;
@@ -923,8 +944,8 @@ impl TermCursor {
                 .map(|i| self.block_tfs[i]);
         }
         let block = self.blocks[self.current_block];
-        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if block_encoding(raw) != ENCODING_BITSET {
+        let hdr = self.current_header();
+        if hdr.encoding != ENCODING_BITSET {
             // PACKED: no rank shortcut — decode + locate like the old path.
             self.skip_to(doc);
             return if self.current_doc_id() == doc {
@@ -933,7 +954,7 @@ impl TermCursor {
                 None
             };
         }
-        let hdr = self.block_header(self.current_block);
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         let base = hdr.base;
         if doc < base {
             return None;
@@ -1230,9 +1251,9 @@ impl TermCursor {
             return self.block_tfs[pos];
         }
         let block = self.blocks[self.current_block];
+        let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if block_encoding(raw) == ENCODING_BITSET {
-            let hdr = self.block_header(self.current_block);
+        if hdr.encoding == ENCODING_BITSET {
             let bit = (doc - hdr.base) as usize;
             let bitset_end = raw.len() - hdr.tfs_size();
             let word_idx = bit / 64;
