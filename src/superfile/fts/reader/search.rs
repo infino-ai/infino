@@ -1002,11 +1002,11 @@ impl FtsReader {
             }
         } else {
             let fst_bytes = self.dict_bytes_async().await?;
-            let dict = Self::open_dict(&fst_bytes)?;
+            let dict = self.open_dict(&fst_bytes)?;
             let key = make_key(&col_meta.name, term);
             match dict.lookup(&key) {
                 None => SingleSource::Absent,
-                Some(packed) => match FstValue::unpack(packed, self.value_layout) {
+                Some(packed) => match packed {
                     FstValue::Inline { doc_id, tf } => SingleSource::Inline { doc_id, tf },
                     FstValue::Pfor {
                         metadata_offset,
@@ -1413,7 +1413,7 @@ impl FtsReader {
         let column_id = self.resolve_column_id(column)?;
         let col_meta = &self.columns[column_id as usize];
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict = self.open_dict(&fst_bytes)?;
 
         // Resolve every term, collecting the PFOR ranges for one
         // coalesced fetch (mirrors `build_term_cursors_opt`).
@@ -1425,25 +1425,23 @@ impl FtsReader {
         let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();
         for term in terms {
             let key = make_key(&col_meta.name, term);
-            let pre =
-                dict.lookup(&key)
-                    .map(|packed| match FstValue::unpack(packed, self.value_layout) {
-                        FstValue::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
-                        FstValue::Pfor {
-                            metadata_offset,
-                            postings_length_hint,
-                            short,
-                        } => {
-                            pfor_offsets.push((
-                                metadata_offset as usize,
-                                postings_length_hint.map(|len| len as usize),
-                            ));
-                            Pre::Pfor {
-                                header_probed: postings_length_hint.is_none(),
-                                short,
-                            }
-                        }
-                    });
+            let pre = dict.lookup(&key).map(|packed| match packed {
+                FstValue::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                    short,
+                } => {
+                    pfor_offsets.push((
+                        metadata_offset as usize,
+                        postings_length_hint.map(|len| len as usize),
+                    ));
+                    Pre::Pfor {
+                        header_probed: postings_length_hint.is_none(),
+                        short,
+                    }
+                }
+            });
             resolved.push((Box::from(*term), pre));
         }
         let pfor_bytes = self.fetch_term_postings(&pfor_offsets).await?;
@@ -1548,7 +1546,7 @@ impl FtsReader {
             false => Some(self.dict_bytes_async().await?),
         };
         let dict = match dict_bytes.as_ref() {
-            Some(b) => Some(Self::open_dict(b)?),
+            Some(b) => Some(self.open_dict(b)?),
             None => None,
         };
         let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(terms.len());
@@ -1567,7 +1565,7 @@ impl FtsReader {
                 resolved.push(None);
                 continue;
             };
-            match FstValue::unpack(packed, self.value_layout) {
+            match packed {
                 FstValue::Inline { doc_id, tf } => {
                     resolved.push(Some(Resolved::Inline { doc_id, tf, gidf }));
                 }

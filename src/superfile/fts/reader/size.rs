@@ -172,7 +172,7 @@ impl FtsReader {
     /// report, not a query.
     pub fn size_breakdown(&self) -> Result<FtsSizeBreakdown, FtsError> {
         let fst_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict = self.open_dict(&fst_bytes)?;
         let mut columns = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
             let positional = col.positions;
@@ -194,7 +194,7 @@ impl FtsReader {
             let mut t = [0u32; BLOCK_LEN];
             for (key, packed) in dict.iter_prefix(&prefix) {
                 let key_bytes = (key.len() - prefix.len()) as u64;
-                match FstValue::unpack(packed, self.value_layout) {
+                match packed {
                     FstValue::Inline { .. } => {
                         let b = &mut buckets[band_of(1)];
                         b.terms += 1;

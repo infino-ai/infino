@@ -151,11 +151,12 @@ pub mod fts {
     /// decodes a short body into the same pre-filled single-block cursor
     /// the df=1 inline form already uses.
     ///
-    /// The dictionary value's PFOR form spends bit 1 on the short/long
-    /// flag (see `fst_value`), narrowing the offset field from 42 to 41
-    /// bits (2 TiB). Readers select the value layout by this version:
-    /// `V1`–`V6` values keep their 42-bit offsets, so a legacy value
-    /// whose offset happens to be odd is never mistaken for a short term.
+    /// The term dictionary is no longer an FST: it is sorted,
+    /// front-coded term blocks behind a first-key index (`fts::dict`),
+    /// whose entries carry the short/long form explicitly and the
+    /// metadata offset as a delta — a third smaller than the FST for
+    /// the same terms. Readers select the layout by this version;
+    /// `V1`–`V6` blobs keep their FST and its packed values.
     /// Multi-block terms are byte-identical to `V6`.
     ///
     /// Readers accept `V1`–`V7`.

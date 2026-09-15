@@ -99,8 +99,8 @@ use crate::superfile::{
     fts::{
         analysis::ChainTokenizer,
         bm25,
-        dict::{DictBuilder, StreamingDictBuilder},
-        fst_value::{FstValue, INLINE_TF_MAX, ValueLayout},
+        dict::{DictLayout, StreamingTermDictBuilder, TermDictBuilder},
+        fst_value::{FstValue, INLINE_TF_MAX},
         positions::{encode_group, encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
         reader::ColumnLengthStats,
@@ -367,11 +367,12 @@ impl BlobEra {
         }
     }
 
-    /// How this era packs a postings-form dictionary value.
-    fn value_layout(self) -> ValueLayout {
+    /// How this era lays out the term dictionary: front-coded term
+    /// blocks from `V7`, an FST of packed values before.
+    fn dict_layout(self) -> DictLayout {
         match self {
-            Self::V7 => ValueLayout::Flagged,
-            Self::V6 | Self::V5 | Self::V2ToV4 => ValueLayout::Legacy,
+            Self::V7 => DictLayout::Blocks,
+            Self::V6 | Self::V5 | Self::V2ToV4 => DictLayout::Fst,
         }
     }
 
@@ -2716,7 +2717,7 @@ impl FtsBuilder {
         // The in-RAM path's FST sink: collect (key, value) into a
         // `DictBuilder` and serialise once at assembly time. No
         // scratch file, no streaming.
-        let mut fst_inram = DictBuilder::new();
+        let mut fst_inram = TermDictBuilder::new(era.dict_layout());
 
         let mut doc_lengths_by_orig_col: Vec<Option<Vec<u32>>> =
             (0..n_columns as usize).map(|_| None).collect();
@@ -2896,7 +2897,7 @@ impl FtsBuilder {
         let mut fst_streaming = {
             let fst_file = File::create(&fst_streaming_path)?;
             let bw = BufWriter::new(fst_file);
-            StreamingDictBuilder::new(bw).map_err(map_fst_err)?
+            StreamingTermDictBuilder::new(era.dict_layout(), bw).map_err(map_fst_err)?
         };
 
         // Drain every spilled column's per-partition batch buffer
@@ -3372,13 +3373,13 @@ struct BlobAssemblyInputs {
 enum FstSinkFinish {
     /// In-RAM build: hand the populated `DictBuilder` to assembly,
     /// which calls `finish()` to produce the FST bytes in one shot.
-    InRam(DictBuilder),
+    InRam(TermDictBuilder),
     /// Spilled build: hand the open `StreamingDictBuilder` (and the
     /// scratch path it's been writing to) to assembly, which finishes
     /// the builder, computes the file's CRC by streaming, and copies
     /// the file into the output.
     Streaming {
-        builder: StreamingDictBuilder<BufWriter<File>>,
+        builder: StreamingTermDictBuilder<BufWriter<File>>,
         path: PathBuf,
     },
 }
@@ -3738,7 +3739,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
-    fst_streaming: &mut StreamingDictBuilder<BufWriter<File>>,
+    fst_streaming: &mut StreamingTermDictBuilder<BufWriter<File>>,
     positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
@@ -3892,8 +3893,8 @@ fn encode_and_emit_term<W: Write>(
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
-    fst_entries_inram: Option<&mut DictBuilder>,
-    mut fst_streaming: Option<&mut StreamingDictBuilder<BufWriter<File>>>,
+    fst_entries_inram: Option<&mut TermDictBuilder>,
+    mut fst_streaming: Option<&mut StreamingTermDictBuilder<BufWriter<File>>>,
     mut term_positions: Option<(&mut PositionsSink, &[u8])>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
@@ -3922,14 +3923,14 @@ fn encode_and_emit_term<W: Write>(
     // lives, tf implied 1 (one position is exactly what a phrase
     // check needs). Otherwise even a df=1 term takes the PFOR form so
     // its positions land in the region.
-    let inline_value: Option<u64> = if df == 1 {
+    let inline_value: Option<FstValue> = if df == 1 {
         let (doc_id, tf) = pairs[0];
         match &term_positions {
-            None => Some(FstValue::pack_inline(doc_id, tf)),
+            None => Some(FstValue::Inline { doc_id, tf }),
             Some((_, runs)) if tf == 1 => {
                 let mut at = 0;
                 let pos = read_varint(runs, &mut at).expect("builder-encoded run is well-formed");
-                (pos <= INLINE_TF_MAX).then(|| FstValue::pack_inline(doc_id, pos))
+                (pos <= INLINE_TF_MAX).then_some(FstValue::Inline { doc_id, tf: pos })
             }
             Some(_) => None,
         }
@@ -3937,7 +3938,7 @@ fn encode_and_emit_term<W: Write>(
         None
     };
 
-    let fst_value: u64 = if let Some(v) = inline_value {
+    let fst_value: FstValue = if let Some(v) = inline_value {
         profile.encode_df1 += 1;
         v
     } else if era.has_short_form() && pairs.len() <= SHORT_MAX_DF {
@@ -3974,12 +3975,11 @@ fn encode_and_emit_term<W: Write>(
         term_buf.clear();
         encode_short(term_buf, pairs, positions);
         write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
-        FstValue::pack_pfor(
+        FstValue::Pfor {
             metadata_offset,
-            term_buf.len() as u32,
-            era.value_layout(),
-            true,
-        )
+            postings_length_hint: Some(term_buf.len() as u32),
+            short: true,
+        }
     } else {
         profile.encode_pfor += 1;
         let idf_t = bm25::idf(n_scored_docs as u64, df);
@@ -4280,12 +4280,11 @@ fn encode_and_emit_term<W: Write>(
             }
         }
 
-        FstValue::pack_pfor(
+        FstValue::Pfor {
             metadata_offset,
-            postings_length as u32,
-            era.value_layout(),
-            false,
-        )
+            postings_length_hint: Some(postings_length as u32),
+            short: false,
+        }
     };
 
     let fst_insert_start = profile.enabled.then(Instant::now);

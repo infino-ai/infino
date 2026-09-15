@@ -49,8 +49,8 @@ use crate::superfile::{
         analysis::{Base, chain_tokenizer},
         bm25,
         builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
-        dict::{DictReader, make_key},
-        fst_value::{FstValue, ValueLayout},
+        dict::{DictLayout, TermDict, make_key},
+        fst_value::FstValue,
         positions::{decode_group, decode_run, positions_from_run_values},
         posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
         short::decode_short,
@@ -487,9 +487,9 @@ pub struct FtsReader {
     /// average length they were baked at, decided by its version. Also
     /// says whether each PFOR term ends with a coarse table.
     pub(super) bounds: StoredBound,
-    /// How this blob's dictionary values pack their offset — and whether
-    /// they carry the short/long flag (`VERSION_V7` and later).
-    pub(super) value_layout: ValueLayout,
+    /// How this blob lays out its term dictionary (front-coded blocks
+    /// from `VERSION_V7`, an FST of packed values before).
+    pub(super) dict_layout: DictLayout,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -707,9 +707,9 @@ impl FtsReader {
             || version == format::fts::VERSION_V5
             || version == format::fts::VERSION_V6
             || version == format::fts::VERSION_V7;
-        let value_layout = match version >= format::fts::VERSION_V7 {
-            true => ValueLayout::Flagged,
-            false => ValueLayout::Legacy,
+        let dict_layout = match version >= format::fts::VERSION_V7 {
+            true => DictLayout::Blocks,
+            false => DictLayout::Fst,
         };
         let bounds = StoredBound::for_version(version).ok_or_else(|| {
             FtsError::Read(ReadError::UnsupportedVersion(format!(
@@ -1036,7 +1036,7 @@ impl FtsReader {
             doc_length_bytes,
             has_bitset_blocks,
             bounds,
-            value_layout,
+            dict_layout,
             columns,
             column_id_by_name,
         })
@@ -1083,8 +1083,17 @@ impl FtsReader {
 
     /// Open the term dictionary over fetched FST bytes, mapping an FST
     /// parse failure to the reader's malformed-blob error.
-    pub(super) fn open_dict(fst_bytes: &[u8]) -> Result<DictReader<'_>, FtsError> {
-        DictReader::open(fst_bytes).map_err(|e| {
+    pub(super) fn open_dict<'b>(&self, fst_bytes: &'b [u8]) -> Result<TermDict<'b>, FtsError> {
+        Self::open_dict_with(fst_bytes, self.dict_layout)
+    }
+
+    /// [`Self::open_dict`] for the pooled walks that carry the layout
+    /// instead of a reader.
+    pub(super) fn open_dict_with(
+        fst_bytes: &[u8],
+        layout: DictLayout,
+    ) -> Result<TermDict<'_>, FtsError> {
+        TermDict::open(fst_bytes, layout).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
                 "FST parse failed: {e}"
             )))
@@ -1350,12 +1359,12 @@ impl FtsReader {
                     (true, true) => {
                         dict_ranges += 1;
                         let fst_bytes = self.dict_bytes_async().await?;
-                        let dict = Self::open_dict(&fst_bytes)?;
+                        let dict = self.open_dict(&fst_bytes)?;
                         let key = make_key(&col_meta.name, term);
                         let packed = dict
                             .lookup(&key)
                             .expect("inline member cursor was built from this dict");
-                        let position = match FstValue::unpack(packed, self.value_layout) {
+                        let position = match packed {
                             FstValue::Inline { tf: slot, .. } => slot,
                             FstValue::Pfor { .. } => {
                                 unreachable!("inline cursor from a PFOR FST value")
@@ -1425,7 +1434,7 @@ impl FtsReader {
         let positions_region = self.positions_range.clone();
 
         let fst_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict = self.open_dict(&fst_bytes)?;
 
         // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
         // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
@@ -1439,7 +1448,7 @@ impl FtsReader {
 
         for (key, packed) in dict.iter_prefix(&column_prefix) {
             let term = &key[prefix_len..];
-            match FstValue::unpack(packed, self.value_layout) {
+            match packed {
                 FstValue::Inline { doc_id, tf } => {
                     // A positional column only inlines tf == 1 postings; the
                     // slot then carries the term's single position and tf is
@@ -1659,7 +1668,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let fst_bytes = self.dict_bytes()?;
-        collect_terms_with_prefix(&fst_bytes, column, term_prefix)
+        collect_terms_with_prefix(&fst_bytes, self.dict_layout, column, term_prefix)
     }
 
     /// Whether `column` is registered as an FTS column in this superfile.
@@ -1674,6 +1683,7 @@ impl FtsReader {
 /// the query path's pooled one (`FtsReader::terms_with_prefix`).
 pub(super) fn collect_terms_with_prefix(
     fst_bytes: &[u8],
+    layout: DictLayout,
     column: &str,
     term_prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, FtsError> {
@@ -1681,7 +1691,7 @@ pub(super) fn collect_terms_with_prefix(
     full_prefix.push(FST_SEPARATOR);
     let column_prefix_len = full_prefix.len();
     full_prefix.extend_from_slice(term_prefix);
-    let dict = FtsReader::open_dict(fst_bytes)?;
+    let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
     let pairs = dict.iter_prefix(&full_prefix);
     Ok(pairs
         .into_iter()
@@ -3009,48 +3019,28 @@ mod tests {
     }
 
     #[test]
-    fn df1_inline_form_flag_set_on_fst_value() {
-        // Verify the FST values for df=1 terms have bit 0 set
-        // (inline form) and df ≥ 2 terms have bit 0 clear (PFOR).
-        let (blob, _json) = build_mixed_df_blob();
-        // Re-parse the blob enough to reach the FST bytes.
-        let header_size = 48usize;
-        let fst_off =
-            u64::from_le_bytes(blob[24..32].try_into().expect("fst_off slice is 8 bytes")) as usize;
-        let postings_off = u64::from_le_bytes(
-            blob[32..40]
-                .try_into()
-                .expect("postings_off slice is 8 bytes"),
-        ) as usize;
-        // FST bytes occupy [fst_off, postings_off - 4) (last 4 = FST CRC).
-        let fst_bytes = &blob[fst_off..postings_off - 4];
-        let dict = DictReader::open(fst_bytes).expect("open dict");
-        assert_eq!(header_size, 48);
+    fn df1_terms_take_the_inline_form_and_others_do_not() {
+        // A df=1 term (tf 1) is an inline dictionary entry; df ≥ 2 terms
+        // are postings-form entries (short here — they fit one block).
+        let (blob, json) = build_mixed_df_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let fst_bytes = r.dict_bytes().expect("dict");
+        let dict = r.open_dict(&fst_bytes).expect("open dict");
 
-        let val_common = dict.lookup(b"body\x1Fcommon").expect("common in FST");
-        let val_rust = dict.lookup(b"body\x1Frust").expect("rust in FST");
-        let val_uniq_d0 = dict.lookup(b"body\x1Funiqzero").expect("uniqzero in FST");
-        let val_uniq_d2 = dict.lookup(b"body\x1Funiqtwo").expect("uniqtwo in FST");
-
-        assert_eq!(val_common & 1, 0, "df=3 common term must use PFOR form");
-        assert_eq!(val_rust & 1, 0, "df=2 rust term must use PFOR form");
-        assert_eq!(val_uniq_d0 & 1, 1, "df=1 uniqzero must use inline form");
-        assert_eq!(val_uniq_d2 & 1, 1, "df=1 uniqtwo must use inline form");
-
-        // Decode the inline values and check (doc_id, tf) match.
-        match FstValue::unpack(val_uniq_d0, ValueLayout::Flagged) {
-            FstValue::Inline { doc_id, tf } => {
-                assert_eq!(doc_id, 0);
-                assert_eq!(tf, 1);
+        for term in ["common", "rust"] {
+            match dict.lookup(&make_key("body", term)).expect("in dict") {
+                FstValue::Pfor { short, .. } => assert!(short, "{term}: df ≥ 2 in one block"),
+                FstValue::Inline { .. } => panic!("{term}: df ≥ 2 must not inline"),
             }
-            FstValue::Pfor { .. } => panic!("expected inline form"),
         }
-        match FstValue::unpack(val_uniq_d2, ValueLayout::Flagged) {
-            FstValue::Inline { doc_id, tf } => {
-                assert_eq!(doc_id, 2);
-                assert_eq!(tf, 1);
+        for (term, doc_id) in [("uniqzero", 0u32), ("uniqtwo", 2u32)] {
+            match dict.lookup(&make_key("body", term)).expect("in dict") {
+                FstValue::Inline { doc_id: d, tf } => {
+                    assert_eq!(d, doc_id);
+                    assert_eq!(tf, 1);
+                }
+                FstValue::Pfor { .. } => panic!("{term}: df=1 must inline"),
             }
-            FstValue::Pfor { .. } => panic!("expected inline form"),
         }
     }
 

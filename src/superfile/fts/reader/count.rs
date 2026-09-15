@@ -323,7 +323,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict = self.open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory FST lookups. Absent and inline
@@ -337,7 +337,7 @@ impl FtsReader {
             let key = make_key(&col_meta.name, token);
             match dict.lookup(&key) {
                 None => {}
-                Some(packed) => match FstValue::unpack(packed, self.value_layout) {
+                Some(packed) => match packed {
                     FstValue::Inline { .. } => dfs[i] = 1,
                     FstValue::Pfor {
                         metadata_offset,
