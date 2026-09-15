@@ -274,12 +274,18 @@ enum GroupKind {
     Bulk,
 }
 
-/// Runs read one at a time from a packed group before the rest of the
-/// block is decoded in bulk. A phrase driven by a rare member asks for
-/// one or two runs per block of a common member and never reaches this;
-/// a phrase of common members asks for most of them, and paid two to
-/// three times the sequential decode's cost per run before this switch.
+/// Runs read one at a time from a packed group before the block may be
+/// decoded in bulk, and the density that then triggers it: at least one
+/// run in [`BULK_MAX_STRIDE`] pairs consumed so far. A phrase driven by
+/// a rare member asks for one or two runs per block of a common member,
+/// scattered, and never reaches this; a phrase of common members asks
+/// for most of them in order, and paid two to three times the
+/// sequential decode's cost per run before this switch. The density
+/// test keeps a block with a handful of scattered candidates on the
+/// per-run path, where decoding all 128 runs would cost more than they
+/// do.
 const BULK_AFTER_RUNS: u32 = 2;
+const BULK_MAX_STRIDE: usize = 4;
 
 /// A position group located for **per-run** access: one pair's run is
 /// decoded without touching the block's other runs. A phrase visits few
@@ -358,7 +364,10 @@ impl GroupIndex {
         out: &mut Vec<u32>,
     ) -> Option<()> {
         let start = *self.starts.get(pair)? as usize;
-        if self.kind == GroupKind::Packed && self.served >= BULK_AFTER_RUNS {
+        if self.kind == GroupKind::Packed
+            && self.served >= BULK_AFTER_RUNS
+            && pair + 1 <= self.served as usize * BULK_MAX_STRIDE
+        {
             self.firsts.clear();
             self.gaps.clear();
             let n_pairs = self.starts.len() - 1;
@@ -553,6 +562,16 @@ mod tests {
         // Relocating resets the count: the next block starts per-run.
         dense.locate(&out, &mut 0, &tfs).expect("relocates");
         assert_eq!(dense.kind, GroupKind::Packed);
+        // Scattered candidates — one pair in forty — never trip the bulk
+        // decode, however many of them a block has.
+        let mut scattered = GroupIndex::default();
+        scattered.locate(&out, &mut 0, &tfs).expect("locates");
+        for pair in [0usize, 40, 80, 120] {
+            scattered
+                .run_positions(&out, pair, tfs[pair], &mut Vec::new())
+                .expect("run");
+            assert_eq!(scattered.kind, GroupKind::Packed, "pair {pair}");
+        }
     }
 
     #[test]
