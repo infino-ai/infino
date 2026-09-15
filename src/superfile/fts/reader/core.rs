@@ -1932,7 +1932,7 @@ pub(super) fn or_cursor_into_bitset(
             // Word-OR the presence bitset in at its aligned base word.
             // Tfs trail; the bitset is everything between them.
             let base_word = hdr.base as usize / 64;
-            let presence = &bytes[hdr.payload..bytes.len() - hdr.tfs_size()];
+            let presence = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
             for (i, chunk) in presence.chunks_exact(8).enumerate() {
                 dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
             }

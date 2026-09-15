@@ -309,8 +309,8 @@ impl FtsReader {
                                 meta.block_layout,
                                 meta.prev_last_doc_id(tb, i),
                             );
-                            let doc_count = hdr.count as u64;
-                            b.block_header_bytes += hdr.payload as u64;
+                            let doc_count = hdr.count() as u64;
+                            b.block_header_bytes += hdr.payload() as u64;
                             if doc_count < LANES {
                                 b.partial_blocks += 1;
                             }
@@ -335,12 +335,12 @@ impl FtsReader {
                                         widest_delta = widest_delta.max(w[1] - w[0]);
                                     }
                                     let widest_tf = t[..n].iter().copied().max().unwrap_or(0);
-                                    let plain = hdr.payload
+                                    let plain = hdr.payload()
                                         + BLOCK_LEN * width_of(u64::from(widest_delta)) as usize
                                             / 8
                                         + BLOCK_LEN * width_of(u64::from(widest_tf)) as usize / 8;
                                     let saved = plain.saturating_sub(block.len()) as u64;
-                                    let e = hist_band(&PATCH_HIST_EDGES, hdr.n_delta_exc as u64);
+                                    let e = hist_band(&PATCH_HIST_EDGES, hdr.n_delta_exc() as u64);
                                     b.patched_by_exceptions[e] += 1;
                                     b.patched_saved_by_exceptions[e] += saved;
                                     let g = hist_band(&PATCH_SAVING_EDGES, saved);
@@ -354,7 +354,7 @@ impl FtsReader {
                                 }
                                 _ => {
                                     b.bitset_bytes +=
-                                        (block.len() - hdr.payload) as u64 - LANES * tf_bits / 8;
+                                        (block.len() - hdr.payload()) as u64 - LANES * tf_bits / 8;
                                     b.tf_bytes += LANES * tf_bits / 8;
                                 }
                             }

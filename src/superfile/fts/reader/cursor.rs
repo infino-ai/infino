@@ -914,7 +914,7 @@ impl TermCursor {
         }
         let bit = (doc - hdr.base) as usize;
         let bitset_end = raw.len() - hdr.tfs_size();
-        let word_at = hdr.payload + (bit / 64) * 8;
+        let word_at = hdr.payload() + (bit / 64) * 8;
         if word_at + 8 > bitset_end {
             return None;
         }
@@ -971,7 +971,7 @@ impl TermCursor {
             return None; // doc not present in this block
         }
         // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
-        let rank = Self::bitset_tf_rank(raw, hdr.payload, bit, word, bitset_end);
+        let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
         // Decode this block's tf array once (doc order), reused across a run of
         // candidates in the same block; the doc ids are never expanded.
         if self.tf_decoded_block != self.current_block {
@@ -1256,7 +1256,7 @@ impl TermCursor {
         if hdr.encoding == ENCODING_BITSET {
             let (bit, word, bitset_end) =
                 Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
-            let rank = Self::bitset_tf_rank(raw, hdr.payload, bit, word, bitset_end);
+            let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
             if self.tf_decoded_block != self.current_block {
                 decode_block_tfs(raw, &hdr, &mut self.block_tfs);
                 self.tf_decoded_block = self.current_block;

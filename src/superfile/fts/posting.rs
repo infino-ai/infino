@@ -193,21 +193,22 @@ pub fn block_encoding(bytes: &[u8]) -> u8 {
 
 /// A block's header, decoded: what every decode needs before it touches
 /// the payload. Parsed from the bytes plus, for the compact layout, the
-/// previous block's last doc id.
+/// previous block's last doc id. Twelve bytes, so the cursor's per-block
+/// cache of it is one store and one compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
     /// Real `(doc_id, tf)` pairs in the block, `1..=BLOCK_LEN`.
-    pub count: usize,
+    count: u8,
     pub delta_bits: u8,
     pub tf_bits: u8,
     pub encoding: u8,
+    n_delta_exc: u8,
+    n_tf_exc: u8,
+    /// Where the doc-id payload (deltas or presence words) begins.
+    payload: u8,
     /// The value the first delta is relative to (packed and patched
     /// blocks), or the presence bitset's word-aligned origin.
     pub base: u32,
-    pub n_delta_exc: usize,
-    pub n_tf_exc: usize,
-    /// Where the doc-id payload (deltas or presence words) begins.
-    pub payload: usize,
 }
 
 impl BlockHeader {
@@ -224,14 +225,6 @@ impl BlockHeader {
     /// nothing else is checked on this per-block path.
     #[inline]
     pub fn parse(bytes: &[u8], layout: BlockLayout, prev_last_doc_id: Option<u32>) -> Self {
-        let encoding = bytes
-            .get(ENCODING_OFF)
-            .map(|b| b & ENCODING_MASK)
-            .expect("block header: bytes too short");
-        assert!(
-            bytes.len() >= layout.header_bytes(encoding),
-            "block header: bytes too short"
-        );
         let header = match layout {
             BlockLayout::Wide => {
                 let encoding = bytes[ENCODING_OFF];
@@ -240,30 +233,31 @@ impl BlockHeader {
                     "wide header with a patched block"
                 );
                 Self {
-                    count: bytes[0] as usize,
+                    count: bytes[0],
                     delta_bits: bytes[1],
                     tf_bits: bytes[2],
                     encoding,
                     base: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
                     n_delta_exc: 0,
                     n_tf_exc: 0,
-                    payload: WIDE_HEADER_SIZE,
+                    payload: WIDE_HEADER_SIZE as u8,
                 }
             }
             BlockLayout::Compact => {
                 let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                let field = |shift: u32, bits: u32| ((word >> shift) & ((1 << bits) - 1)) as usize;
+                let field = |shift: u32, bits: u32| ((word >> shift) & ((1 << bits) - 1)) as u8;
+                let encoding = field(HDR_ENCODING_SHIFT, 2);
                 let (base, payload) = match encoding {
                     ENCODING_BITSET => (
                         u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-                        COMPACT_HEADER_SIZE + ORIGIN_BYTES,
+                        (COMPACT_HEADER_SIZE + ORIGIN_BYTES) as u8,
                     ),
-                    _ => (prev_last_doc_id.unwrap_or(0), COMPACT_HEADER_SIZE),
+                    _ => (prev_last_doc_id.unwrap_or(0), COMPACT_HEADER_SIZE as u8),
                 };
                 Self {
                     count: field(0, HDR_COUNT_BITS) + 1,
-                    delta_bits: field(HDR_DELTA_BITS_SHIFT, HDR_WIDTH_BITS) as u8,
-                    tf_bits: field(HDR_TF_BITS_SHIFT, HDR_WIDTH_BITS) as u8,
+                    delta_bits: field(HDR_DELTA_BITS_SHIFT, HDR_WIDTH_BITS),
+                    tf_bits: field(HDR_TF_BITS_SHIFT, HDR_WIDTH_BITS),
                     encoding,
                     base,
                     n_delta_exc: field(HDR_DELTA_EXC_SHIFT, HDR_EXC_BITS),
@@ -277,7 +271,7 @@ impl BlockHeader {
             "block header: bit width > 32"
         );
         debug_assert!(
-            header.count <= BLOCK_LEN,
+            usize::from(header.count) <= BLOCK_LEN,
             "block header: doc_count > BLOCK_LEN"
         );
         debug_assert!(
@@ -285,6 +279,30 @@ impl BlockHeader {
             "block header: unknown encoding"
         );
         header
+    }
+
+    /// Real `(doc_id, tf)` pairs in the block.
+    #[inline]
+    pub fn count(&self) -> usize {
+        usize::from(self.count)
+    }
+
+    /// Where the doc-id payload (deltas or presence words) begins.
+    #[inline]
+    pub fn payload(&self) -> usize {
+        usize::from(self.payload)
+    }
+
+    /// Exceptions in the delta stream (patched blocks).
+    #[inline]
+    pub fn n_delta_exc(&self) -> usize {
+        usize::from(self.n_delta_exc)
+    }
+
+    /// Exceptions in the tf stream (patched blocks).
+    #[inline]
+    pub fn n_tf_exc(&self) -> usize {
+        usize::from(self.n_tf_exc)
     }
 
     /// Bytes the trailing packed tfs take.
@@ -598,8 +616,8 @@ pub fn decode_block(
         // pass ends where the tf exceptions begin.
         let tf_exc_start = decode_patched_doc_ids(bytes, hdr, dest_doc_ids);
         unpack_tfs(bytes, hdr, dest_tfs);
-        patch_lanes(bytes, tf_exc_start, hdr.n_tf_exc, hdr.tf_bits, dest_tfs);
-        return hdr.count;
+        patch_lanes(bytes, tf_exc_start, hdr.n_tf_exc(), hdr.tf_bits, dest_tfs);
+        return hdr.count();
     }
     let count = decode_block_doc_ids(bytes, hdr, dest_doc_ids);
     decode_block_tfs(bytes, hdr, dest_tfs);
@@ -618,20 +636,20 @@ fn decode_patched_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u
     );
     let deltas_size = hdr.deltas_size();
     assert!(
-        bytes.len() >= hdr.payload + deltas_size,
+        bytes.len() >= hdr.payload() + deltas_size,
         "decode_block_doc_ids: bytes ({}) shorter than header+deltas ({})",
         bytes.len(),
-        hdr.payload + deltas_size
+        hdr.payload() + deltas_size
     );
     BitPacker4x::new().decompress(
-        &bytes[hdr.payload..hdr.payload + deltas_size],
+        &bytes[hdr.payload()..hdr.payload() + deltas_size],
         &mut dest_doc_ids[..BLOCK_LEN],
         hdr.delta_bits,
     );
     let tf_exc_start = patch_lanes(
         bytes,
-        hdr.payload + deltas_size,
-        hdr.n_delta_exc,
+        hdr.payload() + deltas_size,
+        hdr.n_delta_exc(),
         hdr.delta_bits,
         dest_doc_ids,
     );
@@ -717,7 +735,7 @@ fn unpack_tfs(bytes: &[u8], hdr: &BlockHeader, dest_tfs: &mut [u32]) {
     );
     let tfs_size = hdr.tfs_size();
     assert!(
-        bytes.len() >= hdr.payload + tfs_size,
+        bytes.len() >= hdr.payload() + tfs_size,
         "decode_block_tfs: bytes shorter than header+tfs"
     );
     let tfs_start = bytes.len() - tfs_size;
@@ -738,9 +756,9 @@ pub(crate) fn patched_exception_ranges(
     bytes: &[u8],
     hdr: &BlockHeader,
 ) -> (Range<usize>, Range<usize>) {
-    let delta_exc_start = hdr.payload + hdr.deltas_size();
-    let tf_exc_start = skip_lanes(bytes, delta_exc_start, hdr.n_delta_exc);
-    let end = skip_lanes(bytes, tf_exc_start, hdr.n_tf_exc);
+    let delta_exc_start = hdr.payload() + hdr.deltas_size();
+    let tf_exc_start = skip_lanes(bytes, delta_exc_start, hdr.n_delta_exc());
+    let end = skip_lanes(bytes, tf_exc_start, hdr.n_tf_exc());
     (delta_exc_start..tf_exc_start, tf_exc_start..end)
 }
 
@@ -753,8 +771,8 @@ pub(crate) fn patched_exception_ranges(
 pub fn decode_block_tfs(bytes: &[u8], hdr: &BlockHeader, dest_tfs: &mut [u32]) {
     unpack_tfs(bytes, hdr, dest_tfs);
     if hdr.encoding == ENCODING_PATCHED {
-        let tf_exc_start = skip_lanes(bytes, hdr.payload + hdr.deltas_size(), hdr.n_delta_exc);
-        patch_lanes(bytes, tf_exc_start, hdr.n_tf_exc, hdr.tf_bits, dest_tfs);
+        let tf_exc_start = skip_lanes(bytes, hdr.payload() + hdr.deltas_size(), hdr.n_delta_exc());
+        patch_lanes(bytes, tf_exc_start, hdr.n_tf_exc(), hdr.tf_bits, dest_tfs);
     }
 }
 
@@ -770,7 +788,7 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
         dest_doc_ids.len() >= BLOCK_LEN,
         "decode_block_doc_ids: dest_doc_ids must have at least {BLOCK_LEN} slots"
     );
-    let count = hdr.count;
+    let count = hdr.count();
 
     if hdr.encoding == ENCODING_BITSET {
         // Doc ids are a presence bitset over `[base, ...]`; the tfs are
@@ -780,10 +798,10 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
         // expects.
         let tfs_size = hdr.tfs_size();
         assert!(
-            bytes.len() >= hdr.payload + tfs_size,
+            bytes.len() >= hdr.payload() + tfs_size,
             "decode_block_doc_ids: bytes shorter than header+tfs"
         );
-        let words = &bytes[hdr.payload..bytes.len() - tfs_size];
+        let words = &bytes[hdr.payload()..bytes.len() - tfs_size];
         // Bounds safety: `j` advances once per set bit, so it is bounded by
         // `popcount(words)`, and the `dest_doc_ids[j]` writes carry no per-bit
         // bounds check on this hot decode loop because two invariants keep that
@@ -822,14 +840,14 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
 
     let deltas_size = hdr.deltas_size();
     assert!(
-        bytes.len() >= hdr.payload + deltas_size,
+        bytes.len() >= hdr.payload() + deltas_size,
         "decode_block_doc_ids: bytes ({}) shorter than header+deltas ({})",
         bytes.len(),
-        hdr.payload + deltas_size
+        hdr.payload() + deltas_size
     );
     BitPacker4x::new().decompress_sorted(
         hdr.base,
-        &bytes[hdr.payload..hdr.payload + deltas_size],
+        &bytes[hdr.payload()..hdr.payload() + deltas_size],
         &mut dest_doc_ids[..BLOCK_LEN],
         hdr.delta_bits,
     );
@@ -855,7 +873,7 @@ mod tests {
     fn roundtrip_with(b: &Block, layout: BlockLayout, prev: Option<u32>) -> EncodedBlock {
         let enc = encode_block(b, layout, prev);
         let hdr = BlockHeader::parse(&enc.bytes, layout, prev);
-        assert_eq!(hdr.count, b.doc_ids.len());
+        assert_eq!(hdr.count(), b.doc_ids.len());
         let mut got_doc_ids = vec![0u32; BLOCK_LEN];
         let mut got_tfs = vec![0u32; BLOCK_LEN];
         let count = decode_block(&enc.bytes, &hdr, &mut got_doc_ids, &mut got_tfs);
@@ -903,7 +921,7 @@ mod tests {
         assert_eq!(block_encoding(&enc.bytes), ENCODING_PATCHED);
         assert!(enc.bytes.len() < 64, "got {} bytes", enc.bytes.len());
         let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, Some(999));
-        assert_eq!((hdr.n_delta_exc, hdr.n_tf_exc), (1, 1));
+        assert_eq!((hdr.n_delta_exc(), hdr.n_tf_exc()), (1, 1));
         assert_eq!(hdr.base, 999);
     }
 
@@ -918,7 +936,7 @@ mod tests {
         let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, None);
         assert_eq!(hdr.base, 0);
         assert_eq!(hdr.delta_bits, 2);
-        assert_eq!(hdr.n_delta_exc, 1);
+        assert_eq!(hdr.n_delta_exc(), 1);
         // The wide header stores `first - 1` instead and packs plain; the
         // compact block is no larger for lacking a stored base.
         let wide = encode_block(&block(&doc_ids, &[1; 128]), BlockLayout::Wide, None);
@@ -997,7 +1015,7 @@ mod tests {
             assert_eq!(block_encoding(&enc.bytes), ENCODING_BITSET, "{layout:?}");
             let hdr = BlockHeader::parse(&enc.bytes, layout, prev);
             assert_eq!(hdr.base, 960, "{layout:?}");
-            assert_eq!(hdr.payload, 8);
+            assert_eq!(hdr.payload(), 8);
         }
     }
 
@@ -1145,7 +1163,7 @@ mod tests {
             for layout in LAYOUTS {
                 let enc = encode_block(&block(&doc_ids, &tfs), layout, None);
                 assert_eq!(
-                    BlockHeader::parse(&enc.bytes, layout, None).count,
+                    BlockHeader::parse(&enc.bytes, layout, None).count(),
                     count,
                     "header.doc_count for n={count} ({layout:?})"
                 );
@@ -1197,12 +1215,12 @@ mod tests {
         let hdr = BlockHeader::parse(&bytes, BlockLayout::Compact, Some(7));
         assert_eq!(
             (
-                hdr.count,
+                hdr.count(),
                 hdr.delta_bits,
                 hdr.tf_bits,
                 hdr.encoding,
-                hdr.n_delta_exc,
-                hdr.n_tf_exc,
+                hdr.n_delta_exc(),
+                hdr.n_tf_exc(),
                 hdr.base
             ),
             (128, 32, 32, ENCODING_PATCHED, 31, 31, 7)
@@ -1211,7 +1229,7 @@ mod tests {
         let bytes = compact_header(1, 0, 0, ENCODING_PACKED, 0, 0);
         let hdr = BlockHeader::parse(&bytes, BlockLayout::Compact, None);
         assert_eq!(
-            (hdr.count, hdr.delta_bits, hdr.tf_bits, hdr.base),
+            (hdr.count(), hdr.delta_bits, hdr.tf_bits, hdr.base),
             (1, 0, 0, 0)
         );
     }
@@ -1284,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "bytes too short")]
+    #[should_panic(expected = "index out of bounds")]
     fn header_parse_panics_on_short_input() {
         BlockHeader::parse(&[0u8; 3], BlockLayout::Compact, None);
     }
@@ -1462,7 +1480,7 @@ mod tests {
                 ENCODING_BITSET => {
                     // Doc ids are a whole number of 64-bit words; tfs trail.
                     prop_assert_eq!(hdr.delta_bits, 0, "bitset block has delta_bits 0");
-                    let bitset_bytes = enc.bytes.len() - hdr.payload - tfs_size;
+                    let bitset_bytes = enc.bytes.len() - hdr.payload() - tfs_size;
                     prop_assert!(bitset_bytes >= 8 && bitset_bytes.is_multiple_of(8));
                 }
                 ENCODING_PATCHED => {
