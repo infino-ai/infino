@@ -424,7 +424,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        posting::{self, ENCODING_BITSET, ENCODING_PACKED},
+        posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
         tokenize::AsciiLowerTokenizer,
     };
 
@@ -696,7 +696,7 @@ mod tests {
         for blk in mix.blocks.iter() {
             match mix.bytes.as_ref()[blk.block_byte_offset + posting::ENCODING_OFF] {
                 ENCODING_BITSET => saw_bitset = true,
-                ENCODING_PACKED => saw_packed = true,
+                ENCODING_PACKED | ENCODING_PATCHED => saw_packed = true,
                 other => panic!("unexpected encoding byte {other}"),
             }
         }

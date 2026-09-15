@@ -33,6 +33,12 @@
 //! `BLOCK_LEN == 128`, so `128 * num_bits` is divisible by 8 for every
 //! valid `num_bits` value.
 //!
+//! Two further encodings share the header and put the tfs last: a
+//! **bitset** block ([`ENCODING_BITSET`]) stores dense doc ids as
+//! presence words, and a **patched** block ([`ENCODING_PATCHED`]) packs
+//! deltas and tfs at the width most lanes fit and lists the outliers as
+//! exceptions — see each constant's documentation for its layout.
+//!
 //! ## Partial last block
 //!
 //! The last block in a posting list may have `doc_count < BLOCK_LEN`.
@@ -54,7 +60,11 @@
 //!   `assert!` preconditions plus the caller's contract carry safety
 //!   in production.
 
+use std::ops::Range;
+
 use bitpacking::{BitPacker, BitPacker4x};
+
+use crate::superfile::fts::positions::{push_varint, read_varint, varint_len};
 
 /// Number of `(doc_id, tf)` pairs per encoded block. Fixed at 128 to
 /// match `BitPacker4x::BLOCK_LEN`.
@@ -70,6 +80,35 @@ pub const ENCODING_OFF: usize = 3;
 /// Block `encoding` (header byte 3): doc ids stored as PFOR-delta packing
 /// (today's layout). Every `V1`–`V3` block is this.
 pub const ENCODING_PACKED: u8 = 0;
+/// Block `encoding`: **patched** packing (`VERSION_V7`). Doc-id deltas
+/// and tfs are each bit-packed at a width most lanes fit, and the few
+/// lanes that do not — the outliers that would otherwise set the width
+/// for all 128 — store their high bits as **exceptions**. Layout after
+/// the 8-byte header:
+///
+/// ```text
+///   8       1       n_delta_exceptions (u8)
+///   9       1       n_tf_exceptions    (u8)
+///   10      16 × delta_bits  packed low bits of the deltas
+///   ...     per delta exception: lane (u8), high bits (LEB128 u32)
+///   ...     per tf exception:    lane (u8), high bits (LEB128 u32)
+///   ...     16 × tf_bits     packed low bits of the tfs (trailing, as always)
+/// ```
+///
+/// Deltas here are explicit (`doc[0] - base_doc_id`, then `doc[i] -
+/// doc[i-1]`, padding lanes 0), prefix-summed by the reader after the
+/// exceptions are patched in — the sorted bit-packer's fused prefix sum
+/// cannot see a patch. Chosen only when it is the smallest of the three
+/// encodings for the block, so a block with uniform widths stays
+/// [`ENCODING_PACKED`] and decodes exactly as before.
+pub const ENCODING_PATCHED: u8 = 2;
+/// Bytes after the header that hold the two exception counts of a
+/// patched block.
+pub const PATCHED_COUNTS_SIZE: usize = 2;
+/// Most exception lanes a patched stream may carry. Bounds the patch
+/// loop the decoder runs; past this the stream is better off wider.
+const PATCHED_MAX_EXCEPTIONS: usize = 32;
+
 /// Block `encoding`: doc ids stored as a **presence bitset** over
 /// `[base_doc_id, last_doc_id]`, `base_doc_id` aligned down to a 64-bit
 /// word so the union count can OR it in word-aligned. Chosen only when it
@@ -100,6 +139,75 @@ pub struct EncodedBlock {
     pub bytes: Vec<u8>,
     pub last_doc_id: u32,
     pub max_tf: u32,
+}
+
+/// A patched stream's plan: the width most lanes fit and the lanes that
+/// do not, with their high bits.
+struct PatchPlan {
+    width: u8,
+    exceptions: Vec<(u8, u32)>,
+    /// Bytes the packed low bits plus the exception list take.
+    bytes: usize,
+}
+
+/// Plan the cheapest patched packing of `lanes` (all `BLOCK_LEN` of
+/// them). Tries every width below the plain width and keeps the one
+/// whose packed bits plus exception list is smallest, subject to
+/// [`PATCHED_MAX_EXCEPTIONS`]. Returns the plain width's plan when
+/// nothing beats it.
+fn plan_patched(lanes: &[u32; BLOCK_LEN]) -> PatchPlan {
+    let plain_bits = width_bits(lanes.iter().copied().max().unwrap_or(0));
+    let mut best = PatchPlan {
+        width: plain_bits,
+        exceptions: Vec::new(),
+        bytes: BLOCK_LEN * plain_bits as usize / 8,
+    };
+    for width in 0..plain_bits {
+        let mut exceptions = Vec::new();
+        let mut bytes = BLOCK_LEN * width as usize / 8;
+        for (i, &v) in lanes.iter().enumerate() {
+            let hi = if width == 0 { v } else { v >> width };
+            if hi != 0 {
+                exceptions.push((i as u8, hi));
+                bytes += 1 + varint_len(hi);
+                if exceptions.len() > PATCHED_MAX_EXCEPTIONS || bytes >= best.bytes {
+                    break;
+                }
+            }
+        }
+        if exceptions.len() <= PATCHED_MAX_EXCEPTIONS && bytes < best.bytes {
+            best = PatchPlan {
+                width,
+                exceptions,
+                bytes,
+            };
+        }
+    }
+    best
+}
+
+/// Bits needed to hold `v` (zero for zero).
+#[inline]
+fn width_bits(v: u32) -> u8 {
+    (u32::BITS - v.leading_zeros()) as u8
+}
+
+/// Pack `lanes` at `width` bits, keeping only each lane's low `width`
+/// bits (the exceptions carry the rest), into `out`.
+fn compress_low_bits(bp: &BitPacker4x, lanes: &[u32; BLOCK_LEN], width: u8, out: &mut [u8]) {
+    if width == 0 {
+        return;
+    }
+    let mask: u32 = if width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    };
+    let mut low = [0u32; BLOCK_LEN];
+    for (l, &v) in low.iter_mut().zip(lanes) {
+        *l = v & mask;
+    }
+    bp.compress(&low, out, width);
 }
 
 /// Encode one block.
@@ -163,6 +271,62 @@ pub fn encode_block(b: &Block) -> EncodedBlock {
     let bitset_words = (last_doc_id - aligned_base) as usize / 64 + 1;
     let bitset_size = bitset_words * 8;
     let use_bitset = bitset_size <= deltas_size;
+
+    // Patched packing: explicit deltas and tfs, each at the width most
+    // lanes fit plus an exception list for the rest. Considered only for a
+    // block the bitset did not claim: a dense block's presence words are
+    // what the count kernels bit-test and rank into, and that O(1) probe
+    // is worth more than the few bytes patching a dense partial block
+    // would save.
+    let mut explicit_deltas = [0u32; BLOCK_LEN];
+    explicit_deltas[0] = b.doc_ids[0] - base_doc_id;
+    for (slot, pair) in explicit_deltas[1..count]
+        .iter_mut()
+        .zip(b.doc_ids.windows(2))
+    {
+        *slot = pair[1] - pair[0];
+    }
+    let delta_plan = plan_patched(&explicit_deltas);
+    let tf_plan = plan_patched(&padded_tfs);
+    let patched_size = HEADER_SIZE + PATCHED_COUNTS_SIZE + delta_plan.bytes + tf_plan.bytes;
+    let plain_size = HEADER_SIZE + deltas_size + tfs_size;
+    if !use_bitset && patched_size < plain_size {
+        let mut bytes = Vec::with_capacity(patched_size);
+        bytes.push(count as u8);
+        bytes.push(delta_plan.width);
+        bytes.push(tf_plan.width);
+        bytes.push(ENCODING_PATCHED);
+        bytes.extend_from_slice(&base_doc_id.to_le_bytes());
+        bytes.push(delta_plan.exceptions.len() as u8);
+        bytes.push(tf_plan.exceptions.len() as u8);
+        let deltas_start = bytes.len();
+        let deltas_packed = BLOCK_LEN * delta_plan.width as usize / 8;
+        bytes.resize(deltas_start + deltas_packed, 0);
+        compress_low_bits(
+            &bp,
+            &explicit_deltas,
+            delta_plan.width,
+            &mut bytes[deltas_start..],
+        );
+        for &(lane, hi) in &delta_plan.exceptions {
+            bytes.push(lane);
+            push_varint(&mut bytes, hi);
+        }
+        for &(lane, hi) in &tf_plan.exceptions {
+            bytes.push(lane);
+            push_varint(&mut bytes, hi);
+        }
+        let tfs_start = bytes.len();
+        let tfs_packed = BLOCK_LEN * tf_plan.width as usize / 8;
+        bytes.resize(tfs_start + tfs_packed, 0);
+        compress_low_bits(&bp, &padded_tfs, tf_plan.width, &mut bytes[tfs_start..]);
+        debug_assert_eq!(bytes.len(), patched_size);
+        return EncodedBlock {
+            bytes,
+            last_doc_id,
+            max_tf,
+        };
+    }
 
     let doc_ids_size = if use_bitset { bitset_size } else { deltas_size };
     let mut bytes = Vec::with_capacity(HEADER_SIZE + doc_ids_size + tfs_size);
@@ -261,8 +425,48 @@ pub fn decode_block(bytes: &[u8], dest_doc_ids: &mut [u32], dest_tfs: &mut [u32]
         &mut dest_tfs[..BLOCK_LEN],
         tf_bits,
     );
+    if bytes[ENCODING_OFF] == ENCODING_PATCHED {
+        let (_, tf_exc) = patched_exception_ranges(bytes);
+        apply_exceptions(&bytes[tf_exc], tf_bits, dest_tfs);
+    }
 
     count
+}
+
+/// Byte ranges of a patched block's delta and tf exception lists.
+///
+/// # Panics
+///
+/// `bytes` is not a well-formed patched block (the CRC-validated
+/// postings region is the caller's guarantee).
+pub(crate) fn patched_exception_ranges(bytes: &[u8]) -> (Range<usize>, Range<usize>) {
+    let n_delta_exc = bytes[HEADER_SIZE] as usize;
+    let n_tf_exc = bytes[HEADER_SIZE + 1] as usize;
+    let delta_bits = bytes[1] as usize;
+    let delta_exc_start = HEADER_SIZE + PATCHED_COUNTS_SIZE + BLOCK_LEN * delta_bits / 8;
+    let mut at = delta_exc_start;
+    for _ in 0..n_delta_exc {
+        at += 1;
+        read_varint(bytes, &mut at).expect("patched block exception within block");
+    }
+    let tf_exc_start = at;
+    for _ in 0..n_tf_exc {
+        at += 1;
+        read_varint(bytes, &mut at).expect("patched block exception within block");
+    }
+    (delta_exc_start..tf_exc_start, tf_exc_start..at)
+}
+
+/// OR each exception's high bits back into its lane of `dest`.
+#[inline]
+fn apply_exceptions(exceptions: &[u8], width: u8, dest: &mut [u32]) {
+    let mut at = 0usize;
+    while at < exceptions.len() {
+        let lane = exceptions[at] as usize;
+        at += 1;
+        let hi = read_varint(exceptions, &mut at).expect("patched block exception within block");
+        dest[lane] |= hi << width;
+    }
 }
 
 /// Decode only the tf array of a block (the trailing tf-packed bytes) into
@@ -289,6 +493,10 @@ pub fn decode_block_tfs(bytes: &[u8], dest_tfs: &mut [u32]) {
         &mut dest_tfs[..BLOCK_LEN],
         tf_bits,
     );
+    if bytes[ENCODING_OFF] == ENCODING_PATCHED {
+        let (_, tf_exc) = patched_exception_ranges(bytes);
+        apply_exceptions(&bytes[tf_exc], tf_bits, dest_tfs);
+    }
 }
 
 /// Decode only the doc ids of a posting block, skipping the term-frequency
@@ -362,6 +570,28 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest_doc_ids: &mut [u32]) -> usize {
     }
 
     let deltas_size = BLOCK_LEN * delta_bits as usize / 8;
+    if encoding == ENCODING_PATCHED {
+        // Explicit deltas at the narrow width, exceptions patched in,
+        // then the prefix sum the sorted packer would have fused.
+        let deltas_start = HEADER_SIZE + PATCHED_COUNTS_SIZE;
+        assert!(
+            bytes.len() >= deltas_start + deltas_size,
+            "decode_block_doc_ids: bytes shorter than header+deltas"
+        );
+        BitPacker4x::new().decompress(
+            &bytes[deltas_start..deltas_start + deltas_size],
+            &mut dest_doc_ids[..BLOCK_LEN],
+            delta_bits,
+        );
+        let (delta_exc, _) = patched_exception_ranges(bytes);
+        apply_exceptions(&bytes[delta_exc], delta_bits, dest_doc_ids);
+        let mut prev = base_doc_id;
+        for d in dest_doc_ids[..BLOCK_LEN].iter_mut() {
+            prev = prev.wrapping_add(*d);
+            *d = prev;
+        }
+        return count;
+    }
     assert!(
         bytes.len() >= HEADER_SIZE + deltas_size,
         "decode_block_doc_ids: bytes ({}) shorter than header+deltas ({})",
@@ -408,6 +638,46 @@ mod tests {
     }
 
     // --- Basic round-trips ----------------------------------------------
+
+    #[test]
+    fn outliers_take_the_patched_encoding_and_shrink_the_block() {
+        // 127 docs one apart and one 1M gap: plain packing needs 20-bit
+        // deltas for every lane (320 B); patched packs 1-bit deltas (16 B)
+        // and one exception. Same for a lone tf of 900 among ones.
+        let mut doc_ids: Vec<u32> = (1000..1127).collect();
+        doc_ids.push(1_126 + 1_000_000);
+        let mut tfs = vec![1u32; 128];
+        tfs[40] = 900;
+        let enc = roundtrip(&block(&doc_ids, &tfs));
+        assert_eq!(enc.bytes[ENCODING_OFF], ENCODING_PATCHED);
+        assert!(enc.bytes.len() < 64, "got {} bytes", enc.bytes.len());
+        // The tf-only decode patches too.
+        let mut got_tfs = vec![0u32; BLOCK_LEN];
+        decode_block_tfs(&enc.bytes, &mut got_tfs);
+        assert_eq!(&got_tfs[..128], tfs.as_slice());
+        // The doc-id-only decode patches and prefix-sums.
+        let mut got_ids = vec![0u32; BLOCK_LEN];
+        assert_eq!(decode_block_doc_ids(&enc.bytes, &mut got_ids), 128);
+        assert_eq!(&got_ids[..128], doc_ids.as_slice());
+    }
+
+    #[test]
+    fn uniform_blocks_stay_packed_byte_for_byte() {
+        // No outlier ⇒ the patched plan cannot beat plain, so the block
+        // is the PACKED layout older readers know.
+        let doc_ids: Vec<u32> = (0..128).map(|i| 10 + 37 * i).collect();
+        let tfs: Vec<u32> = (0..128).map(|i| 1 + i % 4).collect();
+        let enc = roundtrip(&block(&doc_ids, &tfs));
+        assert_eq!(enc.bytes[ENCODING_OFF], ENCODING_PACKED);
+    }
+
+    #[test]
+    fn partial_patched_block_round_trips() {
+        let doc_ids = vec![5u32, 6, 7, 5_000_000];
+        let tfs = vec![1u32, 1, 1, 1];
+        let enc = roundtrip(&block(&doc_ids, &tfs));
+        assert_eq!(enc.bytes[ENCODING_OFF], ENCODING_PATCHED);
+    }
 
     #[test]
     fn roundtrip_full_block_dense() {
@@ -503,31 +773,19 @@ mod tests {
 
     // --- Bit-width edge cases (1, 7, 8, 31, 32) -------------------------
 
-    /// Build doc_ids whose deltas top out at exactly `max_delta` and tfs
-    /// whose values top out at `max_tf`.
+    /// Build a **full** block whose every delta is exactly `max_delta` and
+    /// every tf exactly `max_tf`. Uniform lanes, so the patched encoding
+    /// cannot beat plain packing and the header pins the plain widths.
     fn block_with_max_delta_and_tf(count: usize, max_delta: u32, max_tf: u32) -> Block {
+        let count = BLOCK_LEN.min(count.max(1));
         let mut doc_ids = Vec::with_capacity(count);
         let mut acc: u32 = 1;
-        for i in 0..count {
-            // Vary deltas to span [1, max_delta]; force at least one
-            // entry to hit max_delta exactly.
-            let delta = if i == count / 2 {
-                max_delta
-            } else {
-                1 + (i as u32 % max_delta.max(1))
-            };
+        for _ in 0..count {
+            let delta = max_delta.max(1);
             acc = acc.checked_add(delta).expect("overflow in test setup");
             doc_ids.push(acc);
         }
-        let tfs: Vec<u32> = (0..count)
-            .map(|i| {
-                if i == count / 3 {
-                    max_tf
-                } else {
-                    (i as u32 % max_tf.max(1)) + 1
-                }
-            })
-            .collect();
+        let tfs = vec![max_tf; count];
         Block { doc_ids, tfs }
     }
 
@@ -559,21 +817,18 @@ mod tests {
     }
 
     #[test]
-    fn bit_width_31_just_below_word_boundary() {
-        // Max delta of 2^30: needs 31 bits.
-        let b = block_with_max_delta_and_tf(8, 1 << 30, 1 << 30);
-        let enc = roundtrip(&b);
-        assert_eq!(enc.bytes[1], 31);
-        assert_eq!(enc.bytes[2], 31);
-    }
-
-    #[test]
-    fn bit_width_32_full_word() {
-        // Maximum possible delta: 2^31 (still fits in u32, needs 32 bits).
-        let b = block_with_max_delta_and_tf(4, 1 << 31, 1 << 31);
-        let enc = roundtrip(&b);
-        assert_eq!(enc.bytes[1], 32);
-        assert_eq!(enc.bytes[2], 32);
+    fn widths_31_and_32_round_trip_losslessly() {
+        // Values needing 31 and 32 bits — a full block of them would
+        // overflow a u32 doc id, so these are partial blocks, which take
+        // the patched form (padding lanes narrow, the wide lanes as
+        // exceptions). What is pinned is that nothing is lost at the top
+        // of the range, in either stream.
+        roundtrip(&block(
+            &[1 << 30, (1 << 30) + (1 << 30)],
+            &[1 << 30, 1 << 30],
+        ));
+        roundtrip(&block(&[7, 7 + (1 << 31)], &[1 << 31, u32::MAX]));
+        roundtrip(&block(&[u32::MAX - 1, u32::MAX], &[u32::MAX, 1]));
     }
 
     // --- All-zero tfs (bit_width 0) -------------------------------------
@@ -618,18 +873,29 @@ mod tests {
 
     #[test]
     fn header_encoding_byte_marks_the_layout() {
-        // Byte 3 (formerly reserved) is the encoding: 0 = PACKED, 1 = BITSET.
-        let packed = encode_block(&block(&[1, 100_000], &[1, 1]));
-        assert_eq!(packed.bytes[3], ENCODING_PACKED, "sparse ⇒ PACKED");
+        // Byte 3 (formerly reserved) is the encoding: 0 = PACKED (a full
+        // block of uniform wide deltas, where nothing beats plain packing),
+        // 1 = BITSET (dense), 2 = PATCHED (a sparse partial block: the
+        // padding lanes pack at width 0 and the real deltas ride as
+        // exceptions).
+        let uniform: Vec<u32> = (0..128).map(|i| 1 + 100_000 * i).collect();
+        let packed = encode_block(&block(&uniform, &[1; 128]));
+        assert_eq!(packed.bytes[3], ENCODING_PACKED, "uniform ⇒ PACKED");
         let bitset = encode_block(&block(&[1, 2, 3], &[1, 1, 1]));
         assert_eq!(bitset.bytes[3], ENCODING_BITSET, "dense ⇒ BITSET");
+        let patched = encode_block(&block(&[1, 100_000], &[1, 1]));
+        assert_eq!(
+            patched.bytes[3], ENCODING_PATCHED,
+            "sparse partial ⇒ PATCHED"
+        );
     }
 
     #[test]
     fn header_base_doc_id_is_first_minus_one() {
-        // A PACKED (sparse) block stores base = first doc - 1.
+        // A non-bitset block stores base = first doc - 1, whichever of the
+        // two packings it takes.
         let enc = encode_block(&block(&[100, 100_000, 200_000], &[1, 1, 1]));
-        assert_eq!(enc.bytes[3], ENCODING_PACKED);
+        assert_ne!(enc.bytes[3], ENCODING_BITSET);
         let base_le = u32::from_le_bytes([enc.bytes[4], enc.bytes[5], enc.bytes[6], enc.bytes[7]]);
         assert_eq!(base_le, 99);
     }
@@ -645,9 +911,10 @@ mod tests {
 
     #[test]
     fn delta_and_tf_use_independent_bit_widths() {
-        // Wide deltas, narrow tfs.
-        let doc_ids: Vec<u32> = (0..16).map(|i| i * 1024).collect(); // delta = 1024 → 11 bits
-        let tfs: Vec<u32> = (0..16).map(|_| 1).collect();
+        // Wide deltas, narrow tfs — a full block of uniform lanes, so the
+        // header carries the plain widths.
+        let doc_ids: Vec<u32> = (0..128).map(|i| i * 1024).collect(); // delta = 1024 → 11 bits
+        let tfs: Vec<u32> = (0..128).map(|_| 1).collect();
         let enc = roundtrip(&block(&doc_ids, &tfs));
         let dbits = enc.bytes[1];
         let tbits = enc.bytes[2];
@@ -839,6 +1106,18 @@ mod tests {
                 prop_assert_eq!(enc.bytes[1], 0, "bitset block has delta_bits 0");
                 let bitset_bytes = enc.bytes.len() - 8 - tfs_size;
                 prop_assert!(bitset_bytes >= 8 && bitset_bytes.is_multiple_of(8));
+            } else if enc.bytes[3] == ENCODING_PATCHED {
+                let delta_bits = enc.bytes[1] as usize;
+                let (delta_exc, tf_exc) = patched_exception_ranges(&enc.bytes);
+                prop_assert_eq!(
+                    enc.bytes.len(),
+                    HEADER_SIZE
+                        + PATCHED_COUNTS_SIZE
+                        + (BLOCK_LEN * delta_bits) / 8
+                        + delta_exc.len()
+                        + tf_exc.len()
+                        + tfs_size
+                );
             } else {
                 let delta_bits = enc.bytes[1] as usize;
                 prop_assert_eq!(enc.bytes.len(), 8 + (BLOCK_LEN * delta_bits) / 8 + tfs_size);

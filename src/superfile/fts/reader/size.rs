@@ -25,7 +25,10 @@ use crate::superfile::{
     fts::{
         builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         fst_value::FstValue,
-        posting::{BLOCK_LEN, ENCODING_OFF, ENCODING_PACKED, HEADER_SIZE},
+        posting::{
+            BLOCK_LEN, ENCODING_OFF, ENCODING_PACKED, ENCODING_PATCHED, HEADER_SIZE,
+            PATCHED_COUNTS_SIZE, patched_exception_ranges,
+        },
         short::{decode_short, short_df},
     },
 };
@@ -80,6 +83,8 @@ pub struct DfBucket {
     pub long_terms: u64,
     pub blocks: u64,
     pub partial_blocks: u64,
+    /// Blocks in the patched encoding (narrow width plus exceptions).
+    pub patched_blocks: u64,
     /// Position-run bytes this band's terms own in the positions region.
     pub positions_bytes: u64,
 }
@@ -104,6 +109,7 @@ impl DfBucket {
         self.long_terms += o.long_terms;
         self.blocks += o.blocks;
         self.partial_blocks += o.partial_blocks;
+        self.patched_blocks += o.patched_blocks;
         self.positions_bytes += o.positions_bytes;
     }
 
@@ -267,14 +273,30 @@ impl FtsReader {
                             if doc_count < LANES {
                                 b.partial_blocks += 1;
                             }
-                            if tb[off + ENCODING_OFF] == ENCODING_PACKED {
-                                let delta_bits = u64::from(tb[off + 1]);
-                                let tf_bits = u64::from(tb[off + 2]);
-                                b.docid_bytes += LANES * delta_bits / 8;
-                                b.tf_bytes += LANES * tf_bits / 8;
-                                b.padding_bytes += (LANES - doc_count) * (delta_bits + tf_bits) / 8;
-                            } else {
-                                b.bitset_bytes += (end - off) as u64 - HEADER_SIZE as u64;
+                            let delta_bits = u64::from(tb[off + 1]);
+                            let tf_bits = u64::from(tb[off + 2]);
+                            match tb[off + ENCODING_OFF] {
+                                ENCODING_PACKED => {
+                                    b.docid_bytes += LANES * delta_bits / 8;
+                                    b.tf_bytes += LANES * tf_bits / 8;
+                                    b.padding_bytes +=
+                                        (LANES - doc_count) * (delta_bits + tf_bits) / 8;
+                                }
+                                ENCODING_PATCHED => {
+                                    // Exceptions count with the stream they patch.
+                                    let (delta_exc, tf_exc) =
+                                        patched_exception_ranges(&tb[off..end]);
+                                    b.block_header_bytes += PATCHED_COUNTS_SIZE as u64;
+                                    b.patched_blocks += 1;
+                                    b.docid_bytes +=
+                                        LANES * delta_bits / 8 + delta_exc.len() as u64;
+                                    b.tf_bytes += LANES * tf_bits / 8 + tf_exc.len() as u64;
+                                    b.padding_bytes +=
+                                        (LANES - doc_count) * (delta_bits + tf_bits) / 8;
+                                }
+                                _ => {
+                                    b.bitset_bytes += (end - off) as u64 - HEADER_SIZE as u64;
+                                }
                             }
                         }
                     }
@@ -394,11 +416,12 @@ impl fmt::Display for FtsSizeBreakdown {
             }
             writeln!(
                 f,
-                "  long-form fixed overhead {:.2} MiB, lane padding {:.2} MiB, {} blocks ({} partial)",
+                "  long-form fixed overhead {:.2} MiB, lane padding {:.2} MiB, {} blocks ({} partial, {} patched)",
                 mib(c.total.fixed_overhead_bytes()),
                 mib(c.total.padding_bytes),
                 c.total.blocks,
-                c.total.partial_blocks
+                c.total.partial_blocks,
+                c.total.patched_blocks
             )?;
         }
         Ok(())
