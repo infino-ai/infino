@@ -18,7 +18,7 @@ use crate::superfile::{
     error::FtsError,
     fts::{
         bm25,
-        positions::{decode_group, decode_run, positions_from_run_values, skip_run},
+        positions::{GroupIndex, decode_run, skip_run},
     },
 };
 
@@ -59,10 +59,9 @@ pub(super) struct PhraseMember {
     pub(super) cached_run_offset: u32,
     /// Scratch for the member's decoded positions at the aligned doc.
     pub(super) pos_scratch: Vec<u32>,
-    /// A packed position group decoded whole — the block's run values in
-    /// posting order — and which block it belongs to (`usize::MAX` =
-    /// none). A pair's run is the slice at the block's tf prefix sum.
-    pub(super) group_vals: Vec<u32>,
+    /// The current block's position group located for per-run access,
+    /// and which block it belongs to (`usize::MAX` = none).
+    pub(super) group_index: Option<GroupIndex>,
     pub(super) group_block: usize,
 }
 
@@ -83,42 +82,40 @@ impl PhraseMember {
         let pair = self.cursor.pos;
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
 
-        // Grouped positions (V7): the block's runs are one group, decoded
-        // whole once per block and indexed by the block's tf prefix sums —
-        // no run walk and no sub-index.
+        // Grouped positions (V7): the block's runs are one group. It is
+        // located once per block and each pair's run read on its own —
+        // no run walk, no sub-index, and no decode of the runs a phrase
+        // never visits.
         if term_meta.positions_grouped {
-            let group_start =
-                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
-            {
-                if self.group_block != block {
-                    self.group_vals.clear();
-                    let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
-                    let mut at = group_start;
-                    decode_group(&self.positions, &mut at, tfs, &mut self.group_vals).ok_or_else(
-                        || {
-                            FtsError::Read(ReadError::MalformedVersion(
-                                "position group truncated or malformed".into(),
-                            ))
-                        },
-                    )?;
-                    self.group_block = block;
-                }
-                let run_start: usize = self.cursor.block_tfs[..pair]
-                    .iter()
-                    .map(|&t| t as usize)
-                    .sum();
-                let tf = self.cursor.block_tfs[pair] as usize;
-                positions_from_run_values(
-                    &self.group_vals[run_start..run_start + tf],
+            if self.group_block != block {
+                let mut at =
+                    term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+                let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
+                let index = GroupIndex::parse(&self.positions, &mut at, tfs).ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "position group truncated or malformed".into(),
+                    ))
+                })?;
+                self.group_index = Some(index);
+                self.group_block = block;
+            }
+            let index = self
+                .group_index
+                .as_mut()
+                .expect("group index located for this block");
+            index
+                .run_positions(
+                    &self.positions,
+                    pair,
+                    self.cursor.block_tfs[pair],
                     &mut self.pos_scratch,
                 )
                 .ok_or_else(|| {
                     FtsError::Read(ReadError::MalformedVersion(
-                        "position run overflowing".into(),
+                        "position run truncated or overflowing".into(),
                     ))
                 })?;
-                return Ok(());
-            }
+            return Ok(());
         }
 
         // Fast path (VERSION_V3): the run-offset sub-index gives the
@@ -288,7 +285,7 @@ impl PhraseCursor {
                     cached_pair: NO_BLOCK_CACHED,
                     cached_run_offset: 0,
                     pos_scratch: Vec::new(),
-                    group_vals: Vec::new(),
+                    group_index: None,
                     group_block: NO_BLOCK_CACHED,
                 }
             })

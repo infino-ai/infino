@@ -48,6 +48,20 @@ pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
     let bit = i * width as usize;
     let byte = bit / 8;
     let shift = (bit % 8) as u32;
+    // One unaligned `u64` load covers any value of up to 57 bits that
+    // does not sit in the stream's last bytes; the tail and the widest
+    // values take the byte loop below.
+    if shift as usize + width as usize <= u64::BITS as usize
+        && let Some(chunk) = payload.get(byte..byte + 8)
+    {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        let mask: u64 = if width == MAX_WIDTH {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        return Some((word >> shift) & mask);
+    }
     let n_bytes = (shift as usize + width as usize).div_ceil(8);
     let slice = payload.get(byte..byte + n_bytes)?;
     let mut acc: u128 = 0;

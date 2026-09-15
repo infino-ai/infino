@@ -469,6 +469,41 @@ fn apply_exceptions(exceptions: &[u8], width: u8, dest: &mut [u32]) {
     }
 }
 
+/// Turn a block's deltas into doc ids in place: `dest[i] = base + Σ
+/// dest[..=i]`. Four independent quarter-block chains, each quarter then
+/// offset by the totals before it, so the adds pipeline four abreast
+/// where one chain over the whole block would wait on every add.
+fn prefix_sum_block(dest: &mut [u32], base: u32) {
+    const QUARTER: usize = BLOCK_LEN / 4;
+    let (q0, rest) = dest.split_at_mut(QUARTER);
+    let (q1, rest) = rest.split_at_mut(QUARTER);
+    let (q2, q3) = rest.split_at_mut(QUARTER);
+    let (mut s0, mut s1, mut s2, mut s3) = (base, 0u32, 0u32, 0u32);
+    for (((a, b), c), d) in q0
+        .iter_mut()
+        .zip(q1.iter_mut())
+        .zip(q2.iter_mut())
+        .zip(q3.iter_mut())
+    {
+        s0 = s0.wrapping_add(*a);
+        *a = s0;
+        s1 = s1.wrapping_add(*b);
+        *b = s1;
+        s2 = s2.wrapping_add(*c);
+        *c = s2;
+        s3 = s3.wrapping_add(*d);
+        *d = s3;
+    }
+    let o1 = s0;
+    let o2 = o1.wrapping_add(s1);
+    let o3 = o2.wrapping_add(s2);
+    for (q, o) in [(q1, o1), (q2, o2), (q3, o3)] {
+        for v in q.iter_mut() {
+            *v = v.wrapping_add(o);
+        }
+    }
+}
+
 /// Decode only the tf array of a block (the trailing tf-packed bytes) into
 /// `dest_tfs`, in doc order, skipping the doc-id half. The ranked-OR
 /// membership probe locates a bitset-block doc by bit-test + popcount-rank
@@ -585,11 +620,7 @@ pub fn decode_block_doc_ids(bytes: &[u8], dest_doc_ids: &mut [u32]) -> usize {
         );
         let (delta_exc, _) = patched_exception_ranges(bytes);
         apply_exceptions(&bytes[delta_exc], delta_bits, dest_doc_ids);
-        let mut prev = base_doc_id;
-        for d in dest_doc_ids[..BLOCK_LEN].iter_mut() {
-            prev = prev.wrapping_add(*d);
-            *d = prev;
-        }
+        prefix_sum_block(&mut dest_doc_ids[..BLOCK_LEN], base_doc_id);
         return count;
     }
     assert!(

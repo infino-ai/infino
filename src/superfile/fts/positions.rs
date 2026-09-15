@@ -15,6 +15,8 @@
 //! table records each 128-doc block's starting byte so a block's runs
 //! are randomly addressable without decoding its predecessors.
 
+use std::ops::Range;
+
 use crate::superfile::bits::{get_bits, payload_bytes, put_bits, width_of};
 
 /// Largest byte length one encoded `u32` can occupy (LEB128: 5 × 7
@@ -334,6 +336,163 @@ pub(crate) fn decode_group(
     }
 }
 
+/// One stream of a packed group located for random access: its lane
+/// width, where its payload lies in the positions bytes, and its
+/// exceptions in ascending lane order.
+struct StreamIndex {
+    width: u8,
+    payload: Range<usize>,
+    exceptions: Vec<(u32, u32)>,
+}
+
+impl StreamIndex {
+    /// Parse the stream of `n` lanes at `*at`, advancing past it. The
+    /// exception lanes must ascend (the writer emits them in lane order),
+    /// so a run's exceptions are one binary search away.
+    fn parse(bytes: &[u8], at: &mut usize, n: usize) -> Option<Self> {
+        let width = *bytes.get(*at)?;
+        *at += 1;
+        if width > GROUP_MAX_WIDTH {
+            return None;
+        }
+        let n_exc = read_varint(bytes, at)? as usize;
+        if n_exc > GROUP_MAX_EXCEPTIONS.max(n) {
+            return None;
+        }
+        let payload = *at..*at + payload_bytes(n, width);
+        bytes.get(payload.clone())?;
+        *at = payload.end;
+        let mut exceptions = Vec::with_capacity(n_exc);
+        let mut prev_lane: Option<u32> = None;
+        for _ in 0..n_exc {
+            let lane = read_varint(bytes, at)?;
+            let hi = read_varint(bytes, at)?;
+            if lane as usize >= n || prev_lane.is_some_and(|p| lane <= p) {
+                return None;
+            }
+            exceptions.push((lane, hi));
+            prev_lane = Some(lane);
+        }
+        Some(Self {
+            width,
+            payload,
+            exceptions,
+        })
+    }
+
+    /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
+    fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
+        let payload = &bytes[self.payload.clone()];
+        let base = out.len();
+        out.reserve(n);
+        for i in from..from + n {
+            out.push(get_bits(payload, i, self.width)? as u32);
+        }
+        let first = self
+            .exceptions
+            .partition_point(|&(lane, _)| (lane as usize) < from);
+        for &(lane, hi) in &self.exceptions[first..] {
+            let lane = lane as usize;
+            if lane >= from + n {
+                break;
+            }
+            out[base + lane - from] |= hi.checked_shl(u32::from(self.width)).unwrap_or(0);
+        }
+        Some(())
+    }
+}
+
+/// The two streams of a packed group, or a LEB128 group's values.
+enum GroupStreams {
+    /// Decoded whole: LEB128 runs allow no random access, and only a
+    /// short-form term (read once, whole) still writes them.
+    Leb128(Vec<u32>),
+    Packed {
+        first: StreamIndex,
+        gap: StreamIndex,
+    },
+}
+
+/// A position group located for **per-run** access: one pair's run is
+/// decoded without touching the block's other runs. A phrase visits few
+/// of a common term's pairs per block when its other members are rare,
+/// so decoding a whole group — every position of 128 docs — per
+/// candidate was the cost that dominated; here a candidate costs its
+/// own `tf` lanes plus one binary search over the stream's exceptions.
+pub(crate) struct GroupIndex {
+    streams: GroupStreams,
+    /// Where pair `p`'s lanes begin: in the gap stream (`Σ (tf - 1)` over
+    /// the pairs before it) for a packed group, in the values (`Σ tf`)
+    /// for a LEB128 one. `tfs.len() + 1` entries.
+    starts: Vec<u32>,
+    /// A run's raw values before the gaps are summed into positions.
+    run: Vec<u32>,
+}
+
+impl GroupIndex {
+    /// Locate the group at `*at` (its header) for the block whose per-doc
+    /// term frequencies are `tfs`, advancing `*at` past it. `None` on a
+    /// truncated or malformed group.
+    pub(crate) fn parse(bytes: &[u8], at: &mut usize, tfs: &[u32]) -> Option<Self> {
+        let n: usize = tfs.iter().map(|&t| t as usize).sum();
+        let header = *bytes.get(*at)?;
+        *at += 1;
+        let (streams, lanes_per_pair): (GroupStreams, fn(u32) -> u32) = match header {
+            GROUP_LEB128 => {
+                let mut values = Vec::with_capacity(n);
+                for _ in 0..n {
+                    values.push(read_varint(bytes, at)?);
+                }
+                (GroupStreams::Leb128(values), |tf| tf)
+            }
+            GROUP_PACKED => {
+                let first = StreamIndex::parse(bytes, at, tfs.len())?;
+                let gap = StreamIndex::parse(bytes, at, n - tfs.len())?;
+                (GroupStreams::Packed { first, gap }, |tf| {
+                    tf.saturating_sub(1)
+                })
+            }
+            _ => return None,
+        };
+        let mut starts = Vec::with_capacity(tfs.len() + 1);
+        let mut acc = 0u32;
+        starts.push(acc);
+        for &tf in tfs {
+            acc = acc.checked_add(lanes_per_pair(tf))?;
+            starts.push(acc);
+        }
+        Some(Self {
+            streams,
+            starts,
+            run: Vec::new(),
+        })
+    }
+
+    /// The absolute positions of pair `pair` (whose term frequency is
+    /// `tf`), appended to `out`. `None` on an overflowing gap.
+    pub(crate) fn run_positions(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        let start = *self.starts.get(pair)? as usize;
+        self.run.clear();
+        match &self.streams {
+            GroupStreams::Leb128(values) => {
+                self.run
+                    .extend_from_slice(values.get(start..start + tf as usize)?);
+            }
+            GroupStreams::Packed { first, gap } => {
+                first.read_lanes(bytes, pair, 1, &mut self.run)?;
+                gap.read_lanes(bytes, start, tf as usize - 1, &mut self.run)?;
+            }
+        }
+        positions_from_run_values(&self.run, out)
+    }
+}
+
 /// Turn a run's `tf` values (first absolute, then gaps) into absolute
 /// positions, appending to `out`. `None` on an overflowing gap.
 #[inline]
@@ -437,6 +596,54 @@ mod tests {
             assert_eq!(read_varint(&buf, &mut at), Some(v));
             assert_eq!(at, buf.len());
         }
+    }
+
+    #[test]
+    fn a_group_index_reads_each_run_like_the_whole_decode() {
+        // Mixed tfs, exceptions in both streams, and the first pair.
+        let tfs: Vec<u32> = (0..100u32).map(|d| 1 + d % 5).collect();
+        let mut vals = Vec::new();
+        for (d, &tf) in tfs.iter().enumerate() {
+            vals.push(30 * d as u32 + 3);
+            vals.extend((1..tf).map(|g| 1 + (g + d as u32) % 9));
+        }
+        vals[0] = 1 << 25;
+        let last = vals.len() - 1;
+        vals[last] = 1 << 28;
+        for allow in [false, true] {
+            let mut out = vec![0xAA; 7];
+            let start = out.len();
+            encode_group(&mut out, &tfs, &vals, allow);
+            let mut at = start;
+            let mut index = GroupIndex::parse(&out, &mut at, &tfs).expect("parses");
+            assert_eq!(at, out.len());
+            let mut whole = Vec::new();
+            decode_group(&out, &mut start.clone(), &tfs, &mut whole).expect("decodes");
+            let mut vi = 0usize;
+            for (pair, &tf) in tfs.iter().enumerate() {
+                let mut want = Vec::new();
+                positions_from_run_values(&whole[vi..vi + tf as usize], &mut want).expect("sums");
+                vi += tf as usize;
+                let mut got = Vec::new();
+                index
+                    .run_positions(&out, pair, tf, &mut got)
+                    .expect("run decodes");
+                assert_eq!(got, want, "pair {pair} allow {allow}");
+            }
+            assert!(
+                index
+                    .run_positions(&out, tfs.len(), 1, &mut Vec::new())
+                    .is_none()
+            );
+            for cut in start..out.len() {
+                assert!(GroupIndex::parse(&out[..cut], &mut start.clone(), &tfs).is_none());
+            }
+        }
+        // A LEB128 group must still be allowed to have a run overflow refused.
+        let mut out = Vec::new();
+        encode_group(&mut out, &[2], &[u32::MAX, 1], true);
+        let mut index = GroupIndex::parse(&out, &mut 0, &[2]).expect("parses");
+        assert!(index.run_positions(&out, 0, 2, &mut Vec::new()).is_none());
     }
 
     #[test]
