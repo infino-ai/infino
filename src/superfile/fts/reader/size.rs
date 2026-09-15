@@ -91,6 +91,12 @@ pub struct DfBucket {
     /// bands) and the bytes each band saves in all.
     pub patched_by_saving: [u64; PATCH_HIST_BANDS],
     pub patched_saved_by_saving: [u64; PATCH_HIST_BANDS],
+    /// Patched blocks that are a term's partial last block, and the
+    /// bytes those save — a walk meets at most one per term.
+    pub patched_partial_blocks: u64,
+    pub patched_partial_saved: u64,
+    /// Bytes the band's patched blocks save over plain packing.
+    pub patched_saved: u64,
     /// Position-run bytes this band's terms own in the positions region.
     pub positions_bytes: u64,
 }
@@ -122,6 +128,9 @@ impl DfBucket {
             self.patched_by_saving[i] += o.patched_by_saving[i];
             self.patched_saved_by_saving[i] += o.patched_saved_by_saving[i];
         }
+        self.patched_partial_blocks += o.patched_partial_blocks;
+        self.patched_partial_saved += o.patched_partial_saved;
+        self.patched_saved += o.patched_saved;
         self.positions_bytes += o.positions_bytes;
     }
 
@@ -346,6 +355,11 @@ impl FtsReader {
                                     let g = hist_band(&PATCH_SAVING_EDGES, saved);
                                     b.patched_by_saving[g] += 1;
                                     b.patched_saved_by_saving[g] += saved;
+                                    b.patched_saved += saved;
+                                    if doc_count < LANES {
+                                        b.patched_partial_blocks += 1;
+                                        b.patched_partial_saved += saved;
+                                    }
                                     b.docid_bytes +=
                                         LANES * delta_bits / 8 + delta_exc.len() as u64;
                                     b.tf_bytes += LANES * tf_bits / 8 + tf_exc.len() as u64;
@@ -427,7 +441,7 @@ impl fmt::Display for FtsSizeBreakdown {
             )?;
             writeln!(
                 f,
-                "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8} {:>8} | {:>7} {:>7} {:>7} {:>7} {:>7} | {:>8} {:>8} {:>8} {:>7} | {:>8} | {:>8}",
+                "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8} {:>8} | {:>7} {:>7} {:>7} {:>7} {:>7} | {:>8} {:>8} {:>8} {:>7} {:>8} | {:>8} | {:>8}",
                 "band",
                 "terms",
                 "postings",
@@ -444,6 +458,7 @@ impl fmt::Display for FtsSizeBreakdown {
                 "tfMiB",
                 "bitsMiB",
                 "padMiB",
+                "patchMiB",
                 "regnMiB",
                 "posMiB"
             )?;
@@ -453,7 +468,7 @@ impl fmt::Display for FtsSizeBreakdown {
                 }
                 writeln!(
                     f,
-                    "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8.2} {:>8.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>8.2} {:>8.2} {:>8.2} {:>7.2} | {:>8.2} | {:>8.2}",
+                    "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8.2} {:>8.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>8.2} {:>8.2} {:>8.2} {:>7.2} {:>8.2} | {:>8.2} | {:>8.2}",
                     b.label,
                     b.terms,
                     b.postings,
@@ -470,6 +485,7 @@ impl fmt::Display for FtsSizeBreakdown {
                     mib(b.tf_bytes),
                     mib(b.bitset_bytes),
                     mib(b.padding_bytes),
+                    mib(b.patched_saved),
                     mib(b.postings_region_bytes()),
                     mib(b.positions_bytes),
                 )?;
@@ -508,6 +524,15 @@ impl fmt::Display for FtsSizeBreakdown {
                     &c.total.patched_by_exceptions,
                     &c.total.patched_saved_by_exceptions
                 )
+            )?;
+            writeln!(
+                f,
+                "  patched partial (last) blocks: {} saving {:.2} MiB; patched full blocks: {} saving {:.2} MiB",
+                c.total.patched_partial_blocks,
+                mib(c.total.patched_partial_saved),
+                c.total.patched_blocks - c.total.patched_partial_blocks,
+                mib(c.total.patched_saved_by_saving.iter().sum::<u64>()
+                    - c.total.patched_partial_saved),
             )?;
             writeln!(
                 f,

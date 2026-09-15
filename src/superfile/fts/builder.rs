@@ -233,6 +233,15 @@ pub(crate) const TERM_META_SIZE: usize = 20;
 /// mix within one column.
 pub(crate) const TERM_META_POSITIONAL_SIZE: usize = 32;
 
+/// Largest document frequency at which a term's blocks may take the
+/// patched encoding. A patched block decodes about 15 ns slower than a
+/// plain one, and a common term's blocks are what every intersection
+/// and union over it expands in bulk; a term below this bar is walked
+/// in full only when it is itself a query term, a few dozen blocks at
+/// most. On a Zipfian corpus the bands below the bar hold ~60% of what
+/// the patched form saves, the bands above it the rest.
+const PATCHED_MAX_DF: usize = 16 * 1024;
+
 /// Doc-lengths directory entry size in bytes (per column).
 ///
 /// Layout:
@@ -4023,7 +4032,12 @@ fn encode_and_emit_term<W: Write>(
                 tfs: mem::take(&mut block_tfs),
             };
             let prev_last_doc_id = encoded_blocks.last().map(|b: &EncodedBlock| b.last_doc_id);
-            encoded_blocks.push(encode_block(&block, era.layout().block, prev_last_doc_id));
+            encoded_blocks.push(encode_block(
+                &block,
+                era.layout().block,
+                prev_last_doc_id,
+                pairs.len() <= PATCHED_MAX_DF,
+            ));
             // Reclaim the underlying allocations for the next chunk.
             block_doc_ids = block.doc_ids;
             block_tfs = block.tfs;
