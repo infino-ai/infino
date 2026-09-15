@@ -18,13 +18,16 @@
 //! builder is consume-on-`finish()`; a session that wants N
 //! superfiles instantiates N builders.
 
+pub(crate) mod bits;
 pub mod builder;
 pub mod error;
 pub mod format;
 pub mod fts;
+pub(crate) mod ids;
 pub mod lazy_source;
 pub mod reader;
 pub mod stats;
+pub(crate) mod varint;
 pub mod vector;
 
 pub use error::{BuildError, FtsError, ReadError, VectorError};

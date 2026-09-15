@@ -11,7 +11,13 @@
 //! the single place that difference is interpreted, so the single-term
 //! walk and the multi-term cursors cannot drift apart.
 
-use crate::superfile::{format, fts::reader::metadata::ColumnMeta};
+use crate::superfile::{
+    format::{
+        self,
+        fts::{BlobLayout, BlockLayout, SkipLayout},
+    },
+    fts::reader::metadata::ColumnMeta,
+};
 
 /// The FTS blob version, as far as reading a block-max slot is
 /// concerned: what the 4-byte slot (skip entry and coarse entry alike)
@@ -25,6 +31,10 @@ use crate::superfile::{format, fts::reader::metadata::ColumnMeta};
 /// arm's decode by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StoredBound {
+    /// [`format::fts::VERSION_V7`]: as [`Self::V6`] for every slot —
+    /// the version changes the rare-term layout and the dictionary
+    /// value, not the bounds or the average they are baked at.
+    V7,
     /// [`format::fts::VERSION_V6`]: exact `f32` bits of the maximum, in
     /// the scorer's own scale, at the table-wide average the file
     /// declares — which is what the reader scores the file at, so
@@ -42,11 +52,36 @@ pub(super) enum StoredBound {
 }
 
 impl StoredBound {
+    /// The layout table of a version this variant stands for. `V1ToV4`
+    /// reads as `V4`: the three fields the bound decoder's callers take
+    /// from it (coarse table, block header, skip entries) are the same
+    /// across `V1`–`V4`.
+    fn layout(self) -> BlobLayout {
+        let version = match self {
+            Self::V7 => format::fts::VERSION_V7,
+            Self::V6 => format::fts::VERSION_V6,
+            Self::V5 => format::fts::VERSION_V5,
+            Self::V1ToV4 => format::fts::VERSION_V4,
+        };
+        BlobLayout::for_version(version).expect("every variant names a known version")
+    }
+
+    /// Which block header the version's posting blocks carry.
+    pub(super) fn block_layout(self) -> BlockLayout {
+        self.layout().block
+    }
+
+    /// How the version's skip tables locate their blocks.
+    pub(super) fn skip_layout(self) -> SkipLayout {
+        self.layout().skip
+    }
+
     /// The variant for a blob version, or `None` for a version this
     /// reader does not know — which the open path turns into an
     /// unsupported-version error.
     pub(super) fn for_version(version: u32) -> Option<Self> {
         match version {
+            format::fts::VERSION_V7 => Some(Self::V7),
             format::fts::VERSION_V6 => Some(Self::V6),
             format::fts::VERSION_V5 => Some(Self::V5),
             format::fts::VERSION_V1_LEGACY
@@ -60,13 +95,13 @@ impl StoredBound {
     /// Whether each PFOR term's region ends with a coarse block-max table
     /// (one slot per [`format::fts::COARSE_BLOCK_MAX_SPAN`] blocks).
     pub(super) fn has_coarse(self) -> bool {
-        self != Self::V1ToV4
+        self.layout().coarse
     }
 
     /// Whether the file's declared average document length is the one to
     /// score it at, or a row-count average the reader must correct.
     pub(super) fn declares_scoring_average(self) -> bool {
-        self == Self::V6
+        matches!(self, Self::V6 | Self::V7)
     }
 }
 
@@ -113,7 +148,7 @@ impl BoundDecoder {
     #[inline]
     pub(super) fn bound(&self, raw: u32) -> f32 {
         let stored = match self.stored {
-            StoredBound::V6 | StoredBound::V5 => f32::from_bits(raw).next_up(),
+            StoredBound::V7 | StoredBound::V6 | StoredBound::V5 => f32::from_bits(raw).next_up(),
             StoredBound::V1ToV4 => {
                 raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
             }
@@ -147,6 +182,7 @@ mod tests {
             (format::fts::VERSION_V4, StoredBound::V1ToV4),
             (format::fts::VERSION_V5, StoredBound::V5),
             (format::fts::VERSION_V6, StoredBound::V6),
+            (format::fts::VERSION_V7, StoredBound::V7),
         ];
         for (version, want) in accepted {
             assert_eq!(
@@ -155,11 +191,16 @@ mod tests {
                 "version {version}"
             );
         }
-        assert_eq!(StoredBound::for_version(format::fts::VERSION_V6 + 1), None);
+        assert_eq!(StoredBound::for_version(format::fts::VERSION_V7 + 1), None);
         assert_eq!(StoredBound::for_version(0), None);
 
-        assert!(StoredBound::V6.has_coarse() && StoredBound::V5.has_coarse());
+        assert!(
+            StoredBound::V7.has_coarse()
+                && StoredBound::V6.has_coarse()
+                && StoredBound::V5.has_coarse()
+        );
         assert!(!StoredBound::V1ToV4.has_coarse());
+        assert!(StoredBound::V7.declares_scoring_average());
         assert!(StoredBound::V6.declares_scoring_average());
         assert!(!StoredBound::V5.declares_scoring_average());
         assert!(!StoredBound::V1ToV4.declares_scoring_average());

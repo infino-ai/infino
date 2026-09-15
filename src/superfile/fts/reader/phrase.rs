@@ -18,7 +18,7 @@ use crate::superfile::{
     error::FtsError,
     fts::{
         bm25,
-        positions::{decode_run, skip_run},
+        positions::{GroupIndex, decode_run, skip_run},
     },
 };
 
@@ -59,6 +59,11 @@ pub(super) struct PhraseMember {
     pub(super) cached_run_offset: u32,
     /// Scratch for the member's decoded positions at the aligned doc.
     pub(super) pos_scratch: Vec<u32>,
+    /// The current block's position group located for per-run access,
+    /// and which block it belongs to (`usize::MAX` = none). Reused
+    /// across blocks, so a block crossing allocates nothing.
+    pub(super) group_index: GroupIndex,
+    pub(super) group_block: usize,
 }
 
 /// Sentinel for [`PhraseMember::run_offsets_block`]: no block cached.
@@ -76,6 +81,40 @@ impl PhraseMember {
         }
         let block = self.cursor.current_block;
         let pair = self.cursor.pos;
+        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
+
+        // Grouped positions (V7): the block's runs are one group. It is
+        // located once per block and each pair's run read on its own —
+        // no run walk, no sub-index, and no decode of the runs a phrase
+        // never visits.
+        if term_meta.positions_grouped {
+            if self.group_block != block {
+                let mut at =
+                    term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+                let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
+                self.group_index
+                    .locate(&self.positions, &mut at, tfs)
+                    .ok_or_else(|| {
+                        FtsError::Read(ReadError::MalformedVersion(
+                            "position group truncated or malformed".into(),
+                        ))
+                    })?;
+                self.group_block = block;
+            }
+            self.group_index
+                .run_positions(
+                    &self.positions,
+                    pair,
+                    self.cursor.block_tfs[pair],
+                    &mut self.pos_scratch,
+                )
+                .ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "position run truncated or overflowing".into(),
+                    ))
+                })?;
+            return Ok(());
+        }
 
         // Fast path (VERSION_V3): the run-offset sub-index gives the
         // nearest checkpoint at or before `pair`. Start the skip from
@@ -84,11 +123,7 @@ impl PhraseMember {
         // so the last one is `<= pair`). Dense reuse then costs ~one
         // `skip_run`; sparse access at most `STRIDE - 1`. Returns an owned
         // tuple, so no `term_meta` borrow is held across the decode below.
-        let subindex = self
-            .term_meta
-            .as_ref()
-            .expect("PFOR member has term meta")
-            .positions_subindex_offset(self.cursor.bytes.as_ref(), block, pair);
+        let subindex = term_meta.positions_subindex_offset(self.cursor.bytes.as_ref(), block, pair);
         if let Some((checkpoint, runs_to_skip)) = subindex {
             let checkpoint_pair = pair - runs_to_skip;
             let (mut from_pair, mut at) = (checkpoint_pair, checkpoint as usize);
@@ -128,12 +163,8 @@ impl PhraseMember {
         // walking every run from the block's recorded first-run offset.
         if self.run_offsets_block != block {
             self.run_offsets.clear();
-            let block_first = self
-                .term_meta
-                .as_ref()
-                .expect("PFOR member has term meta")
-                .positions_block_offset(self.cursor.bytes.as_ref(), block)
-                as usize;
+            let block_first =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             let mut at = block_first;
             for i in 0..self.cursor.block_n {
                 self.run_offsets.push(at as u32);
@@ -252,6 +283,8 @@ impl PhraseCursor {
                     cached_pair: NO_BLOCK_CACHED,
                     cached_run_offset: 0,
                     pos_scratch: Vec::new(),
+                    group_index: GroupIndex::default(),
+                    group_block: NO_BLOCK_CACHED,
                 }
             })
             .collect();
@@ -696,6 +729,188 @@ mod tests {
         vec![Phrase::adjacent(
             terms.iter().map(|t| t.to_string()).collect(),
         )]
+    }
+
+    /// A multi-block positional term's groups are decoded whole and
+    /// indexed by tf prefix sums. Plant a phrase in every one of 300 docs
+    /// at varying in-block pair slots (three blocks, tf varying so the
+    /// runs differ in length) and verify every doc through the phrase
+    /// path.
+    #[tokio::test]
+    async fn grouped_positions_reach_every_pair_across_blocks() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, reader::cursor::SubindexKind, tokenize::AsciiLowerTokenizer,
+        };
+        let n_docs = 300u32;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for i in 0..n_docs {
+            let text = format!(
+                "{}{}alpha beta",
+                "alpha ".repeat((i % 7) as usize),
+                "filler ".repeat((i % 50) as usize)
+            );
+            b.add_doc(0, i, &text).expect("doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert!(r.positions_grouped);
+        assert_eq!(r.subindex, SubindexKind::None);
+        let phrases = phrase(&["alpha", "beta"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                n_docs as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..n_docs).collect::<Vec<_>>(),
+            "every doc holds the phrase"
+        );
+        // No doc holds "beta alpha".
+        let reversed = phrase(&["beta", "alpha"]);
+        let none = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &reversed,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        assert!(none.is_empty());
+    }
+
+    /// Position groups pick packed or LEB128 per block by size. Plant a
+    /// term whose first block has small gaps (packed) and whose second
+    /// block carries an outlier gap (LEB128 wins), plus a short-form
+    /// member with tf > 1 (one packed group), and verify the phrase in
+    /// every doc through both decode paths.
+    #[tokio::test]
+    async fn position_groups_verify_phrases_in_long_and_short_terms() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
+        };
+        const N_DOCS: u32 = 200;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let alpha: Vec<u32> = match d < BLOCK_LEN as u32 {
+                true => vec![0, 5, 10],
+                false => vec![0, 1 << 20],
+            };
+            let beta: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
+            b.add_prebuilt_term_posting(0, "alpha", d, alpha.len() as u32, &alpha)
+                .expect("alpha");
+            b.add_prebuilt_term_posting(0, "beta", d, beta.len() as u32, &beta)
+                .expect("beta");
+            if d < 3 {
+                // Short-form member (df = 3) with two positions each.
+                let rare = [beta[0] + 1, beta[0] + 7];
+                b.add_prebuilt_term_posting(0, "rare", d, 2, &rare)
+                    .expect("rare");
+            }
+        }
+        b.append_prebuilt_doc_lengths(0, &vec![(1 << 20) + 8; N_DOCS as usize]);
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrase(&["alpha", "beta"]),
+                    ..ClauseLists::default()
+                },
+                N_DOCS as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..N_DOCS).collect::<Vec<_>>());
+
+        let rare_hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrase(&["beta", "rare"]),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = rare_hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2], "short-form member's packed group");
+    }
+
+    /// A block whose position runs are very long (600 occurrences per doc,
+    /// 599 unit gaps then one huge one that becomes a stream exception)
+    /// still packs as one group and verifies. Postings are planted
+    /// directly so the fixture costs no tokenization.
+    #[tokio::test]
+    async fn a_block_with_very_long_runs_verifies_phrases() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+        const N_DOCS: u32 = 129;
+        const TF: u32 = 600;
+        const OUTLIER_GAP: u32 = 1 << 25;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        let alpha: Vec<u32> = (0..TF)
+            .map(|j| match j + 1 == TF {
+                true => 2 * j + OUTLIER_GAP,
+                false => 2 * j,
+            })
+            .collect();
+        let filler: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
+        for d in 0..N_DOCS {
+            b.add_prebuilt_term_posting(0, "alpha", d, TF, &alpha)
+                .expect("alpha");
+            b.add_prebuilt_term_posting(0, "filler", d, TF, &filler)
+                .expect("filler");
+        }
+        b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+
+        let phrases = phrase(&["alpha", "filler"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                N_DOCS as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..N_DOCS).collect::<Vec<_>>());
     }
 
     #[tokio::test]

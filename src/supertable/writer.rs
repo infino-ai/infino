@@ -2635,7 +2635,9 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
 /// footer tail (matching the 64 KiB speculation length) plus each
 /// vector / FTS open range. Returns `(absolute_offset, bytes)`
 /// tuples; an empty `Vec` disables the inline-open fast path for
-/// this superfile.
+/// this superfile — which is also the deliberate answer once the open
+/// ranges pass `OPEN_BLOB_INLINE_MAX_BYTES`, so a large superfile's
+/// dictionary is not copied into every manifest read.
 fn build_open_blob(
     bytes: &Bytes,
     total_size: u64,
@@ -2645,6 +2647,22 @@ fn build_open_blob(
     // Must match `cold_fetch_lazy_with_hints`'s parquet tail
     // speculation length so the overlay covers `source.tail()`.
     const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
+    // The blob is a second copy of the open ranges — for an FTS column
+    // that is the whole term dictionary plus the per-doc lengths, which
+    // on a benchmark-scale superfile run to tens of MiB and do not
+    // compress. What it buys is one round-trip per cold open (the
+    // fallback fetches the same ranges in one parallel wave), so past
+    // this size the copy costs more in every manifest read than the
+    // round-trip it saves, and the superfile's open goes the fetch route.
+    const OPEN_BLOB_INLINE_MAX_BYTES: u64 = 1024 * 1024;
+    let inline_bytes: u64 = vec_open_ranges
+        .iter()
+        .chain(fts_open_ranges.iter())
+        .map(|&(_, len)| len)
+        .sum();
+    if inline_bytes > OPEN_BLOB_INLINE_MAX_BYTES {
+        return Vec::new();
+    }
     let mut blob: Vec<(u64, Vec<u8>)> =
         Vec::with_capacity(1 + vec_open_ranges.len() + fts_open_ranges.len());
 
@@ -9224,7 +9242,13 @@ pub(in crate::supertable) async fn stamp_term_stats(
             old
         };
         let entries = old.get_all_superfiles();
-        if entries.is_empty() {
+        // One superfile is its own global statistics: a query gathers df
+        // from that superfile's dictionary — the same numbers, one probe
+        // — so publishing an artifact would only duplicate the dictionary
+        // on disk. Nothing to drop either: a commit that removed the other
+        // superfiles already dropped the reference (the carry rule), and
+        // the next multi-superfile maintenance pass republishes.
+        if entries.len() <= 1 {
             return Ok(());
         }
         // Rebuilt per attempt: a competing commit may have changed the
@@ -10488,6 +10512,27 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_blob_is_inlined_only_while_the_open_ranges_are_small() {
+        // A 4 MiB "superfile": the parquet tail is the last 64 KiB; an
+        // FTS open range of 512 KiB inlines, one of 2 MiB does not (the
+        // fallback fetches it in one wave; copying it into the manifest
+        // would cost more than the round-trip it saves).
+        let total: u64 = 4 * 1024 * 1024;
+        let bytes = Bytes::from(vec![7u8; total as usize]);
+        let small = build_open_blob(&bytes, total, &[], &[(1024, 512 * 1024)]);
+        assert_eq!(small.len(), 2, "parquet tail + one FTS range");
+        assert_eq!(small[1].0, 1024);
+        assert_eq!(small[1].1.len(), 512 * 1024);
+        let large = build_open_blob(&bytes, total, &[], &[(1024, 2 * 1024 * 1024)]);
+        assert!(large.is_empty(), "past the cap the inline fast path is off");
+        let split = build_open_blob(&bytes, total, &[(0, 700 * 1024)], &[(1024, 700 * 1024)]);
+        assert!(
+            split.is_empty(),
+            "the cap is over vector and FTS ranges together"
+        );
+    }
+
     use std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -10777,6 +10822,7 @@ mod tests {
             birth_version: 0,
             superfile_id: Uuid::from_u128(id),
             uri: SuperfileUri(Uuid::from_u128(id)),
+            stem: None,
             n_docs: 1,
             id_min: 0,
             id_max: 0,

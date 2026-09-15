@@ -14,7 +14,7 @@ use rayon::ThreadPool;
 use super::{core::*, work::MatchWork};
 use crate::{
     runtime_bridge::run_on_pool,
-    superfile::{error::FtsError, fts::dict::make_key},
+    superfile::{error::FtsError, format::fts::DictLayout, fts::dict::make_key},
 };
 
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;
@@ -239,9 +239,11 @@ impl FtsReader {
             let column = column.to_owned();
             let owned: Vec<OwnedPattern> = patterns.iter().map(|p| p.into_owned()).collect();
             let walks = walks.clone();
+            let layout = self.dict_layout;
             run_on_pool(pool, "like expansion", move || {
                 walk_dictionary(
                     &fst_bytes,
+                    layout,
                     &column,
                     &owned,
                     &walks,
@@ -285,8 +287,9 @@ impl FtsReader {
         let fst_bytes = self.dict_bytes_async().await?;
         let column = column.to_owned();
         let term_prefix = term_prefix.to_vec();
+        let layout = self.dict_layout;
         run_on_pool(pool, "prefix expansion", move || {
-            collect_terms_with_prefix(&fst_bytes, &column, &term_prefix)
+            collect_terms_with_prefix(&fst_bytes, layout, &column, &term_prefix)
         })
         .await
         .map_err(|_| FtsError::TaskDropped("prefix expansion"))?
@@ -298,6 +301,7 @@ impl FtsReader {
 /// pool, so it takes owned inputs.
 fn walk_dictionary(
     fst_bytes: &[u8],
+    layout: DictLayout,
     column: &str,
     patterns: &[OwnedPattern],
     walks: &[Walk],
@@ -305,7 +309,7 @@ fn walk_dictionary(
     max_terms: usize,
     allow_full_walk: bool,
 ) -> Result<Vec<Collected>, FtsError> {
-    let dict = FtsReader::open_dict(fst_bytes)?;
+    let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
     let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
     // Every key in the column's range starts with `<column>\x1F`; the
     // term is what follows. `for_each_prefix` only visits keys carrying

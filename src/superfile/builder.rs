@@ -102,6 +102,7 @@ use crate::superfile::{
         reader::{ColumnLengthStats, ColumnMeta},
         tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
     },
+    ids,
     stats::SuperfileStats,
     vector::{
         builder::{
@@ -2121,14 +2122,15 @@ impl SuperfileBuilder {
             .seek(SeekFrom::Start(0))
             .map_err(BuildError::Io)?;
         let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
+        let (packed_ids, kvs) = pack_id_sidecar(&ids_bytes, &kvs);
         splice_index_streams_to(
             body,
             BufReader::new(Cursor::new(Vec::<u8>::new())),
             0,
             BufReader::new(vector_file),
             vector_length,
-            Cursor::new(&ids_bytes),
-            ids_bytes.len() as u64,
+            Cursor::new(&packed_ids),
+            packed_ids.len() as u64,
             &kvs,
             &mut output,
         )?;
@@ -2307,6 +2309,22 @@ fn stream_index_blobs_to_scratch(
 /// Splice an encoded body + the two on-disk blobs to `output`, streaming both
 /// blobs off disk so neither is ever resident. Cheap relative to the encode —
 /// byte appends + a footer rewrite.
+/// Pack the raw stable-id sidecar (one `i128` per row) into the
+/// frame-of-reference layout and name that layout in the footer KVs. An
+/// empty sidecar stays empty and adds no key (no sidecar, Parquet
+/// fallback), the shape older readers already handle.
+fn pack_id_sidecar(raw_ids: &[u8], kvs: &[(String, String)]) -> (Vec<u8>, Vec<(String, String)>) {
+    let packed = ids::encode_packed(raw_ids);
+    let mut kvs = kvs.to_vec();
+    if !packed.is_empty() {
+        kvs.push((
+            kv::IDS_LAYOUT.to_string(),
+            kv::IDS_LAYOUT_PACKED.to_string(),
+        ));
+    }
+    (packed, kvs)
+}
+
 fn splice_body_and_blobs_to<W: Write>(
     body: EncodedBody,
     fts_file: NamedTempFile,
@@ -2317,15 +2335,16 @@ fn splice_body_and_blobs_to<W: Write>(
 ) -> Result<ParquetLayout, BuildError> {
     let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
     let vec_length = vec_file.as_file().metadata().map_err(BuildError::Io)?.len();
+    let (packed_ids, kvs) = pack_id_sidecar(ids_bytes, kvs);
     let layout = splice_index_streams_to(
         body,
         BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
         fts_length,
         BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
         vec_length,
-        Cursor::new(ids_bytes),
-        ids_bytes.len() as u64,
-        kvs,
+        Cursor::new(&packed_ids),
+        packed_ids.len() as u64,
+        &kvs,
         output,
     )?;
     Ok(layout)

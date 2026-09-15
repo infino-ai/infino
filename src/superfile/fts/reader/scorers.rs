@@ -2288,7 +2288,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        posting::{ENCODING_BITSET, ENCODING_OFF},
+        posting::{ENCODING_BITSET, block_encoding},
         reader::BoolMode,
         tokenize::AsciiLowerTokenizer,
     };
@@ -2391,17 +2391,20 @@ mod tests {
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false)
             .expect("register column");
-        // `common` is present at doc 0 and docs 100..=165. First-doc 0 word-
-        // aligns the bitset base to 0, so doc 100 -> bit 100 (presence word 1)
-        // and doc 165 -> bit 165 (presence word 2); the 0->100 gap widens the
-        // deltas enough that the block takes the bitset encoding, not PFOR. tf
-        // is 1 everywhere except 3 at doc 100 and 2 at doc 165.
-        for id in 0u32..=165 {
+        // `common` is present at doc 0 and docs 100..=300 — more than one
+        // block, so it takes the long form (a single-block term would be
+        // written in the short form, which has no bitset to probe). Its
+        // first block holds docs 0 and 100..=226. First-doc 0 word-aligns
+        // the bitset base to 0, so doc 100 -> bit 100 (presence word 1)
+        // and doc 165 -> bit 165 (presence word 2); the 0->100 gap widens
+        // the deltas enough that the block takes the bitset encoding, not
+        // PFOR. tf is 1 everywhere except 3 at doc 100 and 2 at doc 165.
+        for id in 0u32..=300 {
             let text = match id {
                 0 => "common",
                 100 => "common common common",
                 165 => "common common",
-                101..=164 => "common",
+                101..=300 => "common",
                 _ => "filler", // 1..=99: present docs that don't carry `common`
             };
             b.add_doc(0, id, text).expect("add doc");
@@ -2420,7 +2423,7 @@ mod tests {
         // probe takes the PACKED fallback and the rank path under test is skipped.
         let blk = cursor.blocks[0];
         assert_eq!(
-            cursor.bytes[blk.block_byte_offset + ENCODING_OFF],
+            block_encoding(&cursor.bytes[blk.block_byte_offset..blk.block_byte_end]),
             ENCODING_BITSET,
             "corpus must produce a bitset block for this test to be meaningful"
         );

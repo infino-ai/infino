@@ -130,6 +130,45 @@ pub mod fts {
     /// than inferred.
     pub const VERSION_V6: u32 = 6;
 
+    /// The version new code writes. Same header, regions, bound scale
+    /// and declared average as [`VERSION_V6`]; what changes is how a
+    /// **rare term** is laid out, and one bit of every dictionary value.
+    ///
+    /// A term whose whole posting list fits one block (`df <=
+    /// BLOCK_LEN`) no longer pays the long-form fixed cost — the 20/32
+    /// byte metadata header, a skip entry, a position sub-index row, a
+    /// coarse slot and a block header, 92 bytes before the first posting
+    /// on a positional column — nor the block codec's padding of a
+    /// partial block to `BLOCK_LEN` lanes, which on a term with two docs
+    /// far apart is hundreds of bytes for two doc ids. It is written in
+    /// the **short form** instead (`fts::short`): a varint `df`, a
+    /// tf-equals-one bitmap, the doc-id deltas as group-varint, the
+    /// remaining tfs as varints and, on a positional column, the term's
+    /// position offset and length. A few bytes per posting, no lane
+    /// padding, nothing per block. On a Zipfian corpus the single-block
+    /// terms are ~97% of the dictionary and were more than half of the
+    /// postings region; they are read once and whole, so the reader
+    /// decodes a short body into the same pre-filled single-block cursor
+    /// the df=1 inline form already uses.
+    ///
+    /// The term dictionary is no longer an FST: it is sorted,
+    /// front-coded term blocks behind a first-key index (`fts::dict`),
+    /// whose entries carry the short/long form explicitly and the
+    /// metadata offset as a delta — a third smaller than the FST for
+    /// the same terms. Readers select the layout by this version;
+    /// `V1`–`V6` blobs keep their FST and its packed values.
+    /// Multi-block terms change in two fixed costs. A block's header is
+    /// one 4-byte word (`posting::BlockLayout::Compact`): the base doc
+    /// id is the previous block's last doc id, which the skip table
+    /// already holds, and a patched block's exception counts ride in the
+    /// word. A skip entry carries the block's byte length instead of its
+    /// offset ([`SkipLayout::Length`]) and drops the positions field on
+    /// a positionless column; each coarse slot gains its span's start
+    /// offset so a random block is still reached in constant work.
+    ///
+    /// Readers accept `V1`–`V7`.
+    pub const VERSION_V7: u32 = 7;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
@@ -144,6 +183,17 @@ pub mod fts {
     /// `block * ENTRIES + slot` indexing derive from this single value, so
     /// they stay in lockstep.
     pub const POSITION_SUBINDEX_ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
+
+    /// Bytes per stored document length from [`VERSION_V7`]: a `u16`,
+    /// saturating at [`DOC_LENGTH_STORED_MAX`], instead of the `u32`
+    /// `V1`–`V6` stored. The scorer reads a one-byte bucket of the length
+    /// and the directory carries the exact average, so nothing about
+    /// scoring changes; a document past 65,535 tokens has its stored
+    /// length (and so its stored bucket and bound) computed from the
+    /// saturated value, consistently on the writer and the reader.
+    pub const DOC_LENGTH_BYTES_V7: usize = 2;
+    /// Largest per-document length a `V7` blob stores.
+    pub const DOC_LENGTH_STORED_MAX: u32 = u16::MAX as u32;
 
     /// Fixed-point scale for the per-column average document length.
     /// The builder stores `round(avgdl × 1000)` in the doc-lengths
@@ -274,36 +324,202 @@ pub mod fts {
         pub const POSITIONS_LENGTH_OFF: usize = 28;
     }
 
-    /// Skip-table entry field offsets (relative to the entry start;
-    /// each entry is `SKIP_ENTRY_SIZE` bytes):
+    /// Which header a posting block carries — by blob version.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BlockLayout {
+        /// `V1`–`V6`: the 8-byte header with the base doc id stored.
+        Wide,
+        /// `V7`+: the 4-byte header word; a packed or patched block's base
+        /// doc id is the previous block's last doc id (zero for the first
+        /// block), a bitset block's origin follows the word.
+        Compact,
+    }
+
+    /// How the term dictionary lays its terms out — by blob version.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DictLayout {
+        /// `V1`–`V6`: one FST keyed `column <SEP> term`, values packed as
+        /// `fts::fst_value` describes.
+        Fst,
+        /// `V7`+: front-coded term blocks behind a fixed-width first-key
+        /// table (see `fts::dict`).
+        Blocks,
+    }
+
+    /// Everything a blob version decides about how its regions are laid
+    /// out — the one table the writer (by the era it writes) and the
+    /// reader (by the version it opened) both consult, so the version
+    /// ladder is spelled out once.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BlobLayout {
+        /// Each long-form term ends with a coarse block-max table, one
+        /// slot per [`COARSE_BLOCK_MAX_SPAN`] blocks (`V5`+).
+        pub coarse: bool,
+        /// A single-block term is written in the short form (`V7`+).
+        pub short_form: bool,
+        /// Positions are per-block groups (`V7`+); a grouped blob carries
+        /// no run-offset sub-index.
+        pub grouped_positions: bool,
+        /// A positional long-form term carries a run-offset sub-index
+        /// between its skip table and its blocks (`V3`–`V6`).
+        pub position_subindex: bool,
+        /// Dense blocks may take the presence-bitset encoding (`V4`+).
+        pub bitset_blocks: bool,
+        pub block: BlockLayout,
+        pub skip: SkipLayout,
+        pub dict: DictLayout,
+        /// Bytes per stored document length.
+        pub doc_length_bytes: usize,
+    }
+
+    impl BlobLayout {
+        /// The layout of blob `version`, or `None` for a version this
+        /// crate does not know.
+        pub fn for_version(version: u32) -> Option<Self> {
+            let legacy = Self {
+                coarse: false,
+                short_form: false,
+                grouped_positions: false,
+                position_subindex: false,
+                bitset_blocks: false,
+                block: BlockLayout::Wide,
+                skip: SkipLayout::Absolute,
+                dict: DictLayout::Fst,
+                doc_length_bytes: U32_BYTES,
+            };
+            Some(match version {
+                VERSION_V1_LEGACY | VERSION_V2 => legacy,
+                VERSION_V3 => Self {
+                    position_subindex: true,
+                    ..legacy
+                },
+                VERSION_V4 => Self {
+                    position_subindex: true,
+                    bitset_blocks: true,
+                    ..legacy
+                },
+                VERSION_V5 | VERSION_V6 => Self {
+                    coarse: true,
+                    position_subindex: true,
+                    bitset_blocks: true,
+                    ..legacy
+                },
+                VERSION_V7 => Self {
+                    coarse: true,
+                    short_form: true,
+                    grouped_positions: true,
+                    position_subindex: false,
+                    bitset_blocks: true,
+                    block: BlockLayout::Compact,
+                    skip: SkipLayout::Length,
+                    dict: DictLayout::Blocks,
+                    doc_length_bytes: DOC_LENGTH_BYTES_V7,
+                },
+                _ => return None,
+            })
+        }
+    }
+
+    /// How a term's skip table locates its blocks — by blob version.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SkipLayout {
+        /// `V1`–`V6`: 16-byte entries carrying each block's absolute byte
+        /// offset within the term; 4-byte coarse slots.
+        Absolute,
+        /// `V7`+: an entry carries the block's byte **length** (`u16`) in
+        /// place of its offset — 10 bytes, 14 on a positional column —
+        /// and each 8-byte coarse slot adds the offset of its span's
+        /// first block. A sequential walk accumulates lengths; a random
+        /// block is one slot read plus at most `COARSE_BLOCK_MAX_SPAN - 1`
+        /// lengths summed.
+        Length,
+    }
+
+    impl SkipLayout {
+        /// Bytes one skip entry takes on a column with or without
+        /// positions.
+        pub fn entry_bytes(self, positional: bool) -> usize {
+            match (self, positional) {
+                (Self::Absolute, _) => 16,
+                (Self::Length, true) => 14,
+                (Self::Length, false) => 10,
+            }
+        }
+
+        /// Bytes one coarse block-max slot takes.
+        pub fn coarse_slot_bytes(self) -> usize {
+            match self {
+                Self::Absolute => U32_BYTES,
+                Self::Length => 2 * U32_BYTES,
+            }
+        }
+
+        /// Entry offset of the block-max bound (`u32` LE).
+        pub fn bound_off(self) -> usize {
+            match self {
+                Self::Absolute => 8,
+                Self::Length => 6,
+            }
+        }
+
+        /// Entry offset of the block's position-group offset (`u32` LE,
+        /// positional columns).
+        pub fn positions_off(self) -> usize {
+            match self {
+                Self::Absolute => 12,
+                Self::Length => 10,
+            }
+        }
+    }
+
+    /// Skip-table entry field offsets (relative to the entry start).
+    ///
+    /// [`SkipLayout::Absolute`]:
     ///
     /// ```text
     /// [ 0.. 4] last_doc_id (u32 LE)
     /// [ 4.. 8] block_offset (u32 LE, relative to term metadata start)
-    /// [ 8..12] max_bm25_x1000 (u32 LE)
+    /// [ 8..12] block-max bound (u32 LE)
     /// [12..16] positions_block_offset (u32 LE; positional columns)
     /// ```
     ///
-    /// The final field was reserved (always written zero) before
-    /// positions existed; for a positional column it now records the
-    /// byte offset of this block's position runs, relative to the
-    /// term's `positions_offset` — per-block random access into the
-    /// term's position bytes, aligned with the PFOR doc blocks.
-    /// Positionless columns keep writing zero, byte-identical to the
-    /// reserved era.
+    /// [`SkipLayout::Length`]:
+    ///
+    /// ```text
+    /// [ 0.. 4] last_doc_id (u32 LE)
+    /// [ 4.. 6] block_len (u16 LE, the block's encoded bytes)
+    /// [ 6..10] block-max bound (u32 LE)
+    /// [10..14] positions_block_offset (u32 LE; positional columns only)
+    /// ```
+    ///
+    /// A block's offset under the length layout is the coarse slot's
+    /// span start plus the lengths of the span's earlier blocks. The
+    /// positions field records the byte offset of this block's position
+    /// group, relative to the term's `positions_offset` — per-block
+    /// random access into the term's position bytes, aligned with the
+    /// doc blocks. An absolute-layout positionless column writes zero
+    /// there (the field's reserved era); a length-layout one omits it.
     pub mod skip_entry {
-        /// `[0..4]` largest doc-id in the block (`u32` LE).
+        /// `[0..4]` largest doc-id in the block (`u32` LE), both layouts.
         pub const LAST_DOC_ID_OFF: usize = 0;
-        /// `[4..8]` byte offset to the encoded PFOR block (`u32` LE).
+        /// `[4..8]` byte offset to the encoded block (`u32` LE), absolute
+        /// layout.
         pub const BLOCK_OFFSET_OFF: usize = 4;
-        /// `[8..12]` block-max BM25 upper bound: exact `f32` bits on V5
-        /// and later, fixed-point `u32` (`ceil(max × scale)`) on legacy
-        /// `V1`-`V4`. LE.
-        pub const MAX_BM25_OFF: usize = 8;
-        /// `[12..16]` block's position-runs offset, relative to the
-        /// term's `positions_offset` (`u32` LE). Zero on positionless
-        /// columns (formerly the reserved field).
-        pub const POSITIONS_BLOCK_OFFSET_OFF: usize = 12;
+        /// `[4..6]` byte length of the encoded block (`u16` LE), length
+        /// layout.
+        pub const BLOCK_LEN_OFF: usize = 4;
+    }
+
+    /// Coarse slot field offsets (relative to the slot start): the
+    /// span's block-max bound, and under [`SkipLayout::Length`] the byte
+    /// offset (relative to term metadata start) of the span's first
+    /// block.
+    pub mod coarse_slot {
+        /// `[0..4]` span bound (`u32` LE: `f32` bits from V5, fixed point
+        /// before).
+        pub const BOUND_OFF: usize = 0;
+        /// `[4..8]` span start offset (`u32` LE), length layout only.
+        pub const SPAN_START_OFF: usize = 4;
     }
 }
 
@@ -552,8 +768,16 @@ pub mod kv {
     pub const IDS_OFFSET: &str = "inf.ids.offset";
 
     /// Present iff the stable-id sidecar is present: its byte length
-    /// (`16 * n_docs`).
+    /// (`16 * n_docs` for the raw layout; whatever the packed layout
+    /// came to otherwise).
     pub const IDS_LENGTH: &str = "inf.ids.length";
+    /// Optional, alongside the sidecar keys: names the sidecar's layout.
+    /// Absent means the raw `i128` array; [`IDS_LAYOUT_PACKED`] means the
+    /// frame-of-reference blocks of `superfile::ids`, which a reader
+    /// decodes per doc at the same fixed cost for a fraction of the bytes.
+    pub const IDS_LAYOUT: &str = "inf.ids.layout";
+    /// The [`IDS_LAYOUT`] value for the packed sidecar.
+    pub const IDS_LAYOUT_PACKED: &str = "packed";
 
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
@@ -599,6 +823,22 @@ pub(crate) const ID_SIDECAR_ENTRY_BYTES: usize = size_of::<i128>();
 /// start with this string. Defensive — keeps the user's namespace and our
 /// internal namespace separate even if we add more KV keys later.
 pub const RESERVED_PREFIX: &str = "inf.";
+
+/// Little-endian `u32` at `at`, `None` past the end of `bytes`.
+#[inline]
+pub(crate) fn u32_le_at(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes
+        .get(at..at + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
+}
+
+/// Little-endian `u64` at `at`, `None` past the end of `bytes`.
+#[inline]
+pub(crate) fn u64_le_at(bytes: &[u8], at: usize) -> Option<u64> {
+    bytes
+        .get(at..at + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
+}
 
 /// Reserved separator byte inside FST keys (`<column>\x1F<term>`). User
 /// column names must not contain this byte. ASCII Unit Separator (U+001F)
@@ -646,6 +886,76 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn blob_layout_table_follows_the_version_ladder() {
+        use fts::{BlobLayout, BlockLayout, DictLayout, SkipLayout};
+        let legacy = BlobLayout::for_version(fts::VERSION_V1_LEGACY).expect("v1");
+        assert!(
+            !legacy.coarse
+                && !legacy.short_form
+                && !legacy.grouped_positions
+                && !legacy.position_subindex
+                && !legacy.bitset_blocks
+        );
+        assert_eq!(legacy.block, BlockLayout::Wide);
+        assert_eq!(legacy.skip, SkipLayout::Absolute);
+        assert_eq!(legacy.dict, DictLayout::Fst);
+        assert_eq!(legacy.doc_length_bytes, fts::U32_BYTES);
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V2), Some(legacy));
+        let v3 = BlobLayout::for_version(fts::VERSION_V3).expect("v3");
+        assert!(v3.position_subindex && !v3.bitset_blocks && !v3.coarse);
+        let v4 = BlobLayout::for_version(fts::VERSION_V4).expect("v4");
+        assert!(v4.position_subindex && v4.bitset_blocks && !v4.coarse);
+        let v5 = BlobLayout::for_version(fts::VERSION_V5).expect("v5");
+        assert!(v5.coarse && v5.position_subindex && v5.bitset_blocks && !v5.short_form);
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V6), Some(v5));
+        assert_eq!(v5.block, BlockLayout::Wide);
+        let v7 = BlobLayout::for_version(fts::VERSION_V7).expect("v7");
+        assert!(v7.coarse && v7.short_form && v7.grouped_positions && v7.bitset_blocks);
+        assert!(!v7.position_subindex, "grouped positions need no sub-index");
+        assert_eq!(v7.block, BlockLayout::Compact);
+        assert_eq!(v7.skip, SkipLayout::Length);
+        assert_eq!(v7.dict, DictLayout::Blocks);
+        assert_eq!(v7.doc_length_bytes, fts::DOC_LENGTH_BYTES_V7);
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V7 + 1), None);
+        assert_eq!(BlobLayout::for_version(0), None);
+    }
+
+    #[test]
+    fn skip_layouts_size_their_entries_and_slots() {
+        use fts::SkipLayout;
+        assert_eq!(SkipLayout::Absolute.entry_bytes(true), 16);
+        assert_eq!(SkipLayout::Absolute.entry_bytes(false), 16);
+        assert_eq!(SkipLayout::Length.entry_bytes(true), 14);
+        assert_eq!(SkipLayout::Length.entry_bytes(false), 10);
+        assert_eq!(SkipLayout::Absolute.coarse_slot_bytes(), 4);
+        assert_eq!(SkipLayout::Length.coarse_slot_bytes(), 8);
+        // The bound and positions fields sit right after what precedes them.
+        assert_eq!(SkipLayout::Absolute.bound_off(), 8);
+        assert_eq!(
+            SkipLayout::Length.bound_off(),
+            fts::skip_entry::BLOCK_LEN_OFF + 2
+        );
+        assert_eq!(SkipLayout::Absolute.positions_off(), 12);
+        assert_eq!(
+            SkipLayout::Length.positions_off(),
+            SkipLayout::Length.bound_off() + 4
+        );
+    }
+
+    #[test]
+    fn little_endian_word_readers_stop_at_the_end() {
+        let bytes = [1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        assert_eq!(u32_le_at(&bytes, 0), Some(1));
+        assert_eq!(u32_le_at(&bytes, 4), Some(2));
+        assert_eq!(u32_le_at(&bytes, 8), Some(3));
+        assert_eq!(u32_le_at(&bytes, 9), None);
+        assert_eq!(u64_le_at(&bytes, 0), Some(1 | (2 << 32)));
+        assert_eq!(u64_le_at(&bytes, 4), Some(2 | (3 << 32)));
+        assert_eq!(u64_le_at(&bytes, 5), None);
+        assert_eq!(u32_le_at(&[], 0), None);
+    }
 
     #[test]
     fn project_magic_is_three_bytes() {

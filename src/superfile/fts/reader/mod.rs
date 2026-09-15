@@ -17,6 +17,7 @@ mod phrase;
 mod scorers;
 mod search;
 mod sink;
+mod size;
 #[cfg(test)]
 mod test_util;
 mod work;
@@ -28,4 +29,5 @@ pub use metadata::{ColumnLengthStats, ColumnMeta, OpenOptions};
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub(crate) use search::FetchedTermMemo;
 pub(crate) use sink::LiveFloor;
+pub use size::{DfBucket, FtsSizeBreakdown};
 pub use work::MatchWork;
