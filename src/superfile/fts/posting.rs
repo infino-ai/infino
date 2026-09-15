@@ -205,16 +205,17 @@ impl BlockHeader {
     ///
     /// # Panics
     ///
-    /// `bytes` is shorter than the header, or a field is out of range.
-    /// The postings region is CRC-validated at open, so this is the
-    /// caller's guarantee.
+    /// `bytes` is shorter than the header, or a bit width is past 32
+    /// (the packer's unsafe kernels take the width on trust). The other
+    /// fields cannot leave their range — the compact word gives them no
+    /// room to — and the postings region is CRC-validated at open, so
+    /// nothing else is checked on this per-block path.
     #[inline]
     pub fn parse(bytes: &[u8], layout: BlockLayout, prev_last_doc_id: Option<u32>) -> Self {
-        assert!(
-            bytes.len() >= COMPACT_HEADER_SIZE,
-            "block header: bytes too short"
-        );
-        let encoding = block_encoding(bytes);
+        let encoding = bytes
+            .get(ENCODING_OFF)
+            .map(|b| b & ENCODING_MASK)
+            .expect("block header: bytes too short");
         assert!(
             bytes.len() >= layout.header_bytes(encoding),
             "block header: bytes too short"
@@ -263,11 +264,11 @@ impl BlockHeader {
             header.delta_bits <= 32 && header.tf_bits <= 32,
             "block header: bit width > 32"
         );
-        assert!(
+        debug_assert!(
             header.count <= BLOCK_LEN,
             "block header: doc_count > BLOCK_LEN"
         );
-        assert!(
+        debug_assert!(
             header.encoding <= ENCODING_PATCHED,
             "block header: unknown encoding"
         );
