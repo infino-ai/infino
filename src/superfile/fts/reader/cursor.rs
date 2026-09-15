@@ -1302,6 +1302,7 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, LogNormal};
 
+    use super::*;
     use crate::superfile::fts::{
         bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
     };
@@ -1346,6 +1347,114 @@ mod tests {
         }
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A positional and a positionless column, each with a term spanning
+    /// many blocks whose gaps vary, so the length-coded skip table has
+    /// to be right in both entry widths.
+    fn two_column_reader() -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        let mut text = String::new();
+        for doc_id in 0..6000u32 {
+            // Every doc has `common`; a stretch of docs carries it several
+            // times, and every 500th doc is a long one.
+            text.clear();
+            let reps = if (doc_id / 128) % 3 == 0 { 3 } else { 1 };
+            for r in 0..reps {
+                text.push_str(&format!("filler{} common ", (doc_id + r) % 97));
+            }
+            if doc_id % 500 == 0 {
+                for i in 0..300 {
+                    text.push_str(&format!("w{i} "));
+                }
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add pos");
+            b.add_doc(1, doc_id, text.trim_end()).expect("add flat");
+        }
+        let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    #[tokio::test]
+    async fn length_coded_skip_entries_locate_every_block_by_either_route() {
+        let view = two_column_reader();
+        assert_eq!(view.bounds.skip_layout(), SkipLayout::Length);
+        for (col, positional) in [(0u32, true), (1u32, false)] {
+            let cursors = view
+                .build_term_cursors(col, &["common"], None, false, None, None)
+                .await
+                .expect("cursors");
+            let cursor = &cursors[0];
+            assert!(cursor.blocks.len() > 40, "{} blocks", cursor.blocks.len());
+            let postings: &[u8] = cursor.bytes.as_ref();
+            let meta = TermMeta::parse(
+                postings,
+                0,
+                positional,
+                SubindexKind::None,
+                view.bounds,
+                view.positions_grouped,
+            )
+            .expect("meta");
+            assert_eq!(meta.num_blocks, cursor.blocks.len());
+            assert_eq!(
+                meta.skip.entry_bytes(positional),
+                if positional { 14 } else { 10 }
+            );
+            // Sequential accumulation and the random route (span start plus
+            // summed lengths) agree with each other and with the cursor.
+            let mut prev_end = None;
+            let mut last_pos_off = 0u32;
+            for i in 0..meta.num_blocks {
+                let sequential = meta.block_range_in_term(postings, i, prev_end);
+                let random = meta.block_range_in_term(postings, i, None);
+                assert_eq!(sequential, random, "block {i}");
+                assert_eq!(
+                    sequential.start, cursor.blocks[i].block_byte_offset,
+                    "block {i}"
+                );
+                assert_eq!(sequential.end, cursor.blocks[i].block_byte_end, "block {i}");
+                prev_end = Some(sequential.end);
+                let (last_doc, _) = meta.skip_entry(postings, i);
+                assert_eq!(last_doc, cursor.blocks[i].last_doc_id);
+                assert_eq!(
+                    meta.prev_last_doc_id(postings, i),
+                    (i > 0).then(|| cursor.blocks[i - 1].last_doc_id)
+                );
+                let pos_off = meta.positions_block_offset(postings, i);
+                match positional {
+                    true => {
+                        assert!(i == 0 || pos_off > last_pos_off, "block {i} group offset");
+                        last_pos_off = pos_off;
+                    }
+                    false => assert_eq!(pos_off, 0, "no positions field"),
+                }
+            }
+            // The last block ends where the coarse table begins.
+            assert_eq!(prev_end, Some(meta.blocks_end_in_term));
+            // Every block decodes from its own range and its predecessor's
+            // last doc, and the term's docs come out ascending across blocks.
+            let mut prev_last: Option<u32> = None;
+            let mut d = vec![0u32; BLOCK_LEN];
+            for i in 0..meta.num_blocks {
+                let range = meta.block_range_in_term(postings, i, None);
+                let hdr =
+                    BlockHeader::parse(&postings[range.clone()], meta.block_layout, prev_last);
+                let n = decode_block_doc_ids(&postings[range], &hdr, &mut d);
+                assert!(
+                    prev_last.is_none_or(|p| p < d[0]),
+                    "block {i} starts after its predecessor"
+                );
+                assert!(
+                    d[..n].windows(2).all(|w| w[0] < w[1]),
+                    "block {i} ascending"
+                );
+                assert_eq!(d[n - 1], cursor.blocks[i].last_doc_id, "block {i} last doc");
+                prev_last = Some(d[n - 1]);
+            }
+        }
     }
 
     /// Per block of `common`: the bound its cursor decoded and the exact

@@ -888,6 +888,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blob_layout_table_follows_the_version_ladder() {
+        use fts::{BlobLayout, BlockLayout, DictLayout, SkipLayout};
+        let legacy = BlobLayout::for_version(fts::VERSION_V1_LEGACY).expect("v1");
+        assert!(
+            !legacy.coarse
+                && !legacy.short_form
+                && !legacy.grouped_positions
+                && !legacy.position_subindex
+                && !legacy.bitset_blocks
+        );
+        assert_eq!(legacy.block, BlockLayout::Wide);
+        assert_eq!(legacy.skip, SkipLayout::Absolute);
+        assert_eq!(legacy.dict, DictLayout::Fst);
+        assert_eq!(legacy.doc_length_bytes, fts::U32_BYTES);
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V2), Some(legacy));
+        let v3 = BlobLayout::for_version(fts::VERSION_V3).expect("v3");
+        assert!(v3.position_subindex && !v3.bitset_blocks && !v3.coarse);
+        let v4 = BlobLayout::for_version(fts::VERSION_V4).expect("v4");
+        assert!(v4.position_subindex && v4.bitset_blocks && !v4.coarse);
+        let v5 = BlobLayout::for_version(fts::VERSION_V5).expect("v5");
+        assert!(v5.coarse && v5.position_subindex && v5.bitset_blocks && !v5.short_form);
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V6), Some(v5));
+        assert_eq!(v5.block, BlockLayout::Wide);
+        let v7 = BlobLayout::for_version(fts::VERSION_V7).expect("v7");
+        assert!(v7.coarse && v7.short_form && v7.grouped_positions && v7.bitset_blocks);
+        assert!(!v7.position_subindex, "grouped positions need no sub-index");
+        assert_eq!(v7.block, BlockLayout::Compact);
+        assert_eq!(v7.skip, SkipLayout::Length);
+        assert_eq!(v7.dict, DictLayout::Blocks);
+        assert_eq!(v7.doc_length_bytes, fts::DOC_LENGTH_BYTES_V7);
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V7 + 1), None);
+        assert_eq!(BlobLayout::for_version(0), None);
+    }
+
+    #[test]
+    fn skip_layouts_size_their_entries_and_slots() {
+        use fts::SkipLayout;
+        assert_eq!(SkipLayout::Absolute.entry_bytes(true), 16);
+        assert_eq!(SkipLayout::Absolute.entry_bytes(false), 16);
+        assert_eq!(SkipLayout::Length.entry_bytes(true), 14);
+        assert_eq!(SkipLayout::Length.entry_bytes(false), 10);
+        assert_eq!(SkipLayout::Absolute.coarse_slot_bytes(), 4);
+        assert_eq!(SkipLayout::Length.coarse_slot_bytes(), 8);
+        // The bound and positions fields sit right after what precedes them.
+        assert_eq!(SkipLayout::Absolute.bound_off(), 8);
+        assert_eq!(
+            SkipLayout::Length.bound_off(),
+            fts::skip_entry::BLOCK_LEN_OFF + 2
+        );
+        assert_eq!(SkipLayout::Absolute.positions_off(), 12);
+        assert_eq!(
+            SkipLayout::Length.positions_off(),
+            SkipLayout::Length.bound_off() + 4
+        );
+    }
+
+    #[test]
+    fn little_endian_word_readers_stop_at_the_end() {
+        let bytes = [1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        assert_eq!(u32_le_at(&bytes, 0), Some(1));
+        assert_eq!(u32_le_at(&bytes, 4), Some(2));
+        assert_eq!(u32_le_at(&bytes, 8), Some(3));
+        assert_eq!(u32_le_at(&bytes, 9), None);
+        assert_eq!(u64_le_at(&bytes, 0), Some(1 | (2 << 32)));
+        assert_eq!(u64_le_at(&bytes, 4), Some(2 | (3 << 32)));
+        assert_eq!(u64_le_at(&bytes, 5), None);
+        assert_eq!(u32_le_at(&[], 0), None);
+    }
+
+    #[test]
     fn project_magic_is_three_bytes() {
         assert_eq!(PROJECT_MAGIC, b"INF");
         assert_eq!(PROJECT_MAGIC.len(), 3);

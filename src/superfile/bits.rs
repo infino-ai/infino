@@ -133,6 +133,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_exceptions_picks_the_cheapest_width_and_keeps_lane_order() {
+        // 128 lanes of 1..=7 (3 bits) with three 20-bit outliers: plain
+        // packing costs 20 bits per lane; the plan drops to 3 bits and
+        // lists the three outliers in ascending lane order with their
+        // high bits, at the caller's cost of 2 bytes per exception.
+        let mut lanes = vec![0u32; 128];
+        for (i, l) in lanes.iter_mut().enumerate() {
+            *l = 1 + (i as u32 % 7);
+        }
+        lanes[5] = 1 << 19;
+        lanes[70] = 3 << 18;
+        lanes[127] = 1 << 12;
+        let base = |width: u8| 128 * width as usize / 8;
+        let plan = plan_exceptions(&lanes, 31, base, |_, _| 2);
+        assert_eq!(plan.width, 3);
+        assert_eq!(plan.bytes, base(3) + 3 * 2);
+        assert_eq!(
+            plan.exceptions,
+            vec![
+                (5, (1 << 19) >> 3),
+                (70, (3 << 18) >> 3),
+                (127, (1 << 12) >> 3)
+            ]
+        );
+        // Uniform lanes: nothing beats plain.
+        let uniform = vec![5u32; 128];
+        let plan = plan_exceptions(&uniform, 31, base, |_, _| 2);
+        assert_eq!(
+            (plan.width, plan.exceptions.len(), plan.bytes),
+            (3, 0, base(3))
+        );
+        // All-zero lanes: width 0 and no exceptions.
+        let plan = plan_exceptions(&[0u32; 16], 31, |w| 2 * w as usize, |_, _| 2);
+        assert_eq!((plan.width, plan.bytes), (0, 0));
+    }
+
+    #[test]
+    fn plan_exceptions_honours_the_cap_and_the_cost_model() {
+        // 40 outliers among 128 lanes: with a cap of 31 the narrow width
+        // is out of reach and the plan stays plain; with a cap of 64 it
+        // is taken. A dear per-exception cost also keeps it plain.
+        let mut lanes = vec![1u32; 128];
+        for i in 0..40 {
+            lanes[i * 3] = 1 << 15;
+        }
+        let base = |width: u8| 128 * width as usize / 8;
+        let capped = plan_exceptions(&lanes, 31, base, |_, _| 2);
+        assert_eq!((capped.width, capped.exceptions.len()), (16, 0));
+        let roomy = plan_exceptions(&lanes, 64, base, |_, _| 2);
+        assert_eq!((roomy.width, roomy.exceptions.len()), (1, 40));
+        assert!(roomy.bytes < capped.bytes);
+        let dear = plan_exceptions(&lanes, 64, base, |_, _| 100);
+        assert_eq!(dear.exceptions.len(), 0);
+    }
+
+    #[test]
     fn every_width_round_trips_at_every_alignment() {
         for width in 0..=MAX_WIDTH {
             let n = 37;

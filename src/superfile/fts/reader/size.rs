@@ -558,6 +558,75 @@ mod tests {
     use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
 
     #[test]
+    fn patched_form_is_granted_only_under_the_posting_cap() {
+        // `common` is in 18,000 of 24,000 docs and `rare` in 400, both with
+        // a 1,000-doc hole every 4,000 docs: the blocks straddling a hole
+        // carry one large delta among small ones, exactly the shape the
+        // patched form is for. `rare` sits under the cap and takes it;
+        // `common` is over it and stays plain, the histograms tally.
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("text".into(), false).expect("register");
+        for i in 0..24_000u32 {
+            let in_hole = i % 4_000 >= 3_000;
+            let mut text = String::new();
+            match in_hole {
+                true => text.push_str("hole"),
+                false => {
+                    text.push_str("common");
+                    if i % 60 == 0 {
+                        text.push_str(" rare");
+                    }
+                }
+            }
+            b.add_doc(0, i, &text).expect("doc");
+        }
+        let json = r#"[{"name":"text","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let s = r.size_breakdown().expect("breakdown");
+        let c = &s.columns[0];
+        let band = |label: &str| c.buckets.iter().find(|b| b.label == label).expect("band");
+        let rare = band("df 129-1k");
+        assert_eq!(rare.terms, 1);
+        assert!(
+            rare.patched_blocks >= 1,
+            "rare term's gappy blocks are patched"
+        );
+        let common = band("df 16k-256k");
+        assert_eq!(common.terms, 1);
+        assert!(common.blocks > 100);
+        assert_eq!(common.patched_blocks, 0, "over the cap: no patched block");
+        // `hole` (6,000 docs, under the cap) straddles the common stretches
+        // the same way; between them they are every patched block.
+        let mid = band("df 1k-16k");
+        assert_eq!(mid.terms, 1);
+        let total = &c.total;
+        assert_eq!(
+            total.patched_blocks,
+            rare.patched_blocks + mid.patched_blocks
+        );
+        assert_eq!(
+            total.patched_by_exceptions.iter().sum::<u64>(),
+            total.patched_blocks
+        );
+        assert_eq!(
+            total.patched_by_saving.iter().sum::<u64>(),
+            total.patched_blocks
+        );
+        assert_eq!(
+            total.patched_saved_by_exceptions.iter().sum::<u64>(),
+            total.patched_saved
+        );
+        assert_eq!(
+            total.patched_saved_by_saving.iter().sum::<u64>(),
+            total.patched_saved
+        );
+        assert!(total.patched_saved > 0);
+        assert!(total.patched_partial_blocks <= total.patched_blocks);
+        assert!(total.patched_partial_saved <= total.patched_saved);
+        assert!(s.to_string().contains("patched partial (last) blocks"));
+    }
+
+    #[test]
     fn every_postings_byte_is_attributed_and_forms_are_told_apart() {
         let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
         b.register_column("body".into(), true).expect("register");
