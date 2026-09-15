@@ -728,6 +728,22 @@ pub(crate) const ID_SIDECAR_ENTRY_BYTES: usize = size_of::<i128>();
 /// internal namespace separate even if we add more KV keys later.
 pub const RESERVED_PREFIX: &str = "inf.";
 
+/// Little-endian `u32` at `at`, `None` past the end of `bytes`.
+#[inline]
+pub(crate) fn u32_le_at(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes
+        .get(at..at + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
+}
+
+/// Little-endian `u64` at `at`, `None` past the end of `bytes`.
+#[inline]
+pub(crate) fn u64_le_at(bytes: &[u8], at: usize) -> Option<u64> {
+    bytes
+        .get(at..at + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
+}
+
 /// Reserved separator byte inside FST keys (`<column>\x1F<term>`). User
 /// column names must not contain this byte. ASCII Unit Separator (U+001F)
 /// is below every printable ASCII char so prefix iteration over a column's

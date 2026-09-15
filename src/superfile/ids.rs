@@ -36,7 +36,7 @@
 
 use crate::superfile::{
     bits::{MAX_WIDTH, get_bits, payload_bytes, put_bits, width_of},
-    format::ID_SIDECAR_ENTRY_BYTES,
+    format::{ID_SIDECAR_ENTRY_BYTES, u32_le_at, u64_le_at},
 };
 
 /// Docs per frame-of-reference block. Large enough that the 24-byte
@@ -134,7 +134,7 @@ impl<'a> PackedIds<'a> {
     pub(crate) fn parse(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
         let ids = Self::open(bytes, n_docs)?;
         for b in 0..ids.n_blocks {
-            let off = u64_at(bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)
+            let off = u64_le_at(bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)
                 .ok_or("packed id sidecar directory truncated")? as usize;
             let n_in_block = match b + 1 == ids.n_blocks {
                 true => n_docs - b * BLOCK_DOCS,
@@ -168,16 +168,16 @@ impl<'a> PackedIds<'a> {
     /// so bytes this is misapplied to answer `None` rather than panic.
     pub(crate) fn open(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
         let declared =
-            u32_at(bytes, 0).ok_or("packed id sidecar shorter than its header")? as usize;
+            u32_le_at(bytes, 0).ok_or("packed id sidecar shorter than its header")? as usize;
         if declared != n_docs {
             return Err(format!(
                 "packed id sidecar declares {declared} docs, superfile has {n_docs}"
             ));
         }
-        if u32_at(bytes, 4) != Some(BLOCK_DOCS as u32) {
+        if u32_le_at(bytes, 4) != Some(BLOCK_DOCS as u32) {
             return Err("packed id sidecar block size is not the reader's".into());
         }
-        let n_blocks = u32_at(bytes, 8).ok_or("packed id sidecar truncated")? as usize;
+        let n_blocks = u32_le_at(bytes, 8).ok_or("packed id sidecar truncated")? as usize;
         if n_blocks != n_docs.div_ceil(BLOCK_DOCS) {
             return Err("packed id sidecar block count does not match n_docs".into());
         }
@@ -202,7 +202,7 @@ impl<'a> PackedIds<'a> {
         let b = doc / BLOCK_DOCS;
         let i = doc % BLOCK_DOCS;
         debug_assert!(b < self.n_blocks);
-        let off = u64_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
+        let off = u64_le_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
         let header = self.bytes.get(off..off + BLOCK_HEADER_BYTES)?;
         let hi_base = u64::from_le_bytes(header[..8].try_into().expect("8 bytes"));
         let lo_base = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
@@ -219,22 +219,6 @@ impl<'a> PackedIds<'a> {
         let lo = lo_base.wrapping_add(get_bits(self.bytes.get(lo_start..lo_end)?, i, lo_width)?);
         Some((((hi as u128) << 64) | lo as u128) as i128)
     }
-}
-
-/// Little-endian `u32` at `at`, `None` past the end.
-#[inline]
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    bytes
-        .get(at..at + 4)
-        .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
-}
-
-/// Little-endian `u64` at `at`, `None` past the end.
-#[inline]
-fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
-    bytes
-        .get(at..at + 8)
-        .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
 }
 
 #[cfg(test)]

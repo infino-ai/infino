@@ -41,11 +41,9 @@ use std::{cmp::Ordering, collections::BTreeMap, io::Write, mem::take, ops::Range
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
 use crate::superfile::{
-    format::FST_SEPARATOR,
-    fts::{
-        fst_value::{FstValue, PFOR_LENGTH_UNKNOWN},
-        positions::{push_varint, read_varint},
-    },
+    format::{FST_SEPARATOR, u32_le_at, u64_le_at},
+    fts::fst_value::{FstValue, PFOR_LENGTH_UNKNOWN},
+    varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
 };
 
 /// Build a canonical FST key from `(column_name, term)`.
@@ -218,37 +216,6 @@ const FORM_INLINE: u8 = 0;
 const FORM_SHORT: u8 = 1;
 const FORM_LONG: u8 = 2;
 
-#[inline]
-fn push_u64_varint(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        let byte = (v as u8) & 0x7f;
-        v >>= 7;
-        if v == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-#[inline]
-fn read_u64_varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
-    let mut v: u64 = 0;
-    let mut shift: u32 = 0;
-    loop {
-        let &b = bytes.get(*at)?;
-        *at += 1;
-        if shift >= 64 {
-            return None;
-        }
-        v |= u64::from(b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            return Some(v);
-        }
-        shift += 7;
-    }
-}
-
 /// How a dictionary lays its terms out — chosen by the blob version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DictLayout {
@@ -407,12 +374,11 @@ impl<'a> TermBlocks<'a> {
             return Err("term-block dictionary shorter than its footer".into());
         }
         let f = bytes.len() - TERM_BLOCKS_FOOTER_BYTES;
-        let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().expect("4 bytes"));
-        let n_terms = u32_at(f) as usize;
-        let n_blocks = u32_at(f + 4) as usize;
-        let block_size = u32_at(f + 8) as usize;
-        let keys_offset =
-            u64::from_le_bytes(bytes[f + 12..f + 20].try_into().expect("8 bytes")) as usize;
+        let footer = "term-block dictionary footer is malformed";
+        let n_terms = u32_le_at(bytes, f).ok_or(footer)? as usize;
+        let n_blocks = u32_le_at(bytes, f + 4).ok_or(footer)? as usize;
+        let block_size = u32_le_at(bytes, f + 8).ok_or(footer)? as usize;
+        let keys_offset = u64_le_at(bytes, f + 12).ok_or(footer)? as usize;
         let table_bytes = n_blocks
             .checked_mul(INDEX_ENTRY_BYTES)
             .ok_or("term-block dictionary footer is malformed")?;
@@ -455,9 +421,8 @@ impl<'a> TermBlocks<'a> {
             return None;
         }
         let at = self.keys_end + b * INDEX_ENTRY_BYTES;
-        let e = &self.bytes[at..at + INDEX_ENTRY_BYTES];
-        let block_start = u64::from_le_bytes(e[..8].try_into().expect("8 bytes")) as usize;
-        let key_start = u32::from_le_bytes(e[8..].try_into().expect("4 bytes")) as usize;
+        let block_start = u64_le_at(self.bytes, at)? as usize;
+        let key_start = u32_le_at(self.bytes, at + 8)? as usize;
         Some((block_start, key_start))
     }
 
@@ -616,15 +581,11 @@ impl TermDictBuilder {
     pub(crate) fn finish(self) -> Vec<u8> {
         match self.layout {
             DictLayout::Fst => {
-                let mut builder = MapBuilder::memory();
+                let mut builder = DictBuilder::new();
                 for (k, v) in self.sorted {
-                    builder
-                        .insert(&k, pack_value(v))
-                        .expect("BTreeMap guarantees sorted, unique keys");
+                    builder.insert(&k, pack_value(v));
                 }
-                builder
-                    .into_inner()
-                    .expect("in-memory FST writer cannot fail at finalize")
+                builder.finish()
             }
             DictLayout::Blocks => {
                 let mut w = TermBlockWriter::new(Vec::new());

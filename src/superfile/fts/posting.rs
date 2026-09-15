@@ -85,7 +85,10 @@ use std::ops::Range;
 
 use bitpacking::{BitPacker, BitPacker4x};
 
-use crate::superfile::fts::positions::{CONTINUATION_BIT, push_varint, read_varint, varint_len};
+use crate::superfile::{
+    bits::{ExceptionPlan, plan_exceptions},
+    varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
+};
 
 /// Number of `(doc_id, tf)` pairs per encoded block. Fixed at 128 to
 /// match `BitPacker4x::BLOCK_LEN`.
@@ -312,55 +315,15 @@ pub struct EncodedBlock {
     pub max_tf: u32,
 }
 
-/// A patched stream's plan: the width most lanes fit and the lanes that
-/// do not, with their high bits.
-struct PatchPlan {
-    width: u8,
-    exceptions: Vec<(u8, u32)>,
-    /// Bytes the packed low bits plus the exception list take.
-    bytes: usize,
-}
-
-/// Plan the cheapest patched packing of `lanes` (all `BLOCK_LEN` of
-/// them). Tries every width below the plain width and keeps the one
-/// whose packed bits plus exception list is smallest, subject to
-/// [`PATCHED_MAX_EXCEPTIONS`]. Returns the plain width's plan when
-/// nothing beats it.
-fn plan_patched(lanes: &[u32; BLOCK_LEN]) -> PatchPlan {
-    let plain_bits = width_bits(lanes.iter().copied().max().unwrap_or(0));
-    let mut best = PatchPlan {
-        width: plain_bits,
-        exceptions: Vec::new(),
-        bytes: BLOCK_LEN * plain_bits as usize / 8,
-    };
-    for width in 0..plain_bits {
-        let mut exceptions = Vec::new();
-        let mut bytes = BLOCK_LEN * width as usize / 8;
-        for (i, &v) in lanes.iter().enumerate() {
-            let hi = if width == 0 { v } else { v >> width };
-            if hi != 0 {
-                exceptions.push((i as u8, hi));
-                bytes += 1 + varint_len(hi);
-                if exceptions.len() > PATCHED_MAX_EXCEPTIONS || bytes >= best.bytes {
-                    break;
-                }
-            }
-        }
-        if exceptions.len() <= PATCHED_MAX_EXCEPTIONS && bytes < best.bytes {
-            best = PatchPlan {
-                width,
-                exceptions,
-                bytes,
-            };
-        }
-    }
-    best
-}
-
-/// Bits needed to hold `v` (zero for zero).
-#[inline]
-fn width_bits(v: u32) -> u8 {
-    (u32::BITS - v.leading_zeros()) as u8
+/// The cheapest patched packing of a block's lanes: the packed low bits
+/// plus, per exception, a lane byte and its high bits as a varint.
+fn plan_patched(lanes: &[u32; BLOCK_LEN]) -> ExceptionPlan {
+    plan_exceptions(
+        lanes,
+        PATCHED_MAX_EXCEPTIONS,
+        |width| BLOCK_LEN * width as usize / 8,
+        |_, hi| 1 + varint_len(hi),
+    )
 }
 
 /// Pack `lanes` at `width` bits, keeping only each lane's low `width`
@@ -517,12 +480,8 @@ pub fn encode_block(b: &Block, layout: BlockLayout, prev_last_doc_id: Option<u32
                 delta_plan.width,
                 &mut bytes[deltas_start..],
             );
-            for &(lane, hi) in &delta_plan.exceptions {
-                bytes.push(lane);
-                push_varint(&mut bytes, hi);
-            }
-            for &(lane, hi) in &tf_plan.exceptions {
-                bytes.push(lane);
+            for &(lane, hi) in delta_plan.exceptions.iter().chain(&tf_plan.exceptions) {
+                bytes.push(lane as u8);
                 push_varint(&mut bytes, hi);
             }
             let tfs_start = bytes.len();

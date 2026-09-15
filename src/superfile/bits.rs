@@ -76,6 +76,58 @@ pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
     Some(((acc >> shift) & mask) as u64)
 }
 
+/// A patched packing: the width most lanes fit, the lanes that do not
+/// with their high bits (ascending lane order), and the bytes the whole
+/// takes under the caller's cost model.
+pub(crate) struct ExceptionPlan {
+    pub(crate) width: u8,
+    pub(crate) exceptions: Vec<(u32, u32)>,
+    pub(crate) bytes: usize,
+}
+
+/// The cheapest patched packing of `lanes`: every width below the plain
+/// one is tried and the smallest total kept, where a width costs
+/// `base(width)` for its packed low bits plus `per_exception(lane, hi)`
+/// for each lane whose high bits do not fit — at most `max_exceptions`
+/// of them. Returns the plain width's plan when nothing beats it.
+pub(crate) fn plan_exceptions(
+    lanes: &[u32],
+    max_exceptions: usize,
+    base: impl Fn(u8) -> usize,
+    per_exception: impl Fn(u32, u32) -> usize,
+) -> ExceptionPlan {
+    let plain = width_of(lanes.iter().copied().max().unwrap_or(0).into());
+    let mut best = ExceptionPlan {
+        width: plain,
+        exceptions: Vec::new(),
+        bytes: base(plain),
+    };
+    for width in 0..plain {
+        let mut exceptions = Vec::new();
+        let mut bytes = base(width);
+        let mut beaten = bytes >= best.bytes;
+        for (i, &v) in lanes.iter().enumerate() {
+            if beaten {
+                break;
+            }
+            let hi = if width == 0 { v } else { v >> width };
+            if hi != 0 {
+                exceptions.push((i as u32, hi));
+                bytes += per_exception(i as u32, hi);
+                beaten = exceptions.len() > max_exceptions || bytes >= best.bytes;
+            }
+        }
+        if !beaten {
+            best = ExceptionPlan {
+                width,
+                exceptions,
+                bytes,
+            };
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

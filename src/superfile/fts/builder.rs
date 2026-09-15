@@ -102,7 +102,7 @@ use crate::superfile::{
         bm25,
         dict::{DictLayout, StreamingTermDictBuilder, TermDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
-        positions::{encode_group, encode_run, read_varint, skip_run},
+        positions::{encode_group, encode_run, skip_run},
         posting::{
             BLOCK_LEN, Block, BlockLayout, ENCODING_BITSET, EncodedBlock, block_encoding,
             encode_block,
@@ -111,6 +111,7 @@ use crate::superfile::{
         short::{SHORT_MAX_DF, encode_short},
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
+    varint::read_varint,
 };
 
 /// Per-column term interner table.

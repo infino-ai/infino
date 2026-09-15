@@ -855,18 +855,10 @@ impl TermCursor {
         let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         if hdr.encoding == ENCODING_BITSET {
-            let base = hdr.base;
-            if doc < base {
-                return false;
+            match Self::bitset_word(raw, &hdr, doc) {
+                Some((bit, word, _)) => (word >> (bit % 64)) & 1 == 1,
+                None => false,
             }
-            let bit = (doc - base) as usize;
-            let bitset_end = raw.len() - hdr.tfs_size();
-            let word_at = hdr.payload + (bit / 64) * 8;
-            if word_at + 8 > bitset_end {
-                return false; // past this block's presence bits ⇒ absent
-            }
-            let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
-            (word >> (bit % 64)) & 1 == 1
         } else {
             // Borrow of `raw` ends above; the decode needs `&mut self`.
             if self.decoded_block != self.current_block {
@@ -911,6 +903,25 @@ impl TermCursor {
     /// `bit`'s position; `bitset_end` is the end of the presence bitmap (start of
     /// the tf array). Shared by [`Self::bitset_probe_tf`] (which first checks the
     /// bit is set) and [`Self::tf_at_contained`] (which knows it is).
+    /// Locate `doc` in a bitset block: its bit index within the presence
+    /// bitset, the word holding it and where the bitset ends (the tf
+    /// array's start). `None` when `doc` lies below the block's origin or
+    /// past its last word — absent either way.
+    #[inline]
+    fn bitset_word(raw: &[u8], hdr: &BlockHeader, doc: u32) -> Option<(usize, u64, usize)> {
+        if doc < hdr.base {
+            return None;
+        }
+        let bit = (doc - hdr.base) as usize;
+        let bitset_end = raw.len() - hdr.tfs_size();
+        let word_at = hdr.payload + (bit / 64) * 8;
+        if word_at + 8 > bitset_end {
+            return None;
+        }
+        let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+        Some((bit, word, bitset_end))
+    }
+
     #[inline]
     fn bitset_tf_rank(raw: &[u8], payload: usize, bit: usize, word: u64, bitset_end: usize) -> u32 {
         let word_idx = bit / 64;
@@ -955,18 +966,7 @@ impl TermCursor {
             };
         }
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        let base = hdr.base;
-        if doc < base {
-            return None;
-        }
-        let bit = (doc - base) as usize;
-        let bitset_end = raw.len() - hdr.tfs_size();
-        let word_idx = bit / 64;
-        let word_at = hdr.payload + word_idx * 8;
-        if word_at + 8 > bitset_end {
-            return None; // past this block's presence bits ⇒ absent
-        }
-        let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+        let (bit, word, bitset_end) = Self::bitset_word(raw, &hdr, doc)?;
         if (word >> (bit % 64)) & 1 == 0 {
             return None; // doc not present in this block
         }
@@ -1254,11 +1254,8 @@ impl TermCursor {
         let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         if hdr.encoding == ENCODING_BITSET {
-            let bit = (doc - hdr.base) as usize;
-            let bitset_end = raw.len() - hdr.tfs_size();
-            let word_idx = bit / 64;
-            let word_at = hdr.payload + word_idx * 8;
-            let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+            let (bit, word, bitset_end) =
+                Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
             let rank = Self::bitset_tf_rank(raw, hdr.payload, bit, word, bitset_end);
             if self.tf_decoded_block != self.current_block {
                 decode_block_tfs(raw, &hdr, &mut self.block_tfs);

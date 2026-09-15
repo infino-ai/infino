@@ -34,9 +34,9 @@
 //! into the pre-filled single-block cursor the df=1 inline form already
 //! uses, so nothing downstream distinguishes the two.
 
-use crate::superfile::fts::{
-    positions::{push_varint, read_varint},
-    posting::BLOCK_LEN,
+use crate::superfile::{
+    fts::posting::BLOCK_LEN,
+    varint::{push_varint, read_varint},
 };
 
 /// Largest posting count the short form is used for — one block.
