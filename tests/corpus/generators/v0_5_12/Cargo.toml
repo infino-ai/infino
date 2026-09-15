@@ -1,0 +1,15 @@
+# Writes one corpus table with the engine as it shipped in 0.5.12, whose
+# builder produces the pre-coarse blob shapes. Detached from the engine
+# workspace (`[workspace]` below) so this pinned, year-old dependency graph
+# never takes part in resolving the engine's own.
+[package]
+name = "corpus-gen-0-5-12"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Exact: the point of this crate is the bytes this one release writes.
+infino = "=0.5.12"

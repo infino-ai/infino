@@ -25,3 +25,6 @@ infino-python/python/infino/*.so
 # proptest writes a failing-case seed here when a property test fails; it is
 # regenerated on demand and not tracked.
 proptest-regressions/
+
+# Corpus generators are detached crates pinned to old engine releases.
+tests/corpus/generators/*/target/
