@@ -289,8 +289,11 @@ mod tests {
             );
         }
         let mut bad_width = packed.clone();
-        let block0 =
-            u64::from_le_bytes(packed[HEADER_BYTES..HEADER_BYTES + 8].try_into().unwrap()) as usize;
+        let block0 = u64::from_le_bytes(
+            packed[HEADER_BYTES..HEADER_BYTES + 8]
+                .try_into()
+                .expect("8 bytes"),
+        ) as usize;
         bad_width[block0 + 16] = 65;
         assert!(
             PackedIds::parse(&bad_width, ids.len()).is_err(),

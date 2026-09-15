@@ -99,12 +99,9 @@ impl PhraseMember {
             if header != GROUP_LEB128 {
                 if self.group_block != block {
                     self.group_vals.clear();
-                    let n: usize = self.cursor.block_tfs[..self.cursor.block_n]
-                        .iter()
-                        .map(|&t| t as usize)
-                        .sum();
+                    let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
                     let mut at = group_start;
-                    decode_group(&self.positions, &mut at, n, &mut self.group_vals).ok_or_else(
+                    decode_group(&self.positions, &mut at, tfs, &mut self.group_vals).ok_or_else(
                         || {
                             FtsError::Read(ReadError::MalformedVersion(
                                 "position group truncated or malformed".into(),
@@ -856,10 +853,7 @@ mod tests {
             .expect("positional blob has a positions region");
         let bytes =
             super::super::core::fetch_source_range(&r.source, region, "test").expect("positions");
-        assert!(
-            bytes.iter().any(|&h| h == GROUP_LEB128),
-            "some LEB128 group"
-        );
+        assert!(bytes.contains(&GROUP_LEB128), "some LEB128 group");
         assert!(
             bytes.iter().any(|&h| h != GROUP_LEB128),
             "some packed group"

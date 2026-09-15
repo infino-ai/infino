@@ -3968,7 +3968,10 @@ fn encode_and_emit_term<W: Write>(
                     }
                 }
                 debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
-                encode_group(out, vals);
+                let tfs = &mut scratch.tfs;
+                tfs.clear();
+                tfs.extend(pairs.iter().map(|&(_, tf)| tf));
+                encode_group(out, tfs, vals);
                 let p = ShortPositions {
                     offset: sink.len,
                     length: out.len() as u32,
@@ -4142,7 +4145,10 @@ fn encode_and_emit_term<W: Write>(
                         }
                     }
                     let group_start = pos_out.len();
-                    encode_group(pos_out, vals);
+                    let tfs = &mut scratch.tfs;
+                    tfs.clear();
+                    tfs.extend(chunk.iter().map(|&(_, tf)| tf));
+                    encode_group(pos_out, tfs, vals);
                     let packed = pos_out[group_start] != GROUP_LEB128;
                     let mut run_at = group_start + 1;
                     let mut vi = 0usize;

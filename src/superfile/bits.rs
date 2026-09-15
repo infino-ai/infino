@@ -29,14 +29,13 @@ pub(crate) fn put_bits(buf: &mut [u8], bit: usize, v: u64, width: u8) {
     if width == 0 {
         return;
     }
-    let mut byte = bit / 8;
+    let first = bit / 8;
     let shift = (bit % 8) as u32;
     // Up to 71 bits land across at most 9 bytes.
     let acc: u128 = (v as u128) << shift;
     let n_bytes = (shift as usize + width as usize).div_ceil(8);
-    for i in 0..n_bytes {
-        buf[byte] |= (acc >> (8 * i)) as u8;
-        byte += 1;
+    for (i, slot) in buf[first..first + n_bytes].iter_mut().enumerate() {
+        *slot |= (acc >> (8 * i)) as u8;
     }
 }
 
@@ -61,19 +60,6 @@ pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
         (1u128 << width) - 1
     };
     Some(((acc >> shift) & mask) as u64)
-}
-
-/// Unpack the first `n` values of a `width`-bit stream into `out`, in
-/// one pass. `None` when `payload` is too short.
-pub(crate) fn unpack_all(payload: &[u8], n: usize, width: u8, out: &mut Vec<u32>) -> Option<()> {
-    if payload.len() < payload_bytes(n, width) {
-        return None;
-    }
-    out.reserve(n);
-    for i in 0..n {
-        out.push(get_bits(payload, i, width)? as u32);
-    }
-    Some(())
 }
 
 #[cfg(test)]

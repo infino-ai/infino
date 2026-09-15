@@ -1489,14 +1489,12 @@ impl FtsReader {
                         // A short body's positions are one group.
                         let mut group_vals: Vec<u32> = Vec::new();
                         if let Some(bytes) = &position_bytes {
-                            let n: usize = t[..decoded.n].iter().map(|&x| x as usize).sum();
-                            decode_group(bytes.as_ref(), &mut 0, n, &mut group_vals).ok_or_else(
-                                || {
+                            decode_group(bytes.as_ref(), &mut 0, &t[..decoded.n], &mut group_vals)
+                                .ok_or_else(|| {
                                     FtsError::Read(ReadError::MalformedVersion(
                                         "malformed position group in merge read".into(),
                                     ))
-                                },
-                            )?;
+                                })?;
                         }
                         let mut vi = 0usize;
                         for i in 0..decoded.n {
@@ -1567,11 +1565,8 @@ impl FtsReader {
                         if grouped && let Some(bytes) = &position_bytes {
                             group_vals.clear();
                             vi = 0;
-                            let n: usize = cursor.block_tfs[..cursor.block_n]
-                                .iter()
-                                .map(|&x| x as usize)
-                                .sum();
-                            decode_group(bytes.as_ref(), &mut pos_at, n, &mut group_vals)
+                            let tfs = &cursor.block_tfs[..cursor.block_n];
+                            decode_group(bytes.as_ref(), &mut pos_at, tfs, &mut group_vals)
                                 .ok_or_else(|| {
                                     FtsError::Read(ReadError::MalformedVersion(
                                         "malformed position group in merge read".into(),
