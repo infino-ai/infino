@@ -366,7 +366,7 @@ impl GroupIndex {
         let start = *self.starts.get(pair)? as usize;
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
-            && pair + 1 <= self.served as usize * BULK_MAX_STRIDE
+            && pair < self.served as usize * BULK_MAX_STRIDE
         {
             self.firsts.clear();
             self.gaps.clear();
