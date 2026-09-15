@@ -259,6 +259,16 @@ vector:
   # stays the sweep's lower seed. Default 4096 (~= 512 * sqrt(N/1e6) at 100M).
   centroid_graph_max_fanout: 4096
 
+  # For ivf_router = auto: how far below hnsw_register_floor the router-fanout
+  # calibration's acceptance bar may relax toward the router's OWN measured
+  # recall ceiling. The router scores the same Sq16 codes as the stamped grid,
+  # so it shares the grid's within-cell recall ceiling; on hard/high-dim data
+  # that ceiling sits below 0.98 (laion-100M: router ~0.973, grid ~0.975), and
+  # an absolute bar would reject the router at parity with the grid it replaces.
+  # 0.03 accepts a router up to 3pt under the floor when that is its ceiling
+  # while still rejecting a collapsed graph. 0 keeps the strict absolute floor.
+  centroid_graph_parity_gap: 0.03
+
   # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table
   # ef into the persisted graph bundle; that stamped value drives every query.

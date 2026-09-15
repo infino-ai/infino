@@ -323,6 +323,16 @@ const DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO: f64 = 0.5;
 /// graph measured a win at 10M+, a loss at 1M). A documented starting point.
 const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 10_000_000;
 const DEFAULT_CENTROID_GRAPH_MAX_FANOUT: usize = 4096;
+/// Default `ivf_router = auto` parity gap: how far below `hnsw_register_floor`
+/// the router-fanout acceptance bar may relax toward the router's OWN measured
+/// recall ceiling. The router reads the same Sq16 codes as the stamped grid, so
+/// it shares the grid's within-cell ceiling — on hard/high-dim data that ceiling
+/// is below 0.98 (laion-100M: router ~0.973, grid ~0.975), and an absolute bar
+/// would reject the router at parity with the grid it replaces. 0.03 accepts a
+/// router up to 3pt under the floor when that is its ceiling (the ~0.7pt codec
+/// gap clears) while still rejecting a collapsed graph. `0` restores the strict
+/// absolute floor.
+const DEFAULT_CENTROID_GRAPH_PARITY_GAP: f64 = 0.03;
 /// Default upper bound on the `hnsw` calibration ef grid. High-dimensional
 /// cosine tables need a wide beam to reach the recall bar (e.g. glove-100
 /// clears ~0.99 only at ef=1024), so the ceiling allows that; the stamped
@@ -682,6 +692,16 @@ pub struct VectorSettings {
     /// query time are still governed by the stamped per-`k` fanout, which this
     /// only caps. Default 4096 (≈ `512 · √(N/1e6)` at 100M).
     pub centroid_graph_max_fanout: usize,
+    /// For `ivf_router = auto`: how far below `hnsw_register_floor` the router's
+    /// fanout-calibration acceptance bar may relax toward the router's OWN
+    /// measured recall ceiling. The router scores the same Sq16 codes as the
+    /// stamped grid and so shares its within-cell recall ceiling; on hard/high-
+    /// dim data that ceiling sits under the absolute floor, and grading the
+    /// router against a bar its shared codec can't reach would reject it at
+    /// parity with the grid it replaces. This bounds the relaxation so a
+    /// genuinely collapsed router (ceiling far under the floor) is still
+    /// rejected. `0` keeps the strict absolute floor. Documented starting point.
+    pub centroid_graph_parity_gap: f64,
     /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
     /// the winning `ef` per table into the persisted bundle. Must be at least
@@ -844,6 +864,7 @@ impl Default for VectorSettings {
             centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
             centroid_graph_scale_floor_docs: DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
             centroid_graph_max_fanout: DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
+            centroid_graph_parity_gap: DEFAULT_CENTROID_GRAPH_PARITY_GAP,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: DEFAULT_VECTOR_HNSW_EF_SEARCH,
@@ -1236,6 +1257,17 @@ impl Config {
                  (a 0 ceiling collapses the fanout calibration sweep)"
             );
             v.centroid_graph_max_fanout = DEFAULT_CENTROID_GRAPH_MAX_FANOUT;
+        }
+        // Parity gap: a fraction in [0, 1). A negative gap is meaningless and a
+        // gap at/above the floor would drive the acceptance bar to ~0 and engage
+        // the router on any nonzero recall — reset either to the default.
+        if !(0.0..1.0).contains(&v.centroid_graph_parity_gap) {
+            tracing::warn!(
+                default = DEFAULT_CENTROID_GRAPH_PARITY_GAP,
+                got = v.centroid_graph_parity_gap,
+                "vector.centroid_graph_parity_gap must be in [0, 1); falling back to the default"
+            );
+            v.centroid_graph_parity_gap = DEFAULT_CENTROID_GRAPH_PARITY_GAP;
         }
     }
 
