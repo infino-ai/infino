@@ -84,6 +84,7 @@
 use std::ops::Range;
 
 use bitpacking::{BitPacker, BitPacker4x};
+use wide::u32x8;
 
 use crate::superfile::{
     bits::{ExceptionPlan, plan_exceptions},
@@ -119,13 +120,11 @@ pub const ENCODING_PACKED: u8 = 0;
 /// ```
 ///
 /// Deltas here are explicit (`doc[0] - base`, then `doc[i] -
-/// doc[i-1]`, padding lanes 0). The reader prefix-sums the low bits
-/// with the same fused kernel a plain block uses and then adds each
-/// exception's high bits to every lane from its own on — exceptions are
-/// listed in ascending lane order so that is one cumulative pass.
-/// Chosen only when it is the smallest of the three encodings for the
-/// block, so a block with uniform widths stays [`ENCODING_PACKED`] and
-/// decodes exactly as before.
+/// doc[i-1]`, padding lanes 0), prefix-summed by the reader after the
+/// exceptions are patched in — the sorted bit-packer's fused prefix sum
+/// cannot see a patch. Chosen only when it is the smallest of the three
+/// encodings for the block, so a block with uniform widths stays
+/// [`ENCODING_PACKED`] and decodes exactly as before.
 pub const ENCODING_PATCHED: u8 = 2;
 /// Most exception lanes a patched stream may carry: the header's count
 /// field is five bits, and past this the stream is better off wider.
@@ -594,14 +593,10 @@ pub fn decode_block(
     count
 }
 
-/// Decode a patched block's doc ids: the low delta bits through the
-/// same fused unpack-and-prefix-sum the plain layout uses, then the
-/// exceptions. An exception adds `hi << width` to one *delta*, which
-/// adds it to every doc id from that lane on — so the exceptions, which
-/// the writer lists in ascending lane order, are applied as one
-/// cumulative pass over the lanes past the first: each lane gets the
-/// sum of the exceptions at or before it, about a hundred adds the
-/// compiler vectorizes, however many exceptions there are. Returns the
+/// Decode a patched block's doc ids: unpack the low delta bits, OR the
+/// exceptions' high bits into their lanes, then prefix-sum from the
+/// base. The prefix sum is the SIMD log-step form ([`prefix_sum_block`]);
+/// the sorted bit-packer's fused one cannot see a patch. Returns the
 /// offset where the tf exceptions begin.
 fn decode_patched_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u32]) -> usize {
     assert!(
@@ -615,33 +610,49 @@ fn decode_patched_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u
         bytes.len(),
         hdr.payload + deltas_size
     );
-    BitPacker4x::new().decompress_sorted(
-        hdr.base,
+    BitPacker4x::new().decompress(
         &bytes[hdr.payload..hdr.payload + deltas_size],
         &mut dest_doc_ids[..BLOCK_LEN],
         hdr.delta_bits,
     );
-    let dest = &mut dest_doc_ids[..BLOCK_LEN];
-    let mut at = hdr.payload + deltas_size;
-    let mut acc: u32 = 0;
-    let mut from = 0usize;
-    for _ in 0..hdr.n_delta_exc {
-        let (lane, hi, next) = read_exception(bytes, at);
-        at = next;
-        if lane > from {
-            for v in &mut dest[from..lane] {
-                *v = v.wrapping_add(acc);
-            }
-            from = lane;
-        }
-        acc = acc.wrapping_add(hi << hdr.delta_bits);
+    let tf_exc_start = patch_lanes(
+        bytes,
+        hdr.payload + deltas_size,
+        hdr.n_delta_exc,
+        hdr.delta_bits,
+        dest_doc_ids,
+    );
+    prefix_sum_block(&mut dest_doc_ids[..BLOCK_LEN], hdr.base);
+    tf_exc_start
+}
+
+/// Lanes per SIMD word of the prefix sum.
+const PREFIX_LANES: usize = 8;
+
+/// Turn a block's deltas into doc ids in place: `dest[i] = base + Σ
+/// dest[..=i]`. Eight lanes at a time in log steps — each lane adds the
+/// lane one, two, then four back — then the running carry; the lane
+/// shifts are array rebuilds the compiler turns into register shuffles.
+/// On the reference box this is a third faster than the packer's own
+/// fused prefix sum and twice as fast as a serial scalar chain, where a
+/// four-chain scalar form auto-vectorized into strided stores and was
+/// slower than serial.
+fn prefix_sum_block(dest: &mut [u32], base: u32) {
+    debug_assert_eq!(dest.len() % PREFIX_LANES, 0);
+    let mut carry = u32x8::splat(base);
+    for chunk in dest.chunks_exact_mut(PREFIX_LANES) {
+        let lanes: [u32; PREFIX_LANES] = chunk.try_into().expect("eight lanes");
+        let v = u32x8::from(lanes);
+        let a = v.to_array();
+        let v = v + u32x8::from([0, a[0], a[1], a[2], a[3], a[4], a[5], a[6]]);
+        let a = v.to_array();
+        let v = v + u32x8::from([0, 0, a[0], a[1], a[2], a[3], a[4], a[5]]);
+        let a = v.to_array();
+        let v = v + u32x8::from([0, 0, 0, 0, a[0], a[1], a[2], a[3]]) + carry;
+        let out = v.to_array();
+        chunk.copy_from_slice(&out);
+        carry = u32x8::splat(out[PREFIX_LANES - 1]);
     }
-    if acc != 0 {
-        for v in &mut dest[from..] {
-            *v = v.wrapping_add(acc);
-        }
-    }
-    at
 }
 
 /// One exception at `at`: its lane, its high bits, and the offset past

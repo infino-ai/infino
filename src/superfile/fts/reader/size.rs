@@ -17,13 +17,15 @@ use super::{
 };
 use crate::superfile::{
     ReadError,
+    bits::width_of,
     error::FtsError,
     format::{self, FST_SEPARATOR, fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK},
     fts::{
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         fst_value::FstValue,
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_PACKED, ENCODING_PATCHED, patched_exception_ranges,
+            BLOCK_LEN, BlockHeader, ENCODING_PACKED, ENCODING_PATCHED, decode_block,
+            patched_exception_ranges,
         },
         short::{decode_short, short_df},
     },
@@ -81,6 +83,14 @@ pub struct DfBucket {
     pub partial_blocks: u64,
     /// Blocks in the patched encoding (narrow width plus exceptions).
     pub patched_blocks: u64,
+    /// Patched blocks by their delta-exception count (`PATCH_HIST_EDGES`
+    /// bands) and the bytes each band saves over plain packing.
+    pub patched_by_exceptions: [u64; PATCH_HIST_BANDS],
+    pub patched_saved_by_exceptions: [u64; PATCH_HIST_BANDS],
+    /// Patched blocks by the bytes each saves (`PATCH_SAVING_EDGES`
+    /// bands) and the bytes each band saves in all.
+    pub patched_by_saving: [u64; PATCH_HIST_BANDS],
+    pub patched_saved_by_saving: [u64; PATCH_HIST_BANDS],
     /// Position-run bytes this band's terms own in the positions region.
     pub positions_bytes: u64,
 }
@@ -106,6 +116,12 @@ impl DfBucket {
         self.blocks += o.blocks;
         self.partial_blocks += o.partial_blocks;
         self.patched_blocks += o.patched_blocks;
+        for i in 0..PATCH_HIST_BANDS {
+            self.patched_by_exceptions[i] += o.patched_by_exceptions[i];
+            self.patched_saved_by_exceptions[i] += o.patched_saved_by_exceptions[i];
+            self.patched_by_saving[i] += o.patched_by_saving[i];
+            self.patched_saved_by_saving[i] += o.patched_saved_by_saving[i];
+        }
         self.positions_bytes += o.positions_bytes;
     }
 
@@ -152,6 +168,18 @@ pub struct FtsSizeBreakdown {
     pub postings_region_bytes: u64,
     pub positions_region_bytes: u64,
     pub columns: Vec<ColumnSizeBreakdown>,
+}
+
+/// Bands of the patched-block histograms: upper edges (inclusive) of
+/// the first four, everything larger in the fifth.
+const PATCH_HIST_BANDS: usize = 5;
+/// Delta-exception count edges.
+const PATCH_HIST_EDGES: [u64; PATCH_HIST_BANDS - 1] = [1, 4, 8, 16];
+/// Bytes-saved edges.
+const PATCH_SAVING_EDGES: [u64; PATCH_HIST_BANDS - 1] = [16, 32, 64, 128];
+
+fn hist_band(edges: &[u64; PATCH_HIST_BANDS - 1], v: u64) -> usize {
+    edges.iter().position(|&e| v <= e).unwrap_or(edges.len())
 }
 
 fn band_of(df: u64) -> usize {
@@ -299,6 +327,25 @@ impl FtsReader {
                                     // Exceptions count with the stream they patch.
                                     let (delta_exc, tf_exc) = patched_exception_ranges(block, &hdr);
                                     b.patched_blocks += 1;
+                                    // What plain packing would have cost: the
+                                    // widths of the widest delta and tf.
+                                    let n = decode_block(block, &hdr, &mut d, &mut t);
+                                    let mut widest_delta = d[0].wrapping_sub(hdr.base);
+                                    for w in d[..n].windows(2) {
+                                        widest_delta = widest_delta.max(w[1] - w[0]);
+                                    }
+                                    let widest_tf = t[..n].iter().copied().max().unwrap_or(0);
+                                    let plain = hdr.payload
+                                        + BLOCK_LEN * width_of(u64::from(widest_delta)) as usize
+                                            / 8
+                                        + BLOCK_LEN * width_of(u64::from(widest_tf)) as usize / 8;
+                                    let saved = plain.saturating_sub(block.len()) as u64;
+                                    let e = hist_band(&PATCH_HIST_EDGES, hdr.n_delta_exc as u64);
+                                    b.patched_by_exceptions[e] += 1;
+                                    b.patched_saved_by_exceptions[e] += saved;
+                                    let g = hist_band(&PATCH_SAVING_EDGES, saved);
+                                    b.patched_by_saving[g] += 1;
+                                    b.patched_saved_by_saving[g] += saved;
                                     b.docid_bytes +=
                                         LANES * delta_bits / 8 + delta_exc.len() as u64;
                                     b.tf_bytes += LANES * tf_bits / 8 + tf_exc.len() as u64;
@@ -435,6 +482,41 @@ impl fmt::Display for FtsSizeBreakdown {
                 c.total.blocks,
                 c.total.partial_blocks,
                 c.total.patched_blocks
+            )?;
+            let bands = |edges: &[u64; PATCH_HIST_BANDS - 1], counts: &[u64], saved: &[u64]| {
+                let mut lo = 0u64;
+                let mut parts = Vec::new();
+                for i in 0..PATCH_HIST_BANDS {
+                    let label = match edges.get(i) {
+                        Some(&hi) => format!("{lo}-{hi}"),
+                        None => format!(">{lo}"),
+                    };
+                    parts.push(format!(
+                        "[{label}] {} blocks {:.2} MiB",
+                        counts[i],
+                        mib(saved[i])
+                    ));
+                    lo = edges.get(i).map(|&e| e + 1).unwrap_or(lo);
+                }
+                parts.join("; ")
+            };
+            writeln!(
+                f,
+                "  patched blocks by delta exceptions (count, bytes saved): {}",
+                bands(
+                    &PATCH_HIST_EDGES,
+                    &c.total.patched_by_exceptions,
+                    &c.total.patched_saved_by_exceptions
+                )
+            )?;
+            writeln!(
+                f,
+                "  patched blocks by bytes saved (count, bytes saved): {}",
+                bands(
+                    &PATCH_SAVING_EDGES,
+                    &c.total.patched_by_saving,
+                    &c.total.patched_saved_by_saving
+                )
             )?;
         }
         Ok(())
