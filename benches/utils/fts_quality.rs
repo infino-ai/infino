@@ -928,7 +928,9 @@ fn recall_cell(recall: f64, gate: bool) -> Cell {
 mod tests {
     use std::sync::Mutex;
 
-    use infino::test_helpers::brute_force_bm25::BruteForceBm25;
+    use infino::{
+        superfile::fts::tokenize::Phrase, test_helpers::brute_force_bm25::BruteForceBm25,
+    };
 
     use super::*;
     use crate::corpus::for_each_generated_doc;
@@ -977,8 +979,19 @@ mod tests {
                 let owned = |v: &[Cow<'_, str>]| -> Vec<String> {
                     v.iter().map(|c| c.to_string()).collect()
                 };
-                let owned_phrases = |v: &[Vec<Cow<'_, str>>]| -> Vec<Vec<String>> {
-                    v.iter().map(|p| owned(p)).collect()
+                // The offsets come across with the terms. A phrase's spacing is
+                // what the analysis chain left behind — drop a stopword and
+                // `end of the world` is three terms at 0, 3, 4 — so rebuilding
+                // these as adjacent would have the reference verify a phrase
+                // the index never holds, and only for the queries the chain
+                // actually changes.
+                let owned_phrases = |v: &[Phrase<Cow<'_, str>>]| -> Vec<Phrase<String>> {
+                    v.iter()
+                        .map(|p| Phrase {
+                            terms: owned(&p.terms),
+                            offsets: p.offsets.clone(),
+                        })
+                        .collect()
                 };
                 let expected = reference.top_k_atoms(
                     &owned(&clauses.musts),
