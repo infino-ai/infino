@@ -34,8 +34,10 @@
 //! The layout is named by the `inf.ids.layout` footer key; a sidecar
 //! without that key is the older raw `i128` array.
 
+use std::ops::Range;
+
 use crate::superfile::{
-    bits::{MAX_WIDTH, get_bits, payload_bytes, put_bits, width_of},
+    bits::{MAX_WIDTH, for_each_lane, get_bits, payload_bytes, put_bits, width_of},
     format::{ID_SIDECAR_ENTRY_BYTES, u32_le_at, u64_le_at},
 };
 
@@ -191,6 +193,33 @@ impl<'a> PackedIds<'a> {
         })
     }
 
+    /// Block `b`'s header and stream ranges, `None` if the bytes cannot
+    /// hold it.
+    #[inline]
+    fn block(&self, b: usize) -> Option<IdBlock> {
+        let off = u64_le_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
+        let header = self.bytes.get(off..off + BLOCK_HEADER_BYTES)?;
+        let hi_width = header[16];
+        let lo_width = header[17];
+        let n_in_block = u16::from_le_bytes([header[18], header[19]]) as usize;
+        if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH {
+            return None;
+        }
+        let hi_start = off + BLOCK_HEADER_BYTES;
+        let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
+        let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
+        self.bytes.get(hi_start..lo_end)?;
+        Some(IdBlock {
+            hi_base: u64::from_le_bytes(header[..8].try_into().expect("8 bytes")),
+            lo_base: u64::from_le_bytes(header[8..16].try_into().expect("8 bytes")),
+            hi_width,
+            lo_width,
+            n_in_block,
+            hi: hi_start..lo_start,
+            lo: lo_start..lo_end,
+        })
+    }
+
     /// The `_id` of local doc `doc`; `None` past `n_docs` or on a block
     /// the sidecar's bytes cannot hold.
     #[inline]
@@ -199,27 +228,104 @@ impl<'a> PackedIds<'a> {
         if doc >= self.n_docs {
             return None;
         }
-        let b = doc / BLOCK_DOCS;
+        let blk = self.block(doc / BLOCK_DOCS)?;
         let i = doc % BLOCK_DOCS;
-        debug_assert!(b < self.n_blocks);
-        let off = u64_le_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
-        let header = self.bytes.get(off..off + BLOCK_HEADER_BYTES)?;
-        let hi_base = u64::from_le_bytes(header[..8].try_into().expect("8 bytes"));
-        let lo_base = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
-        let hi_width = header[16];
-        let lo_width = header[17];
-        let n_in_block = u16::from_le_bytes([header[18], header[19]]) as usize;
-        if i >= n_in_block || hi_width > MAX_WIDTH || lo_width > MAX_WIDTH {
+        if i >= blk.n_in_block {
             return None;
         }
-        let hi_start = off + BLOCK_HEADER_BYTES;
-        let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
-        let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
-        let hi = hi_base.wrapping_add(get_bits(self.bytes.get(hi_start..lo_start)?, i, hi_width)?);
-        let lo = lo_base.wrapping_add(get_bits(self.bytes.get(lo_start..lo_end)?, i, lo_width)?);
-        Some((((hi as u128) << 64) | lo as u128) as i128)
+        let hi = get_bits(&self.bytes[blk.hi.clone()], i, blk.hi_width)?;
+        let lo = get_bits(&self.bytes[blk.lo.clone()], i, blk.lo_width)?;
+        Some(blk.id(hi, lo))
+    }
+
+    /// The `_id`s of `docs`, appended to `out` in the callers' order.
+    /// Docs that arrive ascending — the order a block walk emits them —
+    /// are served a block at a time: when a block has at least one in
+    /// [`BULK_DENSITY`] of its docs asked for, both streams are unpacked
+    /// once and the ids read off; otherwise, and for any other order,
+    /// each doc is looked up on its own. `None` on a doc past `n_docs`
+    /// or a block the bytes cannot hold.
+    pub(crate) fn get_many(&self, docs: &[u32], out: &mut Vec<i128>) -> Option<()> {
+        out.reserve(docs.len());
+        if !docs.is_sorted() {
+            for &d in docs {
+                out.push(self.get(d)?);
+            }
+            return Some(());
+        }
+        let mut his: Vec<u64> = Vec::new();
+        let mut los: Vec<u64> = Vec::new();
+        let mut i = 0usize;
+        while i < docs.len() {
+            let b = docs[i] as usize / BLOCK_DOCS;
+            let mut j = i;
+            while j < docs.len() && docs[j] as usize / BLOCK_DOCS == b {
+                j += 1;
+            }
+            let group = &docs[i..j];
+            i = j;
+            if group[group.len() - 1] as usize >= self.n_docs {
+                return None;
+            }
+            let blk = self.block(b)?;
+            if group.len() * BULK_DENSITY < blk.n_in_block {
+                for &d in group {
+                    out.push(self.get(d)?);
+                }
+                continue;
+            }
+            his.clear();
+            los.clear();
+            for_each_lane(
+                &self.bytes[blk.hi.clone()],
+                0,
+                blk.n_in_block,
+                blk.hi_width,
+                |v| his.push(v),
+            )?;
+            for_each_lane(
+                &self.bytes[blk.lo.clone()],
+                0,
+                blk.n_in_block,
+                blk.lo_width,
+                |v| los.push(v),
+            )?;
+            for &d in group {
+                let k = d as usize % BLOCK_DOCS;
+                if k >= blk.n_in_block {
+                    return None;
+                }
+                out.push(blk.id(his[k], los[k]));
+            }
+        }
+        Some(())
     }
 }
+
+/// One block of the packed sidecar, located.
+struct IdBlock {
+    hi_base: u64,
+    lo_base: u64,
+    hi_width: u8,
+    lo_width: u8,
+    n_in_block: usize,
+    hi: Range<usize>,
+    lo: Range<usize>,
+}
+
+impl IdBlock {
+    /// The id whose halves are `hi` and `lo` above the block's bases.
+    #[inline]
+    fn id(&self, hi: u64, lo: u64) -> i128 {
+        let hi = self.hi_base.wrapping_add(hi);
+        let lo = self.lo_base.wrapping_add(lo);
+        (((hi as u128) << 64) | lo as u128) as i128
+    }
+}
+
+/// A block is unpacked whole for a bulk resolve when at least one doc in
+/// this many of its docs is asked for; below that, per-doc reads win.
+const BULK_DENSITY: usize = 4;
 
 #[cfg(test)]
 mod tests {
@@ -278,6 +384,38 @@ mod tests {
         round_trip(&ids);
         round_trip(&[42]);
         assert!(encode_packed(&[]).is_empty());
+    }
+
+    #[test]
+    fn bulk_resolve_matches_single_lookups_in_every_order_and_density() {
+        let ids: Vec<i128> = (0..BLOCK_DOCS as i128 * 3 + 17)
+            .map(|i| (i * 7919) ^ (i << 40))
+            .collect();
+        let packed = round_trip(&ids);
+        let p = PackedIds::parse(&packed, ids.len()).expect("parses");
+        let n = ids.len() as u32;
+        let cases: Vec<Vec<u32>> = vec![
+            (0..n).collect(),               // every doc, ascending
+            (0..n).step_by(3).collect(),    // dense enough for bulk
+            (0..n).step_by(97).collect(),   // sparse: per-doc path
+            vec![5, 3, 3, 2_000, 1_024, 1], // unsorted, duplicates
+            vec![n - 1, n - 2],             // last block, tail
+            Vec::new(),
+        ];
+        for docs in cases {
+            let mut got = Vec::new();
+            p.get_many(&docs, &mut got).expect("in range");
+            let want: Vec<i128> = docs.iter().map(|&d| ids[d as usize]).collect();
+            assert_eq!(got, want, "docs {docs:?}");
+        }
+        assert!(
+            p.get_many(&[0, n], &mut Vec::new()).is_none(),
+            "past n_docs"
+        );
+        assert!(
+            p.get_many(&[n, 0], &mut Vec::new()).is_none(),
+            "past n_docs, unsorted"
+        );
     }
 
     #[test]

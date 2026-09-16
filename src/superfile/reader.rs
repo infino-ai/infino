@@ -1061,21 +1061,22 @@ impl SuperfileReader {
             false => None,
         };
         let mut ids: Vec<i128> = Vec::with_capacity(local_doc_ids.len());
-        for &doc_id in local_doc_ids {
-            ids.push(match &packed {
-                Some(p) => p.get(doc_id).ok_or_else(|| {
-                    ReadError::MalformedKv(format!(
-                        "stable-id sidecar has no entry for doc {doc_id}"
-                    ))
-                })?,
-                None => {
+        match &packed {
+            // A block walk hands its docs over ascending, so a large
+            // resolve unpacks each block's two streams once instead of
+            // reading two bit fields per doc.
+            Some(p) => p.get_many(local_doc_ids, &mut ids).ok_or_else(|| {
+                ReadError::MalformedKv("stable-id sidecar has no entry for a requested doc".into())
+            })?,
+            None => {
+                for &doc_id in local_doc_ids {
                     let start = doc_id as usize * ENTRY;
                     let raw: [u8; ENTRY] = region[start..start + ENTRY]
                         .try_into()
                         .expect("sidecar entry within bounds");
-                    i128::from_le_bytes(raw)
+                    ids.push(i128::from_le_bytes(raw));
                 }
-            });
+            }
         }
         let id_idx = self
             .schema
