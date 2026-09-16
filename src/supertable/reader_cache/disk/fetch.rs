@@ -463,6 +463,22 @@ impl DiskCacheStore {
         );
     }
 
+    /// The `(offset, len)` ranges of `wanted` that no entry of `blob`
+    /// covers whole — what the open wave still has to fetch when the
+    /// manifest inlined only part of the open batch.
+    fn uncovered_ranges(blob: &[(u64, Vec<u8>)], wanted: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        wanted
+            .iter()
+            .copied()
+            .filter(|&(off, len)| {
+                len > 0
+                    && !blob.iter().any(|(start, bytes)| {
+                        *start <= off && off + len <= *start + bytes.len() as u64
+                    })
+            })
+            .collect()
+    }
+
     /// Lazy cold-fetch path. Foreground builds a reader via
     /// `SuperfileReader::open_lazy_with(StorageRangeSource)`;
     /// background task waits for foreground lazy readers to release,
@@ -471,10 +487,11 @@ impl DiskCacheStore {
     ///
     /// If `offsets` is present, the lazy source starts with a known
     /// superfile size and an optional open-batch overlay:
-    ///   - with `open_blob`: zero superfile-object GETs at open time,
-    ///     because manifest-part fetch already carried the bytes.
-    ///   - without `open_blob`: parquet tail + vector + FTS open ranges
-    ///     are fetched in one parallel batch.
+    ///   - with a complete `open_blob`: zero superfile-object GETs at
+    ///     open time, because the manifest-part fetch already carried
+    ///     the bytes.
+    ///   - otherwise: the parquet tail and whichever vector / FTS open
+    ///     ranges the blob lacks are fetched in one parallel batch.
     ///
     /// If `offsets` is absent, the source starts with unknown size and
     /// discovers it through the first suffix-tail fetch.
@@ -550,18 +567,22 @@ impl DiskCacheStore {
             block_source_arc = Arc::clone(&block_source);
             let mut overlay = PrefetchedSource::new(block_source);
 
-            if !offsets.open_blob.is_empty() {
-                // The open-batch bytes (parquet tail + vector + FTS open
-                // ranges) already rode in with the manifest part GET that
-                // `cold_open` performed. Install them straight into the
-                // overlay: ZERO open-time GETs against the superfile object.
-                for (off, bytes) in &offsets.open_blob {
-                    overlay.install(*off, Bytes::copy_from_slice(bytes));
-                }
-            } else {
-                // Fallback when no captured open blob is present:
-                // fetch the open batch over the wire
-                // (parquet tail + vec + fts ranges in parallel, 1 RTT).
+            // Whatever the manifest part carried rides straight into the
+            // overlay; the rest of the open batch — the parquet tail and
+            // any open range the writer left out of the blob because
+            // copying it into every manifest read would cost more than
+            // the round trip (a large superfile's term dictionary) — is
+            // fetched over the wire in one parallel wave. A complete blob
+            // means zero open-time GETs against the superfile object.
+            for (off, bytes) in &offsets.open_blob {
+                overlay.install(*off, Bytes::copy_from_slice(bytes));
+            }
+            let tail_range = (parquet_tail_start, parquet_tail_len);
+            let tail_missing = parquet_tail_len > 0
+                && !Self::uncovered_ranges(&offsets.open_blob, &[tail_range]).is_empty();
+            let vec_missing = Self::uncovered_ranges(&offsets.open_blob, &vec_ranges);
+            let fts_missing = Self::uncovered_ranges(&offsets.open_blob, &fts_ranges);
+            if tail_missing || !vec_missing.is_empty() || !fts_missing.is_empty() {
                 let storage_for_parquet = Arc::clone(&fetch_storage);
                 let storage_for_vec = Arc::clone(&fetch_storage);
                 let storage_for_fts = Arc::clone(&fetch_storage);
@@ -570,19 +591,17 @@ impl DiskCacheStore {
                 let fts_uri = storage_uri.clone();
 
                 let parquet_fut = async move {
-                    let end = total_size;
-                    let start = parquet_tail_start;
-                    if end == start {
+                    if !tail_missing {
                         return Ok::<_, StorageError>(Bytes::new());
                     }
                     storage_for_parquet
-                        .get_range(&parquet_uri, start..end)
+                        .get_range(&parquet_uri, parquet_tail_start..total_size)
                         .await
                 };
                 let vec_fut =
-                    async move { fetch_hint_ranges(storage_for_vec, vec_uri, vec_ranges).await };
+                    async move { fetch_hint_ranges(storage_for_vec, vec_uri, vec_missing).await };
                 let fts_fut =
-                    async move { fetch_hint_ranges(storage_for_fts, fts_uri, fts_ranges).await };
+                    async move { fetch_hint_ranges(storage_for_fts, fts_uri, fts_missing).await };
 
                 let (parquet_bytes, vec_pre, fts_pre) =
                     futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
@@ -1642,6 +1661,30 @@ mod tests {
         assert_eq!(store.stats().n_cold_fetches, 1);
         assert!(store.is_mmap_promoted(&uri));
         assert!(r2.parquet_bytes().is_some());
+    }
+
+    #[test]
+    fn uncovered_ranges_are_the_open_ranges_the_blob_does_not_hold_whole() {
+        let blob = vec![(100u64, vec![0u8; 50]), (1_000, vec![0u8; 10])];
+        let wanted = [
+            (100u64, 50u64),
+            (110, 20),
+            (90, 20),
+            (140, 20),
+            (1_000, 10),
+            (2_000, 5),
+            (3_000, 0),
+        ];
+        assert_eq!(
+            DiskCacheStore::uncovered_ranges(&blob, &wanted),
+            vec![(90, 20), (140, 20), (2_000, 5)],
+            "whole-inside ranges are covered; straddling, outside and only empty ranges are not"
+        );
+        assert!(DiskCacheStore::uncovered_ranges(&[], &[]).is_empty());
+        assert_eq!(
+            DiskCacheStore::uncovered_ranges(&[], &[(0, 1)]),
+            vec![(0, 1)]
+        );
     }
 
     #[tokio::test]
