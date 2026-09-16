@@ -341,6 +341,112 @@ fn vector_filter_restricts_hits_to_the_predicate_match_set() {
     );
 }
 
+/// UNDRAINED table, rare predicate whose matches sit far from the query's
+/// nearest cells, `k` covering the whole match set: the selectivity-widened
+/// probe must return every match.
+#[test]
+fn filtered_knn_finds_sparse_matches_outside_the_probed_cells() {
+    const ROWS: usize = 256;
+    const WIDE_DIM: usize = 256;
+    const NEEDLE_ROWS: std::ops::Range<usize> = 200..210;
+
+    let writer_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("writer pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(WIDE_DIM), false),
+    ]));
+    let st = Supertable::create(
+        SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![{
+                let mut vc = default_vector_config("emb", VECTOR_ROT_SEED);
+                vc.dim = WIDE_DIM;
+                vc
+            }],
+        )
+        .expect("valid options")
+        .with_writer_pool(writer_pool),
+    )
+    .expect("create");
+
+    let titles: Vec<String> = (0..ROWS)
+        .map(|i| {
+            if NEEDLE_ROWS.contains(&i) {
+                format!("doc {i} needle")
+            } else {
+                format!("doc {i}")
+            }
+        })
+        .collect();
+    let title_arr = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+    // Row `i` = one-hot at dim `i`, plus a tiny distinct lean toward dim 0 on
+    // the needle rows so their exact distances are distinct and ordered.
+    let mut flat = vec![0.0f32; ROWS * WIDE_DIM];
+    for i in 0..ROWS {
+        flat[i * WIDE_DIM + i] = 1.0;
+        if NEEDLE_ROWS.contains(&i) {
+            flat[i * WIDE_DIM] = 0.01 * (i - NEEDLE_ROWS.start + 1) as f32;
+        }
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        WIDE_DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(title_arr), Arc::new(fsl)]).expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+
+    let reader = st.reader().expect("reader");
+    let allowed = stable_ids(
+        &reader
+            .token_match("title", "needle", BoolMode::Or)
+            .expect("token_match"),
+    );
+    assert_eq!(allowed.len(), NEEDLE_ROWS.len(), "fixture: 10 needle rows");
+
+    let query: Vec<f32> = (0..WIDE_DIM)
+        .map(|d| if d == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &query,
+            NEEDLE_ROWS.len(),
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    assert_eq!(
+        stable_ids(&hits),
+        allowed,
+        "every sparse match returns, wherever its cell sits"
+    );
+    // Exact ranking: the lean toward dim 0 grows with the row index, so
+    // cosine distance (1 - dot) strictly DECREASES with it — hits arrive
+    // best-first, i.e. highest needle row first.
+    let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
+    assert!(
+        scores.windows(2).all(|w| w[0] <= w[1]),
+        "hits are ranked ascending by exact distance: {scores:?}"
+    );
+}
+
 /// Notes text for [`two_analyzer_table`], parallel to [`SEG1_TITLES`].
 /// `café` appears in exactly two docs; the accent matters — under the
 /// `standard` analyzer it is a real term, under `ascii_lower` the token
