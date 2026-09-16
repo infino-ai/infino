@@ -1858,14 +1858,18 @@ pub(crate) async fn calibrate_centroid_router_fanout(
         })
         .collect();
 
-    // The acceptance bar for the knee is `hnsw_register_floor` (default 0.98),
-    // NOT `target_recall`: the global-fine path's recall ceiling sits ~0.99, so
-    // requiring the full `target_recall` would leave every rung short of the bar
-    // and stamp the sentinel — `auto` would then never engage. The
-    // recall-parity-vs-stamped question this bar implies is a tracked follow-up.
+    // The acceptance bar starts at `hnsw_register_floor` (default 0.98), NOT
+    // `target_recall`: the global-fine path's recall ceiling sits ~0.99, so
+    // requiring the full `target_recall` would leave every rung short and stamp
+    // the sentinel. The bar then relaxes per-`k` toward the router's own
+    // measured ceiling (bounded `parity_gap` below the floor), so a router that
+    // shares the stamped grid's within-cell codec ceiling — on hard data that
+    // ceiling is below 0.98 — engages at parity with the grid instead of being
+    // rejected for missing a bar the codec can't reach.
     let knee = crate::supertable::opann::fanout_knee_from_recalls(
         &recall_ladder,
         vcfg.hnsw_register_floor,
+        vcfg.centroid_graph_parity_gap,
     );
     tracing::info!(
         column,
