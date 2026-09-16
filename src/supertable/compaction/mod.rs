@@ -62,11 +62,30 @@ use crate::{
     },
 };
 
-struct CompactionSlot<'a>(&'a AtomicBool);
+/// Held for as long as one process is reshaping superfiles, and released
+/// on drop. Compaction and reindex share it: both rewrite superfiles and
+/// commit manifest swaps, so running them together would put two planners
+/// on the same files.
+pub(crate) struct CompactionSlot<'a>(&'a AtomicBool);
 
 impl Drop for CompactionSlot<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Supertable {
+    /// Take the reshape slot, or report that something else holds it.
+    ///
+    /// Process-local by design: across processes it is the per-superfile
+    /// tombstone-sidecar seal that serializes writers, and that guard does
+    /// not care which kind of job took it.
+    pub(crate) fn try_hold_compaction_slot(&self) -> Option<CompactionSlot<'_>> {
+        let outstanding = &self.inner().compaction_outstanding;
+        match outstanding.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => Some(CompactionSlot(outstanding)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -121,6 +140,36 @@ fn split_stats_at_drain_watermark(
     stats
         .into_iter()
         .partition(|s| drained.contains(s.birth_version))
+}
+
+/// What running a job actually did.
+///
+/// A job whose inputs have already been replaced by another writer is not
+/// a failure — there is simply nothing left to do — but it is also not a
+/// rewrite, and a caller counting its progress must not count it as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobOutcome {
+    /// The replacement was committed.
+    Committed,
+    /// The inputs were gone by the time this job reached the manifest, so
+    /// another writer had already handled them.
+    InputsAlreadyReplaced,
+}
+
+/// Whether a merge keeps its inputs' terms or produces new ones.
+///
+/// Compaction always keeps them: re-tokenizing a corpus to merge it would
+/// cost far more and change nothing. A migration that is repairing an
+/// older analyzer's output is the one caller that needs the opposite, and
+/// pays for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TermSource {
+    /// Copy the inputs' postings across.
+    #[default]
+    Carried,
+    /// Re-analyze from the text the inputs stored. Columns whose text was
+    /// not stored are still carried — nothing can regenerate them.
+    Reanalyzed,
 }
 
 /// A set of superfiles to merge into one new superfile.
@@ -439,7 +488,9 @@ impl Supertable {
                 "compaction jobs planned"
             );
             for job in jobs {
-                table.run_compaction_job(job, stale_seal_timeout).await?;
+                table
+                    .run_compaction_job(job, stale_seal_timeout, TermSource::Carried)
+                    .await?;
                 table
                     .refresh()
                     .await
@@ -492,6 +543,7 @@ impl Supertable {
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
+        terms: TermSource,
     ) -> Result<PreparedSuperfile, BuildError> {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
@@ -585,7 +637,16 @@ impl Supertable {
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
                 let mut writer = BufWriter::new(output.as_file_mut());
-                let stats = if multi_cell && sq8_merge == Some(true) {
+                let stats = if terms == TermSource::Reanalyzed {
+                    // Re-tokenizing is the whole point of this call, so it
+                    // takes precedence over every splice below: those all
+                    // carry postings, which is exactly what must not happen.
+                    SuperfileBuilder::build_from_readers_reanalyze_to(
+                        &readers_with_tombstones,
+                        &fts_corpus,
+                        &mut writer,
+                    )?
+                } else if multi_cell && sq8_merge == Some(true) {
                     SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
                         &readers_with_tombstones,
                         &superseded_per_reader,
@@ -665,7 +726,8 @@ impl Supertable {
         &self,
         job: CompactionJob,
         stale_seal_timeout: std::time::Duration,
-    ) -> Result<(), CompactionError> {
+        terms: TermSource,
+    ) -> Result<JobOutcome, CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
         let storage = manifest
@@ -726,7 +788,7 @@ impl Supertable {
             });
         }
 
-        let merged_segment = match self.merge_superfiles(&inputs).await {
+        let merged_segment = match self.merge_superfiles(&inputs, terms).await {
             Ok(seg) => Some(seg),
             // Every input was fully dead — all cells tombstoned, or all
             // superseded by an in-place cell split. There is nothing live to
@@ -787,7 +849,7 @@ impl Supertable {
             // Another compactor already merged our inputs — nothing left to commit.
             let entries_to_remove = match resolve_entries_to_remove(&current, &job.inputs) {
                 Ok(entries) => entries,
-                Err(_missing) => return Ok(()),
+                Err(_missing) => return Ok(JobOutcome::InputsAlreadyReplaced),
             };
 
             let mut pending_storage_replaces: Vec<(String, Bytes)> = Vec::new();
@@ -838,7 +900,7 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
-                    return Ok(());
+                    return Ok(JobOutcome::Committed);
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
                     warn!(
@@ -1237,7 +1299,7 @@ mod tests {
             estimated_output_bytes: 0,
         };
         let err = st
-            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT, TermSource::Carried)
             .await
             .expect_err("must error on unknown input");
         assert!(
@@ -1320,7 +1382,7 @@ mod tests {
             estimated_output_bytes: 1,
         };
         let err = st
-            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT, TermSource::Carried)
             .await
             .expect_err("must conflict on entry_b");
         assert!(matches!(err, CompactionError::SidecarConflict { .. }));
@@ -1620,7 +1682,7 @@ mod tests {
 
         // Merge the superfiles - should succeed
         let _merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, TermSource::Carried)
             .await
             .expect("merge_superfiles should succeed");
     }
@@ -1674,7 +1736,7 @@ mod tests {
 
         // Merge should succeed and preserve scalar stats
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, TermSource::Carried)
             .await
             .expect("merge_superfiles should succeed");
 
@@ -1754,7 +1816,7 @@ mod tests {
 
         // Merging 3 superfiles should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, TermSource::Carried)
             .await
             .expect("merge_superfiles should succeed");
 
@@ -1838,7 +1900,7 @@ mod tests {
         let inputs = &superfiles[..2];
 
         let merged = st
-            .merge_superfiles(inputs)
+            .merge_superfiles(inputs, TermSource::Carried)
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -1908,7 +1970,7 @@ mod tests {
         superfiles.sort_by_key(|sf| sf.id_min);
 
         let merged = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, TermSource::Carried)
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -2036,7 +2098,7 @@ mod tests {
         superfiles.sort_by_key(|sf| sf.id_min);
 
         let merged = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, TermSource::Carried)
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -2110,7 +2172,7 @@ mod tests {
         let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
 
-        match st.merge_superfiles(&superfiles).await {
+        match st.merge_superfiles(&superfiles, TermSource::Carried).await {
             Err(BuildError::MemoryBudgetExceeded(_)) => {}
             Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
             Ok(_) => panic!("merge must be refused over budget"),
@@ -2147,7 +2209,7 @@ mod tests {
 
         // Merging a single superfile should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, TermSource::Carried)
             .await
             .expect("merge_superfiles should succeed");
 

@@ -419,6 +419,58 @@ impl OpenError {
     }
 }
 
+/// Failures from [`crate::Supertable::reindex`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReindexError {
+    /// No durable storage backend is configured (e.g. `memory://`);
+    /// a reindex rewrites committed files, so it needs one.
+    #[error("reindex requires a storage backend")]
+    NoStorage,
+    /// Another compaction or reindex is already running in this process.
+    ///
+    /// Both reshape the same superfiles through the same slot, so they are
+    /// serialized rather than allowed to race. This is a signal to retry
+    /// later, not a failure of the migration.
+    #[error("a compaction or reindex is already running")]
+    AlreadyRunning,
+    /// Reading a superfile to decide whether it is stale failed.
+    #[error("failed to assess superfiles: {0}")]
+    Assess(String),
+    /// Re-analysis was asked for on a table whose vectors cannot be
+    /// rebuilt.
+    ///
+    /// Rebuilding terms means decoding every row and re-encoding the file,
+    /// and a quantized or multi-cell vector index cannot be decoded back
+    /// to the vectors an append needs — it can be copied across a merge,
+    /// but not reconstructed. Rewriting the layout still works on such a
+    /// table; only re-analysis does not.
+    #[error(
+        "re-analysis is not supported for superfile {superfile_id}: its vector index cannot be \
+         rebuilt from stored rows; rewrite the layout instead, or re-ingest the table to change \
+         how its text is analyzed"
+    )]
+    ReanalyzeUnsupported {
+        /// The first superfile found that cannot be rebuilt.
+        superfile_id: uuid::Uuid,
+    },
+    /// Rewriting one superfile failed. The migration stops here; the
+    /// superfiles already rewritten stay rewritten, and re-running picks
+    /// up what is left.
+    ///
+    /// The cause is carried as text rather than as the underlying error:
+    /// that type is internal, and exposing it here would make every
+    /// compaction failure mode part of the public surface for the sake of
+    /// one message.
+    #[error("failed to rewrite superfile {superfile_id}: {cause}")]
+    Rewrite {
+        /// The superfile whose rewrite failed.
+        superfile_id: uuid::Uuid,
+        /// What went wrong underneath.
+        cause: String,
+    },
+}
+
 /// Errors raised by [`crate::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizeError {

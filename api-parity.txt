@@ -21,6 +21,7 @@ Supertable::exact_match	covered	(&self, &str, &str, Option<&[&str]>) -> Result<V
 Supertable::gc	covered	(&self, Duration) -> Result<GcReport, GcError>
 Supertable::hybrid_search	covered	(&self, &str, &str, BoolMode, &str, &[f32], usize, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::optimize	covered	(&self, &OptimizeOptions) -> Result<(), OptimizeError>
+Supertable::reindex	exempt	One-off format migration driven by an operator or by the migration tooling, both of which consume the Rust crate directly; it needs the storage backend and the writer slot, so it is not a language-binding operation. Revisit if a binding consumer needs to migrate a table it owns.
 Supertable::schema	covered	(&self) -> SchemaRef
 Supertable::token_match	covered	(&self, &str, &str, BoolMode, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::update	covered	(&self, Expr, &RecordBatch) -> Result<MutationStats, InfinoError>

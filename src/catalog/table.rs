@@ -20,8 +20,10 @@ use datafusion::prelude::Expr;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, VectorFilter, catalog::ensure_expr_within_connective_cap,
-    superfile::VectorSearchOptions, supertable::Supertable as SupertableHandle,
+    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    catalog::ensure_expr_within_connective_cap,
+    superfile::VectorSearchOptions,
+    supertable::{Supertable as SupertableHandle, reindex::ReindexReport},
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -78,6 +80,7 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
+    fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
@@ -173,6 +176,9 @@ impl Table for SupertableHandle {
     }
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         SupertableHandle::optimize(self, opts)
+    }
+    fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
+        SupertableHandle::reindex(self, opts)
     }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
@@ -404,6 +410,18 @@ impl Supertable {
     /// Optimize (compact) the table.
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         self.inner.optimize(opts)
+    }
+
+    /// Rewrite every superfile whose full-text index is behind the format
+    /// this engine writes, leaving rows, ids and ranking unchanged.
+    ///
+    /// Each superfile is rewritten and committed on its own, so a query
+    /// sees either the old file or its replacement. Interrupting a run
+    /// keeps the rewrites it finished; running again resumes, because what
+    /// is left is read from the files rather than tracked in a journal.
+    /// Idempotent — a second run over a migrated table does nothing.
+    pub fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
+        self.inner.reindex(opts)
     }
 
     /// Garbage-collect orphaned superfiles older than `safety_gap`.
