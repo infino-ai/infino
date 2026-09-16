@@ -5150,7 +5150,7 @@ const MAX_EFFECTIVE_FILTERED_RERANK_MULT: usize = 16_384;
 const UNFILTERED_SELECTIVITY_MULT: usize = 1;
 /// Multiplier for a present-but-empty allow-set: no row can match, so
 /// callers should return an empty result without probing.
-const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
+pub(crate) const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
 /// Population count for an empty allow-set or empty column.
 const EMPTY_FILTER_POPULATION: u64 = 0;
 /// Numerator for the inverse-selectivity multiplier (`1 / selectivity`).

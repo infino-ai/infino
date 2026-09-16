@@ -114,7 +114,10 @@ use crate::{
             flat::Sq4FlatIndex,
             hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
-            reader::{ProbeTally, ScanCandidate, ScanOutcome, selectivity_mult_from_counts},
+            reader::{
+                EMPTY_FILTER_SELECTIVITY_MULT, ProbeTally, ScanCandidate, ScanOutcome,
+                selectivity_mult_from_counts,
+            },
         },
     },
     supertable::{
@@ -5254,12 +5257,25 @@ impl SupertableReader {
                 // widen the [`FILTERED_USER_CELL_NPROBE`] floor by the filter's
                 // inverse selectivity (same capped math as the superfile tier's
                 // `selectivity_mult_from_counts`). Dense filters keep the floor.
+                // Count over THIS fan's superfiles only: the allow map still
+                // carries drained superfiles' entries, and mixing their
+                // matches into `allowed` overstates selectivity for the tail.
                 let allowed: u64 = allow
                     .as_ref()
-                    .map(|m| m.values().map(|bm| bm.len()).sum())
+                    .map(|m| {
+                        superfiles
+                            .iter()
+                            .filter_map(|e| m.get(&e.uri))
+                            .map(|bm| bm.len())
+                            .sum()
+                    })
                     .unwrap_or(0);
                 let population: u64 = superfiles.iter().map(|e| e.n_docs).sum();
-                let mult = selectivity_mult_from_counts(allowed, population).max(1);
+                let mult = selectivity_mult_from_counts(allowed, population);
+                if mult == EMPTY_FILTER_SELECTIVITY_MULT {
+                    // No tail row matches the filter: nothing to probe.
+                    return Ok(Vec::new());
+                }
                 let width = FILTERED_USER_CELL_NPROBE.saturating_mul(mult);
                 CellRoutingParams {
                     nprobe_min: width,
