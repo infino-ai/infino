@@ -223,6 +223,26 @@ impl StreamIndex {
     }
 
     /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
+    /// One lane of the stream, exception applied.
+    #[inline]
+    fn lane(&self, bytes: &[u8], i: usize) -> Option<u32> {
+        let low = u32::try_from(get_bits(&bytes[self.payload.clone()], i, self.width)?).ok()?;
+        if self.exceptions.is_empty() {
+            return Some(low);
+        }
+        let hi = match self
+            .exceptions
+            .binary_search_by_key(&(i as u32), |&(lane, _)| lane)
+        {
+            Ok(k) => self.exceptions[k]
+                .1
+                .checked_shl(u32::from(self.width))
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        Some(low | hi)
+    }
+
     fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
         let payload = &bytes[self.payload.clone()];
         let base = out.len();
@@ -372,22 +392,16 @@ impl GroupIndex {
                     .extend_from_slice(self.values.get(start..start + tf as usize)?);
             }
             GroupKind::Packed => {
-                if tf as usize <= SMALL_TF
-                    && self.first.exceptions.is_empty()
-                    && self.gap.exceptions.is_empty()
-                {
+                if tf as usize <= SMALL_TF {
                     // Most runs on a real corpus are one to three positions:
                     // read the lanes straight out of the two payloads and
                     // write the prefix sums, skipping the generic lane
-                    // reader, its scratch and the exception lookups.
-                    let first =
-                        get_bits(&bytes[self.first.payload.clone()], pair, self.first.width)?;
-                    let mut p = u32::try_from(first).ok()?;
+                    // reader and its scratch. An exception is looked up per
+                    // lane only when the stream has any.
+                    let mut p = self.first.lane(bytes, pair)?;
                     out.push(p);
-                    let gaps = &bytes[self.gap.payload.clone()];
                     for k in 0..tf as usize - 1 {
-                        let g = u32::try_from(get_bits(gaps, start + k, self.gap.width)?).ok()?;
-                        p = p.checked_add(g)?;
+                        p = p.checked_add(self.gap.lane(bytes, start + k)?)?;
                         out.push(p);
                     }
                     return Some(());

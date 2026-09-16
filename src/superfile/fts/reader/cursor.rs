@@ -564,6 +564,11 @@ pub(crate) struct TermCursor {
     /// second one means the caller is walking the block, and the full
     /// expansion is cheaper than one lane read per doc.
     lazy_steps: u8,
+    /// Whether skips into bitset blocks are served lazily. Cleared when a
+    /// lazy block had to be expanded (the caller is walking dense blocks
+    /// by skips), set again when a skip jumps past whole blocks or leaves
+    /// a lazy block after a single probe.
+    lazy_mode: bool,
 }
 
 impl TermCursor {
@@ -650,6 +655,7 @@ impl TermCursor {
             header_cache: None,
             lazy_bit: u32::MAX,
             lazy_steps: 0,
+            lazy_mode: true,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -719,6 +725,7 @@ impl TermCursor {
             header_cache: None,
             lazy_bit: u32::MAX,
             lazy_steps: 0,
+            lazy_mode: true,
         })
     }
 
@@ -780,6 +787,7 @@ impl TermCursor {
             header_cache: None,
             lazy_bit: u32::MAX,
             lazy_steps: 0,
+            lazy_mode: true,
         }
     }
 
@@ -1207,6 +1215,7 @@ impl TermCursor {
                 None => false,
             };
         }
+        self.lazy_mode = false;
         self.decode_current_block();
         while self.pos < self.block_n && self.block_doc_ids[self.pos] <= cur {
             self.pos += 1;
@@ -1282,11 +1291,18 @@ impl TermCursor {
         if self.is_exhausted() {
             return;
         }
-        if !self.predecoded && self.current_header().encoding == ENCODING_BITSET {
+        let left_lazy = self.lazy_bit != u32::MAX && self.current_block != from_block;
+        if left_lazy || self.current_block > from_block + 1 {
+            // A probe that leaves a lazy block after one doc, or jumps past
+            // whole blocks, is sparse: serve the next bitset block lazily.
+            self.lazy_mode = true;
+        }
+        if !self.predecoded && self.lazy_mode && self.current_header().encoding == ENCODING_BITSET {
             // A skip into a bitset block is a probe: publish the one doc
             // the caller asked for instead of expanding all 128. A third
             // skip landing in the same block is a dense caller walking it
-            // by skips (a stopword AND), which the expansion serves better.
+            // by skips (a stopword AND), which the expansion serves better
+            // — for this block and the following ones.
             let again = self.lazy_bit != u32::MAX && self.current_block == from_block;
             let steps = match again {
                 true => self.lazy_steps + 1,
@@ -1302,6 +1318,7 @@ impl TermCursor {
                     return;
                 }
             }
+            self.lazy_mode = false;
         }
         self.decode_current_block();
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < target {
