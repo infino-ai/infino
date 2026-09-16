@@ -10776,6 +10776,7 @@ mod tests {
         Arc::new(SuperfileEntry {
             birth_version: 0,
             superfile_id: Uuid::from_u128(id),
+            stem: None,
             uri: SuperfileUri(Uuid::from_u128(id)),
             n_docs: 1,
             id_min: 0,
