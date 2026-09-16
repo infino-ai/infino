@@ -25,6 +25,10 @@ use crate::superfile::{
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
 /// fetched position runs, and a lazily-built per-block cache of each
 /// pair's run offset.
+/// Survivors-to-positions ratio above which phrase verification merges
+/// the two sorted lists instead of bisecting per survivor.
+const MERGE_WALK_RATIO: usize = 8;
+
 pub(super) struct PhraseMember {
     pub(super) cursor: TermCursor,
     /// The term's complete position runs (empty for an inline df=1
@@ -552,16 +556,36 @@ impl PhraseCursor {
             let plist = &self.members[j].pos_scratch;
             let off = self.position_offsets[j];
             // Compact the survivors in place: keep a start iff member `j`
-            // holds `start + position_offsets[j]`.
+            // holds `start + position_offsets[j]`. Both lists ascend, so
+            // when the survivors are a fair fraction of the member's
+            // positions one merge walk beats a binary search per survivor;
+            // a handful of survivors against a long list still bisects.
             let mut w = 0usize;
-            for r in 0..self.verify_scratch.len() {
-                let start = self.verify_scratch[r];
-                let keep = start
-                    .checked_add(off)
-                    .is_some_and(|want| plist.binary_search(&want).is_ok());
-                if keep {
-                    self.verify_scratch[w] = start;
-                    w += 1;
+            if self.verify_scratch.len() * MERGE_WALK_RATIO >= plist.len() {
+                let mut pi = 0usize;
+                for r in 0..self.verify_scratch.len() {
+                    let start = self.verify_scratch[r];
+                    let Some(want) = start.checked_add(off) else {
+                        continue;
+                    };
+                    while pi < plist.len() && plist[pi] < want {
+                        pi += 1;
+                    }
+                    if pi < plist.len() && plist[pi] == want {
+                        self.verify_scratch[w] = start;
+                        w += 1;
+                    }
+                }
+            } else {
+                for r in 0..self.verify_scratch.len() {
+                    let start = self.verify_scratch[r];
+                    let keep = start
+                        .checked_add(off)
+                        .is_some_and(|want| plist.binary_search(&want).is_ok());
+                    if keep {
+                        self.verify_scratch[w] = start;
+                        w += 1;
+                    }
                 }
             }
             self.verify_scratch.truncate(w);

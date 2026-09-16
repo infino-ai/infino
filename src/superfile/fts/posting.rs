@@ -256,10 +256,9 @@ impl BlockHeader {
                 }
             }
         };
-        assert!(
-            header.delta_bits <= 32 && header.tf_bits <= 32,
-            "block header: bit width > 32"
-        );
+        // Widths are validated where they drive an unpacker
+        // (`check_widths`), not on every probe that only needs the
+        // encoding and origin.
         debug_assert!(
             usize::from(header.count) <= BLOCK_LEN,
             "block header: doc_count > BLOCK_LEN"
@@ -272,6 +271,15 @@ impl BlockHeader {
     }
 
     /// Real `(doc_id, tf)` pairs in the block.
+    /// Reject a corrupt header before its widths reach an unpacker.
+    #[inline]
+    pub fn check_widths(&self) {
+        assert!(
+            self.delta_bits <= 32 && self.tf_bits <= 32,
+            "block header: bit width > 32"
+        );
+    }
+
     #[inline]
     pub fn count(&self) -> usize {
         usize::from(self.count)
@@ -622,6 +630,7 @@ pub fn decode_block(
     dest_doc_ids: &mut [u32],
     dest_tfs: &mut [u32],
 ) -> usize {
+    hdr.check_widths();
     if hdr.encoding == ENCODING_PATCHED {
         // Both halves in one pass over the exception lists: the delta
         // pass ends where the tf exceptions begin.
@@ -740,6 +749,7 @@ fn skip_lanes(bytes: &[u8], mut at: usize, n: usize) -> usize {
 /// Unpack a block's trailing packed tfs (the low bits, for a patched
 /// block).
 fn unpack_tfs(bytes: &[u8], hdr: &BlockHeader, dest_tfs: &mut [u32]) {
+    hdr.check_widths();
     assert!(
         dest_tfs.len() >= BLOCK_LEN,
         "decode_block_tfs: dest_tfs must have at least {BLOCK_LEN} slots"
@@ -794,7 +804,46 @@ pub fn decode_block_tfs(bytes: &[u8], hdr: &BlockHeader, dest_tfs: &mut [u32]) {
 /// # Panics
 ///
 /// As [`decode_block`], minus the `dest_tfs` checks.
+/// One tf out of a bitset block without unpacking the other 127. Bitset
+/// blocks carry plain packed tfs (never patched), and a membership probe
+/// needs the tf of one doc per block it lands in, so unpacking the whole
+/// lane set per probe was most of the probe's cost.
+///
+/// `BitPacker4x` interleaves four 32-bit lanes: value `i` lives in lane
+/// `i % 4` at bit `(i / 4) * width` of that lane's stream, whose 32-bit
+/// words sit at every fourth word of the payload.
+pub fn bitset_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
+    debug_assert_eq!(hdr.encoding, ENCODING_BITSET);
+    debug_assert!(rank < BLOCK_LEN);
+    hdr.check_widths();
+    let width = usize::from(hdr.tf_bits);
+    if width == 0 {
+        return 0;
+    }
+    let tfs_size = hdr.tfs_size();
+    assert!(
+        bytes.len() >= hdr.payload() + tfs_size,
+        "bitset_tf_at: bytes shorter than header+tfs"
+    );
+    let packed = &bytes[bytes.len() - tfs_size..];
+    let lane = rank % 4;
+    let bit = (rank / 4) * width;
+    let word = |w: usize| -> u64 {
+        let at = (w * 4 + lane) * 4;
+        u64::from(u32::from_le_bytes(
+            packed[at..at + 4].try_into().expect("4 bytes"),
+        ))
+    };
+    let shift = bit % 32;
+    let mut v = word(bit / 32) >> shift;
+    if shift + width > 32 {
+        v |= word(bit / 32 + 1) << (32 - shift);
+    }
+    (v & ((1u64 << width) - 1)) as u32
+}
+
 pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u32]) -> usize {
+    hdr.check_widths();
     assert!(
         dest_doc_ids.len() >= BLOCK_LEN,
         "decode_block_doc_ids: dest_doc_ids must have at least {BLOCK_LEN} slots"
@@ -1042,6 +1091,42 @@ mod tests {
             let hdr = BlockHeader::parse(&enc.bytes, layout, Some(40));
             assert_eq!(hdr.base, 64, "{layout:?} origin");
             assert_eq!(hdr.delta_bits, 0);
+        }
+    }
+
+    #[test]
+    fn bitset_tf_at_reads_every_lane_at_every_width() {
+        // Dense docs force the bitset; tfs spanning 1..=2^w-1 force tf width
+        // w. Every lane read alone must equal the full unpack, for every
+        // width the packer can produce and both header layouts.
+        let doc_ids: Vec<u32> = (256..384).collect();
+        for width in 0..=20u32 {
+            let cap = (1u64 << width) as u32;
+            let tfs: Vec<u32> = (0..128u32)
+                .map(|i| match width {
+                    0 => 1,
+                    _ => 1 + (i.wrapping_mul(2_654_435_761).wrapping_add(i * 7) % (cap - 1).max(1)),
+                })
+                .collect();
+            for layout in LAYOUTS {
+                let enc = encode_one(&block(&doc_ids, &tfs), layout, Some(200), true);
+                assert_eq!(
+                    block_encoding(&enc.bytes),
+                    ENCODING_BITSET,
+                    "{layout:?} w{width}"
+                );
+                let hdr = BlockHeader::parse(&enc.bytes, layout, Some(200));
+                let mut full = vec![0u32; BLOCK_LEN];
+                decode_block_tfs(&enc.bytes, &hdr, &mut full);
+                for (rank, &want) in full.iter().enumerate().take(128) {
+                    assert_eq!(
+                        bitset_tf_at(&enc.bytes, &hdr, rank),
+                        want,
+                        "{layout:?} tf_bits {} rank {rank}",
+                        hdr.tf_bits
+                    );
+                }
+            }
         }
     }
 

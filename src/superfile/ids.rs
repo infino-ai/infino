@@ -220,39 +220,44 @@ impl<'a> PackedIds<'a> {
         })
     }
 
-    /// The `_id` of local doc `doc`; `None` past `n_docs` or on a block
-    /// the sidecar's bytes cannot hold.
-    #[inline]
+    /// One doc's id, through the same block path `get_many` takes.
+    #[cfg(test)]
     pub(crate) fn get(&self, doc: u32) -> Option<i128> {
-        let doc = doc as usize;
-        if doc >= self.n_docs {
-            return None;
-        }
-        let blk = self.block(doc / BLOCK_DOCS)?;
-        let i = doc % BLOCK_DOCS;
-        if i >= blk.n_in_block {
-            return None;
-        }
-        let hi = get_bits(&self.bytes[blk.hi.clone()], i, blk.hi_width)?;
-        let lo = get_bits(&self.bytes[blk.lo.clone()], i, blk.lo_width)?;
-        Some(blk.id(hi, lo))
+        let mut out = Vec::with_capacity(1);
+        self.get_many(&[doc], &mut out)?;
+        out.pop()
     }
 
-    /// The `_id`s of `docs`, appended to `out` in the callers' order.
-    /// Docs that arrive ascending — the order a block walk emits them —
-    /// are served a block at a time: when a block has at least one in
-    /// [`BULK_DENSITY`] of its docs asked for, both streams are unpacked
-    /// once and the ids read off; otherwise, and for any other order,
-    /// each doc is looked up on its own. `None` on a doc past `n_docs`
-    /// or a block the bytes cannot hold.
     pub(crate) fn get_many(&self, docs: &[u32], out: &mut Vec<i128>) -> Option<()> {
-        out.reserve(docs.len());
-        if !docs.is_sorted() {
-            for &d in docs {
-                out.push(self.get(d)?);
-            }
-            return Some(());
+        let base = out.len();
+        let resolved = if docs.is_sorted() {
+            out.reserve(docs.len());
+            self.resolve_sorted(docs, |_, id| out.push(id))
+        } else {
+            // Ranked hits arrive in score order. Resolve them in doc order,
+            // so a block's directory entry and header are parsed once for
+            // every doc it holds, then scatter back to the caller's order.
+            let mut order: Vec<(u32, u32)> = docs
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| (d, i as u32))
+                .collect();
+            order.sort_unstable();
+            let sorted: Vec<u32> = order.iter().map(|&(d, _)| d).collect();
+            out.resize(base + docs.len(), 0);
+            self.resolve_sorted(&sorted, |k, id| out[base + order[k].1 as usize] = id)
+        };
+        if resolved.is_none() {
+            out.truncate(base);
         }
+        resolved
+    }
+
+    /// Resolve ascending `docs`, calling `sink(index_in_docs, id)` for each.
+    /// A block's docs are served from one parsed header: unpacked wholesale
+    /// once the run asks for at least `1 / BULK_DENSITY` of the block, lane
+    /// by lane otherwise.
+    fn resolve_sorted(&self, docs: &[u32], mut sink: impl FnMut(usize, i128)) -> Option<()> {
         let mut his: Vec<u64> = Vec::new();
         let mut los: Vec<u64> = Vec::new();
         let mut i = 0usize;
@@ -262,47 +267,41 @@ impl<'a> PackedIds<'a> {
             while j < docs.len() && docs[j] as usize / BLOCK_DOCS == b {
                 j += 1;
             }
-            let group = &docs[i..j];
-            i = j;
-            if group[group.len() - 1] as usize >= self.n_docs {
+            if docs[j - 1] as usize >= self.n_docs {
                 return None;
             }
             let blk = self.block(b)?;
-            if group.len() * BULK_DENSITY < blk.n_in_block {
-                for &d in group {
-                    out.push(self.get(d)?);
+            let hi_bytes = &self.bytes[blk.hi.clone()];
+            let lo_bytes = &self.bytes[blk.lo.clone()];
+            if (j - i) * BULK_DENSITY < blk.n_in_block {
+                for (k, &d) in docs.iter().enumerate().take(j).skip(i) {
+                    let lane = d as usize % BLOCK_DOCS;
+                    if lane >= blk.n_in_block {
+                        return None;
+                    }
+                    let hi = get_bits(hi_bytes, lane, blk.hi_width)?;
+                    let lo = get_bits(lo_bytes, lane, blk.lo_width)?;
+                    sink(k, blk.id(hi, lo));
                 }
-                continue;
-            }
-            his.clear();
-            los.clear();
-            for_each_lane(
-                &self.bytes[blk.hi.clone()],
-                0,
-                blk.n_in_block,
-                blk.hi_width,
-                |v| his.push(v),
-            )?;
-            for_each_lane(
-                &self.bytes[blk.lo.clone()],
-                0,
-                blk.n_in_block,
-                blk.lo_width,
-                |v| los.push(v),
-            )?;
-            for &d in group {
-                let k = d as usize % BLOCK_DOCS;
-                if k >= blk.n_in_block {
-                    return None;
+            } else {
+                his.clear();
+                los.clear();
+                for_each_lane(hi_bytes, 0, blk.n_in_block, blk.hi_width, |v| his.push(v))?;
+                for_each_lane(lo_bytes, 0, blk.n_in_block, blk.lo_width, |v| los.push(v))?;
+                for (k, &d) in docs.iter().enumerate().take(j).skip(i) {
+                    let lane = d as usize % BLOCK_DOCS;
+                    if lane >= blk.n_in_block {
+                        return None;
+                    }
+                    sink(k, blk.id(his[lane], los[lane]));
                 }
-                out.push(blk.id(his[k], los[k]));
             }
+            i = j;
         }
         Some(())
     }
 }
 
-/// One block of the packed sidecar, located.
 struct IdBlock {
     hi_base: u64,
     lo_base: u64,
@@ -399,7 +398,14 @@ mod tests {
             (0..n).step_by(3).collect(),    // dense enough for bulk
             (0..n).step_by(97).collect(),   // sparse: per-doc path
             vec![5, 3, 3, 2_000, 1_024, 1], // unsorted, duplicates
-            vec![n - 1, n - 2],             // last block, tail
+            // Score-ordered hits: every block touched, out of order, dense
+            // in one block and sparse in the others.
+            (0..n)
+                .rev()
+                .step_by(11)
+                .chain((0..64).map(|k| k * 2))
+                .collect(),
+            vec![n - 1, n - 2], // last block, tail
             Vec::new(),
         ];
         for docs in cases {

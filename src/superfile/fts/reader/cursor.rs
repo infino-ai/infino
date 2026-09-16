@@ -29,8 +29,8 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_BITSET, block_encoding, decode_block,
-            decode_block_doc_ids, decode_block_tfs,
+            BLOCK_LEN, BlockHeader, ENCODING_BITSET, bitset_tf_at, block_encoding, decode_block,
+            decode_block_doc_ids,
         },
         short::decode_short,
     },
@@ -972,16 +972,14 @@ impl TermCursor {
         }
         // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
         let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-        // Decode this block's tf array once (doc order), reused across a run of
-        // candidates in the same block; the doc ids are never expanded.
-        if self.tf_decoded_block != self.current_block {
-            // Reuse `raw` (still borrowing this block's bytes, disjoint from
-            // the `&mut self.block_tfs` decode target) rather than recomputing
-            // the same subslice and its bounds check.
-            decode_block_tfs(raw, &hdr, &mut self.block_tfs);
-            self.tf_decoded_block = self.current_block;
+        // A probe lands on one doc per block; read its tf lane alone. A block
+        // whose tfs are already expanded (a doc-at-a-time walk decoded it)
+        // is served from that array instead.
+        if self.tf_decoded_block == self.current_block {
+            Some(self.block_tfs[rank as usize])
+        } else {
+            Some(bitset_tf_at(raw, &hdr, rank as usize))
         }
-        Some(self.block_tfs[rank as usize])
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
@@ -1257,11 +1255,11 @@ impl TermCursor {
             let (bit, word, bitset_end) =
                 Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
             let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-            if self.tf_decoded_block != self.current_block {
-                decode_block_tfs(raw, &hdr, &mut self.block_tfs);
-                self.tf_decoded_block = self.current_block;
+            if self.tf_decoded_block == self.current_block {
+                self.block_tfs[rank as usize]
+            } else {
+                bitset_tf_at(raw, &hdr, rank as usize)
             }
-            self.block_tfs[rank as usize]
         } else {
             // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
             let pos = self.block_doc_ids[..self.block_n]
