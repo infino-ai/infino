@@ -564,11 +564,12 @@ pub(crate) struct TermCursor {
     /// second one means the caller is walking the block, and the full
     /// expansion is cheaper than one lane read per doc.
     lazy_steps: u8,
-    /// Whether skips into bitset blocks are served lazily. Cleared when a
-    /// lazy block had to be expanded (the caller is walking dense blocks
-    /// by skips), set again when a skip jumps past whole blocks or leaves
-    /// a lazy block after a single probe.
-    lazy_mode: bool,
+    /// Consecutive bitset blocks whose lazy probe had to give way to the
+    /// full expansion. Two in a row mean the caller is walking dense
+    /// blocks by skips, and later bitset blocks are expanded outright;
+    /// a skip that jumps past whole blocks, or leaves a block after its
+    /// single lazy doc, resets the streak.
+    dense_streak: u8,
 }
 
 impl TermCursor {
@@ -655,7 +656,7 @@ impl TermCursor {
             header_cache: None,
             lazy_bit: u32::MAX,
             lazy_steps: 0,
-            lazy_mode: true,
+            dense_streak: 0,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -725,7 +726,7 @@ impl TermCursor {
             header_cache: None,
             lazy_bit: u32::MAX,
             lazy_steps: 0,
-            lazy_mode: true,
+            dense_streak: 0,
         })
     }
 
@@ -787,7 +788,7 @@ impl TermCursor {
             header_cache: None,
             lazy_bit: u32::MAX,
             lazy_steps: 0,
-            lazy_mode: true,
+            dense_streak: 0,
         }
     }
 
@@ -1215,7 +1216,7 @@ impl TermCursor {
                 None => false,
             };
         }
-        self.lazy_mode = false;
+        self.dense_streak = self.dense_streak.saturating_add(1);
         self.decode_current_block();
         while self.pos < self.block_n && self.block_doc_ids[self.pos] <= cur {
             self.pos += 1;
@@ -1295,30 +1296,28 @@ impl TermCursor {
         if left_lazy || self.current_block > from_block + 1 {
             // A probe that leaves a lazy block after one doc, or jumps past
             // whole blocks, is sparse: serve the next bitset block lazily.
-            self.lazy_mode = true;
+            self.dense_streak = 0;
         }
-        if !self.predecoded && self.lazy_mode && self.current_header().encoding == ENCODING_BITSET {
+        if !self.predecoded
+            && self.dense_streak < 2
+            && self.current_header().encoding == ENCODING_BITSET
+        {
             // A skip into a bitset block is a probe: publish the one doc
-            // the caller asked for instead of expanding all 128. A third
-            // skip landing in the same block is a dense caller walking it
-            // by skips (a stopword AND), which the expansion serves better
-            // — for this block and the following ones.
+            // the caller asked for instead of expanding all 128. A second
+            // skip landing in the same block is a caller walking it by
+            // skips (a stopword AND), which the expansion serves better.
             let again = self.lazy_bit != u32::MAX && self.current_block == from_block;
-            let steps = match again {
-                true => self.lazy_steps + 1,
-                false => 0,
-            };
-            if steps < 2 {
+            if !again {
                 let block = self.blocks[self.current_block];
                 let hdr = self.current_header();
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
                 if let Some((doc, rank)) = bitset_next_doc(raw, &hdr, target) {
                     self.publish_lazy(doc, rank);
-                    self.lazy_steps = steps;
+                    self.lazy_steps = 0;
                     return;
                 }
             }
-            self.lazy_mode = false;
+            self.dense_streak = self.dense_streak.saturating_add(1);
         }
         self.decode_current_block();
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < target {
