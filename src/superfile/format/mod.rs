@@ -169,6 +169,25 @@ pub mod fts {
     /// Readers accept `V1`–`V7`.
     pub const VERSION_V7: u32 = 7;
 
+    /// The blob version a file must carry to be current — what the
+    /// staleness check compares against and what a migration plans from.
+    ///
+    /// Deliberately *not* what the writer stamps. The writer maps a layout
+    /// era to the version that era defines, and the two are different
+    /// facts: raising this constant says "older files are now stale",
+    /// while stamping it would say "the bytes I just wrote are whatever
+    /// the newest version is" — which is false unless a new era was
+    /// written too. Getting that backwards would label a `V7` layout as
+    /// `V8`, and the reader's feature gates, which enumerate the versions
+    /// that carry a position sub-index, bitset blocks, a term-block
+    /// dictionary and short-form terms, would stop recognising it and
+    /// silently decode none of them.
+    ///
+    /// A new version therefore means: add the constant, add the era that
+    /// writes it, then raise this. `current_version_matches_the_written_era`
+    /// fails if the last step happens without the middle one.
+    pub const VERSION_CURRENT: u32 = VERSION_V7;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.

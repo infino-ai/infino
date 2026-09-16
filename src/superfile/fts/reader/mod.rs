@@ -18,6 +18,7 @@ mod scorers;
 mod search;
 mod sink;
 mod size;
+mod staleness;
 #[cfg(test)]
 mod test_util;
 mod work;
@@ -30,4 +31,5 @@ pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};
 pub(crate) use search::FetchedTermMemo;
 pub(crate) use sink::LiveFloor;
 pub use size::{DfBucket, FtsSizeBreakdown};
+pub(crate) use staleness::{FtsStaleness, StaleColumn};
 pub use work::MatchWork;
