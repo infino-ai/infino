@@ -301,11 +301,10 @@ pub(super) fn and_heap_push(
     }
     if heap.len() < k {
         heap.push(TopKEntry(score, doc_id));
-    } else if let Some(&worst) = heap.peek()
+    } else if let Some(mut worst) = heap.peek_mut()
         && (score > worst.0 || (score == worst.0 && doc_id < worst.1))
     {
-        heap.pop();
-        heap.push(TopKEntry(score, doc_id));
+        *worst = TopKEntry(score, doc_id);
     }
 }
 

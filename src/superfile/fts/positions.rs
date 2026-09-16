@@ -18,7 +18,10 @@
 use std::ops::Range;
 
 use crate::superfile::{
-    bits::{ExceptionPlan, PackScratch, for_each_lane, payload_bytes, plan_exceptions, put_bits},
+    bits::{
+        ExceptionPlan, PackScratch, for_each_lane, get_bits, payload_bytes, plan_exceptions,
+        put_bits,
+    },
     varint::{push_varint, read_varint, varint_len},
 };
 
@@ -268,6 +271,8 @@ enum GroupKind {
 /// per-run path, where decoding all 128 runs would cost more than they
 /// do.
 const BULK_AFTER_RUNS: u32 = 2;
+/// Runs up to this many positions bypass the generic lane reader.
+const SMALL_TF: usize = 4;
 const BULK_MAX_STRIDE: usize = 4;
 
 /// A position group located for **per-run** access: one pair's run is
@@ -367,6 +372,26 @@ impl GroupIndex {
                     .extend_from_slice(self.values.get(start..start + tf as usize)?);
             }
             GroupKind::Packed => {
+                if tf as usize <= SMALL_TF
+                    && self.first.exceptions.is_empty()
+                    && self.gap.exceptions.is_empty()
+                {
+                    // Most runs on a real corpus are one to three positions:
+                    // read the lanes straight out of the two payloads and
+                    // write the prefix sums, skipping the generic lane
+                    // reader, its scratch and the exception lookups.
+                    let first =
+                        get_bits(&bytes[self.first.payload.clone()], pair, self.first.width)?;
+                    let mut p = u32::try_from(first).ok()?;
+                    out.push(p);
+                    let gaps = &bytes[self.gap.payload.clone()];
+                    for k in 0..tf as usize - 1 {
+                        let g = u32::try_from(get_bits(gaps, start + k, self.gap.width)?).ok()?;
+                        p = p.checked_add(g)?;
+                        out.push(p);
+                    }
+                    return Some(());
+                }
                 self.first.read_lanes(bytes, pair, 1, &mut self.run)?;
                 self.gap
                     .read_lanes(bytes, start, tf as usize - 1, &mut self.run)?;

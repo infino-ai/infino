@@ -1100,11 +1100,10 @@ impl FtsReader {
                     }
                     if heap.len() < k {
                         heap.push(TopKEntry(score, doc_id));
-                    } else if let Some(TopKEntry(min_score, _)) = heap.peek()
-                        && score > *min_score
+                    } else if let Some(mut worst) = heap.peek_mut()
+                        && score > worst.0
                     {
-                        heap.pop();
-                        heap.push(TopKEntry(score, doc_id));
+                        *worst = TopKEntry(score, doc_id);
                     }
                 }
                 return Ok((
@@ -1235,11 +1234,10 @@ impl FtsReader {
                     }
                     if seed_heap.len() < k {
                         seed_heap.push(TopKEntry(score, buf_d[j]));
-                    } else if let Some(TopKEntry(mn, _)) = seed_heap.peek()
-                        && score > *mn
+                    } else if let Some(mut worst) = seed_heap.peek_mut()
+                        && score > worst.0
                     {
-                        seed_heap.pop();
-                        seed_heap.push(TopKEntry(score, buf_d[j]));
+                        *worst = TopKEntry(score, buf_d[j]);
                     }
                 }
             }
@@ -1356,11 +1354,10 @@ impl FtsReader {
                 }
                 if heap.len() < k {
                     heap.push(TopKEntry(score, doc_id));
-                } else if let Some(TopKEntry(min_score, _)) = heap.peek()
-                    && score > *min_score
+                } else if let Some(mut worst) = heap.peek_mut()
+                    && score > worst.0
                 {
-                    heap.pop();
-                    heap.push(TopKEntry(score, doc_id));
+                    *worst = TopKEntry(score, doc_id);
                 }
             }
             i += 1;

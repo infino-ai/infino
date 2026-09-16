@@ -506,11 +506,12 @@ impl FtsReader {
                 if heap.len() == k {
                     threshold = heap.peek().expect("non-empty").0;
                 }
-            } else if let Some(TopKEntry(min_score, _)) = heap.peek()
-                && score > *min_score
-            {
-                heap.pop();
-                heap.push(TopKEntry(score, pivot_doc));
+            } else if heap.peek().is_some_and(|worst| score > worst.0) {
+                // Replace the evicted entry in place: one sift instead of
+                // the pop's sift-down plus the push's sift-up.
+                if let Some(mut worst) = heap.peek_mut() {
+                    *worst = TopKEntry(score, pivot_doc);
+                }
                 threshold = heap.peek().expect("non-empty").0;
             }
 
@@ -958,8 +959,9 @@ impl FtsReader {
             let c0 = &mut leader_slice[0];
             let lb_n = c0.block_n;
             let mut i = c0.pos;
+            let (ld, lt) = (&c0.block_doc_ids[..lb_n], &c0.block_tfs[..lb_n]);
             while i < lb_n {
-                let a = c0.block_doc_ids[i];
+                let a = ld[i];
 
                 // For each non-leader, walk its `pos` forward through
                 // the decoded block until block_doc_ids[pos] >= a (or
@@ -988,8 +990,7 @@ impl FtsReader {
                 if all_match {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1.get(a);
-                        let mut score =
-                            bm25::score_with_dl_norm_k1(c0.idf_weight, c0.block_tfs[i], norm);
+                        let mut score = bm25::score_with_dl_norm_k1(c0.idf_weight, lt[i], norm);
                         for o in others.iter() {
                             score +=
                                 bm25::score_with_dl_norm_k1(o.idf_weight, o.block_tfs[o.pos], norm);
@@ -1100,9 +1101,14 @@ impl FtsReader {
             let mut j = c1.pos;
             let c0_idf = c0.idf_weight;
             let c1_idf = c1.idf_weight;
+            // Subslices sized to the decoded prefix: the loop's index
+            // checks fold into `i < lb_n` / `j < rb_n` instead of a
+            // compare against each Vec's length per load.
+            let (ld, lt) = (&c0.block_doc_ids[..lb_n], &c0.block_tfs[..lb_n]);
+            let (rd, rt) = (&c1.block_doc_ids[..rb_n], &c1.block_tfs[..rb_n]);
             while i < lb_n && j < rb_n {
-                let a = c0.block_doc_ids[i];
-                let b = c1.block_doc_ids[j];
+                let a = ld[i];
+                let b = rd[j];
                 if a < b {
                     i += 1;
                 } else if a > b {
@@ -1110,8 +1116,8 @@ impl FtsReader {
                 } else {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1.get(a);
-                        bm25::score_with_dl_norm_k1(c0_idf, c0.block_tfs[i], norm)
-                            + bm25::score_with_dl_norm_k1(c1_idf, c1.block_tfs[j], norm)
+                        bm25::score_with_dl_norm_k1(c0_idf, lt[i], norm)
+                            + bm25::score_with_dl_norm_k1(c1_idf, rt[j], norm)
                     } else {
                         0.0
                     };
@@ -1328,8 +1334,9 @@ impl FtsReader {
                             }
                         }
                     } else if score > threshold {
-                        heap.pop();
-                        heap.push(TopKEntry(score, candidate));
+                        if let Some(mut worst) = heap.peek_mut() {
+                            *worst = TopKEntry(score, candidate);
+                        }
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                         let new_f = recompute_f(&partial_max, threshold);
                         if new_f != f_essential {
@@ -1504,8 +1511,9 @@ impl FtsReader {
                         f_essential = recompute_f(&partial_max, threshold);
                     }
                 } else if score > threshold {
-                    heap.pop();
-                    heap.push(TopKEntry(score, candidate));
+                    if let Some(mut worst) = heap.peek_mut() {
+                        *worst = TopKEntry(score, candidate);
+                    }
                     threshold = heap.peek().expect("non-empty").0.max(threshold);
                     f_essential = recompute_f(&partial_max, threshold);
                 }
@@ -1687,8 +1695,9 @@ impl FtsReader {
                             threshold = heap.peek().expect("non-empty").0.max(threshold);
                         }
                     } else if score > threshold {
-                        heap.pop();
-                        heap.push(TopKEntry(score, doc));
+                        if let Some(mut worst) = heap.peek_mut() {
+                            *worst = TopKEntry(score, doc);
+                        }
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
                 }
@@ -1861,8 +1870,9 @@ impl FtsReader {
                             raised = true;
                         }
                     } else if score > threshold {
-                        heap.pop();
-                        heap.push(TopKEntry(score, candidate));
+                        if let Some(mut worst) = heap.peek_mut() {
+                            *worst = TopKEntry(score, candidate);
+                        }
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                         raised = true;
                     }
@@ -2042,8 +2052,9 @@ impl FtsReader {
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
                 } else if score > threshold {
-                    heap.pop();
-                    heap.push(TopKEntry(score, doc));
+                    if let Some(mut worst) = heap.peek_mut() {
+                        *worst = TopKEntry(score, doc);
+                    }
                     threshold = heap.peek().expect("non-empty").0.max(threshold);
                 }
             }
@@ -2171,8 +2182,9 @@ impl FtsReader {
                     threshold = heap.peek().expect("non-empty").0;
                 }
             } else if score > threshold {
-                heap.pop();
-                heap.push(TopKEntry(score, candidate));
+                if let Some(mut worst) = heap.peek_mut() {
+                    *worst = TopKEntry(score, candidate);
+                }
                 threshold = heap.peek().expect("non-empty").0;
             }
         }

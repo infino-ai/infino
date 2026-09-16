@@ -804,6 +804,77 @@ pub fn decode_block_tfs(bytes: &[u8], hdr: &BlockHeader, dest_tfs: &mut [u32]) {
 /// # Panics
 ///
 /// As [`decode_block`], minus the `dest_tfs` checks.
+/// The first set bit of a bitset block at or after `from`, as `(doc, rank)`
+/// where `rank` is the number of set bits before it — the doc's index in
+/// the block's tf array. `None` when no doc of the block is `>= from`.
+///
+/// A probe that skips into a bitset block needs one doc, not the 128 the
+/// full expansion writes; this scans the block's words from the target's
+/// word with a masked `trailing_zeros`, at most a handful of u64s.
+pub fn bitset_next_doc(bytes: &[u8], hdr: &BlockHeader, from: u32) -> Option<(u32, usize)> {
+    debug_assert_eq!(hdr.encoding, ENCODING_BITSET);
+    let words = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
+    let bit = from.saturating_sub(hdr.base) as usize;
+    let first_word = bit / 64;
+    let mut rank = 0usize;
+    for (wi, chunk) in words.chunks_exact(8).enumerate() {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        if wi < first_word {
+            rank += word.count_ones() as usize;
+            continue;
+        }
+        let masked = match wi == first_word {
+            true => word & (u64::MAX << (bit % 64)),
+            false => word,
+        };
+        if masked != 0 {
+            let tz = masked.trailing_zeros();
+            rank += (word & !(u64::MAX << tz)).count_ones() as usize;
+            return Some((hdr.base + (wi as u32) * 64 + tz, rank));
+        }
+        rank += word.count_ones() as usize;
+    }
+    None
+}
+
+/// One tf out of a bitset block without unpacking the other 127: the tf of
+/// the doc with set-bit index `rank`. Bitset blocks carry plain packed tfs
+/// (never patched). `BitPacker4x` interleaves four 32-bit lanes: value `i`
+/// lives in lane `i % 4` at bit `(i / 4) * width` of that lane's stream,
+/// whose 32-bit words sit at every fourth word of the payload.
+///
+/// For a *walk* over a block the full unpack into the tf array wins (one
+/// unpack serves every doc); this is for a *probe* that touches one doc.
+pub fn bitset_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
+    debug_assert_eq!(hdr.encoding, ENCODING_BITSET);
+    debug_assert!(rank < BLOCK_LEN);
+    hdr.check_widths();
+    let width = usize::from(hdr.tf_bits);
+    if width == 0 {
+        return 0;
+    }
+    let tfs_size = hdr.tfs_size();
+    assert!(
+        bytes.len() >= hdr.payload() + tfs_size,
+        "bitset_tf_at: bytes shorter than header+tfs"
+    );
+    let packed = &bytes[bytes.len() - tfs_size..];
+    let lane = rank % 4;
+    let bit = (rank / 4) * width;
+    let word = |w: usize| -> u64 {
+        let at = (w * 4 + lane) * 4;
+        u64::from(u32::from_le_bytes(
+            packed[at..at + 4].try_into().expect("4 bytes"),
+        ))
+    };
+    let shift = bit % 32;
+    let mut v = word(bit / 32) >> shift;
+    if shift + width > 32 {
+        v |= word(bit / 32 + 1) << (32 - shift);
+    }
+    (v & ((1u64 << width) - 1)) as u32
+}
+
 pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u32]) -> usize {
     hdr.check_widths();
     assert!(
@@ -1053,6 +1124,52 @@ mod tests {
             let hdr = BlockHeader::parse(&enc.bytes, layout, Some(40));
             assert_eq!(hdr.base, 64, "{layout:?} origin");
             assert_eq!(hdr.delta_bits, 0);
+        }
+    }
+
+    #[test]
+    fn bitset_probe_helpers_agree_with_the_full_expansion() {
+        // A dense block with a gap pattern: every target between the base
+        // and past the last doc must resolve to the same (doc, rank) the
+        // expanded arrays give, and the lane read must equal the unpacked tf
+        // for every width the packer produces.
+        let doc_ids: Vec<u32> = (0..128u32).map(|i| 1000 + i * 3 + (i % 5)).collect();
+        let doc_ids: Vec<u32> = {
+            let mut v = doc_ids;
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        for width in 0..=20u32 {
+            let cap = (1u64 << width) as u32;
+            let tfs: Vec<u32> = (0..doc_ids.len() as u32)
+                .map(|i| match width {
+                    0 => 1,
+                    _ => 1 + (i.wrapping_mul(2_654_435_761).wrapping_add(i * 7) % (cap - 1).max(1)),
+                })
+                .collect();
+            for layout in LAYOUTS {
+                let enc = encode_one(&block(&doc_ids, &tfs), layout, Some(900), true);
+                let hdr = BlockHeader::parse(&enc.bytes, layout, Some(900));
+                if hdr.encoding != ENCODING_BITSET {
+                    continue;
+                }
+                let mut ids = vec![0u32; BLOCK_LEN];
+                let mut got_tfs = vec![0u32; BLOCK_LEN];
+                let n = decode_block(&enc.bytes, &hdr, &mut ids, &mut got_tfs);
+                for target in (hdr.base - 5)..=(doc_ids[n - 1] + 3) {
+                    let want = ids[..n].iter().position(|&d| d >= target);
+                    let got = bitset_next_doc(&enc.bytes, &hdr, target);
+                    match want {
+                        None => assert!(got.is_none(), "{layout:?} target {target}"),
+                        Some(r) => {
+                            let (doc, rank) = got.expect("a doc >= target");
+                            assert_eq!((doc, rank), (ids[r], r), "{layout:?} target {target}");
+                            assert_eq!(bitset_tf_at(&enc.bytes, &hdr, rank), got_tfs[r]);
+                        }
+                    }
+                }
+            }
         }
     }
 
