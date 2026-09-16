@@ -7,6 +7,8 @@
 //! and the position groups; both need random access to one value at a
 //! fixed cost, which this gives with one unaligned load per value.
 
+use std::mem::swap;
+
 /// Widest value the stream carries: a full `u64`.
 pub(crate) const MAX_WIDTH: u8 = 64;
 
@@ -79,58 +81,171 @@ pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
 /// A patched packing: the width most lanes fit, the lanes that do not
 /// with their high bits (ascending lane order), and the bytes the whole
 /// takes under the caller's cost model.
+#[derive(Default)]
 pub(crate) struct ExceptionPlan {
     pub(crate) width: u8,
     pub(crate) exceptions: Vec<(u32, u32)>,
     pub(crate) bytes: usize,
 }
 
-/// The cheapest patched packing of `lanes`: every width below the plain
-/// one is tried and the smallest total kept, where a width costs
-/// `base(width)` for its packed low bits plus `per_exception(lane, hi)`
-/// for each lane whose high bits do not fit — at most `max_exceptions`
-/// of them. Returns the plain width's plan when nothing beats it.
+/// The buffers the patched encoders reuse from block to block: two
+/// plans (a block's deltas and tfs, or a group's first positions and
+/// gaps), the candidate list the width search fills, and two lane
+/// buffers for splitting a group into its streams. One per writer, so
+/// encoding a block allocates nothing.
+#[derive(Default)]
+pub struct PackScratch {
+    pub(crate) plan_a: ExceptionPlan,
+    pub(crate) plan_b: ExceptionPlan,
+    pub(crate) candidates: Vec<(u32, u32)>,
+    pub(crate) lanes_a: Vec<u32>,
+    pub(crate) lanes_b: Vec<u32>,
+}
+
+/// The cheapest patched packing of `lanes`, written into `plan`: every
+/// width below the plain one is tried and the smallest total kept,
+/// where a width costs `base(width)` for its packed low bits plus
+/// `per_exception(lane, hi)` for each lane whose high bits do not fit —
+/// at most `max_exceptions` of them. The plain width's plan when nothing
+/// beats it. `candidates` is scratch for the width under trial; a
+/// winning width's list is swapped into `plan`, so neither grows past
+/// the block's lane count.
 pub(crate) fn plan_exceptions(
     lanes: &[u32],
     max_exceptions: usize,
     base: impl Fn(u8) -> usize,
     per_exception: impl Fn(u32, u32) -> usize,
-) -> ExceptionPlan {
+    plan: &mut ExceptionPlan,
+    candidates: &mut Vec<(u32, u32)>,
+) {
     let plain = width_of(lanes.iter().copied().max().unwrap_or(0).into());
-    let mut best = ExceptionPlan {
-        width: plain,
-        exceptions: Vec::new(),
-        bytes: base(plain),
-    };
+    plan.width = plain;
+    plan.exceptions.clear();
+    plan.bytes = base(plain);
     for width in 0..plain {
-        let mut exceptions = Vec::new();
+        candidates.clear();
         let mut bytes = base(width);
-        let mut beaten = bytes >= best.bytes;
+        let mut beaten = bytes >= plan.bytes;
         for (i, &v) in lanes.iter().enumerate() {
             if beaten {
                 break;
             }
             let hi = if width == 0 { v } else { v >> width };
             if hi != 0 {
-                exceptions.push((i as u32, hi));
+                candidates.push((i as u32, hi));
                 bytes += per_exception(i as u32, hi);
-                beaten = exceptions.len() > max_exceptions || bytes >= best.bytes;
+                beaten = candidates.len() > max_exceptions || bytes >= plan.bytes;
             }
         }
         if !beaten {
-            best = ExceptionPlan {
-                width,
-                exceptions,
-                bytes,
-            };
+            plan.width = width;
+            plan.bytes = bytes;
+            swap(&mut plan.exceptions, candidates);
         }
     }
-    best
+}
+
+/// Lanes `from..from + n` of a `width`-bit stream, one 64-bit load per
+/// lane after a single bounds check for the run, to `sink`. `None` when
+/// the run ends past the payload. Shared by the position streams and
+/// the id sidecar's block decode.
+#[inline]
+pub(crate) fn for_each_lane(
+    payload: &[u8],
+    from: usize,
+    n: usize,
+    width: u8,
+    mut sink: impl FnMut(u64),
+) -> Option<()> {
+    if width == 0 {
+        for _ in 0..n {
+            sink(0);
+        }
+        return Some(());
+    }
+    let width = width as usize;
+    let end_bit = (from + n) * width;
+    if end_bit.div_ceil(8) > payload.len() {
+        return None;
+    }
+    let mask: u64 = if width == MAX_WIDTH as usize {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
+    let mut bit = from * width;
+    for _ in 0..n {
+        let byte = bit / 8;
+        let word = match payload.get(byte..byte + 8) {
+            Some(chunk) => u64::from_le_bytes(chunk.try_into().expect("8 bytes")),
+            None => {
+                // The stream's last bytes: pad the load.
+                let mut tail = [0u8; 8];
+                let rest = &payload[byte..];
+                tail[..rest.len()].copy_from_slice(rest);
+                u64::from_le_bytes(tail)
+            }
+        };
+        sink((word >> (bit % 8)) & mask);
+        bit += width;
+    }
+    Some(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan with fresh scratch and hand the plan back.
+    fn planned(
+        lanes: &[u32],
+        max_exceptions: usize,
+        base: impl Fn(u8) -> usize,
+        per_exception: impl Fn(u32, u32) -> usize,
+    ) -> ExceptionPlan {
+        let mut out = ExceptionPlan::default();
+        let mut candidates = Vec::new();
+        plan_exceptions(
+            lanes,
+            max_exceptions,
+            base,
+            per_exception,
+            &mut out,
+            &mut candidates,
+        );
+        out
+    }
+
+    #[test]
+    fn for_each_lane_reads_runs_at_every_width_and_refuses_overruns() {
+        for width in [0u8, 1, 5, 8, 13, 32, 64] {
+            let n = 41;
+            let values: Vec<u64> = (0..n as u64)
+                .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & mask(width))
+                .collect();
+            let mut buf = vec![0u8; payload_bytes(n, width)];
+            for (i, &v) in values.iter().enumerate() {
+                put_bits(&mut buf, i * width as usize, v, width);
+            }
+            for (from, count) in [(0usize, n), (7, 9), (n - 1, 1), (n, 0)] {
+                let mut got = Vec::new();
+                for_each_lane(&buf, from, count, width, |v| got.push(v)).expect("in range");
+                assert_eq!(got, values[from..from + count], "width {width} from {from}");
+            }
+            // The check is byte-granular — lanes inside the last byte's
+            // padding read as zeros — so overrun by a couple of bytes' worth.
+            if width > 0 {
+                assert!(for_each_lane(&buf, n, 16, width, |_| {}).is_none());
+            }
+        }
+    }
+
+    fn mask(width: u8) -> u64 {
+        match width {
+            64 => u64::MAX,
+            w => (1u64 << w) - 1,
+        }
+    }
 
     #[test]
     fn plan_exceptions_picks_the_cheapest_width_and_keeps_lane_order() {
@@ -146,7 +261,7 @@ mod tests {
         lanes[70] = 3 << 18;
         lanes[127] = 1 << 12;
         let base = |width: u8| 128 * width as usize / 8;
-        let plan = plan_exceptions(&lanes, 31, base, |_, _| 2);
+        let plan = planned(&lanes, 31, base, |_, _| 2);
         assert_eq!(plan.width, 3);
         assert_eq!(plan.bytes, base(3) + 3 * 2);
         assert_eq!(
@@ -159,13 +274,13 @@ mod tests {
         );
         // Uniform lanes: nothing beats plain.
         let uniform = vec![5u32; 128];
-        let plan = plan_exceptions(&uniform, 31, base, |_, _| 2);
+        let plan = planned(&uniform, 31, base, |_, _| 2);
         assert_eq!(
             (plan.width, plan.exceptions.len(), plan.bytes),
             (3, 0, base(3))
         );
         // All-zero lanes: width 0 and no exceptions.
-        let plan = plan_exceptions(&[0u32; 16], 31, |w| 2 * w as usize, |_, _| 2);
+        let plan = planned(&[0u32; 16], 31, |w| 2 * w as usize, |_, _| 2);
         assert_eq!((plan.width, plan.bytes), (0, 0));
     }
 
@@ -179,12 +294,12 @@ mod tests {
             lanes[i * 3] = 1 << 15;
         }
         let base = |width: u8| 128 * width as usize / 8;
-        let capped = plan_exceptions(&lanes, 31, base, |_, _| 2);
+        let capped = planned(&lanes, 31, base, |_, _| 2);
         assert_eq!((capped.width, capped.exceptions.len()), (16, 0));
-        let roomy = plan_exceptions(&lanes, 64, base, |_, _| 2);
+        let roomy = planned(&lanes, 64, base, |_, _| 2);
         assert_eq!((roomy.width, roomy.exceptions.len()), (1, 40));
         assert!(roomy.bytes < capped.bytes);
-        let dear = plan_exceptions(&lanes, 64, base, |_, _| 100);
+        let dear = planned(&lanes, 64, base, |_, _| 100);
         assert_eq!(dear.exceptions.len(), 0);
     }
 

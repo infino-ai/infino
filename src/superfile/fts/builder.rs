@@ -92,6 +92,7 @@ use tracing::debug;
 
 use crate::superfile::{
     BuildError,
+    bits::PackScratch,
     format::{
         self, FST_SEPARATOR,
         checksum::{crc32c, crc32c_append},
@@ -3697,6 +3698,8 @@ struct TermScratch {
     /// A term's position region as emitted under grouped positions:
     /// every block's group back to back. Reused across terms.
     pos_out: Vec<u8>,
+    /// The patched encoders' planning buffers.
+    pack: PackScratch,
     /// One block's run values (first position absolute per doc, then
     /// gaps) decoded from the accumulator's LEB128 runs for regrouping.
     pos_vals: Vec<u32>,
@@ -3952,7 +3955,7 @@ fn encode_and_emit_term<W: Write>(
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
                 tfs.extend(pairs.iter().map(|&(_, tf)| tf));
-                encode_group(out, tfs, vals, true);
+                encode_group(out, tfs, vals, true, &mut scratch.pack);
                 Some(out.as_slice())
             }
             None => None,
@@ -4037,6 +4040,7 @@ fn encode_and_emit_term<W: Write>(
                 era.layout().block,
                 prev_last_doc_id,
                 pairs.len() <= PATCHED_MAX_DF,
+                &mut scratch.pack,
             ));
             // Reclaim the underlying allocations for the next chunk.
             block_doc_ids = block.doc_ids;
@@ -4129,7 +4133,7 @@ fn encode_and_emit_term<W: Write>(
                     let tfs = &mut scratch.tfs;
                     tfs.clear();
                     tfs.extend(chunk.iter().map(|&(_, tf)| tf));
-                    encode_group(pos_out, tfs, vals, false);
+                    encode_group(pos_out, tfs, vals, false, &mut scratch.pack);
                 }
             } else {
                 for (i, &(_, tf)) in pairs.iter().enumerate() {

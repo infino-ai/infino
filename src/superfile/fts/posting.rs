@@ -87,7 +87,7 @@ use bitpacking::{BitPacker, BitPacker4x};
 use wide::u32x8;
 
 use crate::superfile::{
-    bits::{ExceptionPlan, plan_exceptions},
+    bits::{ExceptionPlan, PackScratch, plan_exceptions},
     format::fts::BlockLayout,
     varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
 };
@@ -327,13 +327,19 @@ pub struct EncodedBlock {
 
 /// The cheapest patched packing of a block's lanes: the packed low bits
 /// plus, per exception, a lane byte and its high bits as a varint.
-fn plan_patched(lanes: &[u32; BLOCK_LEN]) -> ExceptionPlan {
+fn plan_patched(
+    lanes: &[u32; BLOCK_LEN],
+    plan: &mut ExceptionPlan,
+    candidates: &mut Vec<(u32, u32)>,
+) {
     plan_exceptions(
         lanes,
         PATCHED_MAX_EXCEPTIONS,
         |width| BLOCK_LEN * width as usize / 8,
         |_, hi| 1 + varint_len(hi),
-    )
+        plan,
+        candidates,
+    );
 }
 
 /// Pack `lanes` at `width` bits, keeping only each lane's low `width`
@@ -379,7 +385,8 @@ fn compact_header(
 /// the base doc id from it, the wide layout stores its own. `patchable`
 /// lets the block take the patched form when that is smaller; the
 /// writer grants it per term, withholding it from the common terms
-/// whose blocks every intersection and union walks in bulk.
+/// whose blocks every intersection and union walks in bulk. `scratch`
+/// holds the planners' buffers, reused from block to block.
 ///
 /// # Panics
 ///
@@ -393,6 +400,7 @@ pub fn encode_block(
     layout: BlockLayout,
     prev_last_doc_id: Option<u32>,
     patchable: bool,
+    scratch: &mut PackScratch,
 ) -> EncodedBlock {
     let count = b.doc_ids.len();
     assert!(count > 0, "encode_block: empty block");
@@ -475,8 +483,13 @@ pub fn encode_block(
         {
             *slot = pair[1] - pair[0];
         }
-        let delta_plan = plan_patched(&explicit_deltas);
-        let tf_plan = plan_patched(&padded_tfs);
+        plan_patched(
+            &explicit_deltas,
+            &mut scratch.plan_a,
+            &mut scratch.candidates,
+        );
+        plan_patched(&padded_tfs, &mut scratch.plan_b, &mut scratch.candidates);
+        let (delta_plan, tf_plan) = (&scratch.plan_a, &scratch.plan_b);
         let patched_size = header_size + delta_plan.bytes + tf_plan.bytes;
         let plain_size = header_size + deltas_size + tfs_size;
         if patched_size < plain_size {
@@ -859,6 +872,22 @@ mod tests {
 
     const LAYOUTS: [BlockLayout; 2] = [BlockLayout::Wide, BlockLayout::Compact];
 
+    /// Encode with fresh scratch.
+    fn encode_one(
+        b: &Block,
+        layout: BlockLayout,
+        prev_last_doc_id: Option<u32>,
+        patchable: bool,
+    ) -> EncodedBlock {
+        encode_block(
+            b,
+            layout,
+            prev_last_doc_id,
+            patchable,
+            &mut PackScratch::default(),
+        )
+    }
+
     /// Build a Block from parallel slices.
     fn block(doc_ids: &[u32], tfs: &[u32]) -> Block {
         Block {
@@ -869,7 +898,7 @@ mod tests {
 
     /// Encode as a term's first block and decode it back.
     fn roundtrip_with(b: &Block, layout: BlockLayout, prev: Option<u32>) -> EncodedBlock {
-        let enc = encode_block(b, layout, prev, true);
+        let enc = encode_one(b, layout, prev, true);
         let hdr = BlockHeader::parse(&enc.bytes, layout, prev);
         assert_eq!(hdr.count(), b.doc_ids.len());
         let mut got_doc_ids = vec![0u32; BLOCK_LEN];
@@ -900,7 +929,7 @@ mod tests {
     }
 
     fn compact(b: &Block) -> EncodedBlock {
-        encode_block(b, BlockLayout::Compact, None, true)
+        encode_one(b, BlockLayout::Compact, None, true)
     }
 
     // --- Basic round-trips ----------------------------------------------
@@ -937,7 +966,7 @@ mod tests {
         assert_eq!(hdr.n_delta_exc(), 1);
         // The wide header stores `first - 1` instead and packs plain; the
         // compact block is no larger for lacking a stored base.
-        let wide = encode_block(&block(&doc_ids, &[1; 128]), BlockLayout::Wide, None, true);
+        let wide = encode_one(&block(&doc_ids, &[1; 128]), BlockLayout::Wide, None, true);
         assert_eq!(block_encoding(&wide.bytes), ENCODING_PACKED);
         assert_eq!(
             BlockHeader::parse(&wide.bytes, BlockLayout::Wide, None).base,
@@ -959,9 +988,9 @@ mod tests {
         let mut doc_ids: Vec<u32> = (1000..1127).collect();
         doc_ids.push(1_126 + 1_000_000);
         let b = block(&doc_ids, &[1; 128]);
-        let plain = encode_block(&b, BlockLayout::Compact, Some(999), false);
+        let plain = encode_one(&b, BlockLayout::Compact, Some(999), false);
         assert_eq!(block_encoding(&plain.bytes), ENCODING_PACKED);
-        let patched = encode_block(&b, BlockLayout::Compact, Some(999), true);
+        let patched = encode_one(&b, BlockLayout::Compact, Some(999), true);
         assert_eq!(block_encoding(&patched.bytes), ENCODING_PATCHED);
         assert!(plain.bytes.len() > patched.bytes.len());
         let hdr = BlockHeader::parse(&plain.bytes, BlockLayout::Compact, Some(999));
@@ -1104,7 +1133,7 @@ mod tests {
         let tfs = vec![1u32; 128];
         for layout in LAYOUTS {
             let hdr = BlockHeader::parse(
-                &encode_block(&block(&doc_ids, &tfs), layout, Some(99), true).bytes,
+                &encode_one(&block(&doc_ids, &tfs), layout, Some(99), true).bytes,
                 layout,
                 Some(99),
             );
@@ -1178,7 +1207,7 @@ mod tests {
             let doc_ids: Vec<u32> = (1..=count as u32).collect();
             let tfs = vec![1u32; count];
             for layout in LAYOUTS {
-                let enc = encode_block(&block(&doc_ids, &tfs), layout, None, true);
+                let enc = encode_one(&block(&doc_ids, &tfs), layout, None, true);
                 assert_eq!(
                     BlockHeader::parse(&enc.bytes, layout, None).count(),
                     count,
@@ -1196,7 +1225,7 @@ mod tests {
         // block: the padding lanes pack at width 0 and the real deltas
         // ride as exceptions).
         let uniform: Vec<u32> = (0..128).map(|i| 1 + 100_000 * i).collect();
-        let packed = encode_block(
+        let packed = encode_one(
             &block(&uniform, &[1; 128]),
             BlockLayout::Compact,
             Some(0),
@@ -1225,7 +1254,7 @@ mod tests {
                 block_encoding(&enc.bytes)
             );
         }
-        let wide = encode_block(
+        let wide = encode_one(
             &block(&[1, 2, 3], &[1, 1, 1]),
             BlockLayout::Wide,
             None,
@@ -1264,7 +1293,7 @@ mod tests {
     #[test]
     fn wide_header_base_doc_id_is_first_minus_one() {
         // A wide non-bitset block stores base = first doc - 1.
-        let enc = encode_block(
+        let enc = encode_one(
             &block(&[100, 100_000, 200_000], &[1, 1, 1]),
             BlockLayout::Wide,
             None,
@@ -1275,7 +1304,7 @@ mod tests {
             BlockHeader::parse(&enc.bytes, BlockLayout::Wide, None).base,
             99
         );
-        let enc = encode_block(
+        let enc = encode_one(
             &block(&[0, 1, 2], &[1, 1, 1]),
             BlockLayout::Wide,
             None,
@@ -1368,7 +1397,7 @@ mod tests {
         let b1 = block(&[1, 2, 3, 4, 5], &[1, 2, 1, 2, 1]);
         let b2 = block(&[1000, 1001, 1010, 1100], &[5, 1, 3, 9]);
         let enc1 = compact(&b1);
-        let enc2 = encode_block(&b2, BlockLayout::Compact, Some(5), true);
+        let enc2 = encode_one(&b2, BlockLayout::Compact, Some(5), true);
         // Decode in opposite order to confirm zero shared state.
         let h2 = BlockHeader::parse(&enc2.bytes, BlockLayout::Compact, Some(5));
         let mut d2 = vec![0u32; BLOCK_LEN];
@@ -1396,7 +1425,7 @@ mod tests {
             let mut encoded: Vec<EncodedBlock> = Vec::new();
             let mut prev = None;
             for (d, t) in all_doc_ids.chunks(BLOCK_LEN).zip(all_tfs.chunks(BLOCK_LEN)) {
-                let enc = encode_block(&block(d, t), layout, prev, true);
+                let enc = encode_one(&block(d, t), layout, prev, true);
                 prev = Some(enc.last_doc_id);
                 encoded.push(enc);
             }
@@ -1473,7 +1502,7 @@ mod tests {
 
             let block = Block { doc_ids: doc_ids.clone(), tfs: tfs.clone() };
             for layout in LAYOUTS {
-                let enc = encode_block(&block, layout, prev, true);
+                let enc = encode_one(&block, layout, prev, true);
 
                 prop_assert_eq!(enc.last_doc_id, *doc_ids.last().expect("last element"));
                 prop_assert_eq!(enc.max_tf, *tfs.iter().max().expect("iter max"));

@@ -15,10 +15,10 @@
 //! table records each 128-doc block's starting byte so a block's runs
 //! are randomly addressable without decoding its predecessors.
 
-use std::{iter::repeat_n, ops::Range};
+use std::ops::Range;
 
 use crate::superfile::{
-    bits::{ExceptionPlan, payload_bytes, plan_exceptions, put_bits},
+    bits::{ExceptionPlan, PackScratch, for_each_lane, payload_bytes, plan_exceptions, put_bits},
     varint::{push_varint, read_varint, varint_len},
 };
 
@@ -96,22 +96,31 @@ const GROUP_MAX_EXCEPTIONS: usize = 64;
 /// every long-form group is packed, so `allow_leb128` is `false` for
 /// them; a short-form term's group is decoded whole in any case and may
 /// take the LEB128 form when that is smaller.
-pub(crate) fn encode_group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32], allow_leb128: bool) {
+pub(crate) fn encode_group(
+    out: &mut Vec<u8>,
+    tfs: &[u32],
+    values: &[u32],
+    allow_leb128: bool,
+    scratch: &mut PackScratch,
+) {
     debug_assert_eq!(
         tfs.iter().map(|&t| t as usize).sum::<usize>(),
         values.len(),
         "values are the runs of tfs"
     );
-    let mut firsts: Vec<u32> = Vec::with_capacity(tfs.len());
-    let mut gaps: Vec<u32> = Vec::with_capacity(values.len() - tfs.len());
+    let firsts = &mut scratch.lanes_a;
+    let gaps = &mut scratch.lanes_b;
+    firsts.clear();
+    gaps.clear();
     let mut vi = 0usize;
     for &tf in tfs {
         firsts.push(values[vi]);
         gaps.extend_from_slice(&values[vi + 1..vi + tf as usize]);
         vi += tf as usize;
     }
-    let first_plan = plan_stream(&firsts);
-    let gap_plan = plan_stream(&gaps);
+    plan_stream(firsts, &mut scratch.plan_a, &mut scratch.candidates);
+    plan_stream(gaps, &mut scratch.plan_b, &mut scratch.candidates);
+    let (first_plan, gap_plan) = (&scratch.plan_a, &scratch.plan_b);
     let packed_len = 1 + first_plan.bytes + gap_plan.bytes;
     if allow_leb128 {
         let leb_len: usize = 1 + values.iter().map(|&v| varint_len(v)).sum::<usize>();
@@ -124,20 +133,22 @@ pub(crate) fn encode_group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32], allow
         }
     }
     out.push(GROUP_PACKED);
-    write_stream(out, &firsts, &first_plan);
-    write_stream(out, &gaps, &gap_plan);
+    write_stream(out, firsts, first_plan);
+    write_stream(out, gaps, gap_plan);
 }
 
 /// The cheapest `(width, exceptions)` for one stream: a byte of width, a
 /// byte of exception count, the packed lanes, and each exception's lane
 /// and high bits as varints.
-fn plan_stream(lanes: &[u32]) -> ExceptionPlan {
+fn plan_stream(lanes: &[u32], plan: &mut ExceptionPlan, candidates: &mut Vec<(u32, u32)>) {
     plan_exceptions(
         lanes,
         GROUP_MAX_EXCEPTIONS,
         |width| 2 + payload_bytes(lanes.len(), width),
         |lane, hi| varint_len(lane) + varint_len(hi),
-    )
+        plan,
+        candidates,
+    );
 }
 
 /// Emit one stream per its plan.
@@ -209,39 +220,11 @@ impl StreamIndex {
     }
 
     /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
-    /// One bounds check for the whole run, then one unaligned 64-bit
-    /// load per lane — a phrase reads a few lanes per candidate, so the
-    /// per-lane bookkeeping is what shows.
     fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
         let payload = &bytes[self.payload.clone()];
-        let width = self.width as usize;
         let base = out.len();
         out.reserve(n);
-        if width == 0 {
-            out.extend(repeat_n(0u32, n));
-        } else {
-            let end_bit = (from + n) * width;
-            if end_bit.div_ceil(8) > payload.len() {
-                return None;
-            }
-            let mask = (1u64 << width) - 1;
-            let mut bit = from * width;
-            for _ in 0..n {
-                let byte = bit / 8;
-                let word = match payload.get(byte..byte + 8) {
-                    Some(chunk) => u64::from_le_bytes(chunk.try_into().expect("8 bytes")),
-                    None => {
-                        // The stream's last bytes: pad the load.
-                        let mut tail = [0u8; 8];
-                        let rest = &payload[byte..];
-                        tail[..rest.len()].copy_from_slice(rest);
-                        u64::from_le_bytes(tail)
-                    }
-                };
-                out.push(((word >> (bit % 8)) & mask) as u32);
-                bit += width;
-            }
-        }
+        for_each_lane(payload, from, n, self.width, |v| out.push(v as u32))?;
         if self.exceptions.is_empty() {
             return Some(());
         }
@@ -418,6 +401,11 @@ pub(crate) fn positions_from_run_values(values: &[u32], out: &mut Vec<u32>) -> O
 mod tests {
     use super::*;
 
+    /// Encode a group with fresh scratch.
+    fn group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32], allow_leb128: bool) {
+        encode_group(out, tfs, values, allow_leb128, &mut PackScratch::default());
+    }
+
     /// Decode every pair of a group through the per-run index into
     /// absolute positions, checking the index consumed the whole group.
     fn decode_all(bytes: &[u8], start: usize, tfs: &[u32]) -> Option<Vec<u32>> {
@@ -457,7 +445,7 @@ mod tests {
         vals[3 * 41] = 1 << 24;
         vals[3 * 77 + 2] = 1 << 20;
         let mut out = Vec::new();
-        encode_group(&mut out, &tfs, &vals, true);
+        group(&mut out, &tfs, &vals, true);
         assert_eq!(out[0], GROUP_PACKED);
         // firsts: 1 + 1 + 138 (11 bits) + one exception; gaps: 1 + 1 + 125 (5 bits) + one exception.
         assert!(out.len() < 1 + 145 + 133, "got {} bytes", out.len());
@@ -465,11 +453,11 @@ mod tests {
 
         // A short term with a lone value: LEB128 is smaller and allowed.
         let mut out = Vec::new();
-        encode_group(&mut out, &[1], &[5], true);
+        group(&mut out, &[1], &[5], true);
         assert_eq!(out[0], GROUP_LEB128);
         // The same values with LEB128 disallowed pack anyway.
         let mut out = Vec::new();
-        encode_group(&mut out, &[1], &[5], false);
+        group(&mut out, &[1], &[5], false);
         assert_eq!(out[0], GROUP_PACKED);
         assert_eq!(decode_all(&out, 0, &[1]), Some(vec![5]));
 
@@ -485,7 +473,7 @@ mod tests {
         ] {
             for allow in [true, false] {
                 let mut out = Vec::new();
-                encode_group(&mut out, &tfs, &v, allow);
+                group(&mut out, &tfs, &v, allow);
                 assert_eq!(
                     decode_all(&out, 0, &tfs),
                     Some(positions_of(&tfs, &v)),
@@ -495,7 +483,7 @@ mod tests {
         }
         // Truncation and bad headers are refused, not a panic.
         let mut out = Vec::new();
-        encode_group(&mut out, &tfs, &vals, false);
+        group(&mut out, &tfs, &vals, false);
         for cut in 0..out.len() {
             let mut index = GroupIndex::default();
             assert!(index.locate(&out[..cut], &mut 0, &tfs).is_none());
@@ -527,7 +515,7 @@ mod tests {
         vals[4] = 1 << 22;
         let want = positions_of(&tfs, &vals);
         let mut out = Vec::new();
-        encode_group(&mut out, &tfs, &vals, false);
+        group(&mut out, &tfs, &vals, false);
         let mut dense = GroupIndex::default();
         dense.locate(&out, &mut 0, &tfs).expect("locates");
         assert_eq!(dense.kind, GroupKind::Packed);
@@ -592,7 +580,7 @@ mod tests {
         for allow in [false, true] {
             let mut out = vec![0xAA; 7];
             let start = out.len();
-            encode_group(&mut out, &tfs, &vals, allow);
+            group(&mut out, &tfs, &vals, allow);
             let mut at = start;
             let mut index = GroupIndex::default();
             index.locate(&out, &mut at, &tfs).expect("parses");
@@ -620,7 +608,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        encode_group(&mut out, &[2], &[u32::MAX, 1], true);
+        group(&mut out, &[2], &[u32::MAX, 1], true);
         let mut index = GroupIndex::default();
         index.locate(&out, &mut 0, &[2]).expect("parses");
         assert!(index.run_positions(&out, 0, 2, &mut Vec::new()).is_none());
