@@ -579,10 +579,6 @@ pub(crate) struct TermCursor {
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
 const EAGER_RETRY_BLOCKS: u8 = 8;
 
-/// Docs a packed-block tf probe scans linearly from the previous probe's
-/// position before bisecting the rest of the block.
-const PROBE_LINEAR_STEPS: usize = 8;
-
 impl TermCursor {
     /// Parse one term's metadata + skip table out of its own postings
     /// byte range and decode its first block. `term_bytes` starts at
@@ -1120,28 +1116,30 @@ impl TermCursor {
         let hdr = self.current_header();
         if hdr.encoding != ENCODING_BITSET {
             // PACKED: locate `doc` in the decoded block from the last probe's
-            // position (probes ascend) and read the tf at that index. A short
-            // linear scan first — on a long query the probes land a few docs
-            // apart and a bisection's branches cost more than the steps —
-            // then a bisection for the sparse probes of a short query, where
-            // stepping the cursor doc by doc was a quarter of the union.
+            // position (probes ascend) and read the tf at that index. A
+            // galloping search: doubling steps from the position, then a
+            // bisection of the last stride, so a probe a few docs on costs a
+            // couple of compares and a probe across the block a dozen, where
+            // stepping the cursor doc by doc cost the gap and a bisection of
+            // the whole block cost its seven unpredictable branches on
+            // every probe of a long query.
             debug_assert!(!self.count_only, "a probe for tf on a count-only cursor");
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
             let ids = &self.block_doc_ids[..self.block_n];
             let len = ids.len();
-            let mut i = match self.pos < len && ids[self.pos] <= doc {
+            let mut lo = match self.pos < len && ids[self.pos] <= doc {
                 true => self.pos,
                 false => 0,
             };
-            let lim = (i + PROBE_LINEAR_STEPS).min(len);
-            while i < lim && ids[i] < doc {
-                i += 1;
+            let mut step = 1usize;
+            while lo + step < len && ids[lo + step] < doc {
+                lo += step;
+                step <<= 1;
             }
-            if i == lim && i < len {
-                i += ids[i..].partition_point(|&d| d < doc);
-            }
+            let hi = (lo + step).min(len);
+            let i = lo + ids[lo..hi].partition_point(|&d| d < doc);
             self.pos = i.min(len.saturating_sub(1));
             return (i < len && ids[i] == doc).then(|| self.block_tfs[i]);
         }
