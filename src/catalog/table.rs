@@ -420,6 +420,15 @@ impl Supertable {
     /// keeps the rewrites it finished; running again resumes, because what
     /// is left is read from the files rather than tracked in a journal.
     /// Idempotent — a second run over a migrated table does nothing.
+    ///
+    /// A run killed mid-rewrite leaves its tombstone-sidecar seal behind
+    /// on the one superfile it held. The next run honours that seal rather
+    /// than assuming the owner is dead — it cannot tell a crashed writer
+    /// from a slow one — so it migrates everything else and counts that
+    /// file in [`ReindexReport::held_by_another_run`]. The seal is taken
+    /// over once it is older than
+    /// [`ReindexOptions::stale_seal_timeout_ms`], which is the knob to
+    /// lower when a crash is known rather than suspected.
     pub fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         self.inner.reindex(opts)
     }

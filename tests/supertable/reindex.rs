@@ -13,38 +13,9 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
-use infino::{
-    Bm25SearchOptions, ReindexOptions, Supertable, superfile::format::fts::VERSION_CURRENT,
-};
+use infino::{ReindexOptions, superfile::format::fts::VERSION_CURRENT};
 
-use crate::corpus_shapes::{N_DOCS, blob_versions, corpus_dir, hits, hits_k, open_corpus};
-
-/// Rows a `bm25_search` returns, as `(id, score)` pairs in rank order, so
-/// a comparison sees any reordering and not merely a changed count.
-fn ranked(table: &Supertable, column: &str, query: &str, k: usize) -> Vec<(i128, f32)> {
-    let batches = table
-        .bm25_search(column, query, k, Bm25SearchOptions::new(), None)
-        .expect("bm25 search");
-    let mut out = Vec::new();
-    for batch in &batches {
-        let ids = batch
-            .column_by_name("_id")
-            .expect("_id column")
-            .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
-            .expect("_id is Decimal128");
-        let scores = batch
-            .column_by_name("score")
-            .expect("score column")
-            .as_any()
-            .downcast_ref::<arrow_array::Float32Array>()
-            .expect("score is f32");
-        for i in 0..batch.num_rows() {
-            out.push((ids.value(i), scores.value(i)));
-        }
-    }
-    out
-}
+use crate::corpus_shapes::{N_DOCS, blob_versions, corpus_dir, hits, hits_k, open_corpus, ranked};
 
 /// Rewriting a table written by an older engine brings every superfile to
 /// the current format and changes nothing a caller can observe.
@@ -103,12 +74,7 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
     }
 
     assert_eq!(
-        table
-            .bm25_search("body", "common", N_DOCS, Bm25SearchOptions::new(), None)
-            .expect("search")
-            .iter()
-            .map(|b| b.num_rows())
-            .sum::<usize>(),
+        hits(&table, "body", "common"),
         N_DOCS,
         "{shape}: the corpus-wide term stopped matching every document"
     );

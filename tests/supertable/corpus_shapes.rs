@@ -59,7 +59,7 @@ const CORPUS_ROOT: &str = "tests/corpus/tables";
 /// these tests by having nothing to check.
 const REQUIRED_ENV: &str = "INFINO_CORPUS_REQUIRED";
 /// Table name every generator writes, so a test needs no per-shape name.
-const TABLE: &str = "corpus";
+pub(crate) const TABLE: &str = "corpus";
 
 /// Documents per generated table; mirrors the generators' shared corpus.
 pub(crate) const N_DOCS: usize = 12_000;
@@ -178,7 +178,7 @@ pub(crate) fn open_corpus(shape: &str) -> Option<(TempDir, Supertable, std::path
     Some((tmp, table, root))
 }
 
-fn copy_tree(src: &Path, dst: &Path) {
+pub(crate) fn copy_tree(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create dst");
     for entry in fs::read_dir(src).expect("read src") {
         let entry = entry.expect("dir entry");
@@ -190,6 +190,47 @@ fn copy_tree(src: &Path, dst: &Path) {
             }
         }
     }
+}
+
+/// Rows a `bm25_search` returns, as `(id, score)` pairs in rank order, so
+/// a comparison sees any reordering and not merely a changed count.
+pub(crate) fn ranked(table: &Supertable, column: &str, query: &str, k: usize) -> Vec<(i128, f32)> {
+    let batches = table
+        .bm25_search(column, query, k, Bm25SearchOptions::new(), None)
+        .expect("bm25 search");
+    let mut out = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("_id")
+            .expect("_id column")
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .expect("_id is Decimal128");
+        let scores = batch
+            .column_by_name("score")
+            .expect("score column")
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .expect("score is f32");
+        for i in 0..batch.num_rows() {
+            out.push((ids.value(i), scores.value(i)));
+        }
+    }
+    out
+}
+
+/// The ids [`ranked`] returns, in rank order, without their scores.
+///
+/// What a comparison across a *version* boundary asserts. A rewrite moves
+/// the scale a file's stored bounds are expressed at, which governs
+/// pruning rather than the score a surviving document is given — but the
+/// bar a migration is held to here is that no caller-visible ordering
+/// moves, and ordering is what this compares.
+pub(crate) fn ranked_ids(table: &Supertable, column: &str, query: &str, k: usize) -> Vec<i128> {
+    ranked(table, column, query, k)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Rows a `bm25_search` returns for `query` on `column`, taking the whole

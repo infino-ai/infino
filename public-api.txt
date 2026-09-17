@@ -533,6 +533,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ReindexOptions
 #[non_exhaustive] pub struct infino::ReindexReport
 pub infino::ReindexReport::already_current: usize
 pub infino::ReindexReport::awaiting_reanalysis: usize
+pub infino::ReindexReport::held_by_another_run: usize
 pub infino::ReindexReport::rewritten: usize
 pub infino::ReindexReport::unrepairable_columns: alloc::vec::Vec<alloc::string::String>
 impl core::clone::Clone for infino::ReindexReport

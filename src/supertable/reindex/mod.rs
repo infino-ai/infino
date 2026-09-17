@@ -142,6 +142,22 @@ pub struct ReindexReport {
     /// a separate and far more expensive operation — so they are counted
     /// here rather than rewritten pointlessly on every run.
     pub awaiting_reanalysis: usize,
+    /// Stale superfiles this run could not take, because another run holds
+    /// their tombstone sidecar.
+    ///
+    /// The sidecar seal is the cross-process guard that keeps two writers
+    /// off one superfile, and it is held by superfile rather than by
+    /// table — so a concurrent compaction, or a *crashed* run whose seal
+    /// outlives it, blocks that file and nothing else. Skipping it and
+    /// carrying on is what lets a resume make progress on the rest of the
+    /// table; failing the run would let one abandoned seal hold a whole
+    /// migration for as long as the seal takes to go stale.
+    ///
+    /// Non-zero means the table is not fully migrated and the work is
+    /// still there to do. Run again: a live owner will have finished, and
+    /// an abandoned seal is taken over once it is older than
+    /// [`crate::ReindexOptions::stale_seal_timeout_ms`].
+    pub held_by_another_run: usize,
     /// Columns carried forward still stale, because their text was never
     /// stored and nothing in the file can regenerate their terms.
     ///
@@ -374,13 +390,28 @@ impl Supertable {
         };
         for (done, job) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
             let superfile_id = job.inputs[0];
-            let outcome = self
+            let outcome = match self
                 .run_compaction_job(job, stale_seal_timeout, terms)
                 .await
-                .map_err(|e| ReindexError::Rewrite {
-                    superfile_id,
-                    cause: e.to_string(),
-                })?;
+            {
+                Ok(outcome) => outcome,
+                // Someone else holds this superfile. That is the seal
+                // doing its job, not a failure: the owner may be a live
+                // compaction, or a run that died still holding it. Either
+                // way this file is untouchable right now and every other
+                // stale file is not, so the run continues and says what it
+                // had to leave.
+                Err(CompactionError::SidecarConflict { .. }) => {
+                    report.held_by_another_run += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(ReindexError::Rewrite {
+                        superfile_id,
+                        cause: e.to_string(),
+                    });
+                }
+            };
             // A job whose inputs another writer had already replaced did
             // no work. Counting it would report more rewrites than the
             // table received, which matters because this count is how a
