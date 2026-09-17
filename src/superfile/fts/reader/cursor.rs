@@ -570,7 +570,14 @@ pub(crate) struct TermCursor {
     /// a skip that jumps past whole blocks, or leaves a block after its
     /// single lazy doc, resets the streak.
     dense_streak: u8,
+    /// Bitset blocks entered eagerly since the streak last saturated. Every
+    /// [`EAGER_RETRY_BLOCKS`] of them one lazy probe is tried again, so a
+    /// cursor whose caller turned sparse can leave eager mode.
+    eager_blocks: u8,
 }
+
+/// While a cursor is eager, retry a lazy probe once per this many blocks.
+const EAGER_RETRY_BLOCKS: u8 = 8;
 
 impl TermCursor {
     /// Parse one term's metadata + skip table out of its own postings
@@ -657,6 +664,7 @@ impl TermCursor {
             lazy_bit: u32::MAX,
             lazy_steps: 0,
             dense_streak: 0,
+            eager_blocks: 0,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -727,6 +735,7 @@ impl TermCursor {
             lazy_bit: u32::MAX,
             lazy_steps: 0,
             dense_streak: 0,
+            eager_blocks: 0,
         })
     }
 
@@ -789,6 +798,7 @@ impl TermCursor {
             lazy_bit: u32::MAX,
             lazy_steps: 0,
             dense_streak: 0,
+            eager_blocks: 0,
         }
     }
 
@@ -1297,6 +1307,15 @@ impl TermCursor {
             // A probe that leaves a lazy block after one doc, or jumps past
             // whole blocks, is sparse: serve the next bitset block lazily.
             self.dense_streak = 0;
+            self.eager_blocks = 0;
+        } else if self.dense_streak >= 2 && self.current_block != from_block {
+            // Eager, moving block to block: every so often try one lazy
+            // probe again; if the block expands anyway the streak returns.
+            self.eager_blocks += 1;
+            if self.eager_blocks >= EAGER_RETRY_BLOCKS {
+                self.eager_blocks = 0;
+                self.dense_streak = 1;
+            }
         }
         if !self.predecoded
             && self.dense_streak < 2
