@@ -125,6 +125,11 @@ unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score:
     }
 }
 
+/// How many more docs a term must have in a union window than the
+/// essentials it would be probed for, before the window demotes it from
+/// accumulation to probing.
+const DEMOTE_DENSITY: usize = 8;
+
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
 /// `docs[i]` the term contains, scoring matches in SIMD batches rather than one
 /// at a time. `docs` must be ascending — `bitset_probe_tf` advances the cursor
@@ -1843,6 +1848,7 @@ impl FtsReader {
         // Per-window block-level upper bounds and their suffix sums, in the
         // same term-max order as `partial_max`.
         let mut win_ub = vec![0.0_f32; n];
+        let mut win_blocks = vec![0usize; n];
         let mut partial_win = vec![0.0_f32; n + 1];
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
@@ -1994,31 +2000,33 @@ impl FtsReader {
             // bound valid (block maxima never exceed term maxima, so
             // `f_win <= f_essential`); a window whose total bound is under
             // the threshold holds no competitive doc and is skipped whole.
-            let window_bound = |c: &mut TermCursor, win_last: u32| match c.is_exhausted() {
-                true => 0.0,
-                false => c.block_max_in_range(base, win_last),
-            };
+            // Block-level partition for this window, gated on the weakest
+            // essential term alone: the suffix sums only grow towards the
+            // stronger terms, so unless its window bound plus the
+            // non-essential suffix is under the threshold no term can be
+            // demoted and the window keeps the term-max partition.
+            // Demotion trades accumulating the term's docs (a few ns each,
+            // SIMD) for a probe per remaining candidate (tens of ns), so a
+            // term is only demoted when its docs in the window outnumber
+            // the remaining essentials' by `DEMOTE_DENSITY` — the stopword
+            // shape; two mid-frequency terms are cheaper scored together.
+            // A window whose total bound is under the threshold holds no
+            // competitive doc and is skipped whole regardless.
             let f_win = if prune {
                 let win_last = window_end.saturating_sub(1);
-                // Gate on the weakest essential term alone: the suffix sums
-                // only grow towards the stronger terms, so unless its window
-                // bound plus the non-essential suffix is under the threshold
-                // no term is demoted and the window keeps the term-max
-                // partition. Bounding every essential term per window was
-                // measurable on four-term unions at large k, where nothing
-                // is ever demoted.
                 let weakest = f_essential - 1;
-                let weakest_ub = window_bound(&mut cursors[weakest], win_last);
+                let (weakest_ub, weakest_blocks) =
+                    cursors[weakest].block_max_and_blocks_in_range(base, win_last);
                 if weakest_ub + partial_max[f_essential] > threshold {
-                    // The completion bars below read the window's suffix
-                    // sums; with the term-max partition kept they are the
-                    // term-max sums.
                     partial_win.copy_from_slice(&partial_max);
                     f_essential
                 } else {
                     win_ub[weakest] = weakest_ub;
+                    win_blocks[weakest] = weakest_blocks;
                     for (i, c) in cursors.iter_mut().enumerate().take(weakest) {
-                        win_ub[i] = window_bound(c, win_last);
+                        let (ub, blocks) = c.block_max_and_blocks_in_range(base, win_last);
+                        win_ub[i] = ub;
+                        win_blocks[i] = blocks;
                     }
                     for i in f_essential..n {
                         win_ub[i] = cursors[i].term_max_bm25;
@@ -2027,7 +2035,15 @@ impl FtsReader {
                     for i in (0..n).rev() {
                         partial_win[i] = partial_win[i + 1] + win_ub[i];
                     }
-                    recompute_f(&partial_win, threshold)
+                    let f = recompute_f(&partial_win, threshold);
+                    let kept: usize = win_blocks[..f].iter().sum();
+                    let demoted: usize = win_blocks[f..f_essential].iter().sum();
+                    if f == 0 || demoted >= DEMOTE_DENSITY * kept.max(1) {
+                        f
+                    } else {
+                        partial_win.copy_from_slice(&partial_max);
+                        f_essential
+                    }
                 }
             } else {
                 f_essential

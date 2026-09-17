@@ -1259,6 +1259,20 @@ impl TermCursor {
     /// a hint pointer so monotonically-advancing leader ranges amortize
     /// to O(1) amortized per call.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        self.block_max_and_blocks_in_range(range_start, range_end).0
+    }
+
+    /// [`Self::block_max_in_range`] together with the number of blocks that
+    /// overlap the range — times [`BLOCK_LEN`], the ceiling on this term's
+    /// docs in it. `0` when the cursor is exhausted.
+    pub(super) fn block_max_and_blocks_in_range(
+        &mut self,
+        range_start: u32,
+        range_end: u32,
+    ) -> (f32, usize) {
+        if self.is_exhausted() {
+            return (0.0, 0);
+        }
         // Advance inspect_block to the first block whose last_doc_id
         // could intersect the range. shallow_advance_block_to lands on
         // the first block with last_doc_id >= range_start, which is
@@ -1285,7 +1299,7 @@ impl TermCursor {
             }
             i += 1;
         }
-        max
+        (max, i - self.inspect_block)
     }
 
     /// Block-max-BM25 at the inspect-block pointer. Pair with
