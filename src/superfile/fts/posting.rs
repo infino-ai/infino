@@ -1174,6 +1174,25 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "bit width > 32")]
+    fn decoders_refuse_a_header_width_past_32() {
+        // The width check moved from every header parse to the decoders
+        // that consume the widths; a corrupt compact header still cannot
+        // reach an unpacker.
+        let doc_ids: Vec<u32> = (0..128u32).map(|i| 10 + i * 7).collect();
+        let tfs = vec![1u32; 128];
+        let mut enc = encode_one(&block(&doc_ids, &tfs), BlockLayout::Compact, None, false);
+        let mut word = u32::from_le_bytes(enc.bytes[..4].try_into().expect("4 bytes"));
+        let mask = ((1u32 << HDR_WIDTH_BITS) - 1) << HDR_DELTA_BITS_SHIFT;
+        word = (word & !mask) | (33 << HDR_DELTA_BITS_SHIFT);
+        enc.bytes[..4].copy_from_slice(&word.to_le_bytes());
+        let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, None);
+        assert_eq!(hdr.delta_bits, 33, "the parse itself no longer rejects it");
+        let mut ids = vec![0u32; BLOCK_LEN];
+        decode_block_doc_ids(&enc.bytes, &hdr, &mut ids);
+    }
+
+    #[test]
     fn roundtrip_bitset_block_nonzero_aligned_base() {
         // A dense run far from zero: the origin is the word holding the
         // block's first doc, stored in both layouts, whether the block is

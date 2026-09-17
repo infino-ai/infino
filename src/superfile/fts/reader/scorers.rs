@@ -15,6 +15,7 @@ use super::{
     metadata::NormTable,
     sink::{
         AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
+        replace_worst,
     },
 };
 use crate::superfile::{
@@ -331,9 +332,7 @@ fn wand_two_term_tail(
                 score += bm25::score_with_dl_norm_k1(weak.idf_weight, tf, norm);
             }
             if score > *threshold {
-                if let Some(mut worst) = heap.peek_mut() {
-                    *worst = TopKEntry(score, doc);
-                }
+                replace_worst(heap, TopKEntry(score, doc));
                 *threshold = heap.peek().expect("non-empty").0;
             }
         }
@@ -560,9 +559,7 @@ impl FtsReader {
             } else if heap.peek().is_some_and(|worst| score > worst.0) {
                 // Replace the evicted entry in place: one sift instead of
                 // the pop's sift-down plus the push's sift-up.
-                if let Some(mut worst) = heap.peek_mut() {
-                    *worst = TopKEntry(score, pivot_doc);
-                }
+                replace_worst(&mut heap, TopKEntry(score, pivot_doc));
                 threshold = heap.peek().expect("non-empty").0;
             }
 
@@ -1392,9 +1389,7 @@ impl FtsReader {
                             }
                         }
                     } else if score > threshold {
-                        if let Some(mut worst) = heap.peek_mut() {
-                            *worst = TopKEntry(score, candidate);
-                        }
+                        replace_worst(&mut heap, TopKEntry(score, candidate));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                         let new_f = recompute_f(&partial_max, threshold);
                         if new_f != f_essential {
@@ -1569,9 +1564,7 @@ impl FtsReader {
                         f_essential = recompute_f(&partial_max, threshold);
                     }
                 } else if score > threshold {
-                    if let Some(mut worst) = heap.peek_mut() {
-                        *worst = TopKEntry(score, candidate);
-                    }
+                    replace_worst(&mut heap, TopKEntry(score, candidate));
                     threshold = heap.peek().expect("non-empty").0.max(threshold);
                     f_essential = recompute_f(&partial_max, threshold);
                 }
@@ -1753,9 +1746,7 @@ impl FtsReader {
                             threshold = heap.peek().expect("non-empty").0.max(threshold);
                         }
                     } else if score > threshold {
-                        if let Some(mut worst) = heap.peek_mut() {
-                            *worst = TopKEntry(score, doc);
-                        }
+                        replace_worst(&mut heap, TopKEntry(score, doc));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
                 }
@@ -1928,9 +1919,7 @@ impl FtsReader {
                             raised = true;
                         }
                     } else if score > threshold {
-                        if let Some(mut worst) = heap.peek_mut() {
-                            *worst = TopKEntry(score, candidate);
-                        }
+                        replace_worst(&mut heap, TopKEntry(score, candidate));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                         raised = true;
                     }
@@ -2110,9 +2099,7 @@ impl FtsReader {
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
                 } else if score > threshold {
-                    if let Some(mut worst) = heap.peek_mut() {
-                        *worst = TopKEntry(score, doc);
-                    }
+                    replace_worst(&mut heap, TopKEntry(score, doc));
                     threshold = heap.peek().expect("non-empty").0.max(threshold);
                 }
             }
@@ -2240,9 +2227,7 @@ impl FtsReader {
                     threshold = heap.peek().expect("non-empty").0;
                 }
             } else if score > threshold {
-                if let Some(mut worst) = heap.peek_mut() {
-                    *worst = TopKEntry(score, candidate);
-                }
+                replace_worst(&mut heap, TopKEntry(score, candidate));
                 threshold = heap.peek().expect("non-empty").0;
             }
         }
@@ -3063,6 +3048,57 @@ mod tests {
         let mut s3 = scores0.clone();
         assert_eq!(filter_survivors(&mut d3, &mut s3, f32::NEG_INFINITY), 40);
         assert_eq!(&d3[..], &docs0[..], "all-pass leaves order untouched");
+    }
+
+    #[tokio::test]
+    async fn wand_bmw_stopword_anchor_tail_agrees_with_bmm() {
+        // A term in every doc (bitset blocks, tf 1..=3) unioned with a
+        // rare term of varying tf: once the top-k fills, the stopword's
+        // max score is below the threshold and the kernel takes the
+        // probe-only tail. Its top-k must equal MaxScore+BMM for every k
+        // that fills the heap early, and for k large enough that it does
+        // not fill at all.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            for _ in 0..=(i % 3) {
+                text.push_str("the ");
+            }
+            if i % 37 == 0 {
+                for _ in 0..=(i / 37 % 4) {
+                    text.push_str("rare ");
+                }
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+        for terms in [&["the", "rare"], &["rare", "the"]] {
+            for k in [1usize, 5, 10, 50, 128, 400] {
+                let cw = r
+                    .build_term_cursors(col, terms, None, false, None, None)
+                    .await
+                    .expect("cursors");
+                let cb = r
+                    .build_term_cursors(col, terms, None, false, None, None)
+                    .await
+                    .expect("cursors");
+                let wand = r.run_wand_bmw(col, cw, k).expect("wand");
+                let bmm = r
+                    .run_max_score_bmm(col, cb, k, None, f32::NEG_INFINITY)
+                    .expect("bmm");
+                assert_eq!(wand.len(), bmm.len(), "len mismatch {terms:?} k={k}");
+                for ((dw, sw), (db, sb)) in wand.iter().zip(bmm.iter()) {
+                    assert_eq!(dw, db, "doc mismatch {terms:?} k={k}: {dw} vs {db}");
+                    assert!((sw - sb).abs() < 1e-4, "score mismatch {terms:?} k={k}");
+                }
+            }
+        }
     }
 
     #[tokio::test]

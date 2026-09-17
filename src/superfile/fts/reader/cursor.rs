@@ -821,6 +821,15 @@ impl TermCursor {
 
     /// The current block's parsed header, cached across probes of the
     /// same block.
+    /// The current block's parsed header and its byte range within the
+    /// term's postings, for callers that read the block's raw bytes.
+    #[inline]
+    fn current_block_bytes(&mut self) -> (BlockHeader, Range<usize>) {
+        let block = self.blocks[self.current_block];
+        let hdr = self.current_header();
+        (hdr, block.block_byte_offset..block.block_byte_end)
+    }
+
     #[inline]
     fn current_header(&mut self) -> BlockHeader {
         let b = self.current_block;
@@ -1213,9 +1222,8 @@ impl TermCursor {
     /// Returns `false` when the block holds no further doc.
     fn step_within_lazy_block(&mut self) -> bool {
         let cur = self.block_doc_ids[0];
-        let block = self.blocks[self.current_block];
-        let hdr = self.current_header();
-        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        let (hdr, range) = self.current_block_bytes();
+        let raw = &self.bytes[range];
         if self.lazy_steps == 0 {
             self.lazy_steps = 1;
             return match bitset_next_doc(raw, &hdr, cur.saturating_add(1)) {
@@ -1239,9 +1247,8 @@ impl TermCursor {
     /// the arrays are marked undecoded so `materialize_at`, positions and
     /// the tf probes expand the block if they need it.
     fn publish_lazy(&mut self, doc: u32, rank: usize) {
-        let block = self.blocks[self.current_block];
-        let hdr = self.current_header();
-        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        let (hdr, range) = self.current_block_bytes();
+        let raw = &self.bytes[range];
         self.block_doc_ids[0] = doc;
         if !self.count_only {
             self.block_tfs[0] = bitset_tf_at(raw, &hdr, rank);
@@ -1333,9 +1340,8 @@ impl TermCursor {
                 false => 0,
             };
             if steps < 2 {
-                let block = self.blocks[self.current_block];
-                let hdr = self.current_header();
-                let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                let (hdr, range) = self.current_block_bytes();
+                let raw = &self.bytes[range];
                 if let Some((doc, rank)) = bitset_next_doc(raw, &hdr, target) {
                     self.publish_lazy(doc, rank);
                     self.lazy_steps = steps;
@@ -1504,6 +1510,94 @@ mod tests {
         }
         let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A lazily published block must expand on demand for the callers
+    /// that need the whole block: `materialize_at` (positions read the
+    /// block's tf array by pair index), `contains` and `tf_at_contained`
+    /// on the same block, and the doc-at-a-time walk that follows.
+    #[tokio::test]
+    async fn lazy_block_expands_for_materialize_contains_and_walk() {
+        let view = two_column_reader();
+        let cursors = view
+            .build_term_cursors(1, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let mut reference = cursors[0].clone();
+        let mut walked: Vec<(u32, u32)> = Vec::new();
+        while !reference.is_exhausted() {
+            walked.push((reference.current_doc_id(), reference.current_tf()));
+            reference.next();
+        }
+        let tf_of = |doc: u32| walked.iter().find(|(d, _)| *d == doc).expect("present").1;
+
+        // materialize_at after a lazy skip: whole block, position on the doc.
+        let mut c = cursors[0].clone();
+        c.skip_to(3_001);
+        assert_eq!(c.block_n, 1, "a skip into a bitset block is lazy");
+        c.materialize_at(3_001);
+        assert!(c.block_n > 1, "materialize_at expands the block");
+        assert_eq!(c.current_doc_id(), 3_001);
+        assert_eq!(c.current_tf(), tf_of(3_001));
+        // Walking on from there matches the reference.
+        let start = walked
+            .iter()
+            .position(|(d, _)| *d == 3_001)
+            .expect("in range");
+        for &(d, tf) in &walked[start..start + 200] {
+            assert_eq!((c.current_doc_id(), c.current_tf()), (d, tf));
+            c.next();
+        }
+
+        // contains / tf_at_contained on a lazily entered block.
+        let mut c = cursors[0].clone();
+        c.skip_to(4_100);
+        assert!(c.contains(4_105));
+        assert_eq!(c.tf_at_contained(4_105), tf_of(4_105));
+        assert!(!c.contains(4_105 + 7_000));
+    }
+
+    /// The lazy probes must stay exact when a caller alternates between
+    /// dense stretches (several skips into every block, which switch the
+    /// cursor to eager expansion) and sparse jumps (which bring lazy
+    /// probing back), including the periodic retry while eager.
+    #[tokio::test]
+    async fn dense_and_sparse_skip_patterns_match_the_decoded_walk() {
+        let view = two_column_reader();
+        for count_only in [false, true] {
+            let cursors = view
+                .build_term_cursors(1, &["common"], None, false, None, None)
+                .await
+                .expect("cursors");
+            let mut reference = cursors[0].clone();
+            let mut walked: Vec<(u32, u32)> = Vec::new();
+            while !reference.is_exhausted() {
+                walked.push((reference.current_doc_id(), reference.current_tf()));
+                reference.next();
+            }
+            let expect_at = |target: u32| walked.iter().find(|(d, _)| *d >= target).copied();
+            let mut c = cursors[0].clone();
+            c.count_only = count_only;
+            let mut target = 0u32;
+            let mut strides: Vec<u32> = Vec::new();
+            strides.extend(std::iter::repeat_n(1, 300)); // dense: every doc, several per block
+            strides.extend(std::iter::repeat_n(41, 40)); // one probe per block
+            strides.extend(std::iter::repeat_n(2, 200)); // dense again
+            strides.extend([700, 700, 700, 3, 3, 3, 900]); // jumps past whole blocks, then dense
+            for (k, stride) in strides.into_iter().enumerate() {
+                target += stride;
+                c.skip_to(target);
+                match expect_at(target) {
+                    None => assert!(c.is_exhausted(), "step {k} target {target}"),
+                    Some((d, tf)) => {
+                        assert_eq!(c.current_doc_id(), d, "step {k} target {target}");
+                        if !count_only {
+                            assert_eq!(c.current_tf(), tf, "step {k} target {target}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Every doc of `two_column_reader` carries `common`, so its blocks

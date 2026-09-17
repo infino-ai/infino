@@ -308,9 +308,51 @@ pub(super) fn and_heap_push(
     }
 }
 
+/// Replace the heap's worst entry in place — one sift, where a `pop`
+/// followed by a `push` costs a full sift-down and two sift-ups. The
+/// caller has already decided `entry` belongs in the top-k.
+#[inline]
+pub(super) fn replace_worst(heap: &mut BinaryHeap<TopKEntry>, entry: TopKEntry) {
+    if let Some(mut worst) = heap.peek_mut() {
+        *worst = entry;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn and_heap_push_keeps_the_smaller_doc_on_a_tied_score() {
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        and_heap_push(&mut heap, 2, None, 1.0, 5);
+        and_heap_push(&mut heap, 2, None, 1.0, 9);
+        // Same score, smaller doc: evicts doc 9.
+        and_heap_push(&mut heap, 2, None, 1.0, 7);
+        assert_eq!(drain_top_k_desc(heap.clone()), vec![(5, 1.0), (7, 1.0)]);
+        // Same score, larger doc: no change.
+        and_heap_push(&mut heap, 2, None, 1.0, 12);
+        assert_eq!(drain_top_k_desc(heap.clone()), vec![(5, 1.0), (7, 1.0)]);
+        // Better score: evicts the worst (doc 7, the larger of the tie).
+        and_heap_push(&mut heap, 2, None, 2.0, 30);
+        assert_eq!(drain_top_k_desc(heap.clone()), vec![(30, 2.0), (5, 1.0)]);
+        // Worse score than the worst: no change.
+        and_heap_push(&mut heap, 2, None, 0.5, 1);
+        assert_eq!(drain_top_k_desc(heap), vec![(30, 2.0), (5, 1.0)]);
+    }
+
+    #[test]
+    fn replace_worst_is_pop_then_push() {
+        let mut a: BinaryHeap<TopKEntry> = [(1.0, 4), (2.0, 1), (3.0, 7)]
+            .into_iter()
+            .map(|(s, d)| TopKEntry(s, d))
+            .collect();
+        let mut b = a.clone();
+        replace_worst(&mut a, TopKEntry(2.5, 9));
+        b.pop();
+        b.push(TopKEntry(2.5, 9));
+        assert_eq!(drain_top_k_desc(a), drain_top_k_desc(b));
+    }
 
     #[test]
     fn drain_top_k_desc_orders_descending_with_tiebreak() {
