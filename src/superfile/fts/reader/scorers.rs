@@ -314,9 +314,16 @@ fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> boo
 /// every remaining candidate is a doc of `strong`, scored with `weak`'s tf
 /// when the block bound allows and `weak` holds the doc. `weak` is only
 /// probed, never stepped, so a stopword's bitset blocks are never expanded.
+///
+/// The heap need not be full: a candidate above the threshold is pushed
+/// while the heap has room and replaces the worst entry once it holds `k`,
+/// and the threshold follows the heap only from that point. The caller
+/// today enters with a full heap (its threshold is set only then), but
+/// the tail does not rely on it — a seeded threshold must not lose docs.
 fn wand_two_term_tail(
     weak: &mut TermCursor,
     strong: &mut TermCursor,
+    k: usize,
     heap: &mut BinaryHeap<TopKEntry>,
     threshold: &mut f32,
     dl_norm_k1: &NormTable,
@@ -332,8 +339,14 @@ fn wand_two_term_tail(
                 score += bm25::score_with_dl_norm_k1(weak.idf_weight, tf, norm);
             }
             if score > *threshold {
-                replace_worst(heap, TopKEntry(score, doc));
-                *threshold = heap.peek().expect("non-empty").0;
+                if heap.len() < k {
+                    heap.push(TopKEntry(score, doc));
+                } else {
+                    replace_worst(heap, TopKEntry(score, doc));
+                }
+                if heap.len() == k {
+                    *threshold = heap.peek().expect("non-empty").0;
+                }
             }
         }
         strong.next();
@@ -415,7 +428,7 @@ impl FtsReader {
                         0 => (&mut a[0], &mut b[0]),
                         _ => (&mut b[0], &mut a[0]),
                     };
-                    wand_two_term_tail(weak_c, strong_c, &mut heap, &mut threshold, dl_norm_k1);
+                    wand_two_term_tail(weak_c, strong_c, k, &mut heap, &mut threshold, dl_norm_k1);
                     break;
                 }
             }
@@ -3097,6 +3110,57 @@ mod tests {
                     assert_eq!(dw, db, "doc mismatch {terms:?} k={k}: {dw} vs {db}");
                     assert!((sw - sb).abs() < 1e-4, "score mismatch {terms:?} k={k}");
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wand_two_term_tail_fills_a_partial_heap() {
+        // Entered with an empty heap and the threshold seeded at the weak
+        // term's max score (a floor-seeded pivot would do this), the tail
+        // must still push qualifying docs until the heap holds k and only
+        // then evict, and end with the same top-k as MaxScore+BMM.
+        const N_DOCS: u32 = OR_WINDOW + 700;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("the");
+            if i % 37 == 0 {
+                for _ in 0..=(i / 37 % 4) {
+                    text.push_str(" rare");
+                }
+            }
+            b.add_doc(0, i, &text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+        let dl_norm_k1 = &r.columns[col as usize].dl_norm_k1;
+        for k in [1usize, 5, 20] {
+            let mut cursors = r
+                .build_term_cursors(col, &["the", "rare"], None, false, None, None)
+                .await
+                .expect("cursors");
+            let (a, bb) = cursors.split_at_mut(1);
+            let (weak, strong) = (&mut a[0], &mut bb[0]);
+            assert!(weak.term_max_bm25 < strong.term_max_bm25);
+            let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+            let mut threshold = weak.term_max_bm25;
+            wand_two_term_tail(weak, strong, k, &mut heap, &mut threshold, dl_norm_k1);
+            let tail = drain_top_k_desc(heap);
+            let cb = r
+                .build_term_cursors(col, &["the", "rare"], None, false, None, None)
+                .await
+                .expect("cursors");
+            let bmm = r
+                .run_max_score_bmm(col, cb, k, None, f32::NEG_INFINITY)
+                .expect("bmm");
+            assert_eq!(tail.len(), k, "k={k}: the tail must fill the heap");
+            for ((dt, st), (db, sb)) in tail.iter().zip(bmm.iter()) {
+                assert_eq!(dt, db, "k={k}");
+                assert!((st - sb).abs() < 1e-4, "k={k}");
             }
         }
     }
