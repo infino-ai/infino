@@ -255,9 +255,27 @@ pub(crate) fn hits_k(table: &Supertable, column: &str, query: &str, k: usize) ->
         .sum()
 }
 
+/// Whether a shape carries the burden of proving the coarse block-max
+/// table spans more than one entry.
+///
+/// The version byte proves every other structure by itself — the builder
+/// stamps `V4` only when a block chose the bitset encoding, `V3` only when
+/// the positions region is non-empty, `V5` only when a coarse table was
+/// written. The one thing it cannot prove is that the coarse table has
+/// more than a single entry, which needs enough postings in one superfile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoarseTable {
+    /// This shape must hold a superfile big enough to span many entries.
+    MustSpanManyEntries,
+    /// A sibling shape from the same writer proves it, and this one shards
+    /// too small to. Weakening the check for every shape to accommodate
+    /// that would retire the tripwire entirely.
+    ProvenBySiblingShape,
+}
+
 /// Asserts one shape: the version every superfile carries, and that the
 /// table still opens and ranks.
-fn assert_shape(shape: &str, expected_version: u32) {
+fn assert_shape(shape: &str, expected_version: u32, coarse: CoarseTable) {
     let Some(root) = corpus_dir(shape) else {
         return;
     };
@@ -295,7 +313,7 @@ fn assert_shape(shape: &str, expected_version: u32) {
     // only when the positions region is non-empty, V5 only when a coarse
     // table was written. The one thing it cannot prove is that the coarse
     // table spans more than one entry, which needs the postings to exist.
-    if expected_version >= 5 {
+    if expected_version >= 5 && coarse == CoarseTable::MustSpanManyEntries {
         for (i, h) in headers.iter().enumerate() {
             assert!(
                 h.n_docs >= DOCS_FOR_MULTI_ENTRY_COARSE,
@@ -365,7 +383,7 @@ macro_rules! shape_tests {
 
                 #[test]
                 fn carries_its_format_shape() {
-                    assert_shape($shape, $version);
+                    assert_shape($shape, $version, CoarseTable::MustSpanManyEntries);
                 }
 
                 #[test]
@@ -387,6 +405,35 @@ shape_tests! {
     v4_bitset_blocks => ("v4_bitset_blocks", 4),
     v5_positionless => ("v5_positionless", 5),
     v5_positional => ("v5_positional", 5),
+}
+
+/// The same writer as [`v6_positional`], plus a vector column — the shape
+/// that shows what a migration cannot do rather than what it can.
+///
+/// Its FTS index is stale exactly like its text-only sibling's, so a
+/// container rewrite is available. Re-analysis is not: it would have to
+/// decode every vector back to `f32` and re-encode it, and only an `Fp32`
+/// rerank codec survives that round trip. Nothing here selects a codec —
+/// `IndexSpec::vector` takes a column, a dimension and a metric, and the
+/// codec behind it is internal. So this table is un-re-analyzable by
+/// construction, which is the case every hybrid table in the wild is in.
+mod v6_hybrid {
+    use super::*;
+
+    const SHAPE: &str = "v6_hybrid";
+
+    /// Sharding across five superfiles puts each below the coarse-table
+    /// threshold; `v6_positional`, the same writer without the vector
+    /// column, writes one superfile and proves it.
+    #[test]
+    fn carries_its_format_shape() {
+        assert_shape(SHAPE, 6, CoarseTable::ProvenBySiblingShape);
+    }
+
+    #[test]
+    fn opens_and_ranks() {
+        assert_opens_and_ranks(SHAPE);
+    }
 }
 
 /// The newest published shape, and the one that pulls the two axes of
@@ -411,7 +458,7 @@ mod v6_positional {
 
     #[test]
     fn carries_its_format_shape() {
-        assert_shape(SHAPE, 6);
+        assert_shape(SHAPE, 6, CoarseTable::MustSpanManyEntries);
     }
 
     #[test]
@@ -461,7 +508,7 @@ mod v1_positionless {
 
     #[test]
     fn carries_its_format_shape() {
-        assert_shape("v1_positionless", 1);
+        assert_shape("v1_positionless", 1, CoarseTable::MustSpanManyEntries);
     }
 
     #[test]

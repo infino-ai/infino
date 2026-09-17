@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 tables="$PWD/tables"
 
-# shape : generator directory : expected FTS blob version
+# shape : generator directory : expected FTS blob version : profile (optional)
 shapes=(
   "v1_positionless:v0_1_5:1"
   "v2_positions_region:v0_5_4:2"
@@ -20,22 +20,23 @@ shapes=(
   "v5_positionless:v0_8_0:5"
   "v5_positional:v0_8_2:5"
   "v6_positional:v0_8_3:6"
+  "v6_hybrid:v0_8_3:6:hybrid"
 )
 
 wanted=("$@")
 for entry in "${shapes[@]}"; do
-  IFS=: read -r shape gen version <<<"$entry"
+  IFS=: read -r shape gen version profile <<<"$entry"
   if [ ${#wanted[@]} -gt 0 ] && [[ ! " ${wanted[*]} " =~ " ${shape} " ]]; then
     continue
   fi
 
-  echo "==> $shape (engine ${gen#v}, expecting blob version $version)"
+  echo "==> $shape (engine ${gen#v}${profile:+, $profile}, expecting blob version $version)"
   bin="generators/$gen/target/release/corpus-gen-$(echo "${gen#v}" | tr '_' '-')"
   ( cd "generators/$gen" && cargo build --release --quiet )
 
   rm -rf "${tables:?}/$shape"
   mkdir -p "$tables/$shape"
-  "$bin" "$tables/$shape" corpus >/dev/null
+  "$bin" "$tables/$shape" corpus ${profile:+"$profile"} >/dev/null
 
   # The shape is content-dependent, not just a property of the writer: a
   # corpus too sparse to produce a dense block, or too small for a

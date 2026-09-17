@@ -82,3 +82,21 @@ pub fn notes(i: u32) -> Option<String> {
         _ => None,
     }
 }
+
+/// Dimension of the planted embedding. Small: these tables exist to make a
+/// vector index *present*, not to measure recall through one.
+#[allow(dead_code)]
+pub const EMBEDDING_DIM: usize = 16;
+
+/// A deterministic unit-ish embedding for document `i`.
+///
+/// One dominant component per document so vectors are distinguishable
+/// without any randomness to reproduce. Only the hybrid profile uses this,
+/// so the generators that write text-only tables never call it.
+#[allow(dead_code)]
+pub fn embedding(i: u32) -> Vec<f32> {
+    let lead = (i as usize) % EMBEDDING_DIM;
+    (0..EMBEDDING_DIM)
+        .map(|d| if d == lead { 1.0 } else { 0.05 })
+        .collect()
+}
