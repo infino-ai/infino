@@ -464,6 +464,28 @@ pub(super) struct BlockMeta {
 /// `current_doc_id() == u32::MAX` is the "exhausted" sentinel; the
 /// WAND loop drops cursors that are exhausted at the top of each
 /// iteration.
+/// First index `>= from` in the sorted decoded block `ids` whose doc is
+/// `>= target`, or `ids.len()`. A short linear scan first — an aligned
+/// walk moves a few docs at a time — then a bisection of the rest, so a
+/// far skip inside a 128-doc block costs seven compares, not a hundred.
+/// Works on a subslice with a local index: the per-step store to the
+/// cursor's `pos` and the reload of the buffer pointer were most of the
+/// phrase alignment's time.
+#[inline(always)]
+fn advance_in_block(ids: &[u32], from: usize, target: u32) -> usize {
+    const LINEAR: usize = 8;
+    let n = ids.len();
+    let mut p = from;
+    let lin_end = n.min(p + LINEAR);
+    while p < lin_end && ids[p] < target {
+        p += 1;
+    }
+    if p == lin_end && p < n && ids[p] < target {
+        p += ids[p..].partition_point(|&d| d < target);
+    }
+    p
+}
+
 #[derive(Clone)]
 pub(crate) struct TermCursor {
     /// The effective inverse document frequency this cursor scores
@@ -919,9 +941,7 @@ impl TermCursor {
         if self.decoded_block != self.current_block {
             self.decode_current_block();
         }
-        while self.pos < self.block_n && self.block_doc_ids[self.pos] < doc {
-            self.pos += 1;
-        }
+        self.pos = advance_in_block(&self.block_doc_ids[..self.block_n], self.pos, doc);
     }
 
     /// Ranked-OR non-essential membership probe returning the doc's tf
@@ -1228,9 +1248,11 @@ impl TermCursor {
         }
         self.dense_streak = self.dense_streak.saturating_add(1);
         self.decode_current_block();
-        while self.pos < self.block_n && self.block_doc_ids[self.pos] <= cur {
-            self.pos += 1;
-        }
+        self.pos = advance_in_block(
+            &self.block_doc_ids[..self.block_n],
+            0,
+            cur.saturating_add(1),
+        );
         self.pos < self.block_n
     }
 
@@ -1270,11 +1292,9 @@ impl TermCursor {
             // Just scan pos forward. The `current_doc_id() >= target`
             // guard from before is folded into this scan — if pos is
             // already at-or-past, the loop body doesn't execute.
-            let n = self.block_n;
-            while self.pos < n && self.block_doc_ids[self.pos] < target {
-                self.pos += 1;
-            }
-            if self.pos < n {
+            let p = advance_in_block(&self.block_doc_ids[..self.block_n], self.pos, target);
+            self.pos = p;
+            if p < self.block_n {
                 return;
             }
             // Walked off the end of the decoded block (rare under
@@ -1345,9 +1365,7 @@ impl TermCursor {
             self.dense_streak = self.dense_streak.saturating_add(1);
         }
         self.decode_current_block();
-        while self.pos < self.block_n && self.block_doc_ids[self.pos] < target {
-            self.pos += 1;
-        }
+        self.pos = advance_in_block(&self.block_doc_ids[..self.block_n], 0, target);
         if self.pos >= self.block_n {
             self.current_block += 1;
             if self.current_block > self.inspect_block {
