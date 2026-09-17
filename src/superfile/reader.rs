@@ -57,6 +57,7 @@ use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
+        error::FtsError,
         format::{self, footer, kv},
         fts::{
             bm25::Bm25Params,
@@ -66,6 +67,7 @@ use crate::{
             },
             tokenize::{Phrase, Tokenizer},
         },
+        ids,
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
@@ -191,6 +193,9 @@ pub struct SuperfileReader {
     /// resident bytes to slice (lazy path) — both fall back to the Parquet
     /// id column.
     id_sidecar: Option<Range<usize>>,
+    /// Whether `id_sidecar` holds the packed layout (`superfile::ids`)
+    /// rather than the raw `i128` array.
+    id_sidecar_packed: bool,
 }
 
 struct LazyMetadataFetch {
@@ -408,6 +413,7 @@ impl SuperfileReader {
             // No resident bytes to slice on the lazy path; `_id` resolution
             // there goes through the Parquet id column.
             id_sidecar: None,
+            id_sidecar_packed: false,
         })
     }
 
@@ -513,21 +519,31 @@ impl SuperfileReader {
         //    local doc id. Record its byte range so `take_by_local_doc_ids`
         //    resolves `_id` from a fixed-width slice instead of the Parquet
         //    id pages. Absent on pre-sidecar superfiles → Parquet fallback.
+        let id_sidecar_packed =
+            kv_map.get(kv::IDS_LAYOUT).map(String::as_str) == Some(kv::IDS_LAYOUT_PACKED);
         let id_sidecar = if all_present(&kv_map, kv::IDS_KEYS) {
             let off = parse_u64(&kv_map, kv::IDS_OFFSET)? as usize;
             let len = parse_u64(&kv_map, kv::IDS_LENGTH)? as usize;
-            let expected = (n_docs as usize) * format::ID_SIDECAR_ENTRY_BYTES;
-            if len != expected {
-                return Err(ReadError::MalformedKv(format!(
-                    "stable-id sidecar length {len} != {expected} (16 x n_docs)"
-                )));
-            }
             let end = off
                 .checked_add(len)
                 .filter(|&end| end <= bytes.len())
                 .ok_or_else(|| {
                     ReadError::MalformedKv("stable-id sidecar range out of bounds".into())
                 })?;
+            match id_sidecar_packed {
+                true => {
+                    ids::PackedIds::parse(&bytes[off..end], n_docs as usize)
+                        .map_err(ReadError::MalformedKv)?;
+                }
+                false => {
+                    let expected = (n_docs as usize) * format::ID_SIDECAR_ENTRY_BYTES;
+                    if len != expected {
+                        return Err(ReadError::MalformedKv(format!(
+                            "stable-id sidecar length {len} != {expected} (16 x n_docs)"
+                        )));
+                    }
+                }
+            }
             Some(off..end)
         } else if any_present(&kv_map, kv::IDS_KEYS) {
             return Err(ReadError::MalformedKv(
@@ -550,6 +566,7 @@ impl SuperfileReader {
             scored_fts: RwLock::new(None),
             vec,
             id_sidecar,
+            id_sidecar_packed,
         })
     }
 
@@ -633,6 +650,58 @@ impl SuperfileReader {
     /// Underlying FTS reader. `None` if this superfile has no FTS index.
     pub fn fts(&self) -> Option<&FtsReader> {
         self.fts.as_ref()
+    }
+
+    /// Attribute every byte of a resident superfile to a region — the
+    /// Parquet row groups (per column), the `_id` sidecar, the vector
+    /// index, the FTS blob (itself broken down per term band by
+    /// [`FtsReader::size_breakdown`]) and the footer. A report over the
+    /// whole file, never a query path; `None` when the reader is not
+    /// fully resident (a lazy object-store open), since the total is the
+    /// resident length.
+    pub fn size_breakdown(&self) -> Result<Option<SuperfileSizeBreakdown>, ReadError> {
+        let Some(bytes) = self.bytes.as_ref() else {
+            return Ok(None);
+        };
+        let kv_map = footer::extract_kv_map(&self.parquet_meta).map_err(ReadError::Footer)?;
+        let kv_len = |key: &str| -> u64 {
+            kv_map
+                .get(key)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mut columns: Vec<(String, u64)> = Vec::new();
+        let mut row_group_bytes = 0u64;
+        for rg in self.parquet_meta.row_groups() {
+            for c in rg.columns() {
+                let size = c.compressed_size().max(0) as u64;
+                row_group_bytes += size;
+                let name = c.column_path().string();
+                match columns.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, b)) => *b += size,
+                    None => columns.push((name, size)),
+                }
+            }
+        }
+        let fts = match &self.fts {
+            Some(r) => Some(r.size_breakdown().map_err(fts_reader_error_to_read)?),
+            None => None,
+        };
+        Ok(Some(SuperfileSizeBreakdown {
+            total_bytes: bytes.len() as u64,
+            n_docs: self.n_docs,
+            row_groups: self.parquet_meta.row_groups().len() as u64,
+            row_group_bytes,
+            columns,
+            id_sidecar_bytes: self
+                .id_sidecar
+                .as_ref()
+                .map(|r| r.len() as u64)
+                .unwrap_or(0),
+            vec_bytes: kv_len(kv::VEC_LENGTH),
+            fts_bytes: kv_len(kv::FTS_LENGTH),
+            fts,
+        }))
     }
 
     /// Vector column names in declaration order, or empty.
@@ -967,11 +1036,13 @@ impl SuperfileReader {
     }
 
     /// Build the `_id` column for `local_doc_ids` (in caller order) from the
-    /// stable-id sidecar `range` within `bytes`: each id is a little-endian
-    /// `i128` at `local_doc_id * ENTRY`. Direct indexing, so duplicates and
-    /// ordering need no rank-back. Bounds are guaranteed by the doc-id
-    /// bounds-check in [`take_by_local_doc_ids`] and the sidecar-length check
-    /// at open, so the fixed-width reads cannot overrun the region.
+    /// stable-id sidecar `range` within `bytes`: a packed sidecar is opened
+    /// by its header (its blocks were validated at superfile open) and
+    /// indexed per doc; a raw one holds a little-endian `i128` at
+    /// `local_doc_id * ENTRY`. Direct indexing, so duplicates and ordering
+    /// need no rank-back. Raw bounds are guaranteed by the doc-id
+    /// bounds-check in [`take_by_local_doc_ids`] and the sidecar-length
+    /// check at open, so the fixed-width reads cannot overrun the region.
     fn id_array_from_sidecar(
         &self,
         bytes: &Bytes,
@@ -982,13 +1053,31 @@ impl SuperfileReader {
         /// fixed-size `from_le_bytes` decode.
         const ENTRY: usize = format::ID_SIDECAR_ENTRY_BYTES;
         let region = &bytes[range];
-        let ids = local_doc_ids.iter().map(|&doc_id| {
-            let start = doc_id as usize * ENTRY;
-            let raw: [u8; ENTRY] = region[start..start + ENTRY]
-                .try_into()
-                .expect("sidecar entry within bounds");
-            i128::from_le_bytes(raw)
-        });
+        let packed = match self.id_sidecar_packed {
+            true => Some(
+                ids::PackedIds::open(region, self.n_docs as usize)
+                    .map_err(ReadError::MalformedKv)?,
+            ),
+            false => None,
+        };
+        let mut ids: Vec<i128> = Vec::with_capacity(local_doc_ids.len());
+        match &packed {
+            // A block walk hands its docs over ascending, so a large
+            // resolve unpacks each block's two streams once instead of
+            // reading two bit fields per doc.
+            Some(p) => p.get_many(local_doc_ids, &mut ids).ok_or_else(|| {
+                ReadError::MalformedKv("stable-id sidecar has no entry for a requested doc".into())
+            })?,
+            None => {
+                for &doc_id in local_doc_ids {
+                    let start = doc_id as usize * ENTRY;
+                    let raw: [u8; ENTRY] = region[start..start + ENTRY]
+                        .try_into()
+                        .expect("sidecar entry within bounds");
+                    ids.push(i128::from_le_bytes(raw));
+                }
+            }
+        }
         let id_idx = self
             .schema
             .index_of(&self.id_column)
@@ -2083,6 +2172,100 @@ pub(crate) fn rank_back_indices(ids: &[u32], sorted: &[u32]) -> UInt32Array {
     builder.finish()
 }
 
+/// Whole-file byte attribution; see [`SuperfileReader::size_breakdown`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuperfileSizeBreakdown {
+    pub total_bytes: u64,
+    pub n_docs: u64,
+    pub row_groups: u64,
+    /// Compressed bytes of every Parquet column chunk, and per column.
+    pub row_group_bytes: u64,
+    pub columns: Vec<(String, u64)>,
+    pub id_sidecar_bytes: u64,
+    pub vec_bytes: u64,
+    pub fts_bytes: u64,
+    pub fts: Option<fts_reader::FtsSizeBreakdown>,
+}
+
+impl SuperfileSizeBreakdown {
+    /// Bytes not covered by any region above: the Parquet footer, page
+    /// indexes and region trailers.
+    pub fn other_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(
+            self.row_group_bytes + self.id_sidecar_bytes + self.vec_bytes + self.fts_bytes,
+        )
+    }
+}
+
+/// Bytes per mebibyte, for the report.
+const SIZE_REPORT_BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+impl fmt::Display for SuperfileSizeBreakdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mib = |b: u64| b as f64 / SIZE_REPORT_BYTES_PER_MIB;
+        writeln!(
+            f,
+            "superfile: {} docs, {} B ({:.2} MiB)",
+            self.n_docs,
+            self.total_bytes,
+            mib(self.total_bytes)
+        )?;
+        writeln!(
+            f,
+            "  parquet row groups ({})  {:>12} B  {:>9.2} MiB",
+            self.row_groups,
+            self.row_group_bytes,
+            mib(self.row_group_bytes)
+        )?;
+        for (name, b) in &self.columns {
+            writeln!(
+                f,
+                "    column {:<18} {:>12} B  {:>9.2} MiB",
+                name,
+                b,
+                mib(*b)
+            )?;
+        }
+        writeln!(
+            f,
+            "  id sidecar              {:>12} B  {:>9.2} MiB",
+            self.id_sidecar_bytes,
+            mib(self.id_sidecar_bytes)
+        )?;
+        writeln!(
+            f,
+            "  vector index            {:>12} B  {:>9.2} MiB",
+            self.vec_bytes,
+            mib(self.vec_bytes)
+        )?;
+        writeln!(
+            f,
+            "  fts blob                {:>12} B  {:>9.2} MiB",
+            self.fts_bytes,
+            mib(self.fts_bytes)
+        )?;
+        writeln!(
+            f,
+            "  footer + trailers       {:>12} B  {:>9.2} MiB",
+            self.other_bytes(),
+            mib(self.other_bytes())
+        )?;
+        if let Some(fts) = &self.fts {
+            write!(f, "{fts}")?;
+        }
+        Ok(())
+    }
+}
+
+/// An FTS read error surfaced by the size report is a read error of the
+/// file it was read from.
+fn fts_reader_error_to_read(e: FtsError) -> ReadError {
+    match e {
+        FtsError::Read(r) => r,
+        other => ReadError::MalformedVersion(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -2383,14 +2566,19 @@ mod tests {
     fn stable_id_sidecar_serves_id_and_matches_parquet_fallback() {
         let (bytes, ids) = build_shuffled_id_superfile();
 
-        // The sidecar KV is present, sized to one packed i128 per row.
+        // The sidecar KVs are present and name the packed layout, which
+        // never costs more than one raw i128 per row plus its headers.
         let kvs = footer::read_kv_metadata(&bytes).expect("kv metadata");
         let len: usize = kvs
             .get(kv::IDS_LENGTH)
             .expect("sidecar length present")
             .parse()
             .expect("length is a usize");
-        assert_eq!(len, ids.len() * format::ID_SIDECAR_ENTRY_BYTES);
+        assert_eq!(
+            kvs.get(kv::IDS_LAYOUT).map(String::as_str),
+            Some(kv::IDS_LAYOUT_PACKED)
+        );
+        assert!(len <= ids.len() * format::ID_SIDECAR_ENTRY_BYTES + 4096);
 
         let locals: Vec<u32> = vec![0, 4999, 1, 4999, 37, 100, 2500];
         let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();

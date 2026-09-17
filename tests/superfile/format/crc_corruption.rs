@@ -36,8 +36,11 @@ const ID_DECIMAL_PRECISION: u8 = 38;
 const ID_DECIMAL_SCALE: i8 = 0;
 /// Random-rotation seed for the corruptable superfile's vector index.
 const CRC_TEST_ROT_SEED: u64 = 31;
-/// Doc count for the small corruptable superfile.
-const CRC_TEST_N_DOCS: u32 = 12;
+/// Doc count for the small corruptable superfile. Past one posting
+/// block, so the terms every doc shares take the long form (header, skip
+/// table, blocks) these tests aim their flips at; a single-block term is
+/// written in the short form instead.
+const CRC_TEST_N_DOCS: u32 = 140;
 /// Embedding dimension (matches `default_vector_config`'s dim).
 const CRC_TEST_EMB_DIM: usize = 16;
 /// Secondary one-hot axis weight planted in each doc vector.
@@ -311,7 +314,7 @@ fn corrupt_fts_positions_region_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 6,
+        version, 7,
         "positional superfile must embed a current FTS blob (coarse table; dense corpus ⇒ bitset blocks)"
     );
     let positions_off_rel = u64::from_le_bytes(
@@ -393,7 +396,7 @@ fn corrupt_fts_bitset_block_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 6,
+        version, 7,
         "dense corpus must embed a current FTS blob (coarse table; bitset blocks)"
     );
     // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
@@ -403,33 +406,87 @@ fn corrupt_fts_bitset_block_rejected() {
             .expect("postings offset"),
     ) as usize;
     let term0 = fts_off + postings_offset_rel;
-    // A term is `[meta][skip table][blocks]`; the first block's offset *within
-    // the term* is recorded in skip entry 0's block-offset field, so read it
-    // directly instead of re-deriving the skip-table size. Non-positional term
-    // meta is 20 B (`TERM_META_SIZE`); a skip entry's block-offset u32 sits at
-    // its offset 4 (`BLOCK_OFFSET_OFF`).
+    // A term is `[meta][skip table][blocks]`. Skip entries carry block
+    // lengths, not offsets, so the first block starts right after the skip
+    // table: non-positional term meta is 20 B (`TERM_META_SIZE`), the block
+    // count sits at meta offset 16, and a positionless skip entry is 10 B.
     const TERM_META: usize = 20;
-    const SKIP_BLOCK_OFFSET_FIELD: usize = 4;
-    let block0_off_in_term = u32::from_le_bytes(
-        bytes[term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD
-            ..term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD + 4]
+    const NUM_BLOCKS_OFF: usize = 16;
+    const SKIP_ENTRY: usize = 10;
+    let num_blocks = u32::from_le_bytes(
+        bytes[term0 + NUM_BLOCKS_OFF..term0 + NUM_BLOCKS_OFF + 4]
             .try_into()
-            .expect("block offset"),
+            .expect("block count"),
     ) as usize;
-    let block0 = term0 + block0_off_in_term;
-    // Block header byte 3 is the encoding (`ENCODING_BITSET == 1`). Assert the
-    // first postings term's block really is a bitset — both a fixture sanity
-    // check and proof the flip below lands in a presence bitmap, not a PFOR block.
+    let block0 = term0 + TERM_META + num_blocks * SKIP_ENTRY;
+    // Header byte 3's low two bits are the encoding (`ENCODING_BITSET == 1`).
+    // Assert the first postings term's block really is a bitset — both a
+    // fixture sanity check and proof the flip below lands in a presence
+    // bitmap, not a PFOR block.
     const ENCODING_OFF: usize = 3;
+    const ENCODING_MASK: u8 = 0b11;
     const ENCODING_BITSET: u8 = 1;
-    const BLOCK_HEADER: usize = 8;
+    const BLOCK_HEADER: usize = 4;
     assert_eq!(
-        bytes[block0 + ENCODING_OFF],
+        bytes[block0 + ENCODING_OFF] & ENCODING_MASK,
         ENCODING_BITSET,
         "first postings term's block must be bitset-encoded on this dense corpus"
     );
-    // Flip a byte in the presence bitmap, just past the 8-byte block header.
+    // Flip a byte in the presence bitmap, just past the 4-byte block header.
     assert_corruption_rejected(bytes, block0 + BLOCK_HEADER, "fts/bitset block presence");
+}
+
+#[test]
+fn corrupt_fts_short_term_body_rejected() {
+    // A single-block term is written in the short form — a header-less
+    // body in the postings region. It rides inside the region's CRC like
+    // every long-form term; pin that a flip inside such a body is caught
+    // at open. `alpha` is in every doc (long form, first in lex order);
+    // `pair` is in two docs (short form), so its body starts where
+    // `alpha`'s region ends — the length field at header offset 12.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig::new("title")],
+        vec![],
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let n = CRC_TEST_N_DOCS;
+    let ids = decimal128_ids(0..n as u64);
+    let titles = LargeStringArray::from(
+        (0..n)
+            .map(|i| if i < 2 { "alpha pair" } else { "alpha" })
+            .collect::<Vec<_>>(),
+    );
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
+        .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = b.finish().expect("finish builder");
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    let postings_offset_rel = u64::from_le_bytes(
+        bytes[fts_off + 32..fts_off + 40]
+            .try_into()
+            .expect("postings offset"),
+    ) as usize;
+    let term0 = fts_off + postings_offset_rel;
+    const POSTINGS_LENGTH_OFF: usize = 12;
+    let alpha_len = u32::from_le_bytes(
+        bytes[term0 + POSTINGS_LENGTH_OFF..term0 + POSTINGS_LENGTH_OFF + 4]
+            .try_into()
+            .expect("postings length"),
+    ) as usize;
+    let pair_body = term0 + alpha_len;
+    // The short body leads with its varint df: two docs.
+    assert_eq!(bytes[pair_body], 2, "short body must lead with df = 2");
+    assert_corruption_rejected(bytes, pair_body + 1, "fts/short-form term body");
 }
 
 /// FTS blob range only (the positional fixture has no vector blob, so

@@ -19,7 +19,10 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue, tokenize::Phrase},
+        fts::{
+            builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue, short::short_df,
+            tokenize::Phrase,
+        },
     },
 };
 
@@ -320,7 +323,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict = self.open_dict(&fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory FST lookups. Absent and inline
@@ -329,18 +332,27 @@ impl FtsReader {
         // which token slot it fills so results scatter back in order.
         let mut dfs = vec![0u64; tokens.len()];
         let mut header_ranges: Vec<(usize, Option<usize>)> = Vec::new();
-        let mut pfor_slots: Vec<usize> = Vec::new();
+        let mut pfor_slots: Vec<(usize, bool)> = Vec::new();
         for (i, token) in tokens.iter().enumerate() {
             let key = make_key(&col_meta.name, token);
             match dict.lookup(&key) {
                 None => {}
-                Some(packed) => match FstValue::unpack(packed) {
+                Some(packed) => match packed {
                     FstValue::Inline { .. } => dfs[i] = 1,
                     FstValue::Pfor {
-                        metadata_offset, ..
+                        metadata_offset,
+                        postings_length_hint,
+                        short,
                     } => {
-                        header_ranges.push((metadata_offset as usize, Some(TERM_META_SIZE)));
-                        pfor_slots.push(i);
+                        // A long term's df heads its 20-byte header; a
+                        // short body is at most a few hundred bytes and
+                        // leads with its df, so fetch it whole.
+                        let len = match short {
+                            true => postings_length_hint.map(|l| l as usize),
+                            false => Some(TERM_META_SIZE),
+                        };
+                        header_ranges.push((metadata_offset as usize, len));
+                        pfor_slots.push((i, short));
                     }
                 },
             }
@@ -359,7 +371,7 @@ impl FtsReader {
             let fetched = self.fetch_term_postings(&header_ranges).await?;
             work.planned_ranges += header_ranges.len() as u64;
             let (decoded, decode_ns) = timed_section(|| {
-                for (fetched_idx, &slot) in pfor_slots.iter().enumerate() {
+                for (fetched_idx, &(slot, short)) in pfor_slots.iter().enumerate() {
                     let header = fetched.get(fetched_idx).ok_or_else(|| {
                         FtsError::Read(ReadError::MalformedVersion(
                             "term_dfs: fetched fewer headers than requested".into(),
@@ -367,6 +379,14 @@ impl FtsReader {
                     })?;
                     work.postings_bytes += header.len() as u64;
                     let header_bytes = header.as_ref();
+                    if short {
+                        dfs[slot] = u64::from(short_df(header_bytes).ok_or_else(|| {
+                            FtsError::Read(ReadError::MalformedVersion(
+                                "term_dfs: malformed short-form term body".into(),
+                            ))
+                        })?);
+                        continue;
+                    }
                     if header_bytes.len() < U32_BYTES {
                         return Err(FtsError::Read(ReadError::MalformedVersion(
                             "term_dfs: short postings header".into(),
@@ -404,7 +424,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        posting::{self, ENCODING_BITSET, ENCODING_PACKED},
+        posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
         tokenize::AsciiLowerTokenizer,
     };
 
@@ -674,9 +694,11 @@ mod tests {
         let mix = &cursors[0];
         let (mut saw_bitset, mut saw_packed) = (false, false);
         for blk in mix.blocks.iter() {
-            match mix.bytes.as_ref()[blk.block_byte_offset + posting::ENCODING_OFF] {
+            match posting::block_encoding(
+                &mix.bytes.as_ref()[blk.block_byte_offset..blk.block_byte_end],
+            ) {
                 ENCODING_BITSET => saw_bitset = true,
-                ENCODING_PACKED => saw_packed = true,
+                ENCODING_PACKED | ENCODING_PATCHED => saw_packed = true,
                 other => panic!("unexpected encoding byte {other}"),
             }
         }

@@ -625,6 +625,51 @@ fn store_phases_from_measurement(measured: Option<ColdStoreMeasurement>) -> cost
 /// `(wall_s, io, peak_rss_bytes, cpu_s)` for one metered `optimize()` pass.
 type CompactionStats = (f64, storage_meter::ObjectStoreMeter, u64, Option<f64>);
 
+/// Docs a compacted superfile holds under the lifecycle's compaction target.
+///
+/// Compaction packs inputs by bytes, but a query runs one thread per
+/// superfile, so post-compaction latency is bound by the doc count of the
+/// largest superfile, not its size. Sizing the target from the table's own
+/// bytes per doc pins that count: two builds of the same corpus compact to
+/// the same shape even when one stores its index far denser, and the warm
+/// rows then compare readers rather than how many docs a 1 GiB output
+/// happened to absorb. Chosen to match what the default 1 GiB target yields
+/// on the realistic FTS corpus, so the shape the gates have always measured
+/// is preserved.
+const COMPACTION_DOCS_PER_SUPERFILE: u64 = 200_000;
+
+/// Headroom on the derived target so per-superfile size variance around the
+/// mean cannot drop the last input of a job and shift the whole shape.
+const COMPACTION_TARGET_HEADROOM_PERCENT: u64 = 5;
+
+/// Compaction settings whose byte target holds
+/// [`COMPACTION_DOCS_PER_SUPERFILE`] docs of this table.
+fn shape_pinned_compaction(table: &Supertable) -> CompactionSettings {
+    let (mut docs, mut bytes) = (0u64, 0u64);
+    visit_manifest_superfiles(table, |entry| {
+        docs = docs.saturating_add(entry.n_docs);
+        if let Some(offsets) = entry.subsection_offsets.as_ref() {
+            bytes = bytes.saturating_add(offsets.total_size);
+        }
+    });
+    let bytes_per_superfile =
+        (bytes as u128 * COMPACTION_DOCS_PER_SUPERFILE as u128 / docs.max(1) as u128) as u64;
+    let with_headroom =
+        bytes_per_superfile.saturating_mul(100 + COMPACTION_TARGET_HEADROOM_PERCENT) / 100;
+    let target_superfile_size_mb = with_headroom.div_ceil(1 << 20).max(1);
+    let defaults = CompactionSettings::default();
+    CompactionSettings {
+        target_superfile_size_mb,
+        // Keep the merge's memory ceiling the same distance above the target
+        // as the defaults keep it, so a denser table's smaller target never
+        // tightens it and a larger one is never capped below a full output.
+        max_memory_mb: defaults.max_memory_mb.max(
+            target_superfile_size_mb + (defaults.max_memory_mb - defaults.target_superfile_size_mb),
+        ),
+        ..defaults
+    }
+}
+
 /// Metered [`Supertable::optimize`] — same shape as the vector compaction
 /// window (wall / CPU / RSS / UsageMeter delta), without drain/delta.
 fn run_metered_optimize(
@@ -636,10 +681,15 @@ fn run_metered_optimize(
         "[{label}] before optimize: {} superfiles",
         consumer.reader().expect("reader").n_superfiles()
     );
-    eprintln!("[{label}] compacting (optimize)...");
+    let compaction = shape_pinned_compaction(consumer);
+    eprintln!(
+        "[{label}] compacting (optimize; target {} MiB ≈ {} docs per superfile)...",
+        compaction.target_superfile_size_mb, COMPACTION_DOCS_PER_SUPERFILE
+    );
     let before = meter.snapshot();
     let sampler = PeakSampler::start_default();
-    let (result, wall, cpu_s) = cpu::timed(|| consumer.optimize(&OptimizeOptions::default()));
+    let (result, wall, cpu_s) =
+        cpu::timed(|| consumer.optimize(&OptimizeOptions::compact(compaction)));
     result.expect("optimize (compaction)");
     let wall_s = wall.as_secs_f64();
     let rss_stats = sampler.stop_stats();

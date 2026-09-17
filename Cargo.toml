@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -460,6 +460,12 @@ required-features = ["test-helpers"]
 
 [[example]]
 name = "profile_fts_build"
+required-features = ["test-helpers"]
+
+# `index_size_report` reads superfiles through the format-layer reader
+# and builds one from a corpus through the supertable layer.
+[[example]]
+name = "index_size_report"
 required-features = ["test-helpers"]
 
 # `locomo-recall` uses only the public `infino::*` surface (connect, create_table,

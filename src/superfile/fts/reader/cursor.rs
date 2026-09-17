@@ -6,7 +6,7 @@
 //! the scorers, phrase walk, and count kernels drive. Scoped `pub(super)`
 //! to the `reader/` module — never referenced outside the FTS layer.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use bytes::Bytes;
 
@@ -21,16 +21,43 @@ use crate::superfile::{
     format::{
         self,
         fts::{
-            POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, U32_BYTES, U64_BYTES,
-            skip_entry, term_meta,
+            BlockLayout, POSITION_SUBINDEX_ENTRIES_PER_BLOCK, POSITION_SUBINDEX_STRIDE, SkipLayout,
+            U32_BYTES, U64_BYTES, coarse_slot, skip_entry, term_meta,
         },
     },
     fts::{
         bm25,
-        builder::{SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
-        posting::{self, BLOCK_LEN, decode_block, decode_block_doc_ids},
+        builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
+        posting::{
+            BLOCK_LEN, BlockHeader, ENCODING_BITSET, block_encoding, decode_block,
+            decode_block_doc_ids, decode_block_tfs,
+        },
+        short::decode_short,
     },
 };
+
+/// How a blob lays out the position run-offset sub-index each
+/// positional long-form term carries between its skip table and its
+/// blocks — decided by the blob version at open.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) enum SubindexKind {
+    /// `V1`/`V2`: no sub-index; the phrase decode walks a block's runs
+    /// from the block start. Also `V7`+, whose grouped positions are
+    /// decoded whole per block and indexed by tf prefix sums.
+    None,
+    /// `V3`–`V6`: `u32` offsets absolute within the term's positions.
+    Wide,
+}
+
+impl SubindexKind {
+    /// Bytes one sub-index entry occupies (zero when there is none).
+    pub(super) fn entry_bytes(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Wide => U32_BYTES,
+        }
+    }
+}
 
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —
@@ -64,6 +91,8 @@ pub(super) struct TermMeta {
     /// skip table on a `VERSION_V3` positional term. `None` on
     /// `V1`/`V2` (no sub-index) and on positionless terms.
     pub(super) subindex_start: Option<usize>,
+    /// The sub-index entry layout `subindex_start` points at.
+    pub(super) subindex: SubindexKind,
     /// Absolute offset (within the postings region) of the coarse
     /// block-max table — `ceil(num_blocks / COARSE_BLOCK_MAX_SPAN)`
     /// 4-byte slots at the tail of the term region.
@@ -76,6 +105,22 @@ pub(super) struct TermMeta {
     /// later). `false` for V1–V4 — the ranked walk then skips the coarse
     /// level.
     pub(super) has_coarse: bool,
+    /// A short-form term (`fts::short`, V7): one block, no header, skip
+    /// table, sub-index or coarse table in its bytes. Only `df`,
+    /// `num_blocks == 1` and the positions fields are meaningful; the
+    /// per-block accessors that read the skip table must not be called.
+    /// Its one block's position runs start at offset 0 of the term's
+    /// positions bytes.
+    pub(super) short: bool,
+    /// Whether the term's positions are per-block **groups** behind a
+    /// one-byte width header (`V7`) rather than bare LEB128 runs.
+    pub(super) positions_grouped: bool,
+    /// Which header the term's blocks carry.
+    pub(super) block_layout: BlockLayout,
+    /// How the skip table locates the blocks.
+    pub(super) skip: SkipLayout,
+    /// Bytes per skip entry under `skip` on this column.
+    skip_entry_bytes: usize,
 }
 
 impl TermMeta {
@@ -87,9 +132,13 @@ impl TermMeta {
         postings: &[u8],
         metadata_offset: usize,
         positional: bool,
-        has_subindex: bool,
-        has_coarse: bool,
+        subindex: SubindexKind,
+        stored: StoredBound,
+        positions_grouped: bool,
     ) -> Result<Self, FtsError> {
+        let has_coarse = stored.has_coarse();
+        let skip = stored.skip_layout();
+        let skip_entry_bytes = skip.entry_bytes(positional);
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
         // skip table starts after whichever stride applies. The
@@ -140,7 +189,7 @@ impl TermMeta {
             )));
         }
         let skip_start = metadata_offset + term_meta_size;
-        let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
+        let skip_end = skip_start + num_blocks * skip_entry_bytes;
         if skip_end > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "skip table runs past postings region".into(),
@@ -150,10 +199,10 @@ impl TermMeta {
         // skip table: `num_blocks × ENTRIES_PER_BLOCK` u32s. Bound it now;
         // the blocks follow it (their offsets are read from the skip
         // table, which the writer already shifted past the sub-index).
-        let subindex_start = match has_subindex {
-            true => {
-                let subindex_end =
-                    skip_end + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * U32_BYTES;
+        let subindex_start = match subindex {
+            SubindexKind::Wide => {
+                let subindex_end = skip_end
+                    + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes();
                 if subindex_end > postings.len() {
                     return Err(FtsError::Read(ReadError::MalformedVersion(
                         "position sub-index runs past postings region".into(),
@@ -161,16 +210,25 @@ impl TermMeta {
                 }
                 Some(skip_end)
             }
-            false => None,
+            SubindexKind::None => None,
         };
         // Coarse block-max table (V5 and later): `ceil(num_blocks / span)`
         // slots at the tail of the term region, so the blocks end where it
         // begins. V1–V4 blobs have no such table — the blocks run to
         // `postings_length` and the ranked walk skips the coarse level.
         let coarse_size = match has_coarse {
-            true => num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * U32_BYTES,
+            true => {
+                num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * skip.coarse_slot_bytes()
+            }
             false => 0,
         };
+        // The length layout reaches a block through its span's start
+        // offset, so it exists only alongside the coarse table.
+        if skip == SkipLayout::Length && !has_coarse {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "length-coded skip table without a coarse table".into(),
+            )));
+        }
         if coarse_size > postings_length {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "coarse block-max table larger than the term region".into(),
@@ -185,10 +243,40 @@ impl TermMeta {
             positions_offset,
             positions_length,
             subindex_start,
+            subindex,
             coarse_start,
             blocks_end_in_term,
             has_coarse,
+            short: false,
+            positions_grouped,
+            block_layout: stored.block_layout(),
+            skip,
+            skip_entry_bytes,
         })
+    }
+
+    /// The metadata a short-form term implies: it has no header to
+    /// parse, so the phrase path builds this from the decoded body's
+    /// `df`. Its position group is inline in the body (the member's
+    /// `positions` bytes are that slice), so the region fields are zero.
+    pub(super) fn for_short(df: u64) -> Self {
+        Self {
+            df,
+            num_blocks: 1,
+            skip_start: 0,
+            positions_offset: 0,
+            positions_length: 0,
+            subindex_start: None,
+            subindex: SubindexKind::None,
+            coarse_start: 0,
+            blocks_end_in_term: 0,
+            has_coarse: false,
+            short: true,
+            positions_grouped: true,
+            block_layout: BlockLayout::Compact,
+            skip: SkipLayout::Length,
+            skip_entry_bytes: 0,
+        }
     }
 
     /// Raw coarse slot `g`, bounding every block in span `g` (blocks
@@ -196,8 +284,18 @@ impl TermMeta {
     /// has interpreted it. Coarse entries exist only where `has_coarse`.
     #[inline]
     pub(super) fn coarse_slot(&self, postings: &[u8], g: usize) -> u32 {
-        let at = self.coarse_start + g * U32_BYTES;
+        let at = self.coarse_start + g * self.skip.coarse_slot_bytes() + coarse_slot::BOUND_OFF;
         read_u32_le(&postings[at..at + U32_BYTES])
+    }
+
+    /// Term-relative byte offset of span `g`'s first block (length
+    /// layout only, where the slot records it).
+    #[inline]
+    fn coarse_span_start(&self, postings: &[u8], g: usize) -> usize {
+        debug_assert_eq!(self.skip, SkipLayout::Length);
+        let at =
+            self.coarse_start + g * self.skip.coarse_slot_bytes() + coarse_slot::SPAN_START_OFF;
+        read_u32_le(&postings[at..at + U32_BYTES]) as usize
     }
 
     /// For a `VERSION_V3` positional term, the run offset of the nearest
@@ -217,65 +315,122 @@ impl TermMeta {
         let start = self.subindex_start?;
         let slot = pair_in_block / POSITION_SUBINDEX_STRIDE;
         let idx = block * POSITION_SUBINDEX_ENTRIES_PER_BLOCK + slot;
-        let at = start + idx * U32_BYTES;
-        let checkpoint = read_u32_le(&postings[at..at + U32_BYTES]);
         let runs_to_skip = pair_in_block % POSITION_SUBINDEX_STRIDE;
+        let checkpoint = match self.subindex {
+            SubindexKind::Wide => {
+                let at = start + idx * U32_BYTES;
+                read_u32_le(&postings[at..at + U32_BYTES])
+            }
+            SubindexKind::None => return None,
+        };
         Some((checkpoint, runs_to_skip))
     }
 
-    /// Skip-table entry `i` as `(last_doc_id, block_offset_in_term,
-    /// raw bound slot)`. `block_offset_in_term` is relative to the
-    /// term's `metadata_offset`; the slot is what a
-    /// [`super::bounds::BoundDecoder`] turns into the block's upper
-    /// bound. The positions field (entry bytes 12..16) is read
-    /// separately. Per-entry on purpose — the single-term BMW walk
+    /// Byte offset of skip entry `i`.
+    #[inline]
+    fn entry_off(&self, i: usize) -> usize {
+        debug_assert!(!self.short, "a short-form term has no skip table");
+        debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
+        self.skip_start + i * self.skip_entry_bytes
+    }
+
+    /// Skip-table entry `i` as `(last_doc_id, raw bound slot)`. The slot
+    /// is what a [`super::bounds::BoundDecoder`] turns into the block's
+    /// upper bound. Per-entry on purpose — the single-term BMW walk
     /// streams entries without materializing a `Vec`.
     #[inline]
-    pub(super) fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, usize, u32) {
-        debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
-        let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
+    pub(super) fn skip_entry(&self, postings: &[u8], i: usize) -> (u32, u32) {
+        let entry_off = self.entry_off(i);
         let last_doc_id = read_u32_le(
             &postings[entry_off + skip_entry::LAST_DOC_ID_OFF
                 ..entry_off + skip_entry::LAST_DOC_ID_OFF + U32_BYTES],
         );
-        let block_offset = read_u32_le(
-            &postings[entry_off + skip_entry::BLOCK_OFFSET_OFF
-                ..entry_off + skip_entry::BLOCK_OFFSET_OFF + U32_BYTES],
-        ) as usize;
-        let bound_slot = read_u32_le(
-            &postings[entry_off + skip_entry::MAX_BM25_OFF
-                ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
-        );
-        (last_doc_id, block_offset, bound_slot)
+        let bound_at = entry_off + self.skip.bound_off();
+        let bound_slot = read_u32_le(&postings[bound_at..bound_at + U32_BYTES]);
+        (last_doc_id, bound_slot)
     }
 
-    /// This block's position-run byte offset within the term's
-    /// positions bytes — the skip entry's fourth field (zero on
-    /// positionless columns, where it is the reserved slot).
+    /// The last doc id of the block before `i` — what block `i`'s
+    /// compact header derives its base from. `None` for the first block.
+    #[inline]
+    pub(super) fn prev_last_doc_id(&self, postings: &[u8], i: usize) -> Option<u32> {
+        match i {
+            0 => None,
+            _ => {
+                let entry_off = self.entry_off(i - 1);
+                Some(read_u32_le(
+                    &postings[entry_off + skip_entry::LAST_DOC_ID_OFF
+                        ..entry_off + skip_entry::LAST_DOC_ID_OFF + U32_BYTES],
+                ))
+            }
+        }
+    }
+
+    /// Block `i`'s encoded byte length (length layout).
+    #[inline]
+    fn block_len(&self, postings: &[u8], i: usize) -> usize {
+        let at = self.entry_off(i) + skip_entry::BLOCK_LEN_OFF;
+        u16::from_le_bytes([postings[at], postings[at + 1]]) as usize
+    }
+
+    /// Block `i`'s term-relative byte range. Under the length layout a
+    /// sequential walk passes the previous block's `end` and pays one
+    /// `u16` read; a random block sums the lengths from its span's
+    /// recorded start, at most `COARSE_BLOCK_MAX_SPAN - 1` of them.
+    #[inline]
+    pub(super) fn block_range_in_term(
+        &self,
+        postings: &[u8],
+        i: usize,
+        prev_end: Option<usize>,
+    ) -> Range<usize> {
+        match self.skip {
+            SkipLayout::Absolute => {
+                let at = self.entry_off(i) + skip_entry::BLOCK_OFFSET_OFF;
+                let start = read_u32_le(&postings[at..at + U32_BYTES]) as usize;
+                let end = match i + 1 < self.num_blocks {
+                    true => {
+                        let next = self.entry_off(i + 1) + skip_entry::BLOCK_OFFSET_OFF;
+                        read_u32_le(&postings[next..next + U32_BYTES]) as usize
+                    }
+                    // The coarse block-max table follows the last block,
+                    // so the blocks end before it — not at `postings_length`.
+                    false => self.blocks_end_in_term,
+                };
+                start..end
+            }
+            SkipLayout::Length => {
+                let start = match prev_end {
+                    Some(end) => end,
+                    None => {
+                        let span = format::fts::COARSE_BLOCK_MAX_SPAN;
+                        let g = i / span;
+                        let mut at = self.coarse_span_start(postings, g);
+                        for j in g * span..i {
+                            at += self.block_len(postings, j);
+                        }
+                        at
+                    }
+                };
+                start..start + self.block_len(postings, i)
+            }
+        }
+    }
+
+    /// This block's position-group byte offset within the term's
+    /// positions bytes (zero on a positionless column).
     #[inline]
     pub(super) fn positions_block_offset(&self, postings: &[u8], i: usize) -> u32 {
         debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
-        let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
-        read_u32_le(
-            &postings[entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF
-                ..entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF + U32_BYTES],
-        )
-    }
-
-    /// End offset (relative to the term's `metadata_offset`) of block
-    /// `i`'s bytes. Blocks are concatenated back-to-back, so each
-    /// block ends where the next one's `block_offset` begins; the last
-    /// block ends at `postings_length`.
-    #[inline]
-    pub(super) fn block_end_in_term(&self, postings: &[u8], i: usize) -> usize {
-        if i + 1 < self.num_blocks {
-            let next_off = self.skip_start + (i + 1) * SKIP_ENTRY_SIZE;
-            read_u32_le(&postings[next_off + 4..next_off + 8]) as usize
-        } else {
-            // The coarse block-max table follows the last block, so the
-            // blocks end before it — not at `postings_length`.
-            self.blocks_end_in_term
+        if self.short {
+            // One block whose runs are the whole of the term's positions.
+            return 0;
         }
+        if self.skip_entry_bytes <= self.skip.positions_off() {
+            return 0; // length layout, positionless column: no field
+        }
+        let at = self.entry_off(i) + self.skip.positions_off();
+        read_u32_le(&postings[at..at + U32_BYTES])
     }
 }
 
@@ -389,6 +544,17 @@ pub(crate) struct TermCursor {
     /// without expanding the block's doc ids. Lets the probe reuse the
     /// decoded tfs across a run of candidates landing in the same block.
     pub(super) tf_decoded_block: usize,
+    /// The whole posting list is already in `block_doc_ids[..block_n]` /
+    /// `block_tfs[..block_n]` and `blocks` has exactly one entry with no
+    /// bytes behind it: the df=1 inline form and the short form
+    /// (`fts::short`). Such a cursor never decodes; the membership probes
+    /// binary-search the buffer instead of reading a block encoding.
+    pub(super) predecoded: bool,
+    /// Which header the blocks carry (from the blob version).
+    pub(super) layout: BlockLayout,
+    /// The parsed header of the block it names — the membership probes
+    /// visit one block many times and must not re-parse it per probe.
+    header_cache: Option<(usize, BlockHeader)>,
 }
 
 impl TermCursor {
@@ -417,8 +583,9 @@ impl TermCursor {
             postings,
             metadata_offset,
             col.positions,
+            SubindexKind::None,
+            stored,
             false,
-            stored.has_coarse(),
         )?;
         let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);
         // Effective idf folds in the query-term-frequency `weight` (> 1
@@ -435,16 +602,19 @@ impl TermCursor {
         // entry per 128-doc block), so the doubled write showed up on
         // common-term queries.
         let mut term_max_bm25: f32 = 0.0;
+        let mut prev_end: Option<usize> = None;
         let blocks: Arc<[BlockMeta]> = (0..term_meta.num_blocks)
             .map(|i| {
-                let (last_doc_id, block_offset_in_term, raw) = term_meta.skip_entry(postings, i);
+                let (last_doc_id, raw) = term_meta.skip_entry(postings, i);
                 let block_max_bm25 = bounds.bound(raw);
                 term_max_bm25 = term_max_bm25.max(block_max_bm25);
+                let range = term_meta.block_range_in_term(postings, i, prev_end);
+                prev_end = Some(range.end);
 
                 BlockMeta {
                     last_doc_id,
-                    block_byte_offset: metadata_offset + block_offset_in_term,
-                    block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
+                    block_byte_offset: metadata_offset + range.start,
+                    block_byte_end: metadata_offset + range.end,
                     block_max_bm25,
                 }
             })
@@ -466,11 +636,77 @@ impl TermCursor {
             count_only,
             decoded_block: usize::MAX,
             tf_decoded_block: usize::MAX,
+            predecoded: false,
+            layout: term_meta.block_layout,
+            header_cache: None,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
         }
         Ok(cursor)
+    }
+
+    /// Build a cursor from a short-form body (`fts::short`): decode the
+    /// whole list — at most one block — into the cursor's buffers and
+    /// synthesize its single block's metadata. The block's upper bound
+    /// is computed here, at the query's own statistics, as the maximum
+    /// per-doc score over the decoded postings: exact, and no stored
+    /// slot to decode. `body` is kept as `bytes` so the work tallies
+    /// count the range that was fetched.
+    pub(super) fn new_short(
+        body: Bytes,
+        col: &ColumnMeta,
+        global_idf: Option<f32>,
+        weight: u32,
+        header_probed: bool,
+    ) -> Result<Self, FtsError> {
+        let mut block_doc_ids = vec![0u32; BLOCK_LEN];
+        let mut block_tfs = vec![0u32; BLOCK_LEN];
+        let decoded = decode_short(
+            body.as_ref(),
+            col.positions,
+            &mut block_doc_ids,
+            &mut block_tfs,
+        )
+        .ok_or_else(|| {
+            FtsError::Read(ReadError::MalformedVersion(
+                "malformed short-form term body".into(),
+            ))
+        })?;
+        let n = decoded.n;
+        let local_idf = bm25::idf(col.scored_doc_count(), n as u64);
+        let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
+        let block_max_bm25 = block_doc_ids[..n]
+            .iter()
+            .zip(&block_tfs[..n])
+            .map(|(&d, &t)| bm25::score_with_dl_norm_k1(idf_weight, t, col.dl_norm_k1.get(d)))
+            .fold(0.0f32, f32::max);
+        let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
+            last_doc_id: block_doc_ids[n - 1],
+            block_byte_offset: 0,
+            block_byte_end: 0,
+            block_max_bm25,
+        }]);
+        Ok(Self {
+            idf_weight,
+            term_max_bm25: block_max_bm25,
+            df: n as u64,
+            blocks,
+            block_doc_ids,
+            block_tfs,
+            block_n: n,
+            current_block: 0,
+            pos: 0,
+            inspect_block: 0,
+            bytes: body,
+            header_probed,
+            count_only: false,
+            decoded_block: 0,
+            tf_decoded_block: 0,
+            predecoded: true,
+            layout: BlockLayout::Compact,
+            header_cache: None,
+        })
     }
 
     /// Synthesize a cursor for a df=1 inline-encoded term. Skips the
@@ -526,19 +762,56 @@ impl TermCursor {
             count_only: false,
             decoded_block: 0,
             tf_decoded_block: 0,
+            predecoded: true,
+            layout: BlockLayout::Compact,
+            header_cache: None,
         }
     }
 
+    /// Block `b`'s parsed header. The compact layout derives the base
+    /// doc id from the previous block's `last_doc_id`, which the skip
+    /// table gave us at construction.
+    #[inline]
+    pub(super) fn block_header(&self, b: usize) -> BlockHeader {
+        let block = self.blocks[b];
+        let prev = match b {
+            0 => None,
+            _ => Some(self.blocks[b - 1].last_doc_id),
+        };
+        BlockHeader::parse(
+            &self.bytes[block.block_byte_offset..block.block_byte_end],
+            self.layout,
+            prev,
+        )
+    }
+
+    /// The current block's parsed header, cached across probes of the
+    /// same block.
+    #[inline]
+    fn current_header(&mut self) -> BlockHeader {
+        let b = self.current_block;
+        if let Some((cached, hdr)) = self.header_cache
+            && cached == b
+        {
+            return hdr;
+        }
+        let hdr = self.block_header(b);
+        self.header_cache = Some((b, hdr));
+        hdr
+    }
+
     pub(super) fn decode_current_block(&mut self) {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
         let block = self.blocks[self.current_block];
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
+        let hdr = self.current_header();
         let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
         // Count-only cursors skip the tf half of the block; the count
         // kernels never read `block_tfs`, so it is left stale.
         self.block_n = match self.count_only {
-            true => decode_block_doc_ids(bytes, &mut self.block_doc_ids),
-            false => decode_block(bytes, &mut self.block_doc_ids, &mut self.block_tfs),
+            true => decode_block_doc_ids(bytes, &hdr, &mut self.block_doc_ids),
+            false => decode_block(bytes, &hdr, &mut self.block_doc_ids, &mut self.block_tfs),
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
@@ -565,9 +838,12 @@ impl TermCursor {
         if self.current_block >= self.blocks.len() {
             return false;
         }
-        // Inline (df=1) cursor: single pre-decoded doc, no postings bytes.
-        if self.bytes.is_empty() {
-            return self.block_n > 0 && self.block_doc_ids[0] == doc;
+        // Pre-decoded (inline or short-form) cursor: the whole list is in
+        // the buffer, no block bytes to read.
+        if self.predecoded {
+            return self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .is_ok();
         }
         let block = self.blocks[self.current_block];
         // Borrow the block's bytes in place — `self.bytes` is held for the
@@ -576,21 +852,13 @@ impl TermCursor {
         // every membership probe; over a long driver it was ~11% of the
         // intersection-count time (and wasted on the PACKED path, which
         // only reads the encoding byte before falling to the decode cache).
+        let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET {
-            let base = read_u32_le(&raw[4..8]);
-            if doc < base {
-                return false;
+        if hdr.encoding == ENCODING_BITSET {
+            match Self::bitset_word(raw, &hdr, doc) {
+                Some((bit, word, _)) => (word >> (bit % 64)) & 1 == 1,
+                None => false,
             }
-            let bit = (doc - base) as usize;
-            let tfs_size = BLOCK_LEN * raw[2] as usize / 8;
-            let bitset_end = raw.len() - tfs_size;
-            let word_at = posting::HEADER_SIZE + (bit / 64) * 8;
-            if word_at + 8 > bitset_end {
-                return false; // past this block's presence bits ⇒ absent
-            }
-            let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
-            (word >> (bit % 64)) & 1 == 1
         } else {
             // Borrow of `raw` ends above; the decode needs `&mut self`.
             if self.decoded_block != self.current_block {
@@ -635,10 +903,29 @@ impl TermCursor {
     /// `bit`'s position; `bitset_end` is the end of the presence bitmap (start of
     /// the tf array). Shared by [`Self::bitset_probe_tf`] (which first checks the
     /// bit is set) and [`Self::tf_at_contained`] (which knows it is).
+    /// Locate `doc` in a bitset block: its bit index within the presence
+    /// bitset, the word holding it and where the bitset ends (the tf
+    /// array's start). `None` when `doc` lies below the block's origin or
+    /// past its last word — absent either way.
     #[inline]
-    fn bitset_tf_rank(raw: &[u8], bit: usize, word: u64, bitset_end: usize) -> u32 {
+    fn bitset_word(raw: &[u8], hdr: &BlockHeader, doc: u32) -> Option<(usize, u64, usize)> {
+        if doc < hdr.base {
+            return None;
+        }
+        let bit = (doc - hdr.base) as usize;
+        let bitset_end = raw.len() - hdr.tfs_size();
+        let word_at = hdr.payload() + (bit / 64) * 8;
+        if word_at + 8 > bitset_end {
+            return None;
+        }
+        let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+        Some((bit, word, bitset_end))
+    }
+
+    #[inline]
+    fn bitset_tf_rank(raw: &[u8], payload: usize, bit: usize, word: u64, bitset_end: usize) -> u32 {
         let word_idx = bit / 64;
-        let presence = &raw[posting::HEADER_SIZE..bitset_end];
+        let presence = &raw[payload..bitset_end];
         let mut rank: u32 = 0;
         for w in presence[..word_idx * 8].chunks_exact(8) {
             rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
@@ -660,16 +947,16 @@ impl TermCursor {
         if self.current_block >= self.blocks.len() {
             return None;
         }
-        // Inline (df=1) cursor: single pre-decoded posting, no postings bytes.
-        if self.bytes.is_empty() {
-            if self.block_n > 0 && self.block_doc_ids[0] == doc {
-                return Some(self.block_tfs[0]);
-            }
-            return None;
+        // Pre-decoded (inline or short-form) cursor: locate in the buffer.
+        if self.predecoded {
+            return self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .ok()
+                .map(|i| self.block_tfs[i]);
         }
         let block = self.blocks[self.current_block];
-        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if raw[posting::ENCODING_OFF] != posting::ENCODING_BITSET {
+        let hdr = self.current_header();
+        if hdr.encoding != ENCODING_BITSET {
             // PACKED: no rank shortcut — decode + locate like the old path.
             self.skip_to(doc);
             return if self.current_doc_id() == doc {
@@ -678,32 +965,20 @@ impl TermCursor {
                 None
             };
         }
-        let base = read_u32_le(&raw[4..8]);
-        if doc < base {
-            return None;
-        }
-        let bit = (doc - base) as usize;
-        let tf_bits = raw[2] as usize;
-        let tfs_size = BLOCK_LEN * tf_bits / 8;
-        let bitset_end = raw.len() - tfs_size;
-        let word_idx = bit / 64;
-        let word_at = posting::HEADER_SIZE + word_idx * 8;
-        if word_at + 8 > bitset_end {
-            return None; // past this block's presence bits ⇒ absent
-        }
-        let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        let (bit, word, bitset_end) = Self::bitset_word(raw, &hdr, doc)?;
         if (word >> (bit % 64)) & 1 == 0 {
             return None; // doc not present in this block
         }
         // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
-        let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
+        let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
         // Decode this block's tf array once (doc order), reused across a run of
-        // candidates in the same block; the doc ids are never expanded.
+        // candidates in the same block; the doc ids are never expanded. The
+        // union and intersection kernels probe a dense block many times, so
+        // one 128-lane unpack beats a bit-field read per probe (measured:
+        // reading the single lane cost union 7% and intersection 5%).
         if self.tf_decoded_block != self.current_block {
-            // Reuse `raw` (still borrowing this block's bytes, disjoint from
-            // the `&mut self.block_tfs` decode target) rather than recomputing
-            // the same subslice and its bounds check.
-            posting::decode_block_tfs(raw, &mut self.block_tfs);
+            decode_block_tfs(raw, &hdr, &mut self.block_tfs);
             self.tf_decoded_block = self.current_block;
         }
         Some(self.block_tfs[rank as usize])
@@ -968,24 +1243,22 @@ impl TermCursor {
     /// it doesn't shift their code offsets — those methods drive the flat-merge
     /// AND path, which is measurably sensitive to its own instruction layout.
     pub(super) fn tf_at_contained(&mut self, doc: u32) -> u32 {
-        // Inline (df=1) cursor: single pre-decoded posting.
-        if self.bytes.is_empty() {
-            return self.block_tfs[0];
+        // Pre-decoded (inline or short-form) cursor: locate in the buffer.
+        if self.predecoded {
+            let pos = self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .expect("contains(doc) confirmed presence");
+            return self.block_tfs[pos];
         }
         let block = self.blocks[self.current_block];
+        let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if raw[posting::ENCODING_OFF] == posting::ENCODING_BITSET {
-            let base = read_u32_le(&raw[4..8]);
-            let bit = (doc - base) as usize;
-            let tf_bits = raw[2] as usize;
-            let tfs_size = BLOCK_LEN * tf_bits / 8;
-            let bitset_end = raw.len() - tfs_size;
-            let word_idx = bit / 64;
-            let word_at = posting::HEADER_SIZE + word_idx * 8;
-            let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
-            let rank = Self::bitset_tf_rank(raw, bit, word, bitset_end);
+        if hdr.encoding == ENCODING_BITSET {
+            let (bit, word, bitset_end) =
+                Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
+            let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
             if self.tf_decoded_block != self.current_block {
-                posting::decode_block_tfs(raw, &mut self.block_tfs);
+                decode_block_tfs(raw, &hdr, &mut self.block_tfs);
                 self.tf_decoded_block = self.current_block;
             }
             self.block_tfs[rank as usize]
@@ -1008,14 +1281,13 @@ impl TermCursor {
     /// out-of-line so it stays clear of the hot doc-cursor methods' layout.
     #[cold]
     pub(super) fn is_bitset_dense(&self) -> bool {
-        if self.bytes.is_empty() {
-            return false; // inline df=1 cursor: no postings bytes
+        if self.predecoded {
+            return false; // inline / short-form cursor: no block bytes
         }
         match self.blocks.first() {
             Some(block) => {
-                self.bytes
-                    .get(block.block_byte_offset + posting::ENCODING_OFF)
-                    == Some(&posting::ENCODING_BITSET)
+                block_encoding(&self.bytes[block.block_byte_offset..block.block_byte_end])
+                    == ENCODING_BITSET
             }
             None => false,
         }
@@ -1030,6 +1302,7 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, LogNormal};
 
+    use super::*;
     use crate::superfile::fts::{
         bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
     };
@@ -1074,6 +1347,114 @@ mod tests {
         }
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A positional and a positionless column, each with a term spanning
+    /// many blocks whose gaps vary, so the length-coded skip table has
+    /// to be right in both entry widths.
+    fn two_column_reader() -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        let mut text = String::new();
+        for doc_id in 0..6000u32 {
+            // Every doc has `common`; a stretch of docs carries it several
+            // times, and every 500th doc is a long one.
+            text.clear();
+            let reps = if (doc_id / 128) % 3 == 0 { 3 } else { 1 };
+            for r in 0..reps {
+                text.push_str(&format!("filler{} common ", (doc_id + r) % 97));
+            }
+            if doc_id % 500 == 0 {
+                for i in 0..300 {
+                    text.push_str(&format!("w{i} "));
+                }
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add pos");
+            b.add_doc(1, doc_id, text.trim_end()).expect("add flat");
+        }
+        let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    #[tokio::test]
+    async fn length_coded_skip_entries_locate_every_block_by_either_route() {
+        let view = two_column_reader();
+        assert_eq!(view.bounds.skip_layout(), SkipLayout::Length);
+        for (col, positional) in [(0u32, true), (1u32, false)] {
+            let cursors = view
+                .build_term_cursors(col, &["common"], None, false, None, None)
+                .await
+                .expect("cursors");
+            let cursor = &cursors[0];
+            assert!(cursor.blocks.len() > 40, "{} blocks", cursor.blocks.len());
+            let postings: &[u8] = cursor.bytes.as_ref();
+            let meta = TermMeta::parse(
+                postings,
+                0,
+                positional,
+                SubindexKind::None,
+                view.bounds,
+                view.positions_grouped,
+            )
+            .expect("meta");
+            assert_eq!(meta.num_blocks, cursor.blocks.len());
+            assert_eq!(
+                meta.skip.entry_bytes(positional),
+                if positional { 14 } else { 10 }
+            );
+            // Sequential accumulation and the random route (span start plus
+            // summed lengths) agree with each other and with the cursor.
+            let mut prev_end = None;
+            let mut last_pos_off = 0u32;
+            for i in 0..meta.num_blocks {
+                let sequential = meta.block_range_in_term(postings, i, prev_end);
+                let random = meta.block_range_in_term(postings, i, None);
+                assert_eq!(sequential, random, "block {i}");
+                assert_eq!(
+                    sequential.start, cursor.blocks[i].block_byte_offset,
+                    "block {i}"
+                );
+                assert_eq!(sequential.end, cursor.blocks[i].block_byte_end, "block {i}");
+                prev_end = Some(sequential.end);
+                let (last_doc, _) = meta.skip_entry(postings, i);
+                assert_eq!(last_doc, cursor.blocks[i].last_doc_id);
+                assert_eq!(
+                    meta.prev_last_doc_id(postings, i),
+                    (i > 0).then(|| cursor.blocks[i - 1].last_doc_id)
+                );
+                let pos_off = meta.positions_block_offset(postings, i);
+                match positional {
+                    true => {
+                        assert!(i == 0 || pos_off > last_pos_off, "block {i} group offset");
+                        last_pos_off = pos_off;
+                    }
+                    false => assert_eq!(pos_off, 0, "no positions field"),
+                }
+            }
+            // The last block ends where the coarse table begins.
+            assert_eq!(prev_end, Some(meta.blocks_end_in_term));
+            // Every block decodes from its own range and its predecessor's
+            // last doc, and the term's docs come out ascending across blocks.
+            let mut prev_last: Option<u32> = None;
+            let mut d = vec![0u32; BLOCK_LEN];
+            for i in 0..meta.num_blocks {
+                let range = meta.block_range_in_term(postings, i, None);
+                let hdr =
+                    BlockHeader::parse(&postings[range.clone()], meta.block_layout, prev_last);
+                let n = decode_block_doc_ids(&postings[range], &hdr, &mut d);
+                assert!(
+                    prev_last.is_none_or(|p| p < d[0]),
+                    "block {i} starts after its predecessor"
+                );
+                assert!(
+                    d[..n].windows(2).all(|w| w[0] < w[1]),
+                    "block {i} ascending"
+                );
+                assert_eq!(d[n - 1], cursor.blocks[i].last_doc_id, "block {i} last doc");
+                prev_last = Some(d[n - 1]);
+            }
+        }
     }
 
     /// Per block of `common`: the bound its cursor decoded and the exact

@@ -92,20 +92,24 @@ use tracing::debug;
 
 use crate::superfile::{
     BuildError,
+    bits::PackScratch,
     format::{
         self, FST_SEPARATOR,
         checksum::{crc32c, crc32c_append},
+        fts::{BlobLayout, SkipLayout},
     },
     fts::{
         analysis::ChainTokenizer,
         bm25,
-        dict::{DictBuilder, StreamingDictBuilder},
+        dict::{StreamingTermDictBuilder, TermDictBuilder},
         fst_value::{FstValue, INLINE_TF_MAX},
-        positions::{encode_run, read_varint, skip_run},
-        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, encode_block},
+        positions::{encode_group, encode_run, skip_run},
+        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, block_encoding, encode_block},
         reader::ColumnLengthStats,
+        short::{SHORT_MAX_DF, encode_short},
         tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
     },
+    varint::read_varint,
 };
 
 /// Per-column term interner table.
@@ -173,6 +177,7 @@ struct FinishProfile {
     saw_bitset_block: bool,
     encode_calls: u64,
     encode_df1: u64,
+    encode_short: u64,
     encode_pfor: u64,
     encode_total: Duration,
     encode_block_build: Duration,
@@ -229,8 +234,14 @@ pub(crate) const TERM_META_SIZE: usize = 20;
 /// mix within one column.
 pub(crate) const TERM_META_POSITIONAL_SIZE: usize = 32;
 
-/// Skip-table entry size in bytes.
-pub(crate) const SKIP_ENTRY_SIZE: usize = 16;
+/// Largest document frequency at which a term's blocks may take the
+/// patched encoding. A patched block decodes about 15 ns slower than a
+/// plain one, and a common term's blocks are what every intersection
+/// and union over it expands in bulk; a term below this bar is walked
+/// in full only when it is itself a query term, a few dozen blocks at
+/// most. On a Zipfian corpus the bands below the bar hold ~60% of what
+/// the patched form saves, the bands above it the rest.
+const PATCHED_MAX_DF: usize = 16 * 1024;
 
 /// Doc-lengths directory entry size in bytes (per column).
 ///
@@ -312,6 +323,10 @@ const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))] // the older versions are written only by tests
 pub(crate) enum BlobEra {
+    /// [`format::fts::VERSION_V7`]: as [`Self::V6`], plus single-block
+    /// terms in the short form and the short/long flag in every
+    /// dictionary value.
+    V7,
     /// [`format::fts::VERSION_V6`]: coarse table, bounds in the scorer's
     /// scale, the declared average over documents with tokens.
     V6,
@@ -326,14 +341,32 @@ pub(crate) enum BlobEra {
 }
 
 impl BlobEra {
-    fn has_coarse(self) -> bool {
-        self != Self::V2ToV4
+    /// The version this era stamps, for the layout table. `V2ToV4` reads
+    /// as `V4` — the sub-index and the bitset encoding are written; the
+    /// header's version is then set by what the blob actually contains.
+    fn layout(self) -> BlobLayout {
+        let version = match self {
+            Self::V7 => format::fts::VERSION_V7,
+            Self::V6 => format::fts::VERSION_V6,
+            Self::V5 => format::fts::VERSION_V5,
+            Self::V2ToV4 => format::fts::VERSION_V4,
+        };
+        BlobLayout::for_version(version).expect("every era names a known version")
+    }
+
+    /// The per-document length as this era stores it — what both the
+    /// block-max bound and the reader's bucket are computed from.
+    fn stored_doc_length(self, len: u32) -> u32 {
+        match self.layout().doc_length_bytes {
+            format::fts::DOC_LENGTH_BYTES_V7 => len.min(format::fts::DOC_LENGTH_STORED_MAX),
+            _ => len,
+        }
     }
 
     /// The factor a stored bound of this era carries over the score.
     fn bound_scale(self, params: bm25::Bm25Params) -> f32 {
         match self {
-            Self::V6 => 1.0,
+            Self::V7 | Self::V6 => 1.0,
             Self::V5 | Self::V2ToV4 => params.k1 + 1.0,
         }
     }
@@ -341,7 +374,7 @@ impl BlobEra {
     /// Whether the statistics divide by every row (the pre-current
     /// defect) rather than by the documents that carry tokens.
     fn averages_over_rows(self) -> bool {
-        self != Self::V6
+        !matches!(self, Self::V7 | Self::V6)
     }
 }
 
@@ -1334,7 +1367,7 @@ pub struct FtsBuilder {
     /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
     /// ::Spilled`) keyed by `term_id` instead.
     bump: Bump,
-    /// Which blob era to emit. Always [`BlobEra::V6`] in production;
+    /// Which blob era to emit. Always [`BlobEra::V7`] in production;
     /// the backwards-compatibility tests pick an older one so the reader's
     /// legacy paths are exercised against faithfully written files.
     pub(crate) era: BlobEra,
@@ -1392,7 +1425,7 @@ impl FtsBuilder {
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
             bump: Bump::new(),
-            era: BlobEra::V6,
+            era: BlobEra::V7,
         }
     }
 
@@ -1931,9 +1964,11 @@ impl FtsBuilder {
     /// accumulate — keeping merged BM25 scores identical to a fresh build.
     pub(crate) fn append_prebuilt_doc_lengths(&mut self, column_id: u32, doc_lengths: &[u32]) {
         let total_tokens: u64 = doc_lengths.iter().map(|&dl| u64::from(dl)).sum();
+        let era = self.era;
         let col = &mut self.columns[column_id as usize];
         col.total_tokens += total_tokens;
-        col.doc_lengths.extend_from_slice(doc_lengths);
+        col.doc_lengths
+            .extend(doc_lengths.iter().map(|&dl| era.stored_doc_length(dl)));
         self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
     }
 
@@ -2133,7 +2168,9 @@ impl FtsBuilder {
         // `self.columns[col_idx]` is a disjoint field from
         // `self.postings[col_idx]`, so split-borrow legal.
         let col = &mut self.columns[col_idx];
-        let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
+        let dl_clamped: u32 = self
+            .era
+            .stored_doc_length(tokens_in_doc.min(u32::MAX as u64) as u32);
         col.doc_lengths.push(dl_clamped);
         col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
         let docs_now = local_doc_id.saturating_add(1);
@@ -2385,7 +2422,9 @@ impl FtsBuilder {
         }
 
         let col = &mut self.columns[col_idx];
-        let dl_clamped: u32 = tokens_in_doc.min(u32::MAX as u64) as u32;
+        let dl_clamped: u32 = self
+            .era
+            .stored_doc_length(tokens_in_doc.min(u32::MAX as u64) as u32);
         col.doc_lengths.push(dl_clamped);
         col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
         let docs_now = local_doc_id.saturating_add(1);
@@ -2665,7 +2704,7 @@ impl FtsBuilder {
         // The in-RAM path's FST sink: collect (key, value) into a
         // `DictBuilder` and serialise once at assembly time. No
         // scratch file, no streaming.
-        let mut fst_inram = DictBuilder::new();
+        let mut fst_inram = TermDictBuilder::new(era.layout().dict);
 
         let mut doc_lengths_by_orig_col: Vec<Option<Vec<u32>>> =
             (0..n_columns as usize).map(|_| None).collect();
@@ -2845,7 +2884,7 @@ impl FtsBuilder {
         let mut fst_streaming = {
             let fst_file = File::create(&fst_streaming_path)?;
             let bw = BufWriter::new(fst_file);
-            StreamingDictBuilder::new(bw).map_err(map_fst_err)?
+            StreamingTermDictBuilder::new(era.layout().dict, bw).map_err(map_fst_err)?
         };
 
         // Drain every spilled column's per-partition batch buffer
@@ -3321,13 +3360,13 @@ struct BlobAssemblyInputs {
 enum FstSinkFinish {
     /// In-RAM build: hand the populated `DictBuilder` to assembly,
     /// which calls `finish()` to produce the FST bytes in one shot.
-    InRam(DictBuilder),
+    InRam(TermDictBuilder),
     /// Spilled build: hand the open `StreamingDictBuilder` (and the
     /// scratch path it's been writing to) to assembly, which finishes
     /// the builder, computes the file's CRC by streaming, and copies
     /// the file into the output.
     Streaming {
-        builder: StreamingDictBuilder<BufWriter<File>>,
+        builder: StreamingTermDictBuilder<BufWriter<File>>,
         path: PathBuf,
     },
 }
@@ -3492,16 +3531,25 @@ fn assemble_and_write_blob<W: Write>(
         // is materially faster than the per-u32 `to_le_bytes`
         // + push loop, especially at the 10M-doc / column
         // scale where this writes 40 MB per column.
-        #[cfg(target_endian = "little")]
-        arrays_buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(&col_dls));
-        #[cfg(not(target_endian = "little"))]
-        for &dl in &col_dls {
-            arrays_buf.extend_from_slice(&dl.to_le_bytes());
+        let dl_bytes = era.layout().doc_length_bytes;
+        if dl_bytes == format::fts::DOC_LENGTH_BYTES_V7 {
+            // `add_doc` / the prebuilt carry already saturated every
+            // length to the stored width.
+            for &dl in &col_dls {
+                arrays_buf.extend_from_slice(&(dl as u16).to_le_bytes());
+            }
+        } else {
+            #[cfg(target_endian = "little")]
+            arrays_buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(&col_dls));
+            #[cfg(not(target_endian = "little"))]
+            for &dl in &col_dls {
+                arrays_buf.extend_from_slice(&dl.to_le_bytes());
+            }
         }
         let array_bytes = &arrays_buf[array_start..];
         let array_crc = crc32c(array_bytes);
         arrays_buf.extend_from_slice(&array_crc.to_le_bytes());
-        doc_lengths_array_offset += (col_dls.len() as u64) * 4 + 4;
+        doc_lengths_array_offset += (col_dls.len() as u64) * dl_bytes as u64 + 4;
     }
     let dir_crc = crc32c(&dir_buf);
     dir_buf.extend_from_slice(&dir_crc.to_le_bytes());
@@ -3531,6 +3579,7 @@ fn assemble_and_write_blob<W: Write>(
     // so the stored per-block bound is interpreted against the pair that
     // entry names. Nothing about the layout differs either way.
     let fts_version = match era {
+        BlobEra::V7 => format::fts::VERSION_V7,
         BlobEra::V6 => format::fts::VERSION_V6,
         BlobEra::V5 => format::fts::VERSION_V5,
         BlobEra::V2ToV4 if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
@@ -3646,6 +3695,14 @@ struct TermScratch {
     /// so entry `(block, slot)` sits at a flat `block * ENTRIES_PER_BLOCK
     /// + slot`. Reused like the other buffers.
     pos_subindex_offsets: Vec<u32>,
+    /// A term's position region as emitted under grouped positions:
+    /// every block's group back to back. Reused across terms.
+    pos_out: Vec<u8>,
+    /// The patched encoders' planning buffers.
+    pack: PackScratch,
+    /// One block's run values (first position absolute per doc, then
+    /// gaps) decoded from the accumulator's LEB128 runs for regrouping.
+    pos_vals: Vec<u32>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -3671,7 +3728,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
-    fst_streaming: &mut StreamingDictBuilder<BufWriter<File>>,
+    fst_streaming: &mut StreamingTermDictBuilder<BufWriter<File>>,
     positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
@@ -3825,8 +3882,8 @@ fn encode_and_emit_term<W: Write>(
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
-    fst_entries_inram: Option<&mut DictBuilder>,
-    mut fst_streaming: Option<&mut StreamingDictBuilder<BufWriter<File>>>,
+    fst_entries_inram: Option<&mut TermDictBuilder>,
+    mut fst_streaming: Option<&mut StreamingTermDictBuilder<BufWriter<File>>>,
     mut term_positions: Option<(&mut PositionsSink, &[u8])>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
@@ -3855,14 +3912,14 @@ fn encode_and_emit_term<W: Write>(
     // lives, tf implied 1 (one position is exactly what a phrase
     // check needs). Otherwise even a df=1 term takes the PFOR form so
     // its positions land in the region.
-    let inline_value: Option<u64> = if df == 1 {
+    let inline_value: Option<FstValue> = if df == 1 {
         let (doc_id, tf) = pairs[0];
         match &term_positions {
-            None => Some(FstValue::pack_inline(doc_id, tf)),
+            None => Some(FstValue::Inline { doc_id, tf }),
             Some((_, runs)) if tf == 1 => {
                 let mut at = 0;
                 let pos = read_varint(runs, &mut at).expect("builder-encoded run is well-formed");
-                (pos <= INLINE_TF_MAX).then(|| FstValue::pack_inline(doc_id, pos))
+                (pos <= INLINE_TF_MAX).then_some(FstValue::Inline { doc_id, tf: pos })
             }
             Some(_) => None,
         }
@@ -3870,9 +3927,48 @@ fn encode_and_emit_term<W: Write>(
         None
     };
 
-    let fst_value: u64 = if let Some(v) = inline_value {
+    let fst_value: FstValue = if let Some(v) = inline_value {
         profile.encode_df1 += 1;
         v
+    } else if era.layout().short_form && pairs.len() <= SHORT_MAX_DF {
+        // Single-block term: the short form (`fts::short`) — no header,
+        // skip entry, sub-index row, coarse slot or block header, and no
+        // lane padding. Its position runs go to the positions region
+        // exactly as a long term's do; the body's trailer says where.
+        profile.encode_short += 1;
+        let metadata_offset = *postings_len;
+        let positions = match term_positions.as_ref() {
+            Some((_, runs)) => {
+                // The whole term is one position group, inline in the body:
+                // its run values, packed or LEB128, whichever is smaller.
+                let vals = &mut scratch.pos_vals;
+                let out = &mut scratch.pos_out;
+                vals.clear();
+                out.clear();
+                let mut at = 0usize;
+                for &(_, tf) in pairs {
+                    for _ in 0..tf {
+                        vals.push(read_varint(runs, &mut at).expect("builder-encoded run"));
+                    }
+                }
+                debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+                let tfs = &mut scratch.tfs;
+                tfs.clear();
+                tfs.extend(pairs.iter().map(|&(_, tf)| tf));
+                encode_group(out, tfs, vals, true, &mut scratch.pack);
+                Some(out.as_slice())
+            }
+            None => None,
+        };
+        let term_buf = &mut scratch.term_buf;
+        term_buf.clear();
+        encode_short(term_buf, pairs, positions);
+        write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
+        FstValue::Pfor {
+            metadata_offset,
+            postings_length_hint: Some(term_buf.len() as u32),
+            short: true,
+        }
     } else {
         profile.encode_pfor += 1;
         let idf_t = bm25::idf(n_scored_docs as u64, df);
@@ -3938,7 +4034,14 @@ fn encode_and_emit_term<W: Write>(
                 doc_ids: mem::take(&mut block_doc_ids),
                 tfs: mem::take(&mut block_tfs),
             };
-            encoded_blocks.push(encode_block(&block));
+            let prev_last_doc_id = encoded_blocks.last().map(|b: &EncodedBlock| b.last_doc_id);
+            encoded_blocks.push(encode_block(
+                &block,
+                era.layout().block,
+                prev_last_doc_id,
+                pairs.len() <= PATCHED_MAX_DF,
+                &mut scratch.pack,
+            ));
             // Reclaim the underlying allocations for the next chunk.
             block_doc_ids = block.doc_ids;
             block_tfs = block.tfs;
@@ -3949,12 +4052,17 @@ fn encode_and_emit_term<W: Write>(
             profile.encode_block_build += start.elapsed();
         }
         // A block emitted in the bitset encoding bumps the blob to v4.
-        if encoded_blocks.iter().any(|b| b.bytes[3] == ENCODING_BITSET) {
+        if encoded_blocks
+            .iter()
+            .any(|b| block_encoding(&b.bytes) == ENCODING_BITSET)
+        {
             profile.saw_bitset_block = true;
         }
         let num_blocks = encoded_blocks.len() as u32;
         let metadata_offset = *postings_len;
-        let skip_table_size = encoded_blocks.len() * SKIP_ENTRY_SIZE;
+        let skip_layout = era.layout().skip;
+        let skip_table_size =
+            encoded_blocks.len() * skip_layout.entry_bytes(term_positions.is_some());
         let blocks_total_size: usize = encoded_blocks.iter().map(|b| b.bytes.len()).sum();
         let term_meta_size = match term_positions {
             Some(_) => TERM_META_POSITIONAL_SIZE,
@@ -3966,19 +4074,23 @@ fn encode_and_emit_term<W: Write>(
         // the posting blocks. Zero-sized on positionless terms, which keep
         // the V2 layout byte-for-byte.
         let entries_per_block = format::fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK;
-        let subindex_size = match term_positions {
-            Some(_) => num_blocks as usize * entries_per_block * format::fts::U32_BYTES,
-            None => 0,
+        // A grouped blob (V7) decodes a block's positions whole and needs
+        // no run offsets; earlier eras store a `u32` sub-index entry every
+        // `POSITION_SUBINDEX_STRIDE` pairs.
+        let subindex_entry_bytes = format::fts::U32_BYTES;
+        let subindex_size = match (&term_positions, era.layout().grouped_positions) {
+            (Some(_), false) => num_blocks as usize * entries_per_block * subindex_entry_bytes,
+            _ => 0,
         };
         // Coarse block-max table at the tail of the term region: one slot
         // per `COARSE_BLOCK_MAX_SPAN` blocks bounding the whole span, giving
         // the ranked walk a second skip level. Appended last so no existing
         // block offset moves.
-        let num_coarse = match era.has_coarse() {
+        let num_coarse = match era.layout().coarse {
             true => (num_blocks as usize).div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN),
             false => 0,
         };
-        let coarse_table_size = num_coarse * format::fts::U32_BYTES;
+        let coarse_table_size = num_coarse * skip_layout.coarse_slot_bytes();
         let postings_length = (term_meta_size
             + skip_table_size
             + subindex_size
@@ -3994,32 +4106,59 @@ fn encode_and_emit_term<W: Write>(
         let pos_subindex_offsets = &mut scratch.pos_subindex_offsets;
         pos_block_offsets.clear();
         pos_subindex_offsets.clear();
+        // The bytes the positions region receives for this term: the
+        // accumulator's LEB128 runs verbatim, or — under grouped positions
+        // — those runs regrouped per block into `scratch.pos_out`.
+        let pos_out = &mut scratch.pos_out;
+        pos_out.clear();
         if let Some((_, runs)) = &term_positions {
             debug_assert!(
                 runs.len() <= u32::MAX as usize,
                 "single-term positions > 4 GiB"
             );
             let mut at: usize = 0;
-            for (i, &(_, tf)) in pairs.iter().enumerate() {
-                let in_block = i % BLOCK_LEN;
-                if in_block == 0 {
-                    pos_block_offsets.push(at as u32);
+            if era.layout().grouped_positions {
+                // Regroup block by block: every long-form group is packed,
+                // so the phrase decode reads it whole and indexes it by the
+                // block's tf prefix sums — no run offsets to record.
+                let vals = &mut scratch.pos_vals;
+                for chunk in pairs.chunks(BLOCK_LEN) {
+                    pos_block_offsets.push(pos_out.len() as u32);
+                    vals.clear();
+                    for &(_, tf) in chunk {
+                        for _ in 0..tf {
+                            vals.push(read_varint(runs, &mut at).expect("builder-encoded run"));
+                        }
+                    }
+                    let tfs = &mut scratch.tfs;
+                    tfs.clear();
+                    tfs.extend(chunk.iter().map(|&(_, tf)| tf));
+                    encode_group(pos_out, tfs, vals, false, &mut scratch.pack);
                 }
-                if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
-                    pos_subindex_offsets.push(at as u32);
+            } else {
+                for (i, &(_, tf)) in pairs.iter().enumerate() {
+                    let in_block = i % BLOCK_LEN;
+                    if in_block == 0 {
+                        pos_block_offsets.push(at as u32);
+                    }
+                    if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
+                        pos_subindex_offsets.push(at as u32);
+                    }
+                    skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
                 }
-                skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
             }
             debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
             // Pad the final (partial) block's sub-index up to a whole
             // `entries_per_block`, so entry `(block, slot)` is a flat
             // `block * entries_per_block + slot`. The pad offsets point at
             // the run end and are never read (no pair maps to them).
-            while !pos_subindex_offsets.len().is_multiple_of(entries_per_block) {
+            while !era.layout().grouped_positions
+                && !pos_subindex_offsets.len().is_multiple_of(entries_per_block)
+            {
                 pos_subindex_offsets.push(at as u32);
             }
             debug_assert_eq!(
-                pos_subindex_offsets.len() * format::fts::U32_BYTES,
+                pos_subindex_offsets.len() * subindex_entry_bytes,
                 subindex_size,
                 "sub-index must hold entries_per_block offsets per block"
             );
@@ -4053,8 +4192,12 @@ fn encode_and_emit_term<W: Write>(
         term_buf.extend_from_slice(&(postings_length as u32).to_le_bytes());
         term_buf.extend_from_slice(&num_blocks.to_le_bytes());
         if let Some((sink, runs)) = &term_positions {
+            let region_len = match era.layout().grouped_positions {
+                true => pos_out.len(),
+                false => runs.len(),
+            };
             term_buf.extend_from_slice(&sink.len.to_le_bytes());
-            term_buf.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+            term_buf.extend_from_slice(&(region_len as u32).to_le_bytes());
         }
         debug_assert_eq!(term_buf.len(), term_meta_size);
         if let Some(start) = meta_write_start {
@@ -4064,12 +4207,14 @@ fn encode_and_emit_term<W: Write>(
         // Blocks follow the meta, the skip table, and the (V3-only)
         // position sub-index, so their offsets start past all three.
         let mut block_offset: u32 = (term_meta_size + skip_table_size + subindex_size) as u32;
-        // Coarse span-maxes, filled alongside the per-block skip entries
-        // and appended after the blocks below. Each entry is the span's
-        // max of the per-block `f32` maxes, stored as `f32` bits — a true
-        // upper bound over the span.
-        let mut coarse_maxes: Vec<u32> = Vec::with_capacity(num_coarse);
+        // Coarse slots, filled alongside the per-block skip entries and
+        // appended after the blocks below. Each holds the span's max of
+        // the per-block `f32` maxes, stored as `f32` bits — a true upper
+        // bound over the span — and, under the length skip layout, the
+        // byte offset of the span's first block.
+        let mut coarse_slots: Vec<u8> = Vec::with_capacity(coarse_table_size);
         let mut span_max: f32 = 0.0;
+        let mut span_start: u32 = block_offset;
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
@@ -4081,7 +4226,7 @@ fn encode_and_emit_term<W: Write>(
             // `ceil(max_bm25 × scale)` as a `u32`; `ceil` keeps it a true
             // upper bound after truncation (the reader adds one more step on
             // decode).
-            let block_max_encoded: u32 = if era.has_coarse() {
+            let block_max_encoded: u32 = if era.layout().coarse {
                 max_bm25.to_bits()
             } else {
                 (max_bm25 * format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE)
@@ -4089,30 +4234,48 @@ fn encode_and_emit_term<W: Write>(
                     .max(0.0)
                     .min(u32::MAX as f32) as u32
             };
+            if i.is_multiple_of(coarse_span) {
+                span_start = block_offset;
+            }
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
-            term_buf.extend_from_slice(&block_offset.to_le_bytes());
-            term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
-            // Positionless columns keep writing zero here —
-            // byte-identical to the field's reserved era.
-            let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
-            term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
+            match skip_layout {
+                SkipLayout::Absolute => {
+                    term_buf.extend_from_slice(&block_offset.to_le_bytes());
+                    term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
+                    // Positionless columns keep writing zero here —
+                    // byte-identical to the field's reserved era.
+                    let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
+                    term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
+                }
+                SkipLayout::Length => {
+                    let len = u16::try_from(blk.bytes.len()).expect("a block is under 64 KiB");
+                    term_buf.extend_from_slice(&len.to_le_bytes());
+                    term_buf.extend_from_slice(&block_max_encoded.to_le_bytes());
+                    if term_positions.is_some() {
+                        term_buf.extend_from_slice(&pos_block_offsets[i].to_le_bytes());
+                    }
+                }
+            }
             block_offset += blk.bytes.len() as u32;
 
-            if era.has_coarse() {
+            if era.layout().coarse {
                 span_max = span_max.max(max_bm25);
                 if (i + 1).is_multiple_of(coarse_span) || i + 1 == encoded_blocks.len() {
-                    coarse_maxes.push(span_max.to_bits());
+                    coarse_slots.extend_from_slice(&span_max.to_bits().to_le_bytes());
+                    if skip_layout == SkipLayout::Length {
+                        coarse_slots.extend_from_slice(&span_start.to_le_bytes());
+                    }
                     span_max = 0.0;
                 }
             }
         }
-        debug_assert_eq!(coarse_maxes.len(), num_coarse);
+        debug_assert_eq!(coarse_slots.len(), coarse_table_size);
         if let Some(start) = skip_write_start {
             profile.encode_skip_write += start.elapsed();
         }
 
-        // Position sub-index (VERSION_V3, positional terms): sits between
-        // the skip table and the blocks. Empty on positionless terms.
+        // Position sub-index (positional terms): sits between the skip
+        // table and the blocks. Empty on positionless terms.
         for &off in pos_subindex_offsets.iter() {
             term_buf.extend_from_slice(&off.to_le_bytes());
         }
@@ -4122,9 +4285,7 @@ fn encode_and_emit_term<W: Write>(
             term_buf.extend_from_slice(&blk.bytes);
         }
         // Coarse block-max table: the term region's tail.
-        for &cm in &coarse_maxes {
-            term_buf.extend_from_slice(&cm.to_le_bytes());
-        }
+        term_buf.extend_from_slice(&coarse_slots);
         debug_assert_eq!(term_buf.len(), postings_length as usize);
         write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
         if let Some(start) = block_write_start {
@@ -4132,10 +4293,17 @@ fn encode_and_emit_term<W: Write>(
         }
 
         if let Some((sink, runs)) = term_positions.as_mut() {
-            sink.write(runs)?;
+            match era.layout().grouped_positions {
+                true => sink.write(pos_out)?,
+                false => sink.write(runs)?,
+            }
         }
 
-        FstValue::pack_pfor(metadata_offset, postings_length as u32)
+        FstValue::Pfor {
+            metadata_offset,
+            postings_length_hint: Some(postings_length as u32),
+            short: false,
+        }
     };
 
     let fst_insert_start = profile.enabled.then(Instant::now);
@@ -4482,9 +4650,9 @@ mod tests {
 
         // Magic.
         assert_eq!(&blob[0..8], format::fts::MAGIC);
-        // Version — new code always writes the current version (coarse block-max table).
+        // Version — new code always writes the current version.
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_V6);
+        assert_eq!(version, format::fts::VERSION_V7);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -5279,7 +5447,7 @@ mod tests {
             ver(&legacy) < format::fts::VERSION_V5,
             "legacy must predate the coarse table"
         );
-        assert_eq!(ver(&current), format::fts::VERSION_V6);
+        assert_eq!(ver(&current), format::fts::VERSION_V7);
 
         let r_legacy = FtsReader::open(legacy, title_json(false)).expect("legacy opens");
         let r_current = FtsReader::open(current, title_json(false)).expect("current opens");
@@ -5455,7 +5623,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V6
+            format::fts::VERSION_V7
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

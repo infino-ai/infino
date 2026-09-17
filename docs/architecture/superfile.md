@@ -82,10 +82,12 @@ more text columns. It is built in the following stages:
 - **Tokenization.** Each indexed text value is tokenized into terms,
   and the per-document term frequencies and document lengths that BM25
   needs are accumulated as documents are added.
-- **Term dictionary.** Indexed terms are stored in a
-  [finite-state transducer](https://blog.burntsushi.net/transducers/),
-  a compact, ordered dictionary that maps each term to its postings and
-  supports prefix lookups.
+- **Term dictionary.** Indexed terms are stored sorted in small
+  front-coded blocks (each term recorded as the suffix it does not
+  share with the one before), behind an index of one full key per
+  block. The dictionary maps each term to its postings and supports
+  exact and prefix lookups by locating one block and decoding it
+  sequentially.
 - **Posting lists.** For each term, the documents that contain it are
   stored as a delta- and bit-packed posting list together with the
   per-document term frequencies, kept in document order.
