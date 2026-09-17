@@ -310,9 +310,12 @@ pub(super) fn and_heap_push(
 
 /// Replace the heap's worst entry in place — one sift, where a `pop`
 /// followed by a `push` costs a full sift-down and two sift-ups. The
-/// caller has already decided `entry` belongs in the top-k.
+/// caller has already decided `entry` belongs in the top-k and the heap
+/// is non-empty (it holds `k`); unlike pop-then-push this does not insert
+/// into an empty heap, so that precondition is asserted.
 #[inline]
 pub(super) fn replace_worst(heap: &mut BinaryHeap<TopKEntry>, entry: TopKEntry) {
+    debug_assert!(!heap.is_empty(), "replace_worst on an empty heap");
     if let Some(mut worst) = heap.peek_mut() {
         *worst = entry;
     }
