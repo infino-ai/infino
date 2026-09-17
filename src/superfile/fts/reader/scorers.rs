@@ -309,6 +309,38 @@ fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> boo
     false
 }
 
+/// Tail of the two-term WAND once `weak` cannot reach the threshold alone:
+/// every remaining candidate is a doc of `strong`, scored with `weak`'s tf
+/// when the block bound allows and `weak` holds the doc. `weak` is only
+/// probed, never stepped, so a stopword's bitset blocks are never expanded.
+fn wand_two_term_tail(
+    weak: &mut TermCursor,
+    strong: &mut TermCursor,
+    heap: &mut BinaryHeap<TopKEntry>,
+    threshold: &mut f32,
+    dl_norm_k1: &NormTable,
+) {
+    while !strong.is_exhausted() {
+        let doc = strong.current_doc_id();
+        let norm = dl_norm_k1.get(doc);
+        let own = bm25::score_with_dl_norm_k1(strong.idf_weight, strong.current_tf(), norm);
+        weak.shallow_advance_block_to(doc);
+        if own + weak.inspect_block_max_bm25() > *threshold {
+            let mut score = own;
+            if let Some(tf) = weak.bitset_probe_tf(doc) {
+                score += bm25::score_with_dl_norm_k1(weak.idf_weight, tf, norm);
+            }
+            if score > *threshold {
+                if let Some(mut worst) = heap.peek_mut() {
+                    *worst = TopKEntry(score, doc);
+                }
+                *threshold = heap.peek().expect("non-empty").0;
+            }
+        }
+        strong.next();
+    }
+}
+
 impl FtsReader {
     /// Multi-term OR via WAND + BlockMaxWAND.
     ///
@@ -369,6 +401,25 @@ impl FtsReader {
             }
 
             // Sort cursor indices ascending by current doc_id.
+            if cursors.len() == 2 && threshold > 0.0 {
+                // Two terms and one of them can no longer reach the
+                // threshold on its own: from here the pivot is always the
+                // other term's doc, so walk that term and only probe the
+                // weak one. The generic loop below would re-sort the pair,
+                // re-derive the pivot and step the weak cursor past every
+                // scored doc, which for a stopword is one block expansion
+                // per probe.
+                let weak = usize::from(cursors[0].term_max_bm25 > cursors[1].term_max_bm25);
+                if cursors[weak].term_max_bm25 <= threshold {
+                    let (a, b) = cursors.split_at_mut(1);
+                    let (weak_c, strong_c) = match weak {
+                        0 => (&mut a[0], &mut b[0]),
+                        _ => (&mut b[0], &mut a[0]),
+                    };
+                    wand_two_term_tail(weak_c, strong_c, &mut heap, &mut threshold, dl_norm_k1);
+                    break;
+                }
+            }
             idx.clear();
             idx.extend(0..cursors.len());
             // Per-iteration WAND cursor reorder; pdqsort because
