@@ -697,25 +697,25 @@ impl FtsReader {
 
     /// Ranked AND via a rarest-driven membership walk, for the rare∧common shape the
     /// gate ([`and_prefer_membership`]) routes here. Example: `+the +book +of +life`
-    /// — drive `book` (the rarest term) and test the common terms (`the`, `of`,
-    /// `life`) for presence. This avoids the flat-merge's per-doc `skip_to`, which
-    /// fully decodes a common term's 128-doc posting block just to align it — the
-    /// profiled cost when a rare term is AND-ed with common ones.
+    /// — drive `book` (the rarest term) and, for each of its docs, bit-test the
+    /// common terms (`the`, `of`, `life`) for presence. This avoids the flat-merge's
+    /// per-doc `skip_to`, which fully decodes a common term's 128-doc posting block
+    /// just to align it — the profiled cost when a rare term is AND-ed with common ones.
     ///
-    /// Block at a time: the driver's current block is the candidate list, and each
-    /// other term filters the whole list in one pass over its own blocks
-    /// ([`TermCursor::retain_contained`]: a bit test per doc on a bitset block, one
-    /// decode and a merge on a packed one), rarest first so the list shrinks
-    /// fastest. Only the survivors — docs present in *every* term — are scored, `Σ`
-    /// per-term BM25 (the same score the flat-merge computes), and emitted through
-    /// the sink. The tfs are read only for survivors, in one pass per term on a
-    /// second cursor ([`TermCursor::tfs_of_contained`]), so a doc a later term
-    /// rejects costs no popcount-rank or tf decode.
+    /// Per driver doc: [`TermCursor::contains`] each other term (an O(1) bitset
+    /// bit-test), short-circuiting on the first miss. Only a doc present in *every*
+    /// term is scored — `Σ` per-term BM25, the same score the flat-merge computes —
+    /// and emitted through the sink.
     ///
-    /// The flat-merge's Block-Max-AND heap-bar skip is kept per driver block: if the
-    /// driver's block max plus each other term's largest block max over the block's
-    /// range can't beat the k-th best score, the block is skipped whole. Without it a
-    /// large intersection at small `k` would score every match.
+    /// Two details make it pay off:
+    /// - **tf is read only on a full match**, via [`TermCursor::tf_at_contained`]
+    ///   (reusing the block position `contains` just left). Reading it during the
+    ///   presence probe instead wastes a popcount-rank whenever a later term misses —
+    ///   which dominated on 5–7-term ANDs.
+    /// - **the flat-merge's Block-Max-AND heap-bar skip is kept**, amortized per block
+    ///   window: if the driver's block-max plus each other's block-max at the driver
+    ///   doc can't beat the k-th best score, the driver skips the whole window.
+    ///   Without it a large intersection at small `k` would score every match.
     ///
     /// Only [`run_and_intersect`](Self::run_and_intersect) (pure AND, a `ScoreSink`)
     /// routes here; must+should stays on the flat-merge. `#[cold]` keeps this out of
@@ -737,88 +737,81 @@ impl FtsReader {
             .unwrap_or(0);
         let mut driver = cursors.swap_remove(driver_idx);
         let mut others = cursors;
-        // The presence pass drops a candidate at its first miss, so filter
-        // with the most selective term first: rarest-first (ascending df)
-        // leaves the fewest survivors for the next term and touches a very
-        // common term's blocks only for docs a rarer companion admitted.
-        // Order is irrelevant to the score (Σ is commutative).
+        // Presence pass short-circuits on the first miss, so probe the most
+        // selective term first: rarest-first (ascending df) rejects a
+        // non-matching driver doc in the fewest bit-tests and avoids touching a
+        // very common term's large presence structure for docs a rarer companion
+        // already excludes. Order is irrelevant to the score (Σ is commutative).
         others.sort_by_key(|c| c.df);
-        // Each other term reads its survivors' tfs on a second cursor: the
-        // filtering cursor has moved past the block a survivor sits in by
-        // the time the batch is known.
         let need_score = sink.needs_score();
-        let mut tf_cursors: Vec<TermCursor> = match need_score {
-            true => others.clone(),
-            false => Vec::new(),
-        };
-        let mut cands: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
-        let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
-        let mut tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
         while !driver.is_exhausted() {
             let doc = driver.current_doc_id();
-            let block_end = driver.current_block_last_doc_id();
 
-            // Block-Max-AND pruning per driver block: the driver's block max
-            // plus each other term's largest block max over the driver
-            // block's range bounds every score in the block. Under the heap
-            // bar, the whole block is skipped.
-            if sink.bar() > f32::NEG_INFINITY {
-                let mut ub = driver.current_block_max_bm25();
-                for o in others.iter_mut() {
-                    ub += o.block_max_in_range(doc, block_end);
-                }
+            // Block-Max-AND pruning, amortized over a window: the driver's
+            // block-max plus each other term's block-max at `doc` (inspect
+            // pointer, no decode) upper-bounds every score in `[doc, window_end]`,
+            // where `window_end` is the smallest block boundary across the
+            // cursors. If it can't beat the heap bar, skip the driver past the
+            // window; otherwise process every driver doc up to `window_end`
+            // before recomputing, so a sparse driver pays the bound per block,
+            // not per doc.
+            let window_end = if sink.bar() > f32::NEG_INFINITY {
+                let (ub, window_end) = block_max_and_bound(
+                    driver.current_block_max_bm25(),
+                    driver.current_block_last_doc_id(),
+                    &mut others,
+                    doc,
+                );
                 if ub <= sink.bar() {
-                    driver.skip_to(block_end.saturating_add(1));
+                    driver.skip_to(window_end.saturating_add(1));
                     continue;
                 }
-            }
+                window_end
+            } else {
+                // No live bar (heap not yet full, or an unranked sink): nothing to
+                // prune against. Bound the batch to the driver's current block;
+                // the probes cross the others' blocks on their own.
+                driver.current_block_last_doc_id()
+            };
 
-            // Candidates: the rest of the driver's block. Every other term
-            // filters the whole list in one pass over its own blocks.
-            if driver.decoded_block != driver.current_block {
-                driver.decode_current_block();
-                driver.materialize_at(doc);
-            }
-            cands.clear();
-            cands.extend_from_slice(&driver.block_doc_ids[driver.pos..driver.block_n]);
-            for o in others.iter_mut() {
-                if cands.is_empty() {
-                    break;
+            loop {
+                let d = driver.current_doc_id();
+                // Cheap presence pass: bitset bit-test every other, short-circuit
+                // on the first miss. No tf is read here — a miss after k matching
+                // common terms would waste k popcount-rank + tf decodes.
+                let mut all_match = true;
+                for o in others.iter_mut() {
+                    if !o.contains(d) {
+                        all_match = false;
+                        break;
+                    }
                 }
-                o.retain_contained(&mut cands);
-            }
-            if !cands.is_empty() {
-                if need_score {
-                    // Σ per-term BM25 over the survivors: the driver's tf from
-                    // its decoded block, each other's from its tf cursor.
-                    scores.clear();
-                    for &d in &cands {
-                        driver.skip_to(d);
-                        debug_assert_eq!(driver.current_doc_id(), d);
-                        scores.push(bm25::score_with_dl_norm_k1(
+                if all_match {
+                    let score = if need_score {
+                        let norm = dl_norm_k1.get(d);
+                        let mut s = bm25::score_with_dl_norm_k1(
                             driver.idf_weight,
                             driver.current_tf(),
-                            dl_norm_k1.get(d),
-                        ));
-                    }
-                    for o in tf_cursors.iter_mut() {
-                        tfs.clear();
-                        o.tfs_of_contained(&cands, &mut tfs);
-                        for ((&d, &tf), score) in cands.iter().zip(&tfs).zip(scores.iter_mut()) {
-                            *score +=
-                                bm25::score_with_dl_norm_k1(o.idf_weight, tf, dl_norm_k1.get(d));
+                            norm,
+                        );
+                        // Full match: now read each tf (bit-test + popcount-rank,
+                        // no doc-id decode). `contains` already positioned each
+                        // cursor on `d`'s block, so this doesn't re-seek.
+                        for o in others.iter_mut() {
+                            let tf = o.tf_at_contained(d);
+                            s += bm25::score_with_dl_norm_k1(o.idf_weight, tf, norm);
                         }
-                    }
-                    for (&d, &score) in cands.iter().zip(&scores) {
-                        sink.emit(d, score);
-                    }
-                } else {
-                    for &d in &cands {
-                        sink.emit(d, 0.0);
-                    }
+                        s
+                    } else {
+                        0.0
+                    };
+                    sink.emit(d, score);
+                }
+                driver.next();
+                if driver.is_exhausted() || driver.current_doc_id() > window_end {
+                    break;
                 }
             }
-            driver.skip_to(block_end.saturating_add(1));
         }
     }
 

@@ -998,79 +998,6 @@ impl TermCursor {
         docs.truncate(w);
     }
 
-    /// The tf of every doc of the ascending list `docs`, all of which this
-    /// term contains (a [`Self::retain_contained`] survivor list), appended
-    /// to `out` in order. The block-at-a-time form of
-    /// [`Self::bitset_probe_tf`]: one header parse and, on a packed block,
-    /// one decode per block; on a bitset block a popcount rank per doc into
-    /// the block's tf array. Moves `current_block` like the probes do.
-    pub(super) fn tfs_of_contained(&mut self, docs: &[u32], out: &mut Vec<u32>) {
-        if self.predecoded {
-            let ids = &self.block_doc_ids[..self.block_n];
-            let mut p = 0usize;
-            for &d in docs {
-                while p < ids.len() && ids[p] < d {
-                    p += 1;
-                }
-                debug_assert!(p < ids.len() && ids[p] == d, "doc confirmed present");
-                out.push(self.block_tfs[p]);
-            }
-            return;
-        }
-        let mut r = 0usize;
-        while r < docs.len() {
-            let doc = docs[r];
-            while self.current_block < self.blocks.len()
-                && self.blocks[self.current_block].last_doc_id < doc
-            {
-                self.current_block += 1;
-            }
-            debug_assert!(
-                self.current_block < self.blocks.len(),
-                "doc confirmed present"
-            );
-            let block = self.blocks[self.current_block];
-            let block_last = block.last_doc_id;
-            let hdr = self.current_header();
-            if hdr.encoding == ENCODING_BITSET {
-                let lazy = self.lazy_bit != u32::MAX;
-                while r < docs.len() && docs[r] <= block_last {
-                    let d = docs[r];
-                    r += 1;
-                    let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-                    let (bit, word, bitset_end) =
-                        Self::bitset_word(raw, &hdr, d).expect("doc confirmed present");
-                    let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-                    out.push(Self::bitset_tf_for_probe(
-                        lazy,
-                        self.current_block,
-                        &mut self.tf_decoded_block,
-                        &mut self.block_tfs,
-                        raw,
-                        &hdr,
-                        rank as usize,
-                    ));
-                }
-            } else {
-                if self.decoded_block != self.current_block {
-                    self.decode_current_block();
-                }
-                let ids = &self.block_doc_ids[..self.block_n];
-                let mut p = 0usize;
-                while r < docs.len() && docs[r] <= block_last {
-                    let d = docs[r];
-                    r += 1;
-                    while p < ids.len() && ids[p] < d {
-                        p += 1;
-                    }
-                    debug_assert!(p < ids.len() && ids[p] == d, "doc confirmed present");
-                    out.push(self.block_tfs[p]);
-                }
-                self.pos = p.min(ids.len().saturating_sub(1));
-            }
-        }
-    }
-
     /// Materialize a `contains`-probed cursor at `doc`: ensure the current
     /// block is decoded and `pos` points at `doc`. A membership probe
     /// (`contains`) advances `current_block` but, on a **bitset block**,
@@ -1103,7 +1030,7 @@ impl TermCursor {
     /// block's doc-order tf array. `word` is the presence word already loaded at
     /// `bit`'s position; `bitset_end` is the end of the presence bitmap (start of
     /// the tf array). Shared by [`Self::bitset_probe_tf`] (which first checks the
-    /// bit is set) and [`Self::tfs_of_contained`] (which knows it is).
+    /// bit is set) and [`Self::tf_at_contained`] (which knows it is).
     /// Locate `doc` in a bitset block: its bit index within the presence
     /// bitset, the word holding it and where the bitset ends (the tf
     /// array's start). `None` when `doc` lies below the block's origin or
@@ -1612,6 +1539,51 @@ impl TermCursor {
         }
     }
 
+    /// Tf for `doc` on a cursor a preceding [`Self::contains(doc)`] just confirmed
+    /// present. `contains` already advanced `current_block` to `doc`'s block (and,
+    /// on a PACKED block, decoded it), so this skips the block-advance and the
+    /// presence bit-test that [`Self::bitset_probe_tf`] repeats, doing only the tf
+    /// lookup: a popcount-rank into the tf array on a bitset block, or a binary
+    /// search over the decoded doc ids on a PACKED one. Only valid immediately
+    /// after `contains(doc)` returned `true` with no intervening advance.
+    ///
+    /// Kept at the end of the impl, past the doc-cursor hot methods
+    /// (`skip_to`, `next`, `decode_current_block`, `current_doc_id`), so adding
+    /// it doesn't shift their code offsets — those methods drive the flat-merge
+    /// AND path, which is measurably sensitive to its own instruction layout.
+    pub(super) fn tf_at_contained(&mut self, doc: u32) -> u32 {
+        // Pre-decoded (inline or short-form) cursor: locate in the buffer.
+        if self.predecoded {
+            let pos = self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .expect("contains(doc) confirmed presence");
+            return self.block_tfs[pos];
+        }
+        let block = self.blocks[self.current_block];
+        let hdr = self.current_header();
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        if hdr.encoding == ENCODING_BITSET {
+            let (bit, word, bitset_end) =
+                Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
+            let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
+            Self::bitset_tf_for_probe(
+                self.lazy_bit != u32::MAX,
+                self.current_block,
+                &mut self.tf_decoded_block,
+                &mut self.block_tfs,
+                raw,
+                &hdr,
+                rank as usize,
+            )
+        } else {
+            // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
+            let pos = self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .expect("contains(doc) confirmed presence");
+            self.block_tfs[pos]
+        }
+    }
+
     /// Whether this term's postings are stored in the dense **bitset** encoding,
     /// sampled from the first block's encoding byte (a dense term's blocks are
     /// uniformly bitset). When true, [`Self::contains`] answers by an O(1)
@@ -1740,17 +1712,15 @@ mod tests {
             .await
             .expect("cursors");
         let tf_of = |doc: u32| 1 + doc % 5;
-        for probe in ["tfs_of_contained", "bitset_probe_tf"] {
+        for probe in ["tf_at_contained", "bitset_probe_tf"] {
             let mut c = cursors[0].clone();
             c.skip_to(4_100);
             assert_eq!(c.block_n, 1, "lazy hold");
             assert_eq!((c.current_doc_id(), c.current_tf()), (4_100, tf_of(4_100)));
             let got = match probe {
-                "tfs_of_contained" => {
+                "tf_at_contained" => {
                     assert!(c.contains(4_105));
-                    let mut tfs = Vec::new();
-                    c.tfs_of_contained(&[4_105], &mut tfs);
-                    tfs[0]
+                    c.tf_at_contained(4_105)
                 }
                 _ => c.bitset_probe_tf(4_105).expect("present"),
             };
@@ -1822,7 +1792,7 @@ mod tests {
 
     /// A lazily published block must expand on demand for the callers
     /// that need the whole block: `materialize_at` (positions read the
-    /// block's tf array by pair index), `contains` and `tfs_of_contained`
+    /// block's tf array by pair index), `contains` and `tf_at_contained`
     /// on the same block, and the doc-at-a-time walk that follows.
     #[tokio::test]
     async fn lazy_block_expands_for_materialize_contains_and_walk() {
@@ -1857,13 +1827,11 @@ mod tests {
             c.next();
         }
 
-        // contains / tfs_of_contained on a lazily entered block.
+        // contains / tf_at_contained on a lazily entered block.
         let mut c = cursors[0].clone();
         c.skip_to(4_100);
         assert!(c.contains(4_105));
-        let mut tfs = Vec::new();
-        c.tfs_of_contained(&[4_105], &mut tfs);
-        assert_eq!(tfs, vec![tf_of(4_105)]);
+        assert_eq!(c.tf_at_contained(4_105), tf_of(4_105));
         assert!(!c.contains(4_105 + 7_000));
     }
 
