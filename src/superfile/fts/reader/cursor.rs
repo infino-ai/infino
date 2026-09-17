@@ -574,11 +574,6 @@ pub(crate) struct TermCursor {
     /// [`EAGER_RETRY_BLOCKS`] of them one lazy probe is tried again, so a
     /// cursor whose caller turned sparse can leave eager mode.
     eager_blocks: u8,
-    /// Block whose tf a probe last read as a single lane. A second probe
-    /// into the same block unpacks the whole tf array instead: one probe
-    /// per block is the rare-anchor pattern, repeated probes are a dense
-    /// caller for which the 128-lane unpack is cheaper than lane reads.
-    tf_probe_block: usize,
 }
 
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
@@ -670,7 +665,6 @@ impl TermCursor {
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
-            tf_probe_block: usize::MAX,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -742,7 +736,6 @@ impl TermCursor {
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
-            tf_probe_block: usize::MAX,
         })
     }
 
@@ -806,7 +799,6 @@ impl TermCursor {
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
-            tf_probe_block: usize::MAX,
         }
     }
 
@@ -982,35 +974,6 @@ impl TermCursor {
         rank + (word & below).count_ones()
     }
 
-    /// The tf at `rank` of the current bitset block for a probe. The first
-    /// probe into a block reads its lane alone; a second probe into the
-    /// same block unpacks the whole tf array and serves every later probe
-    /// from it. A rare anchor touches each stopword block once (the lane
-    /// read wins, measured at 2× on `the X` unions); the windowed union and
-    /// the membership conjunction probe a dense block many times (the
-    /// unpack wins, measured at 7% and 5% when every probe read a lane).
-    #[inline]
-    fn probed_tf(
-        current_block: usize,
-        tf_decoded_block: &mut usize,
-        tf_probe_block: &mut usize,
-        block_tfs: &mut [u32],
-        raw: &[u8],
-        hdr: &BlockHeader,
-        rank: usize,
-    ) -> u32 {
-        if *tf_decoded_block == current_block {
-            return block_tfs[rank];
-        }
-        if *tf_probe_block == current_block {
-            decode_block_tfs(raw, hdr, block_tfs);
-            *tf_decoded_block = current_block;
-            return block_tfs[rank];
-        }
-        *tf_probe_block = current_block;
-        bitset_tf_at(raw, hdr, rank)
-    }
-
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -1045,15 +1008,16 @@ impl TermCursor {
         }
         // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
         let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-        Some(Self::probed_tf(
-            self.current_block,
-            &mut self.tf_decoded_block,
-            &mut self.tf_probe_block,
-            &mut self.block_tfs,
-            raw,
-            &hdr,
-            rank as usize,
-        ))
+        // Decode this block's tf array once (doc order), reused across a run of
+        // candidates in the same block; the doc ids are never expanded. The
+        // union and intersection kernels probe a dense block many times, so
+        // one 128-lane unpack beats a bit-field read per probe (measured:
+        // reading the single lane cost union 7% and intersection 5%).
+        if self.tf_decoded_block != self.current_block {
+            decode_block_tfs(raw, &hdr, &mut self.block_tfs);
+            self.tf_decoded_block = self.current_block;
+        }
+        Some(self.block_tfs[rank as usize])
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
@@ -1422,15 +1386,11 @@ impl TermCursor {
             let (bit, word, bitset_end) =
                 Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
             let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-            Self::probed_tf(
-                self.current_block,
-                &mut self.tf_decoded_block,
-                &mut self.tf_probe_block,
-                &mut self.block_tfs,
-                raw,
-                &hdr,
-                rank as usize,
-            )
+            if self.tf_decoded_block != self.current_block {
+                decode_block_tfs(raw, &hdr, &mut self.block_tfs);
+                self.tf_decoded_block = self.current_block;
+            }
+            self.block_tfs[rank as usize]
         } else {
             // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
             let pos = self.block_doc_ids[..self.block_n]
