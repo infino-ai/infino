@@ -871,7 +871,8 @@ impl TermCursor {
     /// cursor forward to the block that could hold `doc` (targets arrive
     /// ascending on the AND-count leapfrog) and, on a **bitset block**,
     /// answers with a single bit-test — no decode. A PACKED block is
-    /// decoded once (cached via `decoded_block`) and binary-searched. Used
+    /// decoded once (cached via `decoded_block`) and scanned from the last
+    /// probe's position. Used
     /// only by the count leapfrog; it moves `current_block`, so a cursor
     /// probed with `contains` must not also be iterated.
     pub(super) fn contains(&mut self, doc: u32) -> bool {
@@ -909,9 +910,21 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
-            self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .is_ok()
+            // Probes ascend, so scan from the last probe's position: a
+            // rare driver lands a doc or two apart in a mid-frequency
+            // term's block, where a bisection's mispredicted halvings cost
+            // several times the steps (the same measurement that keeps the
+            // tf probe on a linear scan).
+            let ids = &self.block_doc_ids[..self.block_n];
+            let mut p = match self.pos < ids.len() && ids[self.pos] <= doc {
+                true => self.pos,
+                false => 0,
+            };
+            while p < ids.len() && ids[p] < doc {
+                p += 1;
+            }
+            self.pos = p.min(ids.len().saturating_sub(1));
+            p < ids.len() && ids[p] == doc
         }
     }
 
@@ -1556,11 +1569,12 @@ impl TermCursor {
                 rank as usize,
             )
         } else {
-            // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
-            let pos = self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .expect("contains(doc) confirmed presence");
-            self.block_tfs[pos]
+            // PACKED: `contains` decoded this block and left `pos` on `doc`.
+            debug_assert_eq!(
+                self.block_doc_ids[self.pos], doc,
+                "contains(doc) confirmed presence"
+            );
+            self.block_tfs[self.pos]
         }
     }
 
