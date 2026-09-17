@@ -12,7 +12,9 @@
 
 use std::time::Duration;
 
-use infino::{Bm25SearchOptions, ReindexOptions, Supertable};
+use infino::{
+    Bm25SearchOptions, ReindexOptions, Supertable, superfile::format::fts::VERSION_CURRENT,
+};
 
 use crate::corpus_shapes::{N_DOCS, blob_versions, corpus_dir, hits, open_corpus};
 
@@ -79,7 +81,7 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
     table.gc(Duration::ZERO).expect("collect superseded bytes");
     let after = blob_versions(&root);
     assert!(
-        after.iter().all(|v| *v == infino_current_blob_version()),
+        after.iter().all(|v| *v == VERSION_CURRENT),
         "{shape}: superfiles still at {after:?} after a reindex"
     );
 
@@ -132,11 +134,6 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
         report.awaiting_reanalysis, again.awaiting_reanalysis,
         "{shape}: a rewrite does not change how many files need re-analysis"
     );
-}
-
-/// Mirrors `format::fts::VERSION_CURRENT`, which is crate-internal.
-fn infino_current_blob_version() -> u32 {
-    6
 }
 
 #[test]
