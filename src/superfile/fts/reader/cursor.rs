@@ -1270,13 +1270,11 @@ impl TermCursor {
             // Just scan pos forward. The `current_doc_id() >= target`
             // guard from before is folded into this scan — if pos is
             // already at-or-past, the loop body doesn't execute.
-            let ids = &self.block_doc_ids[..self.block_n];
-            let mut p = self.pos;
-            while p < ids.len() && ids[p] < target {
-                p += 1;
+            let n = self.block_n;
+            while self.pos < n && self.block_doc_ids[self.pos] < target {
+                self.pos += 1;
             }
-            self.pos = p;
-            if p < ids.len() {
+            if self.pos < n {
                 return;
             }
             // Walked off the end of the decoded block (rare under
