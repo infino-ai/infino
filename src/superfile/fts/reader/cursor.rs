@@ -909,7 +909,9 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
-            self.probe_decoded(doc)
+            self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .is_ok()
         }
     }
 
@@ -1396,38 +1398,12 @@ impl TermCursor {
             }
             self.block_tfs[rank as usize]
         } else {
-            // PACKED: `contains(doc)` left `pos` on the doc.
-            debug_assert_eq!(
-                self.block_doc_ids[self.pos], doc,
-                "contains(doc) confirmed presence"
-            );
-            self.block_tfs[self.pos]
+            // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
+            let pos = self.block_doc_ids[..self.block_n]
+                .binary_search(&doc)
+                .expect("contains(doc) confirmed presence");
+            self.block_tfs[pos]
         }
-    }
-
-    /// Membership of `doc` in the decoded current block, leaving `pos` on
-    /// the first doc `>= doc`. Probes arrive in ascending doc order from a
-    /// driver, so the search resumes from the previous position — a few
-    /// linear steps, then a bisection of what is left — instead of a full
-    /// binary search per probe, which was a quarter of a three-term
-    /// conjunction's time; a probe behind the position restarts from 0.
-    #[inline]
-    fn probe_decoded(&mut self, doc: u32) -> bool {
-        const LINEAR: usize = 8;
-        let ids = &self.block_doc_ids[..self.block_n];
-        let mut p = match self.pos < ids.len() && ids[self.pos] <= doc {
-            true => self.pos,
-            false => 0,
-        };
-        let lin_end = ids.len().min(p + LINEAR);
-        while p < lin_end && ids[p] < doc {
-            p += 1;
-        }
-        if p == lin_end && p < ids.len() && ids[p] < doc {
-            p += ids[p..].partition_point(|&d| d < doc);
-        }
-        self.pos = p;
-        p < ids.len() && ids[p] == doc
     }
 
     /// Whether this term's postings are stored in the dense **bitset** encoding,
@@ -1534,40 +1510,6 @@ mod tests {
         }
         let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
-    }
-
-    /// Membership probes on a decoded block resume from the previous
-    /// position: ascending probes, a probe behind the position, probes
-    /// at block edges and past the term must all answer like a fresh
-    /// search, and `tf_at_contained` must read the tf of the probed doc.
-    #[tokio::test]
-    async fn decoded_block_probes_resume_and_agree_with_a_fresh_search() {
-        let view = two_column_reader();
-        // `filler7` is in every 97th doc: packed blocks, several per term.
-        let cursors = view
-            .build_term_cursors(1, &["filler7"], None, false, None, None)
-            .await
-            .expect("cursors");
-        let mut reference = cursors[0].clone();
-        let mut docs: Vec<(u32, u32)> = Vec::new();
-        while !reference.is_exhausted() {
-            docs.push((reference.current_doc_id(), reference.current_tf()));
-            reference.next();
-        }
-        assert!(cursors[0].block_count() > 1);
-        let present: std::collections::HashMap<u32, u32> = docs.iter().copied().collect();
-        let mut c = cursors[0].clone();
-        let mut probes: Vec<u32> = Vec::new();
-        probes.extend((0..6000u32).step_by(13)); // ascending, mostly misses
-        probes.extend(docs.iter().map(|(d, _)| *d)); // restarts behind, then every hit
-        probes.extend([5_999, 0, 97, 96, 98, 6_000, 60_000]); // edges, behind, past the term
-        for &d in &probes {
-            let got = c.contains(d);
-            assert_eq!(got, present.contains_key(&d), "probe {d}");
-            if got {
-                assert_eq!(c.tf_at_contained(d), present[&d], "tf of {d}");
-            }
-        }
     }
 
     /// A lazily published block must expand on demand for the callers
