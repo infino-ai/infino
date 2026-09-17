@@ -43,7 +43,10 @@ use std::{
 use infino::{ReindexOptions, connect, superfile::format::fts::VERSION_CURRENT};
 use tempfile::TempDir;
 
-use crate::corpus_shapes::{N_DOCS, TABLE, blob_versions, copy_tree, corpus_dir, hits, ranked_ids};
+use crate::corpus_shapes::{
+    N_DOCS, TABLE, assert_scores_equivalent, blob_versions, copy_tree, corpus_dir, hits,
+    scores_by_id,
+};
 
 /// Directory the child reindexes. Set by the parent; its presence is what
 /// makes the child a child.
@@ -152,11 +155,11 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     let pristine = TempDir::new().expect("tempdir");
     copy_tree(&src, pristine.path());
     let db = connect(pristine.path().to_str().expect("utf-8 path")).expect("connect to pristine");
-    let baseline = ranked_ids(
+    let baseline = scores_by_id(
         &db.open_table(TABLE).expect("open pristine"),
         "body",
         "common shared",
-        64,
+        N_DOCS,
     );
     assert!(!baseline.is_empty(), "the baseline ranking is empty");
 
@@ -196,10 +199,10 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
         N_DOCS,
         "documents went missing across the crash"
     );
-    assert_eq!(
-        ranked_ids(&table, "body", "common shared", 64),
-        baseline,
-        "the killed table ranks differently from the same bytes untouched"
+    assert_scores_equivalent(
+        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &baseline,
+        "the killed table against the same bytes untouched",
     );
 
     // Collect the orphans the crash left, then look at what is live. Every
@@ -285,9 +288,9 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
         N_DOCS,
         "documents went missing across the resume"
     );
-    assert_eq!(
-        ranked_ids(&table, "body", "common shared", 64),
-        baseline,
-        "the resumed migration moved the ranking"
+    assert_scores_equivalent(
+        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &baseline,
+        "the resumed migration",
     );
 }

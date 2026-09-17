@@ -41,7 +41,7 @@
 //! accepts but nothing in the wild can be in — and it is what makes both
 //! droppable together when the superseded read paths go.
 
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use infino::{
     Bm25SearchOptions, Supertable, connect,
@@ -219,18 +219,76 @@ pub(crate) fn ranked(table: &Supertable, column: &str, query: &str, k: usize) ->
     out
 }
 
-/// The ids [`ranked`] returns, in rank order, without their scores.
+/// Every matching document's score, keyed by id.
 ///
-/// What a comparison across a *version* boundary asserts. A rewrite moves
-/// the scale a file's stored bounds are expressed at, which governs
-/// pruning rather than the score a surviving document is given — but the
-/// bar a migration is held to here is that no caller-visible ordering
-/// moves, and ordering is what this compares.
-pub(crate) fn ranked_ids(table: &Supertable, column: &str, query: &str, k: usize) -> Vec<i128> {
-    ranked(table, column, query, k)
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect()
+/// **The oracle a migration is held to.** Rank *order* is not, and using it
+/// is a trap this corpus sets: `common shared` matches 9,000 of the 12,000
+/// documents across three length groups, so almost every position in a
+/// top-k is a tie. Which tied document a reader returns first falls out of
+/// superfile layout — how many files there are and which rows sit in
+/// which. A migration rewrites exactly that, so an order comparison fails
+/// on a *correct* migration whenever the layout it produces differs, and
+/// passes on an incorrect one that happens to preserve it.
+///
+/// Keying by id and comparing the whole match set is order-independent and
+/// strictly stronger: it catches a lost document, a gained one, and any
+/// score that moved — the things that are actually wrong.
+pub(crate) fn scores_by_id(
+    table: &Supertable,
+    column: &str,
+    query: &str,
+    k: usize,
+) -> BTreeMap<i128, f32> {
+    ranked(table, column, query, k).into_iter().collect()
+}
+
+/// Largest relative score change a migration may produce.
+///
+/// Not slack for sloppiness — the bound on one specific, intended effect.
+/// A `V6`+ file declares the table-wide average document length over the
+/// documents that carry tokens; a `V1`–`V5` file declares a row-count
+/// average that the reader corrects on open. The correction is per-file
+/// and lands on the nearest `f32`, so for most files it already equals
+/// what the rewritten file bakes exactly and the score does not move at
+/// all — and for one that rounds differently, it moves by a fraction of a
+/// percent. Measured at 1.3e-3 on the multi-superfile shapes; a tenth of
+/// a percent of headroom over that is enough to absorb the rounding and
+/// nowhere near enough to hide a scoring defect.
+const MAX_MIGRATION_SCORE_DRIFT: f32 = 1e-2;
+
+/// The same documents match, with scores that moved no further than the
+/// declared-average correction can move them.
+///
+/// Two assertions, and the first is the load-bearing one: a migration that
+/// dropped or gained a document is broken however well it scores. The
+/// second bounds the intended drift (see [`MAX_MIGRATION_SCORE_DRIFT`]).
+///
+/// Deliberately *not* a rank comparison. `common shared` matches 9,000 of
+/// the 12,000 documents across three length groups, so almost every
+/// position in a top-k is a tie, and which tied document comes first falls
+/// out of superfile layout — precisely what a migration rewrites. An order
+/// oracle therefore fails on a correct migration and passes on an
+/// incorrect one that happens to preserve order.
+pub(crate) fn assert_scores_equivalent(
+    after: &BTreeMap<i128, f32>,
+    before: &BTreeMap<i128, f32>,
+    what: &str,
+) {
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>(),
+        "{what}: the set of matching documents changed"
+    );
+    for (id, &now) in after {
+        let was = before[id];
+        let drift = (now - was).abs() / was.abs().max(f32::MIN_POSITIVE);
+        assert!(
+            drift <= MAX_MIGRATION_SCORE_DRIFT,
+            "{what}: document {id} scored {was} and now scores {now} \
+             (relative change {drift:.3e}), beyond what the declared-average \
+             correction can account for"
+        );
+    }
 }
 
 /// Rows a `bm25_search` returns for `query` on `column`, taking the whole

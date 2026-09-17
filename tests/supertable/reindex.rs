@@ -15,7 +15,10 @@ use std::{sync::Arc, time::Duration};
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use infino::{ReindexError, ReindexOptions, Supertable, superfile::format::fts::VERSION_CURRENT};
 
-use crate::corpus_shapes::{N_DOCS, blob_versions, corpus_dir, hits, hits_k, open_corpus, ranked};
+use crate::corpus_shapes::{
+    N_DOCS, assert_scores_equivalent, blob_versions, corpus_dir, hits, hits_k, open_corpus,
+    scores_by_id,
+};
 
 /// Rewriting a table written by an older engine brings every superfile to
 /// the current format and changes nothing a caller can observe.
@@ -30,7 +33,7 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
         before.iter().all(|v| *v == from_version),
         "{shape}: expected every superfile at version {from_version}, got {before:?}"
     );
-    let ranking_before = ranked(&table, "body", "common shared", 64);
+    let ranking_before = scores_by_id(&table, "body", "common shared", N_DOCS);
     assert!(!ranking_before.is_empty());
 
     let report = table
@@ -57,21 +60,14 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
         "{shape}: superfiles still at {after:?} after a reindex"
     );
 
-    // And nothing a caller can see has moved. Ids and scores, in rank
-    // order — a migration that reordered results would be worse than the
-    // staleness it fixes.
-    let ranking_after = ranked(&table, "body", "common shared", 64);
-    assert_eq!(
-        ranking_before.len(),
-        ranking_after.len(),
-        "{shape}: the hit count changed"
+    // And nothing a caller can see has moved: the same documents match,
+    // each with the same score. Compared by id rather than by rank, since
+    // the migration reshapes the files that decide tie order.
+    assert_scores_equivalent(
+        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &ranking_before,
+        shape,
     );
-    for (i, (before, after)) in ranking_before.iter().zip(&ranking_after).enumerate() {
-        assert_eq!(
-            before.0, after.0,
-            "{shape}: rank {i} is a different document"
-        );
-    }
 
     assert_eq!(
         hits(&table, "body", "common"),
@@ -207,7 +203,7 @@ fn assert_mixed_table_reads_cleanly(shape: &str, from_version: u32) {
         with_appended,
         "{shape}: the corpus-wide term does not span both kinds of superfile"
     );
-    let ranking_mixed = ranked(&table, "body", "common shared", 64);
+    let ranking_mixed = scores_by_id(&table, "body", "common shared", with_appended);
     assert!(
         !ranking_mixed.is_empty(),
         "{shape}: a mixed table returned nothing"
@@ -232,15 +228,14 @@ fn assert_mixed_table_reads_cleanly(shape: &str, from_version: u32) {
         with_appended,
         "{shape}: the corpus-wide term stopped spanning the table after the rewrite"
     );
-    // Ids *and* scores, not just order. The document set does not change,
-    // so the corpus statistics a score is normalised by do not either —
-    // any drift here is the bound scale being corrected once too often or
-    // not at all, which is the failure a version-gated decode exists to
-    // avoid and the one an id-only comparison cannot see.
-    assert_eq!(
-        ranked(&table, "body", "common shared", 64),
-        ranking_mixed,
-        "{shape}: migrating the inherited files moved a score or a rank"
+    // Ids *and* scores. The document set does not change, so the corpus
+    // statistics a score is normalised by do not either — any drift here
+    // is the bound scale being corrected once too often or not at all,
+    // which is the failure a version-gated decode exists to avoid.
+    assert_scores_equivalent(
+        &scores_by_id(&table, "body", "common shared", with_appended),
+        &ranking_mixed,
+        shape,
     );
 }
 
@@ -594,7 +589,7 @@ fn reanalysis_of_the_newest_shape_converges_without_changing_terms() {
     let Some((_tmp, table, _root)) = open_corpus(SHAPE) else {
         return;
     };
-    let before = ranked(&table, "body", "common shared", 64);
+    let before = scores_by_id(&table, "body", "common shared", N_DOCS);
 
     let report = table
         .reindex(&ReindexOptions::reanalyzing())
@@ -604,10 +599,10 @@ fn reanalysis_of_the_newest_shape_converges_without_changing_terms() {
         report.awaiting_reanalysis, 0,
         "re-analysis is what clears this axis"
     );
-    assert_eq!(
-        ranked(&table, "body", "common shared", 64),
-        before,
-        "re-analysis moved terms that were already current"
+    assert_scores_equivalent(
+        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &before,
+        "re-analysing the newest shape",
     );
 
     let again = table
