@@ -43,7 +43,13 @@
 
 use std::{fs, path::Path};
 
-use infino::{Bm25SearchOptions, Supertable, connect};
+use infino::{
+    Bm25SearchOptions, Supertable, connect,
+    superfile::format::fts::{
+        BlobLayout, VERSION_CURRENT, VERSION_V1_LEGACY, VERSION_V2, VERSION_V3, VERSION_V4,
+        VERSION_V5, VERSION_V6, VERSION_V7,
+    },
+};
 use tempfile::TempDir;
 
 /// Where the generated tables live, relative to the crate root.
@@ -421,6 +427,170 @@ mod v1_positionless {
         assert!(
             msg.contains("analyzer names recorded"),
             "expected the incomplete-record refusal, got: {msg}"
+        );
+    }
+}
+
+/// Why a blob version this engine still reads is, or is not, in the corpus.
+///
+/// The corpus exists to prove a migration against real bytes, so a version
+/// with no entry here is a version nothing proves anything about. Adding
+/// one to `BlobLayout::for_version` without adding a row fails
+/// [`every_readable_version_declares_its_coverage`].
+#[derive(Debug, Clone, Copy)]
+enum CorpusCoverage {
+    /// A generated shape covers it, written by the release `generate.sh`
+    /// pins for that shape.
+    Shape(&'static str),
+    /// Nothing written through a published API can carry it — the reason
+    /// is the payload, because it is the whole justification for the
+    /// absence and it has been wrong before.
+    Unreachable(&'static str),
+    /// No published release writes it yet, so no generator can pin one.
+    /// Only [`VERSION_CURRENT`] may sit here; see
+    /// [`only_the_current_version_may_await_a_writer`].
+    AwaitingPublishedWriter,
+}
+
+/// Every blob version this engine reads, and what covers it.
+const CORPUS_COVERAGE: &[(u32, CorpusCoverage)] = &[
+    (VERSION_V1_LEGACY, CorpusCoverage::Shape("v1_positionless")),
+    (VERSION_V2, CorpusCoverage::Shape("v2_positions_region")),
+    (
+        VERSION_V3,
+        CorpusCoverage::Unreachable(
+            "a blob is stamped V3 only when its positions region has a body, and \
+             no release before 0.8.1 exposes a positions setter — 0.8.1 writes V5",
+        ),
+    ),
+    (VERSION_V4, CorpusCoverage::Shape("v4_bitset_blocks")),
+    (VERSION_V5, CorpusCoverage::Shape("v5_positional")),
+    (VERSION_V6, CorpusCoverage::Shape("v6_positional")),
+    (VERSION_V7, CorpusCoverage::AwaitingPublishedWriter),
+];
+
+/// Highest version number probed when asking the reader what it accepts.
+/// Far above any shipped version, so a new one cannot land outside the
+/// scan and slip the ledger check.
+const VERSION_SCAN_CEILING: u32 = 64;
+
+/// The shape names `generate.sh` writes, read from the script so a renamed
+/// or deleted shape cannot leave the ledger pointing at nothing.
+fn generated_shape_names() -> Vec<String> {
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/generate.sh"))
+            .expect("read generate.sh");
+    let body = script
+        .split_once("shapes=(")
+        .expect("generate.sh declares a shapes array")
+        .1
+        .split_once(')')
+        .expect("the shapes array is closed")
+        .0;
+    body.lines()
+        .filter_map(|line| line.trim().strip_prefix('"'))
+        .filter_map(|entry| entry.split(':').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every version the reader accepts has a row, and every row is a version
+/// it accepts.
+///
+/// This is the half that fires on a new format version: adding `V8` to
+/// `BlobLayout::for_version` without a row here fails, and writing the row
+/// is what makes the author say which of the three cases it is.
+#[test]
+fn every_readable_version_declares_its_coverage() {
+    let readable: Vec<u32> = (1..=VERSION_SCAN_CEILING)
+        .filter(|v| BlobLayout::for_version(*v).is_some())
+        .collect();
+    let declared: Vec<u32> = CORPUS_COVERAGE.iter().map(|(v, _)| *v).collect();
+
+    for version in &readable {
+        assert!(
+            declared.contains(version),
+            "blob V{version} is readable but declares no corpus coverage — add a \
+             row to CORPUS_COVERAGE saying which shape covers it, why nothing in \
+             the wild can carry it, or that no published release writes it yet"
+        );
+    }
+    for version in &declared {
+        assert!(
+            readable.contains(version),
+            "CORPUS_COVERAGE claims blob V{version}, which this reader does not \
+             accept — drop the row with the read path"
+        );
+    }
+}
+
+/// An absence is justified by a fact, not by a label.
+///
+/// The V3 row's whole force is that it cites the release where
+/// `FtsField::positions` first appears — a reason with no release in it is
+/// a shrug, and this plan has already carried one wrong claim about
+/// reachability that read perfectly well.
+#[test]
+fn every_unreachable_version_cites_a_release() {
+    for (version, coverage) in CORPUS_COVERAGE {
+        let CorpusCoverage::Unreachable(reason) = coverage else {
+            continue;
+        };
+        assert!(
+            reason.chars().any(|c| c.is_ascii_digit()),
+            "blob V{version} is declared unreachable by {reason:?}, which names no              release — say which one closes the gap, so the claim can be checked              against that release's public-api.txt"
+        );
+    }
+}
+
+/// Every shape the ledger names is one `generate.sh` actually writes.
+#[test]
+fn every_named_shape_is_one_the_generator_writes() {
+    let generated = generated_shape_names();
+    assert!(
+        !generated.is_empty(),
+        "no shapes parsed out of generate.sh — the parser is wrong, not the script"
+    );
+    for (version, coverage) in CORPUS_COVERAGE {
+        let CorpusCoverage::Shape(name) = coverage else {
+            continue;
+        };
+        assert!(
+            generated.iter().any(|g| g == name),
+            "blob V{version} claims the shape {name:?}, which generate.sh does not \
+             write — it writes {generated:?}"
+        );
+    }
+}
+
+/// Only the version this engine writes may be waiting for a published
+/// writer, and this is the check that makes a format bump carry its
+/// migration evidence.
+///
+/// A version older than [`VERSION_CURRENT`] has, by definition, had a
+/// release that wrote it — so it can be pinned as a generator and must be,
+/// or declared unreachable with a reason. Raising `VERSION_CURRENT` leaves
+/// the version it replaced sitting here and fails this test, which is the
+/// point: the shape that just became superseded is exactly the one whose
+/// migration nothing yet proves.
+///
+/// This is the failure that went unnoticed when V7 landed. V6 slipped from
+/// "the control every other shape must become" to "a superseded shape with
+/// no coverage" with nothing to say so, and was caught by a person looking
+/// rather than by a test.
+#[test]
+fn only_the_current_version_may_await_a_writer() {
+    for (version, coverage) in CORPUS_COVERAGE {
+        if !matches!(coverage, CorpusCoverage::AwaitingPublishedWriter) {
+            continue;
+        }
+        assert_eq!(
+            *version, VERSION_CURRENT,
+            "blob V{version} is superseded but still declares that no published \
+             release writes it. A release that writes it has shipped, so add a \
+             generator crate pinned to it under tests/corpus/generators, give it \
+             a generate.sh entry, and point its CORPUS_COVERAGE row at the new \
+             shape — a migration from V{version} is otherwise untested"
         );
     }
 }
