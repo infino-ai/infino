@@ -3,7 +3,8 @@
 
 //! Writes a corpus table with the 0.8.2 engine, whose builder writes the
 //! exact-f32 block-max and coarse-table layout, with `title` positional —
-//! this is the first release exposing a public positions setter.
+//! the last release writing this layout, and one of the three that expose
+//! a public positions setter at all (0.8.1 was the first).
 //!
 //! Usage: `cargo run -- <output-dir> <table-name>`
 

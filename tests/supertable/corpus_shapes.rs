@@ -22,6 +22,24 @@
 //! reason. The newest shape is the exception and is asserted the other
 //! way round — it already holds the corrected terms, and is stale only
 //! because it cannot say so.
+//!
+//! ## Why there is no V3 shape
+//!
+//! V3 is the pre-coarse blob with a position run-offset sub-index, and no
+//! published release can write one. A blob is stamped V3 only when its
+//! positions region has a body, and `FtsField::positions` first appears in
+//! the public API at `0.8.1` — a release that writes V5. Every release in
+//! the V3 window (`0.5.5`–`0.5.12`) constructs `positions: false` on every
+//! catalog path, so its positional blobs do not exist.
+//!
+//! The same fact empties part of V4: a `0.5.12` file may carry bitset
+//! blocks, but never a populated positions region or the sub-index that
+//! rides with it. So the earliest positional shape reachable in the wild
+//! is V5, which `v5_positional` covers.
+//!
+//! This is the V1 argument in a second place — a shape the reader still
+//! accepts but nothing in the wild can be in — and it is what makes both
+//! droppable together when the superseded read paths go.
 
 use std::{fs, path::Path};
 
