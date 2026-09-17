@@ -10,13 +10,14 @@
 //! were — a migration that changed answers would be a worse outcome than
 //! the staleness it set out to fix.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use infino::{
     Bm25SearchOptions, ReindexOptions, Supertable, superfile::format::fts::VERSION_CURRENT,
 };
 
-use crate::corpus_shapes::{N_DOCS, blob_versions, corpus_dir, hits, open_corpus};
+use crate::corpus_shapes::{N_DOCS, blob_versions, corpus_dir, hits, hits_k, open_corpus};
 
 /// Rows a `bm25_search` returns, as `(id, score)` pairs in rank order, so
 /// a comparison sees any reordering and not merely a changed count.
@@ -165,6 +166,121 @@ fn migrates_a_positional_table() {
 #[test]
 fn migrates_a_current_scale_table() {
     assert_reindex_migrates("v6_positional", 6);
+}
+
+/// A table holding both migrated and unmigrated superfiles opens and
+/// ranks as if it held neither kind.
+///
+/// This is the state a reindex passes through on every table with more
+/// than one superfile: jobs commit one at a time, so between any two of
+/// them the table is part old and part new. It is also the state a table
+/// sits in indefinitely if a run is interrupted, and the one an append
+/// creates the moment it lands beside files an older engine wrote.
+///
+/// Two things are mixed at once and they mix independently. The **blob
+/// version** differs, so the reader decodes two layouts and corrects two
+/// bound scales in one query. The **analysis revision** differs, so the
+/// corpus statistics a score is normalised by fold over superfiles that
+/// did not tokenize alike — the one this engine appended holds the
+/// corrected terms, the ones it inherited do not.
+///
+/// Reached without threads or timing: append to a corpus table, which
+/// puts a current superfile beside inherited ones, then reindex, which
+/// leaves the revisions exactly where they were. If a mixed table
+/// mis-scored, a reindex would be unsafe to interrupt and unsafe to run
+/// on a table that is still taking writes — both of which it claims to
+/// be.
+fn assert_mixed_table_reads_cleanly(shape: &str, from_version: u32) {
+    let Some((_tmp, table, root)) = open_corpus(shape) else {
+        return;
+    };
+    let inherited = blob_versions(&root).len();
+    assert!(
+        inherited > 1,
+        "{shape}: a single-superfile table cannot be mixed, so it proves nothing here"
+    );
+
+    // Rows whose terms this engine analyzed, landing beside rows analyzed
+    // by the writer the corpus was generated with.
+    let appended = ["common shared fresh", "common fresh"];
+    let schema = table.schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        schema
+            .fields()
+            .iter()
+            .map(|f| -> ArrayRef {
+                let values = appended
+                    .iter()
+                    .map(|_| Some(f.name().as_str()))
+                    .collect::<Vec<_>>();
+                match f.name().as_str() {
+                    "body" => Arc::new(LargeStringArray::from(appended.to_vec())),
+                    _ => Arc::new(LargeStringArray::from(values)),
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("batch matches the corpus schema");
+    table.append(&batch).expect("append beside inherited files");
+
+    // Mixed on both axes now: the appended superfile is current, the
+    // inherited ones are not.
+    let mixed = blob_versions(&root);
+    assert!(
+        mixed.contains(&from_version) && mixed.contains(&VERSION_CURRENT),
+        "{shape}: expected both versions present, got {mixed:?}"
+    );
+
+    // Every document still carries the corpus-wide term, inherited and
+    // appended alike — so the fold over two tokenizations did not lose a
+    // posting list or double-count one.
+    let with_appended = N_DOCS + appended.len();
+    assert_eq!(
+        hits_k(&table, "body", "common", with_appended),
+        with_appended,
+        "{shape}: the corpus-wide term does not span both kinds of superfile"
+    );
+    let ranking_mixed = ranked(&table, "body", "common shared", 64);
+    assert!(
+        !ranking_mixed.is_empty(),
+        "{shape}: a mixed table returned nothing"
+    );
+
+    // And the rewrite leaves what a caller sees untouched, from the mixed
+    // state rather than from a uniform one. The appended file is already
+    // current, so the planner must skip it rather than rewrite it.
+    let report = table
+        .reindex(&ReindexOptions::default())
+        .expect("reindex a mixed table");
+    assert_eq!(
+        report.already_current, 1,
+        "{shape}: the superfile this engine just wrote was not recognised as current"
+    );
+    assert_eq!(
+        report.rewritten, inherited,
+        "{shape}: every inherited superfile is rewritten, and only those"
+    );
+    assert_eq!(
+        hits_k(&table, "body", "common", with_appended),
+        with_appended,
+        "{shape}: the corpus-wide term stopped spanning the table after the rewrite"
+    );
+    // Ids *and* scores, not just order. The document set does not change,
+    // so the corpus statistics a score is normalised by do not either —
+    // any drift here is the bound scale being corrected once too often or
+    // not at all, which is the failure a version-gated decode exists to
+    // avoid and the one an id-only comparison cannot see.
+    assert_eq!(
+        ranked(&table, "body", "common shared", 64),
+        ranking_mixed,
+        "{shape}: migrating the inherited files moved a score or a rank"
+    );
+}
+
+#[test]
+fn a_mixed_table_reads_cleanly_across_versions_and_revisions() {
+    assert_mixed_table_reads_cleanly("v2_positions_region", 2);
 }
 
 /// Re-analysis is the only repair that changes a file's terms, so it is

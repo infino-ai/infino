@@ -192,10 +192,22 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-/// Rows a `bm25_search` returns for `query` on `column`.
+/// Rows a `bm25_search` returns for `query` on `column`, taking the whole
+/// corpus.
+///
+/// Every shape holds exactly [`N_DOCS`] documents, so that is the `k` a
+/// count needs. A table that has been appended to holds more and must ask
+/// for more — see [`hits_k`], which this delegates to; passing a `k`
+/// smaller than the match count silently truncates and reads as a recall
+/// loss.
 pub(crate) fn hits(table: &Supertable, column: &str, query: &str) -> usize {
+    hits_k(table, column, query, N_DOCS)
+}
+
+/// Rows a `bm25_search` returns for `query` on `column`, taking `k`.
+pub(crate) fn hits_k(table: &Supertable, column: &str, query: &str, k: usize) -> usize {
     table
-        .bm25_search(column, query, N_DOCS, Bm25SearchOptions::new(), None)
+        .bm25_search(column, query, k, Bm25SearchOptions::new(), None)
         .expect("bm25 search")
         .iter()
         .map(|b| b.num_rows())
