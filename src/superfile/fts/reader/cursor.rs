@@ -983,6 +983,36 @@ impl TermCursor {
         rank + (word & below).count_ones()
     }
 
+    /// The tf at `rank` of the current bitset block for a probe. Normally
+    /// the block's tf array is unpacked once (doc order) and reused across
+    /// a run of probes into the same block — the union and intersection
+    /// kernels probe a dense block many times, and one 128-lane unpack
+    /// beats a bit-field read per probe (measured: reading the single lane
+    /// cost union 7% and intersection 5%). While the block is held lazily,
+    /// though, `block_tfs[0]` is the published doc's tf and `pos` names
+    /// it; unpacking the block over it would make `current_tf()` report
+    /// rank 0's tf for the published doc, so a probe then reads its lane
+    /// alone and leaves the buffers as they are.
+    #[inline]
+    fn bitset_tf_for_probe(
+        lazy: bool,
+        current_block: usize,
+        tf_decoded_block: &mut usize,
+        block_tfs: &mut [u32],
+        raw: &[u8],
+        hdr: &BlockHeader,
+        rank: usize,
+    ) -> u32 {
+        if lazy {
+            return bitset_tf_at(raw, hdr, rank);
+        }
+        if *tf_decoded_block != current_block {
+            decode_block_tfs(raw, hdr, block_tfs);
+            *tf_decoded_block = current_block;
+        }
+        block_tfs[rank]
+    }
+
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -1017,16 +1047,15 @@ impl TermCursor {
         }
         // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
         let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-        // Decode this block's tf array once (doc order), reused across a run of
-        // candidates in the same block; the doc ids are never expanded. The
-        // union and intersection kernels probe a dense block many times, so
-        // one 128-lane unpack beats a bit-field read per probe (measured:
-        // reading the single lane cost union 7% and intersection 5%).
-        if self.tf_decoded_block != self.current_block {
-            decode_block_tfs(raw, &hdr, &mut self.block_tfs);
-            self.tf_decoded_block = self.current_block;
-        }
-        Some(self.block_tfs[rank as usize])
+        Some(Self::bitset_tf_for_probe(
+            self.lazy_bit != u32::MAX,
+            self.current_block,
+            &mut self.tf_decoded_block,
+            &mut self.block_tfs,
+            raw,
+            &hdr,
+            rank as usize,
+        ))
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
@@ -1062,6 +1091,10 @@ impl TermCursor {
     #[inline(always)]
     pub(super) fn current_tf(&self) -> u32 {
         debug_assert!(!self.is_exhausted() && self.pos < self.block_n);
+        debug_assert!(
+            self.lazy_bit == u32::MAX || self.tf_decoded_block != self.current_block,
+            "a lazily held block's tf buffer was replaced by a whole-block unpack"
+        );
         self.block_tfs[self.pos]
     }
 
@@ -1392,11 +1425,15 @@ impl TermCursor {
             let (bit, word, bitset_end) =
                 Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
             let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-            if self.tf_decoded_block != self.current_block {
-                decode_block_tfs(raw, &hdr, &mut self.block_tfs);
-                self.tf_decoded_block = self.current_block;
-            }
-            self.block_tfs[rank as usize]
+            Self::bitset_tf_for_probe(
+                self.lazy_bit != u32::MAX,
+                self.current_block,
+                &mut self.tf_decoded_block,
+                &mut self.block_tfs,
+                raw,
+                &hdr,
+                rank as usize,
+            )
         } else {
             // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
             let pos = self.block_doc_ids[..self.block_n]
@@ -1510,6 +1547,58 @@ mod tests {
         }
         let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A same-block tf probe on a lazily held cursor must not disturb the
+    /// published doc: `current_tf()` still answers for `current_doc_id()`.
+    /// The corpus varies tf within a block, so a buffer overwritten by a
+    /// whole-block unpack would show a different doc's tf.
+    #[tokio::test]
+    async fn same_block_tf_probes_leave_the_lazy_doc_intact() {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("flat".into(), false).expect("register");
+        for doc_id in 0..6000u32 {
+            let mut text = String::new();
+            for _ in 0..(1 + doc_id % 5) {
+                text.push_str("common ");
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add");
+        }
+        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let cursors = view
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let tf_of = |doc: u32| 1 + doc % 5;
+        for probe in ["tf_at_contained", "bitset_probe_tf"] {
+            let mut c = cursors[0].clone();
+            c.skip_to(4_100);
+            assert_eq!(c.block_n, 1, "lazy hold");
+            assert_eq!((c.current_doc_id(), c.current_tf()), (4_100, tf_of(4_100)));
+            let got = match probe {
+                "tf_at_contained" => {
+                    assert!(c.contains(4_105));
+                    c.tf_at_contained(4_105)
+                }
+                _ => c.bitset_probe_tf(4_105).expect("present"),
+            };
+            assert_eq!(got, tf_of(4_105), "{probe}");
+            assert_eq!(
+                (c.current_doc_id(), c.current_tf()),
+                (4_100, tf_of(4_100)),
+                "{probe}: the lazy doc must be intact after the probe"
+            );
+            // And the walk on from the lazy doc stays exact.
+            for d in 4_100..4_400 {
+                assert_eq!(
+                    (c.current_doc_id(), c.current_tf()),
+                    (d, tf_of(d)),
+                    "{probe} walk {d}"
+                );
+                c.next();
+            }
+        }
     }
 
     /// A lazily published block must expand on demand for the callers
