@@ -156,6 +156,17 @@ fn migrates_a_positional_table() {
     assert_reindex_migrates("v5_positional", 5);
 }
 
+/// The newest published shape, whose stored bounds are already in the
+/// scorer's scale rather than carrying the `(k1 + 1)` factor older files
+/// do. A rewrite must leave them alone; correcting them a second time, as
+/// it must for every shape above, would shrink bounds that are already
+/// exact and silently prune documents out of the top-k. The ranking
+/// comparison is what catches that.
+#[test]
+fn migrates_a_current_scale_table() {
+    assert_reindex_migrates("v6_positional", 6);
+}
+
 /// Re-analysis is the only repair that changes a file's terms, so it is
 /// the only one these can be asserted against.
 ///
@@ -235,4 +246,41 @@ fn reanalysis_repairs_a_standard_analyzer_table() {
 #[test]
 fn reanalysis_repairs_a_positional_table() {
     assert_reanalysis_repairs_terms("v5_positional", true);
+}
+
+/// Re-analyzing the newest published shape changes no terms — it already
+/// holds the ones this engine emits — and that is the case worth pinning.
+///
+/// The file is planned for re-analysis because it records no revision, not
+/// because anything is known to be wrong with it. So the run has to end
+/// somewhere: it clears the axis by recording the revision it just
+/// analyzed at, and a second run plans nothing. Were the revision written
+/// from the file rather than from the work done, this would re-tokenize
+/// the corpus on every run, forever.
+#[test]
+fn reanalysis_of_the_newest_shape_converges_without_changing_terms() {
+    const SHAPE: &str = "v6_positional";
+    let Some((_tmp, table, _root)) = open_corpus(SHAPE) else {
+        return;
+    };
+    let before = ranked(&table, "body", "common shared", 64);
+
+    let report = table
+        .reindex(&ReindexOptions::reanalyzing())
+        .expect("re-analyze the newest published shape");
+    assert!(report.rewritten > 0, "nothing was re-analyzed");
+    assert_eq!(
+        report.awaiting_reanalysis, 0,
+        "re-analysis is what clears this axis"
+    );
+    assert_eq!(
+        ranked(&table, "body", "common shared", 64),
+        before,
+        "re-analysis moved terms that were already current"
+    );
+
+    let again = table
+        .reindex(&ReindexOptions::reanalyzing())
+        .expect("second re-analysis");
+    assert_eq!(again.rewritten, 0, "re-analysis is not idempotent");
 }

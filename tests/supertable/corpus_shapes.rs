@@ -16,9 +16,12 @@
 //! a too-sparse corpus makes an old builder stamp a lower version, and a
 //! too-small one leaves a structure the version implies with nothing in
 //! it. The recall assertions pin the tokenization defect *in the negative*:
-//! these terms are unreachable in every shipped file, and a reindex that
-//! re-analyzes is what makes them reachable. Without them a reanalysis
-//! test would pass for the wrong reason.
+//! these terms are unreachable in every release that predates the
+//! correction, and a reindex that re-analyzes is what makes them
+//! reachable. Without them a reanalysis test would pass for the wrong
+//! reason. The newest shape is the exception and is asserted the other
+//! way round — it already holds the corrected terms, and is stale only
+//! because it cannot say so.
 
 use std::{fs, path::Path};
 
@@ -307,6 +310,59 @@ shape_tests! {
     v4_bitset_blocks => ("v4_bitset_blocks", 4),
     v5_positionless => ("v5_positionless", 5),
     v5_positional => ("v5_positional", 5),
+}
+
+/// The newest published shape, and the one that pulls the two axes of
+/// staleness apart.
+///
+/// Every older shape is behind on both at once: an old container *and*
+/// terms from an analysis that predates the tokenization correction. This
+/// release carries the correction, so its terms are already what this
+/// engine emits — and it still records no revision, because the field
+/// postdates it. A reader therefore cannot tell these terms from an older
+/// chain's, and treats the column as stale.
+///
+/// That is the conservative default working, not a defect: a file that
+/// cannot name its analysis gets re-analyzed rather than trusted. Pinning
+/// it here is what stops the default being quietly relaxed into "a recent
+/// container implies recent terms", which would leave the tables this
+/// migration exists for silently unrepaired.
+mod v6_positional {
+    use super::*;
+
+    const SHAPE: &str = "v6_positional";
+
+    #[test]
+    fn carries_its_format_shape() {
+        assert_shape(SHAPE, 6);
+    }
+
+    #[test]
+    fn opens_and_ranks() {
+        assert_opens_and_ranks(SHAPE);
+    }
+
+    /// The terms every older shape is missing are already present here,
+    /// which is what distinguishes this shape from the rest of the corpus.
+    #[test]
+    fn already_holds_the_corrected_tokenization() {
+        let Some((_tmp, table, _root)) = open_corpus(SHAPE) else {
+            return;
+        };
+        let capped_piece = "z".repeat(infino_max_token_chars());
+        assert_eq!(
+            hits(&table, "body", &capped_piece),
+            1,
+            "the over-cap run is unreachable, so this was not written by a \
+             post-correction release"
+        );
+        assert_eq!(
+            hits(&table, "body", "\u{1f525}"),
+            1,
+            "the emoji is not indexed, so this was not written by a \
+             post-correction release"
+        );
+    }
 }
 
 /// The oldest shape is a special case, and the reason is not its blob.

@@ -19,6 +19,7 @@ shapes=(
   "v4_bitset_blocks:v0_5_12:4"
   "v5_positionless:v0_8_0:5"
   "v5_positional:v0_8_2:5"
+  "v6_positional:v0_8_3:6"
 )
 
 wanted=("$@")
