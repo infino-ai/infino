@@ -579,6 +579,10 @@ pub(crate) struct TermCursor {
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
 const EAGER_RETRY_BLOCKS: u8 = 8;
 
+/// Docs a packed-block tf probe scans linearly from the previous probe's
+/// position before bisecting the rest of the block.
+const PROBE_LINEAR_STEPS: usize = 8;
+
 impl TermCursor {
     /// Parse one term's metadata + skip table out of its own postings
     /// byte range and decode its first block. `term_bytes` starts at
@@ -1032,21 +1036,31 @@ impl TermCursor {
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
         if hdr.encoding != ENCODING_BITSET {
-            // PACKED: bisect the decoded block from the last probe's position
-            // (probes ascend) and read the tf at that index. Stepping the
-            // cursor there doc by doc was a quarter of a three-term union.
+            // PACKED: locate `doc` in the decoded block from the last probe's
+            // position (probes ascend) and read the tf at that index. A short
+            // linear scan first — on a long query the probes land a few docs
+            // apart and a bisection's branches cost more than the steps —
+            // then a bisection for the sparse probes of a short query, where
+            // stepping the cursor doc by doc was a quarter of the union.
             debug_assert!(!self.count_only, "a probe for tf on a count-only cursor");
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
             let ids = &self.block_doc_ids[..self.block_n];
-            let from = match self.pos < ids.len() && ids[self.pos] <= doc {
+            let len = ids.len();
+            let mut i = match self.pos < len && ids[self.pos] <= doc {
                 true => self.pos,
                 false => 0,
             };
-            let i = from + ids[from..].partition_point(|&d| d < doc);
-            self.pos = i.min(ids.len().saturating_sub(1));
-            return (i < ids.len() && ids[i] == doc).then(|| self.block_tfs[i]);
+            let lim = (i + PROBE_LINEAR_STEPS).min(len);
+            while i < lim && ids[i] < doc {
+                i += 1;
+            }
+            if i == lim && i < len {
+                i += ids[i..].partition_point(|&d| d < doc);
+            }
+            self.pos = i.min(len.saturating_sub(1));
+            return (i < len && ids[i] == doc).then(|| self.block_tfs[i]);
         }
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         let (bit, word, bitset_end) = Self::bitset_word(raw, &hdr, doc)?;
