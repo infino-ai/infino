@@ -1303,17 +1303,23 @@ impl TermCursor {
             && self.current_header().encoding == ENCODING_BITSET
         {
             // A skip into a bitset block is a probe: publish the one doc
-            // the caller asked for instead of expanding all 128. A second
-            // skip landing in the same block is a caller walking it by
-            // skips (a stopword AND), which the expansion serves better.
+            // the caller asked for instead of expanding all 128. A rare
+            // anchor's WAND touches a stopword block twice (the pivot, then
+            // the doc after it), so two lazy probes are allowed; a third
+            // skip into the same block is a caller walking it by skips (a
+            // stopword AND), which the expansion serves better.
             let again = self.lazy_bit != u32::MAX && self.current_block == from_block;
-            if !again {
+            let steps = match again {
+                true => self.lazy_steps + 1,
+                false => 0,
+            };
+            if steps < 2 {
                 let block = self.blocks[self.current_block];
                 let hdr = self.current_header();
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
                 if let Some((doc, rank)) = bitset_next_doc(raw, &hdr, target) {
                     self.publish_lazy(doc, rank);
-                    self.lazy_steps = 0;
+                    self.lazy_steps = steps;
                     return;
                 }
             }
