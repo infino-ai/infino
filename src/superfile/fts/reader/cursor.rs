@@ -1537,30 +1537,54 @@ mod tests {
     }
 
     /// Membership probes on a decoded block resume from the previous
-    /// position: ascending probes, a probe behind the position, probes
-    /// at block edges and past the term must all answer like a fresh
-    /// search, and `tf_at_contained` must read the tf of the probed doc.
+    /// position. `contains` only moves forward across blocks, so probes
+    /// ascend across blocks here; within a block they also step back (a
+    /// probe behind the position restarts the scan), hit block edges and
+    /// run past the term, and every answer must match a fresh search, with
+    /// `tf_at_contained` reading the tf of the probed doc.
     #[tokio::test]
     async fn decoded_block_probes_resume_and_agree_with_a_fresh_search() {
-        let view = two_column_reader();
-        // `filler7` is in every 97th doc: packed blocks, several per term.
+        // Every 7th doc carries `mid` (tf 1..=3): too sparse for the bitset
+        // encoding, so its ~50 blocks are packed and decoded on probe.
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("flat".into(), false).expect("register");
+        for doc_id in 0..45_000u32 {
+            let mut text = String::from("pad");
+            if doc_id % 7 == 3 {
+                for _ in 0..=(doc_id % 3) {
+                    text.push_str(" mid");
+                }
+            }
+            b.add_doc(0, doc_id, &text).expect("add");
+        }
+        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
-            .build_term_cursors(1, &["filler7"], None, false, None, None)
+            .build_term_cursors(0, &["mid"], None, false, None, None)
             .await
             .expect("cursors");
+        assert!(cursors[0].block_count() > 1);
         let mut reference = cursors[0].clone();
-        let mut docs: Vec<(u32, u32)> = Vec::new();
+        let mut docs: Vec<(u32, u32, usize)> = Vec::new();
         while !reference.is_exhausted() {
-            docs.push((reference.current_doc_id(), reference.current_tf()));
+            docs.push((
+                reference.current_doc_id(),
+                reference.current_tf(),
+                reference.current_block,
+            ));
             reference.next();
         }
-        assert!(cursors[0].block_count() > 1);
-        let present: std::collections::HashMap<u32, u32> = docs.iter().copied().collect();
+        let present: std::collections::HashMap<u32, u32> =
+            docs.iter().map(|&(d, tf, _)| (d, tf)).collect();
         let mut c = cursors[0].clone();
         let mut probes: Vec<u32> = Vec::new();
-        probes.extend((0..6000u32).step_by(13)); // ascending, mostly misses
-        probes.extend(docs.iter().map(|(d, _)| *d)); // restarts behind, then every hit
-        probes.extend([5_999, 0, 97, 96, 98, 6_000, 60_000]); // edges, behind, past the term
+        for (i, &(d, _, blk)) in docs.iter().enumerate() {
+            probes.extend([d.saturating_sub(3), d]); // a miss just before, then the hit
+            if i > 0 && docs[i - 1].2 == blk {
+                probes.extend([docs[i - 1].0, docs[i - 1].0 + 1, d]); // back within the block
+            }
+        }
+        probes.extend([45_000, 60_000]); // past the term
         for &d in &probes {
             let got = c.contains(d);
             assert_eq!(got, present.contains_key(&d), "probe {d}");
