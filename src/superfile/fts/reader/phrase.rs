@@ -463,17 +463,18 @@ impl PhraseCursor {
             while self.cand_next < self.cands.len() {
                 let s = self.cands[self.cand_next];
                 self.cand_next += 1;
-                // Every member holds `s`; put each walk cursor on it (the
-                // verification reads the block it lands in).
+                // Every member holds `s`: move each walk cursor's block to it
+                // without a decode (the verification materializes the block
+                // it lands in, and a skip would publish a dense block lazily
+                // only to expand it right after).
                 for &mi in &self.align_order {
-                    self.members[mi].cursor.skip_to(s);
-                    debug_assert_eq!(self.members[mi].cursor.current_doc_id(), s);
+                    self.members[mi].cursor.seek_block(s);
                 }
                 if let Some(norm) = bar_norm {
                     let min_tf = self
                         .members
-                        .iter()
-                        .map(|m| m.cursor.current_tf())
+                        .iter_mut()
+                        .map(|m| m.cursor.tf_at_contained(s))
                         .min()
                         .expect("members >= 2");
                     let ub = bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, norm.get(s));

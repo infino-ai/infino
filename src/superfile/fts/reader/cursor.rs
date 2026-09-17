@@ -1011,6 +1011,24 @@ impl TermCursor {
         docs.truncate(w);
     }
 
+    /// Move the block cursor to the block that holds `doc`, without a
+    /// decode or a presence test: for a doc a probe cursor over the same
+    /// postings has already confirmed, ahead of [`Self::materialize_at`]
+    /// or [`Self::tf_at_contained`]. Like the probes it moves
+    /// `current_block`, so the cursor must not also be iterated.
+    #[inline]
+    pub(super) fn seek_block(&mut self, doc: u32) {
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < doc
+        {
+            self.current_block += 1;
+        }
+        debug_assert!(
+            self.current_block < self.blocks.len(),
+            "doc confirmed present"
+        );
+    }
+
     /// Materialize a `contains`-probed cursor at `doc`: ensure the current
     /// block is decoded and `pos` points at `doc`. A membership probe
     /// (`contains`) advances `current_block` but, on a **bitset block**,
@@ -1569,11 +1587,10 @@ impl TermCursor {
                 rank as usize,
             )
         } else {
-            // PACKED: `contains` decoded this block and left `pos` on `doc`.
-            debug_assert_eq!(
-                self.block_doc_ids[self.pos], doc,
-                "contains(doc) confirmed presence"
-            );
+            // PACKED: `contains` decoded this block and left `pos` on `doc`;
+            // after a bare `seek_block` the block is decoded and scanned here.
+            self.materialize_at(doc);
+            debug_assert_eq!(self.block_doc_ids[self.pos], doc, "doc confirmed present");
             self.block_tfs[self.pos]
         }
     }
