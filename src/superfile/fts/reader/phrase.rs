@@ -369,7 +369,7 @@ impl PhraseCursor {
         if self.is_exhausted() || self.current_doc >= target {
             return Ok(());
         }
-        self.seek_match(target, bar, dl_norm_k1)
+        self.seek_match(target, bar, Some(dl_norm_k1))
     }
 
     /// Approximate seek (the cheap half of a two-phase phrase): advance to the
@@ -423,33 +423,11 @@ impl PhraseCursor {
         }
     }
 
-    /// Unranked (match/count) doc alignment to the next *verified* phrase match
-    /// ≥ `from`: the approximate member-intersection ([`Self::approx_seek`])
-    /// followed by adjacency verification, retrying at the next candidate until
-    /// one verifies or the members exhaust. The count-path twin of the ranked
-    /// [`Self::seek_match`], which must keep decoding tfs for its score bar.
-    pub(super) fn seek_match_unranked(&mut self, mut from: u32) -> Result<(), FtsError> {
-        loop {
-            self.approx_seek(from);
-            if self.current_doc == u32::MAX {
-                return Ok(());
-            }
-            let aligned = self.current_doc;
-            // Verify adjacency; the probed members are decoded here, lazily.
-            let tf = self.verify_at_aligned(aligned)?;
-            if tf > 0 {
-                self.current_tf = tf;
-                return Ok(());
-            }
-            match aligned.checked_add(1) {
-                Some(next) => from = next,
-                None => {
-                    self.current_doc = u32::MAX;
-                    self.current_tf = 0;
-                    return Ok(());
-                }
-            }
-        }
+    /// Unranked (match/count) alignment to the next *verified* phrase match
+    /// ≥ `from`: the block-batched walk of [`Self::seek_match`] with no bar,
+    /// so no tf is compared and no doc is pre-screened.
+    pub(super) fn seek_match_unranked(&mut self, from: u32) -> Result<(), FtsError> {
+        self.seek_match(from, f32::NEG_INFINITY, None)
     }
 
     /// Advance to the first verified phrase match at doc ≥ `from`, a block
@@ -470,8 +448,13 @@ impl PhraseCursor {
         &mut self,
         from: u32,
         bar: f32,
-        dl_norm_k1: &NormTable,
+        dl_norm_k1: Option<&NormTable>,
     ) -> Result<(), FtsError> {
+        debug_assert!(
+            bar == f32::NEG_INFINITY || dl_norm_k1.is_some(),
+            "a finite bar needs the norms"
+        );
+        let bar_norm = dl_norm_k1.filter(|_| bar > f32::NEG_INFINITY);
         while self.cand_next < self.cands.len() && self.cands[self.cand_next] < from {
             self.cand_next += 1;
         }
@@ -486,15 +469,14 @@ impl PhraseCursor {
                     self.members[mi].cursor.skip_to(s);
                     debug_assert_eq!(self.members[mi].cursor.current_doc_id(), s);
                 }
-                if bar > f32::NEG_INFINITY {
+                if let Some(norm) = bar_norm {
                     let min_tf = self
                         .members
                         .iter()
                         .map(|m| m.cursor.current_tf())
                         .min()
                         .expect("members >= 2");
-                    let ub =
-                        bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, dl_norm_k1.get(s));
+                    let ub = bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, norm.get(s));
                     if ub < bar {
                         continue;
                     }
@@ -535,7 +517,7 @@ impl PhraseCursor {
             // smallest member block max over its range scaled to the
             // phrase idf. Under the bar, the block is skipped whole before
             // any of its docs is aligned or its positions read.
-            if bar > f32::NEG_INFINITY && self.block_max_in_range(first, block_last) < bar {
+            if bar_norm.is_some() && self.block_max_in_range(first, block_last) < bar {
                 continue;
             }
             let d = &self.members[driver].cursor;
