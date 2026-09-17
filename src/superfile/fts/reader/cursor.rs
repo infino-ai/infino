@@ -1330,19 +1330,22 @@ impl TermCursor {
     /// a hint pointer so monotonically-advancing leader ranges amortize
     /// to O(1) amortized per call.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
-        self.block_max_and_blocks_in_range(range_start, range_end).0
+        self.block_max_and_density_in_range(range_start, range_end)
+            .0
     }
 
-    /// [`Self::block_max_in_range`] together with the number of blocks that
-    /// overlap the range — times [`BLOCK_LEN`], the ceiling on this term's
-    /// docs in it. `0` when the cursor is exhausted.
-    pub(super) fn block_max_and_blocks_in_range(
+    /// [`Self::block_max_in_range`] together with an estimate of this
+    /// term's docs in the range: the overlapping blocks hold
+    /// [`BLOCK_LEN`] docs each over their combined doc-id span, so the
+    /// range's share of that span is its share of those docs. `0` when the
+    /// cursor is exhausted.
+    pub(super) fn block_max_and_density_in_range(
         &mut self,
         range_start: u32,
         range_end: u32,
-    ) -> (f32, usize) {
+    ) -> (f32, f32) {
         if self.is_exhausted() {
-            return (0.0, 0);
+            return (0.0, 0.0);
         }
         // Advance inspect_block to the first block whose last_doc_id
         // could intersect the range. shallow_advance_block_to lands on
@@ -1370,7 +1373,18 @@ impl TermCursor {
             }
             i += 1;
         }
-        (max, i - self.inspect_block)
+        let first = self.inspect_block;
+        if i == first {
+            return (max, 0.0);
+        }
+        let span_start = match first {
+            0 => 0u32,
+            _ => self.blocks[first - 1].last_doc_id.saturating_add(1),
+        };
+        let span = f64::from(self.blocks[i - 1].last_doc_id) - f64::from(span_start) + 1.0;
+        let range = f64::from(range_end.max(range_start)) - f64::from(range_start) + 1.0;
+        let docs = (i - first) as f64 * BLOCK_LEN as f64 * (range / span).clamp(0.0, 1.0);
+        (max, docs as f32)
     }
 
     /// Block-max-BM25 at the inspect-block pointer. Pair with

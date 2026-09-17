@@ -128,7 +128,7 @@ unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score:
 /// How many more docs a term must have in a union window than the
 /// essentials it would be probed for, before the window demotes it from
 /// accumulation to probing.
-const DEMOTE_DENSITY: usize = 8;
+const DEMOTE_DENSITY: f32 = 8.0;
 
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
 /// `docs[i]` the term contains, scoring matches in SIMD batches rather than one
@@ -1855,7 +1855,7 @@ impl FtsReader {
         // Per-window block-level upper bounds and their suffix sums, in the
         // same term-max order as `partial_max`.
         let mut win_ub = vec![0.0_f32; n];
-        let mut win_blocks = vec![0usize; n];
+        let mut win_docs_est = vec![0.0_f32; n];
         let mut partial_win = vec![0.0_f32; n + 1];
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
@@ -2014,26 +2014,29 @@ impl FtsReader {
             // demoted and the window keeps the term-max partition.
             // Demotion trades accumulating the term's docs (a few ns each,
             // SIMD) for a probe per remaining candidate (tens of ns), so a
-            // term is only demoted when its docs in the window outnumber
-            // the remaining essentials' by `DEMOTE_DENSITY` — the stopword
-            // shape; two mid-frequency terms are cheaper scored together.
+            // term is only demoted when its estimated docs in the window
+            // outnumber the remaining essentials' by `DEMOTE_DENSITY` — the
+            // stopword shape; two mid-frequency terms are cheaper scored
+            // together. (Windows end at an essential block boundary, so a
+            // window is often one stopword block against a sliver of a rare
+            // term's block: the estimate is by doc share, not block count.)
             // A window whose total bound is under the threshold holds no
             // competitive doc and is skipped whole regardless.
             let f_win = if prune {
                 let win_last = window_end.saturating_sub(1);
                 let weakest = f_essential - 1;
-                let (weakest_ub, weakest_blocks) =
-                    cursors[weakest].block_max_and_blocks_in_range(base, win_last);
+                let (weakest_ub, weakest_docs) =
+                    cursors[weakest].block_max_and_density_in_range(base, win_last);
                 if weakest_ub + partial_max[f_essential] > threshold {
                     partial_win.copy_from_slice(&partial_max);
                     f_essential
                 } else {
                     win_ub[weakest] = weakest_ub;
-                    win_blocks[weakest] = weakest_blocks;
+                    win_docs_est[weakest] = weakest_docs;
                     for (i, c) in cursors.iter_mut().enumerate().take(weakest) {
-                        let (ub, blocks) = c.block_max_and_blocks_in_range(base, win_last);
+                        let (ub, docs) = c.block_max_and_density_in_range(base, win_last);
                         win_ub[i] = ub;
-                        win_blocks[i] = blocks;
+                        win_docs_est[i] = docs;
                     }
                     for i in f_essential..n {
                         win_ub[i] = cursors[i].term_max_bm25;
@@ -2043,9 +2046,9 @@ impl FtsReader {
                         partial_win[i] = partial_win[i + 1] + win_ub[i];
                     }
                     let f = recompute_f(&partial_win, threshold);
-                    let kept: usize = win_blocks[..f].iter().sum();
-                    let demoted: usize = win_blocks[f..f_essential].iter().sum();
-                    if f == 0 || demoted >= DEMOTE_DENSITY * kept.max(1) {
+                    let kept: f32 = win_docs_est[..f].iter().sum();
+                    let demoted: f32 = win_docs_est[f..f_essential].iter().sum();
+                    if f == 0 || demoted >= DEMOTE_DENSITY * kept.max(1.0) {
                         f
                     } else {
                         partial_win.copy_from_slice(&partial_max);
