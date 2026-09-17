@@ -1840,6 +1840,10 @@ impl FtsReader {
         // the drain fills it, the SIMD filter compacts it to survivors.
         let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
         let mut win_scores: Vec<f32> = Vec::with_capacity(OR_WINDOW as usize);
+        // Per-window block-level upper bounds and their suffix sums, in the
+        // same term-max order as `partial_max`.
+        let mut win_ub = vec![0.0_f32; n];
+        let mut partial_win = vec![0.0_f32; n + 1];
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
         let total_term_ub = partial_max[0];
@@ -1981,7 +1985,41 @@ impl FtsReader {
             // Block-max skip fires only once the heap is full (threshold is a
             // real k-th score); hoisted so the per-posting loop doesn't re-test.
             let prune = heap.len() >= k;
-            for c in cursors.iter_mut().take(f_essential) {
+            // Block-level partition for this window. A term whose block
+            // maxima over the window cannot lift the weaker terms past the
+            // threshold is non-essential *here*, even if its term max keeps
+            // it essential overall: a stopword's dense blocks are then
+            // probed for the other terms' candidates instead of scored doc
+            // by doc. Suffix sums over the fixed term-max order keep the
+            // bound valid (block maxima never exceed term maxima, so
+            // `f_win <= f_essential`); a window whose total bound is under
+            // the threshold holds no competitive doc and is skipped whole.
+            let f_win = if prune {
+                let win_last = window_end.saturating_sub(1);
+                for (i, c) in cursors.iter_mut().enumerate().take(f_essential) {
+                    win_ub[i] = match c.is_exhausted() {
+                        true => 0.0,
+                        false => c.block_max_in_range(base, win_last),
+                    };
+                }
+                for i in f_essential..n {
+                    win_ub[i] = cursors[i].term_max_bm25;
+                }
+                partial_win[n] = 0.0;
+                for i in (0..n).rev() {
+                    partial_win[i] = partial_win[i + 1] + win_ub[i];
+                }
+                recompute_f(&partial_win, threshold)
+            } else {
+                f_essential
+            };
+            if f_win == 0 {
+                for c in cursors.iter_mut().take(f_essential) {
+                    c.skip_to(window_end);
+                }
+                continue;
+            }
+            for c in cursors.iter_mut().take(f_win) {
                 let mut checked_block = usize::MAX;
                 while !c.is_exhausted() {
                     let d = c.current_doc_id();
@@ -2052,7 +2090,7 @@ impl FtsReader {
             // `(doc, essential-score)` list (dropping negated docs), then run
             // the reference pipeline: SIMD-filter to competitive survivors,
             // complete the non-essentials over the survivors only, collect.
-            let (_, non_ess) = cursors.split_at_mut(f_essential);
+            let (_, non_ess) = cursors.split_at_mut(f_win);
             let heap_full = heap.len() >= k;
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
@@ -2088,7 +2126,7 @@ impl FtsReader {
                 let nn = non_ess.len();
                 for jj in 0..nn {
                     // Max score still obtainable from non-essentials jj..nn.
-                    let bar = threshold - partial_max[f_essential + jj];
+                    let bar = threshold - partial_win[f_win + jj];
                     let sv = filter_survivors(&mut win_docs, &mut win_scores, bar);
                     win_docs.truncate(sv);
                     win_scores.truncate(sv);
@@ -2101,6 +2139,13 @@ impl FtsReader {
                 for c in non_ess.iter_mut() {
                     score_noness_batched(c, &win_docs, &mut win_scores, dl_norm_k1);
                 }
+            }
+
+            // Terms demoted for this window were only probed; move them past
+            // the window so every essential cursor stays on the window
+            // frontier and no doc is accumulated twice.
+            for c in cursors.iter_mut().take(f_essential).skip(f_win) {
+                c.skip_to(window_end);
             }
 
             // Collect the fully-scored candidates (ascending doc order).
@@ -2949,6 +2994,75 @@ mod tests {
             for ((db, sb), (dw, sw)) in bmm.iter().zip(wms.iter()) {
                 assert_eq!(db, dw, "doc mismatch k={k}: bmm={db} wms={dw}");
                 assert!((sb - sw).abs() < 1e-4, "score mismatch k={k}: {sb} vs {sw}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_maxscore_window_partition_demotes_a_stopword() {
+        // A stopword in every doc whose tf reaches 3 only in every eighth
+        // block (2 elsewhere in those blocks, 1 in the rest) unioned with a
+        // rare term that stops two thirds of the way through the corpus.
+        // At k large enough that the threshold settles between the
+        // stopword's tf-1 and tf-3 scores, the stopword stays essential by
+        // its term max but its block maxima over most windows fall under the
+        // threshold: those windows demote it to a probe-only term, and once
+        // the rare term is exhausted the windows are skipped whole. Small k
+        // (stopword non-essential outright) and huge k (heap never fills)
+        // bracket the path. Every k must match per-candidate MaxScore+BMM.
+        const N_DOCS: u32 = OR_WINDOW * 3 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let hot = (i / 128).is_multiple_of(8);
+            let the_tf = match (hot, i % 4) {
+                (true, 0) => 3,
+                (true, _) => 2,
+                (false, _) => 1,
+            };
+            let mut text = String::new();
+            for _ in 0..the_tf {
+                text.push_str("the ");
+            }
+            if i % 37 == 0 && i < OR_WINDOW * 2 {
+                for _ in 0..=(i / 37 % 4) {
+                    text.push_str("incredibles ");
+                }
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        for terms in [&["the", "incredibles"], &["incredibles", "the"]] {
+            for k in [
+                1usize,
+                10,
+                128,
+                300,
+                600,
+                1000,
+                1500,
+                3000,
+                N_DOCS as usize + 1,
+            ] {
+                let bmm = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Bmm)
+                    .await
+                    .expect("bmm");
+                let wms = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::WindowedMaxscore)
+                    .await
+                    .expect("wms");
+                assert_eq!(bmm.len(), wms.len(), "len {terms:?} k={k}");
+                for ((db, sb), (dw, sw)) in bmm.iter().zip(wms.iter()) {
+                    assert_eq!(db, dw, "doc mismatch {terms:?} k={k}: bmm={db} wms={dw}");
+                    assert!(
+                        (sb - sw).abs() < 1e-4,
+                        "score mismatch {terms:?} k={k}: {sb} vs {sw}"
+                    );
+                }
             }
         }
     }

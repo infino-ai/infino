@@ -1032,13 +1032,21 @@ impl TermCursor {
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
         if hdr.encoding != ENCODING_BITSET {
-            // PACKED: no rank shortcut — decode + locate like the old path.
-            self.skip_to(doc);
-            return if self.current_doc_id() == doc {
-                Some(self.current_tf())
-            } else {
-                None
+            // PACKED: bisect the decoded block from the last probe's position
+            // (probes ascend) and read the tf at that index. Stepping the
+            // cursor there doc by doc was a quarter of a three-term union.
+            debug_assert!(!self.count_only, "a probe for tf on a count-only cursor");
+            if self.decoded_block != self.current_block {
+                self.decode_current_block();
+            }
+            let ids = &self.block_doc_ids[..self.block_n];
+            let from = match self.pos < ids.len() && ids[self.pos] <= doc {
+                true => self.pos,
+                false => 0,
             };
+            let i = from + ids[from..].partition_point(|&d| d < doc);
+            self.pos = i.min(ids.len().saturating_sub(1));
+            return (i < ids.len() && ids[i] == doc).then(|| self.block_tfs[i]);
         }
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         let (bit, word, bitset_end) = Self::bitset_word(raw, &hdr, doc)?;
@@ -1603,6 +1611,54 @@ mod tests {
                 c.next();
             }
         }
+    }
+
+    /// The tf probe on a packed block bisects the decoded ids from the
+    /// previous probe's position instead of stepping the cursor there.
+    /// Every doc across several blocks must answer exactly as the walk
+    /// does, ascending probes and a backwards probe within a block alike,
+    /// and the cursor must stay on a valid in-block position throughout.
+    #[tokio::test]
+    async fn packed_block_tf_probes_match_the_walk() {
+        use crate::superfile::fts::posting::{ENCODING_BITSET, block_encoding};
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("flat".into(), false).expect("register");
+        let tf_of = |doc: u32| doc.is_multiple_of(37).then(|| 1 + doc % 5);
+        for doc_id in 0..60_000u32 {
+            let text = match tf_of(doc_id) {
+                Some(tf) => vec!["sparse"; tf as usize].join(" "),
+                None => "filler".to_string(),
+            };
+            b.add_doc(0, doc_id, &text).expect("add");
+        }
+        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let cursors = view
+            .build_term_cursors(0, &["sparse"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let mut c = cursors[0].clone();
+        assert!(c.blocks.len() >= 4, "several blocks");
+        for blk in c.blocks.iter() {
+            assert_ne!(
+                block_encoding(&c.bytes[blk.block_byte_offset..blk.block_byte_end]),
+                ENCODING_BITSET,
+                "the gap-37 list must pack, or the bisecting path is not under test"
+            );
+        }
+        for doc in 0..12_000u32 {
+            assert_eq!(c.bitset_probe_tf(doc), tf_of(doc), "probe {doc}");
+            assert!(c.pos < c.block_n, "probe {doc} left pos out of the block");
+            let _ = c.current_doc_id();
+        }
+        // A probe behind the last one inside the same block restarts the
+        // bisection from the block's start.
+        assert_eq!(c.bitset_probe_tf(11_988), tf_of(11_988));
+        assert_eq!(c.bitset_probe_tf(11_951), tf_of(11_951));
+        assert_eq!(c.bitset_probe_tf(11_100), tf_of(11_100));
+        // Past the last block: absent, and the cursor reports exhaustion.
+        assert_eq!(c.bitset_probe_tf(100_000), None);
+        assert!(c.is_exhausted());
     }
 
     /// A lazily published block must expand on demand for the callers

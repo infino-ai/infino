@@ -251,6 +251,9 @@ pub(super) struct PhraseCursor {
     /// phrase-start positions as they are filtered member by member —
     /// avoids a per-doc allocation on the hot verify path.
     pub(super) verify_scratch: Vec<u32>,
+    /// Block of the rarest member whose block-level phrase bound was last
+    /// checked against the ranked bar, so the check runs once per block.
+    pruned_block: usize,
 }
 
 impl PhraseCursor {
@@ -310,6 +313,7 @@ impl PhraseCursor {
             current_doc: 0,
             current_tf: 0,
             verify_scratch: Vec::new(),
+            pruned_block: usize::MAX,
         };
         cursor.seek_match_unranked(0)?;
         Ok(cursor)
@@ -474,6 +478,29 @@ impl PhraseCursor {
             }
 
             if bar > f32::NEG_INFINITY {
+                // Block-level bound, once per block of the rarest member: the
+                // phrase tf is at most every member's tf, so no doc in this
+                // block can score above the smallest member block max scaled
+                // to the phrase idf. A block under the bar is skipped before
+                // any of its docs is aligned or its positions read, which
+                // the per-doc bound below cannot do for a block of misses.
+                let lead = self.align_order[0];
+                let lead_block = self.members[lead].cursor.current_block;
+                if lead_block != self.pruned_block {
+                    self.pruned_block = lead_block;
+                    let end = self.members[lead].cursor.current_block_last_doc_id();
+                    if self.block_max_in_range(aligned, end) < bar {
+                        from = match end.checked_add(1) {
+                            Some(next) => next,
+                            None => {
+                                self.current_doc = u32::MAX;
+                                self.current_tf = 0;
+                                return Ok(());
+                            }
+                        };
+                        continue 'docs;
+                    }
+                }
                 let min_tf = self
                     .members
                     .iter()
@@ -874,6 +901,72 @@ mod tests {
         let mut ids: Vec<u32> = rare_hits.iter().map(|(d, _)| *d).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1, 2], "short-form member's packed group");
+    }
+
+    /// Ranked phrase walks prune whole blocks of the rarest member whose
+    /// block-level phrase bound is under the bar. Plant "the movement" in
+    /// every 13th doc, twice per doc in every fifth run of eight blocks
+    /// and once elsewhere, so a small k fills the heap from the doubled
+    /// runs and the rarest member's blocks inside the single-occurrence
+    /// runs fall under the bar; near-misses
+    /// ("movement the") keep the members aligning on docs that fail to
+    /// verify. Every k must match the unpruned walk's top-k.
+    #[tokio::test]
+    async fn ranked_phrase_block_pruning_agrees_with_the_unpruned_walk() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
+        };
+        const N_DOCS: u32 = BLOCK_LEN as u32 * 40;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let hot = (d / (8 * BLOCK_LEN as u32)).is_multiple_of(5);
+            let text = match (d % 13, hot) {
+                (0, true) => "the movement of the movement",
+                (0, false) => "the movement of the people",
+                (5, _) => "movement the people of",
+                _ => "the people of the town",
+            };
+            b.add_doc(0, d, text).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["the", "movement"]);
+        let clauses = || ClauseLists {
+            should_phrases: &phrases,
+            ..ClauseLists::default()
+        };
+        // With k above the match count the heap never fills, so the bar
+        // stays at negative infinity and nothing is pruned: the oracle.
+        let mut all = r
+            .search_excluding("title", clauses(), N_DOCS as usize + 1, f32::NEG_INFINITY)
+            .await
+            .expect("unpruned");
+        assert_eq!(
+            all.len(),
+            (N_DOCS as usize).div_ceil(13),
+            "every 13th doc matches"
+        );
+        all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        for k in [1usize, 3, 10, 50, 100, 200] {
+            let pruned = r
+                .search_excluding("title", clauses(), k, f32::NEG_INFINITY)
+                .await
+                .expect("pruned");
+            assert_eq!(pruned.len(), k, "k={k}");
+            for (i, ((dp, sp), (da, sa))) in pruned.iter().zip(all.iter()).enumerate() {
+                assert_eq!(
+                    dp, da,
+                    "doc mismatch k={k} rank {i}: pruned={dp} oracle={da}"
+                );
+                assert!(
+                    (sp - sa).abs() < 1e-4,
+                    "score mismatch k={k} rank {i}: {sp} vs {sa}"
+                );
+            }
+        }
     }
 
     /// A block whose position runs are very long (600 occurrences per doc,
