@@ -200,6 +200,7 @@ impl DiskCacheStore {
             // Only the winner of the remove deletes and subtracts, so two concurrent evictions
             // cannot double-count.
             if self.unindexed.remove(&uri).is_some() {
+                tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: whole .sf.parquet (budget)");
                 let _ = fs::remove_file(self.cache_path(&uri));
                 self.drop_block_file(&uri);
                 self.current_bytes.fetch_sub(size, Ordering::Release);
@@ -231,6 +232,7 @@ impl DiskCacheStore {
             }
 
             if self.block_files.remove(&uri).is_some() {
+                tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: .blocks (budget)");
                 let _ = fs::remove_file(self.blocks_path(&uri));
                 let _ = fs::remove_file(self.blocks_idx_path(&uri));
                 self.current_bytes.fetch_sub(size, Ordering::Release);
@@ -413,6 +415,7 @@ impl DiskCacheStore {
             // reservations evicting the same victim could
             // double-decrement current_bytes.
             if let Some((_, entry)) = self.cached.remove(&uri) {
+                tracing::info!(target: "infino::cache", uri = %uri.0, "evict: live cached entry (budget pressure)");
                 let path = self.cache_path(&uri);
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(self.blocks_path(&uri));
