@@ -1169,6 +1169,38 @@ impl TermCursor {
         block_tfs[rank]
     }
 
+    /// The packed-block half of [`Self::bitset_probe_tf`]: locate `doc` in
+    /// the decoded block from the last probe's position (probes ascend) and
+    /// read the tf at that index. A galloping search — doubling strides
+    /// from the position, then a bisection of the last stride — so a probe
+    /// a few docs on costs a couple of compares and a probe across the
+    /// block a dozen. Kept out of line: the probe is called once per
+    /// candidate per non-essential term, and inlining the decode and
+    /// search here grew the bitset path's caller enough to cost a long
+    /// query a quarter of its time.
+    #[inline(never)]
+    fn packed_probe_tf(&mut self, doc: u32) -> Option<u32> {
+        debug_assert!(!self.count_only, "a probe for tf on a count-only cursor");
+        if self.decoded_block != self.current_block {
+            self.decode_current_block();
+        }
+        let ids = &self.block_doc_ids[..self.block_n];
+        let len = ids.len();
+        let mut lo = match self.pos < len && ids[self.pos] <= doc {
+            true => self.pos,
+            false => 0,
+        };
+        let mut step = 1usize;
+        while lo + step < len && ids[lo + step] < doc {
+            lo += step;
+            step <<= 1;
+        }
+        let hi = (lo + step).min(len);
+        let i = lo + ids[lo..hi].partition_point(|&d| d < doc);
+        self.pos = i.min(len.saturating_sub(1));
+        (i < len && ids[i] == doc).then(|| self.block_tfs[i])
+    }
+
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -1188,33 +1220,7 @@ impl TermCursor {
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
         if hdr.encoding != ENCODING_BITSET {
-            // PACKED: locate `doc` in the decoded block from the last probe's
-            // position (probes ascend) and read the tf at that index. A
-            // galloping search: doubling steps from the position, then a
-            // bisection of the last stride, so a probe a few docs on costs a
-            // couple of compares and a probe across the block a dozen, where
-            // stepping the cursor doc by doc cost the gap and a bisection of
-            // the whole block cost its seven unpredictable branches on
-            // every probe of a long query.
-            debug_assert!(!self.count_only, "a probe for tf on a count-only cursor");
-            if self.decoded_block != self.current_block {
-                self.decode_current_block();
-            }
-            let ids = &self.block_doc_ids[..self.block_n];
-            let len = ids.len();
-            let mut lo = match self.pos < len && ids[self.pos] <= doc {
-                true => self.pos,
-                false => 0,
-            };
-            let mut step = 1usize;
-            while lo + step < len && ids[lo + step] < doc {
-                lo += step;
-                step <<= 1;
-            }
-            let hi = (lo + step).min(len);
-            let i = lo + ids[lo..hi].partition_point(|&d| d < doc);
-            self.pos = i.min(len.saturating_sub(1));
-            return (i < len && ids[i] == doc).then(|| self.block_tfs[i]);
+            return self.packed_probe_tf(doc);
         }
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         let (bit, word, bitset_end) = Self::bitset_word(raw, &hdr, doc)?;
