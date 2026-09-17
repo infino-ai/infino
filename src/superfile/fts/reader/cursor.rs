@@ -1096,38 +1096,6 @@ impl TermCursor {
         block_tfs[rank]
     }
 
-    /// The packed-block half of [`Self::bitset_probe_tf`]: locate `doc` in
-    /// the decoded block from the last probe's position (probes ascend) and
-    /// read the tf at that index. A galloping search — doubling strides
-    /// from the position, then a bisection of the last stride — so a probe
-    /// a few docs on costs a couple of compares and a probe across the
-    /// block a dozen. Kept out of line: the probe is called once per
-    /// candidate per non-essential term, and inlining the decode and
-    /// search here grew the bitset path's caller enough to cost a long
-    /// query a quarter of its time.
-    #[inline(never)]
-    fn packed_probe_tf(&mut self, doc: u32) -> Option<u32> {
-        debug_assert!(!self.count_only, "a probe for tf on a count-only cursor");
-        if self.decoded_block != self.current_block {
-            self.decode_current_block();
-        }
-        let ids = &self.block_doc_ids[..self.block_n];
-        let len = ids.len();
-        let mut lo = match self.pos < len && ids[self.pos] <= doc {
-            true => self.pos,
-            false => 0,
-        };
-        let mut step = 1usize;
-        while lo + step < len && ids[lo + step] < doc {
-            lo += step;
-            step <<= 1;
-        }
-        let hi = (lo + step).min(len);
-        let i = lo + ids[lo..hi].partition_point(|&d| d < doc);
-        self.pos = i.min(len.saturating_sub(1));
-        (i < len && ids[i] == doc).then(|| self.block_tfs[i])
-    }
-
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -1147,7 +1115,19 @@ impl TermCursor {
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
         if hdr.encoding != ENCODING_BITSET {
-            return self.packed_probe_tf(doc);
+            // PACKED: no rank shortcut — decode + locate like a skip. The
+            // in-block step is a linear scan from the cursor's position on
+            // purpose: a completion pass probes a block a few docs apart,
+            // and every search that bisects (whole block, after a few
+            // linear steps, or galloping) measured a quarter slower on a
+            // long query — the predictable scan beats the mispredicted
+            // halving for gaps under a block.
+            self.skip_to(doc);
+            return if self.current_doc_id() == doc {
+                Some(self.current_tf())
+            } else {
+                None
+            };
         }
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
         let (bit, word, bitset_end) = Self::bitset_word(raw, &hdr, doc)?;
@@ -1742,11 +1722,10 @@ mod tests {
         }
     }
 
-    /// The tf probe on a packed block bisects the decoded ids from the
-    /// previous probe's position instead of stepping the cursor there.
-    /// Every doc across several blocks must answer exactly as the walk
-    /// does, ascending probes and a backwards probe within a block alike,
-    /// and the cursor must stay on a valid in-block position throughout.
+    /// The tf probe on a packed block steps the cursor to the doc. Every
+    /// doc across several blocks must answer exactly as the walk does for
+    /// ascending probes, and the cursor must stay on a valid in-block
+    /// position throughout.
     #[tokio::test]
     async fn packed_block_tf_probes_match_the_walk() {
         use crate::superfile::fts::posting::{ENCODING_BITSET, block_encoding};
@@ -1772,7 +1751,7 @@ mod tests {
             assert_ne!(
                 block_encoding(&c.bytes[blk.block_byte_offset..blk.block_byte_end]),
                 ENCODING_BITSET,
-                "the gap-37 list must pack, or the bisecting path is not under test"
+                "the gap-37 list must pack, or the packed path is not under test"
             );
         }
         for doc in 0..12_000u32 {
@@ -1780,11 +1759,6 @@ mod tests {
             assert!(c.pos < c.block_n, "probe {doc} left pos out of the block");
             let _ = c.current_doc_id();
         }
-        // A probe behind the last one inside the same block restarts the
-        // bisection from the block's start.
-        assert_eq!(c.bitset_probe_tf(11_988), tf_of(11_988));
-        assert_eq!(c.bitset_probe_tf(11_951), tf_of(11_951));
-        assert_eq!(c.bitset_probe_tf(11_100), tf_of(11_100));
         // Past the last block: absent, and the cursor reports exhaustion.
         assert_eq!(c.bitset_probe_tf(100_000), None);
         assert!(c.is_exhausted());
