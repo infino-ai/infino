@@ -1994,22 +1994,41 @@ impl FtsReader {
             // bound valid (block maxima never exceed term maxima, so
             // `f_win <= f_essential`); a window whose total bound is under
             // the threshold holds no competitive doc and is skipped whole.
+            let window_bound = |c: &mut TermCursor, win_last: u32| match c.is_exhausted() {
+                true => 0.0,
+                false => c.block_max_in_range(base, win_last),
+            };
             let f_win = if prune {
                 let win_last = window_end.saturating_sub(1);
-                for (i, c) in cursors.iter_mut().enumerate().take(f_essential) {
-                    win_ub[i] = match c.is_exhausted() {
-                        true => 0.0,
-                        false => c.block_max_in_range(base, win_last),
-                    };
+                // Gate on the weakest essential term alone: the suffix sums
+                // only grow towards the stronger terms, so unless its window
+                // bound plus the non-essential suffix is under the threshold
+                // no term is demoted and the window keeps the term-max
+                // partition. Bounding every essential term per window was
+                // measurable on four-term unions at large k, where nothing
+                // is ever demoted.
+                let weakest = f_essential - 1;
+                let weakest_ub = window_bound(&mut cursors[weakest], win_last);
+                if weakest_ub + partial_max[f_essential] > threshold {
+                    // The completion bars below read the window's suffix
+                    // sums; with the term-max partition kept they are the
+                    // term-max sums.
+                    partial_win.copy_from_slice(&partial_max);
+                    f_essential
+                } else {
+                    win_ub[weakest] = weakest_ub;
+                    for (i, c) in cursors.iter_mut().enumerate().take(weakest) {
+                        win_ub[i] = window_bound(c, win_last);
+                    }
+                    for i in f_essential..n {
+                        win_ub[i] = cursors[i].term_max_bm25;
+                    }
+                    partial_win[n] = 0.0;
+                    for i in (0..n).rev() {
+                        partial_win[i] = partial_win[i + 1] + win_ub[i];
+                    }
+                    recompute_f(&partial_win, threshold)
                 }
-                for i in f_essential..n {
-                    win_ub[i] = cursors[i].term_max_bm25;
-                }
-                partial_win[n] = 0.0;
-                for i in (0..n).rev() {
-                    partial_win[i] = partial_win[i + 1] + win_ub[i];
-                }
-                recompute_f(&partial_win, threshold)
             } else {
                 f_essential
             };
