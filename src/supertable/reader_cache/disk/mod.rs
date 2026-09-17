@@ -177,11 +177,15 @@ pub(crate) struct CachedEntry {
 /// else branches on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadIntent {
-    /// Serve byte ranges on demand, stay remote-backed, never promote. Vector search.
+    /// Serve byte ranges on demand from the block cache and never download the whole file to
+    /// promote it. A whole file already on local disk is still used (the disk tier), since that
+    /// costs no GETs. Vector search.
     Stream,
-    /// Serve now, and download the rest in the background toward a local mmap. FTS and SQL queries.
+    /// Serve now, and download the rest in the background toward a local mmap. FTS and SQL
+    /// queries, and user-table compaction, which opens its inputs this way.
     Warm,
-    /// Download the whole file and mmap it before serving. Compaction, which rewrites its input.
+    /// Download the whole file and mmap it before serving; a lazy hit is never enough. Hidden
+    /// vector-index maintenance, which rewrites its input.
     Load,
 }
 
