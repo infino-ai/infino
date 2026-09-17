@@ -813,7 +813,13 @@ pub fn decode_block_tfs(bytes: &[u8], hdr: &BlockHeader, dest_tfs: &mut [u32]) {
 /// word with a masked `trailing_zeros`, at most a handful of u64s.
 pub fn bitset_next_doc(bytes: &[u8], hdr: &BlockHeader, from: u32) -> Option<(u32, usize)> {
     debug_assert_eq!(hdr.encoding, ENCODING_BITSET);
-    let words = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
+    hdr.check_widths();
+    let tfs_size = hdr.tfs_size();
+    assert!(
+        bytes.len() >= hdr.payload() + tfs_size,
+        "bitset_next_doc: bytes shorter than header+tfs"
+    );
+    let words = &bytes[hdr.payload()..bytes.len() - tfs_size];
     let bit = from.saturating_sub(hdr.base) as usize;
     let first_word = bit / 64;
     let mut rank = 0usize;
@@ -1171,6 +1177,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "bit width > 32")]
+    fn bitset_probe_refuses_a_header_width_past_32() {
+        // A bitset block whose header claims tf width 33: the probe must
+        // fail the width check, not underflow the tf-size arithmetic.
+        let doc_ids: Vec<u32> = (256..384).collect();
+        let tfs = vec![1u32; 128];
+        let mut enc = encode_one(
+            &block(&doc_ids, &tfs),
+            BlockLayout::Compact,
+            Some(200),
+            false,
+        );
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_BITSET);
+        let mut word = u32::from_le_bytes(enc.bytes[..4].try_into().expect("4 bytes"));
+        let mask = ((1u32 << HDR_WIDTH_BITS) - 1) << HDR_TF_BITS_SHIFT;
+        word = (word & !mask) | (33 << HDR_TF_BITS_SHIFT);
+        enc.bytes[..4].copy_from_slice(&word.to_le_bytes());
+        let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, Some(200));
+        assert_eq!(hdr.tf_bits, 33);
+        let _ = bitset_next_doc(&enc.bytes, &hdr, 256);
     }
 
     #[test]
