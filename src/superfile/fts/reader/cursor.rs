@@ -919,6 +919,89 @@ impl TermCursor {
         }
     }
 
+    /// Keep, in place, the docs of the ascending list `docs` that this term
+    /// contains. The block-at-a-time form of [`Self::contains`]: the block
+    /// cursor advances forward once per block, a bitset block is bit-tested
+    /// with its header parsed once, and a packed block is decoded once and
+    /// merged against the list. Like `contains` it moves `current_block`,
+    /// so a cursor filtered this way must not also be iterated; the
+    /// callers keep a separate cursor for the walk.
+    pub(super) fn retain_contained(&mut self, docs: &mut Vec<u32>) {
+        let n = docs.len();
+        let mut w = 0usize;
+        let mut r = 0usize;
+        if self.predecoded {
+            let ids = &self.block_doc_ids[..self.block_n];
+            let mut p = 0usize;
+            while r < n {
+                let d = docs[r];
+                while p < ids.len() && ids[p] < d {
+                    p += 1;
+                }
+                if p < ids.len() && ids[p] == d {
+                    docs[w] = d;
+                    w += 1;
+                }
+                r += 1;
+            }
+            docs.truncate(w);
+            return;
+        }
+        while r < n {
+            let doc = docs[r];
+            while self.current_block < self.blocks.len()
+                && self.blocks[self.current_block].last_doc_id < doc
+            {
+                self.current_block += 1;
+            }
+            if self.current_block >= self.blocks.len() {
+                break;
+            }
+            let block = self.blocks[self.current_block];
+            let block_last = block.last_doc_id;
+            let hdr = self.current_header();
+            if hdr.encoding == ENCODING_BITSET {
+                let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                let words = &raw[hdr.payload()..raw.len() - hdr.tfs_size()];
+                while r < n && docs[r] <= block_last {
+                    let d = docs[r];
+                    r += 1;
+                    let Some(bit) = d.checked_sub(hdr.base) else {
+                        continue;
+                    };
+                    let wi = (bit as usize / 64) * 8;
+                    if wi + 8 > words.len() {
+                        continue;
+                    }
+                    let word = u64::from_le_bytes(words[wi..wi + 8].try_into().expect("8 bytes"));
+                    if (word >> (bit % 64)) & 1 == 1 {
+                        docs[w] = d;
+                        w += 1;
+                    }
+                }
+            } else {
+                if self.decoded_block != self.current_block {
+                    self.decode_current_block();
+                }
+                let ids = &self.block_doc_ids[..self.block_n];
+                let mut p = 0usize;
+                while r < n && docs[r] <= block_last {
+                    let d = docs[r];
+                    r += 1;
+                    while p < ids.len() && ids[p] < d {
+                        p += 1;
+                    }
+                    if p < ids.len() && ids[p] == d {
+                        docs[w] = d;
+                        w += 1;
+                    }
+                }
+                self.pos = p.min(ids.len().saturating_sub(1));
+            }
+        }
+        docs.truncate(w);
+    }
+
     /// Materialize a `contains`-probed cursor at `doc`: ensure the current
     /// block is decoded and `pos` points at `doc`. A membership probe
     /// (`contains`) advances `current_block` but, on a **bitset block**,
