@@ -63,8 +63,6 @@ pub(super) const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
 
 const IDX_HEADER: [u8; 8] = CACHE_BLOCK_BYTES.to_le_bytes();
 
-const PERSIST_BYTES_THRESHOLD: u64 = 32 * 1024 * 1024;
-
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Lazily-initialized sparse backing file. Created on the first cached read
@@ -106,7 +104,6 @@ pub(crate) struct BlockCachedSource {
     /// `size_bytes`, so eviction candidates report a lazy entry's real
     /// footprint as it grows.
     filled_bytes: Arc<AtomicU64>,
-    persisted_bytes: AtomicU64,
 }
 
 impl BlockCachedSource {
@@ -152,7 +149,6 @@ impl BlockCachedSource {
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
-            persisted_bytes: AtomicU64::new(0),
         })
     }
 
@@ -235,7 +231,6 @@ impl BlockCachedSource {
             }
         }
         self.filled_bytes.store(adopted_bytes, Ordering::Release);
-        self.persisted_bytes.store(adopted_bytes, Ordering::Release);
         *self.filled.lock().expect("filled bitmap mutex poisoned") = bitmap;
         Some(BlockFile {
             file,
@@ -406,14 +401,9 @@ impl BlockCachedSource {
             }
         }
         if filled_any {
-            let filled = self.filled_bytes.load(Ordering::Acquire);
-            let unpersisted = filled.saturating_sub(self.persisted_bytes.load(Ordering::Acquire));
-            if unpersisted >= PERSIST_BYTES_THRESHOLD {
-                let snapshot = self.snapshot_index();
-                if bf.file.sync_data().is_ok() {
-                    self.persist_idx(&snapshot);
-                    self.persisted_bytes.store(filled, Ordering::Release);
-                }
+            let snapshot = self.snapshot_index();
+            if bf.file.sync_data().is_ok() {
+                self.persist_idx(&snapshot);
             }
         }
         Ok(true)
@@ -445,7 +435,7 @@ impl Drop for BlockCachedSource {
     fn drop(&mut self) {
         if let Some(Some(bf)) = self.state.get() {
             let filled = self.filled_bytes.load(Ordering::Acquire);
-            if filled > self.persisted_bytes.load(Ordering::Acquire) {
+            if filled > 0 {
                 let snapshot = self.snapshot_index();
                 if bf.file.sync_data().is_ok() {
                     self.persist_idx(&snapshot);
