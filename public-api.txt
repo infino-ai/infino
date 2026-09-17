@@ -553,6 +553,32 @@ impl core::marker::Unpin for infino::ReindexReport
 impl core::marker::UnsafeUnpin for infino::ReindexReport
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexReport
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexReport
+#[non_exhaustive] pub struct infino::StalenessReport
+pub infino::StalenessReport::awaiting_reanalysis: usize
+pub infino::StalenessReport::bytes_to_rewrite: u64
+pub infino::StalenessReport::needing_rewrite: usize
+pub infino::StalenessReport::reanalysis_blocked: usize
+pub infino::StalenessReport::superfiles: usize
+pub infino::StalenessReport::unrepairable_columns: alloc::vec::Vec<alloc::string::String>
+impl infino::StalenessReport
+pub fn infino::StalenessReport::is_current(&self) -> bool
+impl core::clone::Clone for infino::StalenessReport
+pub fn infino::StalenessReport::clone(&self) -> infino::StalenessReport
+impl core::cmp::Eq for infino::StalenessReport
+impl core::cmp::PartialEq for infino::StalenessReport
+pub fn infino::StalenessReport::eq(&self, &infino::StalenessReport) -> bool
+impl core::default::Default for infino::StalenessReport
+pub fn infino::StalenessReport::default() -> infino::StalenessReport
+impl core::fmt::Debug for infino::StalenessReport
+pub fn infino::StalenessReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::StalenessReport
+impl core::marker::Freeze for infino::StalenessReport
+impl core::marker::Send for infino::StalenessReport
+impl core::marker::Sync for infino::StalenessReport
+impl core::marker::Unpin for infino::StalenessReport
+impl core::marker::UnsafeUnpin for infino::StalenessReport
+impl core::panic::unwind_safe::RefUnwindSafe for infino::StalenessReport
+impl core::panic::unwind_safe::UnwindSafe for infino::StalenessReport
 pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
@@ -563,6 +589,7 @@ pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::r
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::index_staleness(&self) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef

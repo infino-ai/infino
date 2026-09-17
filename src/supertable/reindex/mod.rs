@@ -126,6 +126,68 @@ impl StaleSuperfile {
     }
 }
 
+/// What a reindex *would* do, without doing any of it.
+///
+/// Every field here is derived from the same scan
+/// [`crate::Supertable::reindex`] plans from, so a number in this report
+/// is the number that run will act on — not an estimate of it.
+///
+/// It exists because the migration is deliberately on demand, and an
+/// operation nobody is told to run is one nobody runs. Every input to the
+/// decision — whether anything is behind, which axis, how many bytes move,
+/// whether re-analysis would refuse the table outright — was already being
+/// computed and then discarded inside `reindex`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StalenessReport {
+    /// Superfiles in the table, stale or not — the denominator for
+    /// everything below.
+    pub superfiles: usize,
+    /// Superfiles whose container is behind, which is exactly what
+    /// [`crate::ReindexMode::Rewrite`] would rewrite.
+    pub needing_rewrite: usize,
+    /// Superfiles holding terms an older analysis produced, which only
+    /// [`crate::ReindexMode::Reanalyze`] can repair.
+    ///
+    /// Counts only files with at least one stale column whose text is
+    /// stored. A file whose stale columns are all index-only cannot be
+    /// repaired and is named through [`Self::unrepairable_columns`]
+    /// instead, because re-analyzing it would rewrite the corpus and
+    /// change nothing.
+    pub awaiting_reanalysis: usize,
+    /// Superfiles [`crate::ReindexMode::Reanalyze`] would refuse, because
+    /// their vectors cannot be reconstructed.
+    ///
+    /// A quantized or multi-cell vector index can be spliced across a
+    /// merge but not rebuilt from what the file holds. The run refuses
+    /// before it commits anything rather than failing halfway — and
+    /// non-zero here is how a caller learns that *before* starting, which
+    /// is the difference between choosing a mode and discovering the
+    /// choice was unavailable.
+    pub reanalysis_blocked: usize,
+    /// Live bytes in the superfiles a [`crate::ReindexMode::Rewrite`]
+    /// would read and write again.
+    ///
+    /// The cost of the cheap mode, for sizing a run. Re-analysis touches
+    /// these *and* the files in [`Self::awaiting_reanalysis`], and costs
+    /// far more per byte besides, so this does not bound it.
+    pub bytes_to_rewrite: u64,
+    /// Columns no rewrite and no re-analysis can repair, because their
+    /// text was never stored.
+    ///
+    /// Non-empty means a fully migrated table will still hold terms from
+    /// an older analysis in these columns, and the only remaining repair
+    /// is re-ingesting them from their source.
+    pub unrepairable_columns: Vec<String>,
+}
+
+impl StalenessReport {
+    /// Whether a reindex would do anything at all.
+    pub fn is_current(&self) -> bool {
+        self.needing_rewrite == 0 && self.awaiting_reanalysis == 0
+    }
+}
+
 /// What a reindex did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -320,6 +382,60 @@ impl Supertable {
     /// [`ReindexError::AlreadyRunning`] while a compaction or another
     /// reindex holds the slot, and [`ReindexError::Rewrite`] naming the
     /// superfile whose rewrite failed.
+    /// What a reindex would do, without doing it.
+    ///
+    /// Reads every superfile's index metadata and reports what is behind
+    /// and what repairing it would cost. Writes nothing and takes no
+    /// writer slot, so it is safe to run against a live table and safe to
+    /// run while a reindex or a compaction is in flight — the numbers are
+    /// then a snapshot that run is already changing.
+    ///
+    /// # Errors
+    ///
+    /// [`ReindexError::NoStorage`] without a durable backend, and
+    /// [`ReindexError::Assess`] if a superfile cannot be opened.
+    pub fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
+        bridge_on_runtime(self.index_staleness_async(), &self.inner().query_runtime())
+    }
+
+    async fn index_staleness_async(&self) -> Result<StalenessReport, ReindexError> {
+        if self.inner().manifest.load_full().options.storage.is_none() {
+            return Err(ReindexError::NoStorage);
+        }
+        // No writer slot: this reads and reports. Taking one would make an
+        // assessment fail while a migration it is meant to describe is
+        // running, which is precisely when someone asks.
+        let (stale, superfiles) = self
+            .stale_superfiles()
+            .await
+            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+
+        let mut report = StalenessReport {
+            superfiles,
+            ..Default::default()
+        };
+        for file in &stale {
+            // Same predicates the planner filters on, so a count here is
+            // the count that run acts on rather than an estimate of it.
+            if file.fts.needs_rewrite() {
+                report.needing_rewrite += 1;
+                report.bytes_to_rewrite += file.live_bytes;
+            }
+            if file.fts.needs_reanalysis() {
+                report.awaiting_reanalysis += 1;
+                if !file.reanalyzable {
+                    report.reanalysis_blocked += 1;
+                }
+            }
+            for column in file.unrepairable_columns() {
+                if !report.unrepairable_columns.contains(&column.name) {
+                    report.unrepairable_columns.push(column.name.clone());
+                }
+            }
+        }
+        Ok(report)
+    }
+
     pub fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         bridge_on_runtime(self.reindex_async(opts), &self.inner().query_runtime())
     }

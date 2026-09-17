@@ -23,7 +23,10 @@ use crate::{
     OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
-    supertable::{Supertable as SupertableHandle, reindex::ReindexReport},
+    supertable::{
+        Supertable as SupertableHandle,
+        reindex::{ReindexReport, StalenessReport},
+    },
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -81,6 +84,7 @@ pub(crate) trait Table: Send + Sync {
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError>;
+    fn index_staleness(&self) -> Result<StalenessReport, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
@@ -179,6 +183,9 @@ impl Table for SupertableHandle {
     }
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         SupertableHandle::reindex(self, opts)
+    }
+    fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
+        SupertableHandle::index_staleness(self)
     }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
@@ -431,6 +438,20 @@ impl Supertable {
     /// lower when a crash is known rather than suspected.
     pub fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         self.inner.reindex(opts)
+    }
+
+    /// What a [`Self::reindex`] would do, without doing it.
+    ///
+    /// The migration is on demand by design, which leaves an operator
+    /// needing an answer to "is anything behind, and what would repairing
+    /// it cost" before they rewrite committed data. This reads that answer
+    /// off the files and writes nothing.
+    ///
+    /// Takes no writer slot, so it is safe against a live table and safe
+    /// while a reindex or compaction is running — the numbers are then a
+    /// snapshot of something already in motion.
+    pub fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
+        self.inner.index_staleness()
     }
 
     /// Garbage-collect orphaned superfiles older than `safety_gap`.

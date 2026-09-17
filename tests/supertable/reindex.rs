@@ -249,6 +249,133 @@ fn a_mixed_table_reads_cleanly_across_versions_and_revisions() {
     assert_mixed_table_reads_cleanly("v2_positions_region", 2);
 }
 
+/// The assessment reports what the run then does — the same numbers, not
+/// a parallel estimate of them.
+///
+/// That equality is the whole value of the thing. An operator uses it to
+/// decide whether to rewrite committed data and how large the job is; a
+/// report that drifted from the planner would be worse than no report,
+/// because it would be trusted. So every count is checked against the run
+/// it predicts rather than against a hand-written expectation.
+fn assert_staleness_predicts_the_run(shape: &str) {
+    let Some((_tmp, table, _root)) = open_corpus(shape) else {
+        return;
+    };
+    let before = table.index_staleness().expect("assess a stale table");
+
+    assert!(!before.is_current(), "{shape}: a corpus table is behind");
+    assert_eq!(
+        before.superfiles, before.needing_rewrite,
+        "{shape}: every superfile in a corpus table has an older container"
+    );
+    assert_eq!(
+        before.awaiting_reanalysis, before.superfiles,
+        "{shape}: every corpus file predates the analysis revision"
+    );
+    assert_eq!(
+        before.reanalysis_blocked, 0,
+        "{shape}: these tables carry no vector index, so nothing blocks re-analysis"
+    );
+    assert!(
+        before.bytes_to_rewrite > 0,
+        "{shape}: a rewrite that moves no bytes is not a rewrite"
+    );
+
+    // Assessing changes nothing: run it twice and the second answer is the
+    // first. A read-only claim is cheap to make and cheap to break.
+    assert_eq!(
+        table.index_staleness().expect("assess again"),
+        before,
+        "{shape}: assessing the table changed it"
+    );
+
+    let report = table
+        .reindex(&ReindexOptions::default())
+        .expect("rewrite what the assessment described");
+    assert_eq!(
+        report.rewritten, before.needing_rewrite,
+        "{shape}: the run rewrote a different number of files than predicted"
+    );
+    assert_eq!(
+        report.awaiting_reanalysis, before.awaiting_reanalysis,
+        "{shape}: the run and the assessment disagree on what is analysis-stale"
+    );
+    assert_eq!(
+        report.unrepairable_columns, before.unrepairable_columns,
+        "{shape}: the run and the assessment name different unrepairable columns"
+    );
+
+    // After the rewrite the container axis is clear and the analysis axis
+    // is not — the two-axis split, visible without running anything.
+    let after = table.index_staleness().expect("assess a rewritten table");
+    assert_eq!(
+        after.needing_rewrite, 0,
+        "{shape}: containers are still behind after a rewrite"
+    );
+    assert_eq!(
+        after.bytes_to_rewrite, 0,
+        "{shape}: a table with nothing to rewrite reports bytes to rewrite"
+    );
+    assert_eq!(
+        after.awaiting_reanalysis, before.awaiting_reanalysis,
+        "{shape}: a rewrite cleared an analysis revision, which it cannot do"
+    );
+    assert!(
+        !after.is_current(),
+        "{shape}: a rewritten but un-reanalyzed table must not look finished"
+    );
+
+    // And re-analysis is what clears it, leaving nothing to report.
+    table
+        .reindex(&ReindexOptions::reanalyzing())
+        .expect("re-analyze");
+    let finished = table.index_staleness().expect("assess a migrated table");
+    assert!(
+        finished.is_current(),
+        "{shape}: a fully migrated table still reports work: {finished:?}"
+    );
+    assert_eq!(
+        finished.superfiles, before.superfiles,
+        "{shape}: files appeared or vanished"
+    );
+}
+
+#[test]
+fn staleness_predicts_a_multi_superfile_run() {
+    assert_staleness_predicts_the_run("v2_positions_region");
+}
+
+#[test]
+fn staleness_predicts_a_positional_run() {
+    assert_staleness_predicts_the_run("v5_positional");
+}
+
+/// A table this engine wrote reports nothing to do, so an operator running
+/// the assessment on a healthy table is told to stop rather than given a
+/// number they have to interpret.
+#[test]
+fn a_current_table_reports_nothing_to_do() {
+    let Some((_tmp, table, _root)) = open_corpus("v6_positional") else {
+        return;
+    };
+    table
+        .reindex(&ReindexOptions::reanalyzing())
+        .expect("bring the newest published shape fully current");
+    let report = table.index_staleness().expect("assess");
+    assert!(
+        report.is_current(),
+        "a migrated table reports work: {report:?}"
+    );
+    assert_eq!(report.needing_rewrite, 0);
+    assert_eq!(report.awaiting_reanalysis, 0);
+    assert_eq!(report.bytes_to_rewrite, 0);
+    assert!(report.unrepairable_columns.is_empty());
+    assert!(
+        report.superfiles > 0,
+        "the table has superfiles to be current about"
+    );
+}
+
 /// Re-analysis is the only repair that changes a file's terms, so it is
 /// the only one these can be asserted against.
 ///

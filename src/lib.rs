@@ -192,7 +192,8 @@ pub use superfile::{
 };
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
-    query::vector::VectorFilter, reindex::ReindexReport,
+    query::vector::VectorFilter,
+    reindex::{ReindexReport, StalenessReport},
 };
 
 /// Convenience builders for test fixtures. Visible to:
