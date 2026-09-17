@@ -72,13 +72,22 @@ const NO_BLOCK_CACHED: usize = usize::MAX;
 impl PhraseMember {
     /// The member's positions at its cursor's current doc, decoded
     /// into `pos_scratch`. The cursor must be positioned on a doc
-    /// (not exhausted).
+    /// (not exhausted) **with its whole block decoded**: `pos` is read as
+    /// the pair index within the block and `block_tfs[..block_n]` as the
+    /// block's tf run. A cursor that reached the doc by a skip into a
+    /// bitset block holds only that one doc (`block_n == 1`, `pos == 0`)
+    /// and would read the wrong run; `materialize_at` expands it first,
+    /// which is why every caller goes through it.
     pub(super) fn decode_current_positions(&mut self) -> Result<(), FtsError> {
         self.pos_scratch.clear();
         if let Some(p) = self.inline_position {
             self.pos_scratch.push(p);
             return Ok(());
         }
+        debug_assert_eq!(
+            self.cursor.decoded_block, self.cursor.current_block,
+            "positions need the whole block decoded; call materialize_at first"
+        );
         let block = self.cursor.current_block;
         let pair = self.cursor.pos;
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
@@ -530,8 +539,11 @@ impl PhraseCursor {
         //
         // `materialize_at` decodes each member's block only now: on the
         // unranked path a common member reached `aligned` by a `contains`
-        // bit-test and its block is not yet decoded; on the ranked path it
-        // was already decoded by `skip_to`, so this is a no-op there.
+        // bit-test and its block is not yet decoded; on the ranked path a
+        // `skip_to` into a bitset block holds just the one doc it landed on,
+        // and `decode_current_positions` needs the whole block (its pair
+        // index and tf run). Only a plain walk leaves the block decoded,
+        // so these calls are not optional.
         let anchor = self.align_order[0];
         let anchor_off = self.position_offsets[anchor];
         self.members[anchor].cursor.materialize_at(aligned);

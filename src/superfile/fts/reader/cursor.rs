@@ -1289,6 +1289,10 @@ impl TermCursor {
         self.block_n = 1;
         self.pos = 0;
         self.lazy_bit = doc - hdr.base;
+        // The buffers now hold one doc, not the block: anything that needs
+        // the whole block — `materialize_at`, the phrase path's pair index
+        // and tf run, the tf probes' unpack — must see it as undecoded and
+        // expand. `decode_current_positions` asserts this on entry.
         self.decoded_block = usize::MAX;
         self.tf_decoded_block = usize::MAX;
     }
