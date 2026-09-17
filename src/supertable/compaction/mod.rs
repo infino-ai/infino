@@ -9,7 +9,7 @@
 //! re-compacted.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::{BufWriter, Write},
     mem,
     sync::{
@@ -40,6 +40,9 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     superfile::{
         builder::SuperfileBuilder,
+        fts::reader::ColumnLengthStats,
+        reader::SuperfileReader,
+        stats::SuperfileStats as BuiltSuperfileStats,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
     supertable::{
@@ -156,20 +159,77 @@ pub(crate) enum JobOutcome {
     InputsAlreadyReplaced,
 }
 
-/// Whether a merge keeps its inputs' terms or produces new ones.
+/// How a job turns its input superfiles into the one it commits.
 ///
-/// Compaction always keeps them: re-tokenizing a corpus to merge it would
-/// cost far more and change nothing. A migration that is repairing an
-/// older analyzer's output is the one caller that needs the opposite, and
-/// pays for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum TermSource {
-    /// Copy the inputs' postings across.
-    #[default]
-    Carried,
-    /// Re-analyze from the text the inputs stored. Columns whose text was
-    /// not stored are still carried — nothing can regenerate them.
-    Reanalyzed,
+/// [`Supertable::run_compaction_job`] owns the risky half of a rewrite —
+/// sealing each input's tombstone sidecar, committing under OCC with
+/// retries, unsealing on the way out — and that is worth exactly one
+/// implementation. What a job *builds* is not: compaction merges files
+/// together, and a format migration rebuilds one in place. Injecting the
+/// build keeps the second from having to be known here.
+pub(crate) trait SuperfileMerge: Send + Sync {
+    fn build(
+        &self,
+        inputs: MergeInputs<'_>,
+        output: &mut dyn Write,
+    ) -> Result<BuiltSuperfileStats, BuildError>;
+}
+
+/// The opened inputs a [`SuperfileMerge`] builds from.
+pub(crate) struct MergeInputs<'a> {
+    /// Each input reader with the tombstones that apply to it.
+    pub(crate) readers: &'a [(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    /// Per reader, the hidden-index cells its rows have been superseded in.
+    pub(crate) superseded: &'a [BTreeSet<u32>],
+    /// Table-wide document-length totals excluding the inputs, so the
+    /// output bakes the average an unfragmented table would have.
+    pub(crate) fts_corpus: &'a HashMap<String, ColumnLengthStats>,
+}
+
+/// What compaction does: splice or carry, never re-tokenize.
+///
+/// Each arm is chosen by what the inputs hold, and every one of them
+/// carries the inputs' posting lists across rather than rebuilding them —
+/// re-tokenizing a corpus to merge it costs far more and changes nothing.
+pub(crate) struct CompactionMerge;
+
+impl SuperfileMerge for CompactionMerge {
+    fn build(
+        &self,
+        inputs: MergeInputs<'_>,
+        output: &mut dyn Write,
+    ) -> Result<BuiltSuperfileStats, BuildError> {
+        let MergeInputs {
+            readers,
+            superseded,
+            fts_corpus,
+        } = inputs;
+        let first_vec = readers.first().and_then(|(reader, _)| reader.vec());
+        let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
+        let sq8_merge = first_vec.and_then(|v| {
+            v.vector_columns_config()
+                .next()
+                .map(|c| c.rerank_codec.is_ivf_mergeable())
+        });
+        let stats = if multi_cell && sq8_merge == Some(true) {
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
+                readers, superseded, fts_corpus, output,
+            )?
+        } else if sq8_merge == Some(true) {
+            SuperfileBuilder::build_from_sq8_ivf_readers_to(readers, fts_corpus, output)?
+        } else if first_vec.is_none() {
+            // FTS/scalar inputs (no vector index): carry each input's
+            // already-built posting lists across instead of re-tokenizing
+            // the whole corpus.
+            SuperfileBuilder::build_from_readers_fts_merge_to(readers, fts_corpus, output)?
+        } else {
+            // A vector index is present but not IVF-mergeable (e.g. an fp32
+            // rerank codec); this path re-encodes both the FTS and the
+            // vectors from the decoded rows.
+            SuperfileBuilder::build_from_readers_to(readers, fts_corpus, output)?
+        };
+        Ok(stats)
+    }
 }
 
 /// A set of superfiles to merge into one new superfile.
@@ -488,9 +548,7 @@ impl Supertable {
                 "compaction jobs planned"
             );
             for job in jobs {
-                table
-                    .run_compaction_job(job, stale_seal_timeout, TermSource::Carried)
-                    .await?;
+                table.run_compaction_job(job, stale_seal_timeout).await?;
                 table
                     .refresh()
                     .await
@@ -540,10 +598,28 @@ impl Supertable {
         feature = "detailed-tracing",
         tracing::instrument(name = "merge_superfiles", skip_all, fields(inputs = superfiles.len()))
     )]
+    /// Merge with the build compaction uses. Test-only: production reaches
+    /// the same build through `run_compaction_job`, which names the
+    /// strategy so a caller cannot get one it did not choose.
+    #[cfg(test)]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
-        terms: TermSource,
+    ) -> Result<PreparedSuperfile, BuildError> {
+        self.merge_superfiles_with(superfiles, &CompactionMerge)
+            .await
+    }
+
+    /// As [`Self::merge_superfiles`], with the build injected.
+    ///
+    /// Everything around the build — opening inputs, applying tombstones,
+    /// the table-wide length totals, streaming to a temp file and mapping
+    /// it back — is the same work whatever produces the bytes, and is not
+    /// worth a second copy. Only the build differs.
+    pub(crate) async fn merge_superfiles_with(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        merge: &dyn SuperfileMerge,
     ) -> Result<PreparedSuperfile, BuildError> {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
@@ -618,15 +694,6 @@ impl Supertable {
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
         let fts_corpus = manifest.fts_corpus_stats(&replaced);
         let (merged_bytes, superfile_stats): (Bytes, _) = {
-            let first_vec = readers_with_tombstones
-                .first()
-                .and_then(|(reader, _)| reader.vec());
-            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
-            let sq8_merge = first_vec.and_then(|v| {
-                v.vector_columns_config()
-                    .next()
-                    .map(|c| c.rerank_codec.is_ivf_mergeable())
-            });
             // Every merge kind streams its output to a temp file and mmaps it
             // back, so the corpus-sized merge output is never held as an anon
             // Vec — the allocation that OOMs compaction on a memory-tight host.
@@ -637,47 +704,14 @@ impl Supertable {
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
                 let mut writer = BufWriter::new(output.as_file_mut());
-                let stats = if terms == TermSource::Reanalyzed {
-                    // Re-tokenizing is the whole point of this call, so it
-                    // takes precedence over every splice below: those all
-                    // carry postings, which is exactly what must not happen.
-                    SuperfileBuilder::build_from_readers_reanalyze_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if multi_cell && sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &superseded_per_reader,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if first_vec.is_none() {
-                    // FTS/scalar inputs (no vector index): carry each input's
-                    // already-built posting lists across instead of
-                    // re-tokenizing the whole corpus.
-                    SuperfileBuilder::build_from_readers_fts_merge_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else {
-                    // A vector index is present but not IVF-mergeable (e.g. an
-                    // fp32 rerank codec); the re-index path re-encodes both the
-                    // FTS and the vectors from the decoded rows.
-                    SuperfileBuilder::build_from_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                };
+                let stats = merge.build(
+                    MergeInputs {
+                        readers: &readers_with_tombstones,
+                        superseded: &superseded_per_reader,
+                        fts_corpus: &fts_corpus,
+                    },
+                    &mut writer,
+                )?;
                 writer
                     .flush()
                     .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
@@ -726,7 +760,18 @@ impl Supertable {
         &self,
         job: CompactionJob,
         stale_seal_timeout: std::time::Duration,
-        terms: TermSource,
+    ) -> Result<JobOutcome, CompactionError> {
+        self.run_compaction_job_with(job, stale_seal_timeout, &CompactionMerge)
+            .await
+    }
+
+    /// As [`Self::run_compaction_job`], with the build injected — the seal,
+    /// commit and unseal cycle is identical, only the bytes differ.
+    pub(crate) async fn run_compaction_job_with(
+        &self,
+        job: CompactionJob,
+        stale_seal_timeout: std::time::Duration,
+        merge: &dyn SuperfileMerge,
     ) -> Result<JobOutcome, CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -788,7 +833,7 @@ impl Supertable {
             });
         }
 
-        let merged_segment = match self.merge_superfiles(&inputs, terms).await {
+        let merged_segment = match self.merge_superfiles_with(&inputs, merge).await {
             Ok(seg) => Some(seg),
             // Every input was fully dead — all cells tombstoned, or all
             // superseded by an in-place cell split. There is nothing live to
@@ -1299,7 +1344,7 @@ mod tests {
             estimated_output_bytes: 0,
         };
         let err = st
-            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT, TermSource::Carried)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must error on unknown input");
         assert!(
@@ -1382,7 +1427,7 @@ mod tests {
             estimated_output_bytes: 1,
         };
         let err = st
-            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT, TermSource::Carried)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must conflict on entry_b");
         assert!(matches!(err, CompactionError::SidecarConflict { .. }));
@@ -1682,7 +1727,7 @@ mod tests {
 
         // Merge the superfiles - should succeed
         let _merged_superfile = st
-            .merge_superfiles(&superfiles, TermSource::Carried)
+            .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
     }
@@ -1736,7 +1781,7 @@ mod tests {
 
         // Merge should succeed and preserve scalar stats
         let merged_superfile = st
-            .merge_superfiles(&superfiles, TermSource::Carried)
+            .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
 
@@ -1816,7 +1861,7 @@ mod tests {
 
         // Merging 3 superfiles should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles, TermSource::Carried)
+            .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
 
@@ -1900,7 +1945,7 @@ mod tests {
         let inputs = &superfiles[..2];
 
         let merged = st
-            .merge_superfiles(inputs, TermSource::Carried)
+            .merge_superfiles(inputs)
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -1970,7 +2015,7 @@ mod tests {
         superfiles.sort_by_key(|sf| sf.id_min);
 
         let merged = st
-            .merge_superfiles(&superfiles, TermSource::Carried)
+            .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -2098,7 +2143,7 @@ mod tests {
         superfiles.sort_by_key(|sf| sf.id_min);
 
         let merged = st
-            .merge_superfiles(&superfiles, TermSource::Carried)
+            .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -2172,7 +2217,7 @@ mod tests {
         let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
 
-        match st.merge_superfiles(&superfiles, TermSource::Carried).await {
+        match st.merge_superfiles(&superfiles).await {
             Err(BuildError::MemoryBudgetExceeded(_)) => {}
             Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
             Ok(_) => panic!("merge must be refused over budget"),
@@ -2209,7 +2254,7 @@ mod tests {
 
         // Merging a single superfile should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles, TermSource::Carried)
+            .merge_superfiles(&superfiles)
             .await
             .expect("merge_superfiles should succeed");
 

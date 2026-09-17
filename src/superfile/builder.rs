@@ -1141,6 +1141,21 @@ impl SuperfileBuilder {
         &mut self,
         reader: &SuperfileReader,
         deleted: Option<&RoaringBitmap>,
+    ) -> Result<(), BuildError> {
+        self.carry_fts_from_reader_scoped(reader, deleted, CarryScope::AllColumns)
+    }
+
+    /// As [`Self::carry_fts_from_reader`], carrying only the columns
+    /// `scope` selects.
+    ///
+    /// Only a rebuild that re-analyzes some columns needs this: it carries
+    /// the ones it cannot re-analyze and leaves the rest for the caller to
+    /// tokenize. Every merge carries everything and takes the entry point
+    /// above.
+    pub(crate) fn carry_fts_from_reader_scoped(
+        &mut self,
+        reader: &SuperfileReader,
+        deleted: Option<&RoaringBitmap>,
         scope: CarryScope,
     ) -> Result<(), BuildError> {
         // Config compatibility first, before any early return — a
@@ -1408,11 +1423,7 @@ impl SuperfileBuilder {
             // FTS rides out of band like the vector blob: carry the input's
             // prebuilt postings (aligned with the surviving rows the batch
             // holds) before the append advances the doc-id counter.
-            superfile_builder.carry_fts_from_reader(
-                reader,
-                deleted.as_deref(),
-                CarryScope::AllColumns,
-            )?;
+            superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())?;
             superfile_builder.add_batch_ids_only(&record_batch)?;
             local_base += record_batch.num_rows() as u32;
         }
@@ -1902,7 +1913,7 @@ impl SuperfileBuilder {
         // the merge is cheaper, byte-faithful to the input's index, and an
         // unstored column — whose text isn't in the batch at all — still
         // merges losslessly.
-        self.carry_fts_from_reader(reader, deleted_docs_bitmap.as_deref(), scope)?;
+        self.carry_fts_from_reader_scoped(reader, deleted_docs_bitmap.as_deref(), scope)?;
         // Re-analyze exactly what the carry left behind.
         let index_fts = scope != CarryScope::AllColumns;
         self.add_batch_inner(&record_batch, &slices, index_fts)?;
@@ -1941,49 +1952,6 @@ impl SuperfileBuilder {
         let mut stats_collector = Vec::with_capacity(readers.len());
         for reader in readers {
             let stats = superfile_builder.add_batch_from_reader(&reader.0, reader.1.clone())?;
-            stats_collector.push(stats);
-        }
-
-        superfile_builder.finish_to(output)?;
-        Ok(SuperfileStats::from_children(stats_collector.as_slice()))
-    }
-
-    /// Rebuild the readers' FTS index from the text they stored, instead
-    /// of copying their postings across.
-    ///
-    /// This is the only path that changes a file's *terms*. Every other
-    /// rebuild copies postings, which is why a container rewrite leaves an
-    /// older analyzer's output exactly where it was: the terms are the
-    /// thing that is stale, and only re-tokenizing the source text
-    /// replaces them.
-    ///
-    /// Columns whose text is not stored cannot be re-analyzed — it was
-    /// never written — so their postings are carried and they keep the
-    /// revision they were built at. The output is then honestly mixed:
-    /// current terms for the columns that had text, older terms for the
-    /// ones that did not.
-    ///
-    /// Vectors ride across unchanged. They are decoded from the input and
-    /// re-encoded by the normal append path rather than spliced, so this
-    /// costs more than a merge — which is the trade for changing terms at
-    /// all.
-    pub(crate) fn build_from_readers_reanalyze_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
-        output: W,
-    ) -> Result<SuperfileStats, BuildError> {
-        let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts =
-            merge_builder_opts(readers, first, fts_corpus).reanalyze_stored_columns();
-        let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
-
-        let mut stats_collector = Vec::with_capacity(readers.len());
-        for reader in readers {
-            let stats = superfile_builder.add_batch_from_reader_scoped(
-                &reader.0,
-                reader.1.clone(),
-                CarryScope::UnstoredOnly,
-            )?;
             stats_collector.push(stats);
         }
 
@@ -2074,11 +2042,7 @@ impl SuperfileBuilder {
             // Carry the input's prebuilt postings + doc-lengths across,
             // remapped densely onto the output rows this batch is about to
             // append (so it must run before `next_local_doc_id` advances).
-            superfile_builder.carry_fts_from_reader(
-                reader,
-                deleted.as_deref(),
-                CarryScope::AllColumns,
-            )?;
+            superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())?;
 
             // Stream this input's surviving rows straight into the Parquet body
             // and drop the batch — the corpus is never accumulated in RAM. The
@@ -2687,7 +2651,7 @@ fn fts_param_json(v: f32) -> String {
 /// A merge's output is only as re-analyzed as its oldest input, and
 /// `new_from_reader` can only see one — see
 /// [`BuilderOptions::lower_analysis_rev_to`].
-fn merge_builder_opts(
+pub(crate) fn merge_builder_opts(
     readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     first: &(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>),
     fts_corpus: &HashMap<String, ColumnLengthStats>,

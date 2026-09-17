@@ -23,6 +23,8 @@ use futures::future::join_all;
 use tracing::warn;
 use uuid::Uuid;
 
+mod build;
+
 use crate::{
     config::{ReindexMode, ReindexOptions},
     runtime_bridge::bridge_on_runtime,
@@ -33,7 +35,7 @@ use crate::{
     },
     supertable::{
         Supertable,
-        compaction::{CompactionJob, JobOutcome, TermSource},
+        compaction::{CompactionJob, CompactionMerge, JobOutcome, SuperfileMerge},
         error::{CompactionError, ReindexError},
         query::dispatch::open_compaction_input,
     },
@@ -500,14 +502,19 @@ impl Supertable {
             });
         }
 
-        let terms = match opts.mode {
-            ReindexMode::Rewrite => TermSource::Carried,
-            ReindexMode::Reanalyze => TermSource::Reanalyzed,
+        // The build this run drives. `Rewrite` wants exactly what a
+        // compaction produces — postings carried, layout current — so it
+        // reuses that build rather than restating it. `Reanalyze` is the
+        // one this tool owns.
+        let reanalyze = build::ReanalyzeMerge;
+        let merge: &dyn SuperfileMerge = match opts.mode {
+            ReindexMode::Rewrite => &CompactionMerge,
+            ReindexMode::Reanalyze => &reanalyze,
         };
         for (done, job) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
             let superfile_id = job.inputs[0];
             let outcome = match self
-                .run_compaction_job(job, stale_seal_timeout, terms)
+                .run_compaction_job_with(job, stale_seal_timeout, merge)
                 .await
             {
                 Ok(outcome) => outcome,
