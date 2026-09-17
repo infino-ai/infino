@@ -1406,51 +1406,28 @@ impl TermCursor {
     }
 
     /// Membership of `doc` in the decoded current block, leaving `pos` on
-    /// the first doc `>= doc` so `tf_at_contained` and
-    /// `lower_bound_after_probe` need no second search.
+    /// the first doc `>= doc`. Probes arrive in ascending doc order from a
+    /// driver, so the search resumes from the previous position — a few
+    /// linear steps, then a bisection of what is left — instead of a full
+    /// binary search per probe, which was a quarter of a three-term
+    /// conjunction's time; a probe behind the position restarts from 0.
     #[inline]
     fn probe_decoded(&mut self, doc: u32) -> bool {
-        match self.block_doc_ids[..self.block_n].binary_search(&doc) {
-            Ok(i) => {
-                self.pos = i;
-                true
-            }
-            Err(i) => {
-                self.pos = i;
-                false
-            }
+        const LINEAR: usize = 8;
+        let ids = &self.block_doc_ids[..self.block_n];
+        let mut p = match self.pos < ids.len() && ids[self.pos] <= doc {
+            true => self.pos,
+            false => 0,
+        };
+        let lin_end = ids.len().min(p + LINEAR);
+        while p < lin_end && ids[p] < doc {
+            p += 1;
         }
-    }
-
-    /// After `contains(doc)` returned false: a lower bound on this term's
-    /// next doc at or after `doc` — exact inside the current block, the
-    /// block's end plus one when the block has nothing further. A
-    /// conjunction skips its driver there instead of stepping one doc,
-    /// so a term that is sparse in a region is probed once per region.
-    pub(super) fn lower_bound_after_probe(&mut self, doc: u32) -> u32 {
-        if self.is_exhausted() {
-            return u32::MAX;
+        if p == lin_end && p < ids.len() && ids[p] < doc {
+            p += ids[p..].partition_point(|&d| d < doc);
         }
-        let block = self.blocks[self.current_block];
-        if self.predecoded {
-            let ids = &self.block_doc_ids[..self.block_n];
-            let i = ids.partition_point(|&d| d < doc);
-            return ids.get(i).copied().unwrap_or(u32::MAX);
-        }
-        if self.decoded_block == self.current_block {
-            if self.pos < self.block_n {
-                return self.block_doc_ids[self.pos];
-            }
-            return block.last_doc_id.saturating_add(1);
-        }
-        let hdr = self.current_header();
-        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if hdr.encoding == ENCODING_BITSET
-            && let Some((d, _)) = bitset_next_doc(raw, &hdr, doc)
-        {
-            return d;
-        }
-        block.last_doc_id.saturating_add(1)
+        self.pos = p;
+        p < ids.len() && ids[p] == doc
     }
 
     /// Whether this term's postings are stored in the dense **bitset** encoding,
@@ -1613,16 +1590,6 @@ mod tests {
             assert_eq!(got, present.contains_key(&d), "probe {d}");
             if got {
                 assert_eq!(c.tf_at_contained(d), present[&d], "tf of {d}");
-            } else {
-                // A lower bound on the next doc: never past the true next
-                // doc, and never behind the probe.
-                let lb = c.lower_bound_after_probe(d);
-                let next = docs.iter().map(|&(x, _, _)| x).find(|&x| x >= d);
-                assert!(lb >= d, "probe {d}: bound {lb} behind the probe");
-                assert!(
-                    next.is_none_or(|n| lb <= n),
-                    "probe {d}: bound {lb} past the next doc {next:?}"
-                );
             }
         }
     }

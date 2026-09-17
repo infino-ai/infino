@@ -762,14 +762,9 @@ impl FtsReader {
                 // on the first miss. No tf is read here — a miss after k matching
                 // common terms would waste k popcount-rank + tf decodes.
                 let mut all_match = true;
-                let mut leap_to = d.saturating_add(1);
                 for o in others.iter_mut() {
                     if !o.contains(d) {
                         all_match = false;
-                        // Leapfrog: the failed term's next doc is the next
-                        // possible match, so the driver skips there instead
-                        // of offering every doc in between.
-                        leap_to = leap_to.max(o.lower_bound_after_probe(d));
                         break;
                     }
                 }
@@ -793,10 +788,8 @@ impl FtsReader {
                         0.0
                     };
                     sink.emit(d, score);
-                    driver.next();
-                } else {
-                    driver.skip_to(leap_to);
                 }
+                driver.next();
                 if driver.is_exhausted() || driver.current_doc_id() > window_end {
                     break;
                 }
