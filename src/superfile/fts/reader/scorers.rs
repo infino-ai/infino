@@ -1023,14 +1023,21 @@ impl FtsReader {
                 let mut block_exhausted = false;
                 let mut all_match = true;
                 for o in others.iter_mut() {
-                    while o.pos < o.block_n && o.block_doc_ids[o.pos] < a {
-                        o.pos += 1;
+                    // Scan on a local index over the decoded prefix: the
+                    // field form reloaded the buffer pointer and stored the
+                    // position on every step, ~5 ns a doc across every
+                    // posting of every non-leader.
+                    let od = &o.block_doc_ids[..o.block_n];
+                    let mut p = o.pos;
+                    while p < od.len() && od[p] < a {
+                        p += 1;
                     }
-                    if o.pos >= o.block_n {
+                    o.pos = p;
+                    if p >= od.len() {
                         block_exhausted = true;
                         break;
                     }
-                    if o.block_doc_ids[o.pos] != a {
+                    if od[p] != a {
                         all_match = false;
                         break;
                     }
