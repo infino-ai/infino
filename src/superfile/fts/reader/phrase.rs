@@ -731,10 +731,13 @@ impl AnyCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
+        builder::FtsBuilder,
         reader::{FtsReader, core::ClauseLists},
-        tokenize::Phrase,
+        tokenize::{AsciiLowerTokenizer, Phrase},
     };
 
     fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
@@ -1084,5 +1087,115 @@ mod tests {
             .await
             .expect_err("must be a typed error");
         assert!(matches!(err, FtsError::PositionsUnavailable { .. }));
+    }
+
+    // ── Cursor-level phrase seeks ─────────────────────────────────────
+
+    /// Rows in the seek corpus: the common member spans a dozen blocks.
+    const SEEK_DOCS: u32 = 1500;
+    /// Rows holding the rare member. The first holds the words reversed;
+    /// the other two hold the phrase, hundreds of docs (several of the
+    /// common member's blocks) apart.
+    const RARE_REVERSED: u32 = 5;
+    const RARE_MATCH_FIRST: u32 = 700;
+    const RARE_MATCH_SECOND: u32 = 1400;
+
+    /// The one phrase cursor `terms` builds on `r`'s first column.
+    async fn phrase_cursor(r: &FtsReader, terms: &[&str]) -> PhraseCursor {
+        let (atoms, _) = r
+            .build_atom_cursors(0, &[], &phrase(terms), None, None)
+            .await
+            .expect("build atoms");
+        match atoms.into_iter().next().flatten() {
+            Some(AnyCursor::Phrase(pc)) => pc,
+            _ => panic!("expected one phrase atom"),
+        }
+    }
+
+    fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for (i, text) in docs.enumerate() {
+            b.add_doc(0, i as u32, &text).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A phrase whose rare member drives the alignment and whose common
+    /// member must be seeked several blocks forward per candidate: the
+    /// cursor lands on each verified match and skips the reversed
+    /// co-occurrence. A member positioned by its own block scan rather
+    /// than a seek to the driver's doc would verify positions against
+    /// the wrong block and either miss the match or report a false one.
+    #[tokio::test]
+    async fn seek_match_positions_a_far_member_by_block_seek() {
+        let r = open_positional((0..SEEK_DOCS).map(|d| match d {
+            RARE_REVERSED => "y x".to_string(),
+            RARE_MATCH_FIRST | RARE_MATCH_SECOND => "x y".to_string(),
+            _ => "x".to_string(),
+        }));
+        let norms = &r.columns[0].dl_norm_k1;
+        let mut pc = phrase_cursor(&r, &["x", "y"]).await;
+        assert!(
+            pc.members[0].cursor.block_count() > 8,
+            "premise: the common member spans many blocks"
+        );
+        assert_eq!(pc.align_order[0], 1, "premise: the rare member drives");
+        assert_eq!(
+            pc.current_doc_id(),
+            RARE_MATCH_FIRST,
+            "construction seeks past the reversed doc"
+        );
+        assert_eq!(pc.current_tf, 1);
+        pc.seek_match(RARE_MATCH_FIRST + 1, f32::NEG_INFINITY, norms)
+            .expect("seek");
+        assert_eq!(pc.current_doc_id(), RARE_MATCH_SECOND);
+        assert_eq!(pc.current_tf, 1);
+        pc.skip_to(RARE_MATCH_SECOND + 1).expect("skip");
+        assert!(pc.is_exhausted(), "no third match");
+    }
+
+    /// A repeated-word phrase counts every occurrence start, overlapping
+    /// ones included: `"a a"` has two starts in `a a a`, one in `a a`,
+    /// none in `a b a`. Counting non-overlapping runs would report one
+    /// for the first doc and misrank it.
+    #[tokio::test]
+    async fn seek_match_counts_overlapping_starts_of_a_repeated_word() {
+        let r = open_positional(
+            ["a a a", "a b a", "a a", "b b", "a a a a"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let norms = &r.columns[0].dl_norm_k1;
+        let mut pc = phrase_cursor(&r, &["a", "a"]).await;
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        while !pc.is_exhausted() {
+            seen.push((pc.current_doc_id(), pc.current_tf));
+            let next = pc.current_doc_id() + 1;
+            pc.seek_match(next, f32::NEG_INFINITY, norms).expect("seek");
+        }
+        assert_eq!(seen, vec![(0, 2), (2, 1), (4, 3)]);
+    }
+
+    /// A three-member phrase matches only where all three are adjacent in
+    /// order: a doc missing the last member is never a candidate, a doc
+    /// holding all three out of order is aligned but fails verification.
+    #[tokio::test]
+    async fn three_member_phrase_rejects_a_missing_or_misplaced_member() {
+        let r = open_positional(
+            ["p q r", "p q s", "p r q", "q r p q r", "p q"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let norms = &r.columns[0].dl_norm_k1;
+        let mut pc = phrase_cursor(&r, &["p", "q", "r"]).await;
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        while !pc.is_exhausted() {
+            seen.push((pc.current_doc_id(), pc.current_tf));
+            let next = pc.current_doc_id() + 1;
+            pc.seek_match(next, f32::NEG_INFINITY, norms).expect("seek");
+        }
+        assert_eq!(seen, vec![(0, 1), (3, 1)]);
     }
 }
