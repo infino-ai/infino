@@ -297,16 +297,24 @@ pub(crate) fn boundary_assignment_fp32(
 pub(crate) const GRAPH_ASSIGN_MIN_N_CENT: usize = 64;
 
 /// Search beam width for the coarse centroid router, as a function of the
-/// grid size. Monotonic in `n_cent`, matching the drain-assign micro-bench's
-/// measured parity knees: `ef = max(8, round(sqrt(n_cent) / 4))` yields
-/// 8@256, 8@1024, 16@4096, 32@16384 — each clearing >=0.99 primary parity
-/// against the exact path in `graph_routed_assignment_microbench`. A fixed ef
-/// under-serves a large grid (the walk needs a wider beam to keep candidate
-/// recall up as the graph grows) and over-serves a small one; `sqrt` tracks
-/// the graph's diameter growth.
-pub(crate) fn coarse_router_ef(n_cent: usize) -> usize {
-    let scaled = ((n_cent as f64).sqrt() / 4.0).round() as usize;
-    scaled.max(8)
+/// grid size and the drain's distance metric. Monotonic in `n_cent`, matching
+/// the drain-assign micro-bench's measured parity knees:
+/// `ef = max(8, round(m * sqrt(n_cent) / 4))` where `m = 1` for cosine and
+/// `m = 2` otherwise. Cosine yields 8@256, 8@1024, 16@4096, 32@16384; L2Sq and
+/// NegDot yield 8@256, 16@1024, 32@4096, 64@16384 — each clearing >=0.99
+/// primary parity against the exact path in `graph_routed_assignment_microbench`.
+/// A fixed ef under-serves a large grid (the walk needs a wider beam to keep
+/// candidate recall up as the graph grows) and over-serves a small one; `sqrt`
+/// tracks the graph's diameter growth.
+///
+/// The 2x for non-cosine is the sweep-validated knee: L2Sq needs 64 at 16384 to
+/// clear the bar (NegDot is over-served but bounded <=64). This is validated on
+/// synthetic corpora; real L2/NegDot corpora should be confirmed to reach
+/// >=0.99 at bounded ef, falling back to the cosine gate if they cannot.
+pub(crate) fn coarse_router_ef(n_cent: usize, metric: Metric) -> usize {
+    let base = (n_cent as f64).sqrt() / 4.0;
+    let m = if metric == Metric::Cosine { 1.0 } else { 2.0 };
+    ((base * m).round() as usize).max(8)
 }
 
 /// Graph-routed variant of [`boundary_assignment_fp32`]. Instead of the
@@ -3254,7 +3262,7 @@ mod tests {
 
             // --- Sweep ef for parity, plus the production formula's own ef so
             // the shipped `coarse_router_ef(n_cent)` is measured directly. ---
-            let formula_ef = coarse_router_ef(n_cent);
+            let formula_ef = coarse_router_ef(n_cent, METRIC);
             let mut sweep: Vec<usize> = efs.to_vec();
             if !sweep.contains(&formula_ef) {
                 sweep.push(formula_ef);
@@ -3456,10 +3464,7 @@ mod tests {
                 metric,
                 0xC0FFEE ^ metric as u64,
             );
-            assert!(
-                N_CENT >= GRAPH_ASSIGN_MIN_N_CENT,
-                "test grid must be above the small-grid floor"
-            );
+            const { assert!(N_CENT >= GRAPH_ASSIGN_MIN_N_CENT) };
             let (scorer, graph, node_to_cell) = build_coarse_router(&clusters, metric);
             // Near-exhaustive beam: isolate wiring from beam-width recall.
             let ef = N_CENT;
@@ -3542,7 +3547,7 @@ mod tests {
                 "router node maps to an empty cell {cell}"
             );
         }
-        let ef = coarse_router_ef(N_CENT);
+        let ef = coarse_router_ef(N_CENT, metric);
         let mut primary_ok = 0usize;
         let mut full_ok = 0usize;
         for q in &queries {
@@ -3583,22 +3588,38 @@ mod tests {
         );
     }
 
-    /// `coarse_router_ef` is monotonic and clears the bench parity knees:
-    /// 8@256, 8@1024, 16@4096, 32@16384. Locks the shipped formula so a
-    /// refactor can't silently drop the beam below a validated point.
+    /// `coarse_router_ef` is monotonic and clears the bench parity knees per
+    /// metric: cosine 8@256, 8@1024, 16@4096, 32@16384; L2Sq and NegDot get
+    /// the 2x beam — 8@256, 16@1024, 32@4096, 64@16384. Locks the shipped
+    /// formula so a refactor can't silently drop the beam below a validated
+    /// point.
     #[test]
     fn coarse_router_ef_hits_parity_knees() {
-        assert_eq!(coarse_router_ef(256), 8);
-        assert_eq!(coarse_router_ef(1024), 8);
-        assert_eq!(coarse_router_ef(4096), 16);
-        assert_eq!(coarse_router_ef(16384), 32);
-        // Monotonic non-decreasing across the full range.
-        let mut prev = 0usize;
-        for n in [1usize, 64, 256, 1024, 4096, 16384, 65536, 262144] {
-            let ef = coarse_router_ef(n);
-            assert!(ef >= prev, "ef must be monotonic: ef({n})={ef} < {prev}");
-            assert!(ef >= 8, "ef floor is 8: ef({n})={ef}");
-            prev = ef;
+        // Cosine knees (multiplier 1).
+        assert_eq!(coarse_router_ef(256, Metric::Cosine), 8);
+        assert_eq!(coarse_router_ef(1024, Metric::Cosine), 8);
+        assert_eq!(coarse_router_ef(4096, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(16384, Metric::Cosine), 32);
+        // Non-cosine knees (multiplier 2): L2Sq and NegDot both.
+        for metric in [Metric::L2Sq, Metric::NegDot] {
+            assert_eq!(coarse_router_ef(256, metric), 8, "metric={metric:?}");
+            assert_eq!(coarse_router_ef(1024, metric), 16, "metric={metric:?}");
+            assert_eq!(coarse_router_ef(4096, metric), 32, "metric={metric:?}");
+            assert_eq!(coarse_router_ef(16384, metric), 64, "metric={metric:?}");
+        }
+        // Monotonic non-decreasing across the full range, with the floor of 8,
+        // for every metric.
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let mut prev = 0usize;
+            for n in [1usize, 64, 256, 1024, 4096, 16384, 65536, 262144] {
+                let ef = coarse_router_ef(n, metric);
+                assert!(
+                    ef >= prev,
+                    "ef must be monotonic: ef({n},{metric:?})={ef} < {prev}"
+                );
+                assert!(ef >= 8, "ef floor is 8: ef({n},{metric:?})={ef}");
+                prev = ef;
+            }
         }
     }
 }

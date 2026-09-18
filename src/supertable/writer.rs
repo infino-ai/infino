@@ -4573,7 +4573,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         // par_iter stays on it. The result type is identical to
                         // the shortlist path, so the spill/replica code below is
                         // untouched.
-                        let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize);
+                        // ef scales with grid size and metric: non-cosine
+                        // (L2Sq/NegDot) gets 2x the cosine beam. The 2x is
+                        // validated on synthetic corpora; real L2/NegDot
+                        // corpora should be confirmed to reach >=0.99 at
+                        // bounded ef (cosine-gate fallback otherwise).
+                        let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
                         hidden_inner.options.writer_pool.install(|| {
                             let router = coarse_router.get_or_insert_with(|| {
                                 opann::build_coarse_router(clusters_ref, metric)
