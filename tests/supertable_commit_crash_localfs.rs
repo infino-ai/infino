@@ -92,8 +92,8 @@ use infino::{
     test_helpers::{build_title_batch, default_supertable_options},
 };
 
-const ENV_DIR: &str = "INFINO_M12_CRASH_DIR";
-const ENV_KILL_POINT: &str = "INFINO_M12_CRASH_KILL_POINT";
+const ENV_DIR: &str = "INFINO_COMMIT_CRASH_DIR";
+const ENV_KILL_POINT: &str = "INFINO_COMMIT_CRASH_KILL_POINT";
 
 /// One named kill point. The child reads the env var and
 /// configures the `CrashStorage` to match.

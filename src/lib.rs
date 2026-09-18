@@ -171,7 +171,7 @@ pub use catalog::Supertable;
 pub use catalog::{
     ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, connect, connect_with,
 };
-pub use config::{CompactionSettings, GcSettings, OptimizeOptions};
+pub use config::{CompactionSettings, GcSettings, OptimizeOptions, ReindexMode, ReindexOptions};
 /// The single public error type for the curated API.
 pub use error::InfinoError;
 // `VectorSearchOptions` (probe width / rerank budget) is deliberately
@@ -191,7 +191,9 @@ pub use superfile::{
     vector::distance::Metric,
 };
 pub use supertable::{
-    Consistency, GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
+    Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
+    query::vector::VectorFilter,
+    reindex::{ReindexReport, StalenessReport},
 };
 
 /// Convenience builders for test fixtures. Visible to:

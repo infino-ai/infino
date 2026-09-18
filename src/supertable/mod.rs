@@ -37,6 +37,7 @@ pub(crate) mod optimize;
 pub mod options;
 pub mod query;
 pub mod reader_cache;
+pub(crate) mod reindex;
 pub(crate) mod slow_vector_state;
 pub mod stats;
 pub mod tombstones;
@@ -44,7 +45,9 @@ pub mod utils;
 pub mod wal;
 pub mod writer;
 
-pub use error::{BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError};
+pub use error::{
+    BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError, ReindexError,
+};
 pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;

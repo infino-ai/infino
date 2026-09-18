@@ -333,6 +333,14 @@ pub struct ColumnMeta {
     /// but absent from the stored schema, so they cannot be read back;
     /// a rebuild carries their postings across instead of re-tokenizing.
     pub stored: bool,
+    /// Revision of the analysis that produced this column's terms (from
+    /// `inf.fts.columns`, `0` when the file predates the field).
+    ///
+    /// Below what this engine's chain emits, the column's terms and a
+    /// query's terms can disagree for the same text, so the column is
+    /// stale and a reindex must re-analyze it. Carried across a rewrite
+    /// unchanged: copying postings does not re-analyze them.
+    pub analysis_rev: u32,
 }
 
 impl ColumnMeta {
@@ -406,6 +414,17 @@ pub struct FtsColumnConfig {
     /// and unknown-name-fails rules as [`FtsColumnConfig::stopwords`].
     #[serde(default)]
     pub stemmer: Option<String>,
+    /// Revision of the analysis that produced this column's terms.
+    ///
+    /// Absent on every file written before revisions were recorded,
+    /// which is precisely what `0` means — terms from an analysis whose
+    /// version this engine cannot name, and which a reindex must
+    /// re-analyze rather than trust. Unlike the other defaults here, a
+    /// missing field is not "the feature was off": it is "unknown, treat
+    /// as oldest", so the default can never make a stale column look
+    /// current.
+    #[serde(default)]
+    pub analysis_rev: u32,
 }
 
 impl FtsColumnConfig {

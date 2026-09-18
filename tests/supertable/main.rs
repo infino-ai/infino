@@ -20,6 +20,14 @@
 //!   sweep policies + supertable-disk-cache integration.
 //! - **storage/**: the supertable-driven S3 smoke run.
 //!
+//! - **reindex_crash**: killing a reindex mid-run and resuming
+//!   it. Spawn-self, but bundled here rather than given its own
+//!   top-level binary like `supertable_commit_crash_localfs.rs`:
+//!   its fixture is a corpus table, so it needs this binary's
+//!   corpus helpers, and duplicating them to keep the file at the
+//!   top level would cost more than it buys. `--exact` names the
+//!   one test the child re-enters.
+//!
 //! Spawn-self tests
 //! (`supertable_commit_crash_localfs.rs`,
 //! `supertable_concurrent_processes.rs`) and the workspace
@@ -31,11 +39,14 @@
 mod bioasq_admit_diag;
 mod commit;
 mod compact_gc;
+mod corpus_shapes;
 mod disk_cache;
 mod drain_tombstones;
 mod gc_stale_snapshot;
 mod manifest;
 mod query;
+mod reindex;
+mod reindex_crash;
 mod storage;
 mod update_crash_property;
 mod vector_cosine_normalize;

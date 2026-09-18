@@ -9,7 +9,7 @@
 //! re-compacted.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::{BufWriter, Write},
     mem,
     sync::{
@@ -40,6 +40,9 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     superfile::{
         builder::SuperfileBuilder,
+        fts::reader::ColumnLengthStats,
+        reader::SuperfileReader,
+        stats::SuperfileStats as BuiltSuperfileStats,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
     supertable::{
@@ -62,11 +65,30 @@ use crate::{
     },
 };
 
-struct CompactionSlot<'a>(&'a AtomicBool);
+/// Held for as long as one process is reshaping superfiles, and released
+/// on drop. Compaction and reindex share it: both rewrite superfiles and
+/// commit manifest swaps, so running them together would put two planners
+/// on the same files.
+pub(crate) struct CompactionSlot<'a>(&'a AtomicBool);
 
 impl Drop for CompactionSlot<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Supertable {
+    /// Take the reshape slot, or report that something else holds it.
+    ///
+    /// Process-local by design: across processes it is the per-superfile
+    /// tombstone-sidecar seal that serializes writers, and that guard does
+    /// not care which kind of job took it.
+    pub(crate) fn try_hold_compaction_slot(&self) -> Option<CompactionSlot<'_>> {
+        let outstanding = &self.inner().compaction_outstanding;
+        match outstanding.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => Some(CompactionSlot(outstanding)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -121,6 +143,93 @@ fn split_stats_at_drain_watermark(
     stats
         .into_iter()
         .partition(|s| drained.contains(s.birth_version))
+}
+
+/// What running a job actually did.
+///
+/// A job whose inputs have already been replaced by another writer is not
+/// a failure — there is simply nothing left to do — but it is also not a
+/// rewrite, and a caller counting its progress must not count it as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobOutcome {
+    /// The replacement was committed.
+    Committed,
+    /// The inputs were gone by the time this job reached the manifest, so
+    /// another writer had already handled them.
+    InputsAlreadyReplaced,
+}
+
+/// How a job turns its input superfiles into the one it commits.
+///
+/// [`Supertable::run_compaction_job`] owns the risky half of a rewrite —
+/// sealing each input's tombstone sidecar, committing under OCC with
+/// retries, unsealing on the way out — and that is worth exactly one
+/// implementation. What a job *builds* is not: compaction merges files
+/// together, and a format migration rebuilds one in place. Injecting the
+/// build keeps the second from having to be known here.
+pub(crate) trait SuperfileMerge: Send + Sync {
+    fn build(
+        &self,
+        inputs: MergeInputs<'_>,
+        output: &mut dyn Write,
+    ) -> Result<BuiltSuperfileStats, BuildError>;
+}
+
+/// The opened inputs a [`SuperfileMerge`] builds from.
+pub(crate) struct MergeInputs<'a> {
+    /// Each input reader with the tombstones that apply to it.
+    pub(crate) readers: &'a [(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    /// Per reader, the hidden-index cells its rows have been superseded in.
+    pub(crate) superseded: &'a [BTreeSet<u32>],
+    /// Table-wide document-length totals excluding the inputs, so the
+    /// output bakes the average an unfragmented table would have.
+    pub(crate) fts_corpus: &'a HashMap<String, ColumnLengthStats>,
+}
+
+/// What compaction does: splice or carry, never re-tokenize.
+///
+/// Each arm is chosen by what the inputs hold, and every one of them
+/// carries the inputs' posting lists across rather than rebuilding them —
+/// re-tokenizing a corpus to merge it costs far more and changes nothing.
+pub(crate) struct CompactionMerge;
+
+impl SuperfileMerge for CompactionMerge {
+    fn build(
+        &self,
+        inputs: MergeInputs<'_>,
+        output: &mut dyn Write,
+    ) -> Result<BuiltSuperfileStats, BuildError> {
+        let MergeInputs {
+            readers,
+            superseded,
+            fts_corpus,
+        } = inputs;
+        let first_vec = readers.first().and_then(|(reader, _)| reader.vec());
+        let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
+        let sq8_merge = first_vec.and_then(|v| {
+            v.vector_columns_config()
+                .next()
+                .map(|c| c.rerank_codec.is_ivf_mergeable())
+        });
+        let stats = if multi_cell && sq8_merge == Some(true) {
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
+                readers, superseded, fts_corpus, output,
+            )?
+        } else if sq8_merge == Some(true) {
+            SuperfileBuilder::build_from_sq8_ivf_readers_to(readers, fts_corpus, output)?
+        } else if first_vec.is_none() {
+            // FTS/scalar inputs (no vector index): carry each input's
+            // already-built posting lists across instead of re-tokenizing
+            // the whole corpus.
+            SuperfileBuilder::build_from_readers_fts_merge_to(readers, fts_corpus, output)?
+        } else {
+            // A vector index is present but not IVF-mergeable (e.g. an fp32
+            // rerank codec); this path re-encodes both the FTS and the
+            // vectors from the decoded rows.
+            SuperfileBuilder::build_from_readers_to(readers, fts_corpus, output)?
+        };
+        Ok(stats)
+    }
 }
 
 /// A set of superfiles to merge into one new superfile.
@@ -489,9 +598,28 @@ impl Supertable {
         feature = "detailed-tracing",
         tracing::instrument(name = "merge_superfiles", skip_all, fields(inputs = superfiles.len()))
     )]
+    /// Merge with the build compaction uses. Test-only: production reaches
+    /// the same build through `run_compaction_job`, which names the
+    /// strategy so a caller cannot get one it did not choose.
+    #[cfg(test)]
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
+    ) -> Result<PreparedSuperfile, BuildError> {
+        self.merge_superfiles_with(superfiles, &CompactionMerge)
+            .await
+    }
+
+    /// As [`Self::merge_superfiles`], with the build injected.
+    ///
+    /// Everything around the build — opening inputs, applying tombstones,
+    /// the table-wide length totals, streaming to a temp file and mapping
+    /// it back — is the same work whatever produces the bytes, and is not
+    /// worth a second copy. Only the build differs.
+    pub(crate) async fn merge_superfiles_with(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        merge: &dyn SuperfileMerge,
     ) -> Result<PreparedSuperfile, BuildError> {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
@@ -566,15 +694,6 @@ impl Supertable {
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
         let fts_corpus = manifest.fts_corpus_stats(&replaced);
         let (merged_bytes, superfile_stats): (Bytes, _) = {
-            let first_vec = readers_with_tombstones
-                .first()
-                .and_then(|(reader, _)| reader.vec());
-            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
-            let sq8_merge = first_vec.and_then(|v| {
-                v.vector_columns_config()
-                    .next()
-                    .map(|c| c.rerank_codec.is_ivf_mergeable())
-            });
             // Every merge kind streams its output to a temp file and mmaps it
             // back, so the corpus-sized merge output is never held as an anon
             // Vec — the allocation that OOMs compaction on a memory-tight host.
@@ -585,38 +704,14 @@ impl Supertable {
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
                 let mut writer = BufWriter::new(output.as_file_mut());
-                let stats = if multi_cell && sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &superseded_per_reader,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if first_vec.is_none() {
-                    // FTS/scalar inputs (no vector index): carry each input's
-                    // already-built posting lists across instead of
-                    // re-tokenizing the whole corpus.
-                    SuperfileBuilder::build_from_readers_fts_merge_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else {
-                    // A vector index is present but not IVF-mergeable (e.g. an
-                    // fp32 rerank codec); the re-index path re-encodes both the
-                    // FTS and the vectors from the decoded rows.
-                    SuperfileBuilder::build_from_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                };
+                let stats = merge.build(
+                    MergeInputs {
+                        readers: &readers_with_tombstones,
+                        superseded: &superseded_per_reader,
+                        fts_corpus: &fts_corpus,
+                    },
+                    &mut writer,
+                )?;
                 writer
                     .flush()
                     .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
@@ -665,7 +760,19 @@ impl Supertable {
         &self,
         job: CompactionJob,
         stale_seal_timeout: std::time::Duration,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<JobOutcome, CompactionError> {
+        self.run_compaction_job_with(job, stale_seal_timeout, &CompactionMerge)
+            .await
+    }
+
+    /// As [`Self::run_compaction_job`], with the build injected — the seal,
+    /// commit and unseal cycle is identical, only the bytes differ.
+    pub(crate) async fn run_compaction_job_with(
+        &self,
+        job: CompactionJob,
+        stale_seal_timeout: std::time::Duration,
+        merge: &dyn SuperfileMerge,
+    ) -> Result<JobOutcome, CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
         let storage = manifest
@@ -726,7 +833,7 @@ impl Supertable {
             });
         }
 
-        let merged_segment = match self.merge_superfiles(&inputs).await {
+        let merged_segment = match self.merge_superfiles_with(&inputs, merge).await {
             Ok(seg) => Some(seg),
             // Every input was fully dead — all cells tombstoned, or all
             // superseded by an in-place cell split. There is nothing live to
@@ -787,7 +894,7 @@ impl Supertable {
             // Another compactor already merged our inputs — nothing left to commit.
             let entries_to_remove = match resolve_entries_to_remove(&current, &job.inputs) {
                 Ok(entries) => entries,
-                Err(_missing) => return Ok(()),
+                Err(_missing) => return Ok(JobOutcome::InputsAlreadyReplaced),
             };
 
             let mut pending_storage_replaces: Vec<(String, Bytes)> = Vec::new();
@@ -838,7 +945,7 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
-                    return Ok(());
+                    return Ok(JobOutcome::Committed);
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
                     warn!(
