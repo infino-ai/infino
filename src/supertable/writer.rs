@@ -4559,8 +4559,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
                     // Graph path only above the small-grid floor; below it the
-                    // exact scan already covers the whole grid cheaply.
+                    // exact scan already covers the whole grid cheaply. Cosine
+                    // only: on L2Sq/NegDot the centroid HNSW is hub-dominated
+                    // for the metric's varying-norm geometry and collapses the
+                    // grid at assign time (most cells starve, one becomes a
+                    // catch-all) — recall@10 tolerates it but filtered recall
+                    // craters. Those metrics take the exact shortlist path
+                    // until the coarse router's build is made metric-robust.
                     let use_graph_assign = drain_graph_assign
+                        && metric == Metric::Cosine
                         && (clusters_ref.n_cent as usize) >= opann::GRAPH_ASSIGN_MIN_N_CENT;
                     let assign_t0 = std::time::Instant::now();
                     let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
@@ -4573,11 +4580,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         // par_iter stays on it. The result type is identical to
                         // the shortlist path, so the spill/replica code below is
                         // untouched.
-                        // ef scales with grid size and metric: non-cosine
-                        // (L2Sq/NegDot) gets 2x the cosine beam. The 2x is
-                        // validated on synthetic corpora; real L2/NegDot
-                        // corpora should be confirmed to reach >=0.99 at
-                        // bounded ef (cosine-gate fallback otherwise).
+                        // Cosine-only path (gated above), so ef is the cosine
+                        // beam: max(16, round(sqrt(n_cent)/4)).
                         let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
                         hidden_inner.options.writer_pool.install(|| {
                             let router = coarse_router.get_or_insert_with(|| {

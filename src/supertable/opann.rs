@@ -295,32 +295,23 @@ pub(crate) fn boundary_assignment_fp32(
 /// the grid grows (the kernel bench crosses over well above this).
 pub(crate) const GRAPH_ASSIGN_MIN_N_CENT: usize = 64;
 
-/// Search beam width for the coarse centroid router, as a function of the
-/// grid size and the drain's distance metric. Monotonic in `n_cent`, matching
-/// the drain-assign micro-bench's measured parity knees:
-/// `ef = max(16, round(m * sqrt(n_cent) / 4))` where `m = 1` for cosine and
-/// `m = 2` otherwise. Cosine yields 16@256, 16@1024, 16@4096, 32@16384; L2Sq and
-/// NegDot yield 16@256, 16@1024, 32@4096, 64@16384 — each clearing >=0.99
-/// primary parity against the exact path in `graph_routed_assignment_microbench`.
-/// A fixed ef under-serves a large grid (the walk needs a wider beam to keep
-/// candidate recall up as the graph grows) and over-serves a small one; `sqrt`
-/// tracks the graph's diameter growth.
+/// Search beam width for the coarse centroid router as a function of grid size:
+/// `ef = max(16, round(sqrt(n_cent) / 4))`. Monotonic in `n_cent`; `sqrt` tracks
+/// the graph's diameter growth (a fixed ef under-serves a large grid and
+/// over-serves a small one). Cosine yields 16@256, 16@1024, 16@4096, 32@16384.
 ///
-/// The floor is 16, not the graph's nominal minimum: at small grids the bare
-/// `sqrt(n)/4` beam (4-8) leaves a visible placement drift vs the exact path
-/// (~0.994 primary parity at 256), and while that drift does not hurt recall it
-/// shifts the post-drain cell membership enough to perturb the cold-read block
-/// layout. A floor of 16 lifts small-grid parity back to the exact path's
-/// footprint, and the graph is cheap at those sizes anyway.
+/// Graph-routed assign is cosine-gated at the drain caller (non-cosine metrics
+/// take the exact path — their centroid HNSW is hub-dominated and collapses the
+/// grid), so this is the cosine beam. The `_metric` parameter is retained for
+/// when a metric-robust coarse router re-enables non-cosine.
 ///
-/// The 2x for non-cosine is the sweep-validated knee: L2Sq needs 64 at 16384 to
-/// clear the bar (NegDot is over-served but bounded <=64). This is validated on
-/// synthetic corpora; real L2/NegDot corpora should be confirmed to reach
-/// >=0.99 at bounded ef, falling back to the cosine gate if they cannot.
-pub(crate) fn coarse_router_ef(n_cent: usize, metric: Metric) -> usize {
-    let base = (n_cent as f64).sqrt() / 4.0;
-    let m = if metric == Metric::Cosine { 1.0 } else { 2.0 };
-    ((base * m).round() as usize).max(16)
+/// The floor is 16, not the graph's nominal minimum: at small grids a bare
+/// `sqrt(n)/4` beam (4-8) leaves ~0.994 primary parity vs the exact path, which
+/// does not hurt recall but shifts post-drain cell membership enough to perturb
+/// the cold-read block layout; a floor of 16 lifts small-grid parity back to the
+/// exact path's footprint, and the graph is cheap at those sizes anyway.
+pub(crate) fn coarse_router_ef(n_cent: usize, _metric: Metric) -> usize {
+    (((n_cent as f64).sqrt() / 4.0).round() as usize).max(16)
 }
 
 /// Graph-routed variant of [`boundary_assignment_fp32`]. Instead of the
@@ -3552,7 +3543,13 @@ mod tests {
                 "router node maps to an empty cell {cell}"
             );
         }
-        let ef = coarse_router_ef(N_CENT, metric);
+        // Beam = N_CENT (exhaustive over the populated nodes): this test asserts
+        // the count-0 SKIP invariant (ef-independent — the graph holds no empty
+        // node), so its secondary parity floor should be deterministic, not
+        // subject to HNSW-build nondeterminism at a narrow production beam.
+        // Walk recall at the production ef is covered by
+        // `graph_assign_matches_exact_across_metrics`.
+        let ef = N_CENT;
         let mut primary_ok = 0usize;
         let mut full_ok = 0usize;
         for q in &queries {
@@ -3600,17 +3597,21 @@ mod tests {
     /// point.
     #[test]
     fn coarse_router_ef_hits_parity_knees() {
-        // Cosine knees (multiplier 1), floor 16.
+        // Cosine beam, floor 16: max(16, round(sqrt(n)/4)).
         assert_eq!(coarse_router_ef(256, Metric::Cosine), 16);
         assert_eq!(coarse_router_ef(1024, Metric::Cosine), 16);
         assert_eq!(coarse_router_ef(4096, Metric::Cosine), 16);
         assert_eq!(coarse_router_ef(16384, Metric::Cosine), 32);
-        // Non-cosine knees (multiplier 2): L2Sq and NegDot both, floor 16.
+        // Metric-independent now (graph-assign is cosine-gated; the parameter is
+        // retained but ignored): every metric gets the cosine beam.
         for metric in [Metric::L2Sq, Metric::NegDot] {
-            assert_eq!(coarse_router_ef(256, metric), 16, "metric={metric:?}");
-            assert_eq!(coarse_router_ef(1024, metric), 16, "metric={metric:?}");
-            assert_eq!(coarse_router_ef(4096, metric), 32, "metric={metric:?}");
-            assert_eq!(coarse_router_ef(16384, metric), 64, "metric={metric:?}");
+            for n in [256usize, 1024, 4096, 16384] {
+                assert_eq!(
+                    coarse_router_ef(n, metric),
+                    coarse_router_ef(n, Metric::Cosine),
+                    "metric={metric:?} n={n}"
+                );
+            }
         }
         // Monotonic non-decreasing across the full range, with the floor of 16,
         // for every metric.
