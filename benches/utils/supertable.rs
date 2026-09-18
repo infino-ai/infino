@@ -54,7 +54,7 @@ use infino::{
     CompactionSettings, OptimizeOptions,
     supertable::{
         Supertable,
-        manifest::{ClusterCentroids, SuperfileEntry},
+        manifest::{ClusterCentroids, ManifestSnapshot, SuperfileEntry},
         writer::maintenance_pool_width,
     },
 };
@@ -409,24 +409,28 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     ]
 }
 
-/// Visit committed superfiles through the flat eager view, or through manifest
-/// parts when the manifest is lazy and the flat view is empty.
-fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
-    let reader = table.reader().expect("reader");
-    let manifest = reader.manifest();
+/// Every committed superfile of `manifest`, from the flat eager view or,
+/// when the manifest is lazy and that view is empty, by loading its parts.
+/// The one place that knows the manifest exposes its entries two ways.
+pub(crate) fn collect_manifest_superfiles(manifest: &ManifestSnapshot) -> Vec<Arc<SuperfileEntry>> {
     let flat_superfiles = manifest.get_all_superfiles();
     if !flat_superfiles.is_empty() {
-        for entry in flat_superfiles {
-            visit(entry);
-        }
-        return;
+        return flat_superfiles.to_vec();
     }
+    let mut entries = Vec::new();
     for part_entry in manifest.get_all_list_entries() {
         let part = tiers::block_on(manifest.get_part_by_id(part_entry.part_id))
             .expect("load manifest part for bench metadata");
-        for entry in part.superfiles.iter() {
-            visit(entry);
-        }
+        entries.extend(part.superfiles.iter().cloned());
+    }
+    entries
+}
+
+/// Visit committed superfiles; see [`collect_manifest_superfiles`].
+fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
+    let reader = table.reader().expect("reader");
+    for entry in collect_manifest_superfiles(reader.manifest()) {
+        visit(&entry);
     }
 }
 

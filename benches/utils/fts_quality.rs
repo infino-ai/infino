@@ -95,7 +95,7 @@ use infino::{
             tokenize::Tokenizer,
         },
     },
-    supertable::{SupertableReader, manifest::SuperfileEntry},
+    supertable::SupertableReader,
     test_helpers::default_tokenizer,
 };
 use rayon::prelude::*;
@@ -104,6 +104,7 @@ use crate::{
     corpus::{self, TextFlavor, block_on_inmem, for_each_doc_in_chunk, generated_chunk_count},
     markdown::fmt_count,
     report::{Better, Block, Cell, Report, Section, context, metric, text},
+    supertable::collect_manifest_superfiles,
     tiers,
 };
 
@@ -441,15 +442,7 @@ impl Layout {
     /// matches only with the current commit's earlier files excluded
     /// continues it. Neither matching is an error.
     pub fn recover(reader: &SupertableReader, column: &str, dl: &[u32]) -> Self {
-        let manifest = reader.manifest();
-        let mut entries: Vec<Arc<SuperfileEntry>> = manifest.get_all_superfiles().to_vec();
-        if entries.is_empty() {
-            for part_entry in manifest.get_all_list_entries() {
-                let part = tiers::block_on(manifest.get_part_by_id(part_entry.part_id))
-                    .expect("load manifest part for the quality layout");
-                entries.extend(part.superfiles.iter().cloned());
-            }
-        }
+        let mut entries = collect_manifest_superfiles(reader.manifest());
         entries.sort_by_key(|e| e.id_min);
         let n_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
         assert_eq!(
@@ -476,22 +469,20 @@ impl Layout {
             let fts = superfile.fts().unwrap_or_else(|| {
                 panic!("superfile {i} ({:?}) has no full-text index", entry.uri)
             });
-            let stored = fts
-                .column_doc_lengths(column)
-                .unwrap_or_else(|e| panic!("superfile {i}: read doc lengths of {column:?}: {e}"));
-            assert_eq!(
-                stored.len(),
-                n_docs,
-                "superfile {i}: doc-length array holds {} rows, manifest says {n_docs}",
-                stored.len()
-            );
             let label = format!("superfile {i} ({:?})", entry.uri);
-            verify_doc_lengths(&stored, dl, first_row, &label);
-            let declared = declared_avgdl(fts, column);
+            let (own, declared) = verify_file(fts, column, dl, first_row, &label);
+            assert_eq!(
+                own.n_scored_docs as usize
+                    + dl[first_row..first_row + n_docs]
+                        .iter()
+                        .filter(|&&l| l == 0)
+                        .count(),
+                n_docs,
+                "{label}: scored-doc count and empty rows do not add up to its {n_docs} rows"
+            );
 
             // The commit rule, under both hypotheses about where this
             // superfile's commit begins.
-            let own = ColumnLengthStats::from_lengths(stored.iter().copied());
             let mut all_earlier = committed;
             all_earlier.merge_with(&commit);
             let as_new_commit = declared_under(&all_earlier, &own);
@@ -586,6 +577,27 @@ fn verify_doc_lengths(stored: &[u32], dl: &[u32], first_row: usize, label: &str)
             expected[bad]
         );
     }
+}
+
+/// Check one file against the oracle and read what it scores at: its
+/// stored document lengths must be the oracle's for the rows starting at
+/// `first_row`, and the totals those lengths imply come back with the
+/// average the file declares. Both tiers verify a file exactly this way —
+/// the supertable tier once per file of the fan-out, the superfile tier
+/// once for the whole corpus.
+fn verify_file(
+    fts: &FtsReader,
+    column: &str,
+    dl: &[u32],
+    first_row: usize,
+    label: &str,
+) -> (ColumnLengthStats, f64) {
+    let stored = fts
+        .column_doc_lengths(column)
+        .unwrap_or_else(|e| panic!("{label}: read doc lengths of {column:?}: {e}"));
+    verify_doc_lengths(&stored, dl, first_row, label);
+    let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+    (own, declared_avgdl(fts, column))
 }
 
 /// The average document length `column` is scored at in one file: what
@@ -1550,12 +1562,7 @@ pub fn run_superfile(
     let fts = reader
         .fts()
         .expect("the graded superfile has a full-text index");
-    let stored = fts
-        .column_doc_lengths(column)
-        .unwrap_or_else(|e| panic!("read doc lengths of {column:?}: {e}"));
-    verify_doc_lengths(&stored, oracle.doc_lengths(), 0, "the superfile");
-    let declared = declared_avgdl(fts, column);
-    let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+    let (own, declared) = verify_file(fts, column, oracle.doc_lengths(), 0, "the superfile");
     let predicted = declared_under(&ColumnLengthStats::default(), &own);
     assert!(
         close_enough(declared, predicted),
@@ -1760,7 +1767,7 @@ mod tests {
 
     use infino::{
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::{builder::FtsConfig, fts::tokenize::Phrase},
+        superfile::builder::FtsConfig,
         supertable::{Supertable, SupertableOptions},
         test_helpers::{brute_force_bm25::BruteForceBm25, build_title_batch, schema_id_title},
     };
@@ -1821,22 +1828,8 @@ mod tests {
                 if q.bm25.is_some() {
                     continue;
                 }
-                let clauses = tokenizer.parse(q.query).into_clauses(q.mode);
-                let owned = |v: &[Cow<'_, str>]| -> Vec<String> {
-                    v.iter().map(|c| c.to_string()).collect()
-                };
-                let owned_phrases = |v: &[Phrase<Cow<'_, str>>]| -> Vec<Phrase<String>> {
-                    v.iter().map(|p| p.map(|c| c.to_string())).collect()
-                };
-                let expected = reference.top_k_atoms(
-                    &owned(&clauses.musts),
-                    &owned_phrases(&clauses.must_phrases),
-                    &owned(&clauses.shoulds),
-                    &owned_phrases(&clauses.should_phrases),
-                    &owned(&clauses.negatives),
-                    &owned_phrases(&clauses.negative_phrases),
-                    usize::MAX,
-                );
+                let expected =
+                    reference.top_k_query(q.query, q.mode, tokenizer.as_ref(), usize::MAX);
                 let mut got = oracle.matches(rq);
                 got.sort_by(|a, b| {
                     b.textbook

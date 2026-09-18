@@ -44,7 +44,7 @@ use infino::{
         builder::FtsConfig,
         fts::{
             bm25::stored_avgdl,
-            reader::{Bm25Stats, BoolMode},
+            reader::{Bm25Stats, BoolMode, ColumnLengthStats},
             tokenize::Phrase,
         },
     },
@@ -1223,34 +1223,15 @@ struct RunningSpan {
     declared_avgdl: f32,
 }
 
-/// Token and scored-document totals, the two numbers the commit rule
-/// runs on.
-#[derive(Clone, Copy, Default)]
-struct LengthTotals {
-    tokens: u64,
-    docs: u64,
-}
-
-impl LengthTotals {
-    fn of(lengths: &[u32]) -> Self {
-        Self {
-            tokens: lengths.iter().map(|&l| u64::from(l)).sum(),
-            docs: lengths.iter().filter(|&&l| l > 0).count() as u64,
-        }
-    }
-
-    fn plus(self, other: Self) -> Self {
-        Self {
-            tokens: self.tokens + other.tokens,
-            docs: self.docs + other.docs,
-        }
-    }
-
-    /// The average a file declares when it joins a table with these
-    /// committed totals: merged, then rounded as the writer stores it.
-    fn declared(self) -> f32 {
-        stored_avgdl(self.tokens as f32 / self.docs.max(1) as f32)
-    }
+/// The average a file declares when it joins a table whose committed
+/// totals are `committed`: the merged totals' average, rounded as the
+/// writer stores it. Both sides of the comparison run on the engine's own
+/// [`ColumnLengthStats`], so the test cannot drift from the writer's
+/// arithmetic the way a private copy of these two numbers would.
+fn declared_under(committed: ColumnLengthStats, own: &ColumnLengthStats) -> f32 {
+    let mut merged = committed;
+    merged.merge_with(own);
+    stored_avgdl(merged.avgdl())
 }
 
 /// Recover the fixture's files in row order and check each one against
@@ -1282,8 +1263,8 @@ fn running_spans(st: &Supertable, corpus: &[(u64, String)]) -> Vec<RunningSpan> 
     entries.sort_by_key(|e| e.id_min);
 
     let mut spans = Vec::with_capacity(entries.len());
-    let mut committed = LengthTotals::default();
-    let mut same_commit = LengthTotals::default();
+    let mut committed = ColumnLengthStats::default();
+    let mut same_commit = ColumnLengthStats::default();
     let mut start = 0u64;
     for entry in &entries {
         let rows = start..start + entry.n_docs;
@@ -1304,24 +1285,26 @@ fn running_spans(st: &Supertable, corpus: &[(u64, String)]) -> Vec<RunningSpan> 
 
         let first_of_commit = (start as usize).is_multiple_of(RUNNING_DOCS_PER_COMMIT);
         if first_of_commit {
-            committed = committed.plus(same_commit);
-            same_commit = LengthTotals::default();
+            committed.merge_with(&same_commit);
+            same_commit = ColumnLengthStats::default();
         }
-        let own = LengthTotals::of(&stored);
-        let expected = committed.plus(own).declared();
+        let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+        let expected = declared_under(committed, &own);
         assert!(
             (declared - expected).abs() <= RUNNING_AVGDL_TOLERANCE * expected,
             "file at rows {rows:?} declares avgdl {declared}, the commit rule predicts {expected}"
         );
         if !first_of_commit {
-            let counting_earlier_flush = committed.plus(same_commit).plus(own).declared();
+            let mut with_earlier_flush = committed;
+            with_earlier_flush.merge_with(&same_commit);
+            let counting_earlier_flush = declared_under(with_earlier_flush, &own);
             assert!(
                 (declared - counting_earlier_flush).abs() > RUNNING_AVGDL_TOLERANCE * expected,
                 "fixture cannot tell whether an earlier file of the same commit was counted \
                  ({declared} vs {counting_earlier_flush}); vary the lengths across a commit"
             );
         }
-        same_commit = same_commit.plus(own);
+        same_commit.merge_with(&own);
         spans.push(RunningSpan {
             uri: entry.uri,
             rows,

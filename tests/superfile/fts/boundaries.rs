@@ -36,7 +36,10 @@ use infino::{
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 
-use super::{brute_force_oracle::build_infino_superfile_with_fts, phrase::assert_matches_oracle};
+use super::{
+    brute_force_oracle::build_infino_superfile_with_fts,
+    phrase::{assert_matches_oracle, search_hits},
+};
 
 /// The one indexed column of every fixture.
 const COLUMN: &str = "title";
@@ -204,14 +207,14 @@ async fn assert_all(
     }
 }
 
-/// The reader's hits for `query` in score order.
+/// The reader's hit ids for `query` in score order — the shared
+/// `search_hits` adapter with the scores dropped, for the tests that
+/// assert placement rather than value.
 async fn ordered_hits(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u64> {
-    reader
-        .bm25_hits_async(COLUMN, query, k, BoolMode::Or)
+    search_hits(reader, query, k, BoolMode::Or)
         .await
-        .expect("bm25 search")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| d)
         .collect()
 }
 
