@@ -72,6 +72,14 @@ use crate::{
     },
     utils::trace::{TableRole, record},
 };
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::{
+    superfile::SuperfileReader,
+    supertable::{
+        manifest::SuperfileEntry, query::superfile_reader::superfile_reader,
+        reader_cache::ReaderCacheError,
+    },
+};
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -2107,6 +2115,27 @@ impl SupertableReader {
             .map(|offsets| offsets.total_size)
             .sum();
         Ok((entries.len(), total_index_bytes))
+    }
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// Open the reader for one superfile of the pinned snapshot, through
+    /// the same tiered open the query fan-out uses (in-memory store, then
+    /// disk cache, then storage). Benchmarks use it to read per-superfile
+    /// metadata the search surface does not return, such as the stored
+    /// document lengths and the average length a file scores at.
+    fn open_superfile(&self, entry: &SuperfileEntry) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+        let options = &self.manifest.options;
+        self.block_on(superfile_reader(
+            &options.store,
+            options.disk_cache.as_ref(),
+            options.storage.as_ref(),
+            &entry.uri,
+            &entry.storage_path(),
+            entry.subsection_offsets.as_ref(),
+            true,
+        ))
     }
     }
 
