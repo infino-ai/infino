@@ -28,7 +28,6 @@
 //! "ordered equality".
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -40,10 +39,7 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::{
-            reader::BoolMode,
-            tokenize::{Phrase, Tokenizer},
-        },
+        fts::{reader::BoolMode, tokenize::Tokenizer},
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids, default_tokenizer},
 };
@@ -164,21 +160,7 @@ pub fn oracle_top_k_atoms(
     mode: BoolMode,
     k: usize,
 ) -> Vec<(u64, f32)> {
-    let clauses = tok.parse(query).into_clauses(mode);
-    let own =
-        |v: Vec<Cow<'_, str>>| -> Vec<String> { v.into_iter().map(Cow::into_owned).collect() };
-    let own_ph = |v: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
-        v.iter().map(|p| p.map(|t| t.to_string())).collect()
-    };
-    oracle.top_k_atoms(
-        &own(clauses.musts),
-        &own_ph(clauses.must_phrases),
-        &own(clauses.shoulds),
-        &own_ph(clauses.should_phrases),
-        &own(clauses.negatives),
-        &own_ph(clauses.negative_phrases),
-        k,
-    )
+    oracle.top_k_query(query, mode, tok, k)
 }
 
 /// Run infino's BM25 search and return doc_ids in score-descending
