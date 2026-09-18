@@ -132,6 +132,7 @@ use crate::{
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
+        reader_cache::ReadIntent,
         slow_vector_state::{
             CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
             fetch_centroid_section, fetch_resident_index_blob, hydrate_resident_index,
@@ -1904,7 +1905,7 @@ async fn open_readers_from_options(
                 options.disk_cache.as_ref(),
                 options.storage.as_ref(),
                 entry,
-                false,
+                ReadIntent::Stream,
             )
             .await?,
         );
@@ -2327,7 +2328,8 @@ async fn read_ids_for_locals(
     let storage = manifest.options.storage.as_ref();
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
-    let reader = dispatch::open_reader(&store, disk_cache, storage, entry, false).await?;
+    let reader =
+        dispatch::open_reader(&store, disk_cache, storage, entry, ReadIntent::Stream).await?;
     // The inline IVF region is usable as an `_id` source only when its rows
     // map 1:1 to Parquet rows. Boundary-replicated user commits break that:
     // the IVF carries stub rows beyond the Parquet count, so inline order
@@ -2801,9 +2803,14 @@ async fn collect_hnsw_plane(
     let mut scratch = vec![0.0f32; dim];
     let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
@@ -2856,9 +2863,14 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
     let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
     let mut n: usize = 0;
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
         if !vr.has_index_column(column) {
             continue;
@@ -3188,9 +3200,14 @@ async fn gather_sq16_rows(
     let mut scratch = vec![0.0f32; dim];
     let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
@@ -3816,9 +3833,14 @@ pub(crate) async fn assemble_hnsw_incremental(
     let mut new_codes: Vec<u8> = Vec::new();
     let mut new_doc_ids: Vec<i128> = Vec::new();
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
@@ -6088,13 +6110,20 @@ impl SupertableReader {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
                 collected.extend(
-                    dispatch::fanout_with(self, wave, !hidden_vector_index, false, body.clone())
-                        .await?,
+                    dispatch::fanout_with(
+                        self,
+                        wave,
+                        !hidden_vector_index,
+                        ReadIntent::Stream,
+                        body.clone(),
+                    )
+                    .await?,
                 );
             }
             collected
         } else {
-            dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
+            dispatch::fanout_with(self, units, !hidden_vector_index, ReadIntent::Stream, body)
+                .await?
         };
 
         // Phase C of the deferred-rerank width sweep: select the best
@@ -6285,8 +6314,10 @@ impl SupertableReader {
                         Ok::<Vec<SuperfileHit>, QueryError>(tagged)
                     }
                 };
-                per_superfile
-                    .extend(dispatch::fanout_with(self, rerank_units, false, false, body_c).await?);
+                per_superfile.extend(
+                    dispatch::fanout_with(self, rerank_units, false, ReadIntent::Stream, body_c)
+                        .await?,
+                );
             }
         }
         if let Some(t0) = fanout_t0 {
@@ -7109,7 +7140,7 @@ impl SupertableReader {
             }
         };
         let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
-            dispatch::fanout_with(self, units, true, false, body).await?;
+            dispatch::fanout_with(self, units, true, ReadIntent::Stream, body).await?;
         Ok(pairs
             .into_iter()
             .filter(|(_, bm)| !bm.is_empty())

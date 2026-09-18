@@ -135,7 +135,7 @@ impl DiskCacheStore {
 
     /// List `cache_root` and record each superfile's size and mtime in `unindexed`, adding the total
     /// to `current_bytes`. Only a stat per file: files are opened later, by the reads that need them
-    /// ([`Self::try_reuse_cached_file`]).
+    /// ([`Self::fetch_from_disk_cache`]).
     ///
     /// Deletes leftovers that can never be used: orphaned `.blocks` sidecars, zero-length files,
     /// and `.tmp` files older than [`TMP_RECLAIM_AGE`] (a fresh one belongs to a sibling process's
@@ -253,12 +253,13 @@ impl DiskCacheStore {
     /// `expected_size` is optional: pass it when the caller already has the size (the lazy path gets
     /// it from the manifest), never fetch one. A truncated file fails to open anyway, since the
     /// footer sits at the end.
-    pub(crate) async fn try_reuse_cached_file(
+    pub(crate) async fn fetch_from_disk_cache(
         &self,
         uri: &SuperfileUri,
         expected_size: Option<u64>,
     ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
         let path = self.cache_path(uri);
+
         let Ok(meta) = fs::metadata(&path) else {
             // No whole-file copy; decrement a vanished counted one but leave any block cache intact.
             if let Some((_, file)) = self.unindexed.remove(uri) {
@@ -285,11 +286,8 @@ impl DiskCacheStore {
 
         match self.open_cached_entry(&path, size, self.config.verify_crc_on_open) {
             Ok(entry) => {
-                // Two racing reuses of one URI can both insert; the second insert must free the
-                // first one's bytes.
-                if let Some(replaced) = self.cached.insert(*uri, Arc::clone(&entry)) {
-                    self.release_entry_accounting(&replaced);
-                }
+                // Two racing reuses of one URI can both admit; admission frees the loser's bytes.
+                let entry = self.admit_entry(*uri, entry);
 
                 if let Some(r) = reservation {
                     r.commit();
@@ -1006,7 +1004,7 @@ mod tests {
 
         let wrong = bytes.len() as u64 + 1;
         let reused = store
-            .try_reuse_cached_file(&uri, Some(wrong))
+            .fetch_from_disk_cache(&uri, Some(wrong))
             .await
             .expect("reuse probe");
         assert!(reused.is_none(), "size mismatch is a miss, not a serve");

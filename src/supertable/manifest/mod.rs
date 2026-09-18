@@ -2659,7 +2659,7 @@ pub struct SuperfileEntry {
     /// stamp this field; the cold open path falls back to the
     /// 2-RTT shape (parquet tail
     /// then vec/fts in parallel) — see
-    /// `DiskCacheStore::reader_with_hints`.
+    /// `DiskCacheStore::open_for_query`.
     pub subsection_offsets: Option<SubsectionOffsets>,
     pub(crate) vector_layout: VectorLayout,
     /// The `manifest_id` of the commit that introduced this superfile — its

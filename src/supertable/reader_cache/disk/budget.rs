@@ -5,10 +5,11 @@
 //! make room, and the idle-page sweeps that trim resident memory.
 
 use std::{
-    fs,
+    fs, mem,
     sync::{Arc, atomic::Ordering},
 };
 
+use dashmap::mapref::entry::Entry;
 use memmap2::{Mmap, UncheckedAdvice};
 
 use crate::supertable::{
@@ -296,35 +297,39 @@ impl DiskCacheStore {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_block_entry_for_test(
+    /// Put `entry` in the cache under `uri`. The one place an entry is admitted, so two rules hold
+    /// wherever admissions race on a URI (a compaction read landing while a query is opening the
+    /// same file, two disk reuses, a lazy open and a whole-file fetch):
+    ///
+    /// 1. A lazy entry never replaces a whole-file one. If a [`Residency::Paged`] entry arrives
+    ///    while the slot already holds a `Mapped` or `Buffered` copy, the incoming entry is dropped
+    ///    (its budget released) and the existing copy is returned, so the caller serves the better
+    ///    copy instead of shadowing it.
+    /// 2. Whatever an admission does replace has its budget released, so a lost race never leaves
+    ///    phantom bytes charged.
+    ///
+    /// Returns the entry now current for `uri`: the incoming one, or the whole-file copy it yielded
+    /// to. Callers must serve what comes back, not what they passed in.
+    pub(crate) fn admit_entry(
         &self,
         uri: SuperfileUri,
-        block_source: Arc<crate::supertable::reader_cache::block_source::BlockCachedSource>,
-    ) {
-        let reader = SuperfileReader::open(
-            crate::supertable::reader_cache::disk::test_support::tiny_superfile_bytes(),
-        )
-        .expect("tiny superfile opens");
-        let size_bytes = block_source.filled_bytes_handle();
-        self.cached.insert(
-            uri,
-            Arc::new(CachedEntry {
-                reader: Arc::new(reader),
-                residency: Residency::Paged {
-                    block_source,
-                    fill_spawned: AtomicBool::new(false),
-                },
-                size_bytes,
-                accounting: EntryAccounting::SourceOwned,
-                last_access_us: AtomicU64::new(self.now_us()),
-            }),
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn remove_block_entry_for_test(&self, uri: &SuperfileUri) {
-        let _ = self.cached.remove(uri);
+        entry: Arc<CachedEntry>,
+    ) -> Arc<CachedEntry> {
+        match self.cached.entry(uri) {
+            Entry::Occupied(mut occupied) => {
+                if !entry.has_whole_file() && occupied.get().has_whole_file() {
+                    self.release_entry_accounting(&entry);
+                    return Arc::clone(occupied.get());
+                }
+                let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
+                self.release_entry_accounting(&replaced);
+                entry
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&entry));
+                entry
+            }
+        }
     }
 
     /// Reserve `bytes` of disk budget via CAS-loop on
@@ -413,6 +418,10 @@ impl DiskCacheStore {
             // reservations evicting the same victim could
             // double-decrement current_bytes.
             if let Some((_, entry)) = self.cached.remove(&uri) {
+                // A coordinator normally lives only while a fetch is in flight. If one is still
+                // here, it holds a strong reference that would keep the evicted entry, and the
+                // budget it owns, alive behind the cache's back.
+                self.coordinators.remove(&uri);
                 let path = self.cache_path(&uri);
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(self.blocks_path(&uri));
@@ -422,6 +431,39 @@ impl DiskCacheStore {
             }
         }
         Ok(())
+    }
+
+    // Test helpers. Compiled only for tests, never into the shipped library.
+
+    #[cfg(test)]
+    pub(crate) fn install_block_entry_for_test(
+        &self,
+        uri: SuperfileUri,
+        block_source: Arc<crate::supertable::reader_cache::block_source::BlockCachedSource>,
+    ) {
+        let reader = SuperfileReader::open(
+            crate::supertable::reader_cache::disk::test_support::tiny_superfile_bytes(),
+        )
+        .expect("tiny superfile opens");
+        let size_bytes = block_source.filled_bytes_handle();
+        self.cached.insert(
+            uri,
+            Arc::new(CachedEntry {
+                reader: Arc::new(reader),
+                residency: Residency::Paged {
+                    block_source,
+                    fill_spawned: AtomicBool::new(false),
+                },
+                size_bytes,
+                accounting: EntryAccounting::SourceOwned,
+                last_access_us: AtomicU64::new(self.now_us()),
+            }),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_block_entry_for_test(&self, uri: &SuperfileUri) {
+        let _ = self.cached.remove(uri);
     }
 }
 
