@@ -4292,6 +4292,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let drain_timers = config::global().diagnostics.drain_build_timers;
     let mut coarse_router: Option<(opann::Fp32Scorer, opann::Hnsw, Vec<u32>)> = None;
     let mut drain_assign_total_ms = 0.0f64;
+    // Drain batch-loop sub-phase accumulators (ms), summed across batches:
+    // `materialize` (open + read + row-materialize) and `assign_spill` (assign +
+    // spill-write; the assign compute alone is timed separately above). Surfaced
+    // as an [optdrain] line at batch-loop end under the drain-build-timers gate.
+    let mut drain_mat_total_ms = 0.0f64;
+    let mut drain_assign_spill_total_ms = 0.0f64;
 
     for (batch_idx, (_, batch_sources)) in batches.iter().enumerate() {
         if batch_idx < local_checkpoint.batches_done {
@@ -4683,6 +4689,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 }
                 local_checkpoint.spills = checkpointed_spills;
                 let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
+                drain_mat_total_ms += t_mat;
+                drain_assign_spill_total_ms += t_spill - t_mat;
                 format!(
                     "kmeans: materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
                     t_mat,
@@ -4720,6 +4728,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             total_ms = drain_assign_total_ms,
             "[optdrain] total cell-assign phase"
         );
+        debug!(
+            materialize_ms = drain_mat_total_ms,
+            assign_spill_ms = drain_assign_spill_total_ms,
+            "[optdrain] materialize + assign_spill phases"
+        );
     }
 
     // One task per final worker shard. Splice cells are already packed; each
@@ -4727,6 +4740,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // their completed IVF files, then assembles one MultiCellIvf.
     {
         let build_t0 = time::Instant::now();
+        // Drain build sub-phase wall timers (ms), surfaced as [optdrain] under
+        // the drain-build-timers gate. `assemble` (the pack/build/encode/splice/
+        // write region) is derived by difference — build_total - freeze - upload
+        // — so the three reconcile exactly to the build wall total.
+        let mut freeze_ms = 0.0f64;
+        let mut upload_ms = 0.0f64;
         let scratch = drain_scratch.as_path();
         let n_cells_total = added_per_cell.len();
         let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
@@ -4799,6 +4818,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // shards, and the maintenance pool is contractually
         // optimize-only. The grid MOVES into the task and comes back
         // with the frozen state — no clone of the centroid bytes.
+        let freeze_t0 = time::Instant::now();
         if let Some(mut cal) = width_law.take() {
             let rot_seed = vector_config.rot_seed;
             // Pool from the PRIOR stamp: an incremental drain calibrates
@@ -4817,6 +4837,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             width_law = Some(frozen);
             running_clusters = clusters_back;
         }
+        freeze_ms += freeze_t0.elapsed().as_secs_f64() * 1e3;
         let width_law_ref = width_law.as_ref();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
             &hidden_inner.options.writer_pool,
@@ -4939,6 +4960,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
+        let upload_t0 = time::Instant::now();
         let mut uploads =
             stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
         while let Some(uploaded) = uploads.next().await {
@@ -4992,6 +5014,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
             save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
         }
+        upload_ms += upload_t0.elapsed().as_secs_f64() * 1e3;
         if new_entries.len() != expected_shards {
             return Err(BuildError::Store(format!(
                 "drain has {} completed shards but expected {expected_shards}",
@@ -5205,6 +5228,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             n_superfiles,
             build_t0.elapsed().as_secs_f64() * 1e3,
         );
+        if drain_timers {
+            let build_total_ms = build_t0.elapsed().as_secs_f64() * 1e3;
+            debug!(
+                assemble_ms = (build_total_ms - freeze_ms - upload_ms).max(0.0),
+                freeze_ms, upload_ms, "[optdrain] assemble + freeze + upload phases"
+            );
+        }
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
             let (train_ms, assign_ms, calib_ms) =
                 crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
