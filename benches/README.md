@@ -195,76 +195,317 @@ JSON metrics land in `target/infino-bench/<bench>.json` (local only).
 
 _Host: unknown CPU · 16C/16T · macos/aarch64_
 
-Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). `recall vs BM25` = textbook BM25 with exact doc lengths and the corpus-wide average length — the user-facing quality, which pays for the one-byte length quantization and for each file normalizing with the average it declares. `recall vs engine BM25` = BM25 with the engine's stored (quantized) lengths and the file's own declared average, both read back from the file and verified against the oracle's own tokenization — gated at 1.0: a miss is a document the kernels' own formula would not have returned. `max score Δ` = largest relative gap between an engine score and that reference for the same doc — gated at 0.10%, f32 arithmetic noise.
+Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). `recall vs BM25` = textbook BM25 with exact doc lengths and the corpus-wide average length — the user-facing quality, which pays for the one-byte length quantization and for each file normalizing with the average it declares; a tripwire floor of 0.80 applies from k = 100. `recall vs engine BM25` = BM25 with the engine's stored (quantized) lengths and the file's own declared average, both read back from the file and verified against the oracle's own tokenization — gated at 1.0: a miss is a document the kernels' own formula would not have returned. `max score Δ` = largest relative gap between an engine score and that reference for the same doc — gated at 0.10%, f32 arithmetic noise. `count` = the unranked count kernels against the oracle's match count (`=` agrees, `–` not expressible on this tier). `order` = descending engine scores whose adjacent pairs agree with the reference's order.
+
+**k = 1**
+
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ | count | order |
+| --- | --- | --- | --- | --- | --- | --- |
+| stopword | 836.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword2 | 722.9K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common | 214.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common2 | 210.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| upper_mid | 89.6K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| mid_dense | 35.5K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| mid_dense2 | 50.0K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| mid | 5.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| low | 2.4K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| few_block | 640 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge | 298 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| rare | 65 | 0.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| year | 20.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common_common2_or | 322.0K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common_mid_or | 216.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_common_or | 841.2K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_or | 836.8K | 0.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_two_mid_or | 836.9K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| dense_three_or | 890.0K | 0.0000 | 1.0000 | 0.0000% | = | ok |
+| three_stopword_or | 908.4K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| three_mid_or | 17.0K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| ten_rare_or | 616 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| ten_common_or | 619.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| five_tier_or | 841.3K | 0.0000 | 1.0000 | 0.0000% | = | ok |
+| two_stopword_and | 672.1K | 0.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_and | 64 | 0.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_mid_dense_and | 35.1K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| two_mid_dense_and | 8.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common_mid_and | 3.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| five_tier_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge_stopword_and | 289 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton_stopword_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| disjoint_rare_and | 0 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| must_rare_should_common | 65 | 0.0000 | 1.0000 | 0.0000% | – | ok |
+| must_two_should_two | 102.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_common_should_rare | 214.3K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_mid_should_two_rare | 5.8K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_phrase_should_common | 275.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| stopword_not_common | 627.0K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| rare_not_stopword | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_rare | 214.2K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_phrase | 89.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| and_two_negatives | 206.0K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_should_negative | 11.7K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_stopwords | 275.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_rare_stopword | 5 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_three_stopwords | 43.8K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_repeated_stopword | 420.8K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_two_mids | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_and_term | 1.3K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| two_phrases_or | 275.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_cased | 214.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| mid_comma | 5.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
 
 **k = 10**
 
-| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ |
-| --- | --- | --- | --- | --- |
-| stopword | 836.8K | 0.8000 | 1.0000 | 0.0000% |
-| common | 214.3K | 1.0000 | 1.0000 | 0.0000% |
-| mid | 5.8K | 1.0000 | 1.0000 | 0.0000% |
-| rare | 65 | 1.0000 | 1.0000 | 0.0000% |
-| singleton | 1 | 1.0000 | 1.0000 | 0.0000% |
-| stopword_common_or | 841.2K | 1.0000 | 1.0000 | 0.0000% |
-| stopword_rare_or | 836.8K | 1.0000 | 1.0000 | 0.0000% |
-| three_stopword_or | 908.4K | 0.9000 | 1.0000 | 0.0000% |
-| three_mid_or | 17.0K | 1.0000 | 1.0000 | 0.0000% |
-| ten_common_or | 619.3K | 0.8000 | 1.0000 | 0.0000% |
-| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% |
-| common_mid_and | 3.8K | 1.0000 | 1.0000 | 0.0000% |
-| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% |
-| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% |
-| must_two_should_two | 102.5K | 1.0000 | 1.0000 | 0.0000% |
-| common_not_stopword | 4.5K | 0.9000 | 1.0000 | 0.0000% |
-| phrase_stopwords | 275.5K | 1.0000 | 1.0000 | 0.0000% |
-| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% |
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ | count | order |
+| --- | --- | --- | --- | --- | --- | --- |
+| stopword | 836.8K | 0.8000 | 1.0000 | 0.0000% | = | ok |
+| stopword2 | 722.9K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common | 214.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common2 | 210.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| upper_mid | 89.6K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| mid_dense | 35.5K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| mid_dense2 | 50.0K | 0.9000 | 1.0000 | 0.0000% | = | ok |
+| mid | 5.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| low | 2.4K | 0.9000 | 1.0000 | 0.0000% | = | ok |
+| few_block | 640 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge | 298 | 0.9000 | 1.0000 | 0.0000% | = | ok |
+| rare | 65 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| year | 20.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common_common2_or | 322.0K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common_mid_or | 216.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_common_or | 841.2K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_or | 836.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_two_mid_or | 836.9K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| dense_three_or | 890.0K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| three_stopword_or | 908.4K | 0.9000 | 1.0000 | 0.0000% | = | ok |
+| three_mid_or | 17.0K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| ten_rare_or | 616 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| ten_common_or | 619.3K | 0.8000 | 1.0000 | 0.0000% | = | ok |
+| five_tier_or | 841.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| two_stopword_and | 672.1K | 0.8000 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_mid_dense_and | 35.1K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| two_mid_dense_and | 8.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common_mid_and | 3.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| five_tier_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge_stopword_and | 289 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton_stopword_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| disjoint_rare_and | 0 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_two_should_two | 102.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_common_should_rare | 214.3K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_mid_should_two_rare | 5.8K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_phrase_should_common | 275.5K | 0.9000 | 1.0000 | 0.0000% | – | ok |
+| common_not_stopword | 4.5K | 0.9000 | 1.0000 | 0.0000% | – | ok |
+| stopword_not_common | 627.0K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| rare_not_stopword | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_rare | 214.2K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_phrase | 89.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| and_two_negatives | 206.0K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_should_negative | 11.7K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_stopwords | 275.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_rare_stopword | 5 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_three_stopwords | 43.8K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_repeated_stopword | 420.8K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_two_mids | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_and_term | 1.3K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| two_phrases_or | 275.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_cased | 214.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| mid_comma | 5.8K | 1.0000 | 1.0000 | 0.0000% | = | ok |
 
 **k = 100**
 
-| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ |
-| --- | --- | --- | --- | --- |
-| stopword | 836.8K | 0.9000 | 1.0000 | 0.0000% |
-| common | 214.3K | 0.9700 | 1.0000 | 0.0000% |
-| mid | 5.8K | 0.9800 | 1.0000 | 0.0000% |
-| rare | 65 | 1.0000 | 1.0000 | 0.0000% |
-| singleton | 1 | 1.0000 | 1.0000 | 0.0000% |
-| stopword_common_or | 841.2K | 0.9500 | 1.0000 | 0.0000% |
-| stopword_rare_or | 836.8K | 0.9800 | 1.0000 | 0.0000% |
-| three_stopword_or | 908.4K | 0.8800 | 1.0000 | 0.0000% |
-| three_mid_or | 17.0K | 0.9600 | 1.0000 | 0.0000% |
-| ten_common_or | 619.3K | 0.9200 | 1.0000 | 0.0000% |
-| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% |
-| common_mid_and | 3.8K | 0.9700 | 1.0000 | 0.0000% |
-| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% |
-| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% |
-| must_two_should_two | 102.5K | 0.9800 | 1.0000 | 0.0000% |
-| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% |
-| phrase_stopwords | 275.5K | 0.9600 | 1.0000 | 0.0000% |
-| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% |
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ | count | order |
+| --- | --- | --- | --- | --- | --- | --- |
+| stopword | 836.8K | 0.9000 | 1.0000 | 0.0000% | = | ok |
+| stopword2 | 722.9K | 0.9500 | 1.0000 | 0.0000% | = | ok |
+| common | 214.3K | 0.9700 | 1.0000 | 0.0000% | = | ok |
+| common2 | 210.3K | 0.9700 | 1.0000 | 0.0000% | = | ok |
+| upper_mid | 89.6K | 0.9900 | 1.0000 | 0.0000% | = | ok |
+| mid_dense | 35.5K | 0.9900 | 1.0000 | 0.0000% | = | ok |
+| mid_dense2 | 50.0K | 0.9700 | 1.0000 | 0.0000% | = | ok |
+| mid | 5.8K | 0.9800 | 1.0000 | 0.0000% | = | ok |
+| low | 2.4K | 0.9900 | 1.0000 | 0.0000% | = | ok |
+| few_block | 640 | 0.9900 | 1.0000 | 0.0000% | = | ok |
+| edge | 298 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| rare | 65 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| year | 20.8K | 0.9500 | 1.0000 | 0.0000% | = | ok |
+| common_common2_or | 322.0K | 0.9500 | 1.0000 | 0.0000% | = | ok |
+| common_mid_or | 216.3K | 0.9700 | 1.0000 | 0.0000% | = | ok |
+| stopword_common_or | 841.2K | 0.9500 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_or | 836.8K | 0.9800 | 1.0000 | 0.0000% | = | ok |
+| stopword_two_mid_or | 836.9K | 0.9900 | 1.0000 | 0.0000% | = | ok |
+| dense_three_or | 890.0K | 0.9400 | 1.0000 | 0.0000% | = | ok |
+| three_stopword_or | 908.4K | 0.8800 | 1.0000 | 0.0000% | = | ok |
+| three_mid_or | 17.0K | 0.9600 | 1.0000 | 0.0000% | = | ok |
+| ten_rare_or | 616 | 0.9800 | 1.0000 | 0.0000% | = | ok |
+| ten_common_or | 619.3K | 0.9200 | 1.0000 | 0.0000% | = | ok |
+| five_tier_or | 841.3K | 0.9500 | 1.0000 | 0.0000% | = | ok |
+| two_stopword_and | 672.1K | 0.9300 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_mid_dense_and | 35.1K | 0.9700 | 1.0000 | 0.0000% | = | ok |
+| two_mid_dense_and | 8.3K | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| common_mid_and | 3.8K | 0.9700 | 1.0000 | 0.0000% | = | ok |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| five_tier_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge_stopword_and | 289 | 0.9900 | 1.0000 | 0.0000% | = | ok |
+| singleton_stopword_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| disjoint_rare_and | 0 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_two_should_two | 102.5K | 0.9800 | 1.0000 | 0.0000% | – | ok |
+| must_common_should_rare | 214.3K | 0.9900 | 1.0000 | 0.0000% | – | ok |
+| must_mid_should_two_rare | 5.8K | 0.9900 | 1.0000 | 0.0000% | – | ok |
+| must_phrase_should_common | 275.5K | 0.9600 | 1.0000 | 0.0000% | – | ok |
+| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| stopword_not_common | 627.0K | 0.9100 | 1.0000 | 0.0000% | – | ok |
+| rare_not_stopword | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_rare | 214.2K | 0.9700 | 1.0000 | 0.0000% | – | ok |
+| common_not_phrase | 89.5K | 0.9700 | 1.0000 | 0.0000% | – | ok |
+| and_two_negatives | 206.0K | 0.9500 | 1.0000 | 0.0000% | – | ok |
+| must_should_negative | 11.7K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_stopwords | 275.5K | 0.9600 | 1.0000 | 0.0000% | – | ok |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_rare_stopword | 5 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_three_stopwords | 43.8K | 0.9900 | 1.0000 | 0.0000% | – | ok |
+| phrase_repeated_stopword | 420.8K | 0.9900 | 1.0000 | 0.0000% | – | ok |
+| phrase_two_mids | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_and_term | 1.3K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| two_phrases_or | 275.5K | 0.9600 | 1.0000 | 0.0000% | – | ok |
+| common_cased | 214.3K | 0.9700 | 1.0000 | 0.0000% | = | ok |
+| mid_comma | 5.8K | 0.9800 | 1.0000 | 0.0000% | = | ok |
+
+**k = 128**
+
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ | count | order |
+| --- | --- | --- | --- | --- | --- | --- |
+| stopword | 836.8K | 0.8984 | 1.0000 | 0.0000% | = | ok |
+| stopword2 | 722.9K | 0.9453 | 1.0000 | 0.0000% | = | ok |
+| common | 214.3K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| common2 | 210.3K | 0.9609 | 1.0000 | 0.0000% | = | ok |
+| upper_mid | 89.6K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| mid_dense | 35.5K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| mid_dense2 | 50.0K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| mid | 5.8K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| low | 2.4K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| few_block | 640 | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| edge | 298 | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| rare | 65 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| year | 20.8K | 0.9922 | 1.0000 | 0.0000% | = | ok |
+| common_common2_or | 322.0K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| common_mid_or | 216.3K | 0.9688 | 1.0000 | 0.0000% | = | ok |
+| stopword_common_or | 841.2K | 0.9609 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_or | 836.8K | 0.9766 | 1.0000 | 0.0000% | = | ok |
+| stopword_two_mid_or | 836.9K | 0.9766 | 1.0000 | 0.0000% | = | ok |
+| dense_three_or | 890.0K | 0.9531 | 1.0000 | 0.0000% | = | ok |
+| three_stopword_or | 908.4K | 0.8906 | 1.0000 | 0.0000% | = | ok |
+| three_mid_or | 17.0K | 0.9609 | 1.0000 | 0.0000% | = | ok |
+| ten_rare_or | 616 | 0.9922 | 1.0000 | 0.0000% | = | ok |
+| ten_common_or | 619.3K | 0.9141 | 1.0000 | 0.0000% | = | ok |
+| five_tier_or | 841.3K | 0.9688 | 1.0000 | 0.0000% | = | ok |
+| two_stopword_and | 672.1K | 0.8828 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_mid_dense_and | 35.1K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| two_mid_dense_and | 8.3K | 0.9922 | 1.0000 | 0.0000% | = | ok |
+| common_mid_and | 3.8K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| five_tier_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge_stopword_and | 289 | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| singleton_stopword_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| disjoint_rare_and | 0 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_two_should_two | 102.5K | 0.9766 | 1.0000 | 0.0000% | – | ok |
+| must_common_should_rare | 214.3K | 0.9844 | 1.0000 | 0.0000% | – | ok |
+| must_mid_should_two_rare | 5.8K | 0.9922 | 1.0000 | 0.0000% | – | ok |
+| must_phrase_should_common | 275.5K | 0.9609 | 1.0000 | 0.0000% | – | ok |
+| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| stopword_not_common | 627.0K | 0.8984 | 1.0000 | 0.0000% | – | ok |
+| rare_not_stopword | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_rare | 214.2K | 0.9844 | 1.0000 | 0.0000% | – | ok |
+| common_not_phrase | 89.5K | 0.9453 | 1.0000 | 0.0000% | – | ok |
+| and_two_negatives | 206.0K | 0.9609 | 1.0000 | 0.0000% | – | ok |
+| must_should_negative | 11.7K | 0.9844 | 1.0000 | 0.0000% | – | ok |
+| phrase_stopwords | 275.5K | 0.9375 | 1.0000 | 0.0000% | – | ok |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_rare_stopword | 5 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_three_stopwords | 43.8K | 0.9922 | 1.0000 | 0.0000% | – | ok |
+| phrase_repeated_stopword | 420.8K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_two_mids | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_and_term | 1.3K | 0.9844 | 1.0000 | 0.0000% | – | ok |
+| two_phrases_or | 275.5K | 0.9844 | 1.0000 | 0.0000% | – | ok |
+| common_cased | 214.3K | 0.9844 | 1.0000 | 0.0000% | = | ok |
+| mid_comma | 5.8K | 0.9844 | 1.0000 | 0.0000% | = | ok |
 
 **k = 1000**
 
-| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ |
-| --- | --- | --- | --- | --- |
-| stopword | 836.8K | 0.9510 | 1.0000 | 0.0000% |
-| common | 214.3K | 0.9830 | 1.0000 | 0.0000% |
-| mid | 5.8K | 0.9920 | 1.0000 | 0.0000% |
-| rare | 65 | 1.0000 | 1.0000 | 0.0000% |
-| singleton | 1 | 1.0000 | 1.0000 | 0.0000% |
-| stopword_common_or | 841.2K | 0.9790 | 1.0000 | 0.0000% |
-| stopword_rare_or | 836.8K | 0.9370 | 1.0000 | 0.0000% |
-| three_stopword_or | 908.4K | 0.9000 | 1.0000 | 0.0000% |
-| three_mid_or | 17.0K | 0.9890 | 1.0000 | 0.0000% |
-| ten_common_or | 619.3K | 0.9120 | 1.0000 | 0.0000% |
-| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% |
-| common_mid_and | 3.8K | 0.9850 | 1.0000 | 0.0000% |
-| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% |
-| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% |
-| must_two_should_two | 102.5K | 0.9570 | 1.0000 | 0.0000% |
-| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% |
-| phrase_stopwords | 275.5K | 0.9810 | 1.0000 | 0.0000% |
-| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% |
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ | count | order |
+| --- | --- | --- | --- | --- | --- | --- |
+| stopword | 836.8K | 0.9510 | 1.0000 | 0.0000% | = | ok |
+| stopword2 | 722.9K | 0.9540 | 1.0000 | 0.0000% | = | ok |
+| common | 214.3K | 0.9830 | 1.0000 | 0.0000% | = | ok |
+| common2 | 210.3K | 0.9800 | 1.0000 | 0.0000% | = | ok |
+| upper_mid | 89.6K | 0.9840 | 1.0000 | 0.0000% | = | ok |
+| mid_dense | 35.5K | 0.9840 | 1.0000 | 0.0000% | = | ok |
+| mid_dense2 | 50.0K | 0.9900 | 1.0000 | 0.0000% | = | ok |
+| mid | 5.8K | 0.9920 | 1.0000 | 0.0000% | = | ok |
+| low | 2.4K | 0.9930 | 1.0000 | 0.0000% | = | ok |
+| few_block | 640 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge | 298 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| rare | 65 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| year | 20.8K | 0.9680 | 1.0000 | 0.0000% | = | ok |
+| common_common2_or | 322.0K | 0.9670 | 1.0000 | 0.0000% | = | ok |
+| common_mid_or | 216.3K | 0.9810 | 1.0000 | 0.0000% | = | ok |
+| stopword_common_or | 841.2K | 0.9790 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_or | 836.8K | 0.9370 | 1.0000 | 0.0000% | = | ok |
+| stopword_two_mid_or | 836.9K | 0.9890 | 1.0000 | 0.0000% | = | ok |
+| dense_three_or | 890.0K | 0.9740 | 1.0000 | 0.0000% | = | ok |
+| three_stopword_or | 908.4K | 0.9000 | 1.0000 | 0.0000% | = | ok |
+| three_mid_or | 17.0K | 0.9890 | 1.0000 | 0.0000% | = | ok |
+| ten_rare_or | 616 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| ten_common_or | 619.3K | 0.9120 | 1.0000 | 0.0000% | = | ok |
+| five_tier_or | 841.3K | 0.9810 | 1.0000 | 0.0000% | = | ok |
+| two_stopword_and | 672.1K | 0.9210 | 1.0000 | 0.0000% | = | ok |
+| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| stopword_mid_dense_and | 35.1K | 0.9840 | 1.0000 | 0.0000% | = | ok |
+| two_mid_dense_and | 8.3K | 0.9780 | 1.0000 | 0.0000% | = | ok |
+| common_mid_and | 3.8K | 0.9850 | 1.0000 | 0.0000% | = | ok |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| five_tier_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| edge_stopword_and | 289 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| singleton_stopword_and | 1 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| disjoint_rare_and | 0 | 1.0000 | 1.0000 | 0.0000% | = | ok |
+| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| must_two_should_two | 102.5K | 0.9570 | 1.0000 | 0.0000% | – | ok |
+| must_common_should_rare | 214.3K | 0.9900 | 1.0000 | 0.0000% | – | ok |
+| must_mid_should_two_rare | 5.8K | 0.9900 | 1.0000 | 0.0000% | – | ok |
+| must_phrase_should_common | 275.5K | 0.9650 | 1.0000 | 0.0000% | – | ok |
+| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| stopword_not_common | 627.0K | 0.9420 | 1.0000 | 0.0000% | – | ok |
+| rare_not_stopword | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| common_not_rare | 214.2K | 0.9830 | 1.0000 | 0.0000% | – | ok |
+| common_not_phrase | 89.5K | 0.9890 | 1.0000 | 0.0000% | – | ok |
+| and_two_negatives | 206.0K | 0.9800 | 1.0000 | 0.0000% | – | ok |
+| must_should_negative | 11.7K | 0.9970 | 1.0000 | 0.0000% | – | ok |
+| phrase_stopwords | 275.5K | 0.9810 | 1.0000 | 0.0000% | – | ok |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_rare_stopword | 5 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_three_stopwords | 43.8K | 0.9840 | 1.0000 | 0.0000% | – | ok |
+| phrase_repeated_stopword | 420.8K | 0.9770 | 1.0000 | 0.0000% | – | ok |
+| phrase_two_mids | 1 | 1.0000 | 1.0000 | 0.0000% | – | ok |
+| phrase_and_term | 1.3K | 0.9970 | 1.0000 | 0.0000% | – | ok |
+| two_phrases_or | 275.5K | 0.9810 | 1.0000 | 0.0000% | – | ok |
+| common_cased | 214.3K | 0.9830 | 1.0000 | 0.0000% | = | ok |
+| mid_comma | 5.8K | 0.9920 | 1.0000 | 0.0000% | = | ok |
 <!-- END: bench/fts/superfile/quality -->
 
 ### Supertable FTS
@@ -598,3 +839,50 @@ Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-a
 | count_star | 961.16 ms | 122.19 ms |
 | group_by_category | 1.04 s | 876.90 ms |
 <!-- END: bench/sql/supertable/cold -->
+
+<!-- BEGIN: bench/fts/superfile/quality-coverage -->
+### Superfile FTS — posting form of every quality-battery term (1M docs, realistic corpus)
+
+_Host: unknown CPU · 16C/16T · macos/aarch64_
+
+Every term the quality battery names, with the posting form it took in the graded file(s): `files` holding it, its document frequency summed over them, long-form blocks by encoding (packed / patched / bitset, summed), and the files where it took the short form (`df <= 128`, one bodiless block), the inline df=1 form, or carries a coarse block-max table. The battery is built so every form appears here at the reference scale; a term that moved off its intended form is a corpus, format or threshold change to look at.
+
+**battery terms**
+
+| Term | files | df | packed | patched | bitset | short | inline | coarse |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1999 | 1 | 20.8K | 163 | 0 | 0 | 0 | 0 | 1 |
+| doc0000001 | 1 | 1 | 0 | 0 | 0 | 0 | 1 | 0 |
+| term00001 | 1 | 836.8K | 0 | 0 | 6538 | 0 | 0 | 1 |
+| term00002 | 1 | 722.9K | 0 | 0 | 5648 | 0 | 0 | 1 |
+| term00003 | 1 | 645.4K | 0 | 0 | 5043 | 0 | 0 | 1 |
+| term00030 | 1 | 214.3K | 618 | 0 | 1057 | 0 | 0 | 1 |
+| term00031 | 1 | 210.3K | 714 | 0 | 929 | 0 | 0 | 1 |
+| term00032 | 1 | 205.9K | 817 | 0 | 792 | 0 | 0 | 1 |
+| term00033 | 1 | 201.1K | 953 | 0 | 618 | 0 | 0 | 1 |
+| term00034 | 1 | 197.3K | 1008 | 0 | 534 | 0 | 0 | 1 |
+| term00035 | 1 | 193.6K | 1049 | 0 | 464 | 0 | 0 | 1 |
+| term00036 | 1 | 190.0K | 1130 | 0 | 355 | 0 | 0 | 1 |
+| term00037 | 1 | 186.0K | 1126 | 0 | 328 | 0 | 0 | 1 |
+| term00038 | 1 | 182.9K | 1138 | 0 | 291 | 0 | 0 | 1 |
+| term00039 | 1 | 179.6K | 1163 | 0 | 241 | 0 | 0 | 1 |
+| term00100 | 1 | 89.6K | 700 | 0 | 1 | 0 | 0 | 1 |
+| term00200 | 1 | 50.0K | 391 | 0 | 0 | 0 | 0 | 1 |
+| term00300 | 1 | 35.5K | 278 | 0 | 0 | 0 | 0 | 1 |
+| term02000 | 1 | 5.8K | 1 | 45 | 0 | 0 | 0 | 1 |
+| term02001 | 1 | 6.0K | 1 | 46 | 0 | 0 | 0 | 1 |
+| term02002 | 1 | 5.9K | 2 | 44 | 0 | 0 | 0 | 1 |
+| term05000 | 1 | 2.4K | 1 | 18 | 0 | 0 | 0 | 1 |
+| term20000 | 1 | 640 | 0 | 5 | 0 | 0 | 0 | 1 |
+| term200000 | 1 | 65 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200001 | 1 | 63 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200002 | 1 | 64 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200003 | 1 | 61 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200004 | 1 | 51 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200005 | 1 | 72 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200006 | 1 | 59 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200007 | 1 | 72 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200008 | 1 | 55 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term200009 | 1 | 55 | 0 | 0 | 0 | 1 | 0 | 0 |
+| term40000 | 1 | 298 | 0 | 3 | 0 | 0 | 0 | 1 |
+<!-- END: bench/fts/superfile/quality-coverage -->

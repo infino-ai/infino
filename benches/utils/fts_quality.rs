@@ -218,7 +218,7 @@ const fn and(name: &'static str, query: &'static str) -> QualityQuery {
 /// | mid, mid2, mid3 | 2000..2002 | ~3.7K, ~29 blocks | patched blocks with bursty tf outliers |
 /// | low | 5000 | ~1.1K, ~9 blocks | short lists with a partial last block |
 /// | few_block | 20000 | ~280, ~3 blocks | long form just past the short-form edge |
-/// | edge | 40000 | ~130: short form in some files, long form in others | the short-form boundary straddled across a fan-out |
+/// | edge | 40000 | ~2.9K over the table, ~40 per file | the short-form boundary from both sides: one 1M-doc file stores it long form (a few patched blocks), a fragmented table stores it short form in every file |
 /// | rare, rare2.. | 200000.. | ~40, short form | the short-form body and its inline positions group |
 /// | singleton | `doc0000001` | 1, inline | the df=1 inline form |
 /// | year | `1999` | a digit token | the analyzer's digit path |
@@ -286,7 +286,8 @@ pub const QUALITY_BATTERY: &[QualityQuery] = &[
         "five_tier_and",
         "term00001 term00030 term02000 term05000 term200000",
     ),
-    // Short form in some files and long form in others, in one query.
+    // A term just past the short-form cap on one file and well inside it
+    // on a fragmented table, intersected with the densest list.
     and("edge_stopword_and", "term40000 term00001"),
     // The inline form intersected with a bitset list.
     and("singleton_stopword_and", "doc0000001 term00001"),
