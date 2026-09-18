@@ -298,13 +298,20 @@ pub(crate) const GRAPH_ASSIGN_MIN_N_CENT: usize = 64;
 /// Search beam width for the coarse centroid router, as a function of the
 /// grid size and the drain's distance metric. Monotonic in `n_cent`, matching
 /// the drain-assign micro-bench's measured parity knees:
-/// `ef = max(8, round(m * sqrt(n_cent) / 4))` where `m = 1` for cosine and
-/// `m = 2` otherwise. Cosine yields 8@256, 8@1024, 16@4096, 32@16384; L2Sq and
-/// NegDot yield 8@256, 16@1024, 32@4096, 64@16384 — each clearing >=0.99
+/// `ef = max(16, round(m * sqrt(n_cent) / 4))` where `m = 1` for cosine and
+/// `m = 2` otherwise. Cosine yields 16@256, 16@1024, 16@4096, 32@16384; L2Sq and
+/// NegDot yield 16@256, 16@1024, 32@4096, 64@16384 — each clearing >=0.99
 /// primary parity against the exact path in `graph_routed_assignment_microbench`.
 /// A fixed ef under-serves a large grid (the walk needs a wider beam to keep
 /// candidate recall up as the graph grows) and over-serves a small one; `sqrt`
 /// tracks the graph's diameter growth.
+///
+/// The floor is 16, not the graph's nominal minimum: at small grids the bare
+/// `sqrt(n)/4` beam (4-8) leaves a visible placement drift vs the exact path
+/// (~0.994 primary parity at 256), and while that drift does not hurt recall it
+/// shifts the post-drain cell membership enough to perturb the cold-read block
+/// layout. A floor of 16 lifts small-grid parity back to the exact path's
+/// footprint, and the graph is cheap at those sizes anyway.
 ///
 /// The 2x for non-cosine is the sweep-validated knee: L2Sq needs 64 at 16384 to
 /// clear the bar (NegDot is over-served but bounded <=64). This is validated on
@@ -313,7 +320,7 @@ pub(crate) const GRAPH_ASSIGN_MIN_N_CENT: usize = 64;
 pub(crate) fn coarse_router_ef(n_cent: usize, metric: Metric) -> usize {
     let base = (n_cent as f64).sqrt() / 4.0;
     let m = if metric == Metric::Cosine { 1.0 } else { 2.0 };
-    ((base * m).round() as usize).max(8)
+    ((base * m).round() as usize).max(16)
 }
 
 /// Graph-routed variant of [`boundary_assignment_fp32`]. Instead of the
@@ -3593,19 +3600,19 @@ mod tests {
     /// point.
     #[test]
     fn coarse_router_ef_hits_parity_knees() {
-        // Cosine knees (multiplier 1).
-        assert_eq!(coarse_router_ef(256, Metric::Cosine), 8);
-        assert_eq!(coarse_router_ef(1024, Metric::Cosine), 8);
+        // Cosine knees (multiplier 1), floor 16.
+        assert_eq!(coarse_router_ef(256, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(1024, Metric::Cosine), 16);
         assert_eq!(coarse_router_ef(4096, Metric::Cosine), 16);
         assert_eq!(coarse_router_ef(16384, Metric::Cosine), 32);
-        // Non-cosine knees (multiplier 2): L2Sq and NegDot both.
+        // Non-cosine knees (multiplier 2): L2Sq and NegDot both, floor 16.
         for metric in [Metric::L2Sq, Metric::NegDot] {
-            assert_eq!(coarse_router_ef(256, metric), 8, "metric={metric:?}");
+            assert_eq!(coarse_router_ef(256, metric), 16, "metric={metric:?}");
             assert_eq!(coarse_router_ef(1024, metric), 16, "metric={metric:?}");
             assert_eq!(coarse_router_ef(4096, metric), 32, "metric={metric:?}");
             assert_eq!(coarse_router_ef(16384, metric), 64, "metric={metric:?}");
         }
-        // Monotonic non-decreasing across the full range, with the floor of 8,
+        // Monotonic non-decreasing across the full range, with the floor of 16,
         // for every metric.
         for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
             let mut prev = 0usize;
@@ -3615,7 +3622,7 @@ mod tests {
                     ef >= prev,
                     "ef must be monotonic: ef({n},{metric:?})={ef} < {prev}"
                 );
-                assert!(ef >= 8, "ef floor is 8: ef({n},{metric:?})={ef}");
+                assert!(ef >= 16, "ef floor is 16: ef({n},{metric:?})={ef}");
                 prev = ef;
             }
         }
