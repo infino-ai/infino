@@ -431,6 +431,11 @@ const DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK: f32 = 0.30;
 const DEFAULT_VECTOR_ADMIT_EXTENSION_MULT: usize = 3;
 /// Default user superfiles the hidden-index drain materializes per batch.
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
+/// Default drain-side cell assignment path: route through a centroid HNSW
+/// built once per drain (`true`) rather than the 1-bit shortlist + exact
+/// rescore. The graph reaches the same placement much faster as the grid
+/// grows; `false` is the kill-switch back to the shortlist path.
+const DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN: bool = true;
 /// Default boundary-replication budget (commit + drain). `<= 1.0` disables
 /// replication, which is the default: at 10M it was a measured net loss —
 /// the extra boundary copies inflated cell size (159K → 232K rows), crowding
@@ -817,6 +822,12 @@ pub struct VectorSettings {
     pub drain_replica_target_factor: f32,
     /// Per-cell consolidation op the drain applies.
     pub drain_consolidate: DrainConsolidate,
+    /// Route drain-side cell assignment through a centroid HNSW built once
+    /// per drain (default `true`), instead of the 1-bit shortlist + exact
+    /// rescore. The graph reaches the same placement far faster as the grid
+    /// grows; `false` is the kill-switch back to the shortlist path. Small
+    /// grids always take the exact path regardless of this flag.
+    pub drain_graph_assign: bool,
     /// Read fan-out for the drain's superfile opens. `auto` resolves
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
@@ -891,6 +902,7 @@ impl Default for VectorSettings {
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
             drain_consolidate: DrainConsolidate::Kmeans,
+            drain_graph_assign: DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN,
             drain_read_concurrency: ThreadCount::Auto,
             maintenance_threads: ThreadCount::Auto,
             user_cell_count: DEFAULT_VECTOR_USER_CELL_COUNT,
@@ -1446,6 +1458,24 @@ mod tests {
     fn embedded_default_loads_with_expected_value() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    /// Drain graph-assign ships on, and the kill-switch parses to `false`.
+    #[test]
+    fn drain_graph_assign_defaults_on_and_toggles() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert!(
+            cfg.vector.drain_graph_assign,
+            "graph-routed drain assign is the shipped default"
+        );
+        let off = Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+            Serialized::defaults(json!({ "vector": { "drain_graph_assign": false } })),
+        ))
+        .expect("kill-switch config loads");
+        assert!(
+            !off.vector.drain_graph_assign,
+            "drain_graph_assign: false must reach the exact path"
+        );
     }
 
     /// A retired key must FAIL the load, not be quietly dropped.

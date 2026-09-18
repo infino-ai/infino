@@ -4279,6 +4279,20 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         packed_cells.push(restore_spilled_packed_cell(&drain_scratch, cell, state)?);
     }
 
+    // Drain-side cell assignment. The default routes each row through a
+    // centroid HNSW built ONCE for the whole drain (the coarse grid is stable
+    // across the batch loop); `vector.drain_graph_assign: false` is the
+    // kill-switch back to the 1-bit shortlist + exact-rescore path, and small
+    // grids (`n_cent < GRAPH_ASSIGN_MIN_N_CENT`) always take the exact path
+    // (the graph's build/walk overhead does not pay there). The router is
+    // built lazily on the first batch that has rows to assign, so a drain with
+    // no assign work never builds it. `running_clusters` is only read inside
+    // the loop (reassigned after it), so one build serves every batch.
+    let drain_graph_assign = config::global().vector.drain_graph_assign;
+    let drain_timers = config::global().diagnostics.drain_build_timers;
+    let mut coarse_router: Option<(opann::Fp32Scorer, opann::Hnsw, Vec<u32>)> = None;
+    let mut drain_assign_total_ms = 0.0f64;
+
     for (batch_idx, (_, batch_sources)) in batches.iter().enumerate() {
         if batch_idx < local_checkpoint.batches_done {
             continue;
@@ -4538,13 +4552,53 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let replica_extra_budget =
                         drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
-                    // Shared admit context + 20% shortlist window: the same
-                    // 1-bit prefilter the commit assign uses, so drain
-                    // assignment compute scales with the window too.
-                    let admit_ctx =
-                        RabitqAdmitContext::new(clusters_ref.dim as usize, drain_rot_seed);
-                    let window = opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
-                    let assignments: Vec<opann::BoundaryAssignment> =
+                    // Graph path only above the small-grid floor; below it the
+                    // exact scan already covers the whole grid cheaply.
+                    let use_graph_assign = drain_graph_assign
+                        && (clusters_ref.n_cent as usize) >= opann::GRAPH_ASSIGN_MIN_N_CENT;
+                    let assign_t0 = std::time::Instant::now();
+                    let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
+                        // No rows to assign: never build the router (skip-empty).
+                        Vec::new()
+                    } else if use_graph_assign {
+                        // Graph-routed assign. Build the coarse centroid router
+                        // ONCE for the drain, lazily on the first batch with
+                        // rows, INSIDE the writer pool so `Hnsw::build`'s rayon
+                        // par_iter stays on it. The result type is identical to
+                        // the shortlist path, so the spill/replica code below is
+                        // untouched.
+                        let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize);
+                        hidden_inner.options.writer_pool.install(|| {
+                            let router = coarse_router.get_or_insert_with(|| {
+                                opann::build_coarse_router(clusters_ref, metric)
+                            });
+                            // Shared reborrows so the parallel closure captures
+                            // `&` (Sync), not the `&mut` from `get_or_insert_with`.
+                            let (scorer, graph, node_to_cell) =
+                                (&router.0, &router.1, &router.2[..]);
+                            distinct_rows
+                                .par_iter()
+                                .map(|row| {
+                                    opann::boundary_assignment_graph_encoded(
+                                        graph,
+                                        scorer,
+                                        node_to_cell,
+                                        clusters_ref,
+                                        metric,
+                                        &row.encoded,
+                                        ef,
+                                    )
+                                })
+                                .collect()
+                        })
+                    } else {
+                        // Shared admit context + 20% shortlist window: the same
+                        // 1-bit prefilter the commit assign uses, so drain
+                        // assignment compute scales with the window too.
+                        let admit_ctx =
+                            RabitqAdmitContext::new(clusters_ref.dim as usize, drain_rot_seed);
+                        let window =
+                            opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
                         hidden_inner.options.writer_pool.install(|| {
                             distinct_rows
                                 .par_iter()
@@ -4558,7 +4612,20 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                     )
                                 })
                                 .collect()
-                        });
+                        })
+                    };
+                    let assign_ms = assign_t0.elapsed().as_secs_f64() * 1e3;
+                    drain_assign_total_ms += assign_ms;
+                    if drain_timers {
+                        debug!(
+                            batch = batch_idx + 1,
+                            rows = distinct_rows.len(),
+                            n_cent = clusters_ref.n_cent,
+                            graph = use_graph_assign,
+                            assign_ms,
+                            "[optdrain] batch cell-assign phase"
+                        );
+                    }
                     let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
                         .iter()
                         .enumerate()
@@ -4645,6 +4712,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             batch_idx + 1,
             n_batches,
             batch_sources.len(),
+        );
+    }
+    if drain_timers {
+        debug!(
+            graph = drain_graph_assign,
+            total_ms = drain_assign_total_ms,
+            "[optdrain] total cell-assign phase"
         );
     }
 
