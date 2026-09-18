@@ -31,7 +31,7 @@ const K_ALL_MULTI_BLOCK: usize = 1024;
 /// Score-equality tolerance between the two BM25 implementations.
 const SCORE_ABS_TOLERANCE: f32 = 1e-3;
 
-async fn search_hits(
+pub async fn search_hits(
     reader: &SuperfileReader,
     query: &str,
     k: usize,
@@ -47,8 +47,9 @@ async fn search_hits(
 }
 
 /// Compare reader results against the phrase oracle for `query`:
-/// identical match sets, per-doc scores within tolerance.
-async fn assert_matches_oracle(
+/// identical match sets, per-doc scores within tolerance. Shared with
+/// the boundary tests, which grade every shape the same way.
+pub async fn assert_matches_oracle(
     reader: &SuperfileReader,
     oracle: &BruteForceBm25,
     query: &str,
