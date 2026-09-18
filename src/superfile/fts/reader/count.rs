@@ -6,6 +6,8 @@
 //! entry points (no BM25 scoring, no top-k). Its own `impl FtsReader`
 //! block, split from the reader `core`.
 
+#[cfg(any(test, feature = "test-helpers"))]
+use super::cursor::{SubindexKind, TermCursor, TermMeta};
 use super::{
     core::*,
     filter::AtomExcludeFilter,
@@ -13,6 +15,8 @@ use super::{
     phrase::AnyCursor,
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::superfile::fts::posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED};
 use crate::{
     runtime_metrics::op_stats::timed_section,
     superfile::{
@@ -413,6 +417,119 @@ impl FtsReader {
         let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
         Ok((dfs.pop().unwrap_or(0), work))
     }
+
+    /// How `term`'s postings are laid out in `column` of this file, or
+    /// `None` if the term is absent. Benchmarks report this for every term
+    /// their quality battery names, so the battery is known to reach every
+    /// posting form (inline, short, packed, patched, bitset) rather than
+    /// assumed to from the term's rank. Reads the term's postings once, the
+    /// way a search would, and parses only the block headers.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn term_layout(
+        &self,
+        column: &str,
+        term: &str,
+    ) -> Result<Option<TermLayout>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let col_meta = &self.columns[column_id as usize];
+        let fst_bytes = self.dict_bytes_async().await?;
+        let dict = self.open_dict(&fst_bytes)?;
+        let key = make_key(&col_meta.name, term);
+        let Some(packed) = dict.lookup(&key) else {
+            return Ok(None);
+        };
+        let (metadata_offset, postings_length_hint, short) = match packed {
+            FstValue::Inline { .. } => {
+                return Ok(Some(TermLayout {
+                    df: 1,
+                    inline: true,
+                    ..TermLayout::default()
+                }));
+            }
+            FstValue::Pfor {
+                metadata_offset,
+                postings_length_hint,
+                short,
+            } => (metadata_offset, postings_length_hint, short),
+        };
+        let mut fetched = self
+            .fetch_term_postings(&[(
+                metadata_offset as usize,
+                postings_length_hint.map(|len| len as usize),
+            )])
+            .await?;
+        let bytes = fetched.pop().expect("one fetched range for one PFOR term");
+        if short {
+            let df = short_df(bytes.as_ref()).ok_or_else(|| {
+                FtsError::Read(ReadError::MalformedVersion(
+                    "term_layout: malformed short-form term body".into(),
+                ))
+            })?;
+            return Ok(Some(TermLayout {
+                df: u64::from(df),
+                short: true,
+                num_blocks: 1,
+                ..TermLayout::default()
+            }));
+        }
+        let meta = TermMeta::parse(
+            bytes.as_ref(),
+            0,
+            col_meta.positions,
+            SubindexKind::None,
+            self.bounds,
+            self.positions_grouped,
+        )?;
+        let cursor = TermCursor::new(
+            bytes,
+            col_meta,
+            self.bounds,
+            None,
+            1,
+            postings_length_hint.is_none(),
+            true,
+        )?;
+        let mut layout = TermLayout {
+            df: meta.df,
+            num_blocks: meta.num_blocks,
+            has_coarse: meta.has_coarse,
+            ..TermLayout::default()
+        };
+        for b in 0..cursor.block_count() {
+            match cursor.block_header(b).encoding {
+                ENCODING_PACKED => layout.packed_blocks += 1,
+                ENCODING_PATCHED => layout.patched_blocks += 1,
+                ENCODING_BITSET => layout.bitset_blocks += 1,
+                other => {
+                    return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                        "term_layout: block {b} carries unknown encoding {other}"
+                    ))));
+                }
+            }
+        }
+        Ok(Some(layout))
+    }
+}
+
+/// The posting form one term takes in one file — see
+/// [`FtsReader::term_layout`].
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TermLayout {
+    /// Documents carrying the term in this file.
+    pub df: u64,
+    /// A df=1 term stored inline in the dictionary: no posting bytes.
+    pub inline: bool,
+    /// A short-form term (`df <= BLOCK_LEN`): one bodiless block.
+    pub short: bool,
+    /// Posting blocks (one for a short term, zero for an inline one).
+    pub num_blocks: usize,
+    /// Whether the term carries a coarse block-max table.
+    pub has_coarse: bool,
+    /// Long-form blocks by encoding.
+    pub packed_blocks: usize,
+    pub patched_blocks: usize,
+    pub bitset_blocks: usize,
 }
 
 #[cfg(test)]
