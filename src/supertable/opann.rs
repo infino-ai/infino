@@ -35,6 +35,9 @@ use std::{
     },
 };
 
+// Re-exported for the drain caller (`writer.rs`), which owns the coarse
+// router across the batch loop and so must name these types.
+pub(crate) use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
 use crate::{
     config,
     superfile::vector::{
@@ -60,10 +63,6 @@ use crate::{
         },
     },
 };
-
-// Re-exported for the drain caller (`writer.rs`), which owns the coarse
-// router across the batch loop and so must name these types.
-pub(crate) use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
 
 /// Overflow threshold for cell split. Sourced from
 /// `vector.cell_split_doc_cap`.
@@ -3170,8 +3169,7 @@ mod tests {
     #[test]
     #[ignore = "micro-bench: run explicitly with --release --nocapture --ignored"]
     fn graph_routed_assignment_microbench() {
-        use std::hint::black_box;
-        use std::time::Instant;
+        use std::{hint::black_box, time::Instant};
 
         const DIM: usize = 768;
         const QUERY_ROWS: usize = 5000;
