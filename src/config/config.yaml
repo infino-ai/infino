@@ -432,6 +432,13 @@ vector:
   #   splice — keep each superfile's local clusters verbatim.
   drain_consolidate: kmeans
 
+  # Drain-side cell assignment path:
+  #   true  — route each row through a centroid HNSW built once per drain
+  #           (default). Reaches the same placement as the exact path but far
+  #           faster as the grid grows; small grids fall back to exact.
+  #   false — kill-switch back to the 1-bit shortlist + exact rescore path.
+  drain_graph_assign: true
+
   # Read fan-out for the drain's superfile opens. `auto` resolves to
   # one in-flight read per hardware thread, floored at the
   # background-fill default and capped at 64; or set a positive
