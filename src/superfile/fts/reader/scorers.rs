@@ -3413,4 +3413,221 @@ mod tests {
                 .is_empty()
         );
     }
+
+    // ── Bound soundness ───────────────────────────────────────────────
+
+    /// Proptest cases for the bound properties; each builds a reader.
+    const BOUND_CASES: u32 = 32;
+    /// Slack for the bound comparisons: the bounds are exact scores held
+    /// as `f32` and the reference sums two `f32` terms, so only rounding
+    /// separates them.
+    const BOUND_EPS: f32 = 1e-4;
+    /// Widest filler run planted per doc, so document lengths span the
+    /// exact and the quantized regions of the stored length.
+    const MAX_FILLER: u8 = 60;
+    /// Rows in a bound corpus.
+    const BOUND_DOCS: u32 = 900;
+
+    /// A two-term corpus with per-doc term frequencies and lengths drawn
+    /// from `seed`, indexed at a `(k1, b)` pair. Term `lead` is planted
+    /// in every third doc from a random phase, `other` in a random
+    /// subset of docs, so the two lists cross block boundaries at
+    /// unrelated places.
+    fn bound_reader(seed: u64, k1: f32, b: f32) -> (FtsReader, Vec<Option<u32>>, Vec<Option<u32>>) {
+        let mut rng = seed | 1;
+        let mut draw = |m: u64| -> u64 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % m
+        };
+        let phase = draw(3) as u32;
+        let mut builder = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        builder
+            .register_column_with_tokenizer(
+                "body".into(),
+                false,
+                Arc::new(AsciiLowerTokenizer),
+                bm25::Bm25Params::new(k1, b),
+            )
+            .expect("register");
+        let mut lead_tf: Vec<Option<u32>> = Vec::with_capacity(BOUND_DOCS as usize);
+        let mut other_tf: Vec<Option<u32>> = Vec::with_capacity(BOUND_DOCS as usize);
+        let mut text = String::new();
+        for doc in 0..BOUND_DOCS {
+            text.clear();
+            let lt = (doc % 3 == phase).then(|| 1 + draw(6) as u32);
+            let ot = (draw(4) == 0).then(|| 1 + draw(9) as u32);
+            for _ in 0..lt.unwrap_or(0) {
+                text.push_str("lead ");
+            }
+            for _ in 0..ot.unwrap_or(0) {
+                text.push_str("other ");
+            }
+            for f in 0..draw(u64::from(MAX_FILLER) + 1) {
+                text.push_str(&format!("f{f} "));
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            builder.add_doc(0, doc, text.trim_end()).expect("add doc");
+            lead_tf.push(lt);
+            other_tf.push(ot);
+        }
+        let json = format!(r#"[{{"name":"body","tokenizer":"ascii_lower","k1":{k1},"b":{b}}}]"#);
+        let r =
+            FtsReader::open(Bytes::from(builder.finish().expect("finish")), &json).expect("open");
+        (r, lead_tf, other_tf)
+    }
+
+    /// `block_max_and_bound` is an upper bound on the AND score of every
+    /// document in the window it declares: for each doc of the leader,
+    /// the bound at that doc must be at least the true `lead + other`
+    /// score of every doc carrying both terms in `[doc, window_end]`. A
+    /// bound below a real score would let Block-Max-AND skip a block
+    /// holding a top-k document, which is a silent recall loss the
+    /// top-k oracles only catch when the skipped doc happens to be
+    /// planted at the boundary. Lengths span both stored-length regions
+    /// and the pair is non-standard, so the quantized norm and the
+    /// bound rescale are both on the path.
+    #[test]
+    fn prop_block_max_and_bound_is_never_below_a_real_and_score() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, TestRunner},
+        };
+        let strategy = (any::<u64>(), 0.3f32..2.5, 0.0f32..=1.0);
+        let mut runner = TestRunner::new(Config {
+            cases: BOUND_CASES,
+            ..Config::default()
+        });
+        runner
+            .run(&strategy, |(seed, k1, b)| {
+                let (r, lead_tf, other_tf) = bound_reader(seed, k1, b);
+                let col = r.resolve_column_id("body").expect("col");
+                let norms = &r.columns[col as usize].dl_norm_k1;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime");
+                let mut cursors = rt
+                    .block_on(r.build_term_cursors(col, &["lead", "other"], None, false, None, None))
+                    .expect("cursors");
+                prop_assume!(cursors.len() == 2);
+                let (lead_slice, others) = cursors.split_at_mut(1);
+                let lead = &mut lead_slice[0];
+                let score = |doc: u32, c: &TermCursor, tf: u32| -> f32 {
+                    bm25::score_with_dl_norm_k1(c.idf_weight, tf, norms.get(doc))
+                };
+                while !lead.is_exhausted() {
+                    let doc = lead.current_doc_id();
+                    let (ub, window_end) = block_max_and_bound(
+                        lead.current_block_max_bm25(),
+                        lead.current_block_last_doc_id(),
+                        others,
+                        doc,
+                    );
+                    prop_assert!(window_end >= doc, "window end precedes the leader doc");
+                    for d in doc..=window_end.min(BOUND_DOCS - 1) {
+                        if let (Some(lt), Some(ot)) = (lead_tf[d as usize], other_tf[d as usize]) {
+                            let real = score(d, lead, lt) + score(d, &others[0], ot);
+                            prop_assert!(
+                                real <= ub + BOUND_EPS,
+                                "seed {seed} k1 {k1} b {b}: doc {d} scores {real} above the bound {ub} \
+                                 declared at leader doc {doc} for window ..={window_end}"
+                            );
+                        }
+                    }
+                    lead.next();
+                }
+                Ok(())
+            })
+            .expect("bound property holds");
+    }
+
+    /// The two-term WAND tail returns exactly the top-k of `strong`'s
+    /// docs by `strong + weak` score among those above the seeded
+    /// threshold, ties broken by ascending doc id. It prunes with
+    /// `weak`'s block bound at each candidate, so a bound below a real
+    /// `weak` score would drop a qualifying doc from the heap: the
+    /// reference here is a brute-force rescore of every candidate, so
+    /// such a drop fails as a set mismatch.
+    #[test]
+    fn prop_wand_two_term_tail_matches_a_brute_force_top_k() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, TestRunner},
+        };
+        let strategy = (any::<u64>(), 0.3f32..2.5, 0.0f32..=1.0, 1usize..=25);
+        let mut runner = TestRunner::new(Config {
+            cases: BOUND_CASES,
+            ..Config::default()
+        });
+        runner
+            .run(&strategy, |(seed, k1, b, k)| {
+                let (r, lead_tf, other_tf) = bound_reader(seed, k1, b);
+                let col = r.resolve_column_id("body").expect("col");
+                let norms = &r.columns[col as usize].dl_norm_k1;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime");
+                let mut cursors = rt
+                    .block_on(r.build_term_cursors(
+                        col,
+                        &["lead", "other"],
+                        None,
+                        false,
+                        None,
+                        None,
+                    ))
+                    .expect("cursors");
+                prop_assume!(cursors.len() == 2);
+                // The tail's contract names the weaker term by its maximum.
+                let lead_is_weak = cursors[0].term_max_bm25 < cursors[1].term_max_bm25;
+                let (weak_tfs, strong_tfs) = if lead_is_weak {
+                    (&lead_tf, &other_tf)
+                } else {
+                    (&other_tf, &lead_tf)
+                };
+                let (a, bb) = cursors.split_at_mut(1);
+                let (weak, strong) = if lead_is_weak {
+                    (&mut a[0], &mut bb[0])
+                } else {
+                    (&mut bb[0], &mut a[0])
+                };
+                let seeded = weak.term_max_bm25;
+                let (weak_idf, strong_idf) = (weak.idf_weight, strong.idf_weight);
+                let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+                let mut threshold = seeded;
+                wand_two_term_tail(weak, strong, k, &mut heap, &mut threshold, norms);
+                let got = drain_top_k_desc(heap);
+
+                // Brute force over strong's docs, above the seeded threshold.
+                let mut want: Vec<(u32, f32)> = (0..BOUND_DOCS)
+                    .filter_map(|d| {
+                        let st = strong_tfs[d as usize]?;
+                        let norm = norms.get(d);
+                        let mut s = bm25::score_with_dl_norm_k1(strong_idf, st, norm);
+                        if let Some(wt) = weak_tfs[d as usize] {
+                            s += bm25::score_with_dl_norm_k1(weak_idf, wt, norm);
+                        }
+                        (s > seeded).then_some((d, s))
+                    })
+                    .collect();
+                want.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.cmp(&y.0)));
+                want.truncate(k);
+                prop_assert_eq!(got.len(), want.len(), "seed {} k {}: hit count", seed, k);
+                for ((gd, gs), (wd, ws)) in got.iter().zip(&want) {
+                    prop_assert!(
+                        (gs - ws).abs() <= BOUND_EPS,
+                        "seed {seed} k {k}: score {gs} vs {ws} at docs {gd}/{wd}"
+                    );
+                    // Equal scores may legitimately swap docs only within a tie.
+                    if (gs - ws).abs() > BOUND_EPS / 10.0 {
+                        prop_assert_eq!(gd, wd, "seed {} k {}: doc order", seed, k);
+                    }
+                }
+                Ok(())
+            })
+            .expect("tail property holds");
+    }
 }
