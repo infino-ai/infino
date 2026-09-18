@@ -38,6 +38,7 @@ use infino::{
 
 use super::{
     brute_force_oracle::build_infino_superfile_with_fts,
+    corpus_truth::docs_with,
     phrase::{assert_matches_oracle, search_hits},
 };
 
@@ -182,16 +183,6 @@ fn fixture(corpus: &[(u64, String)], positions: bool) -> (SuperfileReader, Brute
         build_infino_superfile_with_fts(&refs, FtsConfig::new(COLUMN).positions(positions));
     let tok = default_tokenizer();
     (reader, BruteForceBm25::index(&refs, tok.as_ref()))
-}
-
-/// Documents whose text contains `term` as a whitespace token — corpus
-/// truth, independent of both scorers.
-fn docs_with(corpus: &[(u64, String)], term: &str) -> HashSet<u64> {
-    corpus
-        .iter()
-        .filter(|(_, t)| t.split_whitespace().any(|w| w == term))
-        .map(|(d, _)| *d)
-        .collect()
 }
 
 /// Grade `queries` under `mode` with `k` covering every match.

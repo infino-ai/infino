@@ -23,6 +23,7 @@ use infino::{
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 
+use super::corpus_truth::docs_with;
 use crate::fts::brute_force_oracle::{
     build_infino_superfile, build_multi_block_corpus, build_multi_block_reader, corpus,
 };
@@ -32,14 +33,6 @@ use crate::fts::brute_force_oracle::{
 // The planted superfile has user `doc_id` == row index, so the reader's
 // `local_doc_id` is the user id. "Term in doc" = whitespace-token match,
 // which equals the tokenizer's view for this all-lowercase corpus.
-
-/// Doc-ids whose text contains `term` as a whitespace token.
-fn docs_with(corp: &[(u64, &str)], term: &str) -> HashSet<u64> {
-    corp.iter()
-        .filter(|(_, t)| t.split_whitespace().any(|w| w == term))
-        .map(|(i, _)| *i)
-        .collect()
-}
 
 /// Docs matching ALL of `terms` (the must intersection).
 fn and_match(corp: &[(u64, &str)], terms: &[&str]) -> HashSet<u64> {
