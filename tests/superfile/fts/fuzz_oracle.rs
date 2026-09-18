@@ -48,7 +48,8 @@
 //! CI; a deeper run is on-demand via env overrides (there is no nightly
 //! lane): `PROPTEST_CASES`, `INFINO_FTS_FUZZ_MAX_DOCS`,
 //! `INFINO_FTS_FUZZ_MAX_DOC_LEN` (hard-capped at 15 to keep norms
-//! exact), `INFINO_FTS_FUZZ_MAX_ATOMS`.
+//! exact), `INFINO_FTS_FUZZ_MAX_ATOMS`. The one opt-in test past the
+//! seed floor takes `INFINO_FTS_FUZZ_LARGE_CASES`.
 
 use std::collections::HashSet;
 
@@ -71,6 +72,42 @@ const VOCAB: &[&str] = &[
 /// LEN_QUANT_EXACT_MAX` (16) so every doc's length norm is stored
 /// exactly and the reader/oracle norms agree bit-for-bit.
 const MAX_DOC_LEN_HARD: usize = 15;
+
+/// Top-k values every fuzz case may draw besides a uniform one: `1` is
+/// the sharpest ranking check (one wrong admission fails it), and `128`
+/// / `129` straddle the two-term union's WAND-to-MaxScore cutoff, so the
+/// router's two kernels are both graded on the same corpora.
+const PINNED_KS: [usize; 3] = [1, 128, 129];
+
+/// Tier weights of the tiered vocabulary, per token draw. Relative to
+/// each other they set the document frequency each tier lands at; at
+/// the default corpus size the first tier is in nearly every document
+/// (bitset blocks), the second in most (several packed blocks), the
+/// third in about a third (one long-form block past the short-form
+/// cap), the fourth in a few (a short-form list), and the fifth token
+/// is planted in one document only (the inline df=1 form).
+const TIER_WEIGHT_DENSE: u32 = 40;
+const TIER_WEIGHT_MULTI_BLOCK: u32 = 12;
+const TIER_WEIGHT_ONE_BLOCK: u32 = 4;
+const TIER_WEIGHT_SHORT: u32 = 1;
+/// Vocabulary index of each tier's token.
+const TIER_DENSE: usize = 0;
+const TIER_MULTI_BLOCK: usize = 1;
+const TIER_ONE_BLOCK: usize = 2;
+const TIER_SHORT: usize = 3;
+const TIER_SINGLETON: usize = 4;
+
+/// Smallest corpus of the large tiered tier: past the single-term
+/// walk's seed floor of 256 blocks (32 768 postings), so the dense
+/// tier's list is seeded from its coarse table and skipped span by
+/// span, which no default-size case reaches.
+const LARGE_TIER_MIN_DOCS: usize = 33_000;
+/// Documents the large tier may add past its minimum.
+const LARGE_TIER_DOC_SPREAD: usize = 256;
+/// Default cases of the large tier (`INFINO_FTS_FUZZ_LARGE_CASES`
+/// overrides). Each builds a positional superfile over tens of
+/// thousands of documents, so the tier is opt-in.
+const LARGE_TIER_DEFAULT_CASES: usize = 4;
 
 /// Score-equality tolerance. The two scorers share the identical BM25
 /// formula and (with exact norms) identical inputs; this only absorbs
@@ -137,6 +174,53 @@ fn skewed_corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
     ];
     let doc = prop::collection::vec(token, 1..=max_doc_len());
     prop::collection::vec(doc, 1..=max_docs())
+}
+
+/// A corpus whose vocabulary spans every posting encoding at once:
+/// per token draw the first four vocabulary terms are weighted by
+/// [`TIER_WEIGHT_DENSE`] down to [`TIER_WEIGHT_SHORT`], and the fifth
+/// is planted once, in the first document, after generation. The rest
+/// of the vocabulary never appears, so a query naming it hits the
+/// absent-term paths. `n_docs` sets the scale: at the CI default the
+/// tiers land on bitset, packed multi-block, single long-form block,
+/// short form and inline df=1; at the large tier the dense list runs
+/// past the seed floor and spans several coarse tables.
+fn tiered_corpus_strategy(
+    n_docs: impl Strategy<Value = usize>,
+) -> impl Strategy<Value = Vec<Vec<usize>>> {
+    let token = prop_oneof![
+        TIER_WEIGHT_DENSE => Just(TIER_DENSE),
+        TIER_WEIGHT_MULTI_BLOCK => Just(TIER_MULTI_BLOCK),
+        TIER_WEIGHT_ONE_BLOCK => Just(TIER_ONE_BLOCK),
+        TIER_WEIGHT_SHORT => Just(TIER_SHORT),
+    ];
+    let doc = prop::collection::vec(token, 1..=max_doc_len());
+    n_docs
+        .prop_flat_map(move |n| prop::collection::vec(doc.clone(), n))
+        .prop_map(|mut docs| {
+            // The singleton goes in the first document, replacing its
+            // last draw when the document is already at the length cap.
+            if let Some(first) = docs.first_mut() {
+                if first.len() >= max_doc_len() {
+                    first.pop();
+                }
+                first.push(TIER_SINGLETON);
+            }
+            docs
+        })
+}
+
+/// Top-k for a case: one of the pinned values or a uniform draw.
+fn k_strategy(max_docs: usize) -> impl Strategy<Value = usize> {
+    prop_oneof![
+        1 => prop::sample::select(PINNED_KS.to_vec()),
+        3 => 1usize..=(max_docs + 16),
+    ]
+}
+
+/// Cases of the large tiered tier.
+fn large_tier_cases() -> u32 {
+    env_cap("INFINO_FTS_FUZZ_LARGE_CASES", LARGE_TIER_DEFAULT_CASES) as u32
 }
 
 fn atoms_strategy() -> impl Strategy<Value = Vec<Atom>> {
@@ -333,7 +417,7 @@ proptest! {
         corpus in corpus_strategy(),
         atoms in atoms_strategy(),
         and_mode in any::<bool>(),
-        k in 1usize..=(max_docs() + 16),
+        k in k_strategy(max_docs()),
     ) {
         run_case(&corpus, &atoms, and_mode, k)?;
     }
@@ -347,7 +431,44 @@ proptest! {
         corpus in skewed_corpus_strategy(),
         atoms in atoms_strategy(),
         and_mode in any::<bool>(),
-        k in 1usize..=(max_docs() + 16),
+        k in k_strategy(max_docs()),
+    ) {
+        run_case(&corpus, &atoms, and_mode, k)?;
+    }
+
+    /// Same contract over the tiered corpus, so every posting encoding
+    /// — bitset, packed multi-block, one long-form block, short form,
+    /// inline df=1 — is walked by the same generated clause and phrase
+    /// shapes and graded against the same reference.
+    #[test]
+    fn fuzz_bm25_tiered_vocab_matches_brute_force(
+        corpus in tiered_corpus_strategy(1usize..=max_docs()),
+        atoms in atoms_strategy(),
+        and_mode in any::<bool>(),
+        k in k_strategy(max_docs()),
+    ) {
+        run_case(&corpus, &atoms, and_mode, k)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: large_tier_cases(), ..ProptestConfig::default() })]
+
+    /// The tiered contract past the single-term seed floor and across
+    /// several coarse tables: the dense tier's list has more than 256
+    /// blocks, so the threshold-first seed, the coarse-span skip and the
+    /// per-block skip all run on every single-term case. Opt-in
+    /// (`cargo test ... -- --ignored`): each case builds a superfile
+    /// over tens of thousands of documents.
+    #[test]
+    #[ignore = "large corpora; run explicitly"]
+    fn fuzz_bm25_tiered_large_matches_brute_force(
+        corpus in tiered_corpus_strategy(
+            LARGE_TIER_MIN_DOCS..=LARGE_TIER_MIN_DOCS + LARGE_TIER_DOC_SPREAD
+        ),
+        atoms in atoms_strategy(),
+        and_mode in any::<bool>(),
+        k in k_strategy(LARGE_TIER_MIN_DOCS),
     ) {
         run_case(&corpus, &atoms, and_mode, k)?;
     }
